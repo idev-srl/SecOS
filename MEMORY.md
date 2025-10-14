@@ -52,13 +52,44 @@ void* aligned = kmalloc_aligned(size, 16);  // Allineato a 16 byte
 ## Virtual Memory Manager (VMM)
 
 Il VMM introduce:
-* Funzioni: `vmm_init`, `vmm_map`, `vmm_unmap`, `vmm_translate`, `vmm_alloc_page`, `vmm_dump_entry`.
+* Funzioni base: `vmm_init`, `vmm_map`, `vmm_unmap`, `vmm_translate`, `vmm_alloc_page`.
+* Funzioni per spazi utente (address space separati): `vmm_space_create_user`, `vmm_map_in_space`, `vmm_alloc_page_in_space`, `vmm_map_user_code_in_space`, `vmm_alloc_user_page_in_space`, `vmm_alloc_user_stack_in_space`, `vmm_translate_in_space`, `vmm_harden_user_space`.
 * Physmap: mappa tutta la memoria fisica disponibile in un range alto (`VMM_PHYSMAP_BASE = 0xFFFF888000000000`) usando pagine da 2MB (huge pages) per ridurre il numero di tabelle.
 * Region allocator (stub): permette di registrare regioni virtuali per future allocazioni on-demand (es. heap utente, stack, cache FS).
 * Page Fault handler: se la pagina non è presente e l'indirizzo cade in una regione registrata, viene allocata (demand-zero). Altrimenti viene generato panic.
 
-### NX Bit
-Abilitato impostando EFER.NXE in `boot.asm`. Tutte le pagine physmap sono marcate NX per evitare esecuzione di codice da pagine di dati.
+### W^X + NX
+Il kernel applica la politica "Write XOR Execute" alle sue regioni:
+* `.text` → RX
+* `.rodata` → R (NX)
+* `.data` / `.bss` → RW (NX)
+* Stack kernel → RW (NX)
+* Pagine utente di codice → RX (USER)
+* Pagine utente di dati/stack → RW (NX | USER)
+
+NX è abilitato impostando EFER.NXE in `boot.asm`. Il loader ELF rifiuta segmenti che richiedono contemporaneamente W|X.
+
+### Stack Utente con Guard Page
+Lo stack utente è allocato come N pagine mappate sotto `USER_STACK_TOP` e una pagina non mappata immediatamente sotto per rilevare overflow (page fault se oltrepassata). Questo è gestito da `vmm_alloc_user_stack_in_space`.
+
+### Address Space Utente
+Ogni processo ha una copia iniziale delle PML4 del kernel (clone) poi "hardened" con `vmm_harden_user_space` che rimuove il bit USER dalle regioni alte del kernel per prevenire accessi accidentali. Le pagine utente sono marcate USER e solo quelle sono accessibili in ring3 (futuro).
+Durante la creazione (`vmm_space_create_user`) le entry PDPT corrispondenti al range user (CODE/DATA/STACK) vengono azzerate per evitare che mapping huge ereditati o PDT/kernel page tables già riempite causino collisioni quando il loader ELF tenta di mappare nuove pagine (risolve l'errore "map fallita" nelle chiamate successive di `elfload`).
+
+### Traduzione In-Space
+Per operare su pagine di un address space non attivo si usa `vmm_translate_in_space` che risolve l'indirizzo virtuale rispetto alle tabelle dell'altro spazio, utile per copia segmenti ELF e zeroing BSS.
+
+### Smappare pagine di uno spazio
+La nuova API `vmm_unmap_in_space(space, virt)` permette di rimuovere la pagina da uno spazio utente senza switchare CR3, liberando il frame fisico e lasciando invariati gli altri spazi. Usata da `elf_unload_process` per rilasciare le pagine codice/dati/stack del processo.
+
+### PCB (Process Control Block) Campi Memoria
+Il PCB contiene:
+* `space` → puntatore al suo address space
+* `entry` → entry point (RIP iniziale)
+* `stack_top` → top stack utente
+* `kstack_top` → (stub) stack kernel per future transizioni ring3
+* `regs` → snapshot registri iniziali (RIP/RSP/RFLAGS ecc.)
+* `manifest` → puntatore a descrittore di sicurezza (stub non ancora usato)
 
 ### Layout virtuale (proposto)
 | Area | Descrizione |
@@ -71,11 +102,12 @@ Abilitato impostando EFER.NXE in `boot.asm`. Tutte le pagine physmap sono marcat
 | Guard pages | Pagine non mappate per rilevare overflow |
 
 ### Prossimi passi
-1. Migrare kernel a higher-half eliminando identity mapping.
-2. Completare region allocator (merge/fragmentation handling).
-3. Implementare cache blocchi (LRU) e astrazione dispositivo a blocchi.
-4. Introduzione ELF loader e address space per processi user.
-5. Syscall gate e transizione ring3 con TSS.rsp0.
+1. Migrazione completa a higher-half eliminando identity mapping iniziale.
+2. Region allocator avanzato (merge/fragmentation) + demand paging per heap utente.
+3. Cache blocchi (LRU) e astrazione dispositivo a blocchi.
+4. Syscall gate e transizione a ring3 con TSS.rsp0 (uso di `kstack_top`).
+5. Manifest di sicurezza ELF (`.note.secos`) con policy W^X enforcement esteso.
+6. Scheduler + context switch salvando `regs`.
 
 
 ### mem
@@ -171,27 +203,17 @@ _kernel_end +------------------+
 
 ## 🚀 Prossimi Passi
 
-Per caricare applicazioni userspace avremo bisogno di:
+Per caricare applicazioni userspace abbiamo introdotto:
 
-1. **Virtual Memory Manager (VMM)**
-   - Paging avanzato
-   - Separazione kernel/user space
-   - Page fault handler
+1. **ELF Loader** (base) → carica segmenti PT_LOAD con verifiche W^X e allineamento.
+2. **Address Space** → creato per processo con stack utente dedicato e guard page.
+3. **PCB** → struttura minima per identità e registri iniziali.
 
-2. **ELF Loader**
-   - Parser formato ELF64
-   - Caricamento sezioni
-   - Symbol resolution
-
-3. **Process Manager**
-   - Strutture task/process
-   - Context switching
-   - Scheduling
-
-4. **File System**
-   - Supporto FAT32/exFAT
-   - VFS (Virtual File System)
-   - Driver disco (AHCI/IDE)
+In arrivo:
+* Syscalls
+* Scheduler
+* Manifest parser
+* File system
 
 ## 💡 Note Implementative
 

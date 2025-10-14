@@ -7,15 +7,20 @@ Un kernel scritto in C che si avvia in modalità Long Mode (64-bit) utilizzando 
 - ✅ Avvio in Long Mode (64-bit)
 - ✅ Supporto Multiboot per GRUB
 - ✅ Gestione base del terminale VGA
-- ✅ Identity mapping delle prime 4MB di memoria
+- ✅ Identity mapping iniziale (transitorio)
 - ✅ Stack funzionante
 - ✅ **Interrupt Descriptor Table (IDT)**
 - ✅ **Timer PIT con interrupt periodici (IRQ0)**
 - ✅ **Sistema di tick e uptime**
 - ✅ **Funzioni di sleep (bloccanti)**
 - ✅ **Driver tastiera PS/2 con buffer circolare (IRQ1)**
-- ✅ **Physical Memory Manager (PMM)** - Gestione frame fisici
-- ✅ **Heap Allocator** - kmalloc/kfree per allocazione dinamica
+- ✅ **Physical Memory Manager (PMM)** - frame allocator
+- ✅ **Heap Allocator** - kmalloc/kfree con espansione dinamica
+- ✅ **Virtual Memory Manager (VMM)** con supporto spazi utente e traduzione in-space
+- ✅ **NX Bit** e policy **W^X** per regioni kernel e segmenti ELF
+- ✅ **ELF64 Loader** (segmenti PT_LOAD, enforcement W^X, p_align)
+- ✅ **Address Space** per processi utente + stack con guard page
+- ✅ **PCB esteso** (state, registri iniziali, stub manifest)
 - ✅ **Parsing Multiboot Memory Map**
 - ✅ **Shell interattiva con comandi**
 - ✅ Gestione errori durante il boot
@@ -43,7 +48,7 @@ sudo pacman -S nasm gcc binutils grub xorriso qemu
 
 ## Compilazione
 
-## Struttura del progetto
+## Struttura del progetto (semplificata)
 
 ```
 .
@@ -54,8 +59,11 @@ sudo pacman -S nasm gcc binutils grub xorriso qemu
 ├── timer.c/h     # Driver timer PIT (Programmable Interval Timer)
 ├── keyboard.c/h  # Driver tastiera PS/2
 ├── multiboot.h   # Strutture Multiboot standard
-├── pmm.c/h       # Physical Memory Manager (bitmap allocator)
-├── heap.c/h      # Heap allocator (kmalloc/kfree)
+├── pmm.c/h       # Physical Memory Manager
+├── heap.c/h      # Heap allocator
+├── vmm.c/h       # Virtual Memory Manager + spazi utente
+├── elf.c/h       # Loader ELF64
+├── process.c/h   # Process creation (PCB)
 ├── shell.c/h     # Shell interattiva
 ├── terminal.h    # API terminale VGA condivisa
 ├── linker.ld     # Script del linker
@@ -172,8 +180,21 @@ Per testare su hardware reale:
 ## Sviluppi futuri
 
 Questo kernel è un ottimo punto di partenza. Puoi estenderlo con:
-- **Multitasking cooperativo** - Context switching e task scheduler
-- **Gestione della memoria dinamica** - Heap allocator (kmalloc/kfree)
+- **Scheduler preemptive** - Context switching usando PCB.regs
+- **Transizione a ring3** - Syscall gate e TSS.rsp0
+- **Manifest di sicurezza** - Parsing sezione `.note.secos` per policy
+## Manifest di Sicurezza (.note.secos)
+
+Il loader cerca una nota ELF (PT_NOTE) con name `SECOS` e type `QSEC` contenente una struttura:
+```
+uint32_t version;
+uint32_t flags;   // MANIFEST_FLAG_REQUIRE_WX_BLOCK, STACK_GUARD, NX_DATA, RX_CODE
+uint64_t max_mem; // limite futuro
+uint64_t entry_hint; // entry attesa (0 = ignora)
+```
+Se presente viene validata (entry match, flag supportati). Segmenti W|X vengono già rifiutati a prescindere.
+- **ASLR** - Randomizzazione indirizzi codice e stack
+- **File system** - FAT32/exFAT + VFS
 - **File system** - Sistema di file in RAM o su disco
 - **Driver per dispositivi** - Mouse, serial port, AHCI/IDE
 - **Networking** - Stack TCP/IP base
@@ -204,3 +225,7 @@ gdb kernel.bin
 ## Licenza
 
 Questo codice è fornito come esempio educativo e può essere usato liberamente.
+
+## Note Memoria & Sicurezza
+
+Il kernel applica W^X alle sue sezioni e marca NX le regioni di dati. Le pagine utente sono mappate con USER, mentre quelle kernel condivise mantengono USER=0 dopo hardening (`vmm_harden_user_space`). Lo stack utente ha una guard page non mappata per intercettare overflow. Il loader ELF verifica che nessun segmento sia sia scrivibile che eseguibile e valida l'allineamento (p_align 0 o 0x1000).

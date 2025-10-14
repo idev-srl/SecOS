@@ -36,15 +36,19 @@ void vmm_init(void);
 
 // Mappa una pagina 4K (crea tabelle se necessario)
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags);
+int vmm_map_in_space(vmm_space_t* space, uint64_t virt, uint64_t phys, uint64_t flags);
 
 // Smappa una pagina
 int vmm_unmap(uint64_t virt);
+int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt);
 
 // Traduci indirizzo virtuale -> fisico (ritorna 0 se non presente)
 uint64_t vmm_translate(uint64_t virt);
+uint64_t vmm_translate_in_space(vmm_space_t* space, uint64_t virt);
 
 // Alloca e mappa nuova pagina fisica (zeroed) in virt
 int vmm_alloc_page(uint64_t virt, uint64_t flags);
+int vmm_alloc_page_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags);
 
 // Ottieni spazio kernel corrente
 vmm_space_t* vmm_get_kernel_space(void);
@@ -72,5 +76,13 @@ int vmm_map_user_data(uint64_t virt);         // RW/NX
 uint64_t vmm_alloc_user_stack(int pages);     // allocate stack pages
 vmm_space_t* vmm_space_create_user(void);     // new address space
 int vmm_space_destroy(vmm_space_t* space);    // destroy space
+// Hardening: rimuove eventuali bit USER dalle entry condivise kernel
+void vmm_harden_user_space(vmm_space_t* space);
+
+// Varianti che operano su uno spazio specifico (non sul kernel corrente)
+int vmm_alloc_user_page_in_space(vmm_space_t* space, uint64_t virt);
+int vmm_map_user_code_in_space(vmm_space_t* space, uint64_t virt);
+int vmm_map_user_data_in_space(vmm_space_t* space, uint64_t virt);
+uint64_t vmm_alloc_user_stack_in_space(vmm_space_t* space, int pages);
 
 #endif // VMM_H

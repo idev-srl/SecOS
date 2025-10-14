@@ -6,6 +6,8 @@
 #include "heap.h"
 #include "../config.h"
 #include "vmm.h" // user-space API types/defines
+#include "process.h" // process_t
+#include "elf.h" // PF_R PF_X
 #include "rtc.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -80,6 +82,8 @@ static void cmd_help(void) {
     terminal_writestring("  memtest  - Test allocazione memoria\n");
     terminal_writestring("  memstress- Stress heap (alloc espansione)\n");
     terminal_writestring("  usertest - Crea spazio utente di test\n");
+    terminal_writestring("  elfload  - Carica ELF embedded di test\n");
+    terminal_writestring("  elfunload- Smappa ultimo processo ELF\n");
     terminal_writestring("  crash    - Test eccezioni CPU (div0/pf/gpf/df/inv)\n");
     terminal_writestring("  colors   - Test dei colori\n");
     terminal_writestring("  halt     - Arresta il sistema\n");
@@ -496,6 +500,64 @@ static void execute_command(char* cmd) {
             if (vmm_switch_space(us)==0) terminal_writestring("[OK] switch user CR3\n"); else terminal_writestring("[FAIL] switch user\n");
             vmm_switch_space(vmm_get_kernel_space());
             terminal_writestring("[OK] tornato a kernel space\n");
+        }
+    } else if (strcmp(cmd, "elfload") == 0) {
+        // ELF64 minimale statico (header + un segmento code da 0x200 bytes)
+        // NOTE: Questo è un placeholder non eseguibile reale; serve per testare il parser.
+        extern process_t* process_create_from_elf(const void* elf_buf, size_t size);
+        // Costruiamo un buffer ELF semplificato
+        unsigned char elf_buf[512];
+        for (int i=0;i<512;i++) elf_buf[i]=0; // zero
+        // e_ident
+        elf_buf[0]=0x7F; elf_buf[1]='E'; elf_buf[2]='L'; elf_buf[3]='F';
+        elf_buf[4]=2; // 64-bit
+        elf_buf[5]=1; // little endian
+        elf_buf[6]=1; // version
+        // e_type (ET_EXEC=2)
+        *(uint16_t*)(elf_buf+16)=2;
+        // e_machine (x86-64=0x3E)
+        *(uint16_t*)(elf_buf+18)=0x3E;
+        // e_version
+        *(uint32_t*)(elf_buf+20)=1;
+        // e_entry (USER_CODE_BASE)
+        *(uint64_t*)(elf_buf+24)=USER_CODE_BASE;
+        // e_phoff = 64 (size of ehdr)
+        *(uint64_t*)(elf_buf+32)=64;
+        // e_ehsize
+        *(uint16_t*)(elf_buf+52)=64;
+        // e_phentsize
+        *(uint16_t*)(elf_buf+54)=56; // size phdr
+        // e_phnum
+        *(uint16_t*)(elf_buf+56)=1;
+        // Program header (at offset 64)
+        // p_type=PT_LOAD
+        *(uint32_t*)(elf_buf+64)=1;
+        // p_flags=PF_R|PF_X
+        *(uint32_t*)(elf_buf+68)=PF_R|PF_X;
+        // p_offset=0x100 (contenuto fittizio in fondo al buffer)
+        *(uint64_t*)(elf_buf+72)=0x100ULL;
+        // p_vaddr=USER_CODE_BASE
+        *(uint64_t*)(elf_buf+80)=USER_CODE_BASE;
+        // p_paddr (ignored)
+        *(uint64_t*)(elf_buf+88)=USER_CODE_BASE;
+        // p_filesz=0x80, p_memsz=0x80
+        *(uint64_t*)(elf_buf+96)=0x80ULL; // filesz
+        *(uint64_t*)(elf_buf+104)=0x80ULL; // memsz
+        // p_align=0x1000
+        *(uint64_t*)(elf_buf+112)=0x1000ULL;
+        // Fake code bytes (just pattern) at offset 0x100
+        for (int i=0;i<0x80;i++) elf_buf[0x100 + i] = 0x90; // NOP pattern
+        terminal_writestring("[ELFLOAD] Carico ELF di test...\n");
+        process_t* p = process_create_from_elf(elf_buf, sizeof(elf_buf));
+        if (!p) terminal_writestring("[ELFLOAD] Fallito\n"); else terminal_writestring("[ELFLOAD] OK (process creato)\n");
+    } else if (strcmp(cmd, "elfunload") == 0) {
+        extern process_t* process_get_last(void);
+        extern int process_destroy(process_t* p);
+        process_t* last = process_get_last();
+        if (!last) { terminal_writestring("[ELFUNLOAD] nessun processo\n"); }
+        else {
+            int ur = process_destroy(last);
+            if (ur==0) terminal_writestring("[ELFUNLOAD] OK (process distrutto)\n"); else terminal_writestring("[ELFUNLOAD] FAIL\n");
         }
     } else if (strcmp(cmd, "crash") == 0) {
         cmd_crash(args);

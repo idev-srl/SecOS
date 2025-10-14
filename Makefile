@@ -23,6 +23,10 @@ SRC_C   = \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/fb.c \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
+	$(MM_DIR)/elf.c \
+	mm/elf_unload.c \
+	elf_manifest.c \
+	$(KERNEL_DIR)/process.c \
 	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c \
 	$(LIB_DIR)/terminal.c
 

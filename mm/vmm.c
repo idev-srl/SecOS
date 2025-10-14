@@ -47,9 +47,9 @@ static uint64_t* get_or_create_table(uint64_t* table, int index, uint64_t flags)
     return (uint64_t*)(entry & ADDRESS_MASK);
 }
 
-// Ottieni puntatore livello finale (PT) per virt
-static uint64_t* get_pt(uint64_t virt, int create, uint64_t flags) {
-    uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
+// Ottieni puntatore livello finale (PT) per virt in uno spazio indicato
+static uint64_t* get_pt_space(vmm_space_t* space, uint64_t virt, int create, uint64_t flags) {
+    uint64_t pml4_phys = space->pml4_phys & ADDRESS_MASK;
     uint64_t* pml4 = (uint64_t*)pml4_phys; // Identity assumption
 
     int pml4_i = (virt >> 39) & 0x1FF;
@@ -58,7 +58,7 @@ static uint64_t* get_pt(uint64_t virt, int create, uint64_t flags) {
     int pt_i   = (virt >> 12) & 0x1FF;
 
     uint64_t* pdpt = (uint64_t*)(pml4[pml4_i] & ADDRESS_MASK);
-    if (!pdpt) {
+    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) {
         if (!create) return NULL;
         pdpt = get_or_create_table(pml4, pml4_i, flags);
         if (!pdpt) return NULL;
@@ -78,6 +78,9 @@ static uint64_t* get_pt(uint64_t virt, int create, uint64_t flags) {
     (void)pt_i; // usato da vmm_map
     return pt;
 }
+
+// Wrapper legacy per kernel_space
+static uint64_t* get_pt(uint64_t virt, int create, uint64_t flags) { return get_pt_space(&kernel_space, virt, create, flags); }
 
 void vmm_init(void) {
     kernel_space.pml4_phys = read_cr3();
@@ -208,17 +211,60 @@ static int map_user_page(uint64_t virt, int rw, int exec) {
     return 0;
 }
 
+static int map_user_page_in_space(vmm_space_t* space, uint64_t virt, int rw, int exec) {
+    if (!space) return -10;
+    if (virt & 0xFFF) return -1;
+    void* frame = pmm_alloc_frame(); if (!frame) return -2;
+    zero_frame((uint64_t)frame);
+    uint64_t flags = VMM_FLAG_PRESENT | VMM_FLAG_USER;
+    if (rw) flags |= VMM_FLAG_RW;
+    if (!exec) flags |= VMM_FLAG_NOEXEC;
+    int res = vmm_map_in_space(space, virt, (uint64_t)frame, flags);
+    if (res != 0) {
+        terminal_writestring("[VMM] map_user_page_in_space fail virt=");
+        char hx[]="0123456789ABCDEF"; for(int i=60;i>=0;i-=4) terminal_putchar(hx[(virt>>i)&0xF]);
+        terminal_writestring(" res="); terminal_putchar('0'+(res<0? -res: res)); terminal_writestring("\n");
+        return res;
+    }
+    if (!rw) {
+        uint64_t* pt = get_pt_space(space, virt, 0, 0);
+        int pt_i = (virt >> 12) & 0x1FF;
+        if (pt && (pt[pt_i] & VMM_FLAG_PRESENT)) pt[pt_i] &= ~VMM_FLAG_RW;
+    }
+    return 0;
+}
+
 int vmm_alloc_user_page(uint64_t virt) { return map_user_page(virt, 1, 0); }
 int vmm_map_user_code(uint64_t virt) { return map_user_page(virt, 0, 1); }
 int vmm_map_user_data(uint64_t virt) { return map_user_page(virt, 1, 0); }
 
+int vmm_alloc_user_page_in_space(vmm_space_t* space, uint64_t virt) { return map_user_page_in_space(space, virt, 1, 0); }
+int vmm_map_user_code_in_space(vmm_space_t* space, uint64_t virt) { return map_user_page_in_space(space, virt, 0, 1); }
+int vmm_map_user_data_in_space(vmm_space_t* space, uint64_t virt) { return map_user_page_in_space(space, virt, 1, 0); }
+
 uint64_t vmm_alloc_user_stack(int pages) {
     if (pages <= 0) pages = 4;
     uint64_t top = USER_STACK_TOP;
+    // Lascia una guard page non mappata sotto il bottom (top - pages*PAGE_SIZE - PAGE_SIZE)
     for (int i=0;i<pages;i++) {
         uint64_t page_addr = top - (i+1)*PAGE_SIZE;
         if (vmm_alloc_user_page(page_addr) != 0) {
             terminal_writestring("[USER] alloc stack page fail\n");
+            break;
+        }
+    }
+    return top;
+}
+
+uint64_t vmm_alloc_user_stack_in_space(vmm_space_t* space, int pages) {
+    if (!space) return 0;
+    if (pages <= 0) pages = 4;
+    uint64_t top = USER_STACK_TOP;
+    // Guard page: non mappiamo la pagina subito sotto la bottom del blocco
+    for (int i=0;i<pages;i++) {
+        uint64_t page_addr = top - (i+1)*PAGE_SIZE;
+        if (vmm_alloc_user_page_in_space(space, page_addr) != 0) {
+            terminal_writestring("[USER] alloc stack page fail (space)\n");
             break;
         }
     }
@@ -233,6 +279,21 @@ vmm_space_t* vmm_space_create_user(void) {
     for (int i=0;i<PT_ENTRIES;i++) {
         uint64_t e = old_pml4[i];
         if (e & VMM_FLAG_PRESENT) new_pml4[i] = e & ~VMM_FLAG_USER; // share kernel mappings
+    }
+    // Pulisce i blocchi 1GB che copriranno spazio utente (CODE/DATA/STACK) per evitare collisioni con identity mapping
+    // Iteriamo per intervalli da 1GB usando PDPT index
+    uint64_t start_usr = USER_CODE_BASE;
+    uint64_t end_usr   = USER_STACK_TOP;
+    for (uint64_t addr = start_usr; addr < end_usr; addr += (1ULL<<30)) { // step 1GB
+        int pml4_i = (addr >> 39) & 0x1FF; // tipicamente 0 per indirizzi bassi < 512GB
+        uint64_t pdpt_phys = new_pml4[pml4_i] & ADDRESS_MASK;
+        if (!(new_pml4[pml4_i] & VMM_FLAG_PRESENT)) continue; // nessun PDPT
+        uint64_t* pdpt = (uint64_t*)pdpt_phys;
+        int pdpt_i = (addr >> 30) & 0x1FF;
+        // Se entry presente, la azzeriamo: lo spazio utente avrà tabelle dedicate
+        if (pdpt[pdpt_i] & VMM_FLAG_PRESENT) {
+            pdpt[pdpt_i] = 0; // rimuove huge o link a PDT esistente del kernel
+        }
     }
     vmm_space_t* space = (vmm_space_t*)kmalloc(sizeof(vmm_space_t));
     if (!space) return NULL;
@@ -318,6 +379,17 @@ int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
     return 0;
 }
 
+int vmm_map_in_space(vmm_space_t* space, uint64_t virt, uint64_t phys, uint64_t flags) {
+    if (!space) return -10;
+    if (virt & 0xFFF || phys & 0xFFF) return -1;
+    uint64_t* pt = get_pt_space(space, virt, 1, flags);
+    if (!pt) return -2;
+    int pt_i = (virt >> 12) & 0x1FF;
+    if (pt[pt_i] & VMM_FLAG_PRESENT) return -3;
+    pt[pt_i] = (phys & ADDRESS_MASK) | (flags & ~VMM_FLAG_PS) | VMM_FLAG_PRESENT;
+    return 0;
+}
+
 int vmm_unmap(uint64_t virt) {
     if (virt & 0xFFF) return -1;
     uint64_t* pt = get_pt(virt, 0, 0);
@@ -330,8 +402,32 @@ int vmm_unmap(uint64_t virt) {
     return 0;
 }
 
+int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
+    if (!space) return -10;
+    if (virt & 0xFFF) return -1;
+    uint64_t* pt = get_pt_space(space, virt, 0, 0);
+    if (!pt) return -2;
+    int pt_i = (virt >> 12) & 0x1FF;
+    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3;
+    uint64_t entry = pt[pt_i];
+    pt[pt_i] = 0;
+    // Libera frame fisico
+    void* frame = (void*)(entry & ADDRESS_MASK);
+    pmm_free_frame(frame);
+    return 0;
+}
+
 uint64_t vmm_translate(uint64_t virt) {
     uint64_t* pt = get_pt(virt, 0, 0);
+    if (!pt) return 0;
+    int pt_i = (virt >> 12) & 0x1FF;
+    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return 0;
+    return (pt[pt_i] & ADDRESS_MASK) | (virt & 0xFFF);
+}
+
+uint64_t vmm_translate_in_space(vmm_space_t* space, uint64_t virt) {
+    if (!space) return 0;
+    uint64_t* pt = get_pt_space(space, virt, 0, 0);
     if (!pt) return 0;
     int pt_i = (virt >> 12) & 0x1FF;
     if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return 0;
@@ -345,6 +441,13 @@ int vmm_alloc_page(uint64_t virt, uint64_t flags) {
     return vmm_map(virt, (uint64_t)frame, flags | VMM_FLAG_RW);
 }
 
+int vmm_alloc_page_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
+    if (!space) return -10;
+    void* frame = pmm_alloc_frame(); if (!frame) return -1;
+    zero_frame((uint64_t)frame);
+    return vmm_map_in_space(space, virt, (uint64_t)frame, flags | VMM_FLAG_RW);
+}
+
 vmm_space_t* vmm_get_kernel_space(void) { return &kernel_space; }
 
 vmm_space_t* vmm_clone_space(vmm_space_t* src) {
@@ -355,6 +458,22 @@ int vmm_switch_space(vmm_space_t* space) {
     if (!space) return -1;
     write_cr3(space->pml4_phys & ADDRESS_MASK);
     return 0;
+}
+
+void vmm_harden_user_space(vmm_space_t* space) {
+    if (!space) return;
+    uint64_t* pml4 = (uint64_t*)(space->pml4_phys & ADDRESS_MASK);
+    for (int i=0;i<PT_ENTRIES;i++) {
+        uint64_t e = pml4[i];
+        if (!(e & VMM_FLAG_PRESENT)) continue;
+        // Rimuovi USER dai mapping kernel high (heuristic: indirizzi >= 0xFFFF800000000000)
+        // Calcola indirizzo virtuale base dell'entry PML4
+        uint64_t virt_base = ((uint64_t)i << 39);
+        if (virt_base >= 0xFFFF800000000000ULL) {
+            pml4[i] = e & ~VMM_FLAG_USER;
+        }
+    }
+    terminal_writestring("[SEC] harden user space: cleared USER bit su regioni kernel alte\n");
 }
 
 void vmm_dump_entry(uint64_t virt) {
