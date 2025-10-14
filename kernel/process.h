@@ -27,6 +27,8 @@ int process_init_system(void); // init table
 process_t* process_create_from_elf(const void* elf_buf, size_t size);
 void process_print(const process_t* p);
 process_t* process_get_last(void);
+process_t* process_find_by_pid(uint32_t pid);
+void process_foreach(void (*cb)(process_t*, void*), void* user);
 int process_destroy(process_t* p);
 
 #endif // PROCESS_H

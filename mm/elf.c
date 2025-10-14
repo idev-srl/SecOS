@@ -18,7 +18,7 @@ static int check_magic(const Elf64_Ehdr* eh) {
     return 0;
 }
 
-int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t* entry_out) {
+int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t* entry_out, uint64_t** pages_out, uint32_t* page_count_out) {
     if (!buffer || size < sizeof(Elf64_Ehdr)) return ELF_ERR_FMT;
     const Elf64_Ehdr* eh = (const Elf64_Ehdr*)buffer;
     if (check_magic(eh) != 0) { terminal_writestring("[ELF] Magic err\n"); return ELF_ERR_MAGIC; }
@@ -36,6 +36,25 @@ int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t
     char hx_fb[]="0123456789ABCDEF"; for(int b=60;b>=0;b-=4) terminal_putchar(hx_fb[(free_before>>b)&0xF]); terminal_writestring("\n");
     // Itera program headers
     const uint8_t* base = (const uint8_t*)buffer;
+    // Pass 1: conteggio pagine totali PT_LOAD
+    uint32_t total_pages = 0;
+    if (pages_out && page_count_out) {
+        for (int i=0;i<eh->e_phnum;i++) {
+            const Elf64_Phdr* ph = (const Elf64_Phdr*)(base + eh->e_phoff + i * sizeof(Elf64_Phdr));
+            if (ph->p_type != PT_LOAD) continue;
+            uint64_t memsz = ph->p_memsz; if (memsz < ph->p_filesz) memsz = ph->p_filesz;
+            if (memsz == 0) continue;
+            uint64_t start = ph->p_vaddr & ~0xFFFULL;
+            uint64_t end = (ph->p_vaddr + memsz + 0xFFFULL) & ~0xFFFULL;
+            total_pages += (uint32_t)((end - start) >> 12);
+        }
+    }
+    uint64_t* pages_arr = NULL;
+    uint32_t pages_idx = 0;
+    if (pages_out && page_count_out && total_pages) {
+        pages_arr = (uint64_t*)kmalloc(sizeof(uint64_t)*total_pages);
+        if (!pages_arr) { terminal_writestring("[ELF] alloc pages_arr fail\n"); total_pages = 0; }
+    }
     for (int i=0;i<eh->e_phnum;i++) {
         const Elf64_Phdr* ph = (const Elf64_Phdr*)(base + eh->e_phoff + i * sizeof(Elf64_Phdr));
         if ((const uint8_t*)ph + sizeof(Elf64_Phdr) > base + size) return ELF_ERR_RANGE;
@@ -74,6 +93,7 @@ int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t
             terminal_writestring("[ELF] page ");
             char hx[]="0123456789ABCDEF"; for(int b=60;b>=0;b-=4) terminal_putchar(hx[(va>>b)&0xF]);
             terminal_writestring(" -> "); terminal_putchar(exec? 'X':'-'); terminal_putchar(rw? 'W':'R'); terminal_writestring("\n");
+            if (pages_arr && pages_idx < total_pages) pages_arr[pages_idx++] = va;
         }
         // Copia contenuto file nelle pagine (solo filesz)
         const uint8_t* src = base + ph->p_offset;
@@ -100,5 +120,9 @@ int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t
         terminal_putchar(exec?'X':'-'); terminal_putchar(rw?'W':'R'); terminal_writestring("\n");
     }
     terminal_writestring("[ELF] Caricamento completato\n");
+    if (pages_out && page_count_out) {
+        *pages_out = pages_arr;
+        *page_count_out = pages_idx;
+    }
     return ELF_OK;
 }

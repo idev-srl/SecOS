@@ -59,7 +59,7 @@ typedef struct {
 // size: dimensione del buffer
 // space: address space user dove mappare
 // entry_out: ritorna entry point virtuale
-int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t* entry_out);
+int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t* entry_out, uint64_t** pages_out, uint32_t* page_count_out);
 int elf_unload_process(struct process* p); // forward dichiarazione process
 
 #endif // ELF_H

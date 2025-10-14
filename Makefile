@@ -24,8 +24,8 @@ SRC_C   = \
 	$(DRIVERS_DIR)/fb.c \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
 	$(MM_DIR)/elf.c \
-	mm/elf_unload.c \
-	elf_manifest.c \
+	$(MM_DIR)/elf_unload.c \
+	$(MM_DIR)/elf_manifest.c \
 	$(KERNEL_DIR)/process.c \
 	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c \
 	$(LIB_DIR)/terminal.c
@@ -69,7 +69,7 @@ iso: $(KERNEL)
 	echo 'set default=0' >> $(ISODIR)/boot/grub/grub.cfg
 	echo 'set gfxpayload=1024x768x32' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '' >> $(ISODIR)/boot/grub/grub.cfg
-	echo 'menuentry "My OS 64-bit Kernel" {' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'menuentry "SecOS x64" {' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '    multiboot /boot/kernel.bin' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue --output=$(ISO) $(ISODIR) 2>&1 | tee grub-mkrescue.log

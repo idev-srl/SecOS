@@ -18,12 +18,13 @@ Un kernel scritto in C che si avvia in modalità Long Mode (64-bit) utilizzando 
 - ✅ **Heap Allocator** - kmalloc/kfree con espansione dinamica
 - ✅ **Virtual Memory Manager (VMM)** con supporto spazi utente e traduzione in-space
 - ✅ **NX Bit** e policy **W^X** per regioni kernel e segmenti ELF
-- ✅ **ELF64 Loader** (segmenti PT_LOAD, enforcement W^X, p_align)
+- ✅ **ELF64 Loader** (segmenti PT_LOAD, enforcement W^X, p_align, tracking pagine per processo)
 - ✅ **Address Space** per processi utente + stack con guard page
-- ✅ **PCB esteso** (state, registri iniziali, stub manifest)
+- ✅ **PCB esteso** (state, registri, manifest, lista pagine mappate per unload preciso)
 - ✅ **Parsing Multiboot Memory Map**
 - ✅ **Shell interattiva con comandi**
-- ✅ Gestione errori durante il boot
+- ✅ Gestione errori durante il boot & unload processi (elfunload)
+- ✅ Comando ps (elenco processi base)
 
 ## Requisiti
 
@@ -83,6 +84,10 @@ Una volta avviato il kernel, potrai usare questi comandi:
 - **sleep [ms]** - Attende per N millisecondi (1-10000)
 - **mem** - Mostra statistiche memoria (PMM + Heap)
 - **memtest** - Test di allocazione e deallocazione memoria
+- **memstress** - Stress allocator heap
+- **elfload** - Carica ELF di test embedded
+- **elfunload** - Distrugge ultimo processo caricato
+- **ps** - Elenca processi attivi (minimal)
 - **colors** - Test dei colori VGA disponibili
 - **reboot** - Riavvia il sistema
 
@@ -189,10 +194,10 @@ Il loader cerca una nota ELF (PT_NOTE) con name `SECOS` e type `QSEC` contenente
 ```
 uint32_t version;
 uint32_t flags;   // MANIFEST_FLAG_REQUIRE_WX_BLOCK, STACK_GUARD, NX_DATA, RX_CODE
-uint64_t max_mem; // limite futuro
+uint64_t max_mem; // limite attivo: se usage > max_mem abort
 uint64_t entry_hint; // entry attesa (0 = ignora)
 ```
-Se presente viene validata (entry match, flag supportati). Segmenti W|X vengono già rifiutati a prescindere.
+Se presente viene validata (entry match, flag supportati). Segmenti W|X vengono rifiutati a prescindere. Il campo max_mem viene confrontato con memoria totale occupata (pagine * 4096) post-caricamento e prima dell'avvio processo: se eccede il limite il processo viene abortito.
 - **ASLR** - Randomizzazione indirizzi codice e stack
 - **File system** - FAT32/exFAT + VFS
 - **File system** - Sistema di file in RAM o su disco
@@ -228,4 +233,4 @@ Questo codice è fornito come esempio educativo e può essere usato liberamente.
 
 ## Note Memoria & Sicurezza
 
-Il kernel applica W^X alle sue sezioni e marca NX le regioni di dati. Le pagine utente sono mappate con USER, mentre quelle kernel condivise mantengono USER=0 dopo hardening (`vmm_harden_user_space`). Lo stack utente ha una guard page non mappata per intercettare overflow. Il loader ELF verifica che nessun segmento sia sia scrivibile che eseguibile e valida l'allineamento (p_align 0 o 0x1000).
+Il kernel applica W^X alle sue sezioni e marca NX le regioni di dati. Le pagine utente sono mappate con USER, mentre quelle kernel condivise mantengono USER=0 dopo hardening (`vmm_harden_user_space`). Lo stack utente ha una guard page non mappata per intercettare overflow. Il loader ELF verifica che nessun segmento sia sia scrivibile che eseguibile e valida l'allineamento (p_align 0 o 0x1000). Ogni pagina code/data/stack viene tracciata nel PCB per unload preciso e accounting memoria (manifest max_mem).
