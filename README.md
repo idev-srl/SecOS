@@ -1,0 +1,206 @@
+# Kernel 64-bit con GRUB
+
+Un kernel scritto in C che si avvia in modalità Long Mode (64-bit) utilizzando GRUB come bootloader, con supporto per tastiera PS/2 e shell interattiva.
+
+## Caratteristiche
+
+- ✅ Avvio in Long Mode (64-bit)
+- ✅ Supporto Multiboot per GRUB
+- ✅ Gestione base del terminale VGA
+- ✅ Identity mapping delle prime 4MB di memoria
+- ✅ Stack funzionante
+- ✅ **Interrupt Descriptor Table (IDT)**
+- ✅ **Timer PIT con interrupt periodici (IRQ0)**
+- ✅ **Sistema di tick e uptime**
+- ✅ **Funzioni di sleep (bloccanti)**
+- ✅ **Driver tastiera PS/2 con buffer circolare (IRQ1)**
+- ✅ **Physical Memory Manager (PMM)** - Gestione frame fisici
+- ✅ **Heap Allocator** - kmalloc/kfree per allocazione dinamica
+- ✅ **Parsing Multiboot Memory Map**
+- ✅ **Shell interattiva con comandi**
+- ✅ Gestione errori durante il boot
+
+## Requisiti
+
+### Software necessario:
+- **NASM** - Assembler per il codice boot
+- **GCC** - Compilatore C (con supporto cross-compilation per x86_64)
+- **GNU ld** - Linker
+- **GRUB** - Per creare l'immagine ISO bootable
+- **xorriso** - Necessario per grub-mkrescue
+- **QEMU** - Per testare il kernel (opzionale ma consigliato)
+
+### Installazione su Ubuntu/Debian:
+```bash
+sudo apt update
+sudo apt install nasm gcc binutils grub-common grub-pc-bin xorriso qemu-system-x86
+```
+
+### Installazione su Arch Linux:
+```bash
+sudo pacman -S nasm gcc binutils grub xorriso qemu
+```
+
+## Compilazione
+
+## Struttura del progetto
+
+```
+.
+├── boot.asm      # Codice assembly per entrare in long mode
+├── idt_asm.asm   # Handler interrupt in assembly
+├── kernel.c      # Codice principale del kernel
+├── idt.c/h       # Gestione Interrupt Descriptor Table
+├── timer.c/h     # Driver timer PIT (Programmable Interval Timer)
+├── keyboard.c/h  # Driver tastiera PS/2
+├── multiboot.h   # Strutture Multiboot standard
+├── pmm.c/h       # Physical Memory Manager (bitmap allocator)
+├── heap.c/h      # Heap allocator (kmalloc/kfree)
+├── shell.c/h     # Shell interattiva
+├── terminal.h    # API terminale VGA condivisa
+├── linker.ld     # Script del linker
+├── Makefile      # Script di compilazione
+└── README.md     # Questo file
+```
+
+## Comandi della shell
+
+Una volta avviato il kernel, potrai usare questi comandi:
+
+- **help** - Mostra la lista dei comandi disponibili
+- **clear** - Pulisce lo schermo
+- **echo [testo]** - Stampa il testo specificato
+- **info** - Mostra informazioni sul sistema
+- **uptime** - Mostra il tempo di attività del sistema
+- **sleep [ms]** - Attende per N millisecondi (1-10000)
+- **mem** - Mostra statistiche memoria (PMM + Heap)
+- **memtest** - Test di allocazione e deallocazione memoria
+- **colors** - Test dei colori VGA disponibili
+- **reboot** - Riavvia il sistema
+
+## Requisiti
+
+### Compilare il kernel:
+```bash
+make
+```
+Questo comando genera il file `kernel.bin`.
+
+### Creare l'immagine ISO:
+```bash
+make iso
+```
+Questo comando crea `myos.iso`, un'immagine ISO bootable con GRUB.
+
+### Eseguire con QEMU:
+```bash
+make run
+```
+Questo comando compila, crea l'ISO ed esegue il kernel in QEMU.
+
+### Pulire i file generati:
+```bash
+make clean
+```
+
+## Come funziona
+
+### 1. Boot Process (boot.asm)
+- GRUB carica il kernel in modalità protetta a 32-bit
+- Il codice verifica il supporto per CPUID e Long Mode
+- Imposta le page tables per il paging in 64-bit (4MB identity mapping)
+- Abilita PAE (Physical Address Extension)
+- Configura l'EFER MSR per abilitare il long mode
+- Abilita il paging
+- Salta al codice a 64-bit
+
+### 2. Inizializzazione IDT (idt.c)
+- Crea l'Interrupt Descriptor Table con 256 entry
+- Rimappa il PIC (Programmable Interrupt Controller)
+- Configura l'handler per IRQ0 (timer)
+- Configura l'handler per IRQ1 (tastiera)
+- Abilita gli interrupt
+
+### 3. Timer PIT (timer.c)
+- Configura il Programmable Interval Timer a 1000 Hz (1ms per tick)
+- Gestisce gli interrupt del timer (IRQ0)
+- Mantiene un contatore di tick da 64-bit
+- Fornisce funzioni per uptime e sleep bloccante
+- Base per lo scheduling futuro
+
+### 4. Driver Tastiera (keyboard.c)
+- Gestisce gli interrupt della tastiera (IRQ1)
+- Converte scancode PS/2 in caratteri ASCII
+- Supporta Shift, Caps Lock e caratteri speciali
+- Buffer circolare per l'input
+- Funzioni bloccanti e non-bloccanti per leggere caratteri
+
+### 5. Shell (shell.c)
+- Loop principale che legge comandi dall'utente
+- Parser semplice per separare comando e argomenti
+- Esecuzione comandi integrati
+- Prompt colorato e gestione backspace
+
+### 6. Kernel (kernel.c)
+- Inizializza il terminale VGA in modalità testo
+- Mostra informazioni di boot
+- Verifica il magic number Multiboot
+- Inizializza IDT, timer, tastiera e shell
+- Passa il controllo alla shell interattiva
+
+## Caratteristiche
+
+- ✅ Avvio in Long Mode (64-bit)
+- ✅ Supporto Multiboot per GRUB
+- ✅ Gestione base del terminale VGA
+- ✅ Identity mapping delle prime 1GB di memoria
+- ✅ Stack funzionante
+- ✅ Gestione errori durante il boot
+
+## Test su hardware reale
+
+Per testare su hardware reale:
+
+1. Scrivi l'ISO su una chiavetta USB:
+   ```bash
+   sudo dd if=myos.iso of=/dev/sdX bs=4M status=progress
+   ```
+   (Sostituisci `/dev/sdX` con il dispositivo corretto)
+
+2. Avvia il computer dalla chiavetta USB
+
+## Sviluppi futuri
+
+Questo kernel è un ottimo punto di partenza. Puoi estenderlo con:
+- **Multitasking cooperativo** - Context switching e task scheduler
+- **Gestione della memoria dinamica** - Heap allocator (kmalloc/kfree)
+- **File system** - Sistema di file in RAM o su disco
+- **Driver per dispositivi** - Mouse, serial port, AHCI/IDE
+- **Networking** - Stack TCP/IP base
+- **Shell avanzata** - Piping, redirection, job control
+- **Syscalls** - Interfaccia user/kernel space
+
+## Debugging
+
+Per debug con QEMU e GDB:
+```bash
+qemu-system-x86_64 -cdrom myos.iso -s -S
+```
+
+In un altro terminale:
+```bash
+gdb kernel.bin
+(gdb) target remote localhost:1234
+(gdb) continue
+```
+
+## Risorse utili
+
+- [OSDev Wiki](https://wiki.osdev.org/) - Risorsa completa sullo sviluppo OS
+- [Intel Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html) - Documentazione CPU Intel
+- [AMD Manual](https://www.amd.com/en/support/tech-docs) - Documentazione CPU AMD
+- [GRUB Documentation](https://www.gnu.org/software/grub/manual/) - Manuale GRUB
+
+## Licenza
+
+Questo codice è fornito come esempio educativo e può essere usato liberamente.
