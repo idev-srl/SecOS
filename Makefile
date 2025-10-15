@@ -27,7 +27,7 @@ SRC_C   = \
 	$(MM_DIR)/elf_unload.c \
 	$(MM_DIR)/elf_manifest.c \
 	$(KERNEL_DIR)/process.c \
-	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c \
+	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c $(KERNEL_DIR)/sched.c \
 	$(LIB_DIR)/terminal.c
 
 OBJS_ASM = $(SRC_ASM:%.asm=%.o)

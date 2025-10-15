@@ -1,4 +1,5 @@
 #include "timer.h"
+#include "sched.h"
 
 #define PIT_CHANNEL0 0x40
 #define PIT_COMMAND  0x43
@@ -22,6 +23,7 @@ static inline uint8_t inb(uint16_t port) {
 // Handler interrupt timer (IRQ0)
 void timer_handler(void) {
     timer_ticks++;
+    sched_on_timer_tick();
 }
 
 // Inizializza il timer PIT

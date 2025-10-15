@@ -21,6 +21,9 @@ typedef struct process {
     void* manifest; // stub pointer a manifest_t futura
     uint64_t* mapped_pages; // array di indirizzi virtuali pagina mappati (code+data+stack)
     uint32_t mapped_page_count; // numero di pagine
+    // Metriche runtime
+    uint64_t cpu_ticks;      // tick CPU accumulati (scheduler)
+    uint64_t user_mem_bytes; // memoria virtuale mappata (aggiornata a creazione / estensioni future)
 } process_t;
 
 int process_init_system(void); // init table

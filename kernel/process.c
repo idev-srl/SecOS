@@ -75,6 +75,8 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     // Tracking pagine: aggiungi pagine stack (eccetto guard) se pages!=NULL
     p->mapped_pages = pages;
     p->mapped_page_count = page_count;
+    p->cpu_ticks = 0;
+    p->user_mem_bytes = (uint64_t)page_count * 4096ULL; // aggiornato dopo eventuale aggiunta stack
     if (pages) {
         // Pagine stack utente: N=8 mappate + 1 guard (non tracciare guard)
         uint32_t stack_user_pages = 8 - 1; // exclude guard
@@ -89,6 +91,7 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
             kfree(p->mapped_pages);
             p->mapped_pages = newarr;
             p->mapped_page_count = idx;
+            p->user_mem_bytes = (uint64_t)p->mapped_page_count * 4096ULL;
         } else {
             terminal_writestring("[PROC] stack pages alloc fail\n");
         }

@@ -8,6 +8,7 @@
 #include "vmm.h" // user-space API types/defines
 #include "process.h" // process_t
 #include "elf.h" // PF_R PF_X
+#include "mm/elf_manifest.h" // SECOS_NOTE_TYPE e flags manifest
 #include "rtc.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -76,33 +77,75 @@ static void cmd_memtest(void);
 static void execute_command(char* cmd); // prototipo per evitare implicit declaration
 void shell_ps_list(void); // forward per dispatcher
 
+// Definizione struttura dispatcher (anticipata per help dinamico)
+typedef void (*shell_handler_t)(const char* args);
+struct shell_cmd { const char* name; shell_handler_t handler; };
+
 // Implementazioni comandi base (copiate da old/shell.c)
+// La tabella dei comandi viene definita piu' avanti; per help dinamico abbiamo bisogno di conoscerla.
+// Spostiamo la tabella prima della definizione di cmd_help.
+
+// Forward declarations wrapper handler (definiti dopo)
+static void sh_help(const char* a);
+static void sh_clear(const char* a);
+static void sh_echo(const char* a);
+static void sh_info(const char* a);
+static void sh_uptime(const char* a);
+static void sh_sleep(const char* a);
+static void sh_mem(const char* a);
+static void sh_memtest(const char* a);
+static void sh_memstress(const char* a);
+static void sh_usertest(const char* a);
+static void sh_elfload(const char* a);
+static void sh_elfload2(const char* a);
+static void sh_elfunload(const char* a);
+static void sh_ps(const char* a);
+static void sh_kill(const char* a);
+static void sh_crash(const char* a);
+static void sh_colors(const char* a);
+static void sh_halt(const char* a);
+static void sh_reboot(const char* a);
+static void sh_pinfo(const char* a);
+#if ENABLE_RTC
+static void sh_date(const char* a);
+#endif
+
+static const struct shell_cmd shell_cmds[] = {
+    {"help",      sh_help},
+    {"clear",     sh_clear},
+    {"echo",      sh_echo},
+    {"info",      sh_info},
+    {"uptime",    sh_uptime},
+    {"sleep",     sh_sleep},
+    {"mem",       sh_mem},
+    {"memtest",   sh_memtest},
+    {"memstress", sh_memstress},
+    {"usertest",  sh_usertest},
+    {"elfload",   sh_elfload},
+    {"elfload2",  sh_elfload2},
+    {"elfunload", sh_elfunload},
+    {"kill",      sh_kill},
+    {"pinfo",     sh_pinfo},
+    {"ps",        sh_ps},
+    {"crash",     sh_crash},
+    {"colors",    sh_colors},
+    {"halt",      sh_halt},
+    {"reboot",    sh_reboot},
+#if ENABLE_RTC
+    {"date",      sh_date},
+#endif
+};
+
 static void cmd_help(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("\nComandi disponibili:\n");
+    terminal_writestring("\nComandi disponibili (auto):\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    terminal_writestring("  help       - Mostra questo messaggio\n");
-    terminal_writestring("  clear      - Pulisce lo schermo\n");
-    terminal_writestring("  echo <txt> - Stampa un messaggio\n");
-    terminal_writestring("  info       - Informazioni sul sistema\n");
-    terminal_writestring("  uptime     - Mostra tempo di attivita'\n");
-    terminal_writestring("  sleep <ms> - Attendi per N millisecondi\n");
-    terminal_writestring("  mem        - Mostra statistiche memoria\n");
-    terminal_writestring("  memtest    - Test allocazione memoria\n");
-    terminal_writestring("  memstress  - Stress test heap\n");
-    terminal_writestring("  usertest   - Test spazio utente\n");
-    terminal_writestring("  elfload    - Carica ELF di test (1 segmento)\n");
-    terminal_writestring("  elfload2   - Carica ELF multi-segmento di test\n");
-    terminal_writestring("  elfunload [pid] - Distrugge processo (ultimo o PID)\n");
-    terminal_writestring("  ps         - Elenca processi\n");
-    terminal_writestring("  crash <tipo> - Genera eccezione CPU (div0/pf/gpf/df/inv/stk)\n");
-    terminal_writestring("  colors     - Test dei colori VGA\n");
-    terminal_writestring("  halt       - Arresta il sistema\n");
-    terminal_writestring("  reboot     - Riavvia il sistema\n");
-#if ENABLE_RTC
-    terminal_writestring("  date       - Mostra data/ora RTC\n");
-#endif
-    terminal_writestring("\n");
+    for (unsigned i=0;i<sizeof(shell_cmds)/sizeof(shell_cmds[0]); i++) {
+        terminal_writestring("  ");
+        terminal_writestring(shell_cmds[i].name);
+        terminal_writestring("\n");
+    }
+    terminal_writestring("\nDigita 'help' per aggiornare dopo nuove aggiunte.\n\n");
 }
 
 static void cmd_clear(void) { terminal_initialize(); }
@@ -437,8 +480,6 @@ void shell_run(void) {
 
 // Implementazione corretta execute_command
 // --- Dispatcher tabellare ---
-typedef void (*shell_handler_t)(const char* args);
-struct shell_cmd { const char* name; shell_handler_t handler; };
 
 // Wrappers per adattare funzioni esistenti che non prendono args o hanno firma diversa
 static void sh_help(const char* a){ (void)a; cmd_help(); }
@@ -473,77 +514,108 @@ static void sh_usertest(const char* args) {
 static void sh_elfload(const char* a) {
         extern process_t* process_create_from_elf(const void* elf_buf, size_t size); unsigned char elf_buf[512]; for(int i=0;i<512;i++) elf_buf[i]=0; elf_buf[0]=0x7F; elf_buf[1]='E'; elf_buf[2]='L'; elf_buf[3]='F'; elf_buf[4]=2; elf_buf[5]=1; elf_buf[6]=1; *(uint16_t*)(elf_buf+16)=2; *(uint16_t*)(elf_buf+18)=0x3E; *(uint32_t*)(elf_buf+20)=1; *(uint64_t*)(elf_buf+24)=USER_CODE_BASE; *(uint64_t*)(elf_buf+32)=64; *(uint16_t*)(elf_buf+52)=64; *(uint16_t*)(elf_buf+54)=56; *(uint16_t*)(elf_buf+56)=1; *(uint32_t*)(elf_buf+64)=1; *(uint32_t*)(elf_buf+68)=PF_R|PF_X; *(uint64_t*)(elf_buf+72)=0x100ULL; *(uint64_t*)(elf_buf+80)=USER_CODE_BASE; *(uint64_t*)(elf_buf+88)=USER_CODE_BASE; *(uint64_t*)(elf_buf+96)=0x80ULL; *(uint64_t*)(elf_buf+104)=0x80ULL; *(uint64_t*)(elf_buf+112)=0x1000ULL; for(int i=0;i<0x80;i++) elf_buf[0x100+i]=0x90; terminal_writestring("[ELFLOAD] Carico ELF di test...\n"); process_t* p = process_create_from_elf(elf_buf, sizeof(elf_buf)); if(!p) terminal_writestring("[ELFLOAD] Fallito\n"); else terminal_writestring("[ELFLOAD] OK (process creato)\n"); }
 static void sh_elfload2(const char* a) {
-        // NOTE: versione precedente usava buffer da 1024 bytes ma scriveva fino a offset 0x400+0x80 (0x480) => overflow.
-        // Allochiamo buffer piu' grande e passiamo size reale utilizzata.
-        extern process_t* process_create_from_elf(const void* elf_buf, size_t size);
-        unsigned char elf_buf[2048];
-        for (int i=0;i<2048;i++) elf_buf[i]=0;
-        // ELF header base
-        elf_buf[0]=0x7F; elf_buf[1]='E'; elf_buf[2]='L'; elf_buf[3]='F';
-        elf_buf[4]=2; // 64-bit
-        elf_buf[5]=1; // little endian
-        elf_buf[6]=1; // version
-        *(uint16_t*)(elf_buf+16)=2;      // e_type EXEC
-        *(uint16_t*)(elf_buf+18)=0x3E;   // e_machine x86-64
-        *(uint32_t*)(elf_buf+20)=1;      // e_version
-        *(uint64_t*)(elf_buf+24)=USER_CODE_BASE; // e_entry
-        *(uint64_t*)(elf_buf+32)=64;     // e_phoff
-        *(uint16_t*)(elf_buf+52)=64;     // e_ehsize
-        *(uint16_t*)(elf_buf+54)=56;     // e_phentsize
-        *(uint16_t*)(elf_buf+56)=2;      // e_phnum
-        // PHDR #0 (code RX)
-        *(uint32_t*)(elf_buf+64)=1;                // p_type PT_LOAD
-        *(uint32_t*)(elf_buf+68)=PF_R|PF_X;        // p_flags
-        *(uint64_t*)(elf_buf+72)=0x200;            // p_offset (code starts at 0x200)
-        *(uint64_t*)(elf_buf+80)=USER_CODE_BASE;   // p_vaddr
-        *(uint64_t*)(elf_buf+88)=USER_CODE_BASE;   // p_paddr (ignored)
-        *(uint64_t*)(elf_buf+96)=0x100;            // p_filesz (256 bytes code)
-        *(uint64_t*)(elf_buf+104)=0x180;           // p_memsz (include 0x80 BSS)
-        *(uint64_t*)(elf_buf+112)=0x1000;          // p_align
-        // PHDR #1 (data RW)
-        *(uint32_t*)(elf_buf+120)=1;               // p_type PT_LOAD
-        *(uint32_t*)(elf_buf+124)=PF_R|PF_W;       // p_flags
-        *(uint64_t*)(elf_buf+128)=0x400;           // p_offset (data at 0x400)
-        *(uint64_t*)(elf_buf+136)=USER_DATA_BASE;  // p_vaddr
-        *(uint64_t*)(elf_buf+144)=USER_DATA_BASE;  // p_paddr
-        *(uint64_t*)(elf_buf+152)=0x80;            // p_filesz
-        *(uint64_t*)(elf_buf+160)=0x200;           // p_memsz (extra zeroed)
-        *(uint64_t*)(elf_buf+168)=0x1000;          // p_align
-        // Riempie codice (NOP) e dati (pattern 0xAA)
-        for(int i=0;i<0x100;i++) elf_buf[0x200+i]=0x90;
-        for(int i=0;i<0x80;i++)  elf_buf[0x400+i]=0xAA;
-        // Dimensione reale file: fine dell'ultimo byte scritto dei dati = 0x400+0x80 = 0x480
-        size_t used_size = 0x480;
-        terminal_writestring("[ELFLOAD2] Carico ELF multi-segmento...\n");
-        process_t* p = process_create_from_elf(elf_buf, used_size);
-        if(!p) terminal_writestring("[ELFLOAD2] Fallito\n"); else terminal_writestring("[ELFLOAD2] OK (process creato)\n");
+    // Costruzione ELF di test multi-segment con PT_NOTE manifest SECOS
+    extern process_t* process_create_from_elf(const void* elf_buf, size_t size);
+    size_t buf_size = 2560;
+    unsigned char* elf_buf = (unsigned char*)kmalloc(buf_size);
+    if (!elf_buf) { terminal_writestring("[ELFLOAD2] kmalloc fail\n"); return; }
+    for (size_t i=0;i<buf_size;i++) elf_buf[i]=0;
+    // Header ELF
+    elf_buf[0]=0x7F; elf_buf[1]='E'; elf_buf[2]='L'; elf_buf[3]='F'; elf_buf[4]=2; elf_buf[5]=1; elf_buf[6]=1;
+    *(uint16_t*)(elf_buf+16)=2; *(uint16_t*)(elf_buf+18)=0x3E; *(uint32_t*)(elf_buf+20)=1;
+    *(uint64_t*)(elf_buf+24)=USER_CODE_BASE; // entry
+    *(uint64_t*)(elf_buf+32)=64; // e_phoff
+    *(uint16_t*)(elf_buf+52)=64; *(uint16_t*)(elf_buf+54)=56; *(uint16_t*)(elf_buf+56)=3; // 3 PHDR: code, data, note
+    // PHDR0 CODE (RX) in USER_CODE_BASE
+    *(uint32_t*)(elf_buf+64)=1; *(uint32_t*)(elf_buf+68)=PF_R|PF_X; *(uint64_t*)(elf_buf+72)=0x300; *(uint64_t*)(elf_buf+80)=USER_CODE_BASE; *(uint64_t*)(elf_buf+88)=USER_CODE_BASE; *(uint64_t*)(elf_buf+96)=0x100; *(uint64_t*)(elf_buf+104)=0x180; *(uint64_t*)(elf_buf+112)=0x1000;
+    // PHDR1 DATA (RW) in USER_DATA_BASE (allineato) - usiamo memsz > filesz
+    uint64_t data_vaddr = USER_DATA_BASE + 0x2000; // distanza per evitare conflitti future espansioni
+    *(uint32_t*)(elf_buf+120)=1; *(uint32_t*)(elf_buf+124)=PF_R|PF_W; *(uint64_t*)(elf_buf+128)=0x500; *(uint64_t*)(elf_buf+136)=data_vaddr; *(uint64_t*)(elf_buf+144)=data_vaddr; *(uint64_t*)(elf_buf+152)=0x80; *(uint64_t*)(elf_buf+160)=0x200; *(uint64_t*)(elf_buf+168)=0x1000;
+    // PHDR2 NOTE (non load) solo nel file
+    *(uint32_t*)(elf_buf+176)=4; /* PT_NOTE */ *(uint32_t*)(elf_buf+180)=0; *(uint64_t*)(elf_buf+184)=0x700; *(uint64_t*)(elf_buf+192)=0; *(uint64_t*)(elf_buf+200)=0; *(uint64_t*)(elf_buf+208)=0x40; *(uint64_t*)(elf_buf+216)=0x40; *(uint64_t*)(elf_buf+224)=4; // p_align =4
+    // Code (NOP) at 0x300
+    for(int i=0;i<0x100;i++) elf_buf[0x300+i]=0x90;
+    // Data pattern
+    for(int i=0;i<0x80;i++) elf_buf[0x500+i]=0xAA;
+    // NOTE layout: namesz(4) descsz(4) type(4) name padded, desc padded
+    // name "SECOS\0" -> namesz=6 (include terminator), desc = elf_manifest_raw (size 24 bytes)
+    uint32_t namesz=6; uint32_t descsz=24; uint32_t type=SECOS_NOTE_TYPE; // usa define
+    *(uint32_t*)(elf_buf+0x700)=namesz; *(uint32_t*)(elf_buf+0x704)=descsz; *(uint32_t*)(elf_buf+0x708)=type;
+    elf_buf[0x70C]='S'; elf_buf[0x70D]='E'; elf_buf[0x70E]='C'; elf_buf[0x70F]='O'; elf_buf[0x710]='S'; elf_buf[0x711]=0; // name
+    // padding name up to multiple of 4: namesz=6 -> padded len = 8, bytes 0x712,0x713 già 0
+    // desc (manifest)
+    uint64_t manifest_off = 0x714; // aligned after name padding (0x70C + 8 = 0x714)
+    // struct elf_manifest_raw { u32 version; u32 flags; u64 max_mem; u64 entry_hint; }
+    *(uint32_t*)(elf_buf+manifest_off+0)=1; // version
+    *(uint32_t*)(elf_buf+manifest_off+4)= MANIFEST_FLAG_REQUIRE_WX_BLOCK | MANIFEST_FLAG_REQUIRE_STACK_GUARD | MANIFEST_FLAG_REQUIRE_NX_DATA | MANIFEST_FLAG_REQUIRE_RX_CODE;
+    *(uint64_t*)(elf_buf+manifest_off+8)= 64*1024; // max_mem 64KB
+    *(uint64_t*)(elf_buf+manifest_off+16)= USER_CODE_BASE; // entry_hint
+    // descsz 24 già indicato
+    size_t used_size = 0x740; // fine area nota
+    terminal_writestring("[ELFLOAD2] Carico ELF multi-segmento con manifest...\n");
+    process_t* p = process_create_from_elf(elf_buf, used_size);
+    kfree(elf_buf); // buffer non più necessario
+    if(!p) terminal_writestring("[ELFLOAD2] Fallito\n"); else terminal_writestring("[ELFLOAD2] OK (process creato)\n");
     }
 static void sh_elfunload(const char* a) { extern process_t* process_get_last(void); extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t* p); uint32_t pid=0; while(*a==' ') a++; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* target = pid? process_find_by_pid(pid): process_get_last(); if(!target) terminal_writestring("[ELFUNLOAD] processo non trovato\n"); else { int ur=process_destroy(target); if(ur==0) terminal_writestring("[ELFUNLOAD] OK (process distrutto)\n"); else terminal_writestring("[ELFUNLOAD] FAIL\n"); } }
 static void sh_ps(const char* a){ (void)a; shell_ps_list(); }
+static void sh_kill(const char* a){ extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t*); while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: kill <pid>\n"); return; } uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* t=process_find_by_pid(pid); if(!t){ terminal_writestring("[KILL] PID non trovato\n"); return; } int r=process_destroy(t); if(r==0) terminal_writestring("[KILL] OK\n"); else terminal_writestring("[KILL] FAIL\n"); }
+// Helper per decodificare flags manifest
+static void decode_manifest_flags(uint32_t f, char* out, size_t cap) {
+    out[0]='\0';
+    const struct { uint32_t bit; const char* name; } map[] = {
+        { MANIFEST_FLAG_REQUIRE_WX_BLOCK, "WX_BLOCK" },
+        { MANIFEST_FLAG_REQUIRE_STACK_GUARD, "STACK_GUARD" },
+        { MANIFEST_FLAG_REQUIRE_NX_DATA, "NX_DATA" },
+        { MANIFEST_FLAG_REQUIRE_RX_CODE, "RX_CODE" },
+    };
+    for (unsigned i=0;i<sizeof(map)/sizeof(map[0]);i++) {
+        if (f & map[i].bit) {
+            size_t len=0; while(out[len]) len++;
+            if (len && len+1<cap) out[len++]='|';
+            const char* s = map[i].name; while(*s && len+1<cap) out[len++]=*s++;
+            if (len<cap) out[len]='\0';
+        }
+    }
+    if (!out[0]) { // nessun flag
+        const char* nf="NONE"; size_t i=0; while(nf[i] && i+1<cap){ out[i]=nf[i]; i++; } if (i<cap) out[i]='\0';
+    }
+}
 
-static const struct shell_cmd shell_cmds[] = {
-    {"help",      sh_help},
-    {"clear",     sh_clear},
-    {"echo",      sh_echo},
-    {"info",      sh_info},
-    {"uptime",    sh_uptime},
-    {"sleep",     sh_sleep},
-    {"mem",       sh_mem},
-    {"memtest",   sh_memtest},
-    {"memstress", sh_memstress},
-    {"usertest",  sh_usertest},
-    {"elfload",   sh_elfload},
-    {"elfload2",  sh_elfload2},
-    {"elfunload", sh_elfunload},
-    {"ps",        sh_ps},
-    {"crash",     sh_crash},
-    {"colors",    sh_colors},
-    {"halt",      sh_halt},
-    {"reboot",    sh_reboot},
-#if ENABLE_RTC
-    {"date",      sh_date},
-#endif
-};
+static void sh_pinfo(const char* a){
+    extern process_t* process_find_by_pid(uint32_t pid);
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Uso: pinfo <pid>\n"); return; }
+    uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; }
+    process_t* p = process_find_by_pid(pid);
+    if(!p){ terminal_writestring("[PINFO] PID non trovato\n"); return; }
+    char hx[]="0123456789ABCDEF"; char buf[64];
+    terminal_writestring("[PINFO] PID="); for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->pid>>i)&0xF]);
+    terminal_writestring(" state="); const char* st="UNKNOWN"; switch(p->state){case PROC_NEW:st="NEW";break;case PROC_READY:st="READY";break;case PROC_RUNNING:st="RUN";break;case PROC_BLOCKED:st="BLK";break;case PROC_ZOMBIE:st="ZOMB";break;} terminal_writestring(st);
+    terminal_writestring("\n  entry="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->entry>>i)&0xF]);
+    terminal_writestring(" stack_top="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->stack_top>>i)&0xF]);
+    terminal_writestring(" pages="); itoa(p->mapped_page_count, buf, 10); terminal_writestring(buf);
+    uint64_t memkb = p->user_mem_bytes/1024ULL; itoa(memkb, buf, 10); terminal_writestring(" memKB="); terminal_writestring(buf);
+    itoa(p->cpu_ticks, buf, 10); terminal_writestring(" cpuTicks="); terminal_writestring(buf);
+    // Registri (snapshot)
+    terminal_writestring("\n  RIP="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->regs.rip>>i)&0xF]);
+    terminal_writestring(" RSP="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->regs.rsp>>i)&0xF]);
+    terminal_writestring(" RFLAGS="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->regs.rflags>>i)&0xF]);
+    // Manifest
+    if(p->manifest){
+        elf_manifest_t* mf = (elf_manifest_t*)p->manifest;
+        terminal_writestring("\n  Manifest: version="); itoa(mf->version, buf, 10); terminal_writestring(buf);
+        terminal_writestring(" max_mem="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(mf->max_mem>>i)&0xF]);
+        terminal_writestring(" entry_hint="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(mf->entry_hint>>i)&0xF]);
+        char fbuf[128]; decode_manifest_flags(mf->flags, fbuf, sizeof(fbuf));
+        terminal_writestring(" flags="); terminal_writestring(fbuf);
+    } else {
+        terminal_writestring("\n  Manifest: <none>");
+    }
+    terminal_writestring("\n");
+}
+
+// (Tabella gia' definita sopra)
 
 static void execute_command(char* line) {
     while(*line==' ') line++;
@@ -560,28 +632,39 @@ static void execute_command(char* line) {
 }
 
 // ---- Sezione PS refactor ----
-struct ps_ctx_global { int count; uint64_t total_pages; };
+struct ps_ctx_global { int count; uint64_t total_pages; uint64_t total_cpu; int st_new, st_ready, st_run, st_blk, st_zomb; };
 static void ps_cb_impl(process_t* p, void* user) {
     struct ps_ctx_global* ctx = (struct ps_ctx_global*)user;
     char hx[]="0123456789ABCDEF";
-    uint64_t memkb=(uint64_t)p->mapped_page_count*4ULL;
+    uint64_t memkb = p->user_mem_bytes / 1024ULL;
     terminal_writestring("  PID="); for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->pid>>i)&0xF]);
     terminal_writestring(" entry="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->entry>>i)&0xF]);
     terminal_writestring(" pages="); for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->mapped_page_count>>i)&0xF]);
     terminal_writestring(" memKB="); char buf[32]; itoa(memkb,buf,10); terminal_writestring(buf);
+    terminal_writestring(" cpuTicks="); itoa(p->cpu_ticks, buf, 10); terminal_writestring(buf);
     const char* st="UNKNOWN"; switch(p->state){case PROC_NEW:st="NEW";break;case PROC_READY:st="READY";break;case PROC_RUNNING:st="RUN";break;case PROC_BLOCKED:st="BLK";break;case PROC_ZOMBIE:st="ZOMB";break;} terminal_writestring(" state="); terminal_writestring(st); terminal_writestring("\n");
-    ctx->count++; ctx->total_pages += p->mapped_page_count;
+    ctx->count++; ctx->total_pages += p->mapped_page_count; ctx->total_cpu += p->cpu_ticks;
+    switch(p->state){case PROC_NEW:ctx->st_new++;break;case PROC_READY:ctx->st_ready++;break;case PROC_RUNNING:ctx->st_run++;break;case PROC_BLOCKED:ctx->st_blk++;break;case PROC_ZOMBIE:ctx->st_zomb++;break;}
 }
 
 void shell_ps_list(void) {
     terminal_writestring("\n[PS] Processi attivi:\n");
     extern void process_foreach(void (*cb)(process_t*, void*), void* user);
-    struct ps_ctx_global ctx; ctx.count=0; ctx.total_pages=0;
+    struct ps_ctx_global ctx; ctx.count=0; ctx.total_pages=0; ctx.total_cpu=0; ctx.st_new=ctx.st_ready=ctx.st_run=ctx.st_blk=ctx.st_zomb=0;
     process_foreach(ps_cb_impl, &ctx);
     if (ctx.count==0) {
         terminal_writestring("  <nessuno>\n");
     } else {
         terminal_writestring("[PS] Totale pagine="); char hx[]="0123456789ABCDEF"; for(int i=28;i>=0;i-=4) terminal_putchar(hx[(ctx.total_pages>>i)&0xF]);
-        uint64_t tot_kb = ctx.total_pages * 4ULL; char buf[32]; itoa(tot_kb,buf,10); terminal_writestring(" memKB="); terminal_writestring(buf); terminal_writestring("\n");
+        uint64_t tot_kb = ctx.total_pages * 4ULL; char buf[32]; itoa(tot_kb,buf,10); terminal_writestring(" memKB="); terminal_writestring(buf);
+        terminal_writestring(" NEW="); itoa(ctx.st_new,buf,10); terminal_writestring(buf);
+        terminal_writestring(" READY="); itoa(ctx.st_ready,buf,10); terminal_writestring(buf);
+        terminal_writestring(" RUN="); itoa(ctx.st_run,buf,10); terminal_writestring(buf);
+        terminal_writestring(" BLK="); itoa(ctx.st_blk,buf,10); terminal_writestring(buf);
+        terminal_writestring(" ZOMB="); itoa(ctx.st_zomb,buf,10); terminal_writestring(buf);
+        if (ctx.total_cpu) {
+            terminal_writestring(" CPU%=(tick per proc / total via pinfo)");
+        }
+        terminal_writestring("\n");
     }
 }

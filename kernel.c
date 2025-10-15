@@ -11,6 +11,7 @@
 #include "panic.h"
 #include "shell.h"
 #include "vmm.h"
+#include "sched.h"
 #include "config.h"
 #include "multiboot2.h"
 #if ENABLE_FB
@@ -257,6 +258,7 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
 
     // Inizializza Heap
     heap_init();
+    sched_init();
     
     // Inizializza timer (1000 Hz = 1 tick ogni 1ms)
     terminal_writestring("[OK] Inizializzazione timer PIT (1000 Hz)...\n");
