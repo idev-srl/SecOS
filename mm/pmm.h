@@ -10,6 +10,8 @@
 
 // Inizializza il PMM con la memory map
 void pmm_init(void* mboot_info);
+// Inizializza il PMM usando struttura Multiboot2 (info pointer)
+void pmm_init_mb2(void* mb2_info);
 
 // Alloca un frame fisico
 void* pmm_alloc_frame(void);
@@ -21,6 +23,8 @@ void pmm_free_frame(void* addr);
 uint64_t pmm_get_total_memory(void);
 uint64_t pmm_get_used_memory(void);
 uint64_t pmm_get_free_memory(void);
+// Massimo indirizzo fisico coperto (end, non size)
+uint64_t pmm_get_max_phys(void);
 
 // Debug
 void pmm_print_stats(void);

@@ -10,6 +10,7 @@
 #include "elf.h" // PF_R PF_X
 #include "mm/elf_manifest.h" // SECOS_NOTE_TYPE e flags manifest
 #include "rtc.h"
+#include "fb.h" // per framebuffer_info_t in fbinfo
 #include <stdint.h>
 #include <stddef.h>
 
@@ -90,6 +91,7 @@ static void sh_help(const char* a);
 static void sh_clear(const char* a);
 static void sh_echo(const char* a);
 static void sh_info(const char* a);
+static void sh_fontdump(const char* a);
 static void sh_uptime(const char* a);
 static void sh_sleep(const char* a);
 static void sh_mem(const char* a);
@@ -103,9 +105,14 @@ static void sh_ps(const char* a);
 static void sh_kill(const char* a);
 static void sh_crash(const char* a);
 static void sh_colors(const char* a);
+static void sh_fbinfo(const char* a);
+static void sh_color(const char* a);
+static void sh_cursor(const char* a);
+static void sh_dbuf(const char* a);
 static void sh_halt(const char* a);
 static void sh_reboot(const char* a);
 static void sh_pinfo(const char* a);
+static void sh_logo(const char* a);
 #if ENABLE_RTC
 static void sh_date(const char* a);
 #endif
@@ -129,6 +136,12 @@ static const struct shell_cmd shell_cmds[] = {
     {"ps",        sh_ps},
     {"crash",     sh_crash},
     {"colors",    sh_colors},
+    {"fbinfo",    sh_fbinfo},
+    {"color",     sh_color},
+    {"cursor",    sh_cursor},
+    {"dbuf",      sh_dbuf},
+    {"logo",      sh_logo},
+    {"fontdump",  sh_fontdump},
     {"halt",      sh_halt},
     {"reboot",    sh_reboot},
 #if ENABLE_RTC
@@ -145,7 +158,8 @@ static void cmd_help(void) {
         terminal_writestring(shell_cmds[i].name);
         terminal_writestring("\n");
     }
-    terminal_writestring("\nDigita 'help' per aggiornare dopo nuove aggiunte.\n\n");
+    terminal_writestring("\nNuovi: fbinfo (info framebuffer), color <fg> <bg> (cambia colori).\n");
+    terminal_writestring("Digita 'help' per aggiornare dopo ulteriori aggiunte.\n\n");
 }
 
 static void cmd_clear(void) { terminal_initialize(); }
@@ -490,6 +504,167 @@ static void sh_mem(const char* a){ (void)a; cmd_mem(); }
 static void sh_memtest(const char* a){ (void)a; cmd_memtest(); }
 static void sh_memstress(const char* a){ (void)a; cmd_memstress(); }
 static void sh_colors(const char* a){ (void)a; cmd_colors(); }
+static void sh_fbinfo(const char* a){ (void)a; 
+#if ENABLE_FB
+    extern int fb_get_info(framebuffer_info_t* out);
+    framebuffer_info_t info; 
+    if (!fb_get_info(&info)) { terminal_writestring("[FBINFO] Framebuffer non inizializzato\n"); return; }
+    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+    terminal_writestring("\n[FBINFO] Parametri Framebuffer:\n");
+    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
+    terminal_writestring("  addr="); print_hex(info.addr);
+    terminal_writestring(" virt="); print_hex(info.virt_addr);
+    terminal_writestring(" pitch="); print_dec(info.pitch);
+    terminal_writestring(" width="); print_dec(info.width);
+    terminal_writestring(" height="); print_dec(info.height);
+    terminal_writestring(" bpp="); print_dec(info.bpp);
+    terminal_writestring(" type="); print_dec(info.type);
+    terminal_writestring("\n");
+    if (info.type == 1) { // RGB
+        terminal_writestring("  RGB masks: R(size="); print_dec(info.red_mask_size); terminal_writestring(" pos="); print_dec(info.red_mask_pos);
+        terminal_writestring(" G(size="); print_dec(info.green_mask_size); terminal_writestring(" pos="); print_dec(info.green_mask_pos);
+        terminal_writestring(" B(size="); print_dec(info.blue_mask_size); terminal_writestring(" pos="); print_dec(info.blue_mask_pos); terminal_writestring(")\n");
+    }
+#else
+    terminal_writestring("[FBINFO] Framebuffer disabilitato in configurazione\n");
+#endif
+}
+// Implementazione comando color: color <fg> <bg> nomi o numeri
+static int parse_color_token(const char* s){
+    if(!s||!*s) return -1;
+    int v=0; int digits=0; const char* p=s; while(*p>='0'&&*p<='9'){ v=v*10+(*p-'0'); p++; digits++; }
+    if(digits>0 && *p=='\0') return v; // intero
+    struct { const char* name; int val; } names[] = {
+        {"black",0},{"blue",1},{"green",2},{"cyan",3},{"red",4},{"magenta",5},{"brown",6},{"grey",7},
+        {"darkgrey",8},{"lightblue",9},{"lightgreen",10},{"lightcyan",11},{"lightred",12},{"lightmagenta",13},{"yellow",14},{"white",15}
+    };
+    for(unsigned k=0;k<sizeof(names)/sizeof(names[0]);k++){
+        const char* n=names[k].name; const char* t=s; int eq=1; while(*n||*t){ if(*n!=*t){ eq=0; break; } if(!*n||!*t){ eq=0; break; } n++; t++; }
+        if(eq) return names[k].val;
+    }
+    return -1;
+}
+static void sh_color(const char* args){
+    while(*args==' ') args++;
+    if(!*args){ terminal_writestring("Uso: color <fg> <bg> | color list | color <fg> <bg> clear\n"); return; }
+    // Supporta 'list'
+    if(args[0]=='l'&&args[1]=='i'&&args[2]=='s'&&args[3]=='t'&& (args[4]=='\0'||args[4]==' ')){
+        terminal_writestring("Lista colori (fg/bg):\n");
+        const char* names[]={"black","blue","green","cyan","red","magenta","brown","grey","darkgrey","lightblue","lightgreen","lightcyan","lightred","lightmagenta","yellow","white"};
+        for(int i=0;i<16;i++){ terminal_writestring("  "); print_dec(i); terminal_writestring(" = "); terminal_writestring(names[i]); terminal_writestring("\n"); }
+        return;
+    }
+    char fg_tok[16]; char bg_tok[16]; int i=0;
+    while(*args && *args!=' ' && i<15){ fg_tok[i++]=*args++; } fg_tok[i]='\0';
+    while(*args==' ') args++; i=0; while(*args && *args!=' ' && i<15){ bg_tok[i++]=*args++; } bg_tok[i]='\0';
+    if(bg_tok[0]=='\0'){ terminal_writestring("Uso: color <fg> <bg>\n"); return; }
+    int fg = parse_color_token(fg_tok);
+    int bg = parse_color_token(bg_tok);
+    if(fg<0||fg>15||bg<0||bg>15){ terminal_writestring("Colore non valido\n"); return; }
+    // Registra come colore utente persistente
+    extern void terminal_setcolor(uint8_t color); extern void terminal_restore_user_color(void);
+    terminal_setcolor(vga_entry_color((enum vga_color)fg,(enum vga_color)bg));
+    extern uint8_t user_fg; extern uint8_t user_bg; extern int user_color_set; user_fg=fg; user_bg=bg; user_color_set=1;
+    // Opzionale 'clear' per ridisegnare sfondo
+    while(*args==' ') args++;
+    int do_clear = 0;
+    if(args[0]=='c'&&args[1]=='l'&&args[2]=='e'&&args[3]=='a'&&args[4]=='r'&& (args[5]=='\0'||args[5]==' ')) do_clear=1;
+    if(do_clear){
+        // Se framebuffer attivo, pulisce
+#if ENABLE_FB
+        framebuffer_info_t info; if (fb_get_info(&info)) {
+            extern void fb_clear(uint32_t color);
+            // Traduce bg VGA in RGB dalla palette usata in fb_console (riusiamo la stessa logica locale)
+            uint32_t vga_palette_local[16] = {
+                0x000000,0x0000AA,0x00AA00,0x00AAAA,0xAA0000,0xAA00AA,0xAA5500,0xAAAAAA,
+                0x555555,0x5555FF,0x55FF55,0x55FFFF,0xFF5555,0xFF55FF,0xFFFF55,0xFFFFFF
+            };
+            uint32_t rgb = vga_palette_local[bg & 0xF];
+            fb_clear(rgb);
+            // Dopo un clear lo sfondo è uniforme ma il cursore precedente può lasciare artefatti: ridisegna
+            extern int fb_console_enable_cursor_blink(uint32_t timer_freq); extern void fb_console_disable_cursor_blink(void);
+            // Forza ridisegno: disabilita e riabilita blink
+            fb_console_disable_cursor_blink();
+            fb_console_enable_cursor_blink(timer_get_frequency());
+        }
+#endif
+    }
+}
+// Comando cursor on|off (solo underline blink per ora)
+static void sh_cursor(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Uso: cursor on|off\n"); return; }
+    if(a[0]=='o' && a[1]=='n' && (a[2]=='\0' || a[2]==' ')){
+        extern int fb_console_enable_cursor_blink(uint32_t timer_freq);
+        if (fb_console_enable_cursor_blink(timer_get_frequency())==0) terminal_writestring("Cursor blink ON\n"); else terminal_writestring("[cursor] impossibile abilitarlo\n");
+        return;
+    }
+    if(a[0]=='o' && a[1]=='f' && a[2]=='f' && (a[3]=='\0' || a[3]==' ')){
+        extern void fb_console_disable_cursor_blink(void);
+        fb_console_disable_cursor_blink();
+        terminal_writestring("Cursor blink OFF\n");
+        return;
+    }
+    terminal_writestring("Uso: cursor on|off\n");
+}
+
+// Comando dbuf on|off|flush
+static void sh_dbuf(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Uso: dbuf on|off|flush|auto|manual\n"); return; }
+#if ENABLE_FB
+    if(a[0]=='o'&&a[1]=='n'&&(a[2]=='\0'||a[2]==' ')){
+        extern int fb_console_enable_dbuf(void); if(fb_console_enable_dbuf()==0) terminal_writestring("[dbuf] abilitato\n"); else terminal_writestring("[dbuf] FAIL alloc\n"); return; }
+    if(a[0]=='o'&&a[1]=='f'&&a[2]=='f'&&(a[3]=='\0'||a[3]==' ')){
+        extern void fb_console_disable_dbuf(void); fb_console_disable_dbuf(); terminal_writestring("[dbuf] disabilitato\n"); return; }
+    if(a[0]=='f'&&a[1]=='l'&&a[2]=='u'&&a[3]=='s'&&a[4]=='h'&&(a[5]=='\0'||a[5]==' ')){
+        extern void fb_console_flush(void); fb_console_flush(); terminal_writestring("[dbuf] flush\n"); return; }
+    if(a[0]=='a'&&a[1]=='u'&&a[2]=='t'&&a[3]=='o'&&(a[4]=='\0'||a[4]==' ')){
+        extern void fb_console_set_dbuf_auto(int on); fb_console_set_dbuf_auto(1); terminal_writestring("[dbuf] auto flush ON\n"); return; }
+    if(a[0]=='m'&&a[1]=='a'&&a[2]=='n'&&a[3]=='u'&&a[4]=='a'&&a[5]=='l'&&(a[6]=='\0'||a[6]==' ')){
+        extern void fb_console_set_dbuf_auto(int on); fb_console_set_dbuf_auto(0); terminal_writestring("[dbuf] auto flush OFF\n"); return; }
+#endif
+    terminal_writestring("Uso: dbuf on|off|flush|auto|manual\n");
+}
+// Comando fontdump <char>
+static void sh_fontdump(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Uso: fontdump <char>\n"); return; }
+#if ENABLE_FB
+    extern void fb_console_fontdump(char c); fb_console_fontdump(a[0]);
+#else
+    terminal_writestring("[fontdump] framebuffer non abilitato\n");
+#endif
+}
+static void sh_logo(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Uso: logo on|off|redraw\n"); return; }
+#if ENABLE_FB
+    if(a[0]=='o'&&a[1]=='n'&&(a[2]=='\0'||a[2]==' ')){
+        extern void fb_console_draw_logo(void); fb_console_draw_logo();
+        extern void fb_console_flush(void); fb_console_flush();
+        terminal_writestring("[logo] ridisegnato\n"); return; }
+    if(a[0]=='o'&&a[1]=='f'&&a[2]=='f'&&(a[3]=='\0'||a[3]==' ')){
+        // Pulisci area logo (rectangle top-right) assumendo stessa dimensione usata nel draw
+        framebuffer_info_t info; if(fb_get_info(&info)){
+            uint8_t* base=(uint8_t*)(uint64_t)(info.virt_addr?info.virt_addr:info.addr);
+            int letter_w=12, letter_h=20, spacing=4, len=5; int total_w=len*letter_w+(len-1)*spacing; int start_x=info.width - total_w - 8; int start_y=4; int w=total_w; int h=letter_h;
+            uint8_t* target = base; extern int fb_console_enable_dbuf(void); /* no alloc here */
+            for(int yy=0; yy<h; yy++){
+                uint32_t* row=(uint32_t*)(target + (start_y+yy)*info.pitch);
+                for(int xx=0; xx<w; xx++) row[start_x+xx]=0x000000;
+            }
+            extern void fb_console_flush(void); fb_console_flush();
+        }
+        terminal_writestring("[logo] nascosto\n"); return; }
+    if(a[0]=='r'&&a[1]=='e'&&a[2]=='d'&&a[3]=='r'&&a[4]=='a'&&a[5]=='w'&&(a[6]=='\0'||a[6]==' ')){
+        extern void fb_console_draw_logo(void); fb_console_draw_logo(); extern void fb_console_flush(void); fb_console_flush(); terminal_writestring("[logo] redraw\n"); return; }
+#else
+    terminal_writestring("[logo] framebuffer non abilitato\n"); return;
+#endif
+    terminal_writestring("Uso: logo on|off|redraw\n");
+}
+// Mappa nomi colori (lowercase) -> codice VGA
 static void sh_halt(const char* a){ (void)a; cmd_halt(); }
 static void sh_reboot(const char* a){ (void)a; cmd_reboot(); }
 #if ENABLE_RTC

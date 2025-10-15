@@ -2,11 +2,10 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0;
-    .multiboot : { *(.multiboot) }
-    . = 1M;
-    
-    .text : ALIGN(4K) {
+    . = 2M;
+    .text : ALIGN(8) {
+        mb2_header_start = .;
+        KEEP(*(.multiboot))
         _text_start = .;
         *(.text*)
         _text_end = .;

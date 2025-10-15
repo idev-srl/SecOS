@@ -8,6 +8,10 @@
 // Contatore di tick
 static volatile uint64_t timer_ticks = 0;
 static uint32_t timer_frequency = 0;
+// Callback registro (semplice array statico)
+#define MAX_TICK_CBS 8
+static timer_tick_cb_t tick_cbs[MAX_TICK_CBS];
+static int tick_cb_count = 0;
 
 // Funzioni I/O inline
 static inline void outb(uint16_t port, uint8_t value) {
@@ -24,6 +28,10 @@ static inline uint8_t inb(uint16_t port) {
 void timer_handler(void) {
     timer_ticks++;
     sched_on_timer_tick();
+    // Esegui callbacks registrate
+    for(int i=0;i<tick_cb_count;i++) {
+        if (tick_cbs[i]) tick_cbs[i]();
+    }
 }
 
 // Inizializza il timer PIT
@@ -49,6 +57,8 @@ void timer_init(uint32_t frequency) {
     // Invia il divisore (low byte, poi high byte)
     outb(PIT_CHANNEL0, (uint8_t)(divisor & 0xFF));
     outb(PIT_CHANNEL0, (uint8_t)((divisor >> 8) & 0xFF));
+    // Clear callbacks
+    for(int i=0;i<MAX_TICK_CBS;i++) tick_cbs[i]=0; tick_cb_count=0;
 }
 
 // Ottieni il numero di tick
@@ -64,6 +74,12 @@ uint64_t timer_get_uptime_seconds(void) {
 // Ottieni la frequenza
 uint32_t timer_get_frequency(void) {
     return timer_frequency;
+}
+
+int timer_register_tick_callback(timer_tick_cb_t cb) {
+    if (tick_cb_count >= MAX_TICK_CBS) return -1;
+    tick_cbs[tick_cb_count++] = cb;
+    return 0;
 }
 
 // Sleep per un numero di tick (bloccante)

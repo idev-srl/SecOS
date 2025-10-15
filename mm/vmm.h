@@ -26,6 +26,7 @@ typedef struct vmm_space {
 
 // Inizializza physmap per tutta la memoria fisica (fino a total_memory arrotondato a 2MB)
 void vmm_init_physmap(void);
+void vmm_extend_physmap(uint64_t phys_end); // estende physmap se serve (2MB granularity)
 
 // Conversioni helper
 static inline uint64_t phys_to_virt(uint64_t phys) { return VMM_PHYSMAP_BASE + phys; }

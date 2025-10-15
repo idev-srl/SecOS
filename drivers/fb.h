@@ -8,6 +8,7 @@
 
 typedef struct framebuffer_info {
     uint64_t addr;      // Physical address
+    uint64_t virt_addr; // Virtual address (after physmap ready)
     uint32_t pitch;     // Bytes per scanline
     uint32_t width;
     uint32_t height;
@@ -25,6 +26,9 @@ int fb_init(uint32_t multiboot_info);
 void fb_clear(uint32_t color);
 void fb_putpixel(int x, int y, uint32_t color);
 void fb_draw_test_pattern(void);
+void fb_debug_fill(uint32_t color_rgb);
+int fb_get_info(framebuffer_info_t* out); // ritorna 1 se pronto, 0 se non pronto
+void fb_finalize_mapping(void); // da chiamare dopo physmap per abilitare accesso alto
 
 #endif // ENABLE_FB
 

@@ -4,11 +4,29 @@ BITS 32
 ; Multiboot2 minimal header (sezione dedicata, verrà posta all'inizio del file)
 section .multiboot
 align 8
-mb_hdr_start:
-    dd 0x1BADB002        ; Multiboot1 magic
-    dd 0x0               ; flags
-    dd 0xE4524FFE        ; checksum
-mb_hdr_end:
+; --- Multiboot2 header (minimal: framebuffer request 1024x768x32) ---
+; Tag order:
+;  type=5 framebuffer request (size=20) + padding (4)
+;  type=0 end
+
+mb2_header_start:
+    dd 0xE85250D6            ; magic
+    dd 0x0                   ; arch
+    dd mb2_header_end - mb2_header_start ; header_length
+    dd 0 - (0xE85250D6 + 0x0 + (mb2_header_end - mb2_header_start)) ; checksum
+    ; Framebuffer tag (type=5) request (width,height,depth). Size=20 (header 8 + payload 12). Must pad to 8-align next tag.
+    dw 5                     ; type
+    dw 0                     ; flags
+    dd 20                    ; size (does NOT include padding)
+    dd 1024                  ; width
+    dd 768                   ; height
+    dd 32                    ; depth
+    dd 0                     ; 4-byte padding to align following tag to 8-byte boundary
+    ; End tag
+    dw 0                     ; type=0 end
+    dw 0                     ; flags
+    dd 8                     ; size=8
+mb2_header_end:
 
 ; Stack
 section .bss
@@ -18,6 +36,12 @@ global stack_top
 stack_bottom:
     resb 16384
 stack_top:
+
+; Buffer per copia struttura multiboot (fino a 8KB)
+align 16
+global mb2_copy
+mb2_copy:
+    resb 8192
 
 ; Page tables
 align 4096
@@ -30,25 +54,82 @@ pdt:
 
 section .data
 ; Salva parametri multiboot
-mb_magic: dd 0
-mb_info: dd 0
+mb_magic: dq 0
+mb_info: dq 0
 
 ; Resto del codice
 section .text
 global _start
 extern kernel_main
 
+%define DEBUG_PORT 0
+%macro PORT_CH 1
+%if DEBUG_PORT
+    mov al, %1
+    out 0xE9, al
+%endif
+%endmacro
+
 _start:
     cli
     mov esp, stack_top
-    
-    ; Salva parametri
-    mov [mb_magic], eax
-    mov [mb_info], ebx
-    
+         ; Salva parametri MULTIBOOT appena entrati
+         mov [mb_magic], eax
+         mov [mb_info], ebx
+         ; Verifica subito magic prima di altre operazioni di dump
+        cmp eax, 0x36d76289
+        jne .no_mb2_early
+        PORT_CH 'M'
+        jmp .after_magic_early
+    .no_mb2_early:
+        PORT_CH 'h'
+.after_magic_early:
+    PORT_CH 'H'
+; (header byte dump removed in cleaned build)
+    ; Verifica checksum runtime: somma primi 16 byte deve essere 0 mod 2^32
+    mov esi, mb2_header_start
+    mov eax, [esi]
+    add eax, [esi+8]
+    add eax, [esi+12]
+    test eax, eax
+    jnz .chk_fail
+    PORT_CH 'Z'
+    jmp .after_chk
+.chk_fail:
+    PORT_CH '!'
+    PORT_CH 'B'
+.after_chk:
+; (EBX nibble dump removed)
+    ; Se magic MB2 (abbiamo emesso 'M' già) prova a copiare struttura info in buffer sicuro
+    cmp byte [mb_magic], 0x89        ; check lowest byte of magic 0x36d76289 (quick heuristic)
+    jne .skip_copy
+    test esi, esi
+    jz .skip_copy
+    mov edi, esi
+    ; Leggi total_size (primi 4 byte) se accessibile
+    mov eax, [esi]
+    test eax, eax
+    jz .skip_copy
+    cmp eax, 8192
+    ja .skip_copy
+    mov ecx, eax
+    mov edi, mb2_copy
+    mov edx, ecx
+    rep movsb
+    ; Aggiorna mb_info con nuovo indirizzo buffer
+    mov eax, mb2_copy
+    mov [mb_info], eax
+    PORT_CH 'C'
+.skip_copy:
+    ; Debug: emetti 'H' se magic = MB2
+    cmp eax, 0x36d76289
+    jne .no_mb2
+    jmp .after_mb2
+.no_mb2:
+    PORT_CH 'h'
+.after_mb2:
+
     ; Verifica CPUID
-    pushfd
-    pop eax
     mov ecx, eax
     xor eax, (1 << 21)
     push eax
@@ -57,6 +138,7 @@ _start:
     pop eax
     xor eax, ecx
     jz .no_cpuid
+    ; CPUID disponibile
     
     ; Verifica Long Mode
     mov eax, 0x80000000
@@ -68,6 +150,7 @@ _start:
     cpuid
     test edx, (1 << 29)
     jz .no_long_mode
+    ; Long mode support verificato
     
     ; Setup page tables
     ; Zero out tables
@@ -85,25 +168,19 @@ _start:
     or eax, 0x3
     mov [pdpt], eax
     
-    ; Mappa 16MB con pagine da 2MB (8 entries)
-    ; Flags: Present (1) | Write (2) | Page Size 2MB (bit 7) => 0x83
-    ; Base fisica deve essere allineata a 2MB
-    mov eax, 0x00000083      ; 0 - 2MB
-    mov [pdt + 0*8], eax
-    mov eax, 0x00200083      ; 2MB - 4MB
-    mov [pdt + 1*8], eax
-    mov eax, 0x00400083      ; 4MB - 6MB
-    mov [pdt + 2*8], eax
-    mov eax, 0x00600083      ; 6MB - 8MB
-    mov [pdt + 3*8], eax
-    mov eax, 0x00800083      ; 8MB - 10MB
-    mov [pdt + 4*8], eax
-    mov eax, 0x00A00083      ; 10MB - 12MB
-    mov [pdt + 5*8], eax
-    mov eax, 0x00C00083      ; 12MB - 14MB
-    mov [pdt + 6*8], eax
-    mov eax, 0x00E00083      ; 14MB - 16MB
-    mov [pdt + 7*8], eax
+    ; Mappa 512MB con pagine da 2MB (256 entries)
+    ; Flags: Present|Write|PS=2MB => 0x83
+    xor ebx, ebx            ; ebx = index
+    mov ecx, 256            ; number of 2MB entries
+.map_loop:
+    mov eax, ebx
+    shl eax, 21             ; eax = base phys = index * 2MB
+    or eax, 0x83
+    mov [pdt + ebx*8], eax
+    inc ebx
+    cmp ebx, ecx
+    jl .map_loop
+    ; Identity map 512MB completata
     
     ; Enable PAE
     mov eax, cr4
@@ -113,6 +190,7 @@ _start:
     ; Load PML4
     mov eax, pml4
     mov cr3, eax
+    ; CR3 caricato
     
     ; Enable long mode + NXE (bit 11 di EFER) per usare NX pages
     mov ecx, 0xC0000080          ; EFER
@@ -120,14 +198,17 @@ _start:
     or eax, (1 << 8)             ; LME
     or eax, (1 << 11)            ; NXE
     wrmsr
+    ; LME+NXE abilitati
     
     ; Enable paging
     mov eax, cr0
     or eax, (1 << 31)
     mov cr0, eax
+    ; Paging abilitato
     
     ; Load GDT
     lgdt [gdt.pointer]
+    ; GDT caricata
     jmp 0x08:long_mode
 
 .no_cpuid:
@@ -137,15 +218,14 @@ _start:
 .no_long_mode:
     mov al, 'L'
     jmp error
-
 error:
     mov dword [0xb8000], 0x4f524f45
     mov byte [0xb8004], al
-    hlt
     jmp error
 
 BITS 64
 long_mode:
+    ; Entrato in long mode
     ; Setup segments
     mov ax, 0x10
     mov ds, ax
@@ -154,27 +234,26 @@ long_mode:
     mov gs, ax
     mov ss, ax
     
-    ; Clear the screen - write directly
-    mov rax, 0x0F200F200F200F20
-    mov rdi, 0xB8000
-    mov rcx, 500
-    rep stosq
+    ; Non azzeriamo più la VGA text memory se useremo il framebuffer
     
     ; Setup stack
     mov rsp, stack_top
     
     ; Get multiboot params
-    mov edi, [mb_magic]
-    mov esi, [mb_info]
+    ; Carica parametri 64-bit per SysV: RDI=magic (zero-extended), RSI=info pointer
+    mov eax, dword [mb_magic]   ; magic 32-bit
+    mov rdi, rax
+    mov eax, dword [mb_info]    ; info low 32-bit
+    mov rsi, rax                ; zero-extend
+    ; marker before calling kernel_main
+    PORT_CH 'I'
     
     ; Call kernel
     call kernel_main
-    
+    PORT_CH 'K'
 .hang:
     cli
     hlt
-    jmp .hang
-
 section .rodata
 align 16
 gdt:

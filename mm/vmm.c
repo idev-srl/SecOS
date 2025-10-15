@@ -13,6 +13,51 @@
 
 static vmm_space_t kernel_space;
 static int physmap_initialized = 0;
+static uint64_t physmap_limit = 0; // limite fisico attualmente coperto dalla physmap
+
+// Forward declaration
+static void zero_frame(uint64_t phys);
+
+// Estende la physmap (già inizializzata) per coprire almeno phys_end.
+// Usa pagine huge da 2MB come vmm_init_physmap.
+void vmm_extend_physmap(uint64_t phys_end) {
+    if (!physmap_initialized) return; // verrà configurata al vmm_init_physmap
+    const uint64_t HUGE_SIZE = 2ULL * 1024 * 1024;
+    uint64_t target = (phys_end + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);
+    if (target <= physmap_limit) return;
+
+    uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
+    uint64_t* pml4 = (uint64_t*)pml4_phys;
+    int pml4_i = (VMM_PHYSMAP_BASE >> 39) & 0x1FF;
+    int pdpt_i_start = (VMM_PHYSMAP_BASE >> 30) & 0x1FF;
+    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) { terminal_writestring("[ERR] extend physmap: PDPT assente\n"); return; }
+    uint64_t* pdpt = (uint64_t*)(pml4[pml4_i] & ADDRESS_MASK);
+    uint64_t phys_cursor = physmap_limit;
+    while (phys_cursor < target) {
+        int pdpt_i = pdpt_i_start + ((phys_cursor >> 30) & 0x1FF);
+        if (pdpt_i >= 512) { terminal_writestring("[WARN] extend physmap: superato range PDPT\n"); break; }
+        uint64_t* pdt = (uint64_t*)(pdpt[pdpt_i] & ADDRESS_MASK);
+        if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) {
+            void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] extend physmap: PDT alloc fail\n"); break; }
+            zero_frame((uint64_t)frame);
+            pdpt[pdpt_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+            pdt = (uint64_t*)(((uint64_t)frame) & ADDRESS_MASK);
+        }
+        for (int pdt_i=0; pdt_i<512 && phys_cursor < target; pdt_i++) {
+            uint64_t virt = VMM_PHYSMAP_BASE + phys_cursor;
+            int virt_pdt_i = (virt >> 21) & 0x1FF;
+            if (virt_pdt_i != pdt_i) continue;
+            if (!(pdt[pdt_i] & VMM_FLAG_PRESENT)) {
+                pdt[pdt_i] = (phys_cursor & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS | VMM_FLAG_NOEXEC;
+            }
+            phys_cursor += HUGE_SIZE;
+        }
+    }
+    physmap_limit = phys_cursor;
+    terminal_writestring("[OK] Physmap estesa a ");
+    char hex[17]; hex[16]='\0'; uint64_t v=physmap_limit; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
+    terminal_writestring("0x"); terminal_writestring(hex); terminal_writestring(" (fisico)\n");
+}
 
 // Helper per zero frame
 static void zero_frame(uint64_t phys) {
@@ -364,6 +409,7 @@ void vmm_init_physmap(void) {
         }
     }
     physmap_initialized = 1;
+    physmap_limit = limit; // registra estensione iniziale
     terminal_writestring("[OK] Physmap inizializzata fino a ");
     char hex[17]; hex[16]='\0'; uint64_t v=limit; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
     terminal_writestring("0x"); terminal_writestring(hex); terminal_writestring(" (fisico)\n");

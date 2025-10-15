@@ -21,7 +21,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/kernel.c \
 	$(ARCH_DIR)/idt.c $(ARCH_DIR)/tss.c \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
-	$(DRIVERS_DIR)/fb.c \
+	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
 	$(MM_DIR)/elf.c \
 	$(MM_DIR)/elf_unload.c \
@@ -41,6 +41,11 @@ ISODIR  = isodir
 .PHONY: all clean run iso
 
 all: $(KERNEL)
+
+# Guard: avvisa se compare un kernel.c nella root (non usato)
+ifneq (,$(wildcard kernel.c))
+$(warning ATTENZIONE: Esiste un kernel.c nella root non usato dal build. Rimuoverlo per evitare confusione.)
+endif
 
 $(BOOT_DIR)/%.o: $(BOOT_DIR)/%.asm
 	$(AS) $(ASFLAGS) $< -o $@
@@ -67,10 +72,14 @@ iso: $(KERNEL)
 	cp $(KERNEL) $(ISODIR)/boot/kernel.bin
 	echo 'set timeout=3' > $(ISODIR)/boot/grub/grub.cfg
 	echo 'set default=0' >> $(ISODIR)/boot/grub/grub.cfg
-	echo 'set gfxpayload=1024x768x32' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'insmod all_video' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'insmod gfxterm' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'set gfxmode=1024x768x32,1024x768,800x600x32,800x600,640x480x32,640x480,auto' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'set gfxpayload=keep' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'terminal_output gfxterm' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '' >> $(ISODIR)/boot/grub/grub.cfg
 	echo 'menuentry "SecOS x64" {' >> $(ISODIR)/boot/grub/grub.cfg
-	echo '    multiboot /boot/kernel.bin' >> $(ISODIR)/boot/grub/grub.cfg
+	echo '    multiboot2 /boot/kernel.bin' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue --output=$(ISO) $(ISODIR) 2>&1 | tee grub-mkrescue.log
 	@echo "ISO creata: $(ISO)"
@@ -79,7 +88,7 @@ iso: $(KERNEL)
 
 # Esegui con QEMU
 run: iso
-	qemu-system-x86_64 -cdrom $(ISO)
+	qemu-system-x86_64 -cdrom $(ISO) -debugcon stdio -global isa-debugcon.iobase=0xe9
 
 # Pulisci i file generati
 clean:

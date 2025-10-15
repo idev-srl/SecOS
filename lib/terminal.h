@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "../config.h"
 
 // Colori VGA
 enum vga_color {
@@ -36,8 +37,19 @@ static inline uint16_t vga_entry(unsigned char uc, uint8_t color) {
 // Funzioni del terminale
 void terminal_initialize(void);
 void terminal_setcolor(uint8_t color);
+// Stato colore utente persistente (framebuffer console)
+extern uint8_t user_fg;
+extern uint8_t user_bg;
+extern int user_color_set;
+void terminal_restore_user_color(void);
 void terminal_putchar(char c);
 void terminal_writestring(const char* data);
 void print_hex(uint64_t value);
+void print_dec(uint64_t value);
+#if ENABLE_FB
+int terminal_try_enable_fb(void);
+#else
+static inline int terminal_try_enable_fb(void){ return 0; }
+#endif
 
 #endif

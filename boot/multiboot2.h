@@ -10,7 +10,30 @@ struct multiboot2_tag {
 };
 
 #define MULTIBOOT2_TAG_END 0
-#define MULTIBOOT2_TAG_FRAMEBUFFER 8 // standard type for framebuffer info in MB2
+#define MULTIBOOT2_TAG_CMDLINE      1
+#define MULTIBOOT2_TAG_BOOT_LOADER  2
+#define MULTIBOOT2_TAG_MODULE       3
+#define MULTIBOOT2_TAG_MEMINFO      4
+#define MULTIBOOT2_TAG_BOOTDEV      5
+#define MULTIBOOT2_TAG_MMAP         6
+#define MULTIBOOT2_TAG_FRAMEBUFFER  8 // standard type for framebuffer info in MB2
+
+// Generic memory map tag (type=6)
+struct multiboot2_tag_mmap {
+    uint32_t type;        // =6
+    uint32_t size;        // total size including header + entries
+    uint32_t entry_size;  // size of each entry
+    uint32_t entry_version; // version (ignored)
+    // followed by entries
+};
+
+// Memory map entry (after tag header). Note: MB2 adds a 'zero' / reserved field.
+struct multiboot2_mmap_entry {
+    uint64_t addr;   // base address
+    uint64_t len;    // length in bytes
+    uint32_t type;   // 1=available, others reserved/etc.
+    uint32_t zero;   // reserved
+};
 
 // Framebuffer tag layout (per spec)
 struct multiboot2_tag_framebuffer {

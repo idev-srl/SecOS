@@ -24,4 +24,8 @@ void timer_sleep_ms(uint32_t ms);
 // Ottieni la frequenza del timer
 uint32_t timer_get_frequency(void);
 
+// Registrazione callback tick (chiamato ogni interrupt timer)
+typedef void (*timer_tick_cb_t)(void);
+int timer_register_tick_callback(timer_tick_cb_t cb);
+
 #endif
