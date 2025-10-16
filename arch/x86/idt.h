@@ -64,4 +64,7 @@ extern void isr_timer(void);
 extern void isr_keyboard(void);
 extern void isr_stub(void);
 
+// Syscall entry (INT 0x80)
+extern void syscall_entry(void);
+
 #endif

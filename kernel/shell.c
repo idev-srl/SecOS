@@ -11,10 +11,19 @@
 #include "mm/elf_manifest.h" // SECOS_NOTE_TYPE e flags manifest
 #include "rtc.h"
 #include "fb.h" // per framebuffer_info_t in fbinfo
+#include "fs/ramfs.h" // RAMFS API
+#include "fs/vfs.h" // VFS API
 #include <stdint.h>
 #include <stddef.h>
 
 #define MAX_COMMAND_LEN 256
+static char shell_cwd[RAMFS_NAME_MAX] = ""; // cwd vuota = root
+static void path_print_cwd(void){ terminal_writestring(shell_cwd[0]?"/":"/"); if(shell_cwd[0]) terminal_writestring(shell_cwd); terminal_writestring("\n"); }
+static void path_resolve(const char* in, char* out){ if(in && in[0]=='/') in++; if(!in||!in[0]){ size_t i=0; while(shell_cwd[i]){ out[i]=shell_cwd[i]; i++; } out[i]=0; return; } const char* src=in; char temp[RAMFS_NAME_MAX]; size_t tp=0; if(shell_cwd[0]){ size_t i=0; while(shell_cwd[i]) temp[tp++]=shell_cwd[i++]; }
+    char comp[RAMFS_NAME_MAX]; while(*src){ // salta duplicati '/'
+        while(*src=='/') src++; size_t ci=0; while(src[0]&&src[0]!='/') comp[ci++]=*src++; comp[ci]=0; if(src[0]=='/') src++; if(ci==0) continue; if(comp[0]=='.'&&comp[1]==0){} else if(comp[0]=='.'&&comp[1]=='.'&&comp[2]==0){ if(tp){ int k=(int)tp-1; while(k>=0 && temp[k]!='/') k--; tp = (k>=0)? (size_t)k : 0; if(tp && temp[tp-1]=='/') tp--; } } else { if(tp && temp[tp-1]!='/') temp[tp++]='/'; for(size_t j=0;j<ci && tp<RAMFS_NAME_MAX-1;j++) temp[tp++]=comp[j]; } }
+    // rimuovi eventuale trailing '/'
+    if(tp>1 && temp[tp-1]=='/') tp--; temp[tp]=0; size_t k=0; while(temp[k]){ out[k]=temp[k]; k++; } out[k]=0; }
 
 // Funzioni helper
 static int strcmp(const char* s1, const char* s2) {
@@ -113,6 +122,23 @@ static void sh_halt(const char* a);
 static void sh_reboot(const char* a);
 static void sh_pinfo(const char* a);
 static void sh_logo(const char* a);
+static void sh_rfls(const char* a);
+static void sh_rfcat(const char* a);
+static void sh_rfinfo(const char* a);
+static void sh_rfadd(const char* a);
+static void sh_rfwrite(const char* a);
+static void sh_rfdel(const char* a);
+static void sh_rfmkdir(const char* a);
+static void sh_rfrmdir(const char* a);
+static void sh_rfcd(const char* a);
+static void sh_rfpwd(const char* a);
+static void sh_rftree(const char* a);
+static void sh_rfusage(const char* a);
+static void sh_rfmv(const char* a);
+static void sh_rftruncate(const char* a);
+static void sh_vls(const char* a); static void sh_vcat(const char* a); static void sh_vinfo(const char* a); static void sh_vpwd(const char* a); static void sh_vmount(const char* a);
+static void sh_vcreate(const char* a); static void sh_vwrite(const char* a); static void sh_vtruncate2(const char* a);
+static void sh_ext2mount(const char* a);
 #if ENABLE_RTC
 static void sh_date(const char* a);
 #endif
@@ -141,6 +167,29 @@ static const struct shell_cmd shell_cmds[] = {
     {"cursor",    sh_cursor},
     {"dbuf",      sh_dbuf},
     {"logo",      sh_logo},
+    {"rfls",      sh_rfls},
+    {"rfcat",     sh_rfcat},
+    {"rfinfo",    sh_rfinfo},
+    {"rfadd",     sh_rfadd},
+    {"rfwrite",   sh_rfwrite},
+    {"rfdel",     sh_rfdel},
+    {"rfmkdir",   sh_rfmkdir},
+    {"rfrmdir",   sh_rfrmdir},
+    {"rfcd",      sh_rfcd},
+    {"rfpwd",     sh_rfpwd},
+    {"rftree",    sh_rftree},
+    {"rfusage",   sh_rfusage},
+    {"rfmv",      sh_rfmv},
+    {"rftruncate", sh_rftruncate},
+    {"vls",       sh_vls},
+    {"vcat",      sh_vcat},
+    {"vinfo",     sh_vinfo},
+    {"vpwd",      sh_vpwd},
+    {"vmount",    sh_vmount},
+    {"vcreate",   sh_vcreate},
+    {"vwrite",    sh_vwrite},
+    {"vtruncate", sh_vtruncate2},
+    {"ext2mount", sh_ext2mount},
     {"fontdump",  sh_fontdump},
     {"halt",      sh_halt},
     {"reboot",    sh_reboot},
@@ -159,6 +208,14 @@ static void cmd_help(void) {
         terminal_writestring("\n");
     }
     terminal_writestring("\nNuovi: fbinfo (info framebuffer), color <fg> <bg> (cambia colori).\n");
+    terminal_writestring("RAMFS: rfls rfcat rfinfo rfadd rfwrite rfdel\n");
+    terminal_writestring("Dir: rfmkdir rfrmdir (rfls [path])\n");
+    terminal_writestring("CWD: rfcd <dir>, rfpwd\n");
+    terminal_writestring("Tree: rftree [path], rfusage\n");
+    terminal_writestring("Mod: rfmv <old> <new>, rftruncate <file> <size>\n");
+    terminal_writestring("VFS: vls vcat vinfo vpwd (vmount root auto RAMFS)\n");
+    terminal_writestring("VFS Mod: vcreate vwrite vtruncate (file mutabili su FS supportato)\n");
+    terminal_writestring("EXT2: ext2mount (tenta mount dispositivo ext2ram)\n");
     terminal_writestring("Digita 'help' per aggiornare dopo ulteriori aggiunte.\n\n");
 }
 
@@ -664,6 +721,64 @@ static void sh_logo(const char* a){
 #endif
     terminal_writestring("Uso: logo on|off|redraw\n");
 }
+// RAMFS: lista file
+static void sh_rfls(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else path_resolve("",abs); const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n; if(abs[0]==0){ n=ramfs_list_path("",arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS root ("); } else { n=ramfs_list_path(abs,arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS list '"); terminal_writestring(abs); terminal_writestring("' ("); } print_dec(n); terminal_writestring("):\n"); for(size_t i=0;i<n;i++){ const ramfs_entry_t* e=arr[i]; terminal_writestring("  "); terminal_writestring(e->name); if(e->flags & 2) terminal_writestring("/ "); else terminal_writestring("  "); print_dec(e->size); terminal_writestring(" bytes\n"); } }
+// RAMFS: crea directory
+static void sh_rfmkdir(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfmkdir <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); if(ramfs_mkdir(abs)==0) terminal_writestring("[rfmkdir] OK\n"); else terminal_writestring("[rfmkdir] FAIL\n"); }
+// RAMFS: rimuovi directory (vuota)
+static void sh_rfrmdir(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfrmdir <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); if(ramfs_rmdir(abs)==0) terminal_writestring("[rfrmdir] OK\n"); else terminal_writestring("[rfrmdir] FAIL (non vuota / inesistente)\n"); }
+// RAMFS: cat file
+static void sh_rfcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfcat <nome>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); const ramfs_entry_t* e = ramfs_find(abs); if(!e){ terminal_writestring("[rfcat] file non trovato\n"); return; }
+    for(size_t i=0;i<e->size;i++) terminal_putchar((char)e->data[i]);
+    if(e->size==0) terminal_writestring("[rfcat] (vuoto)\n");
+}
+// RAMFS: info file
+static void sh_rfinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfinfo <nome>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); const ramfs_entry_t* e = ramfs_find(abs); if(!e){ terminal_writestring("[rfinfo] file non trovato\n"); return; }
+    terminal_writestring("Nome: "); terminal_writestring(e->name); terminal_writestring("\nSize: "); print_dec(e->size); terminal_writestring(" bytes\n");
+    // Mostra prime 32 bytes hex
+    terminal_writestring("Primi bytes: "); size_t show = e->size < 32 ? e->size : 32; for(size_t i=0;i<show;i++){ uint8_t b=e->data[i]; char hx[]="0123456789ABCDEF"; terminal_putchar(hx[b>>4]); terminal_putchar(hx[b&0xF]); terminal_putchar(' '); } terminal_writestring("\n");
+}
+// RAMFS: aggiungi file (rfadd nome contenuto)
+static void sh_rfadd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfadd <nome> <contenuto>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(name[0]==0){ terminal_writestring("[rfadd] nome vuoto\n"); return; } if(!*a){ terminal_writestring("[rfadd] contenuto mancante\n"); return; } size_t len=0; while(a[len]) len++; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_find(abs)){ terminal_writestring("[rfadd] esiste gia'\n"); return; } if(ramfs_add(abs,a,len)==0){ terminal_writestring("[rfadd] OK\n"); } else terminal_writestring("[rfadd] FAIL\n"); }
+// RAMFS: scrivi (rfwrite nome offset dati)
+static void sh_rfwrite(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfwrite <nome> <offset> <dati>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(name[0]==0){ terminal_writestring("[rfwrite] nome vuoto\n"); return; } uint64_t off=0; if(*a<'0'||*a>'9'){ terminal_writestring("[rfwrite] offset mancante\n"); return; } while(*a>='0'&&*a<='9'){ off = off*10 + (*a-'0'); a++; } while(*a==' ') a++; if(!*a){ terminal_writestring("[rfwrite] dati mancanti\n"); return; } const char* data_str=a; size_t len=0; while(data_str[len]) len++; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); int written = ramfs_write(abs,(size_t)off,data_str,len); if(written>=0){ terminal_writestring("[rfwrite] scritto "); print_dec(written); terminal_writestring(" bytes\n"); } else terminal_writestring("[rfwrite] FAIL\n"); }
+// RAMFS: elimina file (rfdel nome)
+static void sh_rfdel(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfdel <nome>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_remove(abs)==0){ terminal_writestring("[rfdel] OK\n"); } else terminal_writestring("[rfdel] FAIL (immutabile o inesistente)\n"); }
+// RAMFS: rename
+static void sh_rfmv(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfmv <old> <new>\n"); return; } char oldn[RAMFS_NAME_MAX]; size_t oi=0; while(a[0] && a[0]!=' ' && oi<RAMFS_NAME_MAX-1){ oldn[oi++]=*a++; } oldn[oi]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[rfmv] nuovo nome mancante\n"); return; } char newn[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ newn[ni++]=*a++; } newn[ni]=0; char old_abs[RAMFS_NAME_MAX]; char new_abs[RAMFS_NAME_MAX]; path_resolve(oldn,old_abs); path_resolve(newn,new_abs); if(ramfs_rename(old_abs,new_abs)==0) terminal_writestring("[rfmv] OK\n"); else terminal_writestring("[rfmv] FAIL\n"); }
+// RAMFS: truncate
+static void sh_rftruncate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rftruncate <file> <size>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[rftruncate] size mancante\n"); return; } uint64_t sz=0; while(*a>='0'&&*a<='9'){ sz=sz*10+(*a-'0'); a++; } char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_truncate(abs,(size_t)sz)==0) terminal_writestring("[rftruncate] OK\n"); else terminal_writestring("[rftruncate] FAIL\n"); }
+// RAMFS: cambia directory corrente
+static void sh_rfcd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfcd <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); int d=ramfs_is_dir(abs); if(d==1){ size_t i=0; while(abs[i] && i<RAMFS_NAME_MAX-1){ shell_cwd[i]=abs[i]; i++; } shell_cwd[i]=0; terminal_writestring("[rfcd] OK\n"); } else if(d==0){ terminal_writestring("[rfcd] non directory\n"); } else terminal_writestring("[rfcd] inesistente\n"); }
+// RAMFS: mostra working directory
+static void sh_rfpwd(const char* a){ (void)a; terminal_writestring("CWD: "); path_print_cwd(); }
+// RAMFS: stampa albero ricorsivo
+static void rftree_print(const char* path,int depth){ const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n; n = (path && path[0])? ramfs_list_path(path,arr,RAMFS_MAX_FILES) : ramfs_list_path("",arr,RAMFS_MAX_FILES); for(size_t i=0;i<n;i++){ const ramfs_entry_t* e=arr[i]; // estrai ultimo componente
+        const char* name=e->name; const char* last=name; for(const char* p=name; *p; p++){ if(*p=='/') last=p+1; }
+        // prefisso grafico
+        for(int d=0; d<depth; d++) terminal_writestring("│  ");
+        // determinare ramo
+        if(i+1<n) terminal_writestring("├─ "); else terminal_writestring("└─ ");
+        terminal_writestring(last);
+        if(e->flags & 2){ terminal_writestring("/\n"); rftree_print(e->name, depth+1); }
+        else { terminal_writestring("  "); print_dec(e->size); terminal_writestring(" bytes\n"); }
+    } }
+static void sh_rftree(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else abs[0]=0; if(abs[0] && ramfs_is_dir(abs)!=1){ terminal_writestring("[rftree] non directory\n"); return; } terminal_writestring("[rftree] struttura:\n"); rftree_print(abs,0); }
+// RAMFS: uso totale
+static void sh_rfusage(const char* a){ (void)a; const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n = ramfs_list(arr,RAMFS_MAX_FILES); size_t bytes=0; size_t files=0; size_t dirs=0; for(size_t i=0;i<n;i++){ if(arr[i]->flags & 2) dirs++; else { files++; bytes += arr[i]->size; } } terminal_writestring("[rfusage] files="); print_dec(files); terminal_writestring(" dirs="); print_dec(dirs); terminal_writestring(" total_bytes="); print_dec(bytes); terminal_writestring(" slots_used="); print_dec(n); terminal_writestring(" slots_free="); print_dec(RAMFS_MAX_FILES - n); terminal_writestring("\n"); }
+// ---- VFS commands ----
+static void sh_vls(const char* a){ while(*a==' ') a++; char path[256]; size_t pi=0; while(*a && pi<sizeof(path)-1) path[pi++]=*a++; path[pi]=0; if(pi==0){ path[0]='/'; path[1]=0; } extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*); extern vfs_inode_t* vfs_lookup(const char*); struct ctx { int count; }; struct ctx c; c.count=0; vfs_inode_t* dir = vfs_lookup(path); if(dir && dir->type!=VFS_NODE_DIR){ terminal_writestring("[vls] non directory\n"); return; } terminal_writestring("[vls] "); terminal_writestring(path); terminal_writestring("\n");
+    void cb(const vfs_inode_t* child, void* user){ (void)user; terminal_writestring("  "); terminal_writestring(child->path); if(child->type==VFS_NODE_DIR) terminal_writestring("/\n"); else { terminal_writestring("  "); print_dec(child->size); terminal_writestring(" bytes\n"); } }
+    vfs_readdir(path, cb, &c);
+}
+static void sh_vcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vcat <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_read_all(const char*, void*, size_t); vfs_inode_t* ino=vfs_lookup(a); if(!ino || ino->type!=VFS_NODE_FILE){ terminal_writestring("[vcat] file non trovato\n"); return; } char buf[1024]; if(ino->size >= sizeof(buf)){ terminal_writestring("[vcat] file troppo grande per buffer\n"); return; } int r=vfs_read_all(a,buf,sizeof(buf)); if(r<0){ terminal_writestring("[vcat] read fail\n"); return; } for(int i=0;i<r;i++) terminal_putchar(buf[i]); if(r==0) terminal_writestring("(vuoto)\n"); }
+static void sh_vinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vinfo <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* ino=vfs_lookup(a); if(!ino){ terminal_writestring("[vinfo] non trovato\n"); return; } terminal_writestring("Path: "); terminal_writestring(ino->path); terminal_writestring("\nTipo: "); terminal_writestring(ino->type==VFS_NODE_DIR?"DIR":"FILE"); terminal_writestring("\nSize: "); print_dec(ino->size); terminal_writestring(" bytes\n"); }
+static void sh_vpwd(const char* a){ (void)a; terminal_writestring("(vpwd usa RAMFS CWD) "); path_print_cwd(); }
+static void sh_vmount(const char* a){ (void)a; terminal_writestring("[vmount] root gia' montato (RAMFS)\n"); }
+static void sh_vcreate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vcreate <path> <contenuto>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[vcreate] contenuto mancante\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_create(const char*, const void*, size_t); if(vfs_create(name,data,len)==0) terminal_writestring("[vcreate] OK\n"); else terminal_writestring("[vcreate] FAIL\n"); }
+static void sh_vwrite(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vwrite <path> <offset> <dati>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vwrite] offset mancante\n"); return; } size_t off=0; while(*a>='0'&&*a<='9'){ off=off*10+(*a-'0'); a++; } while(*a==' ') a++; if(!*a){ terminal_writestring("[vwrite] dati mancanti\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_write(const char*, size_t, const void*, size_t); int r=vfs_write(name,off,data,len); if(r>=0){ terminal_writestring("[vwrite] scritto "); print_dec(r); terminal_writestring(" bytes\n"); } else terminal_writestring("[vwrite] FAIL\n"); }
+static void sh_vtruncate2(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vtruncate <path> <size>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vtruncate] size mancante\n"); return; } size_t sz=0; while(*a>='0'&&*a<='9'){ sz=sz*10+(*a-'0'); a++; } extern int vfs_truncate(const char*, size_t); if(vfs_truncate(name,sz)==0) terminal_writestring("[vtruncate] OK\n"); else terminal_writestring("[vtruncate] FAIL\n"); }
+static void sh_ext2mount(const char* a){ (void)a; extern int ext2_mount(const char* dev_name); if(ext2_mount("ext2ram")==0) terminal_writestring("[ext2mount] EXT2 montato come root (stub)\n"); else terminal_writestring("[ext2mount] mount fallito\n"); }
 // Mappa nomi colori (lowercase) -> codice VGA
 static void sh_halt(const char* a){ (void)a; cmd_halt(); }
 static void sh_reboot(const char* a){ (void)a; cmd_reboot(); }
@@ -805,6 +920,10 @@ static void execute_command(char* line) {
     terminal_writestring("Comando non trovato: "); terminal_writestring(cmd); terminal_writestring("\nDigita 'help' per la lista dei comandi.\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
+
+// API pubblica per esecuzione singola linea (init script)
+void shell_run_line(const char* line){ if(!line) return; // copia mutabile
+    char buf[MAX_COMMAND_LEN]; size_t i=0; while(line[i] && i<MAX_COMMAND_LEN-1){ buf[i]=line[i]; i++; } buf[i]=0; execute_command(buf); }
 
 // ---- Sezione PS refactor ----
 struct ps_ctx_global { int count; uint64_t total_pages; uint64_t total_cpu; int st_new, st_ready, st_run, st_blk, st_zomb; };

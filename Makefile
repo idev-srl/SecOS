@@ -10,13 +10,17 @@ DRIVERS_DIR = drivers
 MM_DIR      = mm
 LIB_DIR     = lib
 
-INCLUDES = -I. -I$(BOOT_DIR) -I$(ARCH_DIR) -I$(KERNEL_DIR) -I$(DRIVERS_DIR) -I$(MM_DIR) -I$(LIB_DIR)
+FS_DIR     = fs
+INCLUDES = -I. -I$(BOOT_DIR) -I$(ARCH_DIR) -I$(KERNEL_DIR) -I$(DRIVERS_DIR) -I$(MM_DIR) -I$(LIB_DIR) -I$(FS_DIR)
 
 ASFLAGS = -f elf64
-CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mno-red-zone -mno-sse -mno-sse2 $(INCLUDES)
+BUILD_TS := $(shell date -u +%Y%m%d%H%M%S)
+GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo NOHASH)
+CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mno-red-zone -mno-sse -mno-sse2 $(INCLUDES) \
+		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\""
 LDFLAGS = -n -T linker.ld
 
-SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm
+SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.asm
 SRC_C   = \
 	$(KERNEL_DIR)/kernel.c \
 	$(ARCH_DIR)/idt.c $(ARCH_DIR)/tss.c \
@@ -28,12 +32,19 @@ SRC_C   = \
 	$(MM_DIR)/elf_manifest.c \
 	$(KERNEL_DIR)/process.c \
 	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c $(KERNEL_DIR)/sched.c \
-	$(LIB_DIR)/terminal.c
+	$(KERNEL_DIR)/syscall.c \
+	$(LIB_DIR)/terminal.c \
+	$(FS_DIR)/ramfs.c \
+	$(FS_DIR)/vfs.c \
+	$(FS_DIR)/ramfs_vfs.c \
+	$(FS_DIR)/block.c \
+	$(FS_DIR)/fat32.c \
+	$(FS_DIR)/ext2.c \
+	$(FS_DIR)/ext2ramdev.c
 
 OBJS_ASM = $(SRC_ASM:%.asm=%.o)
 OBJS_C   = $(SRC_C:%.c=%.o)
 OBJS     = $(OBJS_ASM) $(OBJS_C)
-
 KERNEL  = kernel.bin
 ISO     = myos.iso
 ISODIR  = isodir
@@ -61,6 +72,8 @@ $(DRIVERS_DIR)/%.o: $(DRIVERS_DIR)/%.c
 $(MM_DIR)/%.o: $(MM_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(LIB_DIR)/%.o: $(LIB_DIR)/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+$(FS_DIR)/%.o: $(FS_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJS)

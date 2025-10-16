@@ -115,6 +115,9 @@ void idt_init(void) {
     
     // Imposta handler tastiera (IRQ1 = interrupt 0x21)
     idt_set_gate(0x21, (uint64_t)isr_keyboard, 0x08, 0x8E);
+
+    // Syscall gate INT 0x80 (trap gate, present, DPL=3 -> 0xEE: 1110 1110)
+    idt_set_gate(0x80, (uint64_t)syscall_entry, 0x08, 0xEE);
     
     // Carica l'IDT
     idt_load((uint64_t)&idtp);

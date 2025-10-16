@@ -126,6 +126,8 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     p->regs.rflags = 0x202; // IF abilitato default
     p->regs.rax = p->regs.rbx = p->regs.rcx = p->regs.rdx = 0;
     p->regs.rsi = p->regs.rdi = p->regs.rbp = 0;
+    // Init fd table
+    for(int i=0;i<32;i++){ p->fds[i].inode=NULL; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].used=0; }
     if (proc_add(p)!=0) { terminal_writestring("[PROC] table full\n"); }
     // Hardening mapping condiviso
     vmm_harden_user_space(space);

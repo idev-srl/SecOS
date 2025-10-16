@@ -82,6 +82,40 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // terminal_writestring("[OK] Inizializzazione tastiera PS/2...\n");
     keyboard_init();
 
+    // Inizializza RAMFS nativo (fallback)
+    extern int ramfs_init(void); ramfs_init();
+    // Inizializza VFS
+    extern void vfs_init(void); vfs_init();
+    // Registra block device ext2ram e tenta mount ext2
+    extern int ext2ramdev_register(void); ext2ramdev_register();
+    extern int ext2_mount(const char* dev_name);
+    if(ext2_mount("ext2ram")==0){ terminal_writestring("[EXT2] mount riuscito (stub, root sostituita)\n"); }
+    else {
+        extern int vfs_mount_ramfs(void); if(vfs_mount_ramfs()==0) terminal_writestring("[VFS] root RAMFS fallback montato\n"); else terminal_writestring("[VFS] fallback RAMFS FAIL\n");
+    }
+    // Self-test VFS (basic): list root and read VERSION
+    extern void shell_run_line(const char* line);
+    shell_run_line("vls /");
+    shell_run_line("vinfo /VERSION");
+    shell_run_line("vcat /VERSION");
+    // Esecuzione script init.rc se presente
+    #include "fs/ramfs.h"
+    const ramfs_entry_t* initrc = ramfs_find("init.rc");
+    if(initrc){
+        terminal_writestring("[INIT] Eseguo init.rc\n");
+        size_t pos=0; while(pos < initrc->size){
+            // Estrai linea
+            char line[128]; size_t li=0; while(pos < initrc->size && initrc->data[pos] != '\n' && li < sizeof(line)-1){ line[li++] = (char)initrc->data[pos++]; }
+            line[li]=0; if(pos < initrc->size && initrc->data[pos]=='\n') pos++;
+            // Salta commenti/blank
+            char* p=line; while(*p==' '||*p=='\t') p++; if(*p=='#' || *p==0) continue;
+            extern void shell_run_line(const char* line); shell_run_line(p);
+        }
+        terminal_writestring("[INIT] Script completato\n");
+    } else {
+        terminal_writestring("[INIT] init.rc non trovato\n");
+    }
+
 #if ENABLE_FB
     if (multiboot_magic == MULTIBOOT2_BOOTLOADER_MAGIC) {
         if (fb_init((uint32_t)multiboot_info) == 0) {

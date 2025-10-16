@@ -24,6 +24,8 @@ typedef struct process {
     // Metriche runtime
     uint64_t cpu_ticks;      // tick CPU accumulati (scheduler)
     uint64_t user_mem_bytes; // memoria virtuale mappata (aggiornata a creazione / estensioni future)
+    // File descriptor table (semplice)
+    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; } fds[32];
 } process_t;
 
 int process_init_system(void); // init table

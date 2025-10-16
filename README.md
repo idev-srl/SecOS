@@ -91,6 +91,67 @@ Una volta avviato il kernel, potrai usare questi comandi:
 - **colors** - Test dei colori VGA disponibili
 - **reboot** - Riavvia il sistema
 
+### RAMFS (Filesystem in memoria)
+
+Il kernel include un semplice filesystem in memoria con supporto per file mutabili/immutabili e directory gerarchiche. Comandi principali:
+
+- **rfls [path]** - Lista i figli diretti di una directory (root se omesso)
+- **rfcat <file>** - Mostra il contenuto di un file
+- **rfinfo <file>** - Mostra metadata + primi bytes
+- **rfadd <file> <contenuto>** - Crea file mutabile con contenuto iniziale
+- **rfwrite <file> <offset> <dati>** - Scrive (cresce se necessario) in file mutabile
+- **rfdel <file>** - Elimina file mutabile
+- **rfmkdir <dir>** / **rfrmdir <dir>** - Crea / rimuove directory (vuota)
+- **rfcd <path>** / **rfpwd** - Cambia / mostra la working directory della shell RAMFS
+- **rftree [path]** - Stampa l'albero ricorsivo con formato a rami (├─, └─)
+- **rfusage** - Statistiche: numero file, dir, bytes totali, slots liberi
+- **rfmv <old> <new>** - Rinominare file o directory (aggiorna percorsi discendenti). Previene cicli (non puoi rinominare una dir dentro se stessa: /a -> /a/b).
+- **rftruncate <file> <size>** - Riduce/espande un file mutabile a size bytes
+
+File speciali generati all'avvio:
+
+- `VERSION` - Informazioni build dinamiche (BUILD_TS e GIT_HASH dal Makefile)
+- `init.rc` - Script di comandi eseguito automaticamente al boot (usa shell_run_line)
+- `sys/syscalls.txt` - Placeholder elenco syscall
+- `sys/manifest.txt` - Manifest RAMFS iniziale (lista TYPE SIZE NAME di ogni entry)
+
+Note path: il resolver normalizza percorsi rimuovendo slash duplicati e gestendo `.` e `..`.
+
+Esempio rapido:
+```
+rfmkdir docs
+rfadd docs/readme.txt HelloRAMFS
+rfwrite docs/readme.txt 5 _World
+rfcat docs/readme.txt     # Output: Hello_World
+rfmv docs/readme.txt docs/info.txt
+rftree docs
+rftruncate docs/info.txt 5
+rfcat docs/info.txt       # Output: Hello
+```
+
+### VFS (Virtual File System)
+
+E' stato introdotto un layer VFS minimale per astrarre filesystem diversi sotto un'unica API.
+Componenti principali:
+- `vfs_mount_root()` – monta un filesystem come root `/` (attualmente RAMFS).
+- `vfs_lookup(path)` – risolve un inode generico (file o directory).
+- `vfs_readdir(path, cb)` – itera i figli diretti di una directory.
+- Operazioni file: `vfs_read_all`, `vfs_write`, `vfs_create`, `vfs_truncate`, `vfs_remove`, `vfs_rename`, `vfs_mkdir`.
+
+Comandi shell VFS:
+- `vls [path]` – lista via VFS (mostra path assoluti con prefisso `/`).
+- `vcat <path>` – legge file passando per il layer VFS.
+- `vinfo <path>` – mostra tipo e size.
+- `vpwd` – mostra CWD (per ora riutilizza quella RAMFS).
+- `vmount` – mostra stato mount root (RAMFS già montato).
+
+Prossimi passi pianificati:
+- Driver FAT32: parsing BPB, tabella FAT e root directory in modalità read-only iniziale.
+- Driver exFAT: struttura differente (allocation bitmap + up-case table); iniziale supporto read-only.
+- Interfaccia block device astratta (es. `block_read(sector, buf)`). In ambiente QEMU si può simulare con un buffer o ATA/virtio futuro.
+
+File di design in preparazione: `FAT32.md` per delineare parsing iniziale e mapping in inode VFS.
+
 ## Requisiti
 
 ### Compilare il kernel:
