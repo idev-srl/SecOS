@@ -1,4 +1,10 @@
 #include "block.h"
+/*
+* SecOS Kernel - EXT2 RAM Block Device
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdint.h>
 
 // Simple zero-filled block device to allow ext2 mount attempt (will fail magic unless we inject fake superblock later)

@@ -1,13 +1,20 @@
+/*
+ * SecOS Kernel - EXT2 Stub
+ * Reads superblock, publishes diagnostic file in RAMFS, and replaces VFS root with stub ops.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "ext2.h"
-#include "ramfs.h" // per creare file diagnostico finché non abbiamo multi-mount
+#include "ramfs.h" // diagnostic file until multi-mount implemented
 #include <stdint.h>
 
 static int read_super(block_dev_t* dev, ext2_superblock_t* sb){
-    // Superblock at offset 1024 bytes (sector-aligned typical). Assume 512 bytes per sector for demo.
+    // Superblock at offset 1024 bytes (typically sector-aligned). Assume 512-byte sectors for demo.
     uint8_t buf[2048];
-    // Read first 4 sectors (0..3) to cover superblock area at 1024 and following
+    // Read first 4 sectors (0..3) to cover superblock region at 1024 and following
     if(dev->read(dev,0,buf,4)!=4) return -1;
-    // superblock start 1024 offset
+    // Superblock start at 1024 offset within loaded buffer
     uint8_t* s = buf + 1024;
     sb->inodes_count = *(uint32_t*)(s+0);
     sb->blocks_count = *(uint32_t*)(s+4);

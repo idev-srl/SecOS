@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - User Syscall Test Program
+ * Minimal user-mode entry invoking core syscalls through INT 0x80.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdint.h>
 
 static inline uint64_t do_syscall(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2){
@@ -6,7 +13,7 @@ static inline uint64_t do_syscall(uint64_t num, uint64_t a0, uint64_t a1, uint64
     return r;
 }
 
-// Simple entry (will be placed at USER_CODE_BASE by loader)
+// Simple entry point (placed at USER_CODE_BASE by loader)
 void _start(void){
     uint64_t pid = do_syscall(6,0,0,0); // SYS_GETPID
     const char* msg = "Hello from user proc PID=";

@@ -1,3 +1,9 @@
+/*
+
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "vmm.h"
 #include "pmm.h"
 #include "terminal.h"

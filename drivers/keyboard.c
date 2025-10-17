@@ -1,25 +1,31 @@
+/*
+ * SecOS Kernel - PS/2 Keyboard Driver
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "keyboard.h"
 
 #define KEYBOARD_DATA_PORT 0x60
 #define BUFFER_SIZE 256
 
-// Buffer circolare per l'input
+// Circular input buffer
 static char input_buffer[BUFFER_SIZE];
 static int buffer_start = 0;
 static int buffer_end = 0;
 
-// Stati dei tasti modificatori
+// Modifier key states
 static bool shift_pressed = false;
 static bool caps_lock = false;
 
-// Funzioni I/O inline
+// Inline port I/O
 static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
     __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 
-// Mappa scancode US QWERTY -> ASCII (senza shift)
+// Scancode map US QWERTY -> ASCII (no shift)
 static const char scancode_to_ascii[] = {
     0,  0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
     '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
@@ -28,7 +34,7 @@ static const char scancode_to_ascii[] = {
     '*', 0, ' '
 };
 
-// Mappa scancode US QWERTY -> ASCII (con shift)
+// Scancode map US QWERTY -> ASCII (with shift)
 static const char scancode_to_ascii_shift[] = {
     0,  0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
     '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
@@ -37,7 +43,7 @@ static const char scancode_to_ascii_shift[] = {
     '*', 0, ' '
 };
 
-// Aggiungi carattere al buffer
+// Push char into buffer
 static void buffer_put(char c) {
     int next = (buffer_end + 1) % BUFFER_SIZE;
     if (next != buffer_start) {
@@ -46,7 +52,7 @@ static void buffer_put(char c) {
     }
 }
 
-// Leggi carattere dal buffer
+// Pop char from buffer
 static char buffer_get(void) {
     if (buffer_start == buffer_end) {
         return 0;
@@ -56,26 +62,26 @@ static char buffer_get(void) {
     return c;
 }
 
-// Controlla se il buffer ha caratteri
+// Check if buffer has characters
 bool keyboard_has_char(void) {
     return buffer_start != buffer_end;
 }
 
-// Handler interrupt tastiera
+// Keyboard interrupt handler
 void keyboard_handler(void) {
     uint8_t scancode = inb(KEYBOARD_DATA_PORT);
     
-    // Gestisci key release (bit 7 = 1)
+    // Handle key release (bit7 = 1)
     if (scancode & 0x80) {
         scancode &= 0x7F;
-        // Shift release
+    // Shift release
         if (scancode == 0x2A || scancode == 0x36) {
             shift_pressed = false;
         }
         return;
     }
     
-    // Gestisci tasti speciali
+    // Handle special keys
     if (scancode == 0x2A || scancode == 0x36) {  // Left/Right Shift
         shift_pressed = true;
         return;
@@ -86,16 +92,16 @@ void keyboard_handler(void) {
         return;
     }
     
-    // Converti scancode in ASCII
+    // Convert scancode to ASCII
     char ascii = 0;
     if (scancode < sizeof(scancode_to_ascii)) {
         if (shift_pressed) {
             ascii = scancode_to_ascii_shift[scancode];
         } else {
             ascii = scancode_to_ascii[scancode];
-            // Gestisci Caps Lock per le lettere
+            // Apply Caps Lock for letters
             if (caps_lock && ascii >= 'a' && ascii <= 'z') {
-                ascii -= 32;  // Converti in maiuscolo
+                ascii -= 32;  // Convert to uppercase
             }
         }
     }
@@ -105,7 +111,7 @@ void keyboard_handler(void) {
     }
 }
 
-// Inizializza la tastiera
+// Initialize keyboard state
 void keyboard_init(void) {
     buffer_start = 0;
     buffer_end = 0;
@@ -113,15 +119,15 @@ void keyboard_init(void) {
     caps_lock = false;
 }
 
-// Leggi un carattere (bloccante)
+// Read a character (blocking)
 char keyboard_getchar(void) {
     while (!keyboard_has_char()) {
-        __asm__ volatile ("hlt");  // Attendi interrupt
+    __asm__ volatile ("hlt");  // Wait for interrupt
     }
     return buffer_get();
 }
 
-// Leggi una riga completa
+// Read a full line (until Enter)
 void keyboard_readline(char* buffer, int max_len) {
     int pos = 0;
     

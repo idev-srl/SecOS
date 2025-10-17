@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - VFS Core
+ * Minimal virtual filesystem layer to mount a single root filesystem.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "vfs.h"
 #include <stddef.h>
 
@@ -8,7 +15,7 @@ void vfs_init(void){ g_root_mount.mount_point = NULL; g_root_mount.ops = NULL; g
 int vfs_mount_root(const vfs_fs_ops_t* ops, const char* fs_name){ if(!ops || !fs_name) return -1; if(g_root_mount.ops) return -1; g_root_mount.mount_point = "/"; g_root_mount.ops = ops; g_root_mount.fs_name = fs_name; return 0; }
 int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name){ if(!ops || !fs_name) return -1; g_root_mount.mount_point = "/"; g_root_mount.ops = ops; g_root_mount.fs_name = fs_name; return 0; }
 
-// Simplified: underlying FS provides lookup returning allocated inode or cached object. For RAMFS adapter we build lightweight inode objects.
+// Simplified: underlying FS provides lookup returning allocated/cached inode object. RAMFS adapter builds lightweight objects.
 vfs_inode_t* vfs_lookup(const char* path){ if(!path || !*path) path="/"; if(g_root_mount.ops){ return g_root_mount.ops->lookup(path); } return NULL; }
 
 int vfs_readdir(const char* path, vfs_iter_cb cb, void* user){ if(!path || !*path) path="/"; if(!cb) return -1; if(!g_root_mount.ops) return -1; return g_root_mount.ops->readdir(path, cb, user); }

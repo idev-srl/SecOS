@@ -1,4 +1,8 @@
-## Makefile riorganizzato con sottodirectory
+## SecOS Kernel - Build Makefile
+## Copyright (c) 2025 iDev srl
+## Author: Luigi De Astis <l.deastis@idev-srl.com>
+## SPDX-License-Identifier: MIT
+## Build system with subdirectories
 AS      = nasm
 CC      = gcc
 LD      = ld
@@ -33,6 +37,8 @@ SRC_C   = \
 	$(KERNEL_DIR)/process.c \
 	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c $(KERNEL_DIR)/sched.c \
 	$(KERNEL_DIR)/syscall.c \
+	$(KERNEL_DIR)/driver_if.c \
+	user/testdriver.c \
 	$(LIB_DIR)/terminal.c \
 	$(FS_DIR)/ramfs.c \
 	$(FS_DIR)/vfs.c \
@@ -53,9 +59,9 @@ ISODIR  = isodir
 
 all: $(KERNEL)
 
-# Guard: avvisa se compare un kernel.c nella root (non usato)
+# Guard: warn if a stray kernel.c exists in root (unused by build)
 ifneq (,$(wildcard kernel.c))
-$(warning ATTENZIONE: Esiste un kernel.c nella root non usato dal build. Rimuoverlo per evitare confusione.)
+$(warning WARNING: Found unused kernel.c in root; remove to avoid confusion.)
 endif
 
 $(BOOT_DIR)/%.o: $(BOOT_DIR)/%.asm
@@ -79,7 +85,7 @@ $(FS_DIR)/%.o: $(FS_DIR)/%.c
 $(KERNEL): $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 
-# Crea l'immagine ISO bootable
+# Create bootable ISO image
 iso: $(KERNEL)
 	mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/kernel.bin
@@ -99,11 +105,11 @@ iso: $(KERNEL)
 	@echo "Verifica contenuto ISO..."
 	@ls -lh $(ISO)
 
-# Esegui con QEMU
+# Run with QEMU
 run: iso
 	qemu-system-x86_64 -cdrom $(ISO) -debugcon stdio -global isa-debugcon.iobase=0xe9
 
-# Pulisci i file generati
+# Clean generated files
 clean:
 	rm -f $(OBJS) $(KERNEL)
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log

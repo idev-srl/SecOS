@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - Block Device Registry
+ * Lightweight registry for fixed small set of block devices.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "block.h"
 
 #define BLOCK_MAX_DEVS 4

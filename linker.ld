@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - Linker Script
+ * Defines section layout and kernel load address.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 ENTRY(_start)
 
 SECTIONS
@@ -30,6 +37,6 @@ SECTIONS
         _bss_end = .;
     }
     
-    /* Simbolo che indica la fine del kernel */
+    /* Symbol marking end of kernel */
     _kernel_end = .;
 }

@@ -4,13 +4,18 @@
 #include "panic.h"
 #include "pmm.h"
 #include "heap.h"
+/*
 
-// Simple ELF64 loader (solo segmenti PT_LOAD). Assunzioni:
-// - File interamente in memoria (buffer)
-// - space->pml4_phys già creato e CR3 NON switchato (mappiamo tramite funzioni che usano kernel_space per ora)
-// - p_vaddr segmenti user cadono in range USER_CODE_BASE / USER_DATA_BASE / USER_STACK_TOP pianificato
-// - Non gestiamo relocation, richiesto static PIE oppure indirizzi predefiniti
-// Limitazioni: Non verifica sovrapposizioni complicate, niente dynamic (PT_INTERP), niente TLS.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
+// Simple ELF64 loader (PT_LOAD segments only). Assumptions:
+// - File entirely in memory (buffer)
+// - space->pml4_phys already created and CR3 NOT switched (we map through functions that use kernel_space for now)
+// - p_vaddr user segments fall within planned USER_CODE_BASE / USER_DATA_BASE / USER_STACK_TOP range
+// - We don't handle relocation, requires static PIE or predefined addresses
+// Limitations: Doesn't verify complex overlaps, no dynamic (PT_INTERP), no TLS.
 
 static int check_magic(const Elf64_Ehdr* eh) {
     uint32_t m = ((uint32_t)eh->e_ident[0] << 24) | ((uint32_t)eh->e_ident[1] << 16) | ((uint32_t)eh->e_ident[2] << 8) | ((uint32_t)eh->e_ident[3]);

@@ -20,5 +20,6 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_CLOSE:  return (uint64_t)ksys_close((int)a0);
     case SYS_READ:   return (uint64_t)ksys_read((int)a0,(void*)a1,(int)a2);
     case SYS_WRITE:  return (uint64_t)ksys_write((int)a0,(const void*)a1,(int)a2);
+    case SYS_DRIVER: return (uint64_t)driver_syscall((struct driver_call*)a0);
     default: terminal_writestring("[SYSCALL] sconosciuta\n"); return (uint64_t)-1; }
 }

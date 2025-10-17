@@ -1,3 +1,9 @@
+/*
+
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "heap.h"
 #include "pmm.h"
 #include "terminal.h"
@@ -227,20 +233,20 @@ void heap_print_stats(void) {
     char buffer[32];
     
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("\n=== Statistiche Heap ===\n");
+    terminal_writestring("\n=== Heap Statistics ===\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
     
-    terminal_writestring("Allocata:   ");
+    terminal_writestring("Allocated:  ");
     itoa_dec(total_allocated, buffer);
     terminal_writestring(buffer);
     terminal_writestring(" bytes\n");
     
-    terminal_writestring("Liberata:   ");
+    terminal_writestring("Freed:      ");
     itoa_dec(total_freed, buffer);
     terminal_writestring(buffer);
     terminal_writestring(" bytes\n");
     
-    terminal_writestring("In uso:     ");
+    terminal_writestring("In use:     ");
     itoa_dec(total_allocated - total_freed, buffer);
     terminal_writestring(buffer);
     terminal_writestring(" bytes\n\n");

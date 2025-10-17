@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - Block Device Interface
+ * Defines a minimal block device abstraction (read-only operations for now).
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>

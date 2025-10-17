@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - VFS Interface (Minimal)
+ * Abstracts mounting of different filesystems (currently single root).
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 // SecOS VFS layer (minimal) - abstraction to mount different filesystems
 #pragma once
 #include <stddef.h>

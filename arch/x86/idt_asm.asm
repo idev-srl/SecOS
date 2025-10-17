@@ -1,44 +1,48 @@
+; SecOS Kernel - IDT & GDT Assembly Helpers
+; Copyright (c) 2025 iDev srl
+; Author: Luigi De Astis <l.deastis@idev-srl.com>
+; SPDX-License-Identifier: MIT
 BITS 64
 
 section .text
 
-; Funzione per caricare l'IDT
+; Load IDT descriptor pointed by rdi
 global idt_load
 idt_load:
     lidt [rdi]
     ret
 
-; Funzione per caricare il GDT
+; Load GDT & update segment registers
 global gdt_flush
 global tss_flush
 
 ; void gdt_flush(uint64_t gdt_ptr_addr)
-; rdi = indirizzo struttura {limit(16) base(64)}
+; rdi = pointer to packed {limit(16) base(64)} structure
 gdt_flush:
-    lgdt [rdi]               ; Carica il nuovo GDT
+    lgdt [rdi]               ; Load new GDT
     mov ax, 0x10             ; Data segment selector (2nd entry)
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    ; Far jump per aggiornare CS
+    ; Far jump to update CS
     push 0x08                ; Code segment selector
     lea rax, [rel .flush_done]
     push rax
-    ; Usa retfq per completare il far control transfer con nuovo CS
+    ; Use retfq to complete far control transfer with new CS
     retfq
 .flush_done:
     ret
 
 ; void tss_flush(uint16_t tss_selector)
-; rdi = selector (es. 0x28)
+; rdi = selector (e.g. 0x28)
 tss_flush:
     mov ax, di
-    ltr ax                  ; Carica Task Register con selector TSS
+    ltr ax                  ; Load Task Register with TSS selector
     ret
 
-; Macro per creare exception handler senza error code
+; Macro for exception handler without error code
 %macro ISR_NOERRCODE 1
 global isr%1
 isr%1:
@@ -47,7 +51,7 @@ isr%1:
     jmp isr_common
 %endmacro
 
-; Macro per creare exception handler con error code
+; Macro for exception handler with error code
 %macro ISR_ERRCODE 1
 global isr%1
 isr%1:
@@ -161,10 +165,10 @@ isr_timer:
     push r14
     push r15
     
-    ; Chiama il gestore C
+    ; Call the C handler
     call timer_handler
     
-    ; Invia EOI (End Of Interrupt) al PIC
+    ; Send EOI (End Of Interrupt) to the PIC
     mov al, 0x20
     out 0x20, al
     
@@ -186,7 +190,7 @@ isr_timer:
     
     iretq
 
-; Handler per la tastiera (IRQ1 = interrupt 0x21)
+; Keyboard handler (IRQ1 = interrupt 0x21)
 global isr_keyboard
 extern keyboard_handler
 

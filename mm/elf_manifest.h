@@ -1,5 +1,11 @@
 #ifndef ELF_MANIFEST_H
 #define ELF_MANIFEST_H
+/*
+
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include <stddef.h>
 #include <stdint.h>
 

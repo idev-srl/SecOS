@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - Terminal Abstraction
+ * Provides legacy VGA text mode and optional framebuffer console delegation.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "terminal.h"
 #include "fb.h"
 #include "fb_console.h"
@@ -11,7 +18,7 @@ static inline uint8_t inb(uint16_t port){ uint8_t ret; __asm__ volatile("inb %1,
 static void update_cursor(void){ uint16_t pos=terminal_row * VGA_WIDTH + terminal_column; outb(0x3D4,0x0F); outb(0x3D5,(uint8_t)(pos & 0xFF)); outb(0x3D4,0x0E); outb(0x3D5,(uint8_t)((pos>>8)&0xFF)); }
 static void enable_cursor(void){ outb(0x3D4,0x0A); outb(0x3D5,0x0E); outb(0x3D4,0x0B); outb(0x3D5,0x0F); }
 static int use_fb_console = 0;
-uint8_t user_fg = VGA_COLOR_WHITE; // Colore scelto dall'utente via comando color
+uint8_t user_fg = VGA_COLOR_WHITE; // User-selected foreground via shell color command
 uint8_t user_bg = VGA_COLOR_BLACK;
 int user_color_set = 0;
 void terminal_restore_user_color(void){ if(user_color_set) terminal_setcolor(vga_entry_color((enum vga_color)user_fg,(enum vga_color)user_bg)); }
@@ -28,9 +35,9 @@ void terminal_putentryat(char c,uint8_t color,size_t x,size_t y){ terminal_buffe
 void terminal_initialize(void){
 	terminal_row=0; terminal_column=0; terminal_color=vga_entry_color(VGA_COLOR_WHITE,VGA_COLOR_BLACK);
 #if ENABLE_FB
-	// rileva se fb inizializzato (heuristic: magic MB2 già gestito in kernel_main -> fb_init chiamato)
+	// Detect framebuffer console availability (heuristic: kernel_main already invoked fb_init).
 	extern int fb_console_init(void);
-	// Tentiamo init console grafica; se fallisce resta VGA
+	// Attempt graphical console init; on failure remain in VGA text mode.
 	if (fb_console_init()==0) {
 		use_fb_console = 1;
 	} else {

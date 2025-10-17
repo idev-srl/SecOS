@@ -1,79 +1,85 @@
+/*
+ * SecOS Kernel - Interrupt Descriptor Table (IDT) Setup
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "idt.h"
 
 #define IDT_ENTRIES 256
 
-// Array dell'IDT
+// IDT entries array
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_ptr idtp;
 
-// Funzione assembly per caricare l'IDT
+// Assembly stub to load IDT (lidt)
 extern void idt_load(uint64_t);
 
-// Output su porta I/O
+// Out to I/O port
 static inline void outb(uint16_t port, uint8_t value) {
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
 }
 
-// Input da porta I/O
+// In from I/O port
 static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
     __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 
-// Imposta un gate nell'IDT
+// Set an IDT gate
 void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags) {
     idt[num].offset_low = handler & 0xFFFF;
     idt[num].offset_mid = (handler >> 16) & 0xFFFF;
     idt[num].offset_high = (handler >> 32) & 0xFFFFFFFF;
     idt[num].selector = selector;
-    idt[num].ist = 0;  // Default: non usa IST
+    idt[num].ist = 0;  // Default: no IST usage
     idt[num].type_attr = flags;
     idt[num].zero = 0;
 }
 
-// Imposta un gate con IST specifico
+// Set a gate with a specific IST index
 void idt_set_gate_ist(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags, uint8_t ist) {
     idt_set_gate(num, handler, selector, flags);
-    idt[num].ist = ist;  // Imposta IST
+    idt[num].ist = ist;  // Apply IST selector
 }
 
-// Rimappa il PIC (Programmable Interrupt Controller)
+// Remap the PIC (Programmable Interrupt Controller) to avoid conflicts with CPU exceptions
 static void pic_remap(void) {
-    // Salva le maschere
+    // Save current masks
     uint8_t a1 = inb(0x21);
     uint8_t a2 = inb(0xA1);
     
-    // Inizializza PIC master e slave
-    outb(0x20, 0x11);  // ICW1: inizializza
+    // Initialize master and slave PICs
+    outb(0x20, 0x11);  // ICW1: start init sequence (edge triggered, expect ICW4)
     outb(0xA0, 0x11);
     
-    outb(0x21, 0x20);  // ICW2: offset IRQ master -> 0x20-0x27
-    outb(0xA1, 0x28);  // ICW2: offset IRQ slave -> 0x28-0x2F
+    outb(0x21, 0x20);  // ICW2: master vector offset (IRQs 0..7 -> 0x20-0x27)
+    outb(0xA1, 0x28);  // ICW2: slave vector offset (IRQs 8..15 -> 0x28-0x2F)
     
-    outb(0x21, 0x04);  // ICW3: master ha slave su IRQ2
-    outb(0xA1, 0x02);  // ICW3: slave su IRQ2 del master
+    outb(0x21, 0x04);  // ICW3: master has a slave on IRQ2
+    outb(0xA1, 0x02);  // ICW3: slave identity (cascade on IRQ2)
     
-    outb(0x21, 0x01);  // ICW4: modalità 8086
+    outb(0x21, 0x01);  // ICW4: 8086/88 (MCS-80/85) mode
     outb(0xA1, 0x01);
     
-    // Ripristina le maschere
+    // Restore saved masks
     outb(0x21, a1);
     outb(0xA1, a2);
 }
 
-// Inizializza l'IDT
+// Initialize the IDT
 void idt_init(void) {
-    // Imposta il puntatore IDT
+    // Set IDT pointer (limit and base)
     idtp.limit = (sizeof(struct idt_entry) * IDT_ENTRIES) - 1;
     idtp.base = (uint64_t)&idt;
     
-    // Azzera l'IDT
+    // Fill IDT initially with a generic stub (default handler)
     for (int i = 0; i < IDT_ENTRIES; i++) {
         idt_set_gate(i, (uint64_t)isr_stub, 0x08, 0x8E);
     }
     
-    // Registra exception handlers (INT 0-31)
+    // Register CPU exception handlers (INT 0-31)
     idt_set_gate(0, (uint64_t)isr0, 0x08, 0x8E);
     idt_set_gate(1, (uint64_t)isr1, 0x08, 0x8E);
     idt_set_gate(2, (uint64_t)isr2, 0x08, 0x8E);
@@ -82,13 +88,13 @@ void idt_init(void) {
     idt_set_gate(5, (uint64_t)isr5, 0x08, 0x8E);
     idt_set_gate(6, (uint64_t)isr6, 0x08, 0x8E);
     idt_set_gate(7, (uint64_t)isr7, 0x08, 0x8E);
-    idt_set_gate_ist(8, (uint64_t)isr8, 0x08, 0x8E, 1);    // Double Fault con IST1
+    idt_set_gate_ist(8, (uint64_t)isr8, 0x08, 0x8E, 1);    // Double Fault with IST1
     idt_set_gate(9, (uint64_t)isr9, 0x08, 0x8E);
     idt_set_gate(10, (uint64_t)isr10, 0x08, 0x8E);
     idt_set_gate(11, (uint64_t)isr11, 0x08, 0x8E);
     idt_set_gate(12, (uint64_t)isr12, 0x08, 0x8E);
-    idt_set_gate_ist(13, (uint64_t)isr13, 0x08, 0x8E, 3);  // GPF con IST3
-    idt_set_gate_ist(14, (uint64_t)isr14, 0x08, 0x8E, 2);  // Page Fault con IST2
+    idt_set_gate_ist(13, (uint64_t)isr13, 0x08, 0x8E, 3);  // General Protection Fault with IST3
+    idt_set_gate_ist(14, (uint64_t)isr14, 0x08, 0x8E, 2);  // Page Fault with IST2
     idt_set_gate(15, (uint64_t)isr15, 0x08, 0x8E);
     idt_set_gate(16, (uint64_t)isr16, 0x08, 0x8E);
     idt_set_gate(17, (uint64_t)isr17, 0x08, 0x8E);
@@ -107,25 +113,25 @@ void idt_init(void) {
     idt_set_gate(30, (uint64_t)isr30, 0x08, 0x8E);
     idt_set_gate(31, (uint64_t)isr31, 0x08, 0x8E);
     
-    // Rimappa il PIC
+    // Remap the PIC vectors (IRQ base offsets already assigned in pic_remap)
     pic_remap();
     
-    // Imposta handler timer (IRQ0 = interrupt 0x20)
+    // Install PIT timer handler (IRQ0 mapped to interrupt 0x20)
     idt_set_gate(0x20, (uint64_t)isr_timer, 0x08, 0x8E);
     
-    // Imposta handler tastiera (IRQ1 = interrupt 0x21)
+    // Install PS/2 keyboard handler (IRQ1 mapped to interrupt 0x21)
     idt_set_gate(0x21, (uint64_t)isr_keyboard, 0x08, 0x8E);
 
-    // Syscall gate INT 0x80 (trap gate, present, DPL=3 -> 0xEE: 1110 1110)
+    // Syscall gate INT 0x80 (trap gate, present, DPL=3 -> type_attr 0xEE)
     idt_set_gate(0x80, (uint64_t)syscall_entry, 0x08, 0xEE);
     
-    // Carica l'IDT
+    // Load IDT with lidt
     idt_load((uint64_t)&idtp);
     
-    // Abilita IRQ0 (timer) e IRQ1 (tastiera) sul PIC
-    outb(0x21, 0xFC);  // 0xFC = 11111100 - abilita IRQ0 e IRQ1
-    outb(0xA1, 0xFF);  // Disabilita tutte le IRQ slave
+    // Enable only IRQ0 (timer) and IRQ1 (keyboard) on master PIC (mask others)
+    outb(0x21, 0xFC);  // 0xFC = 11111100 -> bits set = masked; 0 & 1 cleared = enabled
+    outb(0xA1, 0xFF);  // Mask all slave IRQ lines for now
     
-    // Abilita gli interrupt
+    // Enable hardware interrupts (sti)
     __asm__ volatile ("sti");
 }

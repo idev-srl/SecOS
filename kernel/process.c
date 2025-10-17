@@ -1,3 +1,9 @@
+/*
+ * SecOS Kernel - Process Management
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "process.h"
 #include "elf.h"
 #include "heap.h"
@@ -14,7 +20,7 @@ static int proc_inited = 0;
 int process_init_system(void) {
     for (int i=0;i<MAX_PROCESSES;i++) proc_table[i]=0;
     proc_inited = 1;
-    terminal_writestring("[PROC] init table\n");
+    terminal_writestring("[PROC] process table initialized\n");
     return 0;
 }
 
@@ -57,7 +63,7 @@ void process_foreach(void (*cb)(process_t*, void*), void* user) {
 process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     if (!proc_inited) process_init_system();
     vmm_space_t* space = vmm_space_create_user();
-    if (!space) { terminal_writestring("[PROC] space alloc fail\n"); return NULL; }
+    if (!space) { terminal_writestring("[PROC] space alloc failed\n"); return NULL; }
     uint64_t entry=0;
     uint64_t* pages=NULL; uint32_t page_count=0;
     int r = elf_load_image(elf_buf, size, space, &entry, &pages, &page_count);

@@ -1,6 +1,11 @@
 #ifndef PMM_H
 #define PMM_H
+/*
 
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>

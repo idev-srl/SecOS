@@ -1,3 +1,9 @@
+/*
+ * SecOS Kernel - PIT Timer Driver
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "timer.h"
 #include "sched.h"
 
@@ -5,15 +11,15 @@
 #define PIT_COMMAND  0x43
 #define PIT_BASE_FREQUENCY 1193182
 
-// Contatore di tick
+// Tick counter
 static volatile uint64_t timer_ticks = 0;
 static uint32_t timer_frequency = 0;
-// Callback registro (semplice array statico)
+// Registered tick callbacks (simple static array)
 #define MAX_TICK_CBS 8
 static timer_tick_cb_t tick_cbs[MAX_TICK_CBS];
 static int tick_cb_count = 0;
 
-// Funzioni I/O inline
+// Inline port I/O functions
 static inline void outb(uint16_t port, uint8_t value) {
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
 }
@@ -24,37 +30,37 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
-// Handler interrupt timer (IRQ0)
+// Timer interrupt handler (IRQ0)
 void timer_handler(void) {
     timer_ticks++;
     sched_on_timer_tick();
-    // Esegui callbacks registrate
+    // Execute registered callbacks
     for(int i=0;i<tick_cb_count;i++) {
         if (tick_cbs[i]) tick_cbs[i]();
     }
 }
 
-// Inizializza il timer PIT
+// Initialize PIT timer
 void timer_init(uint32_t frequency) {
     timer_frequency = frequency;
     timer_ticks = 0;
     
-    // Calcola il divisore per ottenere la frequenza desiderata
+    // Calculate divisor to program desired frequency
     uint32_t divisor = PIT_BASE_FREQUENCY / frequency;
     
-    // Assicurati che il divisore sia valido
+    // Clamp divisor into valid range
     if (divisor > 65535) divisor = 65535;
     if (divisor < 1) divisor = 1;
     
-    // Invia il comando al PIT
+    // Send command to PIT
     // 0x36 = 00110110
     // 00 = Channel 0
     // 11 = Access mode: lobyte/hibyte
-    // 011 = Mode 3 (square wave generator)
-    // 0 = Binary mode (non BCD)
+    // 011 = Mode 3 (square wave)
+    // 0 = Binary mode
     outb(PIT_COMMAND, 0x36);
     
-    // Invia il divisore (low byte, poi high byte)
+    // Send divisor (low byte then high byte)
     outb(PIT_CHANNEL0, (uint8_t)(divisor & 0xFF));
     outb(PIT_CHANNEL0, (uint8_t)((divisor >> 8) & 0xFF));
     // Clear callbacks

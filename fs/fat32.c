@@ -1,10 +1,17 @@
+/*
+ * SecOS Kernel - FAT32 Stub
+ * Reads BPB from block device and exposes diagnostic file in RAMFS; VFS ops unimplemented.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "fat32.h"
 #include "vfs.h"
-#include "ramfs.h" // reuse ramfs_add_common style via public APIs (temporary)
+#include "ramfs.h" // reuse RAMFS to publish diagnostic info (temporary)
 #include <stdint.h>
 
-// For now we simulate by reading first sector and parsing BPB, then create placeholder files under /fat32.
-// Future: implement real FAT directory parsing.
+// Currently: read first sector, parse BPB, create placeholder diagnostic file.
+// Future: implement FAT directory parsing and full VFS integration.
 
 static int parse_bpb(block_dev_t* dev, fat32_bpb_t* out){
     uint8_t sector[1024]; // assume <= 512

@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - RAMFS VFS Adapter
+ * Bridges RAMFS internal storage to generic VFS inode & operations interface.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "vfs.h"
 #include "ramfs.h"
 #include <stddef.h>
@@ -10,8 +17,8 @@ static vfs_inode_t* inode_from_entry(const ramfs_entry_t* e){ if(!e) return NULL
     for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e) return &inode_cache[i]; }
     if(inode_cache_used >= sizeof(inode_cache)/sizeof(inode_cache[0])) return NULL;
     vfs_inode_t* ino = &inode_cache[inode_cache_used++];
-    // path already absolute in ramfs_entry_t.name
-    // Ensure copy and canonical root representation
+    // Path already absolute in ramfs_entry_t.name (without leading '/')
+    // Build canonical path with leading '/' (root = "/")
     size_t k=0; const char* src=e->name; if(!src[0]){ ino->path[0]='/'; ino->path[1]=0; } else {
         // Prepend '/' for consistency
         ino->path[k++]='/'; for(size_t i=0; src[i] && k<sizeof(ino->path)-1; i++) ino->path[k++]=src[i]; ino->path[k]=0;
@@ -34,7 +41,7 @@ static vfs_inode_t* ramfs_vfs_lookup(const char* path){
     }
     if(np[0]=='/') np++;
     const ramfs_entry_t* e = ramfs_find(np);
-    if(!e){ // If path is directory that exists implicitly? (root only). fallback NULL.
+    if(!e){ // If path not found (only root implicitly exists) return NULL
         return NULL;
     }
     vfs_inode_t* ino = inode_from_entry(e);

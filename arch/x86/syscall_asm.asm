@@ -1,8 +1,12 @@
+; SecOS Kernel - Syscall Entry Stub (INT 0x80 path)
+; Copyright (c) 2025 iDev srl
+; Author: Luigi De Astis <l.deastis@idev-srl.com>
+; SPDX-License-Identifier: MIT
 BITS 64
 GLOBAL syscall_entry
 EXTERN syscall_dispatch
 
-; Syscall convention:
+; Syscall calling convention:
 ; rax = number
 ; rdi, rsi, rdx, rcx, r8 = arg0..arg4
 ; Return value in rax

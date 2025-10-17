@@ -1,13 +1,21 @@
+/*
+ * SecOS Kernel - Framebuffer Console
+ * Text console rendering on 32-bpp linear framebuffer with glyph drawing,
+ * cursor blinking, logo glow animation, and optional double buffering.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "fb_console.h"
-#include "terminal.h" // per colori VGA enum
+#include "terminal.h" // VGA color enum
 #include "fb.h"
-#include "vmm.h" // per phys_to_virt
-#include "timer.h" // per registrare callback blink
+#include "vmm.h" // phys_to_virt
+#include "timer.h" // timer callback registration for blink
 #include <stddef.h>
 #include <stdint.h>
 #if ENABLE_FB
 
-// Font VGA 8x16 standard (ASCII 32..126). bit7 = pixel sinistro.
+// Standard VGA 8x16 font (ASCII 32..126). bit7 = leftmost pixel.
 static const uint8_t font8x16[95][16] = {
  /* 0x20 ' ' */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
  /* 0x21 '!' */ {0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x18,0x18,0,0,0,0,0,0},
@@ -113,19 +121,19 @@ static uint8_t current_fg = VGA_COLOR_LIGHT_GREEN;
 static uint8_t current_bg = VGA_COLOR_BLACK;
 static uint32_t cursor_x = 0, cursor_y = 0;
 static const uint32_t glyph_w = 8, glyph_h = 16;
-static int cursor_visible = 1; // stato logico
-static int cursor_blink_phase = 0; // 0 mostrato, 1 nascosto (invertito)
-static uint32_t blink_counter = 0; // in tick
-static uint32_t blink_interval_ticks = 0; // calcolato da frequenza timer (circa 500ms)
+static int cursor_visible = 1; // logical state
+static int cursor_blink_phase = 0; // 0 shown, 1 hidden (inverted)
+static uint32_t blink_counter = 0; // measured in ticks
+static uint32_t blink_interval_ticks = 0; // derived from timer frequency (~500ms)
 static int cursor_blink_enabled = 0;
 static void fb_console_cursor_toggle(void);
 // Double buffering
-static uint8_t* dbuf = NULL; // buffer secondario (virtuale) se attivo
+static uint8_t* dbuf = NULL; // secondary (virtual) buffer when enabled
 static int dbuf_enabled = 0;
-static int dbuf_auto_flush = 0; // flush automatico
+static int dbuf_auto_flush = 0; // automatic flush flag
 // (Scaling removed)
 
-// Palette VGA 16 -> RGB (semplice)
+// VGA 16-color palette -> RGB
 static uint32_t vga_palette[16] = {
     0x000000,0x0000AA,0x00AA00,0x00AAAA,0xAA0000,0xAA00AA,0xAA5500,0xAAAAAA,
     0x555555,0x5555FF,0x55FF55,0x55FFFF,0xFF5555,0xFF55FF,0xFFFF55,0xFFFFFF
@@ -143,25 +151,25 @@ static uint32_t blend(uint32_t a,uint32_t b,float t){
 
 int fb_console_init(void){
     framebuffer_info_t info; if(!fb_get_info(&info)) return -1; if (info.bpp != 32) return -1;
-    // Se virt_addr non è impostato ma l'indirizzo è alto, proviamo comunque: la physmap potrebbe già coprire.
+    // If virt_addr unset but physical address is high, attempt mapping: physmap may already cover.
     if (info.virt_addr == 0 && info.addr >= (16ULL*1024*1024)) {
-        // Tentiamo di usare phys_to_virt direttamente: assumiamo vmm_extend_physmap già chiamato prima di terminal_initialize
+    // Attempt phys_to_virt lookup directly; assume vmm_extend_physmap was called earlier.
         extern uint64_t phys_to_virt(uint64_t phys);
         uint64_t tentative = phys_to_virt(info.addr);
-        // Non possiamo verificare facilmente la mappatura qui senza page-walk; assumiamo valida dopo vmm_init_physmap.
+    // Cannot easily verify mapping here without page-walk; assume valid post vmm_init_physmap.
         info.virt_addr = tentative;
     }
     fb_width = info.width; fb_height = info.height; fb_pitch = info.pitch; fb_phys_addr = (info.virt_addr ? info.virt_addr : info.addr);
     fb_enabled = 1; fb_clear(0x000000); cursor_x=0; cursor_y=0; dbuf_enabled=0; dbuf=NULL;
-    // Disegna logo SecOS in alto a destra
+    // Draw SecOS logo on top-right
     extern void fb_console_draw_logo(void); fb_console_draw_logo();
-    // Imposta colore default più leggibile (bianco su nero)
+    // Set a more legible default color (white on black)
     extern void terminal_setcolor(uint8_t color);
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
     return 0;
 }
 
-// Funzione interna per invertire/blink cursore
+// Internal helper to draw blinking cursor underline
 static void fb_console_draw_cursor(void){
     if(!fb_enabled || !cursor_blink_enabled) return;
     uint32_t cell_w = glyph_w;
@@ -170,7 +178,7 @@ static void fb_console_draw_cursor(void){
     uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
     uint8_t* target = (dbuf_enabled && dbuf)? dbuf : base;
     uint32_t* row; uint32_t fg_rgb = vga_palette[current_fg & 0xF];
-    uint32_t blink_h = 2; if(blink_h>cell_h) blink_h=cell_h;
+    uint32_t blink_h = 2; if(blink_h>cell_h) blink_h=cell_h; // underline thickness
     for(uint32_t y=0;y<blink_h;y++){
         row=(uint32_t*)(target + (gy + cell_h - 1 - y) * fb_pitch);
         for(uint32_t x=0;x<cell_w;x++) row[gx + x] = fg_rgb;
@@ -193,7 +201,7 @@ static void fb_console_clear_cursor(void){
     if(dbuf_enabled && !dbuf_auto_flush) fb_console_flush();
 }
 
-// Logo semplice SecOS (5 lettere stilizzate) in alto a destra
+// Simple stylized SecOS logo (5 letters) rendered top-right
 static void draw_block(int x,int y,int w,int h,uint32_t rgb){
     if(x<0||y<0) return; if(x+w>fb_width) w=fb_width-x; if(y+h>fb_height) h=fb_height-y;
     uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
@@ -203,12 +211,12 @@ static void draw_block(int x,int y,int w,int h,uint32_t rgb){
         for(int xx=0; xx<w; xx++) row[x+xx]=rgb;
     }
 }
-// Coordinate e dimensioni chip per preservare area nello scroll
+// Logo chip coordinates & dimensions (preserved during scroll)
 static int logo_chip_x=0, logo_chip_y=0, logo_chip_w=0, logo_chip_h=0;
-static int logo_pin_len=6; // lunghezza pin usata per calcolo area totale logo
-static int logo_glow_phase=0; // fase animazione glow
-static int logo_glow_enabled=1;
-// Versione kernel (fallback se macro non definita)
+static int logo_pin_len=6; // pin length used for computing total logo area
+static int logo_glow_phase=0; // glow animation phase
+static int logo_glow_enabled=1; // glow effect enabled
+// Kernel version fallback if macro undefined
 #ifndef KERNEL_VERSION
 #define KERNEL_VERSION "v0.2"
 #endif
@@ -228,75 +236,75 @@ static void fb_console_clear_logo_area(void){
 }
 void fb_console_draw_logo(void){
     if(!fb_enabled) return;
-    // Dimensioni chip
+    // Chip body dimensions
     int body_w = 120; int body_h = 40; int margin = 8;
     if(body_w + margin > (int)fb_width) body_w = fb_width - margin;
     logo_chip_w = body_w; logo_chip_h = body_h; logo_chip_x = fb_width - body_w - margin; logo_chip_y = 4;
     uint32_t body_top = 0x303030; uint32_t body_bot = 0x202020; uint32_t pin_col = 0x909090; uint32_t pin_shadow = 0x404040; uint32_t outline = 0xAAAAAA;
-    // Corpo con gradient verticale
+    // Vertical gradient fill
     for(int y=0;y<body_h;y++){
         float t=(float)y/(float)(body_h-1);
         uint32_t col = blend(body_top, body_bot, t);
         draw_block(logo_chip_x, logo_chip_y + y, body_w, 1, col);
     }
-    // Outline
+    // Outline rectangle
     draw_block(logo_chip_x, logo_chip_y, body_w, 1, outline);
     draw_block(logo_chip_x, logo_chip_y + body_h -1, body_w, 1, outline);
     draw_block(logo_chip_x, logo_chip_y, 1, body_h, outline);
     draw_block(logo_chip_x + body_w -1, logo_chip_y, 1, body_h, outline);
-    // Pin: sopra e sotto
+    // Pins: top & bottom rows
     int pin_len = logo_pin_len; int pin_spacing = 10;
     for(int px=logo_chip_x + 6; px < logo_chip_x + body_w - 6; px += pin_spacing){
-        // up
+    // top side pin
         draw_block(px, logo_chip_y - (pin_len+2), 4, pin_len, pin_col);
         draw_block(px+1, logo_chip_y - (pin_len+2), 2, pin_len, pin_shadow); // centrale leggero scuro
-        // down
+    // bottom side pin
         draw_block(px, logo_chip_y + body_h +2, 4, pin_len, pin_col);
         draw_block(px+1, logo_chip_y + body_h +2, 2, pin_len, pin_shadow);
     }
-    // Pin laterali
+    // Side pins
     for(int py=logo_chip_y + 6; py < logo_chip_y + body_h - 6; py += pin_spacing){
-        // left
+    // left side pin
         draw_block(logo_chip_x - (pin_len+2), py, pin_len, 4, pin_col);
         draw_block(logo_chip_x - (pin_len+2), py+1, pin_len, 2, pin_shadow);
-        // right
+    // right side pin
         draw_block(logo_chip_x + body_w +2, py, pin_len, 4, pin_col);
         draw_block(logo_chip_x + body_w +2, py+1, pin_len, 2, pin_shadow);
     }
-    // Label "SecOS" centrata dentro il chip (scala 1, colore chiaro)
+    // Label "SecOS" centered inside chip (scale 1, bright color)
     const char* lbl="SecOS"; int len=5; int gw=glyph_w; int gh=glyph_h; int spacing=1; int text_w=len*gw + (len-1)*spacing; int tx = logo_chip_x + (body_w - text_w)/2; int ty = logo_chip_y + (body_h - gh)/2;
     uint32_t txt_col = 0x66CCFF; uint32_t txt_shadow = 0x000000;
     for(int i=0;i<len;i++){
         char c = lbl[i]; if(c<' '||c>'~') c='?'; const uint8_t* g = font8x16[c-32];
         int gx = tx + i*(gw+spacing);
-        // shadow
+    // shadow layer
         for(int r=0;r<gh;r++){ uint8_t line=g[r]; for(int col=0; col<gw; col++){ if((line>>col)&1) draw_block(gx+col+1, ty+r+1,1,1, txt_shadow); } }
-        // glyph
+    // glyph layer
         for(int r=0;r<gh;r++){ uint8_t line=g[r]; for(int col=0; col<gw; col++){ uint32_t bit=(line>>col)&1; draw_block(gx+col, ty+r,1,1, bit?txt_col: (uint32_t)0x000000); } }
     }
-    // Version string sotto (centrata)
+    // Version string below (centered)
     const char* ver = KERNEL_VERSION; int vlen=0; while(ver[vlen]) vlen++; int vtext_w = vlen*gw + (vlen-1)*spacing; int vtx = logo_chip_x + (body_w - vtext_w)/2; int vty = logo_chip_y + body_h - gh - 2;
     uint32_t ver_col = 0x88FFAA;
     for(int i=0;i<vlen;i++){
         char c = ver[i]; if(c<' '||c>'~') c='?'; const uint8_t* g = font8x16[c-32]; int gx = vtx + i*(gw+spacing);
         for(int r=0;r<gh;r++){ uint8_t line=g[r]; for(int col=0; col<gw; col++){ uint32_t bit=(line>>col)&1; if(bit) draw_block(gx+col, vty+r,1,1, ver_col); } }
     }
-    // Glow esterno: anello sfumato pulsante (varia colore in base a logo_glow_phase)
+    // Outer glow: pulsating ring (color varies with logo_glow_phase)
     if(logo_glow_enabled){
         float phase = (logo_glow_phase % 200) / 200.0f; // ciclo lento
         uint32_t glow_a = 0x003366; uint32_t glow_b = 0x00AAFF; uint32_t glow_c = 0x33DDFF;
-        // Interpolazione due segmenti
+    // Two-stage interpolation
         uint32_t gcol1 = blend(glow_a, glow_b, phase);
         uint32_t gcol2 = blend(glow_b, glow_c, phase);
         uint32_t edge_top = blend(gcol1, gcol2, 0.5f);
         int pad = 3; int gx0 = logo_chip_x - pad; int gy0 = logo_chip_y - pad; int gw0 = logo_chip_w + pad*2; int gh0 = logo_chip_h + pad*2;
-        // Rettangolo trasparente sfumato (bordi)
+    // Faded border rectangle
         // Top & Bottom lines
         for(int x=0;x<gw0;x++){ draw_block(gx0 + x, gy0, 1,1, edge_top); draw_block(gx0 + x, gy0 + gh0 -1,1,1, edge_top); }
         for(int y=0;y<gh0;y++){ draw_block(gx0, gy0 + y,1,1, gcol1); draw_block(gx0 + gw0 -1, gy0 + y,1,1, gcol2); }
     }
 }
-// Redisegna solo l'anello glow per ridurre flicker
+// Redraw only glow ring to reduce flicker
 static void fb_console_draw_logo_glow(void){
     if(!fb_enabled || !logo_glow_enabled) return;
     if(logo_chip_w==0) return;
@@ -314,25 +322,25 @@ static void fb_console_draw_logo_glow(void){
     if(dbuf_enabled && !dbuf_auto_flush) fb_console_flush();
 }
 
-// Tick callback registrato col timer
+// Timer tick callback
 static void fb_console_tick(void){
     if(!cursor_blink_enabled || !fb_enabled) return;
     blink_counter++;
-    // Aggiorna glow lentamente ogni 5 tick indipendentemente dal blink
+    // Update glow slowly every 5 ticks independent of cursor blink
     if(logo_glow_enabled && (blink_counter % 5)==0){ logo_glow_phase++; fb_console_draw_logo_glow(); }
     if (blink_counter >= blink_interval_ticks){
         blink_counter = 0;
-        // Toggle visibilità: cancelliamo e ridisegniamo
+    // Toggle visibility: erase then redraw
         if(cursor_blink_phase==0){ fb_console_clear_cursor(); cursor_blink_phase=1; }
         else { fb_console_draw_cursor(); cursor_blink_phase=0; }
     }
 }
 
-// API per abilitare blink (chiamata dopo timer_init)
+// Enable cursor blinking (called after timer_init)
 int fb_console_enable_cursor_blink(uint32_t timer_freq){
     if(!fb_enabled) return -1;
     if (timer_freq==0) return -1;
-    blink_interval_ticks = (timer_freq / 2); // 500ms
+    blink_interval_ticks = (timer_freq / 2); // ~500ms
     if (blink_interval_ticks==0) blink_interval_ticks=1;
     if (timer_register_tick_callback(fb_console_tick)!=0) return -1;
     cursor_blink_enabled = 1; blink_counter=0; cursor_blink_phase=0; fb_console_draw_cursor();
@@ -349,14 +357,14 @@ static void putpixel_raw(int x,int y,uint32_t rgb){ if(x<0||y<0||x>=(int)fb_widt
 static void putpixel(int x,int y,uint32_t rgb){ putpixel_raw(x,y,rgb); }
 
 static void draw_glyph(char c, uint32_t gx, uint32_t gy){
-    // Supporto semplice caratteri box-drawing CP437: ─ (0xC4), │ (0xB3), ┌ (0xDA), ┐ (0xBF), └ (0xC0), ┘ (0xD9), ├ (0xC3), ┤ (0xB4), ┬ (0xC2), ┴ (0xC1), ┼ (0xC5)
-    // In input potrebbero arrivare come bytes > 126 se la shell consente inserimento esteso (encoding locale 8-bit). Li disegniamo manualmente.
+    // Basic support for CP437 box-drawing chars: ─ (0xC4), │ (0xB3), ┌ (0xDA), ┐ (0xBF), └ (0xC0), ┘ (0xD9), ├ (0xC3), ┤ (0xB4), ┬ (0xC2), ┴ (0xC1), ┼ (0xC5)
+    // They may arrive as bytes >126 if shell allows extended 8-bit input; drawn manually.
     uint32_t fg_rgb = vga_palette[current_fg & 0xF];
     uint32_t bg_rgb = vga_palette[current_bg & 0xF];
     unsigned char uc = (unsigned char)c;
     if (uc >= 0xB3) {
         switch(uc) {
-            case 0xC4: { // ─ orizzontale
+            case 0xC4: { // ─ horizontal line
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -366,7 +374,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xB3: { // │ verticale
+            case 0xB3: { // │ vertical line
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -375,7 +383,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xDA: { // ┌ angolo alto sinistra
+            case 0xDA: { // ┌ top-left corner
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -385,7 +393,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xBF: { // ┐ angolo alto destra
+            case 0xBF: { // ┐ top-right corner
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -395,7 +403,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xC0: { // └ angolo basso sinistra
+            case 0xC0: { // └ bottom-left corner
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -405,7 +413,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xD9: { // ┘ angolo basso destra
+            case 0xD9: { // ┘ bottom-right corner
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -415,7 +423,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xC3: { // ├ incrocio sinistra
+            case 0xC3: { // ├ left junction
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -425,7 +433,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xB4: { // ┤ incrocio destra
+            case 0xB4: { // ┤ right junction
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -435,7 +443,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xC2: { // ┬ incrocio alto
+            case 0xC2: { // ┬ top junction
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -445,7 +453,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xC1: { // ┴ incrocio basso
+            case 0xC1: { // ┴ bottom junction
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -455,7 +463,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            case 0xC5: { // ┼ incrocio pieno
+            case 0xC5: { // ┼ full junction
                 for(uint32_t row=0; row<glyph_h; row++) {
                     for(uint32_t col=0; col<glyph_w; col++) {
                         uint32_t rgb = bg_rgb;
@@ -464,19 +472,19 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
                     }
                 }
                 return; }
-            default: break; // altri >126 non gestiti
+            default: break; // others >126 unsupported
         }
     }
     if(c < 32 || c > 126) c='?';
     const uint8_t* glyph = font8x16[c-32];
-    // Rileva se il glyph è completamente vuoto (font incompleto) tranne lo spazio
+    // Detect if glyph is completely empty (incomplete font) except for space
     int empty = 1;
-    if (c == ' ') empty = 0; // lo spazio è legittimamente vuoto
+    if (c == ' ') empty = 0; // space legitimately empty
     else {
         for (int i=0;i<16;i++) { if (glyph[i] != 0) { empty = 0; break; } }
     }
     if (empty) {
-        // Disegna un box di placeholder 8x16 con bordo
+    // Draw placeholder 8x16 box with border
         for(uint32_t row=0; row<glyph_h; row++) {
             for(uint32_t col=0; col<glyph_w; col++) {
                 int border = (row==0 || row==glyph_h-1 || col==0 || col==glyph_w-1);
@@ -487,7 +495,7 @@ static void draw_glyph(char c, uint32_t gx, uint32_t gy){
     }
     for(uint32_t row=0; row<glyph_h; row++) {
         uint8_t line = glyph[row];
-        // Interpretazione LSB-left (bit0 pixel sinistro) per evitare inversione visiva nel font corrente
+    // Interpret LSB-left (bit0 left pixel) to avoid visual inversion given current font encoding
         for(uint32_t col=0; col<glyph_w; col++) {
             uint32_t bit_on = (line >> col) & 1;
             putpixel(gx+col, gy+row, bit_on ? fg_rgb : bg_rgb);
@@ -501,16 +509,16 @@ static void scroll_if_needed(void){
     uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
     uint8_t* target = dbuf_enabled && dbuf ? dbuf : base;
     size_t line_bytes = fb_pitch * cell_h;
-    // Prima: cancella area logo per evitare copia fantasma verso l'alto
+    // First: clear logo area to avoid phantom copy upward
     fb_console_clear_logo_area();
     size_t copy_bytes = fb_pitch * (fb_height - cell_h);
     for(size_t i=0;i<copy_bytes;i++) target[i] = target[i+line_bytes];
-    // Pulisci ultima riga
+    // Clear last row
     for(uint32_t y=fb_height - cell_h; y<fb_height; y++) {
         uint32_t* row=(uint32_t*)(target + y*fb_pitch);
         for(uint32_t x=0;x<fb_width;x++) row[x]=0x000000; }
     cursor_y--;
-    fb_console_draw_logo(); // ridisegna nella posizione originale
+    fb_console_draw_logo(); // redraw in original position
     if(dbuf_enabled && !dbuf_auto_flush) fb_console_flush();
 }
 
@@ -550,11 +558,11 @@ void fb_console_write(const char* s){ while(*s) fb_console_putc(*s++); }
 int fb_console_enable_dbuf(void){
     if(!fb_enabled) return -1;
     if(dbuf_enabled) return 0;
-    // allocazione semplice con kmalloc (richiede heap funzionante)
+    // Simple allocation via kmalloc (requires working heap)
     extern void* kmalloc(size_t sz); extern void kfree(void* p);
     size_t sz = fb_pitch * fb_height; dbuf = (uint8_t*)kmalloc(sz);
     if(!dbuf) return -1;
-    // Copia contenuto attuale
+    // Copy existing content
     uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
     for(size_t i=0;i<sz;i++) dbuf[i]=base[i];
     dbuf_enabled=1;
@@ -563,7 +571,7 @@ int fb_console_enable_dbuf(void){
 void fb_console_disable_dbuf(void){
     if(!dbuf_enabled) return;
     extern void kfree(void* p);
-    // Prima flush finale
+    // Final flush before freeing
     fb_console_flush();
     kfree(dbuf); dbuf=NULL; dbuf_enabled=0;
 }

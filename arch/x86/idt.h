@@ -1,26 +1,31 @@
 #ifndef IDT_H
 #define IDT_H
-
+/*
+ * SecOS Kernel - IDT Definitions
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdint.h>
 
-// Struttura di un entry dell'IDT
+// IDT entry structure
 struct idt_entry {
     uint16_t offset_low;    // Offset bits 0-15
-    uint16_t selector;      // Selettore del segmento di codice
-    uint8_t  ist;           // Interrupt Stack Table
-    uint8_t  type_attr;     // Type e attributi
+    uint16_t selector;      // Code segment selector
+    uint8_t  ist;           // Interrupt Stack Table index
+    uint8_t  type_attr;     // Type & attributes
     uint16_t offset_mid;    // Offset bits 16-31
     uint32_t offset_high;   // Offset bits 32-63
-    uint32_t zero;          // Riservato
+    uint32_t zero;          // Reserved
 } __attribute__((packed));
 
-// Struttura del puntatore IDT
+// IDT pointer structure
 struct idt_ptr {
     uint16_t limit;
     uint64_t base;
 } __attribute__((packed));
 
-// Funzioni pubbliche
+// Public functions
 void idt_init(void);
 void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags);
 void idt_set_gate_ist(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags, uint8_t ist);

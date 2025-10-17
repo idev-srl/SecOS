@@ -1,3 +1,9 @@
+/*
+ * SecOS Kernel - Real Time Clock (RTC) Driver
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "rtc.h"
 #include "terminal.h"
 #if ENABLE_RTC
@@ -6,7 +12,7 @@ static inline void outb(uint16_t port, uint8_t val) { __asm__ volatile ("outb %0
 static inline uint8_t inb(uint16_t port) { uint8_t v; __asm__ volatile ("inb %1, %0" : "=a"(v) : "Nd"(port)); return v; }
 
 static inline uint8_t cmos_read(uint8_t reg) {
-    outb(0x70, reg | 0x80); // NMI off
+    outb(0x70, reg | 0x80); // NMI disabled while accessing CMOS
     return inb(0x71);
 }
 
@@ -23,7 +29,7 @@ static void itoa2(int v, char* b){ b[0] = (char)('0' + (v/10)); b[1] = (char)('0
 bool rtc_read(struct rtc_datetime* dt) {
     if (!dt) return false;
 
-    // Attendi fine update
+    // Wait until RTC update completes
     while (cmos_update_in_progress()) { }
 
     uint8_t second = cmos_read(0x00);
@@ -47,7 +53,7 @@ bool rtc_read(struct rtc_datetime* dt) {
         year   = bcd_to_bin(year);
     }
 
-    if (!is_24h) { // converti formato 12h -> 24h
+    if (!is_24h) { // convert 12h -> 24h format
         bool pm = (hour & 0x80) != 0;
         hour &= 0x7F;
         if (pm && hour < 12) hour += 12;
@@ -59,13 +65,13 @@ bool rtc_read(struct rtc_datetime* dt) {
     dt->hour   = hour;
     dt->day    = day;
     dt->month  = month;
-    dt->year   = (uint16_t)(2000 + year); // Assumendo 20xx
+    dt->year   = (uint16_t)(2000 + year); // Assuming 20xx
     return true;
 }
 
 void rtc_format(const struct rtc_datetime* dt, char* buf, uint32_t sz) {
     if (!dt || !buf || sz < 20) return;
-    // Formato: YYYY-MM-DD HH:MM:SS
+    // Format: YYYY-MM-DD HH:MM:SS
     buf[0] = '0' + ((dt->year / 1000) % 10);
     buf[1] = '0' + ((dt->year / 100 ) % 10);
     buf[2] = '0' + ((dt->year / 10  ) % 10);

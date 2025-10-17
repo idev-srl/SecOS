@@ -1,3 +1,9 @@
+/*
+ * SecOS Kernel - RTC Driver (Header)
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #ifndef RTC_H
 #define RTC_H
 #include <stdint.h>

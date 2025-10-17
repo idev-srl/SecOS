@@ -1,7 +1,11 @@
-; boot.asm - Bootloader minimalista per Long Mode
+; SecOS Kernel - Minimal Long Mode Bootloader
+; Copyright (c) 2025 iDev srl
+; Author: Luigi De Astis <l.deastis@idev-srl.com>
+; SPDX-License-Identifier: MIT
+; boot.asm - Minimal Long Mode bootloader
 BITS 32
 
-; Multiboot2 minimal header (sezione dedicata, verrà posta all'inizio del file)
+; Multiboot2 minimal header (dedicated section placed at file start)
 section .multiboot
 align 8
 ; --- Multiboot2 header (minimal: framebuffer request 1024x768x32) ---
@@ -28,7 +32,7 @@ mb2_header_start:
     dd 8                     ; size=8
 mb2_header_end:
 
-; Stack
+; Kernel stack
 section .bss
 align 16
 global stack_bottom
@@ -37,13 +41,13 @@ stack_bottom:
     resb 16384
 stack_top:
 
-; Buffer per copia struttura multiboot (fino a 8KB)
+; Buffer to copy multiboot structure (up to 8KB)
 align 16
 global mb2_copy
 mb2_copy:
     resb 8192
 
-; Page tables
+; Page tables (identity + higher-half mappings prepared later)
 align 4096
 pml4:
     resb 4096
@@ -53,7 +57,7 @@ pdt:
     resb 4096
 
 section .data
-; Salva parametri multiboot
+; Saved multiboot parameters
 mb_magic: dq 0
 mb_info: dq 0
 

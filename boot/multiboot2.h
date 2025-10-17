@@ -1,5 +1,10 @@
 #ifndef MULTIBOOT2_H
 #define MULTIBOOT2_H
+/*
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+*/
 #include <stdint.h>
 
 #define MULTIBOOT2_BOOTLOADER_MAGIC 0x36d76289

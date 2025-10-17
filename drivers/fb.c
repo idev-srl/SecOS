@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - Framebuffer Core Driver
+ * Provides low-level framebuffer discovery and basic drawing primitives.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "fb.h"
 #include "terminal.h"
 #include "multiboot2.h"
@@ -8,17 +15,17 @@
 
 static framebuffer_info_t g_fb;
 static int g_fb_ready = 0;
-static int g_fb_phys_only = 0; // set if high address not yet virtually mapped
+static int g_fb_phys_only = 0; // set if high framebuffer physical address not yet virtually mapped
 // Forward declare phys_to_virt
 extern uint64_t phys_to_virt(uint64_t phys);
 
 void fb_finalize_mapping(void) {
     if (!g_fb_ready) return;
     if (!g_fb_phys_only) return;
-    // Assicura che physmap copra l'intero framebuffer
+    // Ensure physmap covers the entire framebuffer
     uint64_t fb_end = g_fb.addr + (uint64_t)g_fb.pitch * g_fb.height;
     vmm_extend_physmap(fb_end);
-    // Assume physmap ora copre il range richiesto
+    // Assume physmap now covers the requested range
     g_fb.virt_addr = phys_to_virt(g_fb.addr);
     g_fb_phys_only = 0;
 }
@@ -42,7 +49,7 @@ int fb_init(uint32_t mb2_info) {
     }
     if (!found) {
         __asm__ volatile("mov $'0', %al; out %al, $0xE9");
-        terminal_writestring("[FB] Tag framebuffer MB2 non trovato\n");
+    terminal_writestring("[FB] Multiboot2 framebuffer tag not found\n");
         return -1;
     }
     __asm__ volatile("mov $'1', %al; out %al, $0xE9");
@@ -59,9 +66,9 @@ int fb_init(uint32_t mb2_info) {
     __asm__ volatile("mov $'A', %al; out %al, $0xE9");
     uint32_t pw = g_fb.pitch; for(int k=0;k<2;k++){ uint8_t n=(pw>>(k*4))&0xF; __asm__ volatile("out %0,$0xE9"::"a"((uint8_t)("0123456789ABCDEF"[n]))); }
     __asm__ volatile("mov $'P', %al; out %al, $0xE9");
-    // Mask sizes/positions se disponibili (solo se type_fb==1 RGB, in MB2 sono dopo struttura base)
+    // Mask sizes/positions if available (type_fb==1 RGB; in MB2 they follow after base structure)
     if (found->type_fb == 1) {
-        // Calcolo offset dei mask: subito dopo campi base
+    // Masks start immediately after the base fields
         uint8_t* extra = (uint8_t*)found + sizeof(struct multiboot2_tag_framebuffer);
         g_fb.red_mask_size = extra[0];
         g_fb.red_mask_pos  = extra[1];
@@ -89,7 +96,7 @@ int fb_init(uint32_t mb2_info) {
     // If address above 16MB identity region, delay usage until physmap
     if (g_fb.addr >= (16ULL*1024*1024)) {
         g_fb_phys_only = 1;
-        terminal_writestring("[FB] Alto indirizzo, rinvio accessi finché physmap non pronta\n");
+    terminal_writestring("[FB] High physical address, deferring access until physmap ready\n");
     }
     g_fb_ready = 1;
     __asm__ volatile("mov $'2', %al; out %al, $0xE9");

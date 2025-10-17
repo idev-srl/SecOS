@@ -1,3 +1,10 @@
+/*
+ * SecOS Kernel - FAT32 Interface (Stub)
+ * Partial BPB parsing and mount entry point (diagnostic only).
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>

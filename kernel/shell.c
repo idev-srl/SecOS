@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MIT
+/*
+ * SecOS Kernel - Interactive Shell
+ * Original Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * License: MIT
+ */
 #include "shell.h"
 #include "keyboard.h"
 #include "terminal.h"
@@ -13,11 +19,12 @@
 #include "fb.h" // per framebuffer_info_t in fbinfo
 #include "fs/ramfs.h" // RAMFS API
 #include "fs/vfs.h" // VFS API
+#include "driver_if.h" // driver space API
 #include <stdint.h>
 #include <stddef.h>
 
 #define MAX_COMMAND_LEN 256
-static char shell_cwd[RAMFS_NAME_MAX] = ""; // cwd vuota = root
+static char shell_cwd[RAMFS_NAME_MAX] = ""; // empty cwd = root
 static void path_print_cwd(void){ terminal_writestring(shell_cwd[0]?"/":"/"); if(shell_cwd[0]) terminal_writestring(shell_cwd); terminal_writestring("\n"); }
 static void path_resolve(const char* in, char* out){ if(in && in[0]=='/') in++; if(!in||!in[0]){ size_t i=0; while(shell_cwd[i]){ out[i]=shell_cwd[i]; i++; } out[i]=0; return; } const char* src=in; char temp[RAMFS_NAME_MAX]; size_t tp=0; if(shell_cwd[0]){ size_t i=0; while(shell_cwd[i]) temp[tp++]=shell_cwd[i++]; }
     char comp[RAMFS_NAME_MAX]; while(*src){ // salta duplicati '/'
@@ -44,7 +51,7 @@ static int strncmp(const char* s1, const char* s2, size_t n) {
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
-// Converti numero in stringa
+// Convert number to string
 static void itoa(uint64_t value, char* buffer, int base) {
     char temp[32];
     int i = 0;
@@ -68,7 +75,7 @@ static void itoa(uint64_t value, char* buffer, int base) {
     buffer[j] = '\0';
 }
 
-// Parse numero da stringa
+// Parse number from string
 static uint32_t atoi(const char* str) {
     uint32_t result = 0;
     while (*str >= '0' && *str <= '9') {
@@ -77,7 +84,7 @@ static uint32_t atoi(const char* str) {
     }
     return result;
 }
-// Forward declarations dei comandi mancanti (portati dalla versione precedente)
+// Forward declarations of missing commands (ported from previous version)
 static void cmd_help(void);
 static void cmd_clear(void);
 static void cmd_echo(const char* args);
@@ -91,11 +98,11 @@ void shell_ps_list(void); // forward per dispatcher
 typedef void (*shell_handler_t)(const char* args);
 struct shell_cmd { const char* name; shell_handler_t handler; };
 
-// Implementazioni comandi base (copiate da old/shell.c)
-// La tabella dei comandi viene definita piu' avanti; per help dinamico abbiamo bisogno di conoscerla.
-// Spostiamo la tabella prima della definizione di cmd_help.
+// Basic command implementations (copied from old version)
+// Command table defined early for dynamic help needs.
+// Table moved before cmd_help definition.
 
-// Forward declarations wrapper handler (definiti dopo)
+// Forward declarations wrapper handlers (defined later)
 static void sh_help(const char* a);
 static void sh_clear(const char* a);
 static void sh_echo(const char* a);
@@ -139,6 +146,8 @@ static void sh_rftruncate(const char* a);
 static void sh_vls(const char* a); static void sh_vcat(const char* a); static void sh_vinfo(const char* a); static void sh_vpwd(const char* a); static void sh_vmount(const char* a);
 static void sh_vcreate(const char* a); static void sh_vwrite(const char* a); static void sh_vtruncate2(const char* a);
 static void sh_ext2mount(const char* a);
+static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
+static void sh_drvtest(const char* a);
 #if ENABLE_RTC
 static void sh_date(const char* a);
 #endif
@@ -190,6 +199,11 @@ static const struct shell_cmd shell_cmds[] = {
     {"vwrite",    sh_vwrite},
     {"vtruncate", sh_vtruncate2},
     {"ext2mount", sh_ext2mount},
+    {"drvreg",    sh_drvreg},
+    {"drvunreg",  sh_drvunreg},
+    {"drvlog",    sh_drvlog},
+    {"drvinfo",   sh_drvinfo},
+    {"drvtest",   sh_drvtest},
     {"fontdump",  sh_fontdump},
     {"halt",      sh_halt},
     {"reboot",    sh_reboot},
@@ -200,23 +214,23 @@ static const struct shell_cmd shell_cmds[] = {
 
 static void cmd_help(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("\nComandi disponibili (auto):\n");
+    terminal_writestring("\nAvailable commands (auto):\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
     for (unsigned i=0;i<sizeof(shell_cmds)/sizeof(shell_cmds[0]); i++) {
         terminal_writestring("  ");
         terminal_writestring(shell_cmds[i].name);
         terminal_writestring("\n");
     }
-    terminal_writestring("\nNuovi: fbinfo (info framebuffer), color <fg> <bg> (cambia colori).\n");
+    terminal_writestring("\nNew: fbinfo (framebuffer info), color <fg> <bg> (change colors).\n");
     terminal_writestring("RAMFS: rfls rfcat rfinfo rfadd rfwrite rfdel\n");
     terminal_writestring("Dir: rfmkdir rfrmdir (rfls [path])\n");
     terminal_writestring("CWD: rfcd <dir>, rfpwd\n");
     terminal_writestring("Tree: rftree [path], rfusage\n");
     terminal_writestring("Mod: rfmv <old> <new>, rftruncate <file> <size>\n");
-    terminal_writestring("VFS: vls vcat vinfo vpwd (vmount root auto RAMFS)\n");
-    terminal_writestring("VFS Mod: vcreate vwrite vtruncate (file mutabili su FS supportato)\n");
-    terminal_writestring("EXT2: ext2mount (tenta mount dispositivo ext2ram)\n");
-    terminal_writestring("Digita 'help' per aggiornare dopo ulteriori aggiunte.\n\n");
+    terminal_writestring("VFS: vls vcat vinfo vpwd (root auto-mounted RAMFS)\n");
+    terminal_writestring("VFS Mod: vcreate vwrite vtruncate (mutable files on supported FS)\n");
+    terminal_writestring("EXT2: ext2mount (attempt mount ext2ram device)\n");
+    terminal_writestring("Type 'help' to refresh after further additions.\n\n");
 }
 
 static void cmd_clear(void) { terminal_initialize(); }
@@ -225,15 +239,15 @@ static void cmd_echo(const char* args) { if (*args) terminal_writestring(args); 
 
 static void cmd_info(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("\n=== Informazioni Sistema ===\n");
+    terminal_writestring("\n=== System Information ===\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    terminal_writestring("Nome:        SecOS Kernel\n");
-    terminal_writestring("Versione:    0.2.0\n");
-    terminal_writestring("Architettura: x86-64 (Long Mode)\n");
+    terminal_writestring("Name:        SecOS Kernel\n");
+    terminal_writestring("Version:     0.2.0\n");
+    terminal_writestring("Architecture: x86-64 (Long Mode)\n");
     terminal_writestring("Bootloader:  GRUB Multiboot\n");
     terminal_writestring("Timer:       PIT @ ");
     char freq_str[16]; itoa(timer_get_frequency(), freq_str, 10); terminal_writestring(freq_str); terminal_writestring(" Hz\n");
-    terminal_writestring("Tastiera:    PS/2 Driver\n");
+    terminal_writestring("Keyboard:    PS/2 Driver\n");
     terminal_writestring("Video:       VGA Text Mode 80x25\n\n");
 }
 
@@ -241,17 +255,17 @@ static void cmd_mem(void) { terminal_writestring("\n"); pmm_print_stats(); heap_
 
 static void cmd_memtest(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK));
-    terminal_writestring("\nTest allocazione memoria...\n");
+    terminal_writestring("\nMemory allocation test...\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    terminal_writestring("Test 1: Allocazione 256 bytes...\n");
+    terminal_writestring("Test 1: Allocating 256 bytes...\n");
     void* test_ptr = kmalloc(256);
-    if (!test_ptr) { terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK)); terminal_writestring("  [FAIL] Allocazione fallita\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); return; }
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK)); terminal_writestring("  [OK] Allocato\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    terminal_writestring("Test 2: Liberazione...\n"); kfree(test_ptr); terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK)); terminal_writestring("  [OK] Liberato\n");
-    terminal_writestring("\nTest 3: Allocazione 5 blocchi da 1KB...\n"); void* blocks[5]; for(int i=0;i<5;i++){ blocks[i]=kmalloc(1024); if(!blocks[i]){ terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK)); terminal_writestring("  [FAIL] Allocazione fallita\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); return; } }
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK)); terminal_writestring("  [OK] Tutti i blocchi allocati\n");
-    terminal_writestring("Test 4: Liberazione blocchi...\n"); for(int i=0;i<5;i++) kfree(blocks[i]); terminal_writestring("  [OK] Tutti i blocchi liberati\n");
-    terminal_writestring("\nTest completato con successo!\n\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
+    if (!test_ptr) { terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK)); terminal_writestring("  [FAIL] Allocation failed\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); return; }
+    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK)); terminal_writestring("  [OK] Allocated\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
+    terminal_writestring("Test 2: Freeing...\n"); kfree(test_ptr); terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK)); terminal_writestring("  [OK] Freed\n");
+    terminal_writestring("\nTest 3: Allocating 5 blocks of 1KB each...\n"); void* blocks[5]; for(int i=0;i<5;i++){ blocks[i]=kmalloc(1024); if(!blocks[i]){ terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK)); terminal_writestring("  [FAIL] Allocation failed\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); return; } }
+    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK)); terminal_writestring("  [OK] All blocks allocated\n");
+    terminal_writestring("Test 4: Freeing blocks...\n"); for(int i=0;i<5;i++) kfree(blocks[i]); terminal_writestring("  [OK] All blocks freed\n");
+    terminal_writestring("\nTest completed successfully!\n\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
 // Uptime
 static void cmd_uptime(void) {
@@ -268,13 +282,13 @@ static void cmd_uptime(void) {
     itoa(minutes, buffer, 10); terminal_writestring(buffer); terminal_writestring("m ");
     itoa(secs, buffer, 10); terminal_writestring(buffer); terminal_writestring("s\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK));
-    terminal_writestring("Tick totali: "); itoa(ticks, buffer, 10); terminal_writestring(buffer); terminal_writestring("\n\n");
+    terminal_writestring("Total ticks: "); itoa(ticks, buffer, 10); terminal_writestring(buffer); terminal_writestring("\n\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
 static void cmd_sleep(const char* args) {
     if (*args == '\0') {
         terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-        terminal_writestring("Uso: sleep <millisecondi>\n");
+    terminal_writestring("Usage: sleep <milliseconds>\n");
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
         return;
     }
@@ -283,14 +297,14 @@ static void cmd_sleep(const char* args) {
     
     if (ms == 0 || ms > 10000) {
         terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-        terminal_writestring("Valore non valido (1-10000 ms)\n");
+    terminal_writestring("Invalid value (1-10000 ms)\n");
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
         return;
     }
     
     char buffer[16];
     terminal_setcolor(vga_entry_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK));
-    terminal_writestring("Attendo ");
+    terminal_writestring("Waiting ");
     itoa(ms, buffer, 10);
     terminal_writestring(buffer);
     terminal_writestring(" ms...\n");
@@ -299,17 +313,17 @@ static void cmd_sleep(const char* args) {
     timer_sleep_ms(ms);
     
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("Fatto!\n");
+    terminal_writestring("Done!\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
 
 static void cmd_colors(void) {
-    terminal_writestring("\nTest colori VGA:\n");
-    
+    terminal_writestring("\nVGA color test:\n");
+
     const char* color_names[] = {
-        "Nero", "Blu", "Verde", "Ciano", "Rosso", "Magenta", "Marrone", "Grigio chiaro",
-        "Grigio scuro", "Blu chiaro", "Verde chiaro", "Ciano chiaro", 
-        "Rosso chiaro", "Magenta chiaro", "Giallo", "Bianco"
+        "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Brown", "Light grey",
+        "Dark grey", "Light blue", "Light green", "Light cyan", 
+        "Light red", "Light magenta", "Yellow", "White"
     };
     
     for (int i = 0; i < 16; i++) {
@@ -322,19 +336,19 @@ static void cmd_colors(void) {
     terminal_writestring("\n\n");
 }
 
-// (Vecchia versione execute_command rimossa; si usa implementazione finale in fondo al file)
+// (Old execute_command version removed; final implementation used at end of file)
 
 static void cmd_reboot(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK));
-    terminal_writestring("\nRiavvio del sistema...\n");
+    terminal_writestring("\nSystem reboot...\n");
     
-    // Riavvia usando la tastiera controller
+    // Reboot using keyboard controller
     uint8_t temp;
-    __asm__ volatile ("cli");  // Disabilita interrupt
+    __asm__ volatile ("cli");  // Disable interrupts
     
     do {
         __asm__ volatile ("inb $0x64, %0" : "=a"(temp));
-    } while (temp & 0x02);  // Attendi che il buffer sia vuoto
+    } while (temp & 0x02);  // Wait until buffer is empty
     
     __asm__ volatile ("outb %0, $0x64" : : "a"((uint8_t)0xFE));  // Pulse reset line
     
@@ -343,10 +357,10 @@ static void cmd_reboot(void) {
 
 static void cmd_halt(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK));
-    terminal_writestring("\nArresto del sistema...\n\n");
+    terminal_writestring("\nSystem halt...\n\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("Il sistema e' stato arrestato in sicurezza.\n");
-    terminal_writestring("E' possibile spegnere il computer.\n\n");
+    terminal_writestring("System halted safely.\n");
+    terminal_writestring("You can power off the machine.\n\n");
     
     // Disabilita interrupt
     __asm__ volatile ("cli");
@@ -357,7 +371,7 @@ static void cmd_halt(void) {
     
     // Se ACPI non funziona, entra in un loop HLT
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    terminal_writestring("(Se il sistema non si spegne automaticamente, premere il pulsante)\n");
+    terminal_writestring("(If the system does not power off automatically, press the power button)\n");
     
     while (1) {
         __asm__ volatile ("hlt");
@@ -365,14 +379,14 @@ static void cmd_halt(void) {
 }
 
 static void cmd_crash(const char* args) {
-    // Rimuovi spazi iniziali
+    // Strip leading spaces
     while (*args == ' ') args++;
     
     if (*args == '\0') {
         terminal_setcolor(vga_entry_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK));
-        terminal_writestring("\nUso: crash <tipo>\n");
+    terminal_writestring("\nUsage: crash <type>\n");
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-        terminal_writestring("Tipi disponibili:\n");
+    terminal_writestring("Available types:\n");
         terminal_writestring("  div0  - Division by zero (INT 0)\n");
         terminal_writestring("  pf    - Page Fault (INT 14)\n");
         terminal_writestring("  gpf   - General Protection Fault (INT 13)\n");
@@ -383,11 +397,11 @@ static void cmd_crash(const char* args) {
     }
     
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-    terminal_writestring("\n!!! ATTENZIONE: Generazione eccezione intenzionale !!!\n\n");
+    terminal_writestring("\n!!! WARNING: Intentional exception generation !!!\n\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
     
     if (strcmp(args, "div0") == 0) {
-        terminal_writestring("Generazione Division by Zero...\n");
+    terminal_writestring("Generating Division by Zero...\n");
         // Usa assembly per evitare ottimizzazioni
         __asm__ volatile (
             "mov $5, %%eax\n"
@@ -396,11 +410,11 @@ static void cmd_crash(const char* args) {
             ::: "eax", "ebx", "edx"
         );
     } else if (strcmp(args, "pf") == 0) {
-        terminal_writestring("Generazione Page Fault...\n");
+    terminal_writestring("Generating Page Fault...\n");
         uint64_t* ptr = (uint64_t*)0x5000000;  // Fuori memoria mappata
         *ptr = 42;
     } else if (strcmp(args, "gpf") == 0) {
-        terminal_writestring("Generazione General Protection Fault...\n");
+    terminal_writestring("Generating General Protection Fault...\n");
         // Carica un valore invalido nel registro DS
         __asm__ volatile (
             "mov $0x1234, %%ax\n"
@@ -408,51 +422,51 @@ static void cmd_crash(const char* args) {
             ::: "ax"
         );
     } else if (strcmp(args, "df") == 0) {
-        terminal_writestring("Generazione Double Fault...\n");
-        terminal_writestring("(Corrompo lo stack e causo un'eccezione)\n");
+    terminal_writestring("Generating Double Fault...\n");
+    terminal_writestring("(Corrupting stack and causing exception)\n");
         // Simulazione: forziamo un'istruzione invalida dopo manipolazione registro generale (evita clobber rsp warning)
         __asm__ volatile ("xor %%eax, %%eax; ud2" ::: "eax", "memory");
     } else if (strcmp(args, "inv") == 0) {
-        terminal_writestring("Generazione Invalid Opcode...\n");
+    terminal_writestring("Generating Invalid Opcode...\n");
         __asm__ volatile ("ud2");  // Undefined instruction
     } else if (strcmp(args, "stk") == 0) {
-        terminal_writestring("Generazione Stack Fault...\n");
-        // Genera fault simulato: forza uso di pagina non valida
-        volatile uint64_t* p = (uint64_t*)0x10; // indirizzo bassissimo non mappato in long mode
+    terminal_writestring("Generating Stack Fault...\n");
+    // Simulated fault: force use of an unmapped page
+    volatile uint64_t* p = (uint64_t*)0x10; // very low unmapped address in long mode
         *p = 0xDEADBEEF;
     } else {
         terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-        terminal_writestring("Tipo di crash non valido!\n");
-        terminal_writestring("Usa 'crash' senza argomenti per vedere i tipi disponibili.\n");
+    terminal_writestring("Invalid crash type!\n");
+    terminal_writestring("Use 'crash' with no args to see supported types.\n");
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
     }
 }
 
-// Stress test heap: forza molte allocazioni per testare espansione e coalescing
+// Stress test heap: perform many allocations to test expansion and coalescing
 static void cmd_memstress(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK));
-    terminal_writestring("\nAvvio memstress (allocazioni ripetute)...\n");
+    terminal_writestring("\nStarting memstress (repeated allocations)...\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 
-    const int small_count = 128; // blocchi piccoli
+    const int small_count = 128; // small blocks
     const size_t small_size = 64;
     void* small_ptrs[small_count];
 
-    // Allocazioni piccole per frammentare
+    // Small allocations to fragment
     int allocated_small = 0;
     for (int i=0; i<small_count; i++) {
         small_ptrs[i] = kmalloc(small_size);
         if (!small_ptrs[i]) break;
         allocated_small++;
     }
-    terminal_writestring("[memstress] Alloc piccoli: ");
+    terminal_writestring("[memstress] Small allocs: ");
     char buf[32];
     // Reuse itoa from above (itoa present globally) -> use base 10
     itoa(allocated_small, buf, 10);
     terminal_writestring(buf);
     terminal_writestring("\n");
 
-    // Allocazioni medie fino a forzare espansione (512 bytes)
+    // Medium allocations to force expansion (512 bytes)
     const int mid_cap = 64;
     void* mid_ptrs[mid_cap];
     int mid_count = 0;
@@ -462,17 +476,17 @@ static void cmd_memstress(void) {
         mid_count++;
     }
     itoa(mid_count, buf, 10);
-    terminal_writestring("[memstress] Alloc medie 512B: ");
+    terminal_writestring("[memstress] Medium allocs 512B: ");
     terminal_writestring(buf);
     terminal_writestring("\n");
 
-    // Libera un pattern alternato dei blocchi piccoli per testare coalescing
+    // Free alternating small blocks to test coalescing
     for (int i=0; i<allocated_small; i+=2) {
         kfree(small_ptrs[i]);
     }
-    terminal_writestring("[memstress] Liberati blocchi piccoli alternati\n");
+    terminal_writestring("[memstress] Freed alternating small blocks\n");
 
-    // Allocazioni grandi per spingere ulteriori espansioni (2048 bytes)
+    // Large allocations to push further expansion (2048 bytes)
     const int big_cap = 32;
     void* big_ptrs[big_cap];
     int big_count = 0;
@@ -482,24 +496,24 @@ static void cmd_memstress(void) {
         big_count++;
     }
     itoa(big_count, buf, 10);
-    terminal_writestring("[memstress] Alloc grandi 2KB: ");
+    terminal_writestring("[memstress] Large allocs 2KB: ");
     terminal_writestring(buf);
     terminal_writestring("\n");
 
-    // Libera tutto
-    for (int i=1; i<allocated_small; i+=2) kfree(small_ptrs[i]); // libera i rimanenti piccoli
+    // Free everything
+    for (int i=1; i<allocated_small; i+=2) kfree(small_ptrs[i]); // free remaining small blocks
     for (int i=0; i<mid_count; i++) kfree(mid_ptrs[i]);
     for (int i=0; i<big_count; i++) kfree(big_ptrs[i]);
-    terminal_writestring("[memstress] Liberati tutti i blocchi\n");
+    terminal_writestring("[memstress] Freed all blocks\n");
 
     heap_print_stats();
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("[memstress] Completato\n");
+    terminal_writestring("[memstress] Completed\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
 
 
-// Prompt della shell
+// Shell prompt
 static void show_prompt(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
     terminal_writestring("secos");
@@ -507,17 +521,17 @@ static void show_prompt(void) {
     terminal_writestring("$ ");
 }
 
-// Inizializza la shell
+// Initialize shell
 void shell_init(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
     terminal_writestring("\n==================================\n");
-    terminal_writestring("   Benvenuto in SecOS Shell!\n");
+    terminal_writestring("   Welcome to SecOS Shell!\n");
     terminal_writestring("==================================\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    terminal_writestring("\nDigita 'help' per vedere i comandi disponibili.\n\n");
+    terminal_writestring("\nType 'help' to see available commands.\n\n");
 }
 
-// Loop principale della shell
+// Main shell loop
 void shell_run(void) {
     char command[MAX_COMMAND_LEN];
     int pos = 0;
@@ -549,10 +563,10 @@ void shell_run(void) {
     }
 }
 
-// Implementazione corretta execute_command
-// --- Dispatcher tabellare ---
+// Correct execute_command implementation
+// --- Table-driven dispatcher ---
 
-// Wrappers per adattare funzioni esistenti che non prendono args o hanno firma diversa
+// Wrappers to adapt existing functions that do not take args or have different signatures
 static void sh_help(const char* a){ (void)a; cmd_help(); }
 static void sh_clear(const char* a){ (void)a; cmd_clear(); }
 static void sh_info(const char* a){ (void)a; cmd_info(); }
@@ -565,9 +579,9 @@ static void sh_fbinfo(const char* a){ (void)a;
 #if ENABLE_FB
     extern int fb_get_info(framebuffer_info_t* out);
     framebuffer_info_t info; 
-    if (!fb_get_info(&info)) { terminal_writestring("[FBINFO] Framebuffer non inizializzato\n"); return; }
+    if (!fb_get_info(&info)) { terminal_writestring("[FBINFO] Framebuffer not initialized\n"); return; }
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("\n[FBINFO] Parametri Framebuffer:\n");
+    terminal_writestring("\n[FBINFO] Framebuffer parameters:\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
     terminal_writestring("  addr="); print_hex(info.addr);
     terminal_writestring(" virt="); print_hex(info.virt_addr);
@@ -583,10 +597,10 @@ static void sh_fbinfo(const char* a){ (void)a;
         terminal_writestring(" B(size="); print_dec(info.blue_mask_size); terminal_writestring(" pos="); print_dec(info.blue_mask_pos); terminal_writestring(")\n");
     }
 #else
-    terminal_writestring("[FBINFO] Framebuffer disabilitato in configurazione\n");
+    terminal_writestring("[FBINFO] Framebuffer disabled in configuration\n");
 #endif
 }
-// Implementazione comando color: color <fg> <bg> nomi o numeri
+// Implement color command: color <fg> <bg> names or numbers
 static int parse_color_token(const char* s){
     if(!s||!*s) return -1;
     int v=0; int digits=0; const char* p=s; while(*p>='0'&&*p<='9'){ v=v*10+(*p-'0'); p++; digits++; }
@@ -603,10 +617,10 @@ static int parse_color_token(const char* s){
 }
 static void sh_color(const char* args){
     while(*args==' ') args++;
-    if(!*args){ terminal_writestring("Uso: color <fg> <bg> | color list | color <fg> <bg> clear\n"); return; }
+    if(!*args){ terminal_writestring("Usage: color <fg> <bg> | color list | color <fg> <bg> clear\n"); return; }
     // Supporta 'list'
     if(args[0]=='l'&&args[1]=='i'&&args[2]=='s'&&args[3]=='t'&& (args[4]=='\0'||args[4]==' ')){
-        terminal_writestring("Lista colori (fg/bg):\n");
+    terminal_writestring("Color list (fg/bg):\n");
         const char* names[]={"black","blue","green","cyan","red","magenta","brown","grey","darkgrey","lightblue","lightgreen","lightcyan","lightred","lightmagenta","yellow","white"};
         for(int i=0;i<16;i++){ terminal_writestring("  "); print_dec(i); terminal_writestring(" = "); terminal_writestring(names[i]); terminal_writestring("\n"); }
         return;
@@ -614,15 +628,15 @@ static void sh_color(const char* args){
     char fg_tok[16]; char bg_tok[16]; int i=0;
     while(*args && *args!=' ' && i<15){ fg_tok[i++]=*args++; } fg_tok[i]='\0';
     while(*args==' ') args++; i=0; while(*args && *args!=' ' && i<15){ bg_tok[i++]=*args++; } bg_tok[i]='\0';
-    if(bg_tok[0]=='\0'){ terminal_writestring("Uso: color <fg> <bg>\n"); return; }
+    if(bg_tok[0]=='\0'){ terminal_writestring("Usage: color <fg> <bg>\n"); return; }
     int fg = parse_color_token(fg_tok);
     int bg = parse_color_token(bg_tok);
-    if(fg<0||fg>15||bg<0||bg>15){ terminal_writestring("Colore non valido\n"); return; }
+    if(fg<0||fg>15||bg<0||bg>15){ terminal_writestring("Invalid color\n"); return; }
     // Registra come colore utente persistente
     extern void terminal_setcolor(uint8_t color); extern void terminal_restore_user_color(void);
     terminal_setcolor(vga_entry_color((enum vga_color)fg,(enum vga_color)bg));
     extern uint8_t user_fg; extern uint8_t user_bg; extern int user_color_set; user_fg=fg; user_bg=bg; user_color_set=1;
-    // Opzionale 'clear' per ridisegnare sfondo
+    // Optional 'clear' to redraw background
     while(*args==' ') args++;
     int do_clear = 0;
     if(args[0]=='c'&&args[1]=='l'&&args[2]=='e'&&args[3]=='a'&&args[4]=='r'&& (args[5]=='\0'||args[5]==' ')) do_clear=1;
@@ -647,13 +661,13 @@ static void sh_color(const char* args){
 #endif
     }
 }
-// Comando cursor on|off (solo underline blink per ora)
+// Command cursor on|off (underline blink only for now)
 static void sh_cursor(const char* a){
     while(*a==' ') a++;
-    if(!*a){ terminal_writestring("Uso: cursor on|off\n"); return; }
+    if(!*a){ terminal_writestring("Usage: cursor on|off\n"); return; }
     if(a[0]=='o' && a[1]=='n' && (a[2]=='\0' || a[2]==' ')){
         extern int fb_console_enable_cursor_blink(uint32_t timer_freq);
-        if (fb_console_enable_cursor_blink(timer_get_frequency())==0) terminal_writestring("Cursor blink ON\n"); else terminal_writestring("[cursor] impossibile abilitarlo\n");
+        if (fb_console_enable_cursor_blink(timer_get_frequency())==0) terminal_writestring("Cursor blink ON\n"); else terminal_writestring("[cursor] unable to enable\n");
         return;
     }
     if(a[0]=='o' && a[1]=='f' && a[2]=='f' && (a[3]=='\0' || a[3]==' ')){
@@ -662,18 +676,18 @@ static void sh_cursor(const char* a){
         terminal_writestring("Cursor blink OFF\n");
         return;
     }
-    terminal_writestring("Uso: cursor on|off\n");
+    terminal_writestring("Usage: cursor on|off\n");
 }
 
-// Comando dbuf on|off|flush
+// Command dbuf on|off|flush
 static void sh_dbuf(const char* a){
     while(*a==' ') a++;
-    if(!*a){ terminal_writestring("Uso: dbuf on|off|flush|auto|manual\n"); return; }
+    if(!*a){ terminal_writestring("Usage: dbuf on|off|flush|auto|manual\n"); return; }
 #if ENABLE_FB
     if(a[0]=='o'&&a[1]=='n'&&(a[2]=='\0'||a[2]==' ')){
-        extern int fb_console_enable_dbuf(void); if(fb_console_enable_dbuf()==0) terminal_writestring("[dbuf] abilitato\n"); else terminal_writestring("[dbuf] FAIL alloc\n"); return; }
+        extern int fb_console_enable_dbuf(void); if(fb_console_enable_dbuf()==0) terminal_writestring("[dbuf] enabled\n"); else terminal_writestring("[dbuf] FAIL alloc\n"); return; }
     if(a[0]=='o'&&a[1]=='f'&&a[2]=='f'&&(a[3]=='\0'||a[3]==' ')){
-        extern void fb_console_disable_dbuf(void); fb_console_disable_dbuf(); terminal_writestring("[dbuf] disabilitato\n"); return; }
+        extern void fb_console_disable_dbuf(void); fb_console_disable_dbuf(); terminal_writestring("[dbuf] disabled\n"); return; }
     if(a[0]=='f'&&a[1]=='l'&&a[2]=='u'&&a[3]=='s'&&a[4]=='h'&&(a[5]=='\0'||a[5]==' ')){
         extern void fb_console_flush(void); fb_console_flush(); terminal_writestring("[dbuf] flush\n"); return; }
     if(a[0]=='a'&&a[1]=='u'&&a[2]=='t'&&a[3]=='o'&&(a[4]=='\0'||a[4]==' ')){
@@ -681,28 +695,28 @@ static void sh_dbuf(const char* a){
     if(a[0]=='m'&&a[1]=='a'&&a[2]=='n'&&a[3]=='u'&&a[4]=='a'&&a[5]=='l'&&(a[6]=='\0'||a[6]==' ')){
         extern void fb_console_set_dbuf_auto(int on); fb_console_set_dbuf_auto(0); terminal_writestring("[dbuf] auto flush OFF\n"); return; }
 #endif
-    terminal_writestring("Uso: dbuf on|off|flush|auto|manual\n");
+    terminal_writestring("Usage: dbuf on|off|flush|auto|manual\n");
 }
-// Comando fontdump <char>
+// Command fontdump <char>
 static void sh_fontdump(const char* a){
     while(*a==' ') a++;
-    if(!*a){ terminal_writestring("Uso: fontdump <char>\n"); return; }
+    if(!*a){ terminal_writestring("Usage: fontdump <char>\n"); return; }
 #if ENABLE_FB
     extern void fb_console_fontdump(char c); fb_console_fontdump(a[0]);
 #else
-    terminal_writestring("[fontdump] framebuffer non abilitato\n");
+    terminal_writestring("[fontdump] framebuffer not enabled\n");
 #endif
 }
 static void sh_logo(const char* a){
     while(*a==' ') a++;
-    if(!*a){ terminal_writestring("Uso: logo on|off|redraw\n"); return; }
+    if(!*a){ terminal_writestring("Usage: logo on|off|redraw\n"); return; }
 #if ENABLE_FB
     if(a[0]=='o'&&a[1]=='n'&&(a[2]=='\0'||a[2]==' ')){
         extern void fb_console_draw_logo(void); fb_console_draw_logo();
         extern void fb_console_flush(void); fb_console_flush();
-        terminal_writestring("[logo] ridisegnato\n"); return; }
+        terminal_writestring("[logo] redrawn\n"); return; }
     if(a[0]=='o'&&a[1]=='f'&&a[2]=='f'&&(a[3]=='\0'||a[3]==' ')){
-        // Pulisci area logo (rectangle top-right) assumendo stessa dimensione usata nel draw
+        // Clear logo area (rectangle top-right) assuming same dimension used in draw
         framebuffer_info_t info; if(fb_get_info(&info)){
             uint8_t* base=(uint8_t*)(uint64_t)(info.virt_addr?info.virt_addr:info.addr);
             int letter_w=12, letter_h=20, spacing=4, len=5; int total_w=len*letter_w+(len-1)*spacing; int start_x=info.width - total_w - 8; int start_y=4; int w=total_w; int h=letter_h;
@@ -713,43 +727,43 @@ static void sh_logo(const char* a){
             }
             extern void fb_console_flush(void); fb_console_flush();
         }
-        terminal_writestring("[logo] nascosto\n"); return; }
+        terminal_writestring("[logo] hidden\n"); return; }
     if(a[0]=='r'&&a[1]=='e'&&a[2]=='d'&&a[3]=='r'&&a[4]=='a'&&a[5]=='w'&&(a[6]=='\0'||a[6]==' ')){
         extern void fb_console_draw_logo(void); fb_console_draw_logo(); extern void fb_console_flush(void); fb_console_flush(); terminal_writestring("[logo] redraw\n"); return; }
 #else
-    terminal_writestring("[logo] framebuffer non abilitato\n"); return;
+    terminal_writestring("[logo] framebuffer not enabled\n"); return;
 #endif
-    terminal_writestring("Uso: logo on|off|redraw\n");
+    terminal_writestring("Usage: logo on|off|redraw\n");
 }
 // RAMFS: lista file
 static void sh_rfls(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else path_resolve("",abs); const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n; if(abs[0]==0){ n=ramfs_list_path("",arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS root ("); } else { n=ramfs_list_path(abs,arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS list '"); terminal_writestring(abs); terminal_writestring("' ("); } print_dec(n); terminal_writestring("):\n"); for(size_t i=0;i<n;i++){ const ramfs_entry_t* e=arr[i]; terminal_writestring("  "); terminal_writestring(e->name); if(e->flags & 2) terminal_writestring("/ "); else terminal_writestring("  "); print_dec(e->size); terminal_writestring(" bytes\n"); } }
 // RAMFS: crea directory
-static void sh_rfmkdir(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfmkdir <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); if(ramfs_mkdir(abs)==0) terminal_writestring("[rfmkdir] OK\n"); else terminal_writestring("[rfmkdir] FAIL\n"); }
+static void sh_rfmkdir(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfmkdir <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); if(ramfs_mkdir(abs)==0) terminal_writestring("[rfmkdir] OK\n"); else terminal_writestring("[rfmkdir] FAIL\n"); }
 // RAMFS: rimuovi directory (vuota)
-static void sh_rfrmdir(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfrmdir <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); if(ramfs_rmdir(abs)==0) terminal_writestring("[rfrmdir] OK\n"); else terminal_writestring("[rfrmdir] FAIL (non vuota / inesistente)\n"); }
+static void sh_rfrmdir(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfrmdir <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); if(ramfs_rmdir(abs)==0) terminal_writestring("[rfrmdir] OK\n"); else terminal_writestring("[rfrmdir] FAIL (not empty / missing)\n"); }
 // RAMFS: cat file
-static void sh_rfcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfcat <nome>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); const ramfs_entry_t* e = ramfs_find(abs); if(!e){ terminal_writestring("[rfcat] file non trovato\n"); return; }
+static void sh_rfcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfcat <name>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); const ramfs_entry_t* e = ramfs_find(abs); if(!e){ terminal_writestring("[rfcat] file not found\n"); return; }
     for(size_t i=0;i<e->size;i++) terminal_putchar((char)e->data[i]);
-    if(e->size==0) terminal_writestring("[rfcat] (vuoto)\n");
+    if(e->size==0) terminal_writestring("[rfcat] (empty)\n");
 }
 // RAMFS: info file
-static void sh_rfinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfinfo <nome>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); const ramfs_entry_t* e = ramfs_find(abs); if(!e){ terminal_writestring("[rfinfo] file non trovato\n"); return; }
-    terminal_writestring("Nome: "); terminal_writestring(e->name); terminal_writestring("\nSize: "); print_dec(e->size); terminal_writestring(" bytes\n");
-    // Mostra prime 32 bytes hex
-    terminal_writestring("Primi bytes: "); size_t show = e->size < 32 ? e->size : 32; for(size_t i=0;i<show;i++){ uint8_t b=e->data[i]; char hx[]="0123456789ABCDEF"; terminal_putchar(hx[b>>4]); terminal_putchar(hx[b&0xF]); terminal_putchar(' '); } terminal_writestring("\n");
+static void sh_rfinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfinfo <name>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); const ramfs_entry_t* e = ramfs_find(abs); if(!e){ terminal_writestring("[rfinfo] file not found\n"); return; }
+    terminal_writestring("Name: "); terminal_writestring(e->name); terminal_writestring("\nSize: "); print_dec(e->size); terminal_writestring(" bytes\n");
+    // Show first 32 bytes hex
+    terminal_writestring("First bytes: "); size_t show = e->size < 32 ? e->size : 32; for(size_t i=0;i<show;i++){ uint8_t b=e->data[i]; char hx[]="0123456789ABCDEF"; terminal_putchar(hx[b>>4]); terminal_putchar(hx[b&0xF]); terminal_putchar(' '); } terminal_writestring("\n");
 }
 // RAMFS: aggiungi file (rfadd nome contenuto)
-static void sh_rfadd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfadd <nome> <contenuto>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(name[0]==0){ terminal_writestring("[rfadd] nome vuoto\n"); return; } if(!*a){ terminal_writestring("[rfadd] contenuto mancante\n"); return; } size_t len=0; while(a[len]) len++; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_find(abs)){ terminal_writestring("[rfadd] esiste gia'\n"); return; } if(ramfs_add(abs,a,len)==0){ terminal_writestring("[rfadd] OK\n"); } else terminal_writestring("[rfadd] FAIL\n"); }
+static void sh_rfadd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfadd <name> <content>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(name[0]==0){ terminal_writestring("[rfadd] empty name\n"); return; } if(!*a){ terminal_writestring("[rfadd] missing content\n"); return; } size_t len=0; while(a[len]) len++; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_find(abs)){ terminal_writestring("[rfadd] already exists\n"); return; } if(ramfs_add(abs,a,len)==0){ terminal_writestring("[rfadd] OK\n"); } else terminal_writestring("[rfadd] FAIL\n"); }
 // RAMFS: scrivi (rfwrite nome offset dati)
-static void sh_rfwrite(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfwrite <nome> <offset> <dati>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(name[0]==0){ terminal_writestring("[rfwrite] nome vuoto\n"); return; } uint64_t off=0; if(*a<'0'||*a>'9'){ terminal_writestring("[rfwrite] offset mancante\n"); return; } while(*a>='0'&&*a<='9'){ off = off*10 + (*a-'0'); a++; } while(*a==' ') a++; if(!*a){ terminal_writestring("[rfwrite] dati mancanti\n"); return; } const char* data_str=a; size_t len=0; while(data_str[len]) len++; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); int written = ramfs_write(abs,(size_t)off,data_str,len); if(written>=0){ terminal_writestring("[rfwrite] scritto "); print_dec(written); terminal_writestring(" bytes\n"); } else terminal_writestring("[rfwrite] FAIL\n"); }
+static void sh_rfwrite(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfwrite <name> <offset> <data>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(name[0]==0){ terminal_writestring("[rfwrite] empty name\n"); return; } uint64_t off=0; if(*a<'0'||*a>'9'){ terminal_writestring("[rfwrite] missing offset\n"); return; } while(*a>='0'&&*a<='9'){ off = off*10 + (*a-'0'); a++; } while(*a==' ') a++; if(!*a){ terminal_writestring("[rfwrite] missing data\n"); return; } const char* data_str=a; size_t len=0; while(data_str[len]) len++; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); int written = ramfs_write(abs,(size_t)off,data_str,len); if(written>=0){ terminal_writestring("[rfwrite] wrote "); print_dec(written); terminal_writestring(" bytes\n"); } else terminal_writestring("[rfwrite] FAIL\n"); }
 // RAMFS: elimina file (rfdel nome)
-static void sh_rfdel(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfdel <nome>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_remove(abs)==0){ terminal_writestring("[rfdel] OK\n"); } else terminal_writestring("[rfdel] FAIL (immutabile o inesistente)\n"); }
+static void sh_rfdel(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfdel <name>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_remove(abs)==0){ terminal_writestring("[rfdel] OK\n"); } else terminal_writestring("[rfdel] FAIL (immutable or missing)\n"); }
 // RAMFS: rename
-static void sh_rfmv(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfmv <old> <new>\n"); return; } char oldn[RAMFS_NAME_MAX]; size_t oi=0; while(a[0] && a[0]!=' ' && oi<RAMFS_NAME_MAX-1){ oldn[oi++]=*a++; } oldn[oi]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[rfmv] nuovo nome mancante\n"); return; } char newn[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ newn[ni++]=*a++; } newn[ni]=0; char old_abs[RAMFS_NAME_MAX]; char new_abs[RAMFS_NAME_MAX]; path_resolve(oldn,old_abs); path_resolve(newn,new_abs); if(ramfs_rename(old_abs,new_abs)==0) terminal_writestring("[rfmv] OK\n"); else terminal_writestring("[rfmv] FAIL\n"); }
+static void sh_rfmv(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfmv <old> <new>\n"); return; } char oldn[RAMFS_NAME_MAX]; size_t oi=0; while(a[0] && a[0]!=' ' && oi<RAMFS_NAME_MAX-1){ oldn[oi++]=*a++; } oldn[oi]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[rfmv] missing new name\n"); return; } char newn[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ newn[ni++]=*a++; } newn[ni]=0; char old_abs[RAMFS_NAME_MAX]; char new_abs[RAMFS_NAME_MAX]; path_resolve(oldn,old_abs); path_resolve(newn,new_abs); if(ramfs_rename(old_abs,new_abs)==0) terminal_writestring("[rfmv] OK\n"); else terminal_writestring("[rfmv] FAIL\n"); }
 // RAMFS: truncate
-static void sh_rftruncate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rftruncate <file> <size>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[rftruncate] size mancante\n"); return; } uint64_t sz=0; while(*a>='0'&&*a<='9'){ sz=sz*10+(*a-'0'); a++; } char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_truncate(abs,(size_t)sz)==0) terminal_writestring("[rftruncate] OK\n"); else terminal_writestring("[rftruncate] FAIL\n"); }
+static void sh_rftruncate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rftruncate <file> <size>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[rftruncate] missing size\n"); return; } uint64_t sz=0; while(*a>='0'&&*a<='9'){ sz=sz*10+(*a-'0'); a++; } char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_truncate(abs,(size_t)sz)==0) terminal_writestring("[rftruncate] OK\n"); else terminal_writestring("[rftruncate] FAIL\n"); }
 // RAMFS: cambia directory corrente
-static void sh_rfcd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: rfcd <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); int d=ramfs_is_dir(abs); if(d==1){ size_t i=0; while(abs[i] && i<RAMFS_NAME_MAX-1){ shell_cwd[i]=abs[i]; i++; } shell_cwd[i]=0; terminal_writestring("[rfcd] OK\n"); } else if(d==0){ terminal_writestring("[rfcd] non directory\n"); } else terminal_writestring("[rfcd] inesistente\n"); }
+static void sh_rfcd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfcd <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); int d=ramfs_is_dir(abs); if(d==1){ size_t i=0; while(abs[i] && i<RAMFS_NAME_MAX-1){ shell_cwd[i]=abs[i]; i++; } shell_cwd[i]=0; terminal_writestring("[rfcd] OK\n"); } else if(d==0){ terminal_writestring("[rfcd] not a directory\n"); } else terminal_writestring("[rfcd] not found\n"); }
 // RAMFS: mostra working directory
 static void sh_rfpwd(const char* a){ (void)a; terminal_writestring("CWD: "); path_print_cwd(); }
 // RAMFS: stampa albero ricorsivo
@@ -763,27 +777,81 @@ static void rftree_print(const char* path,int depth){ const ramfs_entry_t* arr[R
         if(e->flags & 2){ terminal_writestring("/\n"); rftree_print(e->name, depth+1); }
         else { terminal_writestring("  "); print_dec(e->size); terminal_writestring(" bytes\n"); }
     } }
-static void sh_rftree(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else abs[0]=0; if(abs[0] && ramfs_is_dir(abs)!=1){ terminal_writestring("[rftree] non directory\n"); return; } terminal_writestring("[rftree] struttura:\n"); rftree_print(abs,0); }
+static void sh_rftree(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else abs[0]=0; if(abs[0] && ramfs_is_dir(abs)!=1){ terminal_writestring("[rftree] not a directory\n"); return; } terminal_writestring("[rftree] tree:\n"); rftree_print(abs,0); }
 // RAMFS: uso totale
 static void sh_rfusage(const char* a){ (void)a; const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n = ramfs_list(arr,RAMFS_MAX_FILES); size_t bytes=0; size_t files=0; size_t dirs=0; for(size_t i=0;i<n;i++){ if(arr[i]->flags & 2) dirs++; else { files++; bytes += arr[i]->size; } } terminal_writestring("[rfusage] files="); print_dec(files); terminal_writestring(" dirs="); print_dec(dirs); terminal_writestring(" total_bytes="); print_dec(bytes); terminal_writestring(" slots_used="); print_dec(n); terminal_writestring(" slots_free="); print_dec(RAMFS_MAX_FILES - n); terminal_writestring("\n"); }
 // ---- VFS commands ----
-static void sh_vls(const char* a){ while(*a==' ') a++; char path[256]; size_t pi=0; while(*a && pi<sizeof(path)-1) path[pi++]=*a++; path[pi]=0; if(pi==0){ path[0]='/'; path[1]=0; } extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*); extern vfs_inode_t* vfs_lookup(const char*); struct ctx { int count; }; struct ctx c; c.count=0; vfs_inode_t* dir = vfs_lookup(path); if(dir && dir->type!=VFS_NODE_DIR){ terminal_writestring("[vls] non directory\n"); return; } terminal_writestring("[vls] "); terminal_writestring(path); terminal_writestring("\n");
-    void cb(const vfs_inode_t* child, void* user){ (void)user; terminal_writestring("  "); terminal_writestring(child->path); if(child->type==VFS_NODE_DIR) terminal_writestring("/\n"); else { terminal_writestring("  "); print_dec(child->size); terminal_writestring(" bytes\n"); } }
-    vfs_readdir(path, cb, &c);
+static void vls_cb(const vfs_inode_t* child, void* user){
+    (void)user;
+    terminal_writestring("  ");
+    terminal_writestring(child->path);
+    if(child->type==VFS_NODE_DIR){
+        terminal_writestring("/\n");
+    } else {
+        terminal_writestring("  ");
+        print_dec(child->size);
+        terminal_writestring(" bytes\n");
+    }
 }
-static void sh_vcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vcat <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_read_all(const char*, void*, size_t); vfs_inode_t* ino=vfs_lookup(a); if(!ino || ino->type!=VFS_NODE_FILE){ terminal_writestring("[vcat] file non trovato\n"); return; } char buf[1024]; if(ino->size >= sizeof(buf)){ terminal_writestring("[vcat] file troppo grande per buffer\n"); return; } int r=vfs_read_all(a,buf,sizeof(buf)); if(r<0){ terminal_writestring("[vcat] read fail\n"); return; } for(int i=0;i<r;i++) terminal_putchar(buf[i]); if(r==0) terminal_writestring("(vuoto)\n"); }
-static void sh_vinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vinfo <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* ino=vfs_lookup(a); if(!ino){ terminal_writestring("[vinfo] non trovato\n"); return; } terminal_writestring("Path: "); terminal_writestring(ino->path); terminal_writestring("\nTipo: "); terminal_writestring(ino->type==VFS_NODE_DIR?"DIR":"FILE"); terminal_writestring("\nSize: "); print_dec(ino->size); terminal_writestring(" bytes\n"); }
-static void sh_vpwd(const char* a){ (void)a; terminal_writestring("(vpwd usa RAMFS CWD) "); path_print_cwd(); }
-static void sh_vmount(const char* a){ (void)a; terminal_writestring("[vmount] root gia' montato (RAMFS)\n"); }
-static void sh_vcreate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vcreate <path> <contenuto>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[vcreate] contenuto mancante\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_create(const char*, const void*, size_t); if(vfs_create(name,data,len)==0) terminal_writestring("[vcreate] OK\n"); else terminal_writestring("[vcreate] FAIL\n"); }
-static void sh_vwrite(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vwrite <path> <offset> <dati>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vwrite] offset mancante\n"); return; } size_t off=0; while(*a>='0'&&*a<='9'){ off=off*10+(*a-'0'); a++; } while(*a==' ') a++; if(!*a){ terminal_writestring("[vwrite] dati mancanti\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_write(const char*, size_t, const void*, size_t); int r=vfs_write(name,off,data,len); if(r>=0){ terminal_writestring("[vwrite] scritto "); print_dec(r); terminal_writestring(" bytes\n"); } else terminal_writestring("[vwrite] FAIL\n"); }
-static void sh_vtruncate2(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: vtruncate <path> <size>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vtruncate] size mancante\n"); return; } size_t sz=0; while(*a>='0'&&*a<='9'){ sz=sz*10+(*a-'0'); a++; } extern int vfs_truncate(const char*, size_t); if(vfs_truncate(name,sz)==0) terminal_writestring("[vtruncate] OK\n"); else terminal_writestring("[vtruncate] FAIL\n"); }
-static void sh_ext2mount(const char* a){ (void)a; extern int ext2_mount(const char* dev_name); if(ext2_mount("ext2ram")==0) terminal_writestring("[ext2mount] EXT2 montato come root (stub)\n"); else terminal_writestring("[ext2mount] mount fallito\n"); }
+static void sh_vls(const char* a){ while(*a==' ') a++; char path[256]; size_t pi=0; while(*a && pi<sizeof(path)-1) path[pi++]=*a++; path[pi]=0; if(pi==0){ path[0]='/'; path[1]=0; } extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*); extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* dir = vfs_lookup(path); if(dir && dir->type!=VFS_NODE_DIR){ terminal_writestring("[vls] not a directory\n"); return; } terminal_writestring("[vls] "); terminal_writestring(path); terminal_writestring("\n"); vfs_readdir(path, vls_cb, NULL); }
+static void sh_vcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vcat <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_read_all(const char*, void*, size_t); vfs_inode_t* ino=vfs_lookup(a); if(!ino || ino->type!=VFS_NODE_FILE){ terminal_writestring("[vcat] file not found\n"); return; } char buf[1024]; if(ino->size >= sizeof(buf)){ terminal_writestring("[vcat] file too large for buffer\n"); return; } int r=vfs_read_all(a,buf,sizeof(buf)); if(r<0){ terminal_writestring("[vcat] read fail\n"); return; } for(int i=0;i<r;i++) terminal_putchar(buf[i]); if(r==0) terminal_writestring("(empty)\n"); }
+static void sh_vinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vinfo <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* ino=vfs_lookup(a); if(!ino){ terminal_writestring("[vinfo] not found\n"); return; } terminal_writestring("Path: "); terminal_writestring(ino->path); terminal_writestring("\nType: "); terminal_writestring(ino->type==VFS_NODE_DIR?"DIR":"FILE"); terminal_writestring("\nSize: "); print_dec(ino->size); terminal_writestring(" bytes\n"); }
+static void sh_vpwd(const char* a){ (void)a; terminal_writestring("(vpwd uses RAMFS CWD) "); path_print_cwd(); }
+static void sh_vmount(const char* a){ (void)a; terminal_writestring("[vmount] root already mounted (RAMFS)\n"); }
+static void sh_vcreate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vcreate <path> <content>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[vcreate] missing content\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_create(const char*, const void*, size_t); if(vfs_create(name,data,len)==0) terminal_writestring("[vcreate] OK\n"); else terminal_writestring("[vcreate] FAIL\n"); }
+static void sh_vwrite(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vwrite <path> <offset> <data>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vwrite] missing offset\n"); return; } size_t off=0; while(*a>='0'&&*a<='9'){ off=off*10+(*a-'0'); a++; } while(*a==' ') a++; if(!*a){ terminal_writestring("[vwrite] missing data\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_write(const char*, size_t, const void*, size_t); int r=vfs_write(name,off,data,len); if(r>=0){ terminal_writestring("[vwrite] wrote "); print_dec(r); terminal_writestring(" bytes\n"); } else terminal_writestring("[vwrite] FAIL\n"); }
+static void sh_vtruncate2(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vtruncate <path> <size>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vtruncate] missing size\n"); return; } size_t sz=0; while(*a>='0'&&*a<='9'){ sz=sz*10+(*a-'0'); a++; } extern int vfs_truncate(const char*, size_t); if(vfs_truncate(name,sz)==0) terminal_writestring("[vtruncate] OK\n"); else terminal_writestring("[vtruncate] FAIL\n"); }
+static void sh_ext2mount(const char* a){ (void)a; extern int ext2_mount(const char* dev_name); if(ext2_mount("ext2ram")==0) terminal_writestring("[ext2mount] EXT2 mounted as root (stub)\n"); else terminal_writestring("[ext2mount] mount failed\n"); }
+// --- Driver space commands ---
+static void sh_drvreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev = dev*10 + (*a-'0'); a++; } extern int driver_register_binding(process_t*, int); extern const device_desc_t* driver_get_device(int); extern process_t* sched_get_current(void); extern process_t* process_get_last(void);
+    process_t* target = sched_get_current(); if(!target){ // fallback: last created process
+        target = process_get_last();
+        if(target){ terminal_writestring("[drvreg] (fallback: using last process, no current)\n"); }
+    }
+    if(!target){ terminal_writestring("[drvreg] no process: run 'elfload' first\n"); return; }
+    if(!driver_get_device(dev)){ terminal_writestring("[drvreg] device not found\n"); return; }
+    int r = driver_register_binding(target, dev); if(r==DRV_OK) terminal_writestring("[drvreg] OK\n"); else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvreg] FAIL device\n"); else if(r==DRV_ERR_PERM) terminal_writestring("[drvreg] FAIL no slot\n"); else terminal_writestring("[drvreg] FAIL\n"); }
+static void sh_drvunreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvunreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev=dev*10+(*a-'0'); a++; } extern int driver_remove_binding(process_t*, int); extern process_t* sched_get_current(void); extern process_t* process_get_last(void); process_t* target = sched_get_current(); if(!target) target = process_get_last(); if(!target){ terminal_writestring("[drvunreg] no process (create with elfload)\n"); return; } int r=driver_remove_binding(target, dev); if(r==DRV_OK) terminal_writestring("[drvunreg] OK (removed)\n"); else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvunreg] FAIL binding not found\n"); else terminal_writestring("[drvunreg] FAIL\n"); }
+static void sh_drvlog(const char* a){
+    extern int driver_audit_dump(driver_audit_entry_t*, int);
+    int only_errors=0; int filter_dev=-1; int filter_op=-1; int limit=32;
+    // Simple parsing: space separated tokens: errors dev=ID op=OP limit=N
+    const char* s=a; while(*s==' ') s++; char token[32];
+    while(*s){ while(*s==' ') s++; int ti=0; while(*s && *s!=' ' && ti< (int)sizeof(token)-1){ token[ti++]=*s++; } token[ti]=0; if(ti==0) break;
+        if(strcmp(token,"errors")==0) only_errors=1; else if(strncmp(token,"dev=",4)==0){ filter_dev=0; const char* p=token+4; while(*p>='0'&&*p<='9'){ filter_dev = filter_dev*10 + (*p-'0'); p++; } }
+        else if(strncmp(token,"op=",3)==0){ filter_op=0; const char* p=token+3; while(*p>='0'&&*p<='9'){ filter_op = filter_op*10 + (*p-'0'); p++; } }
+        else if(strncmp(token,"limit=",6)==0){ limit=0; const char* p=token+6; while(*p>='0'&&*p<='9'){ limit = limit*10 + (*p-'0'); p++; } if(limit<=0) limit=32; if(limit>128) limit=128; }
+    }
+    if(limit>128) limit=128;
+    driver_audit_entry_t buf[128]; int n = driver_audit_dump(buf, limit);
+    if(n==0){ terminal_writestring("[drvlog] (empty)\n"); return; }
+    terminal_writestring("[drvlog] events (filtered):\n");
+    int shown=0;
+    for(int i=0;i<n;i++){
+        driver_audit_entry_t* e=&buf[i];
+        if(only_errors && e->result==DRV_OK) continue;
+        if(filter_dev!=-1 && e->device_id!=filter_dev) continue;
+        if(filter_op!=-1 && e->opcode!=filter_op) continue;
+        terminal_writestring("  pid="); print_dec(e->pid);
+        terminal_writestring(" dev="); print_dec(e->device_id);
+        terminal_writestring(" op="); print_dec(e->opcode);
+        terminal_writestring(" res="); print_dec(e->result);
+        terminal_writestring(" tgt="); print_hex(e->target);
+        terminal_writestring(" val="); print_hex(e->value);
+        terminal_writestring(" flags="); print_hex(e->flags);
+        terminal_writestring(" tick="); print_dec(e->tick);
+        terminal_writestring("\n");
+        shown++;
+    }
+    if(shown==0){ terminal_writestring("[drvlog] no events after filters\n"); }
+}
+static void sh_drvinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvinfo <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev=dev*10+(*a-'0'); a++; } extern const device_desc_t* driver_get_device(int); const device_desc_t* d = driver_get_device(dev); if(!d){ terminal_writestring("[drvinfo] device not found\n"); return; } terminal_writestring("[drvinfo] id="); print_dec(d->device_id); terminal_writestring(" reg_base="); print_hex(d->reg_base); terminal_writestring(" reg_size="); print_hex(d->reg_size); terminal_writestring(" mem_base="); print_hex(d->mem_base); terminal_writestring(" mem_size="); print_hex(d->mem_size); terminal_writestring(" caps="); print_hex(d->caps_mask); terminal_writestring("\n"); }
+static void sh_drvtest(const char* a){ (void)a; extern void user_test_driver(void); user_test_driver(); }
 // Mappa nomi colori (lowercase) -> codice VGA
 static void sh_halt(const char* a){ (void)a; cmd_halt(); }
 static void sh_reboot(const char* a){ (void)a; cmd_reboot(); }
 #if ENABLE_RTC
-static void sh_date(const char* a){ (void)a; struct rtc_datetime dt; if (rtc_read(&dt)) { char buf[32]; rtc_format(&dt, buf, sizeof(buf)); terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK)); terminal_writestring("\nData/Ora: "); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); terminal_writestring(buf); terminal_writestring("\n"); } else { terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK)); terminal_writestring("\n[FAIL] Lettura RTC fallita\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); } }
+static void sh_date(const char* a){ (void)a; struct rtc_datetime dt; if (rtc_read(&dt)) { char buf[32]; rtc_format(&dt, buf, sizeof(buf)); terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK)); terminal_writestring("\nDate/Time: "); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); terminal_writestring(buf); terminal_writestring("\n"); } else { terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK)); terminal_writestring("\n[FAIL] RTC read failed\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); } }
 #endif
 static void sh_echo(const char* a){ cmd_echo(a); }
 static void sh_sleep(const char* a){ cmd_sleep(a); }
@@ -791,18 +859,18 @@ static void sh_crash(const char* a){ cmd_crash(a); }
 
 // Comandi speciali con logica propria non semplicemente wrapper
 static void sh_usertest(const char* args) {
-        terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK)); terminal_writestring("\nCreazione spazio utente di test...\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
+    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK)); terminal_writestring("\nCreating test user space...\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
         extern int vmm_map_user_code(uint64_t virt); extern int vmm_map_user_data(uint64_t virt); extern uint64_t vmm_alloc_user_stack(int pages); extern vmm_space_t* vmm_space_create_user(void); extern int vmm_switch_space(vmm_space_t* space); extern vmm_space_t* vmm_get_kernel_space(void);
-        vmm_space_t* us = vmm_space_create_user(); if(!us){ terminal_writestring("[FAIL] creazione spazio utente\n"); } else {
+    vmm_space_t* us = vmm_space_create_user(); if(!us){ terminal_writestring("[FAIL] user space creation\n"); } else {
             if (vmm_map_user_code(USER_CODE_BASE) != 0) terminal_writestring("[FAIL] code page\n"); else terminal_writestring("[OK] code page RX\n");
             if (vmm_map_user_data(USER_DATA_BASE) != 0) terminal_writestring("[FAIL] data page\n"); else terminal_writestring("[OK] data page RW/NX\n");
             uint64_t st = vmm_alloc_user_stack(4);
-            terminal_writestring("[OK] stack utente top="); char hx[]="0123456789ABCDEF"; for(int i=60;i>=0;i-=4) terminal_putchar(hx[(st>>i)&0xF]); terminal_writestring("\n[TEST] switch a spazio utente...\n");
+            terminal_writestring("[OK] user stack top="); char hx[]="0123456789ABCDEF"; for(int i=60;i>=0;i-=4) terminal_putchar(hx[(st>>i)&0xF]); terminal_writestring("\n[TEST] switching to user space...\n");
             if (vmm_switch_space(us)==0) terminal_writestring("[OK] switch user CR3\n"); else terminal_writestring("[FAIL] switch user\n");
-            vmm_switch_space(vmm_get_kernel_space()); terminal_writestring("[OK] tornato a kernel space\n"); }
+            vmm_switch_space(vmm_get_kernel_space()); terminal_writestring("[OK] returned to kernel space\n"); }
 }
 static void sh_elfload(const char* a) {
-        extern process_t* process_create_from_elf(const void* elf_buf, size_t size); unsigned char elf_buf[512]; for(int i=0;i<512;i++) elf_buf[i]=0; elf_buf[0]=0x7F; elf_buf[1]='E'; elf_buf[2]='L'; elf_buf[3]='F'; elf_buf[4]=2; elf_buf[5]=1; elf_buf[6]=1; *(uint16_t*)(elf_buf+16)=2; *(uint16_t*)(elf_buf+18)=0x3E; *(uint32_t*)(elf_buf+20)=1; *(uint64_t*)(elf_buf+24)=USER_CODE_BASE; *(uint64_t*)(elf_buf+32)=64; *(uint16_t*)(elf_buf+52)=64; *(uint16_t*)(elf_buf+54)=56; *(uint16_t*)(elf_buf+56)=1; *(uint32_t*)(elf_buf+64)=1; *(uint32_t*)(elf_buf+68)=PF_R|PF_X; *(uint64_t*)(elf_buf+72)=0x100ULL; *(uint64_t*)(elf_buf+80)=USER_CODE_BASE; *(uint64_t*)(elf_buf+88)=USER_CODE_BASE; *(uint64_t*)(elf_buf+96)=0x80ULL; *(uint64_t*)(elf_buf+104)=0x80ULL; *(uint64_t*)(elf_buf+112)=0x1000ULL; for(int i=0;i<0x80;i++) elf_buf[0x100+i]=0x90; terminal_writestring("[ELFLOAD] Carico ELF di test...\n"); process_t* p = process_create_from_elf(elf_buf, sizeof(elf_buf)); if(!p) terminal_writestring("[ELFLOAD] Fallito\n"); else terminal_writestring("[ELFLOAD] OK (process creato)\n"); }
+    extern process_t* process_create_from_elf(const void* elf_buf, size_t size); unsigned char elf_buf[512]; for(int i=0;i<512;i++) elf_buf[i]=0; elf_buf[0]=0x7F; elf_buf[1]='E'; elf_buf[2]='L'; elf_buf[3]='F'; elf_buf[4]=2; elf_buf[5]=1; elf_buf[6]=1; *(uint16_t*)(elf_buf+16)=2; *(uint16_t*)(elf_buf+18)=0x3E; *(uint32_t*)(elf_buf+20)=1; *(uint64_t*)(elf_buf+24)=USER_CODE_BASE; *(uint64_t*)(elf_buf+32)=64; *(uint16_t*)(elf_buf+52)=64; *(uint16_t*)(elf_buf+54)=56; *(uint16_t*)(elf_buf+56)=1; *(uint32_t*)(elf_buf+64)=1; *(uint32_t*)(elf_buf+68)=PF_R|PF_X; *(uint64_t*)(elf_buf+72)=0x100ULL; *(uint64_t*)(elf_buf+80)=USER_CODE_BASE; *(uint64_t*)(elf_buf+88)=USER_CODE_BASE; *(uint64_t*)(elf_buf+96)=0x80ULL; *(uint64_t*)(elf_buf+104)=0x80ULL; *(uint64_t*)(elf_buf+112)=0x1000ULL; for(int i=0;i<0x80;i++) elf_buf[0x100+i]=0x90; terminal_writestring("[ELFLOAD] Loading test ELF...\n"); process_t* p = process_create_from_elf(elf_buf, sizeof(elf_buf)); if(!p) terminal_writestring("[ELFLOAD] Failed\n"); else terminal_writestring("[ELFLOAD] OK (process created)\n"); }
 static void sh_elfload2(const char* a) {
     // Costruzione ELF di test multi-segment con PT_NOTE manifest SECOS
     extern process_t* process_create_from_elf(const void* elf_buf, size_t size);
@@ -842,14 +910,14 @@ static void sh_elfload2(const char* a) {
     *(uint64_t*)(elf_buf+manifest_off+16)= USER_CODE_BASE; // entry_hint
     // descsz 24 già indicato
     size_t used_size = 0x740; // fine area nota
-    terminal_writestring("[ELFLOAD2] Carico ELF multi-segmento con manifest...\n");
+    terminal_writestring("[ELFLOAD2] Loading multi-segment ELF with manifest...\n");
     process_t* p = process_create_from_elf(elf_buf, used_size);
-    kfree(elf_buf); // buffer non più necessario
-    if(!p) terminal_writestring("[ELFLOAD2] Fallito\n"); else terminal_writestring("[ELFLOAD2] OK (process creato)\n");
+    kfree(elf_buf); // buffer no longer needed
+    if(!p) terminal_writestring("[ELFLOAD2] Failed\n"); else terminal_writestring("[ELFLOAD2] OK (process created)\n");
     }
-static void sh_elfunload(const char* a) { extern process_t* process_get_last(void); extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t* p); uint32_t pid=0; while(*a==' ') a++; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* target = pid? process_find_by_pid(pid): process_get_last(); if(!target) terminal_writestring("[ELFUNLOAD] processo non trovato\n"); else { int ur=process_destroy(target); if(ur==0) terminal_writestring("[ELFUNLOAD] OK (process distrutto)\n"); else terminal_writestring("[ELFUNLOAD] FAIL\n"); } }
+static void sh_elfunload(const char* a) { extern process_t* process_get_last(void); extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t* p); uint32_t pid=0; while(*a==' ') a++; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* target = pid? process_find_by_pid(pid): process_get_last(); if(!target) terminal_writestring("[ELFUNLOAD] process not found\n"); else { int ur=process_destroy(target); if(ur==0) terminal_writestring("[ELFUNLOAD] OK (process destroyed)\n"); else terminal_writestring("[ELFUNLOAD] FAIL\n"); } }
 static void sh_ps(const char* a){ (void)a; shell_ps_list(); }
-static void sh_kill(const char* a){ extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t*); while(*a==' ') a++; if(!*a){ terminal_writestring("Uso: kill <pid>\n"); return; } uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* t=process_find_by_pid(pid); if(!t){ terminal_writestring("[KILL] PID non trovato\n"); return; } int r=process_destroy(t); if(r==0) terminal_writestring("[KILL] OK\n"); else terminal_writestring("[KILL] FAIL\n"); }
+static void sh_kill(const char* a){ extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t*); while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: kill <pid>\n"); return; } uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* t=process_find_by_pid(pid); if(!t){ terminal_writestring("[KILL] PID not found\n"); return; } int r=process_destroy(t); if(r==0) terminal_writestring("[KILL] OK\n"); else terminal_writestring("[KILL] FAIL\n"); }
 // Helper per decodificare flags manifest
 static void decode_manifest_flags(uint32_t f, char* out, size_t cap) {
     out[0]='\0';
@@ -875,10 +943,10 @@ static void decode_manifest_flags(uint32_t f, char* out, size_t cap) {
 static void sh_pinfo(const char* a){
     extern process_t* process_find_by_pid(uint32_t pid);
     while(*a==' ') a++;
-    if(!*a){ terminal_writestring("Uso: pinfo <pid>\n"); return; }
+    if(!*a){ terminal_writestring("Usage: pinfo <pid>\n"); return; }
     uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; }
     process_t* p = process_find_by_pid(pid);
-    if(!p){ terminal_writestring("[PINFO] PID non trovato\n"); return; }
+    if(!p){ terminal_writestring("[PINFO] PID not found\n"); return; }
     char hx[]="0123456789ABCDEF"; char buf[64];
     terminal_writestring("[PINFO] PID="); for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->pid>>i)&0xF]);
     terminal_writestring(" state="); const char* st="UNKNOWN"; switch(p->state){case PROC_NEW:st="NEW";break;case PROC_READY:st="READY";break;case PROC_RUNNING:st="RUN";break;case PROC_BLOCKED:st="BLK";break;case PROC_ZOMBIE:st="ZOMB";break;} terminal_writestring(st);
@@ -917,7 +985,7 @@ static void execute_command(char* line) {
         if (strcmp(cmd, shell_cmds[i].name)==0) { shell_cmds[i].handler(args); return; }
     }
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-    terminal_writestring("Comando non trovato: "); terminal_writestring(cmd); terminal_writestring("\nDigita 'help' per la lista dei comandi.\n");
+    terminal_writestring("Command not found: "); terminal_writestring(cmd); terminal_writestring("\nType 'help' for the command list.\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
 
@@ -942,7 +1010,7 @@ static void ps_cb_impl(process_t* p, void* user) {
 }
 
 void shell_ps_list(void) {
-    terminal_writestring("\n[PS] Processi attivi:\n");
+    terminal_writestring("\n[PS] Active processes:\n");
     extern void process_foreach(void (*cb)(process_t*, void*), void* user);
     struct ps_ctx_global ctx; ctx.count=0; ctx.total_pages=0; ctx.total_cpu=0; ctx.st_new=ctx.st_ready=ctx.st_run=ctx.st_blk=ctx.st_zomb=0;
     process_foreach(ps_cb_impl, &ctx);

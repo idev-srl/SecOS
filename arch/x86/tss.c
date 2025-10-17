@@ -1,30 +1,35 @@
+/*
+ * SecOS Kernel - TSS & GDT Setup
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "tss.h"
 #include "pmm.h"
 #include "terminal.h"
-// Forward declaration di print_hex definita in kernel.c
+// Forward declaration of print_hex defined in kernel.c
 extern void print_hex(uint64_t value);
 
-#define IST_STACK_SIZE 4096  // 4KB per ogni stack IST
+#define IST_STACK_SIZE 4096  // 4KB for each IST stack
 
-// GDT 64-bit: null, kernel code, kernel data, user data, user code, TSS (2 slot)
-// Per semplicità costruiamo un buffer grezzo di 7 * 8 = 56 byte (5 entry normali + 2 per TSS)
-// userò strutture per riempire i campi e poi copia binaria contigua.
+// 64-bit GDT layout: null, kernel code, kernel data, user data, user code, TSS (2 slots)
+// Build a raw buffer (5 normal entries + TSS descriptor) then load.
 static gdt_entry_t gdt_entries[5];
-static gdt_tss_entry_t gdt_tss; // occuperà 16 byte consecutivi
+static gdt_tss_entry_t gdt_tss; // occupies 16 bytes
 static uint8_t gdt_raw[5 * sizeof(gdt_entry_t) + sizeof(gdt_tss_entry_t)];
 static gdt_ptr_t gdt_ptr;
 static tss_t tss;
 
-// Stack per IST
+// IST stacks
 static uint8_t* ist1_stack = NULL;
 static uint8_t* ist2_stack = NULL;
 static uint8_t* ist3_stack = NULL;
 
-// Funzioni assembly esterne
+// External assembly functions
 extern void gdt_flush(uint64_t gdt_ptr_addr);
 extern void tss_flush(uint16_t tss_selector);
 
-// Imposta un entry nel GDT
+// Set a GDT entry
 static void gdt_set_gate(int num, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran) {
     gdt_entries[num].base_low = (base & 0xFFFF);
     gdt_entries[num].base_middle = (base >> 16) & 0xFF;
@@ -36,7 +41,7 @@ static void gdt_set_gate(int num, uint32_t base, uint32_t limit, uint8_t access,
     gdt_entries[num].access = access;
 }
 
-// Imposta TSS entry nel GDT
+// Set TSS descriptor in GDT
 static void gdt_set_tss(uint64_t base, uint32_t limit) {
     gdt_tss.limit_low = limit & 0xFFFF;
     gdt_tss.base_low = base & 0xFFFF;
@@ -51,7 +56,7 @@ static void gdt_set_tss(uint64_t base, uint32_t limit) {
 }
 
 void tss_init(void) {
-    // Alloca stack per IST
+    // Allocate IST stacks
     ist1_stack = (uint8_t*)pmm_alloc_frame();  // Double Fault
     ist2_stack = (uint8_t*)pmm_alloc_frame();  // Page Fault
     ist3_stack = (uint8_t*)pmm_alloc_frame();  // General Protection Fault

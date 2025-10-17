@@ -1,5 +1,13 @@
 #ifndef FB_CONSOLE_H
 #define FB_CONSOLE_H
+/*
+ * SecOS Kernel - Framebuffer Console
+ * Text console rendering on 32-bpp linear framebuffer with glyph drawing,
+ * cursor blinking, logo glow animation, and optional double buffering.
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include <stdint.h>
 #include "fb.h"
 

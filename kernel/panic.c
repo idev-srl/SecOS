@@ -1,7 +1,13 @@
+/*
+ * SecOS Kernel - Panic & Exception Handling
+ * Copyright (c) 2025 iDev srl
+ * Author: Luigi De Astis <l.deastis@idev-srl.com>
+ * SPDX-License-Identifier: MIT
+ */
 #include "panic.h"
 #include "terminal.h"
 
-// Nomi delle eccezioni CPU (INT 0-31)
+// CPU exception names (INT 0-31)
 const char* exception_messages[] = {
     "Division By Zero",
     "Debug",
@@ -37,7 +43,7 @@ const char* exception_messages[] = {
     "Reserved"
 };
 
-// Converti numero in stringa esadecimale
+// Convert number to hexadecimal string
 static void print_hex64(uint64_t value) {
     char hex_chars[] = "0123456789ABCDEF";
     terminal_writestring("0x");

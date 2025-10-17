@@ -8,6 +8,7 @@
 #define SYS_OPEN    4
 #define SYS_CLOSE   5
 #define SYS_GETPID  6
+#define SYS_DRIVER  7  // driver space mediated hardware access
 
 // Flags for open (simplified)
 #define O_RDONLY 0x0
@@ -24,3 +25,7 @@ int ksys_write(int fd, const void* buf, int len);
 int ksys_read(int fd, void* buf, int len);
 int ksys_getpid(void);
 void ksys_exit(int status);
+
+// Driver interface forward declaration (struct defined in driver_if.h)
+struct driver_call;
+int driver_syscall(struct driver_call* req);
