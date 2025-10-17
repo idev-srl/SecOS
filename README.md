@@ -1,3 +1,7 @@
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
+[![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
+[![Made by iDev](https://img.shields.io/badge/made%20by-iDev%20Srl-blue)](https://www.idev-srl.com)
+
 # 64-bit Kernel with GRUB
 
 A kernel written in C that boots in Long Mode (64-bit) via GRUB as the bootloader, with PS/2 keyboard support and an interactive shell.
@@ -26,10 +30,7 @@ A kernel written in C that boots in Long Mode (64-bit) via GRUB as the bootloade
 - ✅ Error handling during boot & process unload (elfunload)
 - ✅ ps command (basic process listing)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
-[![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Made by iDev](https://img.shields.io/badge/made%20by-iDev%20Srl-blue)](https://www.idev-srl.com)
-
+See our [Development Roadmap](ROADMAP.md) for upcoming features!
 
 ## Requirements
 
@@ -394,3 +395,4 @@ The kernel applies W^X to its sections and marks data regions NX. User pages are
 | Frame | 4KB physical memory unit managed by PMM. |
 | Huge Page | Larger page (2MB) used to reduce page table overhead for physmap. |
 | Demand-Zero | Technique allocating zeroed pages lazily on first access within a registered region. |
+
