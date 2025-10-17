@@ -16,13 +16,13 @@ Main components:
 - `driver_call_t` — Structure passed via syscall `SYS_DRIVER`:
   ```c
   typedef struct {
-      uint32_t opcode;     // DRIVER_OP_*
-      uint32_t device_id;  // indice registro
-      uint64_t reg_offset; // per READ/WRITE_REG
-      uint64_t value;      // valore da scrivere / argomento generico
-      uint64_t mem_offset; // per MAP/UNMAP
-      uint64_t mem_length; // lunghezza regione
-      uint32_t flags;      // DRIVER_FLAG_*
+    uint32_t opcode;     // DRIVER_OP_*
+    uint32_t device_id;  // registry index
+    uint64_t reg_offset; // for READ/WRITE_REG
+    uint64_t value;      // value to write / generic argument
+    uint64_t mem_offset; // for MAP/UNMAP
+    uint64_t mem_length; // region length
+    uint32_t flags;      // DRIVER_FLAG_*
   } driver_call_t;
   ```
 - Dispatcher `handle_driver_call()` — Switch on opcode, invokes helpers and returns result code.
@@ -118,46 +118,46 @@ Structure (simplified):
 - Always validate syscall result.
 - Minimize number of calls: batch grouped operations.
 - Do not assume offset zero is always configured: query with `GET_INFO` first.
-- Usare flag audit solo per operazioni diagnostiche critiche (riduce rumore).
+- Use audit flag only for critical diagnostic operations (reduces noise).
 
-## Estensioni Pianificate
+## Planned Extensions
 
-| Feature | Stato | Note |
+| Feature | Status | Notes |
 |---------|-------|------|
-| Rate limiting | Design | Contatori per (pid, device, opcode) con finestra temporale |
-| Audit filtering | Design | Parametri shell: `drvlog errors|dev=<n>|op=<code>` |
-| DMA setup | Futuro | Validazione buffer user + IOMMU stub |
-| IRQ subscribe | Futuro | Lista handler user registrati |
-| Bulk transfer | Futuro | Copia ottimizzata / sg-list |
+| Rate limiting | Design | Counters per (pid, device, opcode) with time window |
+| Audit filtering | Design | Shell params: `drvlog errors|dev=<n>|op=<code>` |
+| DMA setup | Future | User buffer validation + IOMMU stub |
+| IRQ subscribe | Future | List of registered user handlers |
+| Bulk transfer | Future | Optimized copy / sg-list |
 
-## Domande Frequenti
+## FAQ
 
-**Perché un driver user-space?** Per iterare velocemente su prototipi senza crash kernel; transizione graduale verso modelli ibridi.
+**Why a user-space driver?** To iterate quickly on prototypes without kernel crashes; gradual transition toward hybrid models.
 
-**Come avviene la rimozione sicura?** `drvunreg` invalida il binding; chiamate successive dal vecchio processo falliscono (perm check).
+**How is safe removal done?** `drvunreg` invalidates the binding; subsequent calls from the old process fail (permission check).
 
-**Cosa succede se il processo muore?** Attualmente non c'è auto-cleanup: pianificata scansione periodica PCB per rimuovere binding orfani.
+**What happens if the process dies?** Currently no auto-cleanup: planned periodic PCB scan to remove orphan bindings.
 
 ---
-Documentazione versione iniziale. Aggiornare se vengono aggiunti nuovi opcode o capability.
+Initial version documentation. Update when new opcodes or capabilities are added.
 
-## Rate Limiting Implementato (Versione Base)
+## Implemented Rate Limiting (Base Version)
 
-Una tabella circolare (`RL_CAPACITY=64`) traccia triple (pid, device_id, opcode). Per ciascuna:
-- Finestra temporale: 100 tick
-- Max chiamate: 50 per finestra
-Superato il limite, la syscall ritorna `DRV_ERR_RATE` e viene loggata in audit.
-Tabella piena => nessun rate limit (fail-open per evitare blocchi involontari all'avvio).
+A circular table (`RL_CAPACITY=64`) tracks triples (pid, device_id, opcode). For each:
+- Time window: 100 ticks
+- Max calls: 50 per window
+If the limit is exceeded the syscall returns `DRV_ERR_RATE` and is logged in audit.
+Table full => no rate limiting (fail-open to avoid accidental boot blocking).
 
-## Filtri Audit Avanzati
+## Advanced Audit Filters
 
-Comando shell `drvlog` ora supporta:
-- `errors` — mostra solo eventi con result != DRV_OK
-- `dev=<id>` — filtra per device
-- `op=<opcode>` — filtra per opcode
-- `limit=<N>` — massimo eventi (1..128, default 32)
+Shell command `drvlog` now supports:
+- `errors` — show only events with result != DRV_OK
+- `dev=<id>` — filter by device
+- `op=<opcode>` — filter by opcode
+- `limit=<N>` — max events (1..128, default 32)
 
-Esempi:
+Examples:
 ```
 drvlog errors
 drvlog dev=0 limit=10

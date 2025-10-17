@@ -1,11 +1,11 @@
 # Memory Management in SecOS
 
-## 📋 Architettura
+## 📋 Architecture
 
 SecOS memory management is divided into two layers:
 
 ### 1. Physical Memory Manager (PMM)
-Gestisce la memoria fisica a livello di **frame** (4KB ciascuno).
+Manages physical memory at the **frame** level (each 4KB).
 
 **Features:**
 - Uses a **bitmap** to track free/allocated frames
@@ -15,15 +15,15 @@ Gestisce la memoria fisica a livello di **frame** (4KB ciascuno).
 
 **Initialization:**
 ```c
-pmm_init(multiboot_info);  // Chiamato da kernel_main
+pmm_init(multiboot_info);  // Called by kernel_main
 ```
 
 **Usage:**
 ```c
-void* frame = pmm_alloc_frame();  // Alloca un frame da 4KB
+void* frame = pmm_alloc_frame();  // Allocate a 4KB frame
 if (frame) {
-    // Usa il frame...
-    pmm_free_frame(frame);        // Libera quando finito
+  // Use the frame...
+  pmm_free_frame(frame);        // Free when done
 }
 ```
 
@@ -38,14 +38,14 @@ Provides dynamic allocation of **variable-sized memory**.
 
 **Usage:**
 ```c
-char* buffer = kmalloc(1024);     // Alloca 1KB
+char* buffer = kmalloc(1024);     // Allocate 1KB
 if (buffer) {
-    // Usa il buffer...
-    kfree(buffer);                 // Libera quando finito
+  // Use buffer...
+  kfree(buffer);                 // Free when done
 }
 
-// Allocazione allineata
-void* aligned = kmalloc_aligned(size, 16);  // Allineato a 16 byte
+// Aligned allocation
+void* aligned = kmalloc_aligned(size, 16);  // 16-byte aligned
 ```
 
 ## 🔍 Comandi Shell
@@ -165,19 +165,19 @@ void pmm_print_stats(void);
 ### Heap Allocator
 
 ```c
-// Inizializza l'heap
+// Initialize heap
 void heap_init(void);
 
-// Alloca memoria dinamica
+// Allocate dynamic memory
 void* kmalloc(size_t size);
 
-// Alloca memoria allineata
+// Allocate aligned memory
 void* kmalloc_aligned(size_t size, size_t alignment);
 
-// Libera memoria
+// Free memory
 void kfree(void* ptr);
 
-// Statistiche
+// Statistics
 void heap_print_stats(void);
 ```
 
@@ -187,29 +187,29 @@ void heap_print_stats(void);
 0x00000000  +------------------+
             | BIOS / HW        |
 0x00100000  +------------------+
-            | Kernel Code      | ← Caricato da GRUB a 1MB
+            | Kernel Code      | ← Loaded by GRUB at 1MB
             | Kernel Data      |
             | Kernel BSS       |
 _kernel_end +------------------+
-            | PMM Bitmap       | ← Bitmap frame allocation
+            | PMM Bitmap       | ← Frame allocation bitmap
             +------------------+
-            | Heap             | ← Cresce dinamicamente
+            | Heap             | ← Grows dynamically
             +------------------+
-            | Frame liberi     | ← Gestiti dal PMM
+            | Free frames      | ← Managed by PMM
             |                  |
             |    ...           |
             +------------------+
 ```
 
-## 🚀 Prossimi Passi
+## 🚀 Next Steps
 
-Per caricare applicazioni userspace abbiamo introdotto:
+To load user-space applications we introduced:
 
-1. **ELF Loader** (base) → carica segmenti PT_LOAD con verifiche W^X e allineamento.
-2. **Address Space** → creato per processo con stack utente dedicato e guard page.
-3. **PCB** → struttura minima per identità e registri iniziali.
+1. **ELF Loader** (base) → loads PT_LOAD segments with W^X and alignment checks.
+2. **Address Space** → created per process with dedicated user stack and guard page.
+3. **PCB** → minimal structure for identity and initial registers.
 
-In arrivo:
+Incoming:
 * Syscalls
 * Scheduler
 * Manifest parser
@@ -224,18 +224,18 @@ In arrivo:
 
 ### Heap Allocator
 - First-fit algorithm
-- Coalescing automatico dei blocchi liberi
-- Espansione automatica dell'heap tramite PMM
-- Header di 24 byte per blocco
+- Automatic coalescing of free blocks
+- Automatic heap expansion via PMM
+- 24-byte header per block
 
-### Limitazioni Attuali
-- Heap non può ridursi (solo crescere)
-- Nessuna protezione contro double-free
-- Nessuna gestione fragmentazione avanzata
-- Allocazioni > 4KB allocano frame multipli
+### Current Limitations
+- Heap cannot shrink (only grow)
+- No protection against double-free
+- No advanced fragmentation handling
+- Allocations > 4KB allocate multiple frames
 
-### Possibili Miglioramenti
-- Buddy allocator per il PMM
-- Slab allocator per oggetti piccoli
-- Guard pages per rilevare overflow
-- Memory pools per allocazioni frequenti
+### Possible Improvements
+- Buddy allocator for PMM
+- Slab allocator for small objects
+- Guard pages to detect overflow
+- Memory pools for frequent allocations

@@ -10,25 +10,25 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-// Dimensione frame (4KB)
+// Frame size (4KB)
 #define PMM_FRAME_SIZE 4096
 
-// Inizializza il PMM con la memory map
+// Initialize PMM using Multiboot1 memory map
 void pmm_init(void* mboot_info);
-// Inizializza il PMM usando struttura Multiboot2 (info pointer)
+// Initialize PMM using Multiboot2 structure (info pointer)
 void pmm_init_mb2(void* mb2_info);
 
-// Alloca un frame fisico
+// Allocate a physical frame
 void* pmm_alloc_frame(void);
 
-// Libera un frame fisico
+// Free a physical frame
 void pmm_free_frame(void* addr);
 
-// Ottieni informazioni memoria
+// Memory info accessors
 uint64_t pmm_get_total_memory(void);
 uint64_t pmm_get_used_memory(void);
 uint64_t pmm_get_free_memory(void);
-// Massimo indirizzo fisico coperto (end, non size)
+// Maximum physical address seen (end address, not size)
 uint64_t pmm_get_max_phys(void);
 
 // Debug

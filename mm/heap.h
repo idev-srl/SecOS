@@ -9,19 +9,19 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// Inizializza l'heap
+// Initialize heap allocator
 void heap_init(void);
 
-// Alloca memoria
+// Allocate dynamic memory
 void* kmalloc(size_t size);
 
-// Alloca memoria allineata
+// Allocate memory with specified alignment
 void* kmalloc_aligned(size_t size, size_t alignment);
 
-// Libera memoria
+// Free previously allocated memory
 void kfree(void* ptr);
 
-// Statistiche heap
+// Print heap statistics
 void heap_print_stats(void);
 
 #endif

@@ -11,38 +11,38 @@
 // print_hex definita in kernel, forward decl per debug
 extern void print_hex(uint64_t value);
 
-// Bitmap per tracciare frame liberi/usati
+// Bitmap tracking free/used physical frames
 static uint32_t* frame_bitmap = NULL;
 static uint64_t total_frames = 0;
 static uint64_t used_frames = 0;
 static uint64_t total_memory = 0;
 static uint64_t max_phys_addr_seen = 0;
 
-// Posizione del kernel (definita nel linker)
+// Kernel end position (defined in linker script)
 extern uint32_t _kernel_end;
 
-// Helper: imposta un bit nel bitmap
+// Helper: set a bit in bitmap
 static inline void bitmap_set(uint32_t frame) {
     uint32_t idx = frame / 32;
     uint32_t bit = frame % 32;
     frame_bitmap[idx] |= (1 << bit);
 }
 
-// Helper: pulisce un bit nel bitmap
+// Helper: clear a bit in bitmap
 static inline void bitmap_clear(uint32_t frame) {
     uint32_t idx = frame / 32;
     uint32_t bit = frame % 32;
     frame_bitmap[idx] &= ~(1 << bit);
 }
 
-// Helper: testa un bit nel bitmap
+// Helper: test a bit in bitmap
 static inline bool bitmap_test(uint32_t frame) {
     uint32_t idx = frame / 32;
     uint32_t bit = frame % 32;
     return (frame_bitmap[idx] & (1 << bit)) != 0;
 }
 
-// Trova il primo frame libero
+// Find first free frame
 static uint32_t find_free_frame(void) {
     for (uint32_t i = 0; i < total_frames; i++) {
         if (!bitmap_test(i)) {
@@ -52,7 +52,7 @@ static uint32_t find_free_frame(void) {
     return (uint32_t)-1;
 }
 
-// Converti numero in stringa
+// Convert number to decimal string
 static void itoa_dec(uint64_t value, char* buffer) {
     if (value == 0) {
         buffer[0] = '0';
@@ -75,7 +75,7 @@ static void itoa_dec(uint64_t value, char* buffer) {
     buffer[j] = '\0';
 }
 
-// Struttura semplice per regioni di memoria disponibili raccolte da loader
+// Simple structure for available memory regions gathered from loader
 struct avail_region { uint64_t addr; uint64_t len; };
 
 static void pmm_build_from_regions(struct avail_region* regions, int region_count) {
@@ -86,8 +86,8 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
         if (end > max_addr) max_addr = end;
         total_memory += regions[i].len;
     }
-    // Costruzione bitmap frame
-    // Limite di frame effettivamente mappati in identity (512MB => 256 * 2MB)
+    // Build bitmap of frames
+    // Limit frames actually identity-mapped early (512MB => 256 * 2MB)
     uint64_t mapped_limit = 512ULL * 1024 * 1024;
     total_frames = (max_addr + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE; // round up
     uint64_t mapped_frames_limit = mapped_limit / PMM_FRAME_SIZE;
@@ -98,40 +98,40 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
         char buf[32]; itoa_dec(total_frames, buf); terminal_writestring(buf); }
     terminal_writestring(" bitmap_size="); { char buf2[32]; itoa_dec(bitmap_size, buf2); terminal_writestring(buf2); terminal_writestring(" bytes\n"); }
     frame_bitmap = (uint32_t*)((uint64_t)&_kernel_end);
-    // Azzera bitmap
+    // Zero bitmap
     uint64_t dwords = (bitmap_size + 3) / 4;
     for (uint64_t i = 0; i < dwords; i++) {
         frame_bitmap[i] = 0x00000000;
     }
     used_frames = 0;
 
-    // Libera regioni
+    // Mark regions as free
     uint64_t free_frames_before = used_frames; // usato per fallback
     for (int r=0;r<region_count;r++) {
         uint64_t start_frame = regions[r].addr / PMM_FRAME_SIZE;
         uint64_t end_frame   = (regions[r].addr + regions[r].len) / PMM_FRAME_SIZE;
         if (end_frame > total_frames) end_frame = total_frames; // clamp to discovered limit
-        // Non liberare frame oltre mapping identity corrente
+    // Do not free frames beyond current identity mapping limit
         uint64_t mapped_frames = mapped_limit / PMM_FRAME_SIZE;
         if (end_frame > mapped_frames) end_frame = mapped_frames;
         if (regions[r].len == 0) continue;
-    // Log ridotto regioni (solo indice e dimensione in MB)
+    // Compact region log (index and size in MB)
     terminal_writestring("[PMM] region "); { char b[32]; itoa_dec(r, b); terminal_writestring(b); }
     terminal_writestring(": sizeMB="); { char b1[32]; itoa_dec(regions[r].len / 1024 / 1024, b1); terminal_writestring(b1);} terminal_writestring("\n");
         for (uint64_t f=start_frame; f<end_frame; f++) {
-            // Mark free (already zero) just ensure we don't double count
+            // Mark free (already zero); ensure we don't double count
             if (bitmap_test(f)) {
                 bitmap_clear(f);
                 used_frames--;
             }
         }
     }
-    // Proteggi area kernel+bitmap
+    // Protect kernel+bitmap area (mark as used)
     uint64_t kernel_end_frame = ((uint64_t)frame_bitmap + bitmap_size) / PMM_FRAME_SIZE + 1;
     for (uint64_t f=0; f<kernel_end_frame; f++) {
         if (!bitmap_test(f)) { bitmap_set(f); used_frames++; }
     }
-    // Fallback: se nessun frame libero (tutti occupati) crea regione sintetica dopo kernel entro mapped limit
+    // Fallback: if no free frames create synthetic region after kernel within mapped limit
     if (used_frames == 0 || used_frames == total_frames || pmm_get_free_memory() == 0) {
         terminal_writestring("[PMM][WARN] Nessun frame libero dalle regioni; applico fallback sintetico\n");
         uint64_t fallback_start = ((uint64_t)frame_bitmap + bitmap_size + PMM_FRAME_SIZE -1) & ~(PMM_FRAME_SIZE-1);
@@ -144,18 +144,18 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
                 // leave as free
             }
         }
-        // Reconta used frames (proteggendo kernel) - semplice: marca kernel frames e lascia resto libero
+    // Recount used frames (protect kernel) - simple: mark kernel frames, keep rest free
         used_frames = 0;
         for (uint64_t f=0; f<kernel_end_frame; f++) { if (!bitmap_test(f)) { bitmap_set(f); used_frames++; } }
     }
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("[OK] PMM inizializzato\n");
+    terminal_writestring("[OK] PMM initialized\n");
     pmm_print_stats();
 }
 
 uint64_t pmm_get_max_phys(void) { return max_phys_addr_seen; }
 
-// Inizializza il PMM (Multiboot1)
+// Initialize PMM (Multiboot1)
 void pmm_init(void* mboot_info_ptr) {
     if (!mboot_info_ptr) { terminal_writestring("[ERROR] Multiboot info NULL!\n"); return; }
     struct multiboot_info* mboot = (struct multiboot_info*)mboot_info_ptr;
@@ -163,12 +163,12 @@ void pmm_init(void* mboot_info_ptr) {
         char hex[9];
         uint32_t f = mboot->flags; for (int i=7;i>=0;i--){ uint8_t ny=(f & 0xF); hex[i] = "0123456789ABCDEF"[ny]; f >>=4; } hex[8]='\0'; terminal_writestring(hex); terminal_writestring("\n"); }
     if (!(mboot->flags & (1 << 6))) {
-        terminal_writestring("[WARN] Nessuna memory map MB1, fallback sintetico\n");
+    terminal_writestring("[WARN] No MB1 memory map, synthetic fallback\n");
         struct avail_region regions[1];
-        // Usa mem_upper se disponibile (flag bit 0 indica mem_lower/upper validi)
+    // Use mem_upper if available (flag bit 0 indicates mem_lower/upper valid)
         uint64_t upper_kb = 0;
         if (mboot->flags & 1) upper_kb = mboot->mem_upper;
-        if (upper_kb == 0) upper_kb = 64 * 1024; // fallback 64MB
+    if (upper_kb == 0) upper_kb = 64 * 1024; // fallback 64MB
         regions[0].addr = 0x00100000; // 1MB
         regions[0].len = (upper_kb * 1024) - 0x00100000;
         pmm_build_from_regions(regions, 1);
@@ -197,7 +197,7 @@ void pmm_init(void* mboot_info_ptr) {
     pmm_build_from_regions(regions, rc);
 }
 
-// Inizializza il PMM (Multiboot2)
+// Initialize PMM (Multiboot2)
 void pmm_init_mb2(void* mb2_info_ptr) {
     if (!mb2_info_ptr) { terminal_writestring("[ERROR] MB2 info NULL!\n"); return; }
     uint8_t* base = (uint8_t*)mb2_info_ptr;
@@ -226,13 +226,13 @@ void pmm_init_mb2(void* mb2_info_ptr) {
         ptr += (tag->size + 7) & ~7;
     }
     if (rc == 0) {
-        terminal_writestring("[WARN] Nessuna regione MB2 riportata, fallback sintetico 1MB..64MB\n");
+    terminal_writestring("[WARN] No MB2 regions reported, synthetic fallback 1MB..64MB\n");
         regions[0].addr = 0x00100000ULL;
         regions[0].len  = 63ULL * 1024 * 1024; // 63MB sopra 1MB
         rc = 1;
     } else if (rc == 1 && regions[0].addr == 0 && regions[0].len < 0x100000) {
-        // Solo low memory, aggiungi regione alta sintetica
-        terminal_writestring("[WARN] Solo low memory in mmap; aggiungo regione sintetica 1MB..256MB\n");
+    // Only low memory, add synthetic high region
+    terminal_writestring("[WARN] Only low memory in mmap; adding synthetic region 1MB..256MB\n");
         regions[1].addr = 0x00100000ULL;
         regions[1].len  = 255ULL * 1024 * 1024; // fino a 256MB totale
         rc = 2;
@@ -240,12 +240,12 @@ void pmm_init_mb2(void* mb2_info_ptr) {
     pmm_build_from_regions(regions, rc);
 }
 
-// Alloca un frame
+// Allocate one physical frame
 void* pmm_alloc_frame(void) {
     uint32_t frame = find_free_frame();
     
     if (frame == (uint32_t)-1) {
-        return NULL;  // Out of memory
+    return NULL;  // Out of memory
     }
     
     bitmap_set(frame);
@@ -254,49 +254,49 @@ void* pmm_alloc_frame(void) {
     return (void*)((uint64_t)frame * PMM_FRAME_SIZE);
 }
 
-// Libera un frame
+// Free a physical frame
 void pmm_free_frame(void* addr) {
     uint32_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
     
     if (!bitmap_test(frame)) {
-        return;  // Già libero
+    return;  // Already free
     }
     
     bitmap_clear(frame);
     used_frames--;
 }
 
-// Ottieni memoria totale
+// Get total memory (sum of regions)
 uint64_t pmm_get_total_memory(void) {
     return total_memory;
 }
 
-// Ottieni memoria usata
+// Get used memory in bytes
 uint64_t pmm_get_used_memory(void) {
     return used_frames * PMM_FRAME_SIZE;
 }
 
-// Ottieni memoria libera
+// Get free memory in bytes
 uint64_t pmm_get_free_memory(void) {
     return (total_frames - used_frames) * PMM_FRAME_SIZE;
 }
 
-// Stampa statistiche
+// Print PMM statistics
 void pmm_print_stats(void) {
     char buffer[32];
     
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("     Memoria totale:   ");
+    terminal_writestring("     Total memory:   ");
     itoa_dec(total_memory / 1024 / 1024, buffer);
     terminal_writestring(buffer);
     terminal_writestring(" MB\n");
     
-    terminal_writestring("     Memoria usata:    ");
+    terminal_writestring("     Used memory:    ");
     itoa_dec(pmm_get_used_memory() / 1024 / 1024, buffer);
     terminal_writestring(buffer);
     terminal_writestring(" MB\n");
     
-    terminal_writestring("     Memoria libera:   ");
+    terminal_writestring("     Free memory:    ");
     itoa_dec(pmm_get_free_memory() / 1024 / 1024, buffer);
     terminal_writestring(buffer);
     terminal_writestring(" MB\n");

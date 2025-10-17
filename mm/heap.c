@@ -8,7 +8,7 @@
 #include "pmm.h"
 #include "terminal.h"
 
-// Header per ogni blocco
+// Header for each heap block
 typedef struct heap_block {
     size_t size;
     bool is_free;
@@ -21,12 +21,12 @@ static heap_block_t* heap_start = NULL;
 static uint64_t total_allocated = 0;
 static uint64_t total_freed = 0;
 
-// Helper per allineare indirizzi
+// Helper to align addresses
 static inline size_t align_up(size_t size, size_t alignment) {
     return (size + alignment - 1) & ~(alignment - 1);
 }
 
-// Converti numero in stringa
+// Convert number to decimal string
 static void itoa_dec(uint64_t value, char* buffer) {
     if (value == 0) {
         buffer[0] = '0';
@@ -49,15 +49,15 @@ static void itoa_dec(uint64_t value, char* buffer) {
     buffer[j] = '\0';
 }
 
-// Inizializza l'heap
+// Initialize heap
 void heap_init(void) {
-    // Alloca il primo frame per l'heap
+    // Allocate the first frame for the heap
     heap_start = (heap_block_t*)pmm_alloc_frame();
     
     if (heap_start == NULL) {
         terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-        terminal_writestring("[ERROR] Impossibile allocare heap iniziale!\n");
-        terminal_writestring("[DEBUG] pmm_alloc_frame() ha ritornato NULL\n");
+        terminal_writestring("[ERROR] Unable to allocate initial heap!\n");
+        terminal_writestring("[DEBUG] pmm_alloc_frame() returned NULL\n");
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
         return;
     }
@@ -67,9 +67,9 @@ void heap_init(void) {
     heap_start->next = NULL;
     
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("[OK] Heap inizializzato @ ");
+    terminal_writestring("[OK] Heap initialized @ ");
     
-    // Stampa l'indirizzo dell'heap (debug)
+    // Print heap address (debug)
     char hex_chars[] = "0123456789ABCDEF";
     uint64_t addr = (uint64_t)heap_start;
     for (int i = 60; i >= 0; i -= 4) {
@@ -81,21 +81,21 @@ void heap_init(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
 
-// Espandi l'heap allocando un nuovo frame
+// Expand heap by allocating a new physical frame
 static heap_block_t* expand_heap(size_t required_size) {
-    // Trova l'ultimo blocco
+    // Find last block
     heap_block_t* current = heap_start;
     while (current->next != NULL) {
         current = current->next;
     }
     
-    // Alloca un nuovo frame
+    // Allocate a new frame
     void* new_frame = pmm_alloc_frame();
     if (new_frame == NULL) {
         return NULL;
     }
     
-    // Crea un nuovo blocco nel frame allocato
+    // Create a new block in the allocated frame
     heap_block_t* new_block = (heap_block_t*)new_frame;
     new_block->size = PMM_FRAME_SIZE - HEAP_BLOCK_HEADER_SIZE;
     new_block->is_free = true;
@@ -106,7 +106,7 @@ static heap_block_t* expand_heap(size_t required_size) {
     return new_block;
 }
 
-// Alloca memoria
+// Allocate memory
 void* kmalloc(size_t size) {
     // DEBUG
     terminal_writestring("[kmalloc] Entry, size=");
@@ -120,7 +120,7 @@ void* kmalloc(size_t size) {
         return NULL;
     }
     
-    // Verifica che l'heap sia inizializzato
+    // Verify heap is initialized
     if (heap_start == NULL) {
         terminal_writestring("[kmalloc] heap_start is NULL!\n");
         return NULL;
@@ -128,29 +128,29 @@ void* kmalloc(size_t size) {
     
     terminal_writestring("[kmalloc] heap_start OK\n");
     
-    // Allinea la dimensione a 8 byte
+    // Align size to 8 bytes
     size = align_up(size, 8);
     
     terminal_writestring("[kmalloc] Searching for free block...\n");
     
     heap_block_t* current = heap_start;
     
-    // Cerca un blocco libero abbastanza grande (con eventuale splitting)
+    // Search free block large enough (with potential splitting)
     while (current != NULL) {
         terminal_writestring("[kmalloc] Checking block\n");
         if (current->is_free && current->size >= size) {
             terminal_writestring("[kmalloc] Found free block!\n");
-            // Se il blocco è molto più grande, dividilo
+            // If block is much larger, split it
             size_t remaining = current->size - size;
             if (remaining > HEAP_BLOCK_HEADER_SIZE + 16) {
-                // Split
+                // Perform split
                 uint8_t* new_addr = (uint8_t*)current + HEAP_BLOCK_HEADER_SIZE + size;
                 heap_block_t* new_block = (heap_block_t*)new_addr;
                 new_block->size = remaining - HEAP_BLOCK_HEADER_SIZE;
                 new_block->is_free = true;
                 new_block->next = current->next;
                 current->next = new_block;
-                current->size = size; // ridimensiona blocco assegnato
+                current->size = size; // resize allocated block
                 terminal_writestring("[kmalloc] Block split\n");
             }
             current->is_free = false;
@@ -161,15 +161,15 @@ void* kmalloc(size_t size) {
         current = current->next;
     }
     terminal_writestring("[kmalloc] No free block, need to expand\n");
-    // Prova ad espandere l'heap
+    // Try to expand the heap
     heap_block_t* new_block = expand_heap(size);
     if (!new_block) {
         terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-        terminal_writestring("[FAIL] Allocazione fallita (expand_heap NULL)\n");
+        terminal_writestring("[FAIL] Allocation failed (expand_heap NULL)\n");
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
         return NULL;
     }
-    // Alloca dal nuovo blocco (potenziale split se troppo grande)
+    // Allocate from the new block (potential split if too large)
     if (new_block->size > size + HEAP_BLOCK_HEADER_SIZE + 16) {
         uint8_t* split_addr = (uint8_t*)new_block + HEAP_BLOCK_HEADER_SIZE + size;
         heap_block_t* tail = (heap_block_t*)split_addr;
@@ -185,41 +185,41 @@ void* kmalloc(size_t size) {
     return (void*)((uint8_t*)new_block + HEAP_BLOCK_HEADER_SIZE);
 }
 
-// Alloca memoria allineata
+// Allocate memory with alignment guarantee
 void* kmalloc_aligned(size_t size, size_t alignment) {
-    // Alloca extra spazio per l'allineamento
+    // Allocate extra space for alignment
     void* ptr = kmalloc(size + alignment);
     if (ptr == NULL) {
         return NULL;
     }
     
-    // Allinea il puntatore
+    // Align pointer
     uint64_t aligned = align_up((uint64_t)ptr, alignment);
     return (void*)aligned;
 }
 
-// Libera memoria
+// Free memory
 void kfree(void* ptr) {
     if (ptr == NULL) {
         return;
     }
     
-    // Ottieni l'header del blocco
+    // Get block header
     heap_block_t* block = (heap_block_t*)((uint8_t*)ptr - HEAP_BLOCK_HEADER_SIZE);
     
     if (block->is_free) {
-        return;  // Già libero
+        return;  // Already free
     }
     
     block->is_free = true;
     total_freed += block->size;
     
-    // Unisci blocchi liberi adiacenti (coalescing)
+    // Coalesce adjacent free blocks
     heap_block_t* current = heap_start;
     
     while (current != NULL && current->next != NULL) {
         if (current->is_free && current->next->is_free) {
-            // Unisci i due blocchi
+            // Merge blocks
             current->size += HEAP_BLOCK_HEADER_SIZE + current->next->size;
             current->next = current->next->next;
         } else {
@@ -228,7 +228,7 @@ void kfree(void* ptr) {
     }
 }
 
-// Stampa statistiche heap
+// Print heap allocator statistics
 void heap_print_stats(void) {
     char buffer[32];
     

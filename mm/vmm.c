@@ -10,24 +10,24 @@
 #include "panic.h"
 #include "heap.h" // kmalloc/kfree
 
-// Strutture base page table
+// Basic page table constants
 #define PAGE_SIZE 4096ULL
 #define PT_ENTRIES 512
 
-// Maschere
+// Address mask constant
 #define ADDRESS_MASK 0x000FFFFFFFFFF000ULL
 
 static vmm_space_t kernel_space;
 static int physmap_initialized = 0;
-static uint64_t physmap_limit = 0; // limite fisico attualmente coperto dalla physmap
+static uint64_t physmap_limit = 0; // physical memory currently covered by physmap
 
 // Forward declaration
 static void zero_frame(uint64_t phys);
 
-// Estende la physmap (già inizializzata) per coprire almeno phys_end.
-// Usa pagine huge da 2MB come vmm_init_physmap.
+// Extend physmap (already initialized) to cover at least phys_end.
+// Uses 2MB huge pages like vmm_init_physmap.
 void vmm_extend_physmap(uint64_t phys_end) {
-    if (!physmap_initialized) return; // verrà configurata al vmm_init_physmap
+    if (!physmap_initialized) return; // will be configured by vmm_init_physmap
     const uint64_t HUGE_SIZE = 2ULL * 1024 * 1024;
     uint64_t target = (phys_end + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);
     if (target <= physmap_limit) return;
@@ -36,12 +36,12 @@ void vmm_extend_physmap(uint64_t phys_end) {
     uint64_t* pml4 = (uint64_t*)pml4_phys;
     int pml4_i = (VMM_PHYSMAP_BASE >> 39) & 0x1FF;
     int pdpt_i_start = (VMM_PHYSMAP_BASE >> 30) & 0x1FF;
-    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) { terminal_writestring("[ERR] extend physmap: PDPT assente\n"); return; }
+    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) { terminal_writestring("[ERR] extend physmap: PDPT missing\n"); return; }
     uint64_t* pdpt = (uint64_t*)(pml4[pml4_i] & ADDRESS_MASK);
     uint64_t phys_cursor = physmap_limit;
     while (phys_cursor < target) {
         int pdpt_i = pdpt_i_start + ((phys_cursor >> 30) & 0x1FF);
-        if (pdpt_i >= 512) { terminal_writestring("[WARN] extend physmap: superato range PDPT\n"); break; }
+    if (pdpt_i >= 512) { terminal_writestring("[WARN] extend physmap: exceeded PDPT range\n"); break; }
         uint64_t* pdt = (uint64_t*)(pdpt[pdpt_i] & ADDRESS_MASK);
         if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) {
             void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] extend physmap: PDT alloc fail\n"); break; }
@@ -60,18 +60,18 @@ void vmm_extend_physmap(uint64_t phys_end) {
         }
     }
     physmap_limit = phys_cursor;
-    terminal_writestring("[OK] Physmap estesa a ");
+    terminal_writestring("[OK] Physmap extended to ");
     char hex[17]; hex[16]='\0'; uint64_t v=physmap_limit; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
     terminal_writestring("0x"); terminal_writestring(hex); terminal_writestring(" (fisico)\n");
 }
 
-// Helper per zero frame
+// Zero out entire physical frame
 static void zero_frame(uint64_t phys) {
     uint8_t* p;
     if (physmap_initialized) {
         p = (uint8_t*)phys_to_virt(phys);
     } else {
-        // Fallback identity: funziona finché i frame iniziali sono mappati
+    // Identity fallback: works while early frames are identity mapped
         p = (uint8_t*)phys;
     }
     for (int i = 0; i < PAGE_SIZE; i++) p[i] = 0;
@@ -84,7 +84,7 @@ static inline void write_cr3(uint64_t val) {
     __asm__ volatile("mov %0, %%cr3" :: "r"(val));
 }
 
-// Cammina o crea livello
+// Walk page table level or create if absent
 static uint64_t* get_or_create_table(uint64_t* table, int index, uint64_t flags) {
     uint64_t entry = table[index];
     if (!(entry & VMM_FLAG_PRESENT)) {
@@ -98,7 +98,7 @@ static uint64_t* get_or_create_table(uint64_t* table, int index, uint64_t flags)
     return (uint64_t*)(entry & ADDRESS_MASK);
 }
 
-// Ottieni puntatore livello finale (PT) per virt in uno spazio indicato
+// Get pointer to final PT level for virtual address in given space
 static uint64_t* get_pt_space(vmm_space_t* space, uint64_t virt, int create, uint64_t flags) {
     uint64_t pml4_phys = space->pml4_phys & ADDRESS_MASK;
     uint64_t* pml4 = (uint64_t*)pml4_phys; // Identity assumption
@@ -130,7 +130,7 @@ static uint64_t* get_pt_space(vmm_space_t* space, uint64_t virt, int create, uin
     return pt;
 }
 
-// Wrapper legacy per kernel_space
+// Wrapper for kernel_space
 static uint64_t* get_pt(uint64_t virt, int create, uint64_t flags) { return get_pt_space(&kernel_space, virt, create, flags); }
 
 void vmm_init(void) {
@@ -142,46 +142,46 @@ void vmm_init(void) {
     terminal_writestring("0x"); terminal_writestring(buf); terminal_writestring(")\n");
 }
 
-// Helpers per sezione
+// Section boundaries (from linker script)
 extern uint8_t _text_start, _text_end;
 extern uint8_t _rodata_start, _rodata_end;
 extern uint8_t _data_start, _data_end;
 extern uint8_t _bss_start, _bss_end;
-extern uint8_t stack_bottom, stack_top; // da boot.asm
+extern uint8_t stack_bottom, stack_top; // from boot.asm
 
 static inline uint64_t align_down(uint64_t v) { return v & ~0xFFFULL; }
 static inline uint64_t align_up_4k(uint64_t v) { return (v + 0xFFFULL) & ~0xFFFULL; }
 
-// Recupera PDT entry per indirizzo virtuale identita' (<16MB) e crea pagetable se huge
+// Retrieve PDT entry for identity-mapped virtual address (<16MB) and create page table if huge
 static uint64_t* ensure_pt_for_identity(uint64_t virt_base_2mb) {
     uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
     uint64_t* pml4 = (uint64_t*)pml4_phys;
     int pml4_i = (virt_base_2mb >> 39) & 0x1FF;
     uint64_t* pdpt = (uint64_t*)(pml4[pml4_i] & ADDRESS_MASK);
-    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) return NULL; // dovrebbe esistere
+    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) return NULL; // should exist
     int pdpt_i = (virt_base_2mb >> 30) & 0x1FF;
     uint64_t* pdt = (uint64_t*)(pdpt[pdpt_i] & ADDRESS_MASK);
     if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) return NULL;
     int pdt_i = (virt_base_2mb >> 21) & 0x1FF;
     uint64_t entry = pdt[pdt_i];
     if (entry & VMM_FLAG_PS) {
-        void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] alloc PT fail\n"); return NULL; }
+    void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] alloc PT fail\n"); return NULL; }
         zero_frame((uint64_t)frame);
         uint64_t phys_base = (entry & ADDRESS_MASK);
         uint64_t* pt = (uint64_t*)(((uint64_t)frame) & ADDRESS_MASK);
         for (int i=0;i<512;i++) {
             uint64_t phys = phys_base + (i * PAGE_SIZE);
-            // Default permissivo: RW + executable; applicheremo restrizioni dopo
-            pt[i] = phys | VMM_FLAG_PRESENT | VMM_FLAG_RW; // niente NX qui per evitare fault in fase conversione
+            // Permissive default: RW + executable; restrictions applied later.
+            pt[i] = phys | VMM_FLAG_PRESENT | VMM_FLAG_RW; // no NX here to avoid conversion faults
         }
-        pdt[pdt_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW; // clear PS
+    pdt[pdt_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW; // clear PS (remove huge)
         return pt;
     }
     return (uint64_t*)(entry & ADDRESS_MASK);
 }
 
 static void set_page_flags(uint64_t virt, uint64_t flags_mask_clear, uint64_t flags_set) {
-    // Assicurati che il 2MB chunk sia splittato
+    // Ensure the 2MB chunk is split into 4K pages
     ensure_pt_for_identity(virt & ~((2ULL*1024*1024)-1));
     uint64_t* pt = get_pt(virt, 0, 0);
     if (!pt) return;
@@ -195,7 +195,7 @@ static void set_page_flags(uint64_t virt, uint64_t flags_mask_clear, uint64_t fl
 }
 
 void vmm_protect_kernel_sections(void) {
-    terminal_writestring("[SEC] Protezione sezioni kernel (W^X)...\n");
+    terminal_writestring("[SEC] Protecting kernel sections (W^X)...\n");
     uint64_t text_start = (uint64_t)&_text_start;
     uint64_t text_end   = (uint64_t)&_text_end;
     uint64_t ro_start   = (uint64_t)&_rodata_start;
@@ -207,13 +207,13 @@ void vmm_protect_kernel_sections(void) {
     uint64_t stack_btm  = (uint64_t)&stack_bottom;
     uint64_t stack_tp   = (uint64_t)&stack_top;
 
-    // Calcola range globale da proteggere (min start massimo top stack)
+    // Compute global range to protect (min start through stack top)
     uint64_t min_addr = text_start;
     if (ro_start < min_addr) min_addr = ro_start;
     if (data_start < min_addr) min_addr = data_start;
     if (bss_start < min_addr) min_addr = bss_start;
     if (stack_btm < min_addr) min_addr = stack_btm;
-    uint64_t max_addr = stack_tp; // include stack
+    uint64_t max_addr = stack_tp; // includes stack
 
     uint64_t cur = min_addr & ~((2ULL*1024*1024)-1);
     uint64_t end = (max_addr + (2ULL*1024*1024 -1)) & ~((2ULL*1024*1024)-1);
@@ -221,7 +221,7 @@ void vmm_protect_kernel_sections(void) {
         ensure_pt_for_identity(cur);
     }
 
-    // Text: RX (no RW, no NX)
+    // Text: RX (clear RW & NX)
     for (uint64_t v = align_down(text_start); v < align_up_4k(text_end); v += PAGE_SIZE) {
         set_page_flags(v, VMM_FLAG_RW | VMM_FLAG_NOEXEC, 0); // clear RW & NX
     }
@@ -236,12 +236,12 @@ void vmm_protect_kernel_sections(void) {
     for (uint64_t v = align_down(bss_start); v < align_up_4k(bss_end); v += PAGE_SIZE) {
         set_page_flags(v, VMM_FLAG_NOEXEC, VMM_FLAG_NOEXEC | VMM_FLAG_RW);
     }
-    // Stack: RW, NX (guard page rinviata per stabilità)
+    // Stack: RW, NX (guard page deferred for stability)
     for (uint64_t v = align_down(stack_btm); v < align_up_4k(stack_tp); v += PAGE_SIZE) {
         set_page_flags(v, VMM_FLAG_NOEXEC, VMM_FLAG_NOEXEC | VMM_FLAG_RW);
     }
 
-    terminal_writestring("[SEC] W^X applicato: text RX, rodata R/NX, data+bss RW/NX, stack RW/NX con guard page\n");
+    terminal_writestring("[SEC] W^X applied: text RX, rodata R/NX, data+bss RW/NX, stack RW/NX with guard page\n");
 }
 
 // ---- User space helpers ----
@@ -296,7 +296,7 @@ int vmm_map_user_data_in_space(vmm_space_t* space, uint64_t virt) { return map_u
 uint64_t vmm_alloc_user_stack(int pages) {
     if (pages <= 0) pages = 4;
     uint64_t top = USER_STACK_TOP;
-    // Lascia una guard page non mappata sotto il bottom (top - pages*PAGE_SIZE - PAGE_SIZE)
+    // Leave one unmapped guard page below bottom (top - pages*PAGE_SIZE - PAGE_SIZE)
     for (int i=0;i<pages;i++) {
         uint64_t page_addr = top - (i+1)*PAGE_SIZE;
         if (vmm_alloc_user_page(page_addr) != 0) {
@@ -311,7 +311,7 @@ uint64_t vmm_alloc_user_stack_in_space(vmm_space_t* space, int pages) {
     if (!space) return 0;
     if (pages <= 0) pages = 4;
     uint64_t top = USER_STACK_TOP;
-    // Guard page: non mappiamo la pagina subito sotto la bottom del blocco
+    // Guard page: don't map page immediately below stack bottom
     for (int i=0;i<pages;i++) {
         uint64_t page_addr = top - (i+1)*PAGE_SIZE;
         if (vmm_alloc_user_page_in_space(space, page_addr) != 0) {
@@ -331,17 +331,17 @@ vmm_space_t* vmm_space_create_user(void) {
         uint64_t e = old_pml4[i];
         if (e & VMM_FLAG_PRESENT) new_pml4[i] = e & ~VMM_FLAG_USER; // share kernel mappings
     }
-    // Pulisce i blocchi 1GB che copriranno spazio utente (CODE/DATA/STACK) per evitare collisioni con identity mapping
-    // Iteriamo per intervalli da 1GB usando PDPT index
+    // Clear 1GB blocks for user space (CODE/DATA/STACK) to avoid collisions with identity mapping
+    // Iterate in 1GB intervals using PDPT index
     uint64_t start_usr = USER_CODE_BASE;
     uint64_t end_usr   = USER_STACK_TOP;
     for (uint64_t addr = start_usr; addr < end_usr; addr += (1ULL<<30)) { // step 1GB
         int pml4_i = (addr >> 39) & 0x1FF; // tipicamente 0 per indirizzi bassi < 512GB
         uint64_t pdpt_phys = new_pml4[pml4_i] & ADDRESS_MASK;
-        if (!(new_pml4[pml4_i] & VMM_FLAG_PRESENT)) continue; // nessun PDPT
+    if (!(new_pml4[pml4_i] & VMM_FLAG_PRESENT)) continue; // no PDPT
         uint64_t* pdpt = (uint64_t*)pdpt_phys;
         int pdpt_i = (addr >> 30) & 0x1FF;
-        // Se entry presente, la azzeriamo: lo spazio utente avrà tabelle dedicate
+    // If entry present, zero it: user space gets dedicated tables
         if (pdpt[pdpt_i] & VMM_FLAG_PRESENT) {
             pdpt[pdpt_i] = 0; // rimuove huge o link a PDT esistente del kernel
         }
@@ -349,7 +349,7 @@ vmm_space_t* vmm_space_create_user(void) {
     vmm_space_t* space = (vmm_space_t*)kmalloc(sizeof(vmm_space_t));
     if (!space) return NULL;
     space->pml4_phys = (uint64_t)pml4_new & ADDRESS_MASK;
-    terminal_writestring("[USER] new space CR3=");
+    terminal_writestring("[USER] new address space CR3=");
     char hx[]="0123456789ABCDEF"; for(int i=60;i>=0;i-=4) terminal_putchar(hx[(space->pml4_phys>>i)&0xF]);
     terminal_writestring("\n");
     return space;
@@ -361,30 +361,30 @@ int vmm_space_destroy(vmm_space_t* space) {
     return 0;
 }
 
-// Mappa tutta la memoria fisica disponibile usando pagine 2MB (huge) per ridurre numero di tabelle.
+// Map all available physical memory using 2MB huge pages to reduce table count.
 void vmm_init_physmap(void) {
     if (physmap_initialized) return;
     uint64_t total = pmm_get_total_memory();
     if (total == 0) {
-        terminal_writestring("[WARN] physmap: memoria totale = 0\n");
+    terminal_writestring("[WARN] physmap: total memory = 0\n");
         return;
     }
-    // Arrotonda a multipli di 2MB
+    // Round up to 2MB multiples
     const uint64_t HUGE_SIZE = 2ULL * 1024 * 1024;
     uint64_t limit = (total + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);
 
     uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
     uint64_t* pml4 = (uint64_t*)pml4_phys; // identity assumption
 
-    // Calcola indici PML4 / PDPT / PDT per range physmap
-    // Usando VMM_PHYSMAP_BASE: estrai pml4 index
+    // Calculate PML4 / PDPT / PDT indices for physmap range
+    // Using VMM_PHYSMAP_BASE: extract PML4 index
     int pml4_i = (VMM_PHYSMAP_BASE >> 39) & 0x1FF;
     int pdpt_i_start = (VMM_PHYSMAP_BASE >> 30) & 0x1FF;
 
-    // Assicura PDPT presente
+    // Ensure PDPT is present
     uint64_t* pdpt = (uint64_t*)(pml4[pml4_i] & ADDRESS_MASK);
     if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) {
-        void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] physmap: PDPT alloc fail\n"); return; }
+    void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] physmap: PDPT alloc fail\n"); return; }
         zero_frame((uint64_t)frame);
         pml4[pml4_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
         pdpt = (uint64_t*)(((uint64_t)frame) & ADDRESS_MASK);
@@ -392,8 +392,8 @@ void vmm_init_physmap(void) {
 
     uint64_t phys_cursor = 0;
     while (phys_cursor < limit) {
-        int pdpt_i = pdpt_i_start + ((phys_cursor >> 30) & 0x1FF); // Semplice, non supera 512 per 128MB
-        if (pdpt_i >= 512) { terminal_writestring("[WARN] physmap: supera PDPT range\n"); break; }
+    int pdpt_i = pdpt_i_start + ((phys_cursor >> 30) & 0x1FF); // Simple, should not exceed 512 early
+    if (pdpt_i >= 512) { terminal_writestring("[WARN] physmap: exceeds PDPT range\n"); break; }
         uint64_t* pdt = (uint64_t*)(pdpt[pdpt_i] & ADDRESS_MASK);
         if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) {
             void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] physmap: PDT alloc fail\n"); break; }
@@ -401,53 +401,53 @@ void vmm_init_physmap(void) {
             pdpt[pdpt_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
             pdt = (uint64_t*)(((uint64_t)frame) & ADDRESS_MASK);
         }
-        // Riempie PDT con huge pages
+    // Fill PDT with huge pages
         for (int pdt_i = 0; pdt_i < 512 && phys_cursor < limit; pdt_i++) {
-            // Calcola virtuale corrispondente
+            // Compute corresponding virtual address
             uint64_t virt = VMM_PHYSMAP_BASE + phys_cursor;
             int virt_pdt_i = (virt >> 21) & 0x1FF;
-            if (virt_pdt_i != pdt_i) continue; // Allinea con indice locale
+            if (virt_pdt_i != pdt_i) continue; // Align with local index
             if (!(pdt[pdt_i] & VMM_FLAG_PRESENT)) {
-                // Marcare NX su physmap (non eseguibile) e RW
+                // Mark physmap pages NX (non-executable) and RW
                 pdt[pdt_i] = (phys_cursor & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS | VMM_FLAG_NOEXEC;
             }
             phys_cursor += HUGE_SIZE;
         }
     }
     physmap_initialized = 1;
-    physmap_limit = limit; // registra estensione iniziale
-    terminal_writestring("[OK] Physmap inizializzata fino a ");
+    physmap_limit = limit; // record initial extension
+    terminal_writestring("[OK] Physmap initialized up to ");
     char hex[17]; hex[16]='\0'; uint64_t v=limit; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
     terminal_writestring("0x"); terminal_writestring(hex); terminal_writestring(" (fisico)\n");
 }
 
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
-    if (virt & 0xFFF || phys & 0xFFF) return -1; // non allineati
+    if (virt & 0xFFF || phys & 0xFFF) return -1; // not aligned
     uint64_t* pt = get_pt(virt, 1, flags);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
-    if (pt[pt_i] & VMM_FLAG_PRESENT) return -3; // già mappato
+    if (pt[pt_i] & VMM_FLAG_PRESENT) return -3; // already mapped
     pt[pt_i] = (phys & ADDRESS_MASK) | (flags & ~VMM_FLAG_PS) | VMM_FLAG_PRESENT;
     return 0;
 }
 
 int vmm_map_in_space(vmm_space_t* space, uint64_t virt, uint64_t phys, uint64_t flags) {
     if (!space) return -10;
-    if (virt & 0xFFF || phys & 0xFFF) return -1;
+    if (virt & 0xFFF || phys & 0xFFF) return -1; // not aligned
     uint64_t* pt = get_pt_space(space, virt, 1, flags);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
-    if (pt[pt_i] & VMM_FLAG_PRESENT) return -3;
+    if (pt[pt_i] & VMM_FLAG_PRESENT) return -3; // already mapped
     pt[pt_i] = (phys & ADDRESS_MASK) | (flags & ~VMM_FLAG_PS) | VMM_FLAG_PRESENT;
     return 0;
 }
 
 int vmm_unmap(uint64_t virt) {
-    if (virt & 0xFFF) return -1;
+    if (virt & 0xFFF) return -1; // not aligned
     uint64_t* pt = get_pt(virt, 0, 0);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
-    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3;
+    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3; // not mapped
     pt[pt_i] = 0;
     // Invalidate TLB
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
@@ -456,14 +456,14 @@ int vmm_unmap(uint64_t virt) {
 
 int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
     if (!space) return -10;
-    if (virt & 0xFFF) return -1;
+    if (virt & 0xFFF) return -1; // not aligned
     uint64_t* pt = get_pt_space(space, virt, 0, 0);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
-    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3;
+    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3; // not mapped
     uint64_t entry = pt[pt_i];
     pt[pt_i] = 0;
-    // Libera frame fisico
+    // Free physical frame
     void* frame = (void*)(entry & ADDRESS_MASK);
     pmm_free_frame(frame);
     return 0;
@@ -503,7 +503,7 @@ int vmm_alloc_page_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
 vmm_space_t* vmm_get_kernel_space(void) { return &kernel_space; }
 
 vmm_space_t* vmm_clone_space(vmm_space_t* src) {
-    (void)src; return NULL; // stub
+    (void)src; return NULL; // cloning stub (not implemented)
 }
 
 int vmm_switch_space(vmm_space_t* space) {
@@ -518,20 +518,18 @@ void vmm_harden_user_space(vmm_space_t* space) {
     for (int i=0;i<PT_ENTRIES;i++) {
         uint64_t e = pml4[i];
         if (!(e & VMM_FLAG_PRESENT)) continue;
-        // Rimuovi USER dai mapping kernel high (heuristic: indirizzi >= 0xFFFF800000000000)
-        // Calcola indirizzo virtuale base dell'entry PML4
+    // Remove USER bit from high kernel mappings (heuristic: virt >= 0xFFFF800000000000)
+    // Compute virtual base address of PML4 entry
         uint64_t virt_base = ((uint64_t)i << 39);
-        if (virt_base >= 0xFFFF800000000000ULL) {
-            pml4[i] = e & ~VMM_FLAG_USER;
-        }
+        if (virt_base >= 0xFFFF800000000000ULL) pml4[i] = e & ~VMM_FLAG_USER;
     }
-    terminal_writestring("[SEC] harden user space: cleared USER bit su regioni kernel alte\n");
+    terminal_writestring("[SEC] harden user space: cleared USER bit on high kernel regions\n");
 }
 
 void vmm_dump_entry(uint64_t virt) {
     uint64_t phys = vmm_translate(virt);
     terminal_writestring("[VMM] Virt ");
-    // naive hex
+    // Naive hex formatting
     char hex[17]; hex[16]='\0'; uint64_t v=virt; char hc[]="0123456789ABCDEF";
     for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
     terminal_writestring("0x"); terminal_writestring(hex);
@@ -558,17 +556,17 @@ const vmm_region_t* vmm_region_find(uint64_t addr) {
     return NULL;
 }
 
-// Page Fault handler (chiamato da exception_handler per INT 14)
+// Page Fault handler (called by exception_handler for INT 14)
 void vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-    terminal_writestring("[PAGEFAULT] indirizzo: ");
+    terminal_writestring("[PAGEFAULT] address: ");
     char hex[17]; hex[16]='\0'; uint64_t v=fault_addr; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
     terminal_writestring("0x"); terminal_writestring(hex);
     terminal_writestring(" EC="); v=error_code; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; } terminal_writestring("0x"); terminal_writestring(hex);
     terminal_writestring(" ");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
     // Decode error code bits
-    // bit0 P, bit1 W/R, bit2 U/S, bit3 RSVD, bit4 I/D
+    // bit0 Present, bit1 W/R, bit2 U/S, bit3 RSVD, bit4 Instr fetch
     terminal_writestring("(" );
     if (error_code & 1) terminal_writestring("present "); else terminal_writestring("not-present ");
     if (error_code & 2) terminal_writestring("write "); else terminal_writestring("read ");
@@ -579,14 +577,14 @@ void vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
 
     const vmm_region_t* r = vmm_region_find(fault_addr);
     if (r && !(error_code & 1)) {
-        // Demand-zero page se allineata a pagina
+    // Demand-zero page if page-aligned
         uint64_t page = fault_addr & ~0xFFFULL;
         if (vmm_alloc_page(page, r->flags) == 0) {
             terminal_writestring("[PAGEFAULT] Demand alloc page -> OK\n");
-            return; // handler continua esecuzione
+            return; // handler returns allowing execution to continue
         }
-        terminal_writestring("[PAGEFAULT] Demand alloc fallita\n");
+    terminal_writestring("[PAGEFAULT] Demand alloc failed\n");
     }
-    terminal_writestring("[PANIC] Page fault non gestito\n");
+    terminal_writestring("[PANIC] Unhandled page fault\n");
     while(1){ __asm__ volatile("hlt"); }
 }

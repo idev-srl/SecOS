@@ -1,63 +1,63 @@
-# Piano Driver FAT32 (Bozza)
+# FAT32 Driver Plan (Draft)
 
-## Obiettivi Iniziali
-- Implementare supporto **read-only** FAT32 per montare un volume e leggere file/directory.
-- Integrare con il layer VFS esistente (inodes virtuali, readdir, read file).
+## Initial Goals
+- Implement **read-only** FAT32 support to mount a volume and read files/directories.
+- Integrate with existing VFS layer (virtual inodes, readdir, file read).
 
-## Componenti Necessari
-1. **Block Device Astratto**: `int blk_read(uint64_t lba, void* buf, size_t sectors)` provvisorio su buffer in RAM.
-2. **Parser BPB (BIOS Parameter Block)**: Estrarre valori chiave:
-   - Bytes per settore
-   - Settori per cluster
-   - Numero FAT
-   - Settori riservati
-   - Settori per FAT
-   - Primo cluster root (FAT32 usa cluster root invece di root directory fissa)
-3. **Gestione FAT Table**: Caricamento lazy di entry FAT per seguire catena cluster di un file.
-4. **Directory Entries** (short name + LFN): Per la prima versione ignorare LFN e usare solo 8.3; successivamente aggiungere parsing LFN.
-5. **Caching Clusters**: Buffer temporaneo per cluster corrente (ottimizzazione semplice; no LRU avanzato all'inizio).
-6. **Traduzione Path -> cluster**: Walk directory componenti usando confronto 8.3 case-insensitive.
+## Required Components
+1. **Abstract Block Device**: `int blk_read(uint64_t lba, void* buf, size_t sectors)` initially backed by a RAM buffer.
+2. **BPB Parser (BIOS Parameter Block)**: Extract key values:
+  - Bytes per sector
+  - Sectors per cluster
+  - Number of FATs
+  - Reserved sectors
+  - Sectors per FAT
+  - First root cluster (FAT32 uses a root cluster instead of fixed root directory)
+3. **FAT Table Handling**: Lazy loading of FAT entries to follow a file's cluster chain.
+4. **Directory Entries** (short name + LFN): Ignore LFN initially, use only 8.3; later add LFN parsing.
+5. **Cluster Caching**: Temporary buffer for current cluster (simple optimization; no advanced LRU initially).
+6. **Path → Cluster Translation**: Walk directory components using case-insensitive 8.3 comparison.
 
-## Mappatura in VFS
-- Ogni file/directory inode contiene:
-  - Primo cluster
-  - Size (per file)
-  - Flag directory
-- `lookup(path)`: risolve partendo da root cluster.
-- `readdir(path)`: elenca entries nel cluster chain della directory.
-- `read(file, offset, buf, len)`: segue catena FAT fino al cluster contenente offset.
+## VFS Mapping
+- Each file/directory inode contains:
+  - First cluster
+  - Size (for files)
+  - Directory flag
+- `lookup(path)`: resolves starting from the root cluster.
+- `readdir(path)`: lists entries in the directory's cluster chain.
+- `read(file, offset, buf, len)`: follows FAT chain until the cluster containing the offset.
 
-## Limiti Versione Iniziale
-- Niente scrittura/modifica/metadati estesi.
-- Ignora attributi avanzati (solo DIR/FILE, hidden ignorato).
-- Niente timestamps.
-- Nessun supporto LFN nella prima iterazione.
+## Initial Version Limits
+- No write/modify/extended metadata.
+- Ignore advanced attributes (only DIR/FILE, hidden ignored).
+- No timestamps.
+- No LFN support in first iteration.
 
-## Estensioni Future
-- Supporto LFN (sequenza di entries con attribute 0x0F).
-- Write support (allocazione cluster libera, aggiornamento FAT, creazione entries).
-- Cache multi-cluster + prefetch.
-- Gestione attributi (RO, H, S, A).
-- Timestamps DosDate -> conversione.
+## Future Extensions
+- LFN support (sequence of entries with attribute 0x0F).
+- Write support (allocate free clusters, update FAT, create entries).
+- Multi-cluster cache + prefetch.
+- Attribute handling (RO, H, S, A).
+- Timestamp (DOS Date) conversion.
 
-## exFAT Considerazioni
-exFAT differisce radicalmente (allocation bitmap, directory entries variabili, upcase table). Verrà affrontato dopo che FAT32 base è stabile.
+## exFAT Considerations
+exFAT differs significantly (allocation bitmap, variable directory entries, upcase table). Will be addressed after FAT32 base stabilizes.
 
-## Sequenza Implementazione
-1. Stub block device (buffer fittizio con immagine FAT32 caricata staticamente).
-2. Lettura BPB e validazione signature.
-3. Caricamento primo cluster root e list readdir.
-4. Implementazione lookup componenti.
-5. Implementazione read file linearizzata.
-6. Integrazione con VFS mount (es. `vfs_mount_fat32(image_base)`).
-7. Test: elenco root, cat di un file noto.
+## Implementation Sequence
+1. Stub block device (dummy buffer with FAT32 image loaded statically).
+2. Read BPB and validate signature.
+3. Load first root cluster and list via readdir.
+4. Implement component lookup.
+5. Implement linearized file read.
+6. Integrate with VFS mount (e.g. `vfs_mount_fat32(image_base)`).
+7. Tests: list root, cat a known file.
 
-## Test Pianificati
-- Avvia kernel con immagine FAT32 embedded e confrontare output `vls /` vs entries attese.
-- `vcat /README.TXT` corrisponde al contenuto noto.
+## Planned Tests
+- Boot kernel with embedded FAT32 image and compare `vls /` output vs expected entries.
+- `vcat /README.TXT` matches known content.
 
-## Note Performance
-La versione iniziale sacrifica performance per semplicità; cluster traversal lineare per ogni read.
+## Performance Notes
+Initial version sacrifices performance for simplicity; linear cluster traversal per read.
 
 ---
-Bozza – soggetta a modifiche in base alle esigenze.
+Draft – subject to change based on needs.
