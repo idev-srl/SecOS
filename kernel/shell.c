@@ -87,24 +87,10 @@ static uint32_t atoi(const char* str) {
 // Forward declarations of missing commands (ported from previous version)
 static void cmd_help(void);
 static void cmd_clear(void);
-static void cmd_echo(const char* args);
-static void cmd_info(void);
-static void cmd_mem(void);
-static void cmd_memtest(void);
-static void execute_command(char* cmd); // prototipo per evitare implicit declaration
-void shell_ps_list(void); // forward per dispatcher
-
-// Definizione struttura dispatcher (anticipata per help dinamico)
-typedef void (*shell_handler_t)(const char* args);
-struct shell_cmd { const char* name; shell_handler_t handler; };
-
-// Basic command implementations (copied from old version)
-// Command table defined early for dynamic help needs.
-// Table moved before cmd_help definition.
-
-// Forward declarations wrapper handlers (defined later)
-static void sh_help(const char* a);
-static void sh_clear(const char* a);
+static void sh_help(const char* a); // forward wrapper
+static void sh_clear(const char* a); // forward wrapper
+static void execute_command(char* line); // forward dispatcher
+static void shell_ps_list(void); // forward ps listing
 static void sh_echo(const char* a);
 static void sh_info(const char* a);
 static void sh_fontdump(const char* a);
@@ -151,6 +137,29 @@ static void sh_drvtest(const char* a);
 #if ENABLE_RTC
 static void sh_date(const char* a);
 #endif
+
+// Command dispatcher types
+typedef void (*shell_handler_t)(const char* args);
+struct shell_cmd { const char* name; shell_handler_t handler; };
+
+// Pager subsystem (generic)
+static int pager_enabled = 1;           // enabled by default
+static unsigned pager_page_lines = 22;  // fits typical 25-line VGA (minus prompt/header)
+static int pager_line_budget;           // remaining lines
+static int pager_quit;                  // user aborted
+static void sh_pager(const char* a);    // forward command handler
+static void pager_begin(void){ if(pager_enabled){ pager_line_budget = (int)pager_page_lines; pager_quit=0; } else { pager_line_budget = 0x7FFFFFFF; pager_quit=0; } }
+static int pager_should_stop(void){ return pager_quit; }
+static void pager_prompt_more(void){
+    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+    terminal_writestring("--More--(SPACE=page, ENTER=line, q=quit)");
+    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
+    while(1){ char c = keyboard_getchar(); if(c=='q'||c=='Q'){ pager_quit=1; break; } if(c==' '){ pager_line_budget = (int)pager_page_lines; break; } if(c=='\n'){ pager_line_budget = 1; break; } }
+    terminal_writestring("\n");
+}
+static void pager_print(const char* line){ if(pager_quit) return; terminal_writestring(line); terminal_writestring("\n"); if(--pager_line_budget <=0 && pager_enabled) pager_prompt_more(); }
+static void pager_end(void){ (void)0; }
+static void shell_print_help_paged(void); // forward after generic pager
 
 static const struct shell_cmd shell_cmds[] = {
     {"help",      sh_help},
@@ -207,30 +216,42 @@ static const struct shell_cmd shell_cmds[] = {
     {"fontdump",  sh_fontdump},
     {"halt",      sh_halt},
     {"reboot",    sh_reboot},
+    {"pager",    sh_pager},
 #if ENABLE_RTC
     {"date",      sh_date},
 #endif
 };
 
-static void cmd_help(void) {
+static void cmd_help(void) { shell_print_help_paged(); }
+
+static void shell_print_help_paged(void){
+    pager_begin();
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("\nAvailable commands (auto):\n");
+    pager_print("");
+    pager_print("Available commands:");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    for (unsigned i=0;i<sizeof(shell_cmds)/sizeof(shell_cmds[0]); i++) {
-        terminal_writestring("  ");
-        terminal_writestring(shell_cmds[i].name);
-        terminal_writestring("\n");
+    for (unsigned i=0;i<sizeof(shell_cmds)/sizeof(shell_cmds[0]); i++) { if(pager_should_stop()) break; char namebuf[64]; int k=0; namebuf[k++]=' '; namebuf[k++]=' '; const char* n=shell_cmds[i].name; while(*n && k < (int)sizeof(namebuf)-1) namebuf[k++]=*n++; namebuf[k]=0; pager_print(namebuf); }
+    if(!pager_should_stop()){
+        pager_print("");
+        pager_print("RAMFS: rfls rfcat rfinfo rfadd rfwrite rfdel rfmkdir rfrmdir rfcd rfpwd rftree rfusage rfmv rftruncate");
+        pager_print("VFS: vls vcat vinfo vpwd vmount vcreate vwrite vtruncate");
+        pager_print("Drivers: drvinfo drvreg drvunreg drvlog drvtest");
+        pager_print("System: help clear info uptime sleep mem memtest memstress colors color fbinfo fontdump halt reboot crash");
+        pager_print("Other: elfload elfload2 elfunload ps pinfo kill ext2mount usertest logo date (if enabled)");
+        pager_print("");
+        pager_print("Use 'pager off' to disable paging or 'pager lines N' to change page size.");
     }
-    terminal_writestring("\nNew: fbinfo (framebuffer info), color <fg> <bg> (change colors).\n");
-    terminal_writestring("RAMFS: rfls rfcat rfinfo rfadd rfwrite rfdel\n");
-    terminal_writestring("Dir: rfmkdir rfrmdir (rfls [path])\n");
-    terminal_writestring("CWD: rfcd <dir>, rfpwd\n");
-    terminal_writestring("Tree: rftree [path], rfusage\n");
-    terminal_writestring("Mod: rfmv <old> <new>, rftruncate <file> <size>\n");
-    terminal_writestring("VFS: vls vcat vinfo vpwd (root auto-mounted RAMFS)\n");
-    terminal_writestring("VFS Mod: vcreate vwrite vtruncate (mutable files on supported FS)\n");
-    terminal_writestring("EXT2: ext2mount (attempt mount ext2ram device)\n");
-    terminal_writestring("Type 'help' to refresh after further additions.\n\n");
+    pager_end();
+    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
+}
+
+static void sh_pager(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Pager is "); terminal_writestring(pager_enabled?"ON":"OFF"); terminal_writestring(", lines="); print_dec(pager_page_lines); terminal_writestring("\n"); return; }
+    if(a[0]=='o'&&a[1]=='n'&& (a[2]==0||a[2]==' ')){ pager_enabled=1; terminal_writestring("Pager enabled\n"); return; }
+    if(a[0]=='o'&&a[1]=='f'&&a[2]=='f'&& (a[3]==0||a[3]==' ')){ pager_enabled=0; terminal_writestring("Pager disabled\n"); return; }
+    if(strncmp(a, "lines",5)==0){ a+=5; while(*a==' ') a++; unsigned v=0; while(*a>='0'&&*a<='9'){ v=v*10+(*a-'0'); a++; } if(v>=5 && v<=100){ pager_page_lines=v; terminal_writestring("Pager lines updated\n"); } else terminal_writestring("Invalid lines (5-100)\n"); return; }
+    terminal_writestring("Usage: pager [on|off|lines <n>]\n");
 }
 
 static void cmd_clear(void) { terminal_initialize(); }
@@ -736,7 +757,9 @@ static void sh_logo(const char* a){
     terminal_writestring("Usage: logo on|off|redraw\n");
 }
 // RAMFS: lista file
-static void sh_rfls(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else path_resolve("",abs); const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n; if(abs[0]==0){ n=ramfs_list_path("",arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS root ("); } else { n=ramfs_list_path(abs,arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS list '"); terminal_writestring(abs); terminal_writestring("' ("); } print_dec(n); terminal_writestring("):\n"); for(size_t i=0;i<n;i++){ const ramfs_entry_t* e=arr[i]; terminal_writestring("  "); terminal_writestring(e->name); if(e->flags & 2) terminal_writestring("/ "); else terminal_writestring("  "); print_dec(e->size); terminal_writestring(" bytes\n"); } }
+static void sh_rfls(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else path_resolve("",abs); const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n; if(abs[0]==0){ n=ramfs_list_path("",arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS root ("); } else { n=ramfs_list_path(abs,arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS list '"); terminal_writestring(abs); terminal_writestring("' ("); } print_dec(n); terminal_writestring("):\n"); pager_begin(); for(size_t i=0;i<n;i++){ if(pager_should_stop()) break; const ramfs_entry_t* e=arr[i]; char line[RAMFS_NAME_MAX+32]; int k=0; line[k++]=' '; line[k++]=' '; const char* nm=e->name; while(*nm && k < (int)sizeof(line)-10) line[k++]=*nm++; if(e->flags & 2 && k < (int)sizeof(line)-2) { line[k++]='/'; line[k++]=' '; } else { line[k++]=' '; line[k++]=' '; } // size
+        line[k]=0; terminal_writestring(line); print_dec(e->size); terminal_writestring(" bytes\n"); if(--pager_line_budget <=0 && pager_enabled && !pager_should_stop()) pager_prompt_more(); }
+    pager_end(); }
 // RAMFS: crea directory
 static void sh_rfmkdir(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfmkdir <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); if(ramfs_mkdir(abs)==0) terminal_writestring("[rfmkdir] OK\n"); else terminal_writestring("[rfmkdir] FAIL\n"); }
 // RAMFS: rimuovi directory (vuota)
@@ -767,17 +790,8 @@ static void sh_rfcd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writes
 // RAMFS: mostra working directory
 static void sh_rfpwd(const char* a){ (void)a; terminal_writestring("CWD: "); path_print_cwd(); }
 // RAMFS: stampa albero ricorsivo
-static void rftree_print(const char* path,int depth){ const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n; n = (path && path[0])? ramfs_list_path(path,arr,RAMFS_MAX_FILES) : ramfs_list_path("",arr,RAMFS_MAX_FILES); for(size_t i=0;i<n;i++){ const ramfs_entry_t* e=arr[i]; // estrai ultimo componente
-        const char* name=e->name; const char* last=name; for(const char* p=name; *p; p++){ if(*p=='/') last=p+1; }
-        // prefisso grafico
-        for(int d=0; d<depth; d++) terminal_writestring("│  ");
-        // determinare ramo
-        if(i+1<n) terminal_writestring("├─ "); else terminal_writestring("└─ ");
-        terminal_writestring(last);
-        if(e->flags & 2){ terminal_writestring("/\n"); rftree_print(e->name, depth+1); }
-        else { terminal_writestring("  "); print_dec(e->size); terminal_writestring(" bytes\n"); }
-    } }
-static void sh_rftree(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else abs[0]=0; if(abs[0] && ramfs_is_dir(abs)!=1){ terminal_writestring("[rftree] not a directory\n"); return; } terminal_writestring("[rftree] tree:\n"); rftree_print(abs,0); }
+static void rftree_print(const char* path,int depth){ const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n = (path && path[0])? ramfs_list_path(path,arr,RAMFS_MAX_FILES) : ramfs_list_path("",arr,RAMFS_MAX_FILES); for(size_t i=0;i<n;i++){ if(pager_should_stop()) return; const ramfs_entry_t* e=arr[i]; const char* last=e->name; for(const char* p=e->name; *p; p++){ if(*p=='/') last=p+1; } char line[RAMFS_NAME_MAX+16]; int k=0; for(int d=0; d<depth && k < (int)sizeof(line)-4; d++){ line[k++]=' '; line[k++]=' '; line[k++]='|'; line[k++]=' '; } if(i+1<n){ line[k++]='|'; line[k++]='-'; line[k++]=' '; } else { line[k++]='`'; line[k++]='-'; line[k++]=' '; } const char* q=last; while(*q && k < (int)sizeof(line)-2) line[k++]=*q++; if(e->flags & 2 && k < (int)sizeof(line)-2) line[k++]='/'; line[k]=0; pager_print(line); if((e->flags & 2) && !pager_should_stop()) rftree_print(e->name, depth+1); } }
+static void sh_rftree(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else abs[0]=0; if(abs[0] && ramfs_is_dir(abs)!=1){ terminal_writestring("[rftree] not a directory\n"); return; } terminal_writestring("[rftree] tree:\n"); pager_begin(); rftree_print(abs,0); pager_end(); }
 // RAMFS: uso totale
 static void sh_rfusage(const char* a){ (void)a; const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n = ramfs_list(arr,RAMFS_MAX_FILES); size_t bytes=0; size_t files=0; size_t dirs=0; for(size_t i=0;i<n;i++){ if(arr[i]->flags & 2) dirs++; else { files++; bytes += arr[i]->size; } } terminal_writestring("[rfusage] files="); print_dec(files); terminal_writestring(" dirs="); print_dec(dirs); terminal_writestring(" total_bytes="); print_dec(bytes); terminal_writestring(" slots_used="); print_dec(n); terminal_writestring(" slots_free="); print_dec(RAMFS_MAX_FILES - n); terminal_writestring("\n"); }
 // ---- VFS commands ----
@@ -793,7 +807,7 @@ static void vls_cb(const vfs_inode_t* child, void* user){
         terminal_writestring(" bytes\n");
     }
 }
-static void sh_vls(const char* a){ while(*a==' ') a++; char path[256]; size_t pi=0; while(*a && pi<sizeof(path)-1) path[pi++]=*a++; path[pi]=0; if(pi==0){ path[0]='/'; path[1]=0; } extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*); extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* dir = vfs_lookup(path); if(dir && dir->type!=VFS_NODE_DIR){ terminal_writestring("[vls] not a directory\n"); return; } terminal_writestring("[vls] "); terminal_writestring(path); terminal_writestring("\n"); vfs_readdir(path, vls_cb, NULL); }
+static void sh_vls(const char* a){ while(*a==' ') a++; char path[256]; size_t pi=0; while(*a && pi<sizeof(path)-1) path[pi++]=*a++; path[pi]=0; if(pi==0){ path[0]='/'; path[1]=0; } extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*); extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* dir = vfs_lookup(path); if(dir && dir->type!=VFS_NODE_DIR){ terminal_writestring("[vls] not a directory\n"); return; } terminal_writestring("[vls] "); terminal_writestring(path); terminal_writestring("\n"); pager_begin(); vfs_readdir(path, vls_cb, NULL); pager_end(); }
 static void sh_vcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vcat <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_read_all(const char*, void*, size_t); vfs_inode_t* ino=vfs_lookup(a); if(!ino || ino->type!=VFS_NODE_FILE){ terminal_writestring("[vcat] file not found\n"); return; } char buf[1024]; if(ino->size >= sizeof(buf)){ terminal_writestring("[vcat] file too large for buffer\n"); return; } int r=vfs_read_all(a,buf,sizeof(buf)); if(r<0){ terminal_writestring("[vcat] read fail\n"); return; } for(int i=0;i<r;i++) terminal_putchar(buf[i]); if(r==0) terminal_writestring("(empty)\n"); }
 static void sh_vinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vinfo <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* ino=vfs_lookup(a); if(!ino){ terminal_writestring("[vinfo] not found\n"); return; } terminal_writestring("Path: "); terminal_writestring(ino->path); terminal_writestring("\nType: "); terminal_writestring(ino->type==VFS_NODE_DIR?"DIR":"FILE"); terminal_writestring("\nSize: "); print_dec(ino->size); terminal_writestring(" bytes\n"); }
 static void sh_vpwd(const char* a){ (void)a; terminal_writestring("(vpwd uses RAMFS CWD) "); path_print_cwd(); }
@@ -826,8 +840,9 @@ static void sh_drvlog(const char* a){
     driver_audit_entry_t buf[128]; int n = driver_audit_dump(buf, limit);
     if(n==0){ terminal_writestring("[drvlog] (empty)\n"); return; }
     terminal_writestring("[drvlog] events (filtered):\n");
-    int shown=0;
+    int shown=0; pager_begin();
     for(int i=0;i<n;i++){
+        if(pager_should_stop()) break;
         driver_audit_entry_t* e=&buf[i];
         if(only_errors && e->result==DRV_OK) continue;
         if(filter_dev!=-1 && e->device_id!=filter_dev) continue;
@@ -843,7 +858,7 @@ static void sh_drvlog(const char* a){
         terminal_writestring("\n");
         shown++;
     }
-    if(shown==0){ terminal_writestring("[drvlog] no events after filters\n"); }
+    pager_end(); if(shown==0){ terminal_writestring("[drvlog] no events after filters\n"); }
 }
 static void sh_drvinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvinfo <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev=dev*10+(*a-'0'); a++; } extern const device_desc_t* driver_get_device(int); const device_desc_t* d = driver_get_device(dev); if(!d){ terminal_writestring("[drvinfo] device not found\n"); return; } terminal_writestring("[drvinfo] id="); print_dec(d->device_id); terminal_writestring(" reg_base="); print_hex(d->reg_base); terminal_writestring(" reg_size="); print_hex(d->reg_size); terminal_writestring(" mem_base="); print_hex(d->mem_base); terminal_writestring(" mem_size="); print_hex(d->mem_size); terminal_writestring(" caps="); print_hex(d->caps_mask); terminal_writestring("\n"); }
 static void sh_drvtest(const char* a){ (void)a; extern void user_test_driver(void); user_test_driver(); }
@@ -916,7 +931,7 @@ static void sh_elfload2(const char* a) {
     if(!p) terminal_writestring("[ELFLOAD2] Failed\n"); else terminal_writestring("[ELFLOAD2] OK (process created)\n");
     }
 static void sh_elfunload(const char* a) { extern process_t* process_get_last(void); extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t* p); uint32_t pid=0; while(*a==' ') a++; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* target = pid? process_find_by_pid(pid): process_get_last(); if(!target) terminal_writestring("[ELFUNLOAD] process not found\n"); else { int ur=process_destroy(target); if(ur==0) terminal_writestring("[ELFUNLOAD] OK (process destroyed)\n"); else terminal_writestring("[ELFUNLOAD] FAIL\n"); } }
-static void sh_ps(const char* a){ (void)a; shell_ps_list(); }
+static void sh_ps(const char* a){ (void)a; pager_begin(); shell_ps_list(); pager_end(); }
 static void sh_kill(const char* a){ extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t*); while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: kill <pid>\n"); return; } uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* t=process_find_by_pid(pid); if(!t){ terminal_writestring("[KILL] PID not found\n"); return; } int r=process_destroy(t); if(r==0) terminal_writestring("[KILL] OK\n"); else terminal_writestring("[KILL] FAIL\n"); }
 // Helper per decodificare flags manifest
 static void decode_manifest_flags(uint32_t f, char* out, size_t cap) {
@@ -1009,7 +1024,7 @@ static void ps_cb_impl(process_t* p, void* user) {
     switch(p->state){case PROC_NEW:ctx->st_new++;break;case PROC_READY:ctx->st_ready++;break;case PROC_RUNNING:ctx->st_run++;break;case PROC_BLOCKED:ctx->st_blk++;break;case PROC_ZOMBIE:ctx->st_zomb++;break;}
 }
 
-void shell_ps_list(void) {
+static void shell_ps_list(void) {
     terminal_writestring("\n[PS] Active processes:\n");
     extern void process_foreach(void (*cb)(process_t*, void*), void* user);
     struct ps_ctx_global ctx; ctx.count=0; ctx.total_pages=0; ctx.total_cpu=0; ctx.st_new=ctx.st_ready=ctx.st_run=ctx.st_blk=ctx.st_zomb=0;

@@ -26,6 +26,11 @@ A kernel written in C that boots in Long Mode (64-bit) via GRUB as the bootloade
 - ✅ Error handling during boot & process unload (elfunload)
 - ✅ ps command (basic process listing)
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
+[![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
+[![Made by iDev](https://img.shields.io/badge/made%20by-iDev%20Srl-blue)](https://www.idev-srl.com)
+
+
 ## Requirements
 
 ### Required software:
