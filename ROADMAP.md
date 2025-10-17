@@ -1,5 +1,7 @@
 # 🛣️ SecOS Development Roadmap
 
+*Last updated: 2025/10/17*
+
 This roadmap outlines the planned features and milestones for the development of **SecOS**, a minimal secure operating system kernel built from scratch.
 
 ---
@@ -62,4 +64,5 @@ If you'd like to contribute to SecOS, please refer to [CONTRIBUTING.md](CONTRIBU
 
 ---
 
-*Last updated: {{ today’s date }}*
+
+
