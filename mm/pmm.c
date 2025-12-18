@@ -240,6 +240,52 @@ void pmm_init_mb2(void* mb2_info_ptr) {
     pmm_build_from_regions(regions, rc);
 }
 
+// Initialize PMM (UEFI) using memory descriptors
+// mem_descs: array di EFI_MEMORY_DESCRIPTOR (semplificato) identità mappati
+// type=7 (EfiConventionalMemory) considerato disponibile
+// Per evitare dipendenza diretta da efi.h (loader esterno), usiamo offset e campi attesi.
+void pmm_init_uefi(void* mem_descs, uint64_t desc_count, uint64_t desc_size, uint64_t desc_version) {
+    (void)desc_version; // versione non usata
+    if (!mem_descs || desc_count == 0 || desc_size < 32) {
+        terminal_writestring("[UEFI][PMM][WARN] Parametri mappa memoria non validi\n");
+        // Fallback sintetico 1MB..128MB
+        struct avail_region regions[1];
+        regions[0].addr = 0x00100000ULL; regions[0].len = 127ULL * 1024 * 1024;
+        pmm_build_from_regions(regions, 1);
+        return;
+    }
+    struct avail_region regions[128]; int rc=0;
+    uint8_t* base = (uint8_t*)mem_descs;
+    for (uint64_t i=0; i<desc_count && rc < 128; i++) {
+        uint8_t* d = base + i * desc_size;
+        // Layout semplificato EFI_MEMORY_DESCRIPTOR:
+        // uint32_t Type; uint64_t PhysicalStart; uint64_t VirtualStart; uint64_t NumberOfPages; uint64_t Attribute;
+        uint32_t Type = *(uint32_t*)d;
+        uint64_t PhysicalStart = *(uint64_t*)(d + 8);
+        uint64_t NumberOfPages = *(uint64_t*)(d + 24);
+        if (Type == 7) { // EfiConventionalMemory
+            uint64_t len = NumberOfPages * 4096ULL;
+            regions[rc].addr = PhysicalStart;
+            regions[rc].len  = len;
+            rc++;
+        }
+    }
+    if (rc == 0) {
+        terminal_writestring("[UEFI][PMM][WARN] Nessuna regione EfiConventionalMemory, fallback sintetico\n");
+        struct avail_region fr[1]; fr[0].addr = 0x00100000ULL; fr[0].len = 63ULL * 1024 * 1024; pmm_build_from_regions(fr, 1); return;
+    }
+    // Clamp identità early come percorso MB2
+    uint64_t identity_limit = 128ULL * 1024 * 1024;
+    for (int r=0; r<rc; r++) {
+        uint64_t end = regions[r].addr + regions[r].len;
+        if (end > identity_limit) {
+            if (regions[r].addr >= identity_limit) regions[r].len = 0; else regions[r].len = identity_limit - regions[r].addr;
+        }
+    }
+    pmm_build_from_regions(regions, rc);
+    terminal_writestring("[UEFI][PMM] Inizializzazione da descriptors completata\n");
+}
+
 // Allocate one physical frame
 void* pmm_alloc_frame(void) {
     uint32_t frame = find_free_frame();

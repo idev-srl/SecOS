@@ -17,6 +17,8 @@
 void pmm_init(void* mboot_info);
 // Initialize PMM using Multiboot2 structure (info pointer)
 void pmm_init_mb2(void* mb2_info);
+// Initialize PMM using UEFI memory descriptors (bootinfo handoff)
+void pmm_init_uefi(void* mem_descs, uint64_t desc_count, uint64_t desc_size, uint64_t desc_version);
 
 // Allocate a physical frame
 void* pmm_alloc_frame(void);

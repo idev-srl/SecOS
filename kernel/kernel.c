@@ -38,6 +38,9 @@
 #include "sched.h"
 #include "panic.h"
 #include "driver_if.h" // driver registry init
+#if CONFIG_UEFI
+#include "bootinfo.h"
+#endif
 #if ENABLE_FB
 #include "fb.h"
 #include "fb_console.h"
@@ -77,11 +80,23 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // (Optional: could enumerate framebuffer tags only in debug mode)
 #endif
 
-    // Mark which PMM path we take
+    // Se avvio UEFI (bootloader nostro): multiboot_magic probabilmente 0 e multiboot_info contiene ptr a secos_boot_info
+#if CONFIG_UEFI
+    if (multiboot_magic == 0 && multiboot_info != 0) {
+        struct secos_boot_info* bi = (struct secos_boot_info*)multiboot_info;
+        terminal_writestring("[UEFI] Boot info flags= "); print_hex(bi->flags); terminal_writestring("\n");
+        if (bi->flags & (1ULL<<1)) { // memory map valida
+            pmm_init_uefi(bi->mem_descs, bi->mem_desc_count, bi->mem_desc_size, bi->mem_desc_version);
+        } else {
+            terminal_writestring("[UEFI][WARN] Memory map assente, fallback PMM sintetico\n");
+            pmm_init_uefi(NULL,0,0,0);
+        }
+    } else
+#endif
     if (multiboot_magic == MULTIBOOT2_BOOTLOADER_MAGIC) {
-    pmm_init_mb2((void*)multiboot_info);
+        pmm_init_mb2((void*)multiboot_info);
     } else {
-    pmm_init((void*)multiboot_info);
+        pmm_init((void*)multiboot_info);
     }
     // pmm_print_stats(); // optional
     vmm_init();
@@ -170,6 +185,31 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             }
         }
     }
+#if CONFIG_UEFI
+    else if (multiboot_magic == 0 && multiboot_info != 0) {
+        // Init framebuffer from UEFI boot info
+        struct secos_boot_info* bi = (struct secos_boot_info*)multiboot_info;
+        if (bi->fb_addr && (bi->flags & (1ULL<<0))) {  // bit0: GOP valid
+            extern int fb_init_uefi(struct secos_boot_info*);
+            if (fb_init_uefi(bi) == 0) {
+                fb_finalize_mapping();
+                framebuffer_info_t info; 
+                if (fb_get_info(&info)) {
+                    uint64_t base = info.virt_addr ? info.virt_addr : info.addr;
+                    if (terminal_try_enable_fb()) {
+                        fb_clear(0x000000);
+                        extern void fb_console_draw_logo(void); 
+                        fb_console_draw_logo();
+                        print_banner();
+                        terminal_writestring("[UEFI-FB] w="); print_hex(info.width); terminal_writestring(" h="); print_hex(info.height); terminal_writestring(" bpp="); print_hex(info.bpp); terminal_writestring("\n");
+                        extern int fb_console_enable_cursor_blink(uint32_t timer_freq);
+                        fb_console_enable_cursor_blink(timer_get_frequency());
+                    }
+                }
+            }
+        }
+    }
+#endif
 #endif
 
     // terminal_writestring("[OK] Sistema pronto!\n");

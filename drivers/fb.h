@@ -9,6 +9,9 @@
  */
 #include <stdint.h>
 #include "config.h"
+#if CONFIG_UEFI
+#include "bootinfo.h"
+#endif
 
 #if ENABLE_FB
 
@@ -29,6 +32,7 @@ typedef struct framebuffer_info {
 } framebuffer_info_t;
 
 int fb_init(uint32_t multiboot_info);
+int fb_init_uefi(struct secos_boot_info* bi);
 void fb_clear(uint32_t color);
 void fb_putpixel(int x, int y, uint32_t color);
 void fb_draw_test_pattern(void);

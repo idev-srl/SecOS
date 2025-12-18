@@ -174,4 +174,38 @@ void fb_debug_fill(uint32_t color_rgb) {
     }
 }
 
+// Initialize framebuffer from UEFI boot info
+int fb_init_uefi(struct secos_boot_info* bi) {
+    if (!bi) return -1;
+    
+    terminal_writestring("[FB-UEFI] Initializing from boot info\n");
+    terminal_writestring("[FB-UEFI] GOP addr="); print_hex(bi->fb_addr); 
+    terminal_writestring(" size="); print_hex((uint64_t)bi->fb_width * bi->fb_height * 4);
+    terminal_writestring("\n");
+    
+    g_fb.addr  = bi->fb_addr;
+    g_fb.virt_addr = 0; // Will be set after physmap
+    g_fb.pitch = bi->fb_pitch;
+    g_fb.width = bi->fb_width;
+    g_fb.height = bi->fb_height;
+    g_fb.bpp   = bi->fb_bpp;
+    g_fb.type  = 1; // Assume RGB type
+    g_fb.red_mask_size = 8;
+    g_fb.red_mask_pos = 16;
+    g_fb.green_mask_size = 8;
+    g_fb.green_mask_pos = 8;
+    g_fb.blue_mask_size = 8;
+    g_fb.blue_mask_pos = 0;
+    
+    // If address above identity map, defer access
+    if (g_fb.addr >= (512ULL*1024*1024)) {
+        g_fb_phys_only = 1;
+        terminal_writestring("[FB-UEFI] High physical address, deferring access\n");
+    }
+    
+    g_fb_ready = 1;
+    terminal_writestring("[FB-UEFI] Ready\n");
+    return 0;
+}
+
 #endif // ENABLE_FB

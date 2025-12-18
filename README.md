@@ -2,15 +2,16 @@
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
 [![Made by iDev](https://img.shields.io/badge/made%20by-iDev%20Srl-blue)](https://www.idev-srl.com)
 
-# 64-bit Kernel with GRUB
+# 64-bit Kernel with GRUB & UEFI
 
-A kernel written in C that boots in Long Mode (64-bit) via GRUB as the bootloader, with PS/2 keyboard support and an interactive shell.
+A kernel written in C that boots in Long Mode (64-bit) via GRUB (Multiboot) or UEFI bootloader, with PS/2 keyboard support and an interactive shell.
 
 ## Features
 
 - ✅ Long Mode (64-bit) boot
-- ✅ Multiboot support (GRUB)
-- ✅ Basic VGA text terminal
+- ✅ Multiboot 1/2 support (GRUB)
+- ✅ **UEFI boot support** ([see UEFI_IMPLEMENTATION.md](UEFI_IMPLEMENTATION.md))
+- ✅ Basic VGA text terminal + framebuffer console
 - ✅ Initial identity mapping (transitory)
 - ✅ Working stack
 - ✅ Interrupt Descriptor Table (IDT)

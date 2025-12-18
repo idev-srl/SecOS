@@ -20,6 +20,7 @@ INCLUDES = -I. -I$(BOOT_DIR) -I$(ARCH_DIR) -I$(KERNEL_DIR) -I$(DRIVERS_DIR) -I$(
 ASFLAGS = -f elf64
 BUILD_TS := $(shell date -u +%Y%m%d%H%M%S)
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo NOHASH)
+# Nota: CONFIG_MULTIBOOT e CONFIG_UEFI sono ora definiti in config.h (dual-boot support)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mno-red-zone -mno-sse -mno-sse2 $(INCLUDES) \
 		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\""
 LDFLAGS = -n -T linker.ld
@@ -54,6 +55,14 @@ OBJS     = $(OBJS_ASM) $(OBJS_C)
 KERNEL  = kernel.bin
 ISO     = myos.iso
 ISODIR  = isodir
+
+# UEFI output directories
+DIST_DIR = dist
+EFI_BOOT_DIR = $(DIST_DIR)/EFI/BOOT
+UEFI_LOADER_ELF = uefi_loader.elf
+UEFI_APP = $(EFI_BOOT_DIR)/BOOTX64.EFI
+
+.PHONY: uefi uefi-clean
 
 .PHONY: all clean run iso
 
@@ -113,7 +122,42 @@ run: iso
 clean:
 	rm -f $(OBJS) $(KERNEL)
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
+	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)
 
 tree:
 	@echo "ASM: $(SRC_ASM)"
 	@echo "C  : $(SRC_C)"
+
+# --- UEFI build (Strategy B: external bootloader) ---
+UEFI_SRC = uefi/boot.c uefi/elf_load.c
+UEFI_HELLO_SRC = uefi/hello.c
+UEFI_OBJS = $(UEFI_SRC:%.c=%.o)
+UEFI_HELLO_OBJS = $(UEFI_HELLO_SRC:%.c=%.o)
+UEFI_HELLO_APP = $(EFI_BOOT_DIR)/HELLO.EFI
+UEFI_CFLAGS = -ffreestanding -fshort-wchar -O2 -mno-red-zone -m64 -fno-stack-protector -fPIE -fno-omit-frame-pointer -fno-asynchronous-unwind-tables -fno-unwind-tables -fcf-protection=none -mno-sse -mno-mmx $(INCLUDES) -DCONFIG_UEFI
+
+uefi/%.o: uefi/%.c
+	$(CC) $(UEFI_CFLAGS) -c $< -o $@
+
+uefi: $(UEFI_OBJS)
+	mkdir -p $(EFI_BOOT_DIR)
+	$(LD) -nostdlib -znocombreloc -shared -Bsymbolic -e efi_main $(UEFI_OBJS) -o $(UEFI_LOADER_ELF)
+	objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .rel -j .rela -j .reloc --target=efi-app-x86_64 $(UEFI_LOADER_ELF) $(UEFI_APP)
+	cp $(KERNEL) $(DIST_DIR)/kernel.elf || true
+	@echo "UEFI loader built: $(UEFI_APP)"
+	@echo "To run under QEMU OVMF, mount dist as FAT drive."
+
+uefi-clean:
+	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF) $(UEFI_OBJS)
+
+uefi_hello: $(UEFI_HELLO_OBJS)
+	mkdir -p $(EFI_BOOT_DIR)
+	$(LD) -nostdlib -znocombreloc -T $(GNU_EFI_LDS) -shared -Bsymbolic -L$(GNU_EFI_LIB) $(GNU_EFI_CRT) $(UEFI_HELLO_OBJS) -o uefi_hello.elf -lgnuefi -lefi
+	objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .rel -j .rela -j .reloc --target=efi-app-x86_64 uefi_hello.elf $(UEFI_HELLO_APP)
+	@echo "Minimal UEFI hello built: $(UEFI_HELLO_APP)"
+
+# Avvio rapido UEFI (richiede script run_uefi.sh)
+.PHONY: run-uefi
+run-uefi: uefi
+	@chmod +x run_uefi.sh 2>/dev/null || true
+	./run_uefi.sh

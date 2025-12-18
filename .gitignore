@@ -7,6 +7,11 @@
 # Ignore log files
 *.log
 
+# Ignore image files
+*.img
+*.iso
+
+
 # Ignore some directories
 build/
 dist/

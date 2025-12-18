@@ -1,0 +1,15 @@
+[36m[INFO][0m Eseguo build UEFI (make uefi)
+UEFI loader built: dist/EFI/BOOT/BOOTX64.EFI
+To run under QEMU OVMF, mount dist as FAT drive.
+[36m[INFO][0m Avvio QEMU con OVMF
+[32m[ OK ][0m Immagine FAT già presente: dist/esp_fat.img
+[32m[ OK ][0m startup.nsh aggiornato
+[36m[INFO][0m Controller selezionato: VIRTIO | Machine: q35
++ '[' 0 -eq 1 ']'
++ /home/luigi/qemu-local/bin/qemu-system-x86_64 -machine q35,accel=tcg -cpu qemu64 -m 512M -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd -serial stdio -debugcon file:uefi_debug.log -global isa-debugcon.iobase=0x402 -no-reboot -drive if=none,id=esp,file=dist/esp_fat.img,format=raw -device virtio-blk-pci,drive=esp -drive if=pflash,format=raw,file=dist/OVMF_VARS.copy.fd
+VNC server running on 127.0.0.1:5900
+[2J[01;01H[=3h[2J[01;01HBdsDxe: failed to load Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0): Not Found
+BdsDxe: loading Boot0002 "UEFI Non-Block Boot Device" from PciRoot(0x0)/Pci(0x3,0x0)
+BdsDxe: failed to load Boot0002 "UEFI Non-Block Boot Device" from PciRoot(0x0)/Pci(0x3,0x0): Not Found
+
+>>Start PXE over IPv4.
