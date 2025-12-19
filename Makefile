@@ -141,10 +141,12 @@ uefi/%.o: uefi/%.c
 
 uefi: $(UEFI_OBJS)
 	mkdir -p $(EFI_BOOT_DIR)
-	$(LD) -nostdlib -znocombreloc -shared -Bsymbolic -e efi_main $(UEFI_OBJS) -o $(UEFI_LOADER_ELF)
-	objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .rel -j .rela -j .reloc --target=efi-app-x86_64 $(UEFI_LOADER_ELF) $(UEFI_APP)
-	cp $(KERNEL) $(DIST_DIR)/kernel.elf || true
-	@echo "UEFI loader built: $(UEFI_APP)"
+	$(LD) -nostdlib -znocombreloc -shared -Bsymbolic -T /usr/lib/elf_x86_64_efi.lds \
+		-L /usr/lib /usr/lib/crt0-efi-x86_64.o $(UEFI_OBJS) -lefi -lgnuefi -o $(UEFI_LOADER_ELF)
+	objcopy -j .hash -j .gnu.hash -j .dynsym -j .dynstr -j .text -j .sdata -j .data -j .rodata -j .eh_frame -j .dynamic -j .rel -j .rela -j .reloc --target=efi-app-x86_64 $(UEFI_LOADER_ELF) $(UEFI_APP)
+	@echo "✅ UEFI loader built: $(UEFI_APP)"
+	@ls -lh $(UEFI_APP)
+	@cp $(KERNEL) $(DIST_DIR)/kernel.elf || true
 	@echo "To run under QEMU OVMF, mount dist as FAT drive."
 
 uefi-clean:
