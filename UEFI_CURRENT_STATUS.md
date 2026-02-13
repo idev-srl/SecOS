@@ -35,7 +35,7 @@
 - **Kernel**: `dist/kernel.elf` (131 KB)
 - **Boot Info Header**: `kernel/bootinfo.h` (aggiornato)
 - **Image**: `dist/esp_fat.img` (GPT+FAT32)
-- **Comando QEMU**:
+- **Comando QEMU**:dir (.)
   ```bash
   /home/luigi/qemu-local/bin/qemu-system-x86_64 \
     -machine q35 -cpu qemu64 -m 512M \
