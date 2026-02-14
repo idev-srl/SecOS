@@ -43,29 +43,50 @@ static void puts16(EFI_SYSTEM_TABLE* st, const CHAR16* s) {
     st->ConOut->OutputString(st->ConOut, s);
 }
 
-// Basic hex print (limited)
-static void print_hex64(EFI_SYSTEM_TABLE* st, uint64_t v) {
-    CHAR16 buf[19]; // L"0x" + 16 hex + null
-    buf[0]='0'; buf[1]='x';
-    for(int i=0;i<16;i++){ int shift=(15-i)*4; uint8_t ny=(v>>shift)&0xF; CHAR16 c=(ny<10)?('0'+ny):('A'+ny-10); buf[2+i]=c; }
-    buf[18]=0; puts16(st, buf);
+// Converts a 64-bit value to "0x" + 16 hex digits + null into out[19].
+static void hex64_to_str(uint64_t v, CHAR16 out[19]) {
+    out[0] = '0'; out[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        int shift = (15 - i) * 4;
+        uint8_t ny = (uint8_t)((v >> shift) & 0xF);
+        out[2 + i] = (ny < 10) ? ('0' + ny) : ('A' + ny - 10);
+    }
+    out[18] = 0;
 }
 
-EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
-    puts16(SystemTable, WIDE("[BOOT] SecOS UEFI loader starting minimal...\r\n"));
+// Prints: "<where>: <0x...>\r\n"
+static void print_status(EFI_SYSTEM_TABLE* st, const CHAR16* where, EFI_STATUS s) {
+    CHAR16 buf[19];
+    hex64_to_str(s, buf);
+    puts16(st, where);
+    puts16(st, (const CHAR16*)L": ");
+    puts16(st, buf);
+    puts16(st, (const CHAR16*)L"\r\n");
+}
 
-    // DEBUG: Log status after each critical call
-    EFI_STATUS debug_status;
+// Basic hex print helper (used for non-status values)
+static void print_hex64(EFI_SYSTEM_TABLE* st, uint64_t v) {
+    CHAR16 buf[19];
+    hex64_to_str(v, buf);
+    puts16(st, buf);
+}
+
+// Executes expr; if != EFI_SUCCESS prints "<where>: <status>" and returns.
+// Requires `SystemTable` in scope.
+#define CHECK_OK(where, expr) do { \
+    EFI_STATUS __s = (expr); \
+    if (__s != EFI_SUCCESS) { \
+        print_status(SystemTable, WIDE(where), __s); \
+        return __s; \
+    } \
+} while(0)
+
+EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
+    puts16(SystemTable, WIDE("[BOOT] entered efi_main\r\n"));
 
     // Locate GOP
     EFI_GRAPHICS_OUTPUT_PROTOCOL* gop = NULL;
-    debug_status = SystemTable->BootServices->LocateProtocol(&EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, NULL, (void**)&gop);
-    if (debug_status != EFI_SUCCESS) {
-        puts16(SystemTable, WIDE("[DEBUG] LocateProtocol failed with status: "));
-        print_hex64(SystemTable, debug_status);
-        puts16(SystemTable, WIDE("\r\n"));
-        return debug_status;
-    }
+    CHECK_OK("Locate GOP", SystemTable->BootServices->LocateProtocol(&EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, NULL, (void**)&gop));
     if (gop && gop->Mode && gop->Mode->Info) {
         puts16(SystemTable, WIDE("GOP found: ")); print_hex64(SystemTable, gop->Mode->FrameBufferBase); puts16(SystemTable, WIDE("\r\n"));
     } else {
@@ -74,60 +95,36 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
 
     // Fase 1: Ottieni mappa di memoria completa
     uint64_t map_size = 0, map_key=0, desc_size=0; uint32_t desc_ver=0;
-    debug_status = SystemTable->BootServices->GetMemoryMap(&map_size, NULL, &map_key, &desc_size, &desc_ver);
-    if (debug_status != EFI_SUCCESS && map_size == 0) {
-        puts16(SystemTable, WIDE("[ERR] Prima query GetMemoryMap fallita\r\n"));
-        return debug_status;
+    {
+        // First call: expected to return EFI_BUFFER_TOO_SMALL, filling map_size.
+        EFI_STATUS __s = SystemTable->BootServices->GetMemoryMap(&map_size, NULL, &map_key, &desc_size, &desc_ver);
+        if (__s != EFI_SUCCESS && map_size == 0) {
+            print_status(SystemTable, WIDE("GetMemMap size"), __s);
+            return __s;
+        }
     }
     // Aggiungi margine per nuove allocazioni temporanee prima di ExitBootServices
     map_size += 4096 * 8;
     EFI_MEMORY_DESCRIPTOR* mem_map = NULL;
-    debug_status = SystemTable->BootServices->AllocatePool(EFI_LOADER_DATA, map_size, (void**)&mem_map);
-    if (debug_status != EFI_SUCCESS) {
-        puts16(SystemTable, WIDE("[ERR] Allocazione buffer mappa memoria fallita\r\n"));
-        return debug_status;
-    } else {
-        debug_status = SystemTable->BootServices->GetMemoryMap(&map_size, mem_map, &map_key, &desc_size, &desc_ver);
-        if (debug_status != EFI_SUCCESS) {
-            puts16(SystemTable, WIDE("[ERR] Lettura mappa memoria fallita\r\n"));
-            return debug_status;
-        } else {
-            puts16(SystemTable, WIDE("[OK] Mappa memoria acquisita\r\n"));
-        }
-    }
+    CHECK_OK("AllocPool memmap", SystemTable->BootServices->AllocatePool(EFI_LOADER_DATA, map_size, (void**)&mem_map));
+    CHECK_OK("GetMemoryMap", SystemTable->BootServices->GetMemoryMap(&map_size, mem_map, &map_key, &desc_size, &desc_ver));
+    puts16(SystemTable, WIDE("[OK] Mappa memoria acquisita\r\n"));
 
     // Carica kernel ELF
     void* kernel_entry = NULL;
-    debug_status = elf_load_kernel(SystemTable, &kernel_entry);
-    if (debug_status == EFI_SUCCESS) {
-        puts16(SystemTable, WIDE("[OK] Kernel ELF caricato, entry= "));
-        print_hex64(SystemTable, (uint64_t)kernel_entry);
-        puts16(SystemTable, WIDE("\r\n"));
-    } else {
-        puts16(SystemTable, WIDE("[ERR] Caricamento kernel ELF fallito\r\n"));
-        return debug_status;
-    }
+    CHECK_OK("ELF load", elf_load_kernel(SystemTable, &kernel_entry));
+    puts16(SystemTable, WIDE("[OK] Kernel ELF caricato, entry= "));
+    print_hex64(SystemTable, (uint64_t)kernel_entry);
+    puts16(SystemTable, WIDE("\r\n"));
 
     // Fase 2: costruzione tabelle di pagine (PML4, PDPT, PDT, PT) minimale
     // Strategia: identity map area bassa (<=512MB) + mappa segmenti kernel alle loro vaddr se rientrano.
     // Per semplicità: usiamo pagine da 2MB (PS) come nel percorso BIOS iniziale.
     uint64_t pml4_phys = 0, pdpt_phys = 0, pdt_phys = 0;
     uint8_t* pml4 = NULL; uint8_t* pdpt = NULL; uint8_t* pdt = NULL;
-    debug_status = SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pml4_phys);
-    if (debug_status != EFI_SUCCESS) {
-        puts16(SystemTable, WIDE("[ERR] Allocazione page tables fallita\r\n"));
-        return debug_status;
-    }
-    debug_status = SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdpt_phys);
-    if (debug_status != EFI_SUCCESS) {
-        puts16(SystemTable, WIDE("[ERR] Allocazione page tables fallita\r\n"));
-        return debug_status;
-    }
-    debug_status = SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdt_phys);
-    if (debug_status != EFI_SUCCESS) {
-        puts16(SystemTable, WIDE("[ERR] Allocazione page tables fallita\r\n"));
-        return debug_status;
-    }
+    CHECK_OK("AllocPages PML4", SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pml4_phys));
+    CHECK_OK("AllocPages PDPT", SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdpt_phys));
+    CHECK_OK("AllocPages PDT",  SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdt_phys));
     // Se arriviamo qui, le allocazioni sono andate a buon fine, quindi possiamo procedere
     pml4 = (uint8_t*)pml4_phys; pdpt = (uint8_t*)pdpt_phys; pdt = (uint8_t*)pdt_phys;
     for(int i=0;i<4096;i++){ pml4[i]=0; pdpt[i]=0; pdt[i]=0; }
@@ -142,7 +139,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
 
     // Fase 3: Rimappare segmenti ELF (placeholder: già copiati in pool; mapping reale post-ExitBootServices non ancora implementato).
     // Per implementazione completa servirebbe allocare memoria fisica alle vaddr e copiare i dati fuori da pool temporaneo.
-    if (debug_status == EFI_SUCCESS && g_loaded_segment_count > 0) {
+    if (g_loaded_segment_count > 0) {
         puts16(SystemTable, WIDE("[INFO] Copia segmenti ELF nelle vaddr target (assunzione identity)\r\n"));
         for (uint16_t si = 0; si < g_loaded_segment_count; ++si) {
             secos_loaded_segment_t* seg = &g_loaded_segments[si];
@@ -174,19 +171,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
 
     // Fase 4: Seconda GetMemoryMap (obbligatoria prima di ExitBootServices)
     uint64_t final_map_size = map_size; uint64_t final_map_key=0; uint64_t final_desc_size=0; uint32_t final_desc_ver=0;
-    debug_status = SystemTable->BootServices->GetMemoryMap(&final_map_size, mem_map, &final_map_key, &final_desc_size, &final_desc_ver);
-    if (debug_status != EFI_SUCCESS) {
-        puts16(SystemTable, WIDE("[ERR] Seconda GetMemoryMap fallita, impossibile procedere\r\n"));
-        return debug_status;
-    }
+    CHECK_OK("GetMemMap final", SystemTable->BootServices->GetMemoryMap(&final_map_size, mem_map, &final_map_key, &final_desc_size, &final_desc_ver));
     puts16(SystemTable, WIDE("[OK] Seconda GetMemoryMap acquisita\r\n"));
     puts16(SystemTable, WIDE("[BOOT] Calling ExitBootServices — no more console after this\r\n"));
-    debug_status = SystemTable->BootServices->ExitBootServices(ImageHandle, final_map_key);
-    if (debug_status != EFI_SUCCESS) {
-        /* EBS failed — services state undefined, just halt */
-        puts16(SystemTable, WIDE("[ERR] ExitBootServices failed\r\n"));
-        return debug_status;
-    }
+    CHECK_OK("ExitBootServices", SystemTable->BootServices->ExitBootServices(ImageHandle, final_map_key));
     /* === No UEFI Boot Services or Console calls past this point === */
 
     // Fase 5: Costruisci struttura handoff
