@@ -50,6 +50,37 @@ typedef struct {
 
 #define PT_LOAD 1
 
+/* ELF section header (for symbol table lookup) */
+typedef struct {
+    uint32_t sh_name;       // offset into section name string table
+    uint32_t sh_type;       // SHT_SYMTAB=2, SHT_STRTAB=3
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;     // file offset
+    uint64_t sh_size;
+    uint32_t sh_link;       // for SHT_SYMTAB: index of associated SHT_STRTAB
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+} elf64_shdr_t;
+
+/* ELF symbol table entry */
+typedef struct {
+    uint32_t st_name;       // offset into string table
+    uint8_t  st_info;
+    uint8_t  st_other;
+    uint16_t st_shndx;
+    uint64_t st_value;      // symbol virtual address
+    uint64_t st_size;
+} elf64_sym_t;
+
+#define SHT_SYMTAB 2
+
+static int strneq(const char* a, const char* b) {
+    while (*a && *b && *a == *b) { a++; b++; }
+    return *a == 0 && *b == 0;
+}
+
 static void memcpy8(uint8_t* dst, const uint8_t* src, uint64_t n) { while(n--) *dst++ = *src++; }
 static void memset8(uint8_t* dst, uint8_t v, uint64_t n) { while(n--) *dst++ = v; }
 
@@ -152,7 +183,30 @@ EFI_STATUS elf_load_kernel(EFI_SYSTEM_TABLE* SystemTable, void** entry_out) {
         }
         (void)seg_dst; // placeholder
     }
-    *entry_out = (void*)eh->e_entry;
+    /* Symbol table lookup: prefer _uefi_start over e_entry if present.
+     * _uefi_start is a BITS 64 entry that handles being called from UEFI long mode. */
+    uint64_t uefi_entry = 0;
+    if (eh->e_shoff && eh->e_shnum && eh->e_shentsize == sizeof(elf64_shdr_t) &&
+        eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(elf64_shdr_t) <= file_len) {
+        elf64_shdr_t* sh = (elf64_shdr_t*)(file_buf + eh->e_shoff);
+        for (uint16_t s = 0; s < eh->e_shnum && !uefi_entry; s++) {
+            if (sh[s].sh_type != SHT_SYMTAB) continue;
+            uint32_t strtab_idx = sh[s].sh_link;
+            if (strtab_idx >= eh->e_shnum) continue;
+            elf64_shdr_t* strtab_sh = &sh[strtab_idx];
+            if (strtab_sh->sh_offset + strtab_sh->sh_size > file_len) continue;
+            const char* strtab = (const char*)(file_buf + strtab_sh->sh_offset);
+            if (sh[s].sh_offset + sh[s].sh_size > file_len) continue;
+            uint64_t nsyms = sh[s].sh_size / sizeof(elf64_sym_t);
+            elf64_sym_t* syms = (elf64_sym_t*)(file_buf + sh[s].sh_offset);
+            for (uint64_t si = 0; si < nsyms; si++) {
+                if (syms[si].st_name + 12 > strtab_sh->sh_size) continue;
+                if (strneq(strtab + syms[si].st_name, "_uefi_start"))
+                    uefi_entry = syms[si].st_value;
+            }
+        }
+    }
+    *entry_out = (void*)(uefi_entry ? uefi_entry : eh->e_entry);
     g_kernel_entry = *entry_out;
     return EFI_SUCCESS;
 }

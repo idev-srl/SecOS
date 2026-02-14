@@ -258,6 +258,25 @@ long_mode:
 .hang:
     cli
     hlt
+
+; ── UEFI entry point ─────────────────────────────────────────────────────────
+; Called by UEFI bootloader already in 64-bit long mode.
+; Calling convention: SysV AMD64 (RDI = magic=0, RSI = &secos_boot_info).
+; Reloads our own GDT/segments, sets stack, calls kernel_main directly.
+global _uefi_start
+_uefi_start:
+    lgdt [rel gdt.pointer]
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    lea rsp, [rel stack_top]
+    PORT_CH 'U'                 ; debug probe (only if DEBUG_PORT=1)
+    call kernel_main
+    cli
+    hlt
 section .rodata
 align 16
 gdt:

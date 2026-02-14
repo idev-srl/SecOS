@@ -135,15 +135,20 @@ UEFI_OBJS = $(UEFI_SRC:%.c=%.o)
 UEFI_HELLO_OBJS = $(UEFI_HELLO_SRC:%.c=%.o)
 UEFI_HELLO_APP = $(EFI_BOOT_DIR)/HELLO.EFI
 UEFI_CFLAGS = -ffreestanding -fshort-wchar -O2 -mno-red-zone -m64 -fno-stack-protector -fPIE -fno-omit-frame-pointer -fno-asynchronous-unwind-tables -fno-unwind-tables -fcf-protection=none -mno-sse -mno-mmx $(INCLUDES) -DCONFIG_UEFI
+UEFI_CRT0 = uefi/crt0.o
 
-uefi/%.o: uefi/%.c
+uefi/%.o: uefi/%.c uefi/efi.h
 	$(CC) $(UEFI_CFLAGS) -c $< -o $@
 
-uefi: $(UEFI_OBJS)
+uefi/crt0.o: uefi/crt0.s
+	$(CC) -c $< -o $@
+
+uefi: $(UEFI_CRT0) $(UEFI_OBJS)
 	mkdir -p $(EFI_BOOT_DIR)
 	$(LD) -nostdlib -znocombreloc -shared -Bsymbolic -T /usr/lib/elf_x86_64_efi.lds \
-		-L /usr/lib /usr/lib/crt0-efi-x86_64.o $(UEFI_OBJS) -o $(UEFI_LOADER_ELF)
-	objcopy -j .hash -j .gnu.hash -j .dynsym -j .dynstr -j .text -j .sdata -j .data -j .rodata -j .eh_frame -j .dynamic -j .rel -j .rela -j .reloc --target=efi-app-x86_64 $(UEFI_LOADER_ELF) $(UEFI_APP)
+		-L /usr/lib $(UEFI_CRT0) $(UEFI_OBJS) -lgnuefi -lefi -o $(UEFI_LOADER_ELF)
+	objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .rel -j .rela -j .reloc --target=efi-app-x86_64 $(UEFI_LOADER_ELF) $(UEFI_APP)
+	python3 -c "import struct; f=open('$(UEFI_APP)','r+b'); f.seek(0x3c); pe=struct.unpack('<I',f.read(4))[0]; f.seek(pe+22); c=struct.unpack('<H',f.read(2))[0]; f.seek(pe+22); f.write(struct.pack('<H',c&~0x0001)); f.close(); print('PE Characteristics: 0x{:04x} -> 0x{:04x}'.format(c, c&~0x0001))"
 	@echo "✅ UEFI loader: $(UEFI_APP) ($(shell ls -lh $(UEFI_APP) | awk '{print $$5}'))"
 	@cp $(KERNEL) $(DIST_DIR)/kernel.elf || true
 

@@ -42,28 +42,30 @@ struct EFI_RUNTIME_SERVICES;
 // GUID structure
 typedef struct { uint32_t Data1; uint16_t Data2; uint16_t Data3; uint8_t Data4[8]; } EFI_GUID;
 
-// Graphics Output Protocol
+// Graphics Output Protocol — exact UEFI spec layout (UEFI 2.9 §12.9)
 typedef struct {
-    uint32_t Version;
-    uint32_t HorizontalResolution;
-    uint32_t VerticalResolution;
-    uint32_t PixelFormat; // Simplified
-    uint32_t PixelsPerScanLine;
+    uint32_t Version;               // offset 0
+    uint32_t HorizontalResolution;  // offset 4
+    uint32_t VerticalResolution;    // offset 8
+    uint32_t PixelFormat;           // offset 12
+    uint32_t PixelInformation[4];   // offset 16: EFI_PIXEL_BITMASK (Red/Green/Blue/Reserved masks)
+    uint32_t PixelsPerScanLine;     // offset 32
 } EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
 
 typedef struct {
-    uint64_t FrameBufferBase;
-    uint64_t FrameBufferSize;
-    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* Info;
-    uint32_t SizeOfInfo;
-    uint32_t Mode;
+    uint32_t MaxMode;                           // offset 0
+    uint32_t Mode;                              // offset 4
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* Info; // offset 8
+    uint64_t SizeOfInfo;                        // offset 16  (UINTN = 8 bytes on x64)
+    uint64_t FrameBufferBase;                   // offset 24
+    uint64_t FrameBufferSize;                   // offset 32
 } EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
 
 typedef struct EFI_GRAPHICS_OUTPUT_PROTOCOL {
-    EFI_STATUS (EFIAPI *QueryMode)(struct EFI_GRAPHICS_OUTPUT_PROTOCOL*, uint32_t, uint64_t*, EFI_GRAPHICS_OUTPUT_MODE_INFORMATION**);
-    EFI_STATUS (EFIAPI *SetMode)(struct EFI_GRAPHICS_OUTPUT_PROTOCOL*, uint32_t);
-    // Blt omitted
-    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE* Mode;
+    EFI_STATUS (EFIAPI *QueryMode)(struct EFI_GRAPHICS_OUTPUT_PROTOCOL*, uint32_t, uint64_t*, EFI_GRAPHICS_OUTPUT_MODE_INFORMATION**); // offset 0
+    EFI_STATUS (EFIAPI *SetMode)(struct EFI_GRAPHICS_OUTPUT_PROTOCOL*, uint32_t);  // offset 8
+    void* Blt;                                  // offset 16 (not called; void* preserves layout)
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE* Mode;    // offset 24
 } EFI_GRAPHICS_OUTPUT_PROTOCOL;
 
 // Simple Text Output
@@ -193,7 +195,8 @@ typedef struct EFI_SYSTEM_TABLE {
 // Status codes: high bit set for error conditions per UEFI spec.
 #define EFI_SUCCESS 0ULL
 #define EFI_ERROR_BIT 0x8000000000000000ULL
-#define EFI_UNSUPPORTED (EFI_ERROR_BIT | 3ULL)
+#define EFI_INVALID_PARAMETER (EFI_ERROR_BIT | 2ULL)
+#define EFI_UNSUPPORTED       (EFI_ERROR_BIT | 3ULL)
 
 // Common error (generic) macro (simplified)
 #define EFI_ERR(x) ((EFI_STATUS)(EFI_ERROR_BIT | (uint64_t)(x)))

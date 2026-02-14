@@ -105,6 +105,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     }
     // Aggiungi margine per nuove allocazioni temporanee prima di ExitBootServices
     map_size += 4096 * 8;
+    uint64_t alloc_buf_size = map_size;  /* salva dimensione allocata (map_size viene sovrascritto da GetMemoryMap) */
     EFI_MEMORY_DESCRIPTOR* mem_map = NULL;
     CHECK_OK("AllocPool memmap", SystemTable->BootServices->AllocatePool(EFI_LOADER_DATA, map_size, (void**)&mem_map));
     CHECK_OK("GetMemoryMap", SystemTable->BootServices->GetMemoryMap(&map_size, mem_map, &map_key, &desc_size, &desc_ver));
@@ -169,24 +170,43 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         // TODO: Convertire flags ELF in permessi pagine (rimappando con 4KB granularità): RW per data, RX per codice.
     }
 
+    // Salva valori GOP prima di ExitBootServices (gop->Mode è boot-services memory, freed dopo EBS).
+    uint64_t saved_fb_addr = 0, saved_fb_w = 0, saved_fb_h = 0, saved_fb_pitch = 0;
+    if (gop && gop->Mode && gop->Mode->Info) {
+        saved_fb_addr  = gop->Mode->FrameBufferBase;
+        saved_fb_w     = gop->Mode->Info->HorizontalResolution;
+        saved_fb_h     = gop->Mode->Info->VerticalResolution;
+        saved_fb_pitch = gop->Mode->Info->PixelsPerScanLine * 4;
+    }
+
     // Fase 4: Seconda GetMemoryMap (obbligatoria prima di ExitBootServices)
-    uint64_t final_map_size = map_size; uint64_t final_map_key=0; uint64_t final_desc_size=0; uint32_t final_desc_ver=0;
+    // Usa alloc_buf_size (non map_size): UEFI ha aggiornato map_size alla dimensione effettiva del primo call,
+    // ma la buffer è più grande; tra i due call nuove AllocPages/AllocPool aggiungono descrittori.
+    uint64_t final_map_size = alloc_buf_size; uint64_t final_map_key=0; uint64_t final_desc_size=0; uint32_t final_desc_ver=0;
     CHECK_OK("GetMemMap final", SystemTable->BootServices->GetMemoryMap(&final_map_size, mem_map, &final_map_key, &final_desc_size, &final_desc_ver));
     puts16(SystemTable, WIDE("[OK] Seconda GetMemoryMap acquisita\r\n"));
-    puts16(SystemTable, WIDE("[BOOT] Calling ExitBootServices — no more console after this\r\n"));
-    CHECK_OK("ExitBootServices", SystemTable->BootServices->ExitBootServices(ImageHandle, final_map_key));
+    puts16(SystemTable, WIDE("[BOOT] Calling ExitBootServices\r\n"));
+    /* Nota: puts16 sopra possono invalidare il MapKey (allocazioni firmware).
+       Retry silenzioso senza console se EFI_INVALID_PARAMETER (UEFI spec §7.4.6). */
+    EFI_STATUS ebs = SystemTable->BootServices->ExitBootServices(ImageHandle, final_map_key);
+    if (ebs == EFI_INVALID_PARAMETER) {
+        final_map_size = alloc_buf_size;
+        if (SystemTable->BootServices->GetMemoryMap(&final_map_size, mem_map, &final_map_key, &final_desc_size, &final_desc_ver) == EFI_SUCCESS)
+            ebs = SystemTable->BootServices->ExitBootServices(ImageHandle, final_map_key);
+    }
+    if (ebs != EFI_SUCCESS) { print_status(SystemTable, WIDE("ExitBootServices"), ebs); return ebs; }
     /* === No UEFI Boot Services or Console calls past this point === */
 
     // Fase 5: Costruisci struttura handoff
     static struct secos_boot_info bootinfo;
     bootinfo.flags = 0;
-    if (gop && gop->Mode && gop->Mode->Info) {
-        bootinfo.fb_addr  = gop->Mode->FrameBufferBase;
-        bootinfo.fb_width = gop->Mode->Info->HorizontalResolution;
-        bootinfo.fb_height= gop->Mode->Info->VerticalResolution;
-        bootinfo.fb_pitch = gop->Mode->Info->PixelsPerScanLine * 4; // assumendo 32bpp
-        bootinfo.fb_bpp   = 32;
-        bootinfo.flags   |= 1ULL; // bit0 GOP
+    if (saved_fb_addr) {
+        bootinfo.fb_addr   = saved_fb_addr;
+        bootinfo.fb_width  = (uint32_t)saved_fb_w;
+        bootinfo.fb_height = (uint32_t)saved_fb_h;
+        bootinfo.fb_pitch  = (uint32_t)saved_fb_pitch;
+        bootinfo.fb_bpp    = 32;
+        bootinfo.flags    |= 1ULL; // bit0 GOP
     } else {
         bootinfo.fb_addr=bootinfo.fb_width=bootinfo.fb_height=bootinfo.fb_pitch=bootinfo.fb_bpp=0;
     }
