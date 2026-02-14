@@ -118,11 +118,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
             ((uint64_t*)pdt)[e] = phys | 0x83; // Present|Write|PS
         }
     puts16(SystemTable, WIDE("[OK] Page tables base costruite\r\n"));
-    // Attiva subito le nuove tabelle (sostituisce quelle UEFI). UEFI runtime rimane utilizzabile finché non facciamo ExitBootServices.
-    // NOTE: Commentato per ora - attiviamo dopo ExitBootServices
-    // activate_page_tables(pml4);
-    puts16(SystemTable, WIDE("[SKIP] Page tables activation deferred\r\n"));
-        // TODO: segmenti kernel con vaddr > 512MB richiedono mapping aggiuntivo (creare nuove PDT + entry in PML4/PDPT).
+        // NOTE: attivazione deferred a dopo ExitBootServices (sotto, prima del jump al kernel)
     }
 
     // Fase 3: Rimappare segmenti ELF (placeholder: già copiati in pool; mapping reale post-ExitBootServices non ancora implementato).
@@ -197,6 +193,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         /* No console available post-EBS — just halt */
         for(;;){ __asm__ __volatile__("hlt"); }
     }
+    /* Attiva page tables custom prima del handoff.
+     * A questo punto bootinfo è già costruita (gop->Mode letto sopra),
+     * quindi non servono più accessi a strutture dati UEFI.
+     * Il codice del bootloader e il bootinfo statico sono entrambi
+     * sotto 512MB (memoria convenzionale), quindi l'identity map copre
+     * istruzioni correnti, stack e il puntatore bootinfo. */
+    activate_page_tables(pml4);
     // Firma attesa: void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info)
     void (*kentry)(uint32_t, uint64_t) = (void(*)(uint32_t, uint64_t))kernel_entry;
     kentry(0, (uint64_t)&bootinfo);

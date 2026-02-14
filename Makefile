@@ -142,7 +142,7 @@ uefi/%.o: uefi/%.c
 uefi: $(UEFI_OBJS)
 	mkdir -p $(EFI_BOOT_DIR)
 	$(LD) -nostdlib -znocombreloc -shared -Bsymbolic -T /usr/lib/elf_x86_64_efi.lds \
-		-L /usr/lib /usr/lib/crt0-efi-x86_64.o $(UEFI_OBJS) --subsystem efi-app -o $(UEFI_LOADER_ELF) 2>&1 | head -5 || true
+		-L /usr/lib /usr/lib/crt0-efi-x86_64.o $(UEFI_OBJS) -o $(UEFI_LOADER_ELF)
 	objcopy -j .hash -j .gnu.hash -j .dynsym -j .dynstr -j .text -j .sdata -j .data -j .rodata -j .eh_frame -j .dynamic -j .rel -j .rela -j .reloc --target=efi-app-x86_64 $(UEFI_LOADER_ELF) $(UEFI_APP)
 	@echo "✅ UEFI loader: $(UEFI_APP) ($(shell ls -lh $(UEFI_APP) | awk '{print $$5}'))"
 	@cp $(KERNEL) $(DIST_DIR)/kernel.elf || true

@@ -209,20 +209,23 @@ typedef struct EFI_SYSTEM_TABLE {
 struct EFI_FILE_PROTOCOL;
 
 typedef struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
-    EFI_STATUS (*OpenVolume)(struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL*, struct EFI_FILE_PROTOCOL**);
+    uint64_t   Revision;                                                                                    /* offset  0 */
+    EFI_STATUS (EFIAPI *OpenVolume)(struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL*, struct EFI_FILE_PROTOCOL**);  /* offset  8 */
 } EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
 
 typedef struct EFI_FILE_PROTOCOL {
-    EFI_STATUS (*Open)(struct EFI_FILE_PROTOCOL*, struct EFI_FILE_PROTOCOL**, const CHAR16* FileName, uint64_t OpenMode, uint64_t Attributes);
-    EFI_STATUS (*Close)(struct EFI_FILE_PROTOCOL*);
-    EFI_STATUS (*Read)(struct EFI_FILE_PROTOCOL*, uint64_t* BufferSize, void* Buffer);
+    uint64_t   Revision;                                                                                    /* offset  0 */
+    EFI_STATUS (EFIAPI *Open)(struct EFI_FILE_PROTOCOL*, struct EFI_FILE_PROTOCOL**, const CHAR16* FileName, uint64_t OpenMode, uint64_t Attributes); /* offset  8 */
+    EFI_STATUS (EFIAPI *Close)(struct EFI_FILE_PROTOCOL*);                                                 /* offset 16 */
+    void*      Delete;                                                                                      /* offset 24 */
+    EFI_STATUS (EFIAPI *Read)(struct EFI_FILE_PROTOCOL*, uint64_t* BufferSize, void* Buffer);              /* offset 32 */
     // Additional methods omitted.
 } EFI_FILE_PROTOCOL;
 
 // Protocol GUIDs (GOP)
 static const EFI_GUID EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID = {0x9042a9de,0x23dc,0x4a38,{0x96,0xfb,0x7a,0xde,0xd0,0x80,0x51,0x6a}};
 // NOTE: GUIDs below should be verified against the UEFI specification; provided values are placeholders that may need adjustment.
-static const EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID = {0x0964e5b6,0x5b22,0x4e5d,{0x8e,0x65,0x42,0x3b,0xb6,0x8c,0x53,0x54}}; // Placeholder GUID
+static const EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID = {0x964e5b22,0x6459,0x11d2,{0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b}};
 
 
 // Helper to make a CHAR16 literal (wide) from ASCII (simple macro for short strings)
