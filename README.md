@@ -2,9 +2,20 @@
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
 [![Made by iDev](https://img.shields.io/badge/made%20by-iDev%20Srl-blue)](https://www.idev-srl.com)
 
-# 64-bit Kernel with GRUB & UEFI
+# SECoS — Secure OS Kernel (x86-64)
 
-A kernel written in C that boots in Long Mode (64-bit) via GRUB (Multiboot) or UEFI bootloader, with PS/2 keyboard support and an interactive shell.
+A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB Multiboot2 (legacy path), targeting x86-64 long mode.
+
+## Current Status — M0 Complete
+
+**Milestone M0 (UEFI Boot)**: complete and stabilized.
+
+- UEFI boot chain verified end-to-end on OVMF/QEMU
+- Custom UEFI bootloader loads kernel ELF, sets up identity-mapped page tables (512 MB, 2MB pages), calls `ExitBootServices`, hands off to 64-bit `_uefi_start` entry point
+- Kernel receives framebuffer (GOP), memory map, and boot info struct
+- Multiboot2 path (GRUB) continues to work unchanged
+
+**M1 (kernel-owned page tables)**: not yet started.
 
 ## Features
 
@@ -33,50 +44,104 @@ A kernel written in C that boots in Long Mode (64-bit) via GRUB (Multiboot) or U
 
 See our [Development Roadmap](ROADMAP.md) for upcoming features!
 
-## Requirements
+## Build — UEFI Path (primary)
 
-### Required software:
-- **NASM** - Assembler for boot code
-- **GCC** - C compiler (cross-compilation for x86_64 recommended)
-- **GNU ld** - Linker
-- **GRUB** - To build the bootable ISO image
-- **xorriso** - Required by grub-mkrescue
-- **QEMU** - To test the kernel (optional but recommended)
+### Requirements
 
-### Install on Ubuntu/Debian:
 ```bash
-sudo apt update
+sudo apt install nasm gcc binutils gnu-efi ovmf qemu-system-x86 mtools
+```
+
+### Build kernel + UEFI bootloader
+
+```bash
+make          # produces kernel.bin
+make uefi     # produces dist/EFI/BOOT/BOOTX64.EFI
+```
+
+### Update ESP image
+
+```bash
+cp kernel.bin dist/kernel.elf
+mcopy -i dist/test_esp.img -o dist/kernel.elf ::kernel.elf
+mcopy -i dist/test_esp.img -o dist/EFI/BOOT/BOOTX64.EFI ::EFI/BOOT/BOOTX64.EFI
+```
+
+### Run with QEMU (canonical command)
+
+```bash
+qemu-system-x86_64 \
+  -machine pc -cpu qemu64 -m 512M \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,file=dist/OVMF_VARS_test.fd \
+  -drive if=ide,format=raw,file=dist/test_esp.img \
+  -serial file:/tmp/kernel_debug.log \
+  -debugcon file:/tmp/uefi_boot.log \
+  -display none -no-reboot
+```
+
+Serial log (`/tmp/kernel_debug.log`) captures kernel output.
+Debugcon (`/tmp/uefi_boot.log`) captures UEFI loader progress messages.
+
+## Build — Multiboot2 / GRUB Path (legacy)
+
+### Requirements
+
+```bash
 sudo apt install nasm gcc binutils grub-common grub-pc-bin xorriso qemu-system-x86
 ```
 
-### Install on Arch Linux:
+### Build ISO and run
+
 ```bash
-sudo pacman -S nasm gcc binutils grub xorriso qemu
+make iso      # produces myos.iso (GRUB bootable)
+make run      # build ISO + run in QEMU
+make clean    # remove all artifacts
 ```
 
-## Build
+## Boot Architecture
+
+```
+UEFI path (primary):
+  OVMF → BOOTX64.EFI → efi_main() → elf_load_kernel()
+       → ExitBootServices() → _uefi_start [BITS 64] → kernel_main(magic=0, info=&secos_boot_info)
+
+Multiboot2 path (legacy):
+  GRUB → _start [BITS 32] → long mode setup → long_mode [BITS 64] → kernel_main(magic=0x36d76289, info=mb2_info)
+```
+
+`kernel_main` distinguishes the boot path via `magic`:
+- `magic == 0` → UEFI; `info` is a pointer to `struct secos_boot_info`
+- `magic == 0x36d76289` → Multiboot2; `info` is pointer to Multiboot2 info struct
 
 ## Project Structure (simplified)
 
 ```
 .
-├── boot.asm      # Assembly to enter long mode
-├── idt_asm.asm   # Interrupt handlers in assembly
-├── kernel.c      # Main kernel code
-├── idt.c/h       # Interrupt Descriptor Table management
-├── timer.c/h     # PIT (Programmable Interval Timer) driver
-├── keyboard.c/h  # PS/2 keyboard driver
-├── multiboot.h   # Multiboot standard structures
-├── pmm.c/h       # Physical Memory Manager
-├── heap.c/h      # Heap allocator
-├── vmm.c/h       # Virtual Memory Manager + user spaces
-├── elf.c/h       # ELF64 loader
-├── process.c/h   # Process creation (PCB)
-├── shell.c/h     # Interactive shell
-├── terminal.h    # Shared VGA terminal API
-├── linker.ld     # Linker script
-├── Makefile      # Build script
-└── README.md     # This file
+├── boot/
+│   └── boot.asm          # Multiboot2 entry (_start, 32-bit) + UEFI entry (_uefi_start, 64-bit)
+├── arch/x86/
+│   ├── idt_asm.asm        # Interrupt stubs
+│   └── syscall_asm.asm    # Syscall entry
+├── kernel/
+│   ├── kernel.c           # kernel_main, initialization
+│   └── bootinfo.h         # secos_boot_info struct (shared UEFI/Multiboot2)
+├── uefi/
+│   ├── boot.c             # UEFI bootloader (efi_main)
+│   ├── elf_load.c         # ELF64 loader (used by UEFI bootloader)
+│   ├── efi.h              # UEFI type definitions
+│   └── crt0.s             # UEFI application CRT0 (replaces gnu-efi crt0)
+├── mm/                    # PMM, VMM, heap, ELF kernel loader
+├── drivers/               # Framebuffer, keyboard, timer, RTC
+├── fs/                    # RAMFS, VFS, FAT32, ext2
+├── lib/                   # Terminal utilities
+├── user/                  # Embedded test ELF driver
+├── dist/
+│   ├── EFI/BOOT/BOOTX64.EFI   # Built UEFI bootloader
+│   ├── test_esp.img            # FAT32 ESP image for QEMU
+│   └── OVMF_VARS_test.fd       # UEFI variable store
+├── linker.ld              # Kernel linker script
+└── Makefile               # Build system
 ```
 
 ## Shell Commands
@@ -218,80 +283,9 @@ Future hardening plans: rate limiting per process/opcode, advanced audit filter 
 
 For more details see `DRIVER_IF.md`.
 
-## Build Requirements
-
-### Compile the kernel:
-```bash
-make
-```
-This command produces `kernel.bin`.
-
-### Create the ISO image:
-```bash
-make iso
-```
-This creates `myos.iso`, a bootable GRUB ISO.
-
-### Run with QEMU:
-```bash
-make run
-```
-This compiles, builds the ISO and runs the kernel in QEMU.
-
-### Clean generated files:
-```bash
-make clean
-```
-
-## How it works
-
-### 1. Boot Process (boot.asm)
-- GRUB loads the kernel in 32-bit protected mode
-- Code checks CPUID and Long Mode support
-- Sets up page tables for 64-bit paging (4MB identity mapping)
-- Enables PAE (Physical Address Extension)
-- Configures the EFER MSR to enable long mode
-- Enables paging
-- Jumps to 64-bit code
-
-### 2. IDT Initialization (idt.c)
-- Creates the Interrupt Descriptor Table with 256 entries
-- Remaps the PIC (Programmable Interrupt Controller)
-- Sets up the handler for IRQ0 (timer)
-- Sets up the handler for IRQ1 (keyboard)
-- Enables interrupts
-
-### 3. PIT Timer (timer.c)
-- Configures the Programmable Interval Timer at 1000 Hz (1ms per tick)
-- Handles timer interrupts (IRQ0)
-- Maintains a 64-bit tick counter
-- Provides uptime and blocking sleep functions
-- Foundation for future scheduling
-
-### 4. Keyboard Driver (keyboard.c)
-- Handles keyboard interrupts (IRQ1)
-- Converts PS/2 scancodes to ASCII characters
-- Supports Shift, Caps Lock and special characters
-- Circular buffer for input
-- Blocking and non-blocking functions to read characters
-
-### 5. Shell (shell.c)
-- Main loop reading user commands
-- Simple parser splitting command and arguments
-- Executes built-in commands
-- Colored prompt and backspace handling
-
-### 6. Kernel (kernel.c)
-- Initializes the VGA text terminal
-- Prints boot information
-- Verifies the Multiboot magic number
-- Initializes IDT, timer, keyboard and shell
-- Transfers control to the interactive shell
-
-## Capabilities (legacy list)
+## Capabilities
 
 - ✅ Long Mode (64-bit) boot
-- ✅ Multiboot support for GRUB
 - ✅ Basic VGA text terminal
 - ✅ Identity mapping of first 1GB of memory
 - ✅ Working stack
