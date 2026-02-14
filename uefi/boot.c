@@ -160,12 +160,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         for(;;){ __asm__ __volatile__("hlt"); }
     }
     puts16(SystemTable, WIDE("[OK] Seconda GetMemoryMap acquisita\r\n"));
+    puts16(SystemTable, WIDE("[BOOT] Calling ExitBootServices — no more console after this\r\n"));
     EFI_STATUS exst = SystemTable->BootServices->ExitBootServices(ImageHandle, final_map_key);
     if (exst != EFI_SUCCESS) {
-        puts16(SystemTable, WIDE("[ERR] ExitBootServices fallita\r\n"));
+        /* EBS failed — services state undefined, just halt */
         for(;;){ __asm__ __volatile__("hlt"); }
     }
-    puts16(SystemTable, WIDE("[OK] ExitBootServices eseguita\r\n"));
+    /* === No UEFI Boot Services or Console calls past this point === */
 
     // Fase 5: Costruisci struttura handoff
     static struct secos_boot_info bootinfo;
@@ -188,15 +189,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
 
     // Fase 6: Salta al kernel
     if (!kernel_entry) {
-        puts16(SystemTable, WIDE("[ERR] Entry kernel assente\r\n"));
+        /* No console available post-EBS — just halt */
         for(;;){ __asm__ __volatile__("hlt"); }
     }
-    puts16(SystemTable, WIDE("[JUMP] Transfer to kernel_main (magic=0, info ptr)\r\n"));
     // Firma attesa: void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info)
     void (*kentry)(uint32_t, uint64_t) = (void(*)(uint32_t, uint64_t))kernel_entry;
     kentry(0, (uint64_t)&bootinfo);
     // Se mai ritorna, fermiamo
-    puts16(SystemTable, WIDE("[WARN] Kernel ha restituito controllo inaspettatamente\r\n"));
     for(;;){ __asm__ __volatile__("hlt"); }
     return EFI_SUCCESS; // non raggiunto
 }
