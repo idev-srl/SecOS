@@ -97,12 +97,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     // Fase 2: costruzione tabelle di pagine (PML4, PDPT, PDT, PT) minimale
     // Strategia: identity map area bassa (<=512MB) + mappa segmenti kernel alle loro vaddr se rientrano.
     // Per semplicità: usiamo pagine da 2MB (PS) come nel percorso BIOS iniziale.
+    uint64_t pml4_phys = 0, pdpt_phys = 0, pdt_phys = 0;
     uint8_t* pml4 = NULL; uint8_t* pdpt = NULL; uint8_t* pdt = NULL;
-    if (SystemTable->BootServices->AllocatePool(EFI_LOADER_DATA, 4096, (void**)&pml4) != EFI_SUCCESS ||
-        SystemTable->BootServices->AllocatePool(EFI_LOADER_DATA, 4096, (void**)&pdpt) != EFI_SUCCESS ||
-        SystemTable->BootServices->AllocatePool(EFI_LOADER_DATA, 4096, (void**)&pdt)  != EFI_SUCCESS) {
+    if (SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pml4_phys) != EFI_SUCCESS ||
+        SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdpt_phys) != EFI_SUCCESS ||
+        SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdt_phys)  != EFI_SUCCESS) {
         puts16(SystemTable, WIDE("[ERR] Allocazione page tables fallita\r\n"));
+    } else if ((pml4_phys & 0xFFF) || (pdpt_phys & 0xFFF) || (pdt_phys & 0xFFF)) {
+        /* AllocatePages must return page-aligned addresses; this should never trigger */
+        puts16(SystemTable, WIDE("[ERR] Page tables non 4KB aligned!\r\n"));
     } else {
+        pml4 = (uint8_t*)pml4_phys; pdpt = (uint8_t*)pdpt_phys; pdt = (uint8_t*)pdt_phys;
         for(int i=0;i<4096;i++){ pml4[i]=0; pdpt[i]=0; pdt[i]=0; }
         // Link PML4->PDPT, PDPT->PDT
         ((uint64_t*)pml4)[0] = (uint64_t)pdpt | 0x3;

@@ -87,32 +87,106 @@ typedef struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
 
 // Boot Services subset
 typedef EFI_STATUS (EFIAPI *EFI_GET_MEMORY_MAP)(uint64_t* MemoryMapSize, EFI_MEMORY_DESCRIPTOR* MemoryMap, uint64_t* MapKey, uint64_t* DescriptorSize, uint32_t* DescriptorVersion);
+typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_PAGES)(uint32_t Type, uint32_t MemoryType, uint64_t Pages, uint64_t* Memory);
 typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_POOL)(uint32_t PoolType, uint64_t Size, void** Buffer);
 typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(const EFI_GUID* Protocol, void* Registration, void** Interface);
 typedef EFI_STATUS (EFIAPI *EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE ImageHandle, uint64_t MapKey);
 
+/* AllocatePages Type argument */
+#define AllocateAnyPages 0
+
+/*
+ * EFI_BOOT_SERVICES — offsets per UEFI Spec (all pointers 8 bytes on x86-64):
+ *   0   EFI_TABLE_HEADER (24 bytes)
+ *  24   RaiseTPL
+ *  32   RestoreTPL
+ *  40   AllocatePages   ← first used field
+ *  48   FreePages
+ *  56   GetMemoryMap
+ *  64   AllocatePool
+ *  72   FreePool
+ *  80   CreateEvent
+ *  88   SetTimer
+ *  96   WaitForEvent
+ * 104   SignalEvent
+ * 112   CloseEvent
+ * 120   CheckEvent
+ * 128   InstallProtocolInterface
+ * 136   ReinstallProtocolInterface
+ * 144   UninstallProtocolInterface
+ * 152   HandleProtocol
+ * 160   Reserved
+ * 168   RegisterProtocolNotify
+ * 176   LocateHandle
+ * 184   LocateDevicePath
+ * 192   InstallConfigurationTable
+ * 200   LoadImage
+ * 208   StartImage
+ * 216   Exit
+ * 224   UnloadImage
+ * 232   ExitBootServices
+ * 240..319  (10 × 8 bytes skipped)
+ * 320   LocateProtocol
+ */
 typedef struct EFI_BOOT_SERVICES {
-    char _pad[24]; // Skip first fields (RaiseTPL/RestoreTPL etc.)
-    EFI_GET_MEMORY_MAP    GetMemoryMap;
-    EFI_ALLOCATE_POOL     AllocatePool;
-    void*                 FreePool; // not used
-    void*                 CreateEvent; // omitted
-    void*                 SetTimer;    // omitted
-    void*                 WaitForEvent; // omitted
-    void*                 SignalEvent; // omitted
-    void*                 CloseEvent;  // omitted
-    EFI_LOCATE_PROTOCOL   LocateProtocol;
-    char _pad2[56]; // skip to ExitBootServices (layout simplified)
-    EFI_EXIT_BOOT_SERVICES ExitBootServices;
+    char _pad[40];                              /* header(24)+RaiseTPL(8)+RestoreTPL(8) */
+    EFI_ALLOCATE_PAGES    AllocatePages;        /* offset  40 */
+    void*                 FreePages;            /* offset  48 */
+    EFI_GET_MEMORY_MAP    GetMemoryMap;         /* offset  56 */
+    EFI_ALLOCATE_POOL     AllocatePool;         /* offset  64 */
+    void*                 FreePool;             /* offset  72 */
+    void*                 CreateEvent;          /* offset  80 */
+    void*                 SetTimer;             /* offset  88 */
+    void*                 WaitForEvent;         /* offset  96 */
+    void*                 SignalEvent;          /* offset 104 */
+    void*                 CloseEvent;           /* offset 112 */
+    void*                 CheckEvent;           /* offset 120 */
+    void*                 InstallProtocolInterface;    /* 128 */
+    void*                 ReinstallProtocolInterface;  /* 136 */
+    void*                 UninstallProtocolInterface;  /* 144 */
+    void*                 HandleProtocol;              /* 152 */
+    void*                 _reserved;                   /* 160 */
+    void*                 RegisterProtocolNotify;      /* 168 */
+    void*                 LocateHandle;                /* 176 */
+    void*                 LocateDevicePath;             /* 184 */
+    void*                 InstallConfigurationTable;   /* 192 */
+    void*                 LoadImage;                   /* 200 */
+    void*                 StartImage;                  /* 208 */
+    void*                 Exit;                        /* 216 */
+    void*                 UnloadImage;                 /* 224 */
+    EFI_EXIT_BOOT_SERVICES ExitBootServices;           /* offset 232 */
+    char _pad2[80];                             /* 240-319: 10 skipped entries */
+    EFI_LOCATE_PROTOCOL   LocateProtocol;              /* offset 320 */
 } EFI_BOOT_SERVICES;
 
-// System Table
+/*
+ * EFI_SYSTEM_TABLE — offsets per UEFI Spec:
+ *   0   EFI_TABLE_HEADER (24 bytes)
+ *  24   FirmwareVendor (CHAR16*)
+ *  32   FirmwareRevision (UINT32)
+ *  36   [4 bytes implicit padding]
+ *  40   ConsoleInHandle (EFI_HANDLE)
+ *  48   ConIn
+ *  56   ConsoleOutHandle (EFI_HANDLE)
+ *  64   ConOut
+ *  72   StdErrHandle (EFI_HANDLE)
+ *  80   StdErr
+ *  88   RuntimeServices
+ *  96   BootServices
+ */
 typedef struct EFI_SYSTEM_TABLE {
-    char _pad_header[24]; // Signature, Revision, CRC32, etc.
-    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL* ConOut;
-    EFI_SIMPLE_TEXT_INPUT_PROTOCOL*  ConIn;
-    EFI_BOOT_SERVICES* BootServices;
-    void* RuntimeServices; // placeholder (unused)
+    char     _pad_header[24];                        /* EFI_TABLE_HEADER */
+    CHAR16*  FirmwareVendor;                         /* offset  24 */
+    uint32_t FirmwareRevision;                       /* offset  32 */
+    /* 4 bytes implicit padding to align next pointer */
+    EFI_HANDLE                       ConsoleInHandle; /* offset  40 */
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL*  ConIn;           /* offset  48 */
+    EFI_HANDLE                       ConsoleOutHandle;/* offset  56 */
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL* ConOut;          /* offset  64 */
+    EFI_HANDLE                       StdErrHandle;    /* offset  72 */
+    void*                            StdErr;          /* offset  80 */
+    void*                            RuntimeServices; /* offset  88 */
+    EFI_BOOT_SERVICES*               BootServices;    /* offset  96 */
 } EFI_SYSTEM_TABLE;
 
 // Status codes (subset)
