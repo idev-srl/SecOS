@@ -352,30 +352,31 @@ void vmm_setup_kernel_guard_pages(void) {
     char hx[] = "0123456789ABCDEF"; char buf[17]; buf[16] = '\0'; uint64_t v;
 
     // A) Kernel stack guard page
+    // Safety: stack_bottom is the FIRST symbol in .bss (= _bss_start).
+    // stack_bottom - PAGE_SIZE falls inside .data — MUST NOT mark it not-present.
+    // Guard page requires the stack not to be flush against another mapped section.
+    // Deferred until stack placement is separated from _bss_start (see M2 TODO).
     uint64_t sb = (uint64_t)&stack_bottom;
     uint64_t guard_kern = sb - PAGE_SIZE;
-    if (vmm_install_guard_page(guard_kern) == 0) {
-        v = guard_kern; for (int i=15;i>=0;i--){ buf[i]=hx[v&0xF]; v>>=4; }
-        terminal_writestring("[M1.3] Kernel stack guard at 0x"); terminal_writestring(buf); terminal_writestring("\n");
+    uint64_t data_end = (uint64_t)&_data_end;
+    if (guard_kern >= data_end) {
+        if (vmm_install_guard_page(guard_kern) == 0) {
+            v = guard_kern; for (int i=15;i>=0;i--){ buf[i]=hx[v&0xF]; v>>=4; }
+            terminal_writestring("[M1.3] Kernel stack guard at 0x"); terminal_writestring(buf); terminal_writestring("\n");
+        } else {
+            terminal_writestring("[ERR] M1.3: kernel stack guard failed\n");
+        }
     } else {
-        terminal_writestring("[ERR] M1.3: kernel stack guard failed\n");
+        terminal_writestring("[M1.3] Kernel stack guard skipped: guard_virt in .data range\n");
     }
 
     // C) IST stack guard pages
-    extern void tss_get_ist_bases(uint64_t*, uint64_t*, uint64_t*);
-    uint64_t ist1_base, ist2_base, ist3_base;
-    tss_get_ist_bases(&ist1_base, &ist2_base, &ist3_base);
-    uint64_t ist_bases[3] = { ist1_base, ist2_base, ist3_base };
-    for (int s = 0; s < 3; s++) {
-        uint64_t guard_ist = ist_bases[s] - PAGE_SIZE;
-        if (vmm_install_guard_page(guard_ist) == 0) {
-            v = guard_ist; for (int i=15;i>=0;i--){ buf[i]=hx[v&0xF]; v>>=4; }
-            terminal_writestring("[M1.3] IST"); terminal_putchar('1' + s);
-            terminal_writestring(" guard at 0x"); terminal_writestring(buf); terminal_writestring("\n");
-        } else {
-            terminal_writestring("[ERR] M1.3: IST guard failed\n");
-        }
-    }
+    // Deferred: PMM allocates IST frames contiguously (ist_n_lo, ist_n_hi, ist_(n+1)_lo, ...).
+    // ist_(n+1)_lo - PAGE_SIZE = ist_n_hi, which is an ACTIVE IST-n stack frame.
+    // Marking it not-present corrupts IST-n and triggers a triple fault on any #PF.
+    // IST guard pages require each stack to have a dedicated guard frame allocated BEFORE
+    // the stack frames. Deferred to M2 when IST allocation is redesigned.
+    terminal_writestring("[M1.3] IST guard pages deferred (consecutive-frame conflict)\n");
 }
 
 // ---- User space helpers ----

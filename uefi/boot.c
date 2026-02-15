@@ -179,21 +179,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         saved_fb_pitch = gop->Mode->Info->PixelsPerScanLine * 4;
     }
 
-    // Fase 4: Seconda GetMemoryMap (obbligatoria prima di ExitBootServices)
-    // Usa alloc_buf_size (non map_size): UEFI ha aggiornato map_size alla dimensione effettiva del primo call,
-    // ma la buffer è più grande; tra i due call nuove AllocPages/AllocPool aggiungono descrittori.
+    // Fase 4: ExitBootServices — retry loop (UEFI spec §7.4.6)
+    // Any puts16 after GetMemoryMap allocates console buffers and stales the map_key.
+    // Solution: print BEFORE the loop, then only GetMemoryMap + EBS inside it, no console.
     uint64_t final_map_size = alloc_buf_size; uint64_t final_map_key=0; uint64_t final_desc_size=0; uint32_t final_desc_ver=0;
-    CHECK_OK("GetMemMap final", SystemTable->BootServices->GetMemoryMap(&final_map_size, mem_map, &final_map_key, &final_desc_size, &final_desc_ver));
-    puts16(SystemTable, WIDE("[OK] Seconda GetMemoryMap acquisita\r\n"));
     puts16(SystemTable, WIDE("[BOOT] Calling ExitBootServices\r\n"));
-    /* Nota: puts16 sopra possono invalidare il MapKey (allocazioni firmware).
-       Retry silenzioso senza console se EFI_INVALID_PARAMETER (UEFI spec §7.4.6). */
-    EFI_STATUS ebs = SystemTable->BootServices->ExitBootServices(ImageHandle, final_map_key);
-    if (ebs == EFI_INVALID_PARAMETER) {
-        final_map_size = alloc_buf_size;
-        if (SystemTable->BootServices->GetMemoryMap(&final_map_size, mem_map, &final_map_key, &final_desc_size, &final_desc_ver) == EFI_SUCCESS)
-            ebs = SystemTable->BootServices->ExitBootServices(ImageHandle, final_map_key);
+    EFI_STATUS ebs = EFI_INVALID_PARAMETER;
+    for (int _att = 0; _att < 8 && ebs == EFI_INVALID_PARAMETER; _att++) {
+        final_map_size = alloc_buf_size; // reset to full buffer capacity each attempt
+        EFI_STATUS gm = SystemTable->BootServices->GetMemoryMap(
+            &final_map_size, mem_map, &final_map_key, &final_desc_size, &final_desc_ver);
+        if (gm != EFI_SUCCESS) { ebs = gm; break; }
+        ebs = SystemTable->BootServices->ExitBootServices(ImageHandle, final_map_key);
+        // EFI_INVALID_PARAMETER → map_key stale, loop retries; any other code exits loop
     }
+    // Console still available iff ebs != EFI_SUCCESS (boot services not yet exited)
     if (ebs != EFI_SUCCESS) { print_status(SystemTable, WIDE("ExitBootServices"), ebs); return ebs; }
     /* === No UEFI Boot Services or Console calls past this point === */
 
