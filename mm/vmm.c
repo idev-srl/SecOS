@@ -503,6 +503,64 @@ vmm_space_t* vmm_space_create_user(void) {
 
 int vmm_space_destroy(vmm_space_t* space) {
     if (!space) return -1;
+
+    uint64_t pml4_phys = space->pml4_phys & ADDRESS_MASK;
+    uint64_t* pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(pml4_phys) : (uint64_t*)pml4_phys;
+    uint32_t n_pages = 0, n_tables = 0;
+
+    // All user addresses are in PML4[0] (USER_CODE_BASE..USER_STACK_TOP are within 0..512GB).
+    // PML4[0] points to the SHARED kernel PDPT — must not free the PDPT itself.
+    // User allocations injected PDPT entries 4..15; walk only that range.
+    int pdpt_lo = (int)((USER_CODE_BASE >> 30) & 0x1FF); // 4
+    int pdpt_hi = (int)((USER_STACK_TOP  >> 30) & 0x1FF); // 15
+
+    uint64_t pml4e = pml4[0];
+    if (pml4e & VMM_FLAG_PRESENT) {
+        uint64_t pdpt_phys = pml4e & ADDRESS_MASK;
+        uint64_t* pdpt = physmap_initialized ? (uint64_t*)phys_to_virt(pdpt_phys) : (uint64_t*)pdpt_phys;
+
+        for (int pi = pdpt_lo; pi <= pdpt_hi; pi++) {
+            uint64_t pdpte = pdpt[pi];
+            if (!(pdpte & VMM_FLAG_PRESENT)) continue;
+
+            uint64_t pdt_phys = pdpte & ADDRESS_MASK;
+            uint64_t* pdt = physmap_initialized ? (uint64_t*)phys_to_virt(pdt_phys) : (uint64_t*)pdt_phys;
+
+            for (int di = 0; di < 512; di++) {
+                uint64_t pdte = pdt[di];
+                if (!(pdte & VMM_FLAG_PRESENT)) continue;
+                if (pdte & VMM_FLAG_PS) continue; // 2MB huge: ownership unclear, skip
+
+                uint64_t pt_phys = pdte & ADDRESS_MASK;
+                uint64_t* pt = physmap_initialized ? (uint64_t*)phys_to_virt(pt_phys) : (uint64_t*)pt_phys;
+
+                for (int ti = 0; ti < 512; ti++) {
+                    uint64_t pte = pt[ti];
+                    if (!(pte & VMM_FLAG_PRESENT)) continue;
+                    pmm_free_frame((void*)(pte & ADDRESS_MASK));
+                    n_pages++;
+                }
+                pmm_free_frame((void*)pt_phys);
+                n_tables++;
+            }
+            pmm_free_frame((void*)pdt_phys);
+            n_tables++;
+            pdpt[pi] = 0; // zero entry in shared kernel PDPT
+        }
+        // PDPT is shared with kernel_space — do NOT free
+    }
+
+    // PML4 frame is unique per user space
+    pmm_free_frame((void*)pml4_phys);
+    n_tables++;
+
+    char hx[] = "0123456789ABCDEF"; char b[9]; b[8] = '\0';
+    terminal_writestring("[M1.5] vmm_space_destroy freed 0x");
+    uint32_t v = n_pages; for (int i=7;i>=0;i--){ b[i]=hx[v&0xF]; v>>=4; } terminal_writestring(b);
+    terminal_writestring(" pages, 0x");
+    v = n_tables; for (int i=7;i>=0;i--){ b[i]=hx[v&0xF]; v>>=4; } terminal_writestring(b);
+    terminal_writestring(" table frames\n");
+
     kfree(space);
     return 0;
 }
