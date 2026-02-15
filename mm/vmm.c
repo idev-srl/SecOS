@@ -33,21 +33,24 @@ void vmm_extend_physmap(uint64_t phys_end) {
     if (target <= physmap_limit) return;
 
     uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
-    uint64_t* pml4 = (uint64_t*)pml4_phys;
+    // M1.2: physmap_initialized==1 here (checked at function entry), use phys_to_virt
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
     int pml4_i = (VMM_PHYSMAP_BASE >> 39) & 0x1FF;
     int pdpt_i_start = (VMM_PHYSMAP_BASE >> 30) & 0x1FF;
     if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) { terminal_writestring("[ERR] extend physmap: PDPT missing\n"); return; }
-    uint64_t* pdpt = (uint64_t*)(pml4[pml4_i] & ADDRESS_MASK);
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[pml4_i] & ADDRESS_MASK);
     uint64_t phys_cursor = physmap_limit;
     while (phys_cursor < target) {
         int pdpt_i = pdpt_i_start + ((phys_cursor >> 30) & 0x1FF);
     if (pdpt_i >= 512) { terminal_writestring("[WARN] extend physmap: exceeded PDPT range\n"); break; }
-        uint64_t* pdt = (uint64_t*)(pdpt[pdpt_i] & ADDRESS_MASK);
+        uint64_t* pdt;
         if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) {
             void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] extend physmap: PDT alloc fail\n"); break; }
             zero_frame((uint64_t)frame);
             pdpt[pdpt_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
-            pdt = (uint64_t*)(((uint64_t)frame) & ADDRESS_MASK);
+            pdt = (uint64_t*)phys_to_virt((uint64_t)frame & ADDRESS_MASK);
+        } else {
+            pdt = (uint64_t*)phys_to_virt(pdpt[pdpt_i] & ADDRESS_MASK);
         }
         for (int pdt_i=0; pdt_i<512 && phys_cursor < target; pdt_i++) {
             uint64_t virt = VMM_PHYSMAP_BASE + phys_cursor;
@@ -84,7 +87,8 @@ static inline void write_cr3(uint64_t val) {
     __asm__ volatile("mov %0, %%cr3" :: "r"(val));
 }
 
-// Walk page table level or create if absent
+// Walk page table level or create if absent.
+// M1.2: after physmap is active, return phys_to_virt(phys) instead of identity cast.
 static uint64_t* get_or_create_table(uint64_t* table, int index, uint64_t flags) {
     uint64_t entry = table[index];
     if (!(entry & VMM_FLAG_PRESENT)) {
@@ -93,38 +97,54 @@ static uint64_t* get_or_create_table(uint64_t* table, int index, uint64_t flags)
         zero_frame((uint64_t)frame);
         uint64_t phys = (uint64_t)frame & ADDRESS_MASK;
         table[index] = phys | (flags & (VMM_FLAG_RW|VMM_FLAG_USER|VMM_FLAG_PWT|VMM_FLAG_PCD)) | VMM_FLAG_PRESENT;
-        return (uint64_t*)phys; // Identity assumption
+        if (physmap_initialized) {
+            static int once = 0;
+            if (!once) { once = 1; terminal_writestring("[M1.2] get_or_create_table: phys_to_virt path active\n"); }
+            return (uint64_t*)phys_to_virt(phys);
+        }
+        return (uint64_t*)phys;
     }
-    return (uint64_t*)(entry & ADDRESS_MASK);
+    uint64_t phys = entry & ADDRESS_MASK;
+    return physmap_initialized ? (uint64_t*)phys_to_virt(phys) : (uint64_t*)phys;
 }
 
-// Get pointer to final PT level for virtual address in given space
+// Get pointer to final PT level for virtual address in given space.
+// M1.2: use phys_to_virt for all page-table frame dereferences when physmap is active.
 static uint64_t* get_pt_space(vmm_space_t* space, uint64_t virt, int create, uint64_t flags) {
     uint64_t pml4_phys = space->pml4_phys & ADDRESS_MASK;
-    uint64_t* pml4 = (uint64_t*)pml4_phys; // Identity assumption
+    uint64_t* pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(pml4_phys) : (uint64_t*)pml4_phys;
 
     int pml4_i = (virt >> 39) & 0x1FF;
     int pdpt_i = (virt >> 30) & 0x1FF;
     int pdt_i  = (virt >> 21) & 0x1FF;
     int pt_i   = (virt >> 12) & 0x1FF;
 
-    uint64_t* pdpt = (uint64_t*)(pml4[pml4_i] & ADDRESS_MASK);
+    uint64_t* pdpt;
     if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) {
         if (!create) return NULL;
         pdpt = get_or_create_table(pml4, pml4_i, flags);
         if (!pdpt) return NULL;
+    } else {
+        uint64_t pdpt_phys = pml4[pml4_i] & ADDRESS_MASK;
+        pdpt = physmap_initialized ? (uint64_t*)phys_to_virt(pdpt_phys) : (uint64_t*)pdpt_phys;
     }
-    uint64_t* pdt = (uint64_t*)(pdpt[pdpt_i] & ADDRESS_MASK);
+    uint64_t* pdt;
     if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) {
         if (!create) return NULL;
         pdt = get_or_create_table(pdpt, pdpt_i, flags);
         if (!pdt) return NULL;
+    } else {
+        uint64_t pdt_phys = pdpt[pdpt_i] & ADDRESS_MASK;
+        pdt = physmap_initialized ? (uint64_t*)phys_to_virt(pdt_phys) : (uint64_t*)pdt_phys;
     }
-    uint64_t* pt = (uint64_t*)(pdt[pdt_i] & ADDRESS_MASK);
+    uint64_t* pt;
     if (!(pdt[pdt_i] & VMM_FLAG_PRESENT)) {
         if (!create) return NULL;
         pt = get_or_create_table(pdt, pdt_i, flags);
         if (!pt) return NULL;
+    } else {
+        uint64_t pt_phys = pdt[pdt_i] & ADDRESS_MASK;
+        pt = physmap_initialized ? (uint64_t*)phys_to_virt(pt_phys) : (uint64_t*)pt_phys;
     }
     (void)pt_i; // usato da vmm_map
     return pt;
@@ -465,6 +485,10 @@ void vmm_init_physmap(void) {
     terminal_writestring("[OK] Physmap initialized up to ");
     char hex[17]; hex[16]='\0'; uint64_t v=limit; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
     terminal_writestring("0x"); terminal_writestring(hex); terminal_writestring(" (fisico)\n");
+    // M1.2: physmap_initialized just became 1; print sample phys_to_virt conversion
+    uint64_t sample = phys_to_virt(0x200000ULL);
+    uint64_t sv = sample; for(int i=15;i>=0;i--){ hex[i]=hc[sv & 0xF]; sv>>=4; }
+    terminal_writestring("[M1.2] physmap_initialized=1. phys_to_virt(0x200000)= 0x"); terminal_writestring(hex); terminal_writestring("\n");
 }
 
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
