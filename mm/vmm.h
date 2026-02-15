@@ -71,6 +71,9 @@ void vmm_dump_entry(uint64_t virt);
 // Protect kernel sections applying W^X: text RX, rodata R (NX), data/bss RW (NX), stack RW (NX), guard page
 void vmm_protect_kernel_sections(void);
 
+// M1.3: Install guard pages for kernel stack and IST stacks (call after vmm_init_physmap)
+void vmm_setup_kernel_guard_pages(void);
+
 // ---- User space (phase 1b) ----
 #define USER_CODE_BASE  0x0000000100000000ULL
 #define USER_DATA_BASE  0x0000000200000000ULL

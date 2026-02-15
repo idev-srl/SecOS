@@ -58,5 +58,6 @@ typedef struct {
 // Public functions
 void tss_init(void);
 void tss_set_kernel_stack(uint64_t stack);
+void tss_get_ist_bases(uint64_t* out_ist1, uint64_t* out_ist2, uint64_t* out_ist3);
 
 #endif

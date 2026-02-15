@@ -10,7 +10,7 @@
 // Forward declaration of print_hex defined in kernel.c
 extern void print_hex(uint64_t value);
 
-#define IST_STACK_SIZE 4096  // 4KB for each IST stack
+#define IST_STACK_SIZE 8192  // 8KB (2 frames) for each IST stack
 
 // 64-bit GDT layout: null, kernel code, kernel data, user data, user code, TSS (2 slots)
 // Build a raw buffer (5 normal entries + TSS descriptor) then load.
@@ -56,16 +56,22 @@ static void gdt_set_tss(uint64_t base, uint32_t limit) {
 }
 
 void tss_init(void) {
-    // Allocate IST stacks
-    ist1_stack = (uint8_t*)pmm_alloc_frame();  // Double Fault
-    ist2_stack = (uint8_t*)pmm_alloc_frame();  // Page Fault
-    ist3_stack = (uint8_t*)pmm_alloc_frame();  // General Protection Fault
-    
-    if (!ist1_stack || !ist2_stack || !ist3_stack) {
+    // Allocate IST stacks (2 consecutive frames = 8KB each)
+    uint8_t* ist1_lo = (uint8_t*)pmm_alloc_frame();
+    uint8_t* ist1_hi = (uint8_t*)pmm_alloc_frame();
+    uint8_t* ist2_lo = (uint8_t*)pmm_alloc_frame();
+    uint8_t* ist2_hi = (uint8_t*)pmm_alloc_frame();
+    uint8_t* ist3_lo = (uint8_t*)pmm_alloc_frame();
+    uint8_t* ist3_hi = (uint8_t*)pmm_alloc_frame();
+
+    if (!ist1_lo || !ist1_hi || !ist2_lo || !ist2_hi || !ist3_lo || !ist3_hi) {
         terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
         terminal_writestring("[ERROR] Impossibile allocare stack IST!\n");
         return;
     }
+    ist1_stack = ist1_lo;  // base of IST1 (2 frames: ist1_lo, ist1_hi)
+    ist2_stack = ist2_lo;
+    ist3_stack = ist3_lo;
     
     // Azzera il TSS
     uint8_t* tss_ptr = (uint8_t*)&tss;
@@ -121,4 +127,10 @@ void tss_init(void) {
 
 void tss_set_kernel_stack(uint64_t stack) {
     tss.rsp0 = stack;
+}
+
+void tss_get_ist_bases(uint64_t* out_ist1, uint64_t* out_ist2, uint64_t* out_ist3) {
+    if (out_ist1) *out_ist1 = (uint64_t)ist1_stack;
+    if (out_ist2) *out_ist2 = (uint64_t)ist2_stack;
+    if (out_ist3) *out_ist3 = (uint64_t)ist3_stack;
 }

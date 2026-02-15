@@ -310,6 +310,74 @@ void vmm_protect_kernel_sections(void) {
     terminal_writestring("[SEC] W^X applied: text RX, rodata R/NX, data+bss RW/NX, stack RW/NX with guard page\n");
 }
 
+// --- M1.3: Guard pages ---
+// Split a 2MB huge page containing guard_virt into 4KB pages, then mark guard_virt not-present.
+// Must be called AFTER vmm_init_physmap() (uses phys_to_virt).
+static int vmm_install_guard_page(uint64_t guard_virt) {
+    uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+    int pml4_i = (guard_virt >> 39) & 0x1FF;
+    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) return -1;
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[pml4_i] & ADDRESS_MASK);
+    int pdpt_i = (guard_virt >> 30) & 0x1FF;
+    if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) return -1;
+    uint64_t* pdt = (uint64_t*)phys_to_virt(pdpt[pdpt_i] & ADDRESS_MASK);
+    int pdt_i = (guard_virt >> 21) & 0x1FF;
+    uint64_t pde = pdt[pdt_i];
+    if (!(pde & VMM_FLAG_PRESENT)) return -1;
+
+    if (pde & VMM_FLAG_PS) {
+        // Split 2MB huge page into 512 × 4KB pages
+        void* frame = pmm_alloc_frame();
+        if (!frame) { terminal_writestring("[ERR] M1.3: PT alloc fail\n"); return -2; }
+        zero_frame((uint64_t)frame);
+        uint64_t phys_base = pde & ADDRESS_MASK;
+        uint64_t* pt = (uint64_t*)phys_to_virt((uint64_t)frame);
+        for (int i = 0; i < 512; i++) {
+            pt[i] = (phys_base + i * PAGE_SIZE) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+        }
+        pdt[pdt_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    }
+
+    // Mark guard page not-present
+    uint64_t pt_phys = pdt[pdt_i] & ADDRESS_MASK;
+    uint64_t* pt = (uint64_t*)phys_to_virt(pt_phys);
+    int pt_i = (guard_virt >> 12) & 0x1FF;
+    pt[pt_i] = 0;
+    __asm__ volatile("invlpg (%0)" :: "r"(guard_virt) : "memory");
+    return 0;
+}
+
+void vmm_setup_kernel_guard_pages(void) {
+    char hx[] = "0123456789ABCDEF"; char buf[17]; buf[16] = '\0'; uint64_t v;
+
+    // A) Kernel stack guard page
+    uint64_t sb = (uint64_t)&stack_bottom;
+    uint64_t guard_kern = sb - PAGE_SIZE;
+    if (vmm_install_guard_page(guard_kern) == 0) {
+        v = guard_kern; for (int i=15;i>=0;i--){ buf[i]=hx[v&0xF]; v>>=4; }
+        terminal_writestring("[M1.3] Kernel stack guard at 0x"); terminal_writestring(buf); terminal_writestring("\n");
+    } else {
+        terminal_writestring("[ERR] M1.3: kernel stack guard failed\n");
+    }
+
+    // C) IST stack guard pages
+    extern void tss_get_ist_bases(uint64_t*, uint64_t*, uint64_t*);
+    uint64_t ist1_base, ist2_base, ist3_base;
+    tss_get_ist_bases(&ist1_base, &ist2_base, &ist3_base);
+    uint64_t ist_bases[3] = { ist1_base, ist2_base, ist3_base };
+    for (int s = 0; s < 3; s++) {
+        uint64_t guard_ist = ist_bases[s] - PAGE_SIZE;
+        if (vmm_install_guard_page(guard_ist) == 0) {
+            v = guard_ist; for (int i=15;i>=0;i--){ buf[i]=hx[v&0xF]; v>>=4; }
+            terminal_writestring("[M1.3] IST"); terminal_putchar('1' + s);
+            terminal_writestring(" guard at 0x"); terminal_writestring(buf); terminal_writestring("\n");
+        } else {
+            terminal_writestring("[ERR] M1.3: IST guard failed\n");
+        }
+    }
+}
+
 // ---- User space helpers ----
 static int map_user_page(uint64_t virt, int rw, int exec) {
     if (virt & 0xFFF) return -1;
@@ -362,13 +430,19 @@ int vmm_map_user_data_in_space(vmm_space_t* space, uint64_t virt) { return map_u
 uint64_t vmm_alloc_user_stack(int pages) {
     if (pages <= 0) pages = 4;
     uint64_t top = USER_STACK_TOP;
-    // Leave one unmapped guard page below bottom (top - pages*PAGE_SIZE - PAGE_SIZE)
     for (int i=0;i<pages;i++) {
         uint64_t page_addr = top - (i+1)*PAGE_SIZE;
         if (vmm_alloc_user_page(page_addr) != 0) {
             terminal_writestring("[USER] alloc stack page fail\n");
             break;
         }
+    }
+    // M1.3: Explicit guard page — ensure PTE exists as not-present
+    uint64_t guard_addr = top - (pages+1)*PAGE_SIZE;
+    uint64_t* pt = get_pt(guard_addr, 1, VMM_FLAG_RW | VMM_FLAG_USER);
+    if (pt) {
+        int pt_i = (guard_addr >> 12) & 0x1FF;
+        pt[pt_i] = 0; // explicitly not-present
     }
     return top;
 }
@@ -377,13 +451,19 @@ uint64_t vmm_alloc_user_stack_in_space(vmm_space_t* space, int pages) {
     if (!space) return 0;
     if (pages <= 0) pages = 4;
     uint64_t top = USER_STACK_TOP;
-    // Guard page: don't map page immediately below stack bottom
     for (int i=0;i<pages;i++) {
         uint64_t page_addr = top - (i+1)*PAGE_SIZE;
         if (vmm_alloc_user_page_in_space(space, page_addr) != 0) {
             terminal_writestring("[USER] alloc stack page fail (space)\n");
             break;
         }
+    }
+    // M1.3: Explicit guard page — ensure PTE exists as not-present
+    uint64_t guard_addr = top - (pages+1)*PAGE_SIZE;
+    uint64_t* pt = get_pt_space(space, guard_addr, 1, VMM_FLAG_RW | VMM_FLAG_USER);
+    if (pt) {
+        int pt_i = (guard_addr >> 12) & 0x1FF;
+        pt[pt_i] = 0; // explicitly not-present
     }
     return top;
 }

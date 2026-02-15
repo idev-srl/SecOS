@@ -31,8 +31,8 @@ SECTIONS
     }
     
     .bss : ALIGN(4K) {
-        *(COMMON)
         _bss_start = .;
+        *(COMMON)
         *(.bss*)
         _bss_end = .;
     }
