@@ -100,10 +100,10 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     // pmm_print_stats(); // optional
     vmm_init();
+    tss_init();
     // terminal_writestring("[OK] IDT initialization...\n");
     idt_init();
     vmm_init_physmap();
-    tss_init();
 
     // Debug addresses (enable if needed)
     // terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
