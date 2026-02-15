@@ -133,13 +133,59 @@ static uint64_t* get_pt_space(vmm_space_t* space, uint64_t virt, int create, uin
 // Wrapper for kernel_space
 static uint64_t* get_pt(uint64_t virt, int create, uint64_t flags) { return get_pt_space(&kernel_space, virt, create, flags); }
 
+// --- M1.1: kernel-owned page tables ---
+// Allocate a fresh PML4/PDPT/PDT from PMM and populate a 0–512MB identity map
+// using 2MB huge pages. Must be called while identity mapping is still active
+// (physmap_initialized == 0). Returns physical address of new PML4, or 0 on failure.
+static uint64_t vmm_build_kernel_pml4_identity_512mb(void) {
+    uint64_t pml4_phys = (uint64_t)pmm_alloc_frame();
+    uint64_t pdpt_phys = (uint64_t)pmm_alloc_frame();
+    uint64_t pdt_phys  = (uint64_t)pmm_alloc_frame();
+    if (!pml4_phys || !pdpt_phys || !pdt_phys) {
+        terminal_writestring("[ERR] M1.1: PMM alloc failed for kernel page tables\n");
+        return 0;
+    }
+    zero_frame(pml4_phys);
+    zero_frame(pdpt_phys);
+    zero_frame(pdt_phys);
+
+    // Identity cast: frames are within 0–512MB, bootloader tables are still active
+    uint64_t* pml4 = (uint64_t*)pml4_phys;
+    uint64_t* pdpt = (uint64_t*)pdpt_phys;
+    uint64_t* pdt  = (uint64_t*)pdt_phys;
+
+    pml4[0] = pdpt_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    pdpt[0] = pdt_phys  | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    // 256 entries × 2MB = 512MB identity map
+    for (int i = 0; i < 256; i++) {
+        pdt[i] = ((uint64_t)i << 21) | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS;
+    }
+    return pml4_phys;
+}
+
 void vmm_init(void) {
-    kernel_space.pml4_phys = read_cr3();
-    terminal_writestring("[OK] VMM init (CR3= ");
-    uint64_t cr3 = kernel_space.pml4_phys; // Already physical
-    char hex_chars[] = "0123456789ABCDEF"; char buf[17]; buf[16]='\0';
-    for (int i=15;i>=0;i--){ buf[i]=hex_chars[cr3 & 0xF]; cr3 >>=4; }
-    terminal_writestring("0x"); terminal_writestring(buf); terminal_writestring(")\n");
+    char hx[] = "0123456789ABCDEF"; char buf[17]; buf[16] = '\0'; uint64_t v;
+
+    uint64_t old_cr3 = read_cr3();
+    v = old_cr3; for (int i=15;i>=0;i--){ buf[i]=hx[v&0xF]; v>>=4; }
+    terminal_writestring("[M1.1] Bootloader CR3= 0x"); terminal_writestring(buf); terminal_writestring("\n");
+
+    uint64_t new_pml4 = vmm_build_kernel_pml4_identity_512mb();
+    if (!new_pml4) {
+        terminal_writestring("[WARN] M1.1: keeping bootloader CR3\n");
+        kernel_space.pml4_phys = old_cr3;
+        return;
+    }
+
+    v = new_pml4; for (int i=15;i>=0;i--){ buf[i]=hx[v&0xF]; v>>=4; }
+    terminal_writestring("[M1.1] New kernel CR3= 0x"); terminal_writestring(buf); terminal_writestring("\n");
+
+    write_cr3(new_pml4);
+    kernel_space.pml4_phys = new_pml4;
+
+    // Sanity read through new mapping: read back kernel_space.pml4_phys
+    v = kernel_space.pml4_phys; for (int i=15;i>=0;i--){ buf[i]=hx[v&0xF]; v>>=4; }
+    terminal_writestring("[M1.1] CR3 switch OK. pml4_phys= 0x"); terminal_writestring(buf); terminal_writestring("\n");
 }
 
 // Section boundaries (from linker script)
