@@ -1,3 +1,11 @@
+ MILESTONE STATUS
+ ─────────────────────────────────────────────────────────
+  M0  DONE       Tag: —           UEFI boot chain
+  M1  DONE       Tag: M1_STABLE   Memory model hardening
+  M2  PLANNED    —                Context switch + multiprogramming
+  M3  PLANNED    —                Higher-half kernel + demand paging
+ ─────────────────────────────────────────────────────────
+
  1) ANALISI ARCHITETTURALE CRITICA
 
   1. UEFI page tables mai attivate. uefi/boot.c:118 — le tabelle custom sono allocate con AllocatePool (non
@@ -62,7 +70,7 @@
   indirizzo non mappato produce page fault gestito.
 
   ---
-  M1 — Memory model robusto
+  M1 — Memory model robusto  [DONE — tag M1_STABLE]
 
   Obiettivo: Il kernel possiede le proprie page tables, accede alla memoria fisica in modo corretto e protegge le
   sezioni kernel.

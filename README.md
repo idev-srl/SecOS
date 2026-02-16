@@ -6,16 +6,20 @@
 
 A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB Multiboot2 (legacy path), targeting x86-64 long mode.
 
-## Current Status — M0 Complete
+## Current Status — M1 Complete (`M1_STABLE`)
 
-**Milestone M0 (UEFI Boot)**: complete and stabilized.
+**Milestone M1 (Memory Model Hardening)**: complete and stabilized. See [`docs/devlog/M1.md`](docs/devlog/M1.md).
 
-- UEFI boot chain verified end-to-end on OVMF/QEMU
-- Custom UEFI bootloader loads kernel ELF, sets up identity-mapped page tables (512 MB, 2MB pages), calls `ExitBootServices`, hands off to 64-bit `_uefi_start` entry point
-- Kernel receives framebuffer (GOP), memory map, and boot info struct
-- Multiboot2 path (GRUB) continues to work unchanged
+- Kernel-owned page tables: PML4/PDPT/PDT built via PMM, CR3 switched at boot (M1.1)
+- Physmap-aware VMM walkers: `phys_to_virt()` used for all page table access post-physmap (M1.2)
+- Guard pages: kernel stack guard with safety check; user stack guard explicit (M1.3)
+- linker.ld fix: `*(COMMON)` moved inside `[_bss_start, _bss_end]` range (M1.3)
+- IST stacks enlarged to 8KB each (M1.3); IST guard pages deferred to M2
+- GDT/TSS timing stabilized: `tss_init()` before `idt_init()` (M1.4)
+- `vmm_space_destroy`: recursive PML4→PDPT→PDT→PT walk, no frame leaks (M1.5)
+- UEFI ExitBootServices: 8-attempt retry loop, zero console calls between GetMemoryMap and EBS
 
-**M1 (kernel-owned page tables)**: not yet started.
+**M2 (context switch + multiprogramming)**: planned.
 
 ## Features
 
@@ -67,7 +71,37 @@ mcopy -i dist/test_esp.img -o dist/kernel.elf ::kernel.elf
 mcopy -i dist/test_esp.img -o dist/EFI/BOOT/BOOTX64.EFI ::EFI/BOOT/BOOTX64.EFI
 ```
 
-### Run with QEMU (canonical command)
+### UEFI smoke test (canonical command, M1+)
+
+Build ESP image and run with q35 (OVMF works best with q35 chipset):
+
+```bash
+# Full rebuild
+make clean && make && make uefi
+
+# Rebuild ESP image (run once or after EFI/kernel changes)
+dd if=/dev/zero of=dist/test_esp.img bs=1M count=64 2>/dev/null
+mkfs.fat -F 32 dist/test_esp.img
+mmd -i dist/test_esp.img ::/EFI ::/EFI/BOOT
+mcopy -i dist/test_esp.img dist/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i dist/test_esp.img dist/kernel.elf ::/kernel.elf
+
+# Run (exit 124 = timeout = kernel alive; exit 0 = kernel crashed)
+timeout 30 qemu-system-x86_64 \
+  -machine q35,accel=tcg \
+  -m 512M \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,file=dist/OVMF_VARS_test.fd \
+  -drive if=ide,format=raw,file=dist/test_esp.img \
+  -net none \
+  -nographic \
+  -serial file:/tmp/secos_smoke.log
+echo "Exit: $?"
+```
+
+Serial output lands in `/tmp/secos_smoke.log`.
+
+### Run with QEMU (legacy command, pre-M1)
 
 ```bash
 qemu-system-x86_64 \
@@ -79,9 +113,6 @@ qemu-system-x86_64 \
   -debugcon file:/tmp/uefi_boot.log \
   -display none -no-reboot
 ```
-
-Serial log (`/tmp/kernel_debug.log`) captures kernel output.
-Debugcon (`/tmp/uefi_boot.log`) captures UEFI loader progress messages.
 
 ## Build — Multiboot2 / GRUB Path (legacy)
 
