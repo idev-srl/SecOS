@@ -383,6 +383,17 @@ gdb kernel.bin
 
 This code is provided as an educational example and may be used freely under the MIT license (see `LICENSE.md`).
 
+## Security Model: Kernel / Driver Space / User Space
+
+SECoS adotta un modello a tre livelli logici. Il **Kernel Space** (Ring 0) possiede page tables,
+PMM, VMM, IDT e scheduler. Lo **User Space** (Ring 3) esegue processi ELF isolati, senza accesso
+hardware diretto. Il **Driver Space** è un livello intermedio in Ring 3: un processo con binding a
+un dispositivo può eseguire operazioni granulari via `SYS_DRIVER`, mediate e auditate dal kernel.
+Nessun processo Ring 3 accede a MMIO, IOPL=0. Ogni operazione driver è soggetta a capability check
+(`caps_mask`) e registrata nel log circolare.
+
+Specifica completa: [`docs/DRIVER_SPACE.md`](docs/DRIVER_SPACE.md).
+
 ## Memory & Security Notes
 
 The kernel applies W^X to its sections and marks data regions NX. User pages are mapped with USER while shared kernel regions keep USER=0 after hardening (`vmm_harden_user_space`). The user stack has an unmapped guard page to catch overflow via page fault. The ELF loader enforces that no segment is both writable and executable and validates alignment (p_align 0 or 0x1000). Every code/data/stack page is tracked in the PCB for precise unload and memory accounting (manifest max_mem).

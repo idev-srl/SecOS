@@ -4,6 +4,7 @@
   M1  DONE       Tag: M1_STABLE   Memory model hardening
   M2  PLANNED    —                Context switch + multiprogramming
   M3  PLANNED    —                Higher-half kernel + demand paging
+ M4  PLANNED    —                Driver Space enforcement (policy + memory + syscalls)
  ─────────────────────────────────────────────────────────
 
  1) ANALISI ARCHITETTURALE CRITICA
@@ -149,6 +150,36 @@
 
   Done quando: Kernel gira a 0xFFFFFFFF80…, identity mapping low rimossa. PMM gestisce >512MB (testare con QEMU -m 2G).
   Page fault su pagina W+X genera #GP/panic. Serial output funzionante.
+
+  ---
+  M4 — Driver Space enforcement
+
+  Obiettivo: Il Driver Space diventa un confine di sicurezza verificabile: processi driver
+  identificati esplicitamente, DRIVER_OP_MAP_MEM funzionante, restart automatico su crash,
+  IRQ subscribe via coda IPC.
+
+  Task:
+  - Aggiungere campo proc_type (PROC_TYPE_USER / PROC_TYPE_DRIVER) al PCB; il loader lo imposta
+  in base al manifest ELF (MANIFEST_FLAG_DRIVER).
+  - Vietare SYS_DRIVER ai processi PROC_TYPE_USER: il dispatcher ritorna DRV_ERR_PERM senza
+  consultare il registro dispositivi.
+  - Implementare DRIVER_OP_MAP_MEM: validare mem_offset e mem_length contro device_desc_t.mem_base
+  e mem_size, creare mapping virtuale nel processo driver (USER=1, RW=1, NX=1), registrarlo nel PCB
+  per cleanup preciso.
+  - Cleanup mapping su unload: vmm_space_destroy gia' funzionante (M1); aggiungere rimozione
+  binding dal registro dispositivi al momento della distruzione del processo.
+  - Restart automatico driver critico: kernel rileva exit anomala, ricarica ELF dal RAMFS,
+  ripristina binding. Limite N restart in K tick; oltre soglia: DEV_FLAG_FAILED.
+  - DRIVER_OP_IRQ_SUBSCRIBE: associa un IRQ a un processo driver; l'ISR kernel inserisce evento
+  in coda IPC; il driver consuma via SYS_READ su fd speciale.
+
+  Dipendenze: M3 completata (VMM higher-half funzionante necessario per MAP_MEM affidabile;
+  context switch M2 necessario per IPC e restart).
+
+  Done quando: Un processo PROC_TYPE_USER riceve DRV_ERR_PERM su SYS_DRIVER. Un driver che
+  crasha viene riavviato automaticamente. MAP_MEM mappa la regione corretta e la dealloca
+  all'unload (PMM stats stabili). Un IRQ simulato via drvtest raggiunge il processo driver
+  via coda e viene consumato senza race.
 
   ---
   3) DECISIONI ARCHITETTURALI DA PRENDERE SUBITO
