@@ -235,3 +235,16 @@ isr_keyboard:
     pop rax
     
     iretq
+; ---- M2: Stack-switch trampoline ----
+; void trampoline_switch_stack(uint64_t new_rsp, void (*fn)(void));
+; rdi = new_rsp  (System V AMD64: first integer arg)
+; rsi = fn       (System V AMD64: second integer arg)
+;
+; Switches RSP to new_rsp, resets RBP to 0 (new frame base),
+; then tail-calls fn.  fn must not return.
+; NOTE(M2-B): interrupts are disabled at this point (idt_init not yet called).
+global trampoline_switch_stack
+trampoline_switch_stack:
+    mov  rsp, rdi   ; switch to new guarded kernel stack
+    xor  rbp, rbp   ; mark bottom of new call chain
+    jmp  rsi        ; tail-call kernel_main_phase2 (no return)
