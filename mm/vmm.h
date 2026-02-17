@@ -71,8 +71,9 @@ void vmm_dump_entry(uint64_t virt);
 // Protect kernel sections applying W^X: text RX, rodata R (NX), data/bss RW (NX), stack RW (NX), guard page
 void vmm_protect_kernel_sections(void);
 
-// M1.3: Install guard pages for kernel stack and IST stacks (call after vmm_init_physmap)
-// NOTE: superseded by M2; kept for reference but no longer called from kernel_main.
+// M1.3: Install guard pages for kernel stack and IST stacks.
+// DEPRECATED (M2): superseded by vmm_alloc_kernel_stack() + vmm_alloc_ist_stack().
+// Kept for reference; NOT called from kernel_main in M2.
 void vmm_setup_kernel_guard_pages(void);
 
 // ---- M2: dedicated guarded stack region ----
