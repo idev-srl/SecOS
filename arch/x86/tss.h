@@ -56,8 +56,17 @@ typedef struct {
 } __attribute__((packed)) gdt_ptr_t;
 
 // Public functions
-void tss_init(void);
+
+// M2: tss_init now takes the kernel RSP0 value (M2_KSTACK_TOP).
+// It allocates IST stacks via vmm_alloc_ist_stack(), maps them at
+// fixed virtual addresses in the M2 stack region, and loads GDT/TSS.
+// Must be called after vmm_init_physmap() and vmm_alloc_kernel_stack().
+void tss_init(uint64_t kernel_rsp0);
+
+// Update TSS.rsp0 (used when entering ring 0 from ring 3).
 void tss_set_kernel_stack(uint64_t stack);
+
+// Return the virtual tops of the IST stacks (M2: virtual, not physical).
 void tss_get_ist_bases(uint64_t* out_ist1, uint64_t* out_ist2, uint64_t* out_ist3);
 
 #endif

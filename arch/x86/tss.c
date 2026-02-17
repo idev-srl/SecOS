@@ -3,14 +3,17 @@
  * Copyright (c) 2025 iDev srl
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
+ *
+ * M2: IST stacks are now allocated via vmm_alloc_ist_stack() and mapped at
+ * fixed virtual addresses in the M2 stack region (0xFFFFFF8000000000).
+ * Each IST has explicit guard pages (NP PTEs) above and below the usable region.
+ * No more raw physical pointer casts for IST pointers.
  */
 #include "tss.h"
-#include "pmm.h"
+#include "vmm.h"     // vmm_alloc_ist_stack, M2_IST* constants
 #include "terminal.h"
 // Forward declaration of print_hex defined in kernel.c
 extern void print_hex(uint64_t value);
-
-#define IST_STACK_SIZE 8192  // 8KB (2 frames) for each IST stack
 
 // 64-bit GDT layout: null, kernel code, kernel data, user data, user code, TSS (2 slots)
 // Build a raw buffer (5 normal entries + TSS descriptor) then load.
@@ -20,10 +23,10 @@ static uint8_t gdt_raw[5 * sizeof(gdt_entry_t) + sizeof(gdt_tss_entry_t)];
 static gdt_ptr_t gdt_ptr;
 static tss_t tss;
 
-// IST stacks
-static uint8_t* ist1_stack = NULL;
-static uint8_t* ist2_stack = NULL;
-static uint8_t* ist3_stack = NULL;
+// M2: IST virtual top addresses (set by tss_init, returned by tss_get_ist_bases)
+static uint64_t m2_ist1_top = 0;
+static uint64_t m2_ist2_top = 0;
+static uint64_t m2_ist3_top = 0;
 
 // External assembly functions
 extern void gdt_flush(uint64_t gdt_ptr_addr);
@@ -48,80 +51,83 @@ static void gdt_set_tss(uint64_t base, uint32_t limit) {
     gdt_tss.base_middle = (base >> 16) & 0xFF;
     gdt_tss.base_high = (base >> 24) & 0xFF;
     gdt_tss.base_upper = (base >> 32) & 0xFFFFFFFF;
-    
+
     // Access byte: Present, DPL=0, Type=0x9 (Available TSS)
     gdt_tss.access = 0x89;
     gdt_tss.granularity = 0x00;
     gdt_tss.reserved = 0;
 }
 
-void tss_init(void) {
-    // Allocate IST stacks (2 consecutive frames = 8KB each)
-    uint8_t* ist1_lo = (uint8_t*)pmm_alloc_frame();
-    uint8_t* ist1_hi = (uint8_t*)pmm_alloc_frame();
-    uint8_t* ist2_lo = (uint8_t*)pmm_alloc_frame();
-    uint8_t* ist2_hi = (uint8_t*)pmm_alloc_frame();
-    uint8_t* ist3_lo = (uint8_t*)pmm_alloc_frame();
-    uint8_t* ist3_hi = (uint8_t*)pmm_alloc_frame();
+// M2: tss_init takes the kernel stack RSP_INIT (M2_KSTACK_TOP).
+// Must be called after vmm_init_physmap() and vmm_alloc_kernel_stack().
+void tss_init(uint64_t kernel_rsp0) {
+    terminal_writestring("[M2] Initializing TSS with guarded IST stacks...\n");
 
-    if (!ist1_lo || !ist1_hi || !ist2_lo || !ist2_hi || !ist3_lo || !ist3_hi) {
-        terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-        terminal_writestring("[ERROR] Impossibile allocare stack IST!\n");
-        return;
-    }
-    ist1_stack = ist1_lo;  // base of IST1 (2 frames: ist1_lo, ist1_hi)
-    ist2_stack = ist2_lo;
-    ist3_stack = ist3_lo;
-    
-    // Azzera il TSS
+    // --- Allocate and map IST stacks via VMM ---
+    // vmm_alloc_ist_stack() allocates PMM frames, maps them at the given VAs,
+    // installs guard PTEs (NP) at guard_lo and guard_hi, returns top VA.
+    m2_ist1_top = vmm_alloc_ist_stack(M2_IST1_GUARD_LO, M2_IST1_BASE,
+                                       M2_IST1_TOP, M2_IST1_GUARD_HI, 1);
+    m2_ist2_top = vmm_alloc_ist_stack(M2_IST2_GUARD_LO, M2_IST2_BASE,
+                                       M2_IST2_TOP, M2_IST2_GUARD_HI, 2);
+    m2_ist3_top = vmm_alloc_ist_stack(M2_IST3_GUARD_LO, M2_IST3_BASE,
+                                       M2_IST3_TOP, M2_IST3_GUARD_HI, 3);
+
+    // --- Zero the TSS ---
     uint8_t* tss_ptr = (uint8_t*)&tss;
-    for (int i = 0; i < sizeof(tss_t); i++) {
-        tss_ptr[i] = 0;
-    }
-    
-    // Configura IST (puntano alla fine dello stack perché cresce verso il basso)
-    tss.ist1 = (uint64_t)(ist1_stack + IST_STACK_SIZE);
-    tss.ist2 = (uint64_t)(ist2_stack + IST_STACK_SIZE);
-    tss.ist3 = (uint64_t)(ist3_stack + IST_STACK_SIZE);
+    for (int i = 0; i < (int)sizeof(tss_t); i++) tss_ptr[i] = 0;
+
+    // --- Configure TSS fields ---
+    // rsp0: kernel stack pointer used on ring-0 entry from ring-3
+    tss.rsp0 = kernel_rsp0;
+
+    // IST pointers: virtual tops (stacks grow downward from top)
+    tss.ist1 = m2_ist1_top;   // Double Fault   (#8)
+    tss.ist2 = m2_ist2_top;   // Page Fault     (#14)
+    tss.ist3 = m2_ist3_top;   // GPF            (#13)
+
     tss.iomap_base = sizeof(tss_t);
-    
-    // Entry standard
+
+    // --- Build GDT ---
     gdt_set_gate(0, 0, 0, 0, 0);                 // Null
-    gdt_set_gate(1, 0, 0x000FFFFF, 0x9A, 0xA0);  // Kernel code (limit impostato a 1MB per sicurezza)
+    gdt_set_gate(1, 0, 0x000FFFFF, 0x9A, 0xA0);  // Kernel code
     gdt_set_gate(2, 0, 0x000FFFFF, 0x92, 0xC0);  // Kernel data
     gdt_set_gate(3, 0, 0x000FFFFF, 0xF2, 0xC0);  // User data
     gdt_set_gate(4, 0, 0x000FFFFF, 0xFA, 0xA0);  // User code
 
-    // TSS entry (due slot consecutivi)
+    // TSS descriptor (occupies 2 consecutive GDT slots)
     gdt_set_tss((uint64_t)&tss, sizeof(tss_t) - 1);
 
-    // Copia nella rappresentazione contigua
+    // Copy GDT entries into the contiguous raw buffer
     uint8_t* dst = gdt_raw;
     for (int i = 0; i < 5; i++) {
         const uint8_t* src = (const uint8_t*)&gdt_entries[i];
-        for (size_t b = 0; b < sizeof(gdt_entry_t); b++) {
+        for (int b = 0; b < (int)sizeof(gdt_entry_t); b++)
             dst[i * sizeof(gdt_entry_t) + b] = src[b];
-        }
     }
-    // Copia TSS (16 byte)
+    // Copy TSS descriptor (16 bytes)
     const uint8_t* tss_src = (const uint8_t*)&gdt_tss;
-    size_t base_off = 5 * sizeof(gdt_entry_t);
-    for (size_t b = 0; b < sizeof(gdt_tss_entry_t); b++) {
+    int base_off = 5 * sizeof(gdt_entry_t);
+    for (int b = 0; b < (int)sizeof(gdt_tss_entry_t); b++)
         dst[base_off + b] = tss_src[b];
-    }
 
     gdt_ptr.limit = sizeof(gdt_raw) - 1;
     gdt_ptr.base = (uint64_t)&gdt_raw[0];
 
-    terminal_writestring("[DBG] GDT base: "); print_hex(gdt_ptr.base); terminal_writestring(" limit: "); print_hex(gdt_ptr.limit); terminal_writestring("\n");
-    terminal_writestring("[DBG] TSS addr: "); print_hex((uint64_t)&tss); terminal_writestring(" selector 0x28\n");
+    // --- Load GDT and TSS ---
+    terminal_writestring("[M2] GDT base: "); print_hex(gdt_ptr.base);
+    terminal_writestring(" limit: "); print_hex(gdt_ptr.limit); terminal_writestring("\n");
+    terminal_writestring("[M2] TSS addr: "); print_hex((uint64_t)&tss);
+    terminal_writestring(" rsp0: "); print_hex(tss.rsp0); terminal_writestring("\n");
+    terminal_writestring("[M2] TSS.ist1: "); print_hex(tss.ist1); terminal_writestring("\n");
+    terminal_writestring("[M2] TSS.ist2: "); print_hex(tss.ist2); terminal_writestring("\n");
+    terminal_writestring("[M2] TSS.ist3: "); print_hex(tss.ist3); terminal_writestring("\n");
 
-    // Carica GDT e TSS
     gdt_flush((uint64_t)&gdt_ptr);
     tss_flush(0x28);
-    
+
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("[OK] TSS inizializzato con IST\n");
+    terminal_writestring("[M2][OK] TSS loaded with guarded IST stacks\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
 
@@ -129,8 +135,9 @@ void tss_set_kernel_stack(uint64_t stack) {
     tss.rsp0 = stack;
 }
 
+// M2: returns virtual top addresses (not physical identity pointers)
 void tss_get_ist_bases(uint64_t* out_ist1, uint64_t* out_ist2, uint64_t* out_ist3) {
-    if (out_ist1) *out_ist1 = (uint64_t)ist1_stack;
-    if (out_ist2) *out_ist2 = (uint64_t)ist2_stack;
-    if (out_ist3) *out_ist3 = (uint64_t)ist3_stack;
+    if (out_ist1) *out_ist1 = m2_ist1_top;
+    if (out_ist2) *out_ist2 = m2_ist2_top;
+    if (out_ist3) *out_ist3 = m2_ist3_top;
 }
