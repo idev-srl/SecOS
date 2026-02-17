@@ -2,8 +2,8 @@
  ─────────────────────────────────────────────────────────
   M0  DONE       Tag: —           UEFI boot chain
   M1  DONE       Tag: M1_STABLE   Memory model hardening
-  M2  PLANNED    —                Context switch + multiprogramming
-  M3  PLANNED    —                Higher-half kernel + demand paging
+  M2  DONE       Tag: M2_STABLE   Stack hardening + IST guard pages + physmap reorder
+  M3  PLANNED    —                Driver Space foundations + context switch
  M4  PLANNED    —                Driver Space enforcement (policy + memory + syscalls)
  ─────────────────────────────────────────────────────────
 

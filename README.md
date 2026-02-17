@@ -6,20 +6,22 @@
 
 A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB Multiboot2 (legacy path), targeting x86-64 long mode.
 
-## Current Status — M1 Complete (`M1_STABLE`)
+## Current Status — M2 Complete (`M2_STABLE`)
 
-**Milestone M1 (Memory Model Hardening)**: complete and stabilized. See [`docs/devlog/M1.md`](docs/devlog/M1.md).
+**Milestone M2 (Stack and Exception Hardening)**: complete and stabilized. See [`docs/devlog/M2.md`](docs/devlog/M2.md).
 
-- Kernel-owned page tables: PML4/PDPT/PDT built via PMM, CR3 switched at boot (M1.1)
-- Physmap-aware VMM walkers: `phys_to_virt()` used for all page table access post-physmap (M1.2)
-- Guard pages: kernel stack guard with safety check; user stack guard explicit (M1.3)
-- linker.ld fix: `*(COMMON)` moved inside `[_bss_start, _bss_end]` range (M1.3)
-- IST stacks enlarged to 8KB each (M1.3); IST guard pages deferred to M2
-- GDT/TSS timing stabilized: `tss_init()` before `idt_init()` (M1.4)
-- `vmm_space_destroy`: recursive PML4→PDPT→PDT→PT walk, no frame leaks (M1.5)
-- UEFI ExitBootServices: 8-attempt retry loop, zero console calls between GetMemoryMap and EBS
+- Dedicated virtual stack region at `0xFFFFFF8000000000` (PML4[511])
+- Kernel main stack: 16 KB usable + guard_lo / guard_hi (not-present PTEs)
+- IST1/2/3 stacks: 8 KB each, full guard pages, virtual addresses in TSS
+- Two-phase `kernel_main`: phase 1 on old `.bss` stack, phase 2 on guarded stack
+- `trampoline_switch_stack`: assembly RSP switch, tail-call to `kernel_main_phase2`
+- Physmap init moved before TSS so all VMM walks use `phys_to_virt()`
+- Debugcon boot markers: `SECoS build <TS> git:<HASH>` + `[M2] Stack switch ok`
+- Deterministic smoke test: `tools/smoke.sh` (exit 124 = PASS for both MB2 and UEFI)
 
-**M2 (context switch + multiprogramming)**: planned.
+**M1 (Memory Model Hardening)**: complete. See [`docs/devlog/M1.md`](docs/devlog/M1.md).
+
+**M3 (Driver Space foundations + context switch)**: planned.
 
 ## Features
 
@@ -100,6 +102,19 @@ echo "Exit: $?"
 ```
 
 Serial output lands in `/tmp/secos_smoke.log`.
+
+### Smoke test (canonical, both paths)
+
+```bash
+# Multiboot2 / GRUB (build ISO + run 20s)
+tools/smoke.sh --mb2 --timeout 20 --log /tmp/secos_mb2.log
+
+# UEFI / OVMF / q35 (build + run 25s)
+tools/smoke.sh --uefi --timeout 25 --log /tmp/secos_uefi.log
+```
+
+Exit 0 = PASS (kernel alive). Exit 1 = FAIL (triple fault / crash).
+Debugcon log captures: build timestamp, git hash, M2 stack switch RSP.
 
 ### Run with QEMU (legacy command, pre-M1)
 
