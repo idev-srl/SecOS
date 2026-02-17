@@ -35,6 +35,7 @@ SRC_C   = \
 	$(MM_DIR)/elf.c \
 	$(MM_DIR)/elf_unload.c \
 	$(MM_DIR)/elf_manifest.c \
+	$(MM_DIR)/user_copy.c \
 	$(KERNEL_DIR)/process.c \
 	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c $(KERNEL_DIR)/sched.c \
 	$(KERNEL_DIR)/syscall.c \
