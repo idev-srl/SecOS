@@ -763,6 +763,12 @@ int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
 int vmm_map_in_space(vmm_space_t* space, uint64_t virt, uint64_t phys, uint64_t flags) {
     if (!space) return -10;
     if (virt & 0xFFF || phys & 0xFFF) return -1; // not aligned
+    /* [M4] Supervisor enforcement: mirror vmm_map() policy.
+     * Kernel-canonical VAs must never carry VMM_FLAG_USER. */
+    if ((flags & VMM_FLAG_USER) && (virt >= 0xFFFF800000000000ULL)) {
+        terminal_writestring("[VMM][M4] POLICY VIOLATION: kernel VA in space mapped with USER bit — rejected\n");
+        return -4;
+    }
     uint64_t* pt = get_pt_space(space, virt, 1, flags);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
