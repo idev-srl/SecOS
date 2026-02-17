@@ -39,7 +39,7 @@
 #include "sched.h"
 #include "panic.h"
 #include "driver_if.h" // driver registry init
-#include "debugcon.h"  // ISA debugcon boot markers (port 0xE9)
+#include "debugcon.h"   // ISA debugcon boot markers (port 0xE9)
 #if CONFIG_UEFI
 #include "bootinfo.h"
 #endif
