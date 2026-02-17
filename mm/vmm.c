@@ -592,6 +592,24 @@ vmm_space_t* vmm_space_create_user(void) {
     vmm_space_t* space = (vmm_space_t*)kmalloc(sizeof(vmm_space_t));
     if (!space) return NULL;
     space->pml4_phys = (uint64_t)pml4_new & ADDRESS_MASK;
+
+    // [M3] Address space protection: assert PML4[256..511] have U=0.
+    // Entries in the kernel-canonical half must never be accessible from ring-3.
+    // This is a defensive in-place check immediately after construction.
+    {
+        uint64_t* virt_pml4 = physmap_initialized
+            ? (uint64_t*)phys_to_virt(space->pml4_phys)
+            : (uint64_t*)space->pml4_phys;
+        for (int i = 256; i < PT_ENTRIES; i++) {
+            if ((virt_pml4[i] & (VMM_FLAG_PRESENT | VMM_FLAG_USER)) ==
+                              (VMM_FLAG_PRESENT | VMM_FLAG_USER)) {
+                // Strip it silently and report — should never happen with current code.
+                virt_pml4[i] &= ~VMM_FLAG_USER;
+                terminal_writestring("[VMM][M3] WARNING: PML4[kernel] had U=1 — stripped\n");
+            }
+        }
+    }
+
     terminal_writestring("[USER] new address space CR3=");
     char hx[]="0123456789ABCDEF"; for(int i=60;i>=0;i-=4) terminal_putchar(hx[(space->pml4_phys>>i)&0xF]);
     terminal_writestring("\n");
@@ -728,6 +746,12 @@ void vmm_init_physmap(void) {
 
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
     if (virt & 0xFFF || phys & 0xFFF) return -1; // not aligned
+    // [M3] Supervisor enforcement: kernel-canonical VAs (>= 0xFFFF800000000000)
+    // must NEVER carry VMM_FLAG_USER.  Reject the call and log the violation.
+    if ((flags & VMM_FLAG_USER) && (virt >= 0xFFFF800000000000ULL)) {
+        terminal_writestring("[VMM][M3] POLICY VIOLATION: kernel VA mapped with USER bit — call rejected\n");
+        return -4;
+    }
     uint64_t* pt = get_pt(virt, 1, flags);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
@@ -819,16 +843,25 @@ int vmm_switch_space(vmm_space_t* space) {
 
 void vmm_harden_user_space(vmm_space_t* space) {
     if (!space) return;
-    uint64_t* pml4 = (uint64_t*)(space->pml4_phys & ADDRESS_MASK);
-    for (int i=0;i<PT_ENTRIES;i++) {
+    // [M3] Use physmap-aware access (physmap is always initialized before any
+    //      user space is created — it is safe to call phys_to_virt here).
+    uint64_t pml4_phys = space->pml4_phys & ADDRESS_MASK;
+    uint64_t* pml4 = physmap_initialized
+        ? (uint64_t*)phys_to_virt(pml4_phys)
+        : (uint64_t*)pml4_phys;
+    // [M3] PML4 indices 256–511 are the kernel-canonical high half.
+    //      x86-64: entries 0–255 → user range, 256–511 → kernel range.
+    //      Strip VMM_FLAG_USER from ALL kernel-half entries unconditionally.
+    int cleared = 0;
+    for (int i = 256; i < PT_ENTRIES; i++) {
         uint64_t e = pml4[i];
         if (!(e & VMM_FLAG_PRESENT)) continue;
-    // Remove USER bit from high kernel mappings (heuristic: virt >= 0xFFFF800000000000)
-    // Compute virtual base address of PML4 entry
-        uint64_t virt_base = ((uint64_t)i << 39);
-        if (virt_base >= 0xFFFF800000000000ULL) pml4[i] = e & ~VMM_FLAG_USER;
+        if (e & VMM_FLAG_USER) { pml4[i] = e & ~VMM_FLAG_USER; cleared++; }
     }
-    terminal_writestring("[SEC] harden user space: cleared USER bit on high kernel regions\n");
+    if (cleared)
+        terminal_writestring("[SEC][M3] harden: cleared USER bit from kernel-half PML4 entries\n");
+    else
+        terminal_writestring("[SEC][M3] harden: kernel-half PML4 entries already supervisor-only\n");
 }
 
 void vmm_dump_entry(uint64_t virt) {
