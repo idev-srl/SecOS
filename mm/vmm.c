@@ -379,6 +379,102 @@ void vmm_setup_kernel_guard_pages(void) {
     terminal_writestring("[M1.3] IST guard pages deferred (consecutive-frame conflict)\n");
 }
 
+// ---- M2: Dedicated guarded stack region ----
+
+// Helper: ensure a PT entry exists for `addr` and force it to 0 (not-present).
+// Creates intermediate page tables if needed (so the PT entry slot exists).
+// Calls INVLPG to flush any stale TLB entry.
+static void m2_mark_guard(uint64_t addr) {
+    uint64_t* pt = get_pt(addr, 1, VMM_FLAG_RW);
+    if (!pt) {
+        terminal_writestring("[M2][ERR] m2_mark_guard: PT alloc fail for ");
+        char hx[]="0123456789ABCDEF";
+        for(int i=60;i>=0;i-=4) terminal_putchar(hx[(addr>>i)&0xF]);
+        terminal_writestring("\n");
+        return;
+    }
+    int pt_i = (addr >> 12) & 0x1FF;
+    pt[pt_i] = 0; // explicitly not-present
+    __asm__ volatile("invlpg (%0)" :: "r"(addr) : "memory");
+}
+
+// Print a 64-bit hex value using only terminal primitives (no heap, no sprintf).
+static void m2_print_hex(uint64_t v) {
+    char hx[] = "0123456789ABCDEF";
+    char buf[17]; buf[16] = '\0';
+    for (int i = 15; i >= 0; i--) { buf[i] = hx[v & 0xF]; v >>= 4; }
+    terminal_writestring("0x"); terminal_writestring(buf);
+}
+
+// Map `pages` consecutive virtual pages starting at `virt_base` to freshly
+// allocated PMM frames.  Flags: RW + NX, no USER.  Panics if PMM or vmm_map fails.
+static void m2_map_stack_pages(uint64_t virt_base, int pages) {
+    for (int i = 0; i < pages; i++) {
+        uint64_t va = virt_base + (uint64_t)i * PAGE_SIZE;
+        void* frame = pmm_alloc_frame();
+        if (!frame) {
+            terminal_writestring("[M2][PANIC] PMM out of frames for stack page at ");
+            m2_print_hex(va); terminal_writestring("\n");
+            for(;;) __asm__ volatile("hlt");
+        }
+        zero_frame((uint64_t)frame);
+        int r = vmm_map(va, (uint64_t)frame, VMM_FLAG_RW | VMM_FLAG_NOEXEC);
+        if (r != 0) {
+            terminal_writestring("[M2][PANIC] vmm_map failed ("); m2_print_hex((uint64_t)r);
+            terminal_writestring(") for "); m2_print_hex(va); terminal_writestring("\n");
+            for(;;) __asm__ volatile("hlt");
+        }
+    }
+}
+
+uint64_t vmm_alloc_kernel_stack(void) {
+    terminal_writestring("[M2] Allocating kernel stack in dedicated virtual region...\n");
+
+    // Ensure guard_lo PTE exists and is not-present.
+    // This also forces creation of PML4[511]->PDPT[0]->PDT[0]->PT, covering
+    // the entire M2_STACK_REGION_BASE 2MB block.
+    m2_mark_guard(M2_KSTACK_GUARD_LO);
+
+    // Map the 4 usable stack pages.
+    m2_map_stack_pages(M2_KSTACK_BASE, M2_KSTACK_PAGES);
+
+    // guard_hi: one page above RSP_INIT (M2_KSTACK_TOP).
+    // The page at M2_KSTACK_TOP .. M2_KSTACK_TOP+0xFFF is implicitly NP
+    // (zero PTE in the freshly created PT).  M2_KSTACK_GUARD_HI is one page
+    // further and is explicitly zeroed for clarity.
+    m2_mark_guard(M2_KSTACK_GUARD_HI);
+
+    // Diagnostics
+    terminal_writestring("[M2] Kernel stack mapped:\n");
+    terminal_writestring("  usable : "); m2_print_hex(M2_KSTACK_BASE);
+    terminal_writestring(" .. "); m2_print_hex(M2_KSTACK_TOP - 1); terminal_writestring(" (16 KB)\n");
+    terminal_writestring("  RSP_INIT: "); m2_print_hex(M2_KSTACK_TOP); terminal_writestring("\n");
+    terminal_writestring("  guard_lo: "); m2_print_hex(M2_KSTACK_GUARD_LO); terminal_writestring(" (NP)\n");
+    terminal_writestring("  guard_hi: "); m2_print_hex(M2_KSTACK_GUARD_HI); terminal_writestring(" (NP)\n");
+
+    return M2_KSTACK_TOP;
+}
+
+// Allocate and map an IST stack (8 KB usable, 2 frames) at the given virtual
+// addresses.  Called by tss_init() for each IST.
+// Returns the top address (= TSS.istN value).
+uint64_t vmm_alloc_ist_stack(uint64_t guard_lo, uint64_t base, uint64_t top,
+                              uint64_t guard_hi, int ist_num) {
+    m2_mark_guard(guard_lo);
+    m2_map_stack_pages(base, M2_IST_PAGES);
+    m2_mark_guard(guard_hi);
+
+    terminal_writestring("[M2] IST");
+    terminal_putchar('0' + ist_num);
+    terminal_writestring(" mapped: usable=[");
+    m2_print_hex(base); terminal_writestring(","); m2_print_hex(top);
+    terminal_writestring(") top="); m2_print_hex(top);
+    terminal_writestring("  guards: "); m2_print_hex(guard_lo);
+    terminal_writestring(" / "); m2_print_hex(guard_hi); terminal_writestring("\n");
+
+    return top;
+}
+
 // ---- User space helpers ----
 static int map_user_page(uint64_t virt, int rw, int exec) {
     if (virt & 0xFFF) return -1;

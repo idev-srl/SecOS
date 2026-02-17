@@ -72,7 +72,52 @@ void vmm_dump_entry(uint64_t virt);
 void vmm_protect_kernel_sections(void);
 
 // M1.3: Install guard pages for kernel stack and IST stacks (call after vmm_init_physmap)
+// NOTE: superseded by M2; kept for reference but no longer called from kernel_main.
 void vmm_setup_kernel_guard_pages(void);
+
+// ---- M2: dedicated guarded stack region ----
+// Virtual base of the M2 stack region (PML4[511], PDPT[0], PDT[0] → single PT)
+#define M2_STACK_REGION_BASE    0xFFFFFF8000000000ULL
+
+// Kernel main stack layout (16 KB usable, 4 frames)
+//   [GUARD_LO][page0..page3 usable][implicit-NP][GUARD_HI]
+//   RSP_INIT = M2_KSTACK_TOP  (end of last usable page, NOT a guard page)
+#define M2_KSTACK_GUARD_LO  (M2_STACK_REGION_BASE + 0x0000ULL)  // PTE = 0 (NP)
+#define M2_KSTACK_BASE      (M2_STACK_REGION_BASE + 0x1000ULL)  // first usable page
+#define M2_KSTACK_TOP       (M2_STACK_REGION_BASE + 0x5000ULL)  // RSP_INIT
+#define M2_KSTACK_GUARD_HI  (M2_STACK_REGION_BASE + 0x6000ULL)  // PTE = 0 (NP)
+#define M2_KSTACK_PAGES     4
+
+// IST1 (Double Fault, IST index 1) — 8 KB usable, 2 frames
+#define M2_IST1_GUARD_LO    (M2_STACK_REGION_BASE + 0x0F000ULL) // PTE = 0 (NP)
+#define M2_IST1_BASE        (M2_STACK_REGION_BASE + 0x10000ULL) // first usable page
+#define M2_IST1_TOP         (M2_STACK_REGION_BASE + 0x12000ULL) // TSS.ist1
+#define M2_IST1_GUARD_HI    (M2_STACK_REGION_BASE + 0x13000ULL) // PTE = 0 (NP)
+
+// IST2 (Page Fault, IST index 2) — 8 KB usable, 2 frames
+#define M2_IST2_GUARD_LO    (M2_STACK_REGION_BASE + 0x14000ULL) // PTE = 0 (NP)
+#define M2_IST2_BASE        (M2_STACK_REGION_BASE + 0x15000ULL)
+#define M2_IST2_TOP         (M2_STACK_REGION_BASE + 0x17000ULL) // TSS.ist2
+#define M2_IST2_GUARD_HI    (M2_STACK_REGION_BASE + 0x18000ULL) // PTE = 0 (NP)
+
+// IST3 (General Protection Fault, IST index 3) — 8 KB usable, 2 frames
+#define M2_IST3_GUARD_LO    (M2_STACK_REGION_BASE + 0x19000ULL) // PTE = 0 (NP)
+#define M2_IST3_BASE        (M2_STACK_REGION_BASE + 0x1A000ULL)
+#define M2_IST3_TOP         (M2_STACK_REGION_BASE + 0x1C000ULL) // TSS.ist3
+#define M2_IST3_GUARD_HI    (M2_STACK_REGION_BASE + 0x1D000ULL) // PTE = 0 (NP)
+
+#define M2_IST_PAGES        2   // pages per IST usable region (8 KB)
+
+// Allocate and map the kernel main stack in the M2 region.
+// Must be called after vmm_init_physmap() (uses phys_to_virt for PT walks).
+// Returns M2_KSTACK_TOP — the RSP_INIT value for the new stack.
+uint64_t vmm_alloc_kernel_stack(void);
+
+// Allocate and map a single IST stack (called by tss_init for each IST).
+// guard_lo / base / top / guard_hi must be page-aligned and non-overlapping.
+// Returns top (= value to store in TSS.istN).
+uint64_t vmm_alloc_ist_stack(uint64_t guard_lo, uint64_t base, uint64_t top,
+                              uint64_t guard_hi, int ist_num);
 
 // ---- User space (phase 1b) ----
 #define USER_CODE_BASE  0x0000000100000000ULL
