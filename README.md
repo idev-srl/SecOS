@@ -6,22 +6,43 @@
 
 A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB Multiboot2 (legacy path), targeting x86-64 long mode.
 
-## Current Status — M2 Complete (`M2_STABLE`)
+## Current Status — M4 Stable (`M4_STABLE`)
 
-**Milestone M2 (Stack and Exception Hardening)**: complete and stabilized. See [`docs/devlog/M2.md`](docs/devlog/M2.md).
+**Milestone M4 (Stabilization & Isolation Test Suite)**: complete. See [`docs/devlog/M4.md`](docs/devlog/M4.md).
+
+- 12-case in-kernel selftest suite for `user_range_valid` / `copy_from/to_user` (all PASS)
+- `vmm_map_in_space()` supervisor enforcement aligned with `vmm_map()` (R1 closed)
+- Smoke tests: MB2 (exit 124 PASS) + UEFI (exit 124 PASS)
+- Selftest controlled by `M4_SELFTEST_ENABLE` (default: 1)
+
+**Milestone M3 (User/Kernel Isolation)**: complete. Tag `M3_ISOLATION_BASE`. See [`docs/devlog/M3.md`](docs/devlog/M3.md).
+
+- `user_range_valid`, `copy_from_user`, `copy_to_user` — safe boundary-crossing primitives
+- `vmm_map()` supervisor enforcement, `vmm_harden_user_space()` fixed, PML4[256+] assert
+- All syscall user pointers validated (SYS_OPEN/READ/WRITE/DRIVER)
+
+**Milestone M2 (Stack and Exception Hardening)**: complete. Tag `M2_STABLE`. See [`docs/devlog/M2.md`](docs/devlog/M2.md).
 
 - Dedicated virtual stack region at `0xFFFFFF8000000000` (PML4[511])
 - Kernel main stack: 16 KB usable + guard_lo / guard_hi (not-present PTEs)
 - IST1/2/3 stacks: 8 KB each, full guard pages, virtual addresses in TSS
-- Two-phase `kernel_main`: phase 1 on old `.bss` stack, phase 2 on guarded stack
-- `trampoline_switch_stack`: assembly RSP switch, tail-call to `kernel_main_phase2`
-- Physmap init moved before TSS so all VMM walks use `phys_to_virt()`
 - Debugcon boot markers: `SECoS build <TS> git:<HASH>` + `[M2] Stack switch ok`
 - Deterministic smoke test: `tools/smoke.sh` (exit 124 = PASS for both MB2 and UEFI)
 
-**M1 (Memory Model Hardening)**: complete. See [`docs/devlog/M1.md`](docs/devlog/M1.md).
+**M1 (Memory Model Hardening)**: complete. Tag `M1_STABLE`. See [`docs/devlog/M1.md`](docs/devlog/M1.md).
 
-**M3 (Driver Space foundations + context switch)**: planned.
+**M5 (Context Switch + First User Task)**: planned.
+
+### Running the Isolation Selftest
+
+```bash
+# Build and run (selftest is enabled by default, M4_SELFTEST_ENABLE=1):
+make iso && tools/smoke.sh --mb2 --timeout 20 --log /tmp/secos_mb2.log
+# Check debugcon log for [M4][SELFTEST] lines (expect: 12/12 PASS)
+
+# Disable selftest at build time:
+make iso CFLAGS_EXTRA=-DM4_SELFTEST_ENABLE=0
+```
 
 ## Features
 

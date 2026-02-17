@@ -1,10 +1,11 @@
  MILESTONE STATUS
  ─────────────────────────────────────────────────────────
-  M0  DONE       Tag: —           UEFI boot chain
-  M1  DONE       Tag: M1_STABLE   Memory model hardening
-  M2  DONE       Tag: M2_STABLE   Stack hardening + IST guard pages + physmap reorder
-  M3  PLANNED    —                Driver Space foundations + context switch
- M4  PLANNED    —                Driver Space enforcement (policy + memory + syscalls)
+  M0  DONE       Tag: —                    UEFI boot chain
+  M1  DONE       Tag: M1_STABLE            Memory model hardening
+  M2  DONE       Tag: M2_STABLE            Stack hardening + IST guard pages + physmap reorder
+  M3  DONE       Tag: M3_ISOLATION_BASE    User/Kernel isolation (user_range_valid, copy_from/to_user, syscall hardening)
+  M4  DONE       Tag: M4_STABLE            Stabilization + isolation selftest (12/12 PASS) + vmm_map_in_space hardening
+  M5  PLANNED    —                         Context switch + first ring-3 user task
  ─────────────────────────────────────────────────────────
 
  1) ANALISI ARCHITETTURALE CRITICA
