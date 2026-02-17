@@ -39,6 +39,7 @@
 #include "sched.h"
 #include "panic.h"
 #include "driver_if.h" // driver registry init
+#include "debugcon.h"  // ISA debugcon boot markers (port 0xE9)
 #if CONFIG_UEFI
 #include "bootinfo.h"
 #endif
@@ -73,6 +74,10 @@ static void kernel_main_phase2(void) {
     terminal_writestring("[M2] Stack switch complete. RSP= ");
     print_hex(rsp);
     terminal_writestring("\n");
+    // Crash-signature: also send to debugcon so smoke log captures it.
+    debugcon_writestring("[M2] Stack switch ok. RSP=");
+    debugcon_print_hex(rsp);
+    debugcon_writestring("\n");
 
     // NOTE(M2-B): We are now past the narrow window where no IDT/IST was
     // present.  vmm_init_physmap() and vmm_alloc_kernel_stack() ran with
@@ -224,6 +229,9 @@ uint64_t g_multiboot_info  = 0;
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // --- Phase 1 begins (old .bss stack) ---
     terminal_initialize();
+    // Crash-signature marker: visible in QEMU -debugcon log even before VGA is
+    // readable.  BUILD_TS and GIT_HASH are injected by the Makefile as -D macros.
+    debugcon_writestring("SECoS build " BUILD_TS " git:" GIT_HASH "\n");
     print_banner();
 
     // Save for phase2 (framebuffer)
