@@ -40,6 +40,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c $(KERNEL_DIR)/sched.c \
 	$(KERNEL_DIR)/syscall.c \
 	$(KERNEL_DIR)/driver_if.c \
+	$(KERNEL_DIR)/selftest.c \
 	user/testdriver.c \
 	$(LIB_DIR)/terminal.c \
 	$(FS_DIR)/ramfs.c \

@@ -40,6 +40,7 @@
 #include "panic.h"
 #include "driver_if.h" // driver registry init
 #include "debugcon.h"   // ISA debugcon boot markers (port 0xE9)
+#include "selftest.h"   // M4 isolation selftest
 #if CONFIG_UEFI
 #include "bootinfo.h"
 #endif
@@ -91,6 +92,10 @@ static void kernel_main_phase2(void) {
     driver_registry_init();
     timer_init(1000);
     keyboard_init();
+
+#if M4_SELFTEST_ENABLE
+    m4_run_selftests();
+#endif
 
     // Initialize native RAMFS (fallback)
     extern int ramfs_init(void); ramfs_init();
