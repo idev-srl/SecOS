@@ -39,6 +39,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/process.c \
 	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c $(KERNEL_DIR)/sched.c \
 	$(KERNEL_DIR)/syscall.c \
+	$(KERNEL_DIR)/syscall_trap.c \
 	$(KERNEL_DIR)/driver_if.c \
 	$(KERNEL_DIR)/selftest.c \
 	user/testdriver.c \
