@@ -87,6 +87,7 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     p->stack_top = st_top;
     p->kstack_top = 0;
     p->kstack_slot = 0;
+    p->tf = NULL;
     p->state = PROC_NEW;
     p->manifest = NULL;
     // Tracking pagine: aggiungi pagine stack (eccetto guard) se pages!=NULL
@@ -154,6 +155,30 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
         kfree(p);
         return NULL;
     }
+    // [M6] Allocate and initialize trapframe for initial iretq entry
+    p->tf = (trapframe_t*)kmalloc(sizeof(trapframe_t));
+    if (!p->tf) {
+        terminal_writestring("[PROC] trapframe alloc failed\n");
+        vmm_free_kernel_stack_for_slot(p->kstack_slot); p->kstack_top = 0;
+        proc_remove(p);
+        kfree(p);
+        return NULL;
+    }
+    {
+        // Zero all GPRs
+        uint8_t* z = (uint8_t*)p->tf;
+        for (int i = 0; i < (int)sizeof(trapframe_t); i++) z[i] = 0;
+        // CPU iret frame
+        p->tf->rip    = entry;
+        p->tf->rflags = 0x202;       // IF enabled
+        p->tf->rsp    = st_top;
+        // Use kernel selectors for now; TODO: user selectors (0x23/0x1B) for ring3
+        p->tf->cs     = 0x08;
+        p->tf->ss     = 0x10;
+        // Markers
+        p->tf->int_no   = 0x80;
+        p->tf->err_code = 0;
+    }
     // Hardening mapping condiviso
     vmm_harden_user_space(space);
     terminal_writestring("[PROC] creato PID=");
@@ -180,6 +205,8 @@ int process_destroy(process_t* p) {
     elf_unload_process(p);
     if (p->manifest) kfree(p->manifest);
     if (p->mapped_pages) { kfree(p->mapped_pages); p->mapped_pages=NULL; }
+    // [M6] Free saved trapframe
+    if (p->tf) { kfree(p->tf); p->tf = NULL; }
     // [M5] Free per-process kernel stack
     if (p->kstack_top) { vmm_free_kernel_stack_for_slot(p->kstack_slot); p->kstack_top = 0; }
     if (p->space) {

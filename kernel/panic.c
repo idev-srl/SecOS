@@ -6,6 +6,9 @@
  */
 #include "panic.h"
 #include "terminal.h"
+#include "trapframe.h"
+#include "sched.h"
+#include "process.h"
 
 // CPU exception names (INT 0-31)
 const char* exception_messages[] = {
@@ -121,6 +124,18 @@ void kernel_panic(const char* message, const char* file, uint32_t line) {
 // Handler per eccezioni CPU (unica definizione corretta)
 void exception_handler(struct registers* regs) {
     __asm__ volatile("cli");
+
+    // [M6] Save trapframe snapshot into current process (struct registers
+    // and trapframe_t share the same binary layout).
+    {
+        process_t* cur = sched_get_current();
+        if (cur && cur->tf) {
+            const uint8_t* s = (const uint8_t*)regs;
+            uint8_t* d = (uint8_t*)cur->tf;
+            for (int i = 0; i < (int)sizeof(trapframe_t); i++) d[i] = s[i];
+        }
+    }
+
     uint64_t int_no = regs->int_no;
     uint64_t err_code = regs->err_code;
 

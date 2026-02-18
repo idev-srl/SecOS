@@ -40,6 +40,8 @@ int sched_add_process(process_t* p) { (void)p; return 0; }
 
 // [M5] Update TSS.rsp0 on context switch
 extern void tss_set_kernel_stack(uint64_t stack);
+// [M6] Full context switch via trapframe restore + iretq
+extern void arch_switch_to_process(process_t* next);
 
 void sched_yield(void) {
     process_t* next = pick_next(current);
@@ -50,7 +52,11 @@ void sched_yield(void) {
         // [M5] Set per-process kernel stack in TSS for ring-3 → ring-0 entry
         if (next->kstack_top)
             tss_set_kernel_stack(next->kstack_top);
-    // TODO: real context switch (save regs, load CR3, etc.)
+        // [M6] Perform real context switch if trapframe is ready.
+        // arch_switch_to_process does NOT return (ends with iretq).
+        // NOTE: for timer-tick preemption, caller must send EOI before this point.
+        if (next->tf)
+            arch_switch_to_process(next);
     }
 }
 

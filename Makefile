@@ -25,10 +25,10 @@ CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mno-red-zone -mno-sse -mno-ss
 		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\""
 LDFLAGS = -n -T linker.ld
 
-SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.asm
+SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.asm $(ARCH_DIR)/context_switch_asm.asm
 SRC_C   = \
 	$(KERNEL_DIR)/kernel.c \
-	$(ARCH_DIR)/idt.c $(ARCH_DIR)/tss.c \
+	$(ARCH_DIR)/idt.c $(ARCH_DIR)/tss.c $(ARCH_DIR)/context_switch.c \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \

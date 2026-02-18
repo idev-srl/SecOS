@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "vmm.h"
+#include "trapframe.h"
 #include "../mm/elf.h" // for ELF_OK
 
 typedef struct process {
@@ -19,6 +20,7 @@ typedef struct process {
     uint64_t kstack_top; // kernel stack top (for future trap/switch)
     uint8_t  kstack_slot; // bounded slot index for kernel stack region
     enum { PROC_NEW, PROC_READY, PROC_RUNNING, PROC_BLOCKED, PROC_ZOMBIE } state;
+    trapframe_t* tf;      // [M6] saved trapframe for context switch
     struct regs_snapshot {
         uint64_t rip, rsp, rflags;
         uint64_t rax, rbx, rcx, rdx;
