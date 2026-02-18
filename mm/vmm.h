@@ -109,6 +109,23 @@ void vmm_setup_kernel_guard_pages(void);
 
 #define M2_IST_PAGES        2   // pages per IST usable region (8 KB)
 
+// ---- M5: per-process guarded kernel stacks ----
+// Each slot gets: [guard_lo(1 page)] [usable(16 pages)] [guard_hi(1 page)]
+// Region grows downward from top of the first 2MB PT block.
+// Slot index is bounded [0..M5_MAX_KSTACK_SLOTS-1], derived from proc_table index.
+#define M5_KSTACK_PAGES        16
+#define M5_KSTACK_SLOT_PAGES   (M5_KSTACK_PAGES + 2)   // 18 pages per slot
+#define M5_KSTACK_SLOT_SIZE    (M5_KSTACK_SLOT_PAGES * 0x1000ULL)
+#define M5_KSTACK_REGION_TOP   (M2_STACK_REGION_BASE + 0x200000ULL) // top of first 2MB block
+#define M5_MAX_KSTACK_SLOTS    32  // must match MAX_PROCESSES
+
+// Allocate guarded per-process kernel stack for a bounded slot index.
+// Returns rsp0 (top of usable area, just below guard_hi). 0 on failure.
+uint64_t vmm_alloc_kernel_stack_for_slot(uint32_t slot);
+
+// Free per-process kernel stack (unmap usable pages, free PMM frames).
+int vmm_free_kernel_stack_for_slot(uint32_t slot);
+
 // Allocate and map the kernel main stack in the M2 region.
 // Must be called after vmm_init_physmap() (uses phys_to_virt for PT walks).
 // Returns M2_KSTACK_TOP — the RSP_INIT value for the new stack.

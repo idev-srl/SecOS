@@ -475,6 +475,78 @@ uint64_t vmm_alloc_ist_stack(uint64_t guard_lo, uint64_t base, uint64_t top,
     return top;
 }
 
+// ---- M5: per-process guarded kernel stacks (slot-based) ----
+
+static uint64_t m5_kstack_slot_top(uint32_t slot) {
+    return M5_KSTACK_REGION_TOP - ((uint64_t)slot * M5_KSTACK_SLOT_SIZE);
+}
+static uint64_t m5_kstack_guard_lo(uint32_t slot) {
+    return m5_kstack_slot_top(slot) - M5_KSTACK_SLOT_SIZE;
+}
+static uint64_t m5_kstack_base(uint32_t slot) {
+    return m5_kstack_guard_lo(slot) + 0x1000ULL;
+}
+static uint64_t m5_kstack_guard_hi(uint32_t slot) {
+    return m5_kstack_slot_top(slot) - 0x1000ULL;
+}
+static uint64_t m5_kstack_rsp_top(uint32_t slot) {
+    return m5_kstack_guard_hi(slot); // rsp0 = top of usable, grows down
+}
+
+uint64_t vmm_alloc_kernel_stack_for_slot(uint32_t slot) {
+    if (slot >= M5_MAX_KSTACK_SLOTS) {
+        terminal_writestring("[M5] ERROR: slot out of range\n");
+        return 0;
+    }
+
+    uint64_t glo  = m5_kstack_guard_lo(slot);
+    uint64_t base = m5_kstack_base(slot);
+    uint64_t ghi  = m5_kstack_guard_hi(slot);
+    uint64_t top  = m5_kstack_rsp_top(slot);
+
+    // Runtime assertion: region must stay within M2 stack 2MB block
+    if (ghi >= M5_KSTACK_REGION_TOP || glo < M2_STACK_REGION_BASE) {
+        terminal_writestring("[M5][PANIC] kstack slot ");
+        m2_print_hex((uint64_t)slot);
+        terminal_writestring(" outside M2 region\n");
+        for(;;) __asm__ volatile("hlt");
+    }
+
+    m2_mark_guard(glo);
+    m2_map_stack_pages(base, M5_KSTACK_PAGES);
+    m2_mark_guard(ghi);
+
+    terminal_writestring("[M5] kstack slot=");
+    m2_print_hex((uint64_t)slot);
+    terminal_writestring(" base="); m2_print_hex(base);
+    terminal_writestring(" top=");  m2_print_hex(top);
+    terminal_writestring(" guards="); m2_print_hex(glo);
+    terminal_writestring("/"); m2_print_hex(ghi);
+    terminal_writestring("\n");
+
+    return top;
+}
+
+int vmm_free_kernel_stack_for_slot(uint32_t slot) {
+    if (slot >= M5_MAX_KSTACK_SLOTS) return -1;
+
+    uint64_t base = m5_kstack_base(slot);
+    uint64_t glo  = m5_kstack_guard_lo(slot);
+    uint64_t ghi  = m5_kstack_guard_hi(slot);
+
+    for (int i = 0; i < M5_KSTACK_PAGES; i++) {
+        uint64_t va = base + (uint64_t)i * PAGE_SIZE;
+        uint64_t phys = vmm_translate(va);
+        if (phys) {
+            vmm_unmap(va);
+            pmm_free_frame((void*)(phys & ADDRESS_MASK));
+        }
+    }
+    m2_mark_guard(glo);
+    m2_mark_guard(ghi);
+    return 0;
+}
+
 // ---- User space helpers ----
 static int map_user_page(uint64_t virt, int rw, int exec) {
     if (virt & 0xFFF) return -1;
@@ -568,8 +640,10 @@ uint64_t vmm_alloc_user_stack_in_space(vmm_space_t* space, int pages) {
 vmm_space_t* vmm_space_create_user(void) {
     void* pml4_new = pmm_alloc_frame(); if (!pml4_new) return NULL;
     zero_frame((uint64_t)pml4_new);
-    uint64_t* old_pml4 = (uint64_t*)(kernel_space.pml4_phys & ADDRESS_MASK);
-    uint64_t* new_pml4 = (uint64_t*)((uint64_t)pml4_new & ADDRESS_MASK);
+    uint64_t old_phys = kernel_space.pml4_phys & ADDRESS_MASK;
+    uint64_t new_phys = (uint64_t)pml4_new & ADDRESS_MASK;
+    uint64_t* old_pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(old_phys) : (uint64_t*)old_phys;
+    uint64_t* new_pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(new_phys) : (uint64_t*)new_phys;
     for (int i=0;i<PT_ENTRIES;i++) {
         uint64_t e = old_pml4[i];
         if (e & VMM_FLAG_PRESENT) new_pml4[i] = e & ~VMM_FLAG_USER; // share kernel mappings
@@ -580,9 +654,9 @@ vmm_space_t* vmm_space_create_user(void) {
     uint64_t end_usr   = USER_STACK_TOP;
     for (uint64_t addr = start_usr; addr < end_usr; addr += (1ULL<<30)) { // step 1GB
         int pml4_i = (addr >> 39) & 0x1FF; // tipicamente 0 per indirizzi bassi < 512GB
+        if (!(new_pml4[pml4_i] & VMM_FLAG_PRESENT)) continue; // no PDPT
         uint64_t pdpt_phys = new_pml4[pml4_i] & ADDRESS_MASK;
-    if (!(new_pml4[pml4_i] & VMM_FLAG_PRESENT)) continue; // no PDPT
-        uint64_t* pdpt = (uint64_t*)pdpt_phys;
+        uint64_t* pdpt = physmap_initialized ? (uint64_t*)phys_to_virt(pdpt_phys) : (uint64_t*)pdpt_phys;
         int pdpt_i = (addr >> 30) & 0x1FF;
     // If entry present, zero it: user space gets dedicated tables
         if (pdpt[pdpt_i] & VMM_FLAG_PRESENT) {

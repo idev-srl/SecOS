@@ -26,7 +26,7 @@ int process_init_system(void) {
 
 static int proc_add(process_t* p) {
     for (int i=0;i<MAX_PROCESSES;i++) {
-        if (!proc_table[i]) { proc_table[i]=p; return 0; }
+        if (!proc_table[i]) { proc_table[i]=p; p->kstack_slot = (uint8_t)i; return 0; }
     }
     return -1;
 }
@@ -67,15 +67,26 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     uint64_t entry=0;
     uint64_t* pages=NULL; uint32_t page_count=0;
     int r = elf_load_image(elf_buf, size, space, &entry, &pages, &page_count);
-    if (r != ELF_OK) { terminal_writestring("[PROC] elf load fail\n"); return NULL; }
+    if (r != ELF_OK) {
+        terminal_writestring("[PROC] elf load fail\n");
+        pmm_free_frame((void*)(space->pml4_phys & 0x000FFFFFFFFFF000ULL));
+        kfree(space);
+        return NULL;
+    }
     uint64_t st_top = vmm_alloc_user_stack_in_space(space, 8);
     process_t* p = (process_t*)kmalloc(sizeof(process_t));
-    if (!p) return NULL;
+    if (!p) {
+        if (pages) kfree(pages);
+        pmm_free_frame((void*)(space->pml4_phys & 0x000FFFFFFFFFF000ULL));
+        kfree(space);
+        return NULL;
+    }
     p->pid = next_pid++;
     p->space = space;
     p->entry = entry;
     p->stack_top = st_top;
-    p->kstack_top = 0; // da allocare quando introdurremo scheduler/trap
+    p->kstack_top = 0;
+    p->kstack_slot = 0;
     p->state = PROC_NEW;
     p->manifest = NULL;
     // Tracking pagine: aggiungi pagine stack (eccetto guard) se pages!=NULL
@@ -134,7 +145,15 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     p->regs.rsi = p->regs.rdi = p->regs.rbp = 0;
     // Init fd table
     for(int i=0;i<32;i++){ p->fds[i].inode=NULL; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].used=0; }
-    if (proc_add(p)!=0) { terminal_writestring("[PROC] table full\n"); }
+    if (proc_add(p)!=0) { terminal_writestring("[PROC] table full\n"); kfree(p); return NULL; }
+    // [M5] Allocate per-process guarded kernel stack using bounded slot
+    p->kstack_top = vmm_alloc_kernel_stack_for_slot(p->kstack_slot);
+    if (!p->kstack_top) {
+        terminal_writestring("[PROC] kstack alloc failed\n");
+        proc_remove(p);
+        kfree(p);
+        return NULL;
+    }
     // Hardening mapping condiviso
     vmm_harden_user_space(space);
     terminal_writestring("[PROC] creato PID=");
@@ -161,6 +180,8 @@ int process_destroy(process_t* p) {
     elf_unload_process(p);
     if (p->manifest) kfree(p->manifest);
     if (p->mapped_pages) { kfree(p->mapped_pages); p->mapped_pages=NULL; }
+    // [M5] Free per-process kernel stack
+    if (p->kstack_top) { vmm_free_kernel_stack_for_slot(p->kstack_slot); p->kstack_top = 0; }
     if (p->space) {
         pmm_free_frame((void*)(p->space->pml4_phys & 0x000FFFFFFFFFF000ULL));
         kfree(p->space);

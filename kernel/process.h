@@ -17,6 +17,7 @@ typedef struct process {
     uint64_t entry;
     uint64_t stack_top;
     uint64_t kstack_top; // kernel stack top (for future trap/switch)
+    uint8_t  kstack_slot; // bounded slot index for kernel stack region
     enum { PROC_NEW, PROC_READY, PROC_RUNNING, PROC_BLOCKED, PROC_ZOMBIE } state;
     struct regs_snapshot {
         uint64_t rip, rsp, rflags;

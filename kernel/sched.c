@@ -38,12 +38,18 @@ process_t* sched_get_current(void) { return current; }
 
 int sched_add_process(process_t* p) { (void)p; return 0; }
 
+// [M5] Update TSS.rsp0 on context switch
+extern void tss_set_kernel_stack(uint64_t stack);
+
 void sched_yield(void) {
     process_t* next = pick_next(current);
     if (next && next != current) {
         if (current && current->state == PROC_RUNNING) current->state = PROC_READY;
         next->state = PROC_RUNNING;
         current = next;
+        // [M5] Set per-process kernel stack in TSS for ring-3 → ring-0 entry
+        if (next->kstack_top)
+            tss_set_kernel_stack(next->kstack_top);
     // TODO: real context switch (save regs, load CR3, etc.)
     }
 }
