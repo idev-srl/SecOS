@@ -6,6 +6,8 @@
  */
 #include "sched.h"
 #include "terminal.h"
+#include "debugcon.h"
+#include "vmm.h"
 
 static process_t* current = NULL;
 // Simple strategy: iterate process table and pick next NEW/READY.
@@ -35,6 +37,7 @@ void sched_init(void) {
 }
 
 process_t* sched_get_current(void) { return current; }
+void sched_set_current(process_t* p) { current = p; }
 
 int sched_add_process(process_t* p) { (void)p; return 0; }
 
@@ -58,6 +61,42 @@ void sched_yield(void) {
         if (next->tf)
             arch_switch_to_process(next);
     }
+}
+
+// [M7] Cooperative yield from SYS_YIELD syscall.
+// Saves caller trapframe, picks next READY process, switches to it.
+// Does NOT return if a switch occurs (ends with iretq into next process).
+extern void arch_iret_to_tf(trapframe_t* tf) __attribute__((noreturn));
+
+void sched_yield_from_syscall(trapframe_t* tf) {
+    if (!current) return;
+
+    // Save caller's trapframe into persistent heap copy
+    if (current->tf) {
+        const uint8_t* s = (const uint8_t*)tf;
+        uint8_t* d = (uint8_t*)current->tf;
+        for (int i = 0; i < (int)sizeof(trapframe_t); i++) d[i] = s[i];
+        current->tf->rax = 0; // yield returns 0
+    }
+
+    process_t* next = pick_next(current);
+    if (!next || next == current) return; // no switch
+
+    // Log context switch
+    debugcon_writestring("[SCHED] switch ");
+    debugcon_print_hex(current->pid);
+    debugcon_writestring(" -> ");
+    debugcon_print_hex(next->pid);
+    debugcon_writestring("\n");
+
+    current->state = PROC_READY;
+    next->state = PROC_RUNNING;
+    current = next;
+
+    vmm_switch_space(next->space);
+    tss_set_kernel_stack(next->kstack_top);
+    arch_iret_to_tf(next->tf);
+    // NOT REACHED
 }
 
 void sched_on_timer_tick(void) {

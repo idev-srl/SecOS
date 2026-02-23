@@ -172,9 +172,9 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
         p->tf->rip    = entry;
         p->tf->rflags = 0x202;       // IF enabled
         p->tf->rsp    = st_top;
-        // Use kernel selectors for now; TODO: user selectors (0x23/0x1B) for ring3
-        p->tf->cs     = 0x08;
-        p->tf->ss     = 0x10;
+        // [M6] User selectors for ring3 execution
+        p->tf->cs     = 0x1B;  // User code: GDT entry 3, RPL=3
+        p->tf->ss     = 0x23;  // User data: GDT entry 4, RPL=3
         // Markers
         p->tf->int_no   = 0x80;
         p->tf->err_code = 0;

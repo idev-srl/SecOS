@@ -15,7 +15,7 @@
 // Forward declaration of print_hex defined in kernel.c
 extern void print_hex(uint64_t value);
 
-// 64-bit GDT layout: null, kernel code, kernel data, user data, user code, TSS (2 slots)
+// 64-bit GDT layout: null, kernel code, kernel data, user code, user data, TSS (2 slots)
 // Build a raw buffer (5 normal entries + TSS descriptor) then load.
 static gdt_entry_t gdt_entries[5];
 static gdt_tss_entry_t gdt_tss; // occupies 16 bytes
@@ -92,8 +92,8 @@ void tss_init(uint64_t kernel_rsp0) {
     gdt_set_gate(0, 0, 0, 0, 0);                 // Null
     gdt_set_gate(1, 0, 0x000FFFFF, 0x9A, 0xA0);  // Kernel code
     gdt_set_gate(2, 0, 0x000FFFFF, 0x92, 0xC0);  // Kernel data
-    gdt_set_gate(3, 0, 0x000FFFFF, 0xF2, 0xC0);  // User data
-    gdt_set_gate(4, 0, 0x000FFFFF, 0xFA, 0xA0);  // User code
+    gdt_set_gate(3, 0, 0x000FFFFF, 0xFA, 0xA0);  // User code (selector 0x18, RPL3 = 0x1B)
+    gdt_set_gate(4, 0, 0x000FFFFF, 0xF2, 0xC0);  // User data (selector 0x20, RPL3 = 0x23)
 
     // TSS descriptor (occupies 2 consecutive GDT slots)
     gdt_set_tss((uint64_t)&tss, sizeof(tss_t) - 1);

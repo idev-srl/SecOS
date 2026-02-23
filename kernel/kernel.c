@@ -41,6 +41,7 @@
 #include "driver_if.h" // driver registry init
 #include "debugcon.h"   // ISA debugcon boot markers (port 0xE9)
 #include "selftest.h"   // M4 isolation selftest
+#include "process.h"    // M6 ring3 entry
 #if CONFIG_UEFI
 #include "bootinfo.h"
 #endif
@@ -96,6 +97,70 @@ static void kernel_main_phase2(void) {
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();
 #endif
+
+    // [M7] Cooperative scheduling test — two ring3 processes yielding to each other
+    // User code: mov rax,0 / int 0x80 / jmp loop  (SYS_YIELD=0)
+    //   48 C7 C0 00 00 00 00   mov rax, 0
+    //   CD 80                  int 0x80
+    //   EB F5                  jmp -11
+    {
+        extern void arch_enter_user_mode(process_t* p);
+        #include "../mm/elf.h"
+
+        unsigned char elf_buf[512];
+        for (int i = 0; i < 512; i++) elf_buf[i] = 0;
+        // ELF header
+        elf_buf[0]=0x7F; elf_buf[1]='E'; elf_buf[2]='L'; elf_buf[3]='F';
+        elf_buf[4]=2; elf_buf[5]=1; elf_buf[6]=1;
+        *(uint16_t*)(elf_buf+16) = 2;       // ET_EXEC
+        *(uint16_t*)(elf_buf+18) = 0x3E;    // EM_X86_64
+        *(uint32_t*)(elf_buf+20) = 1;       // EV_CURRENT
+        *(uint64_t*)(elf_buf+24) = USER_CODE_BASE; // e_entry
+        *(uint64_t*)(elf_buf+32) = 64;      // e_phoff
+        *(uint16_t*)(elf_buf+52) = 64;      // e_ehsize
+        *(uint16_t*)(elf_buf+54) = 56;      // e_phentsize
+        *(uint16_t*)(elf_buf+56) = 1;       // e_phnum
+        // PHDR: PT_LOAD, RX
+        *(uint32_t*)(elf_buf+64)  = 1;              // p_type = PT_LOAD
+        *(uint32_t*)(elf_buf+68)  = PF_R | PF_X;    // p_flags
+        *(uint64_t*)(elf_buf+72)  = 0x100ULL;       // p_offset
+        *(uint64_t*)(elf_buf+80)  = USER_CODE_BASE; // p_vaddr
+        *(uint64_t*)(elf_buf+88)  = USER_CODE_BASE; // p_paddr
+        *(uint64_t*)(elf_buf+96)  = 0x20ULL;        // p_filesz
+        *(uint64_t*)(elf_buf+104) = 0x20ULL;        // p_memsz
+        *(uint64_t*)(elf_buf+112) = 0x1000ULL;      // p_align
+        // User code at offset 0x100: mov rax,0 / int 0x80 / jmp loop
+        elf_buf[0x100] = 0x48; elf_buf[0x101] = 0xC7; elf_buf[0x102] = 0xC0;
+        elf_buf[0x103] = 0x00; elf_buf[0x104] = 0x00; elf_buf[0x105] = 0x00; elf_buf[0x106] = 0x00;
+        elf_buf[0x107] = 0xCD; elf_buf[0x108] = 0x80;
+        elf_buf[0x109] = 0xEB; elf_buf[0x10A] = 0xF5; // jmp rel8 -11
+
+        terminal_writestring("[M7] Creating two ring3 yield-loop processes...\n");
+        debugcon_writestring("[M7] Creating two ring3 yield-loop processes\n");
+
+        process_t* p1 = process_create_from_elf(elf_buf, 512);
+        process_t* p2 = process_create_from_elf(elf_buf, 512);
+
+        if (!p1 || !p2) {
+            terminal_writestring("[M7] FAILED to create ring3 processes\n");
+            debugcon_writestring("[M7] FAILED to create ring3 processes\n");
+        } else {
+            p1->state = PROC_RUNNING;
+            p2->state = PROC_READY;
+            sched_set_current(p1);
+
+            debugcon_writestring("[M7] p1 pid=");
+            debugcon_print_hex(p1->pid);
+            debugcon_writestring(" p2 pid=");
+            debugcon_print_hex(p2->pid);
+            debugcon_writestring("\n");
+
+            terminal_writestring("[M7] Entering ring3 (p1) — cooperative yield loop\n");
+            debugcon_writestring("[M7] Entering ring3\n");
+            arch_enter_user_mode(p1);
+            // NOT REACHED
+        }
+    }
 
     // Initialize native RAMFS (fallback)
     extern int ramfs_init(void); ramfs_init();
