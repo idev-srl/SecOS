@@ -15,7 +15,8 @@ MM_DIR      = mm
 LIB_DIR     = lib
 
 FS_DIR     = fs
-INCLUDES = -I. -I$(BOOT_DIR) -I$(ARCH_DIR) -I$(KERNEL_DIR) -I$(DRIVERS_DIR) -I$(MM_DIR) -I$(LIB_DIR) -I$(FS_DIR)
+CRYPTO_DIR = crypto
+INCLUDES = -I. -I$(BOOT_DIR) -I$(ARCH_DIR) -I$(KERNEL_DIR) -I$(DRIVERS_DIR) -I$(MM_DIR) -I$(LIB_DIR) -I$(FS_DIR) -I$(CRYPTO_DIR)
 
 ASFLAGS = -f elf64
 BUILD_TS := $(shell date -u +%Y%m%d%H%M%S)
@@ -51,7 +52,9 @@ SRC_C   = \
 	$(FS_DIR)/block.c \
 	$(FS_DIR)/fat32.c \
 	$(FS_DIR)/ext2.c \
-	$(FS_DIR)/ext2ramdev.c
+	$(FS_DIR)/ext2ramdev.c \
+	$(CRYPTO_DIR)/sha256.c \
+	$(CRYPTO_DIR)/crypto_selftest.c
 
 OBJS_ASM = $(SRC_ASM:%.asm=%.o)
 OBJS_C   = $(SRC_C:%.c=%.o)
@@ -93,6 +96,8 @@ $(MM_DIR)/%.o: $(MM_DIR)/%.c
 $(LIB_DIR)/%.o: $(LIB_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(FS_DIR)/%.o: $(FS_DIR)/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+$(CRYPTO_DIR)/%.o: $(CRYPTO_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJS)

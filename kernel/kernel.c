@@ -207,6 +207,10 @@ static void kernel_main_phase2(void) {
     m4_run_selftests();
 #endif
 
+    // [M9] Crypto known-answer self-tests (SHA-256, Ed25519 verify). Cheap; the
+    // signing trust root depends on these being correct.
+    { extern int crypto_selftest(void); crypto_selftest(); }
+
     // [M7] Cooperative scheduling demo — two ring3 processes yielding to each
     // other via SYS_YIELD.  Disabled by default so normal boot reaches the
     // shell; the self-test harness builds with -DM7_RING3_DEMO=1.

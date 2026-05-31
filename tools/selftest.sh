@@ -61,6 +61,9 @@ echo "[selftest] Assertions:"
 # A. M4 isolation selftest 12/12
 grep -q "12/12 PASS" "$LOG"; check "M4 isolation selftest 12/12" $?
 
+# A2. M9 crypto known-answer self-tests
+grep -q "\[CRYPTO\] --- all PASS ---" "$LOG"; check "M9 crypto KATs pass" $?
+
 # B. M7 ring-3 cooperative scheduling
 n_fwd=$(grep -c "switch 0x0000000000000001 -> 0x0000000000000002" "$LOG" || true)
 n_rev=$(grep -c "switch 0x0000000000000002 -> 0x0000000000000001" "$LOG" || true)
