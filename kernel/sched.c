@@ -100,7 +100,9 @@ void sched_yield_from_syscall(trapframe_t* tf) {
 }
 
 void sched_on_timer_tick(void) {
+    // [M7] Cooperative stage: the timer only accounts CPU time. It must NOT
+    // drive arch_switch_to_process() here — doing so preempts kernel
+    // initialization and iretq's into half-built processes. Preemptive
+    // scheduling is M8; until then switching is driven only by SYS_YIELD.
     if (current) current->cpu_ticks++;
-    // For now yield every tick (future: quantum)
-    sched_yield();
 }

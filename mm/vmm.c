@@ -644,24 +644,39 @@ vmm_space_t* vmm_space_create_user(void) {
     uint64_t new_phys = (uint64_t)pml4_new & ADDRESS_MASK;
     uint64_t* old_pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(old_phys) : (uint64_t*)old_phys;
     uint64_t* new_pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(new_phys) : (uint64_t*)new_phys;
+    // Copy all kernel PML4 entries as supervisor (strip USER). The kernel high
+    // half (256..511, physmap) must stay supervisor and shared.
     for (int i=0;i<PT_ENTRIES;i++) {
         uint64_t e = old_pml4[i];
         if (e & VMM_FLAG_PRESENT) new_pml4[i] = e & ~VMM_FLAG_USER; // share kernel mappings
     }
-    // Clear 1GB blocks for user space (CODE/DATA/STACK) to avoid collisions with identity mapping
-    // Iterate in 1GB intervals using PDPT index
-    uint64_t start_usr = USER_CODE_BASE;
-    uint64_t end_usr   = USER_STACK_TOP;
-    for (uint64_t addr = start_usr; addr < end_usr; addr += (1ULL<<30)) { // step 1GB
-        int pml4_i = (addr >> 39) & 0x1FF; // tipicamente 0 per indirizzi bassi < 512GB
-        if (!(new_pml4[pml4_i] & VMM_FLAG_PRESENT)) continue; // no PDPT
-        uint64_t pdpt_phys = new_pml4[pml4_i] & ADDRESS_MASK;
-        uint64_t* pdpt = physmap_initialized ? (uint64_t*)phys_to_virt(pdpt_phys) : (uint64_t*)pdpt_phys;
-        int pdpt_i = (addr >> 30) & 0x1FF;
-    // If entry present, zero it: user space gets dedicated tables
-        if (pdpt[pdpt_i] & VMM_FLAG_PRESENT) {
-            pdpt[pdpt_i] = 0; // rimuove huge o link a PDT esistente del kernel
+    // PML4[0] is special: it covers BOTH the kernel low identity map
+    // (0..512MB, needed while the kernel runs on behalf of a user process) AND
+    // the entire user range — USER_CODE_BASE (4GB) .. USER_STACK_TOP (16GB) are
+    // all < 512GB, i.e. PML4 index 0.  The two must coexist: PML4[0] needs the
+    // USER bit so ring-3 can reach its USER leaves, while kernel pages beneath
+    // stay supervisor (and thus inaccessible to ring-3).  Sharing the kernel's
+    // PDPT here would also collide/leak user tables across processes, so give
+    // each user space its OWN PDPT for PML4[0]: copy the kernel low entries
+    // (supervisor) and leave the user-range PDPT slots empty for the loader.
+    {
+        const int uidx = (int)((USER_CODE_BASE >> 39) & 0x1FF); // 0 for current layout
+        uint64_t kern_pdpt_phys = old_pml4[uidx] & ADDRESS_MASK;
+        uint64_t* kern_pdpt = (old_pml4[uidx] & VMM_FLAG_PRESENT)
+            ? (physmap_initialized ? (uint64_t*)phys_to_virt(kern_pdpt_phys) : (uint64_t*)kern_pdpt_phys)
+            : NULL;
+        void* priv = pmm_alloc_frame();
+        if (!priv) { pmm_free_frame(pml4_new); return NULL; }
+        zero_frame((uint64_t)priv);
+        uint64_t priv_phys = (uint64_t)priv & ADDRESS_MASK;
+        uint64_t* priv_pdpt = physmap_initialized ? (uint64_t*)phys_to_virt(priv_phys) : (uint64_t*)priv_phys;
+        const int lo = (int)((USER_CODE_BASE >> 30) & 0x1FF);
+        const int hi = (int)((USER_STACK_TOP  >> 30) & 0x1FF);
+        for (int i = 0; i < PT_ENTRIES; i++) {
+            if (i >= lo && i <= hi) { priv_pdpt[i] = 0; continue; }      // user range: private, empty
+            priv_pdpt[i] = kern_pdpt ? (kern_pdpt[i] & ~VMM_FLAG_USER) : 0; // kernel low: supervisor
         }
+        new_pml4[uidx] = priv_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_USER;
     }
     vmm_space_t* space = (vmm_space_t*)kmalloc(sizeof(vmm_space_t));
     if (!space) return NULL;

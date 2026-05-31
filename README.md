@@ -8,12 +8,14 @@ A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB 
 
 ## Current Status — M7 (Ring-3 + Cooperative Scheduling, in progress)
 
-**Milestone M7 (Ring-3 Entry + Cooperative Scheduling)**: code committed, runtime demo not yet passing. See [`docs/devlog/M7.md`](docs/devlog/M7.md).
+**Milestone M7 (Ring-3 Entry + Cooperative Scheduling)**: complete. Tag `M7_STABLE`. See [`docs/devlog/M7.md`](docs/devlog/M7.md).
 
 - `arch_enter_user_mode()` performs the ring-0 → ring-3 transition into a user process built from a synthetic ELF
 - `SYS_YIELD` (syscall 0) drives `sched_yield_from_syscall()`, which saves the caller trapframe, picks the next `READY` process and resumes it via `iretq`
-- Builds clean; MB2 + UEFI smoke tests PASS (no triple fault); 12/12 isolation selftests PASS
-- **Known issue:** at HEAD the boot path enters the M7 ring-3 demo and stalls after `[M7] Creating two ring3 yield-loop processes` — no `[SCHED] switch` lines appear and the interactive shell is not reached. The demo call in `kernel_main_phase2` is marked `// NOT REACHED` and currently short-circuits normal boot. Needs investigation before tagging.
+- Two ring-3 processes alternate cooperatively via `SYS_YIELD` (verified: hundreds of thousands of clean `[SCHED] switch` per run, both directions, no CPU exception, on MB2 + UEFI)
+- Demo is gated behind `M7_RING3_DEMO` (off by default so normal boot reaches the shell): `make CFLAGS_EXTRA=-DM7_RING3_DEMO=1`
+- Non-interactive verification: `tools/selftest.sh` (asserts M4 12/12 + alternating ring-3 switches + no `[EXC]`)
+- Four bugs were fixed to get here (premature timer preemption, `EFLAGS.NT` → `iretq` #GP, supervisor `PML4[0]` + shared user PDPT, 2× stride in ELF copy) — see the devlog
 
 **Milestone M6 (Minimal Context Switch)**: complete. See [`docs/devlog/M6.md`](docs/devlog/M6.md).
 

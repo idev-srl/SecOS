@@ -22,7 +22,7 @@ BUILD_TS := $(shell date -u +%Y%m%d%H%M%S)
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo NOHASH)
 # Nota: CONFIG_MULTIBOOT e CONFIG_UEFI sono ora definiti in config.h (dual-boot support)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mno-red-zone -mno-sse -mno-sse2 $(INCLUDES) \
-		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\""
+		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(CFLAGS_EXTRA)
 LDFLAGS = -n -T linker.ld
 
 SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.asm $(ARCH_DIR)/context_switch_asm.asm

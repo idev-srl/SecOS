@@ -4,6 +4,7 @@
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
  */
+#include "debugcon.h"
 #include "panic.h"
 #include "terminal.h"
 #include "trapframe.h"
@@ -147,6 +148,13 @@ void exception_handler(struct registers* regs) {
     }
 
     if (int_no < 32) {
+        // Headless crash diagnosis: surface the fault on debugcon (the smoke
+        // harness captures port 0xE9; the framebuffer is not visible there).
+        { debugcon_writestring("[EXC] int="); debugcon_print_hex(int_no);
+          debugcon_writestring(" err="); debugcon_print_hex(err_code);
+          debugcon_writestring(" rip="); debugcon_print_hex(regs->rip);
+          debugcon_writestring(" cs="); debugcon_print_hex(regs->cs);
+          debugcon_writestring(" rsp="); debugcon_print_hex(regs->rsp); debugcon_writestring("\n"); }
         terminal_initialize();
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_RED));
         terminal_writestring("\n=== EXCEPTION ===\n");

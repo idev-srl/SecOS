@@ -23,6 +23,14 @@ GLOBAL arch_iret_to_tf
 ; the struct, and iretq.  We cannot just set RSP to &tf->r15 because the
 ; trapframe lives in heap memory that may be reclaimed after the switch.
 arch_iret_to_tf:
+    ; Clear EFLAGS.NT (bit 14).  In long mode, executing iretq while NT=1
+    ; attempts a (now-illegal) task return and faults with #GP(0).  NT can be
+    ; left set by the boot path, so clear it here — the single choke point for
+    ; every iretq-based transition (ring-3 entry and context switch).
+    pushfq
+    and qword [rsp], ~0x4000
+    popfq
+
     ; Push the CPU iret frame (SS, RSP, RFLAGS, CS, RIP) in reverse
     push qword [rdi + 0xA8]    ; ss
     push qword [rdi + 0xA0]    ; rsp

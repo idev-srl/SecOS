@@ -4,8 +4,8 @@ Single, linear milestone scheme (M0 → present → future). Earlier revisions o
 this file mixed two conflicting numbering schemes (the executed git milestones
 and an older pre-analysis plan); that has been collapsed into one timeline.
 
-- **Done:** M0–M6
-- **In progress:** M7 (ring-3 + cooperative scheduling — runtime demo not yet passing)
+- **Done:** M0–M7 (M7 = cooperative ring-3 scheduling, working)
+- **In progress:** — (next: M8, preemptive multitasking)
 - **Planned:** M8+
 
 Per-milestone implementation notes live in `docs/devlog/M*.md`. The detailed
@@ -27,42 +27,26 @@ full secure OS, custom minimal ABI, UEFI-golden + virtio-blk.
 | M4 | DONE | `M4_STABLE` | Stabilization: 12/12 in-kernel isolation selftest, `vmm_map_in_space` supervisor enforcement |
 | M5 | DONE | — | Trapframe-based `INT 0x80` entry + C `syscall_handler`; bounded kernel-stack slots |
 | M6 | DONE | — | Minimal context switch: per-PCB trapframe, `arch_iret_to_tf`, CR3 switch on resume |
-| M7 | **WIP** | — | Ring-3 entry (`arch_enter_user_mode`) + `SYS_YIELD` cooperative scheduling — **runtime demo not yet passing** |
+| M7 | DONE | `M7_STABLE` | Ring-3 entry (`arch_enter_user_mode`) + `SYS_YIELD` cooperative scheduling — two ring-3 processes alternate, verified by `tools/selftest.sh` |
 
 ---
 
-## 2. Current focus — finish M7
+## 2. Current focus — M8 (M7 done)
 
-### Problem
-At HEAD the boot path runs an M7 demo from `kernel_main_phase2`: it builds a
-synthetic 512-byte ELF (`mov rax,0 / int 0x80 / jmp loop`), creates two
-processes, and calls `arch_enter_user_mode(p1)` (marked `// NOT REACHED`).
-The smoke test reports PASS (no triple fault), but debugcon output stalls at:
+### M7 — resolved
+Cooperative ring-3 scheduling works. Diagnosis found four independent bugs
+(premature timer preemption, `EFLAGS.NT` causing `iretq` #GP, supervisor
+`PML4[0]` + shared user PDPT, and a 2× stride in the ELF segment copy) — all
+fixed; see `docs/devlog/M7.md`. Two ring-3 processes now alternate via
+`SYS_YIELD`. The demo is gated behind `M7_RING3_DEMO` (off by default, so normal
+boot reaches the shell) and asserted non-interactively by `tools/selftest.sh`
+(M4 12/12 + alternating ring-3 switches + no `[EXC]`).
 
-```
-[M7] Creating two ring3 yield-loop processes
-```
-
-The follow-up lines (`[M7] p1 pid=...`, `[M7] Entering ring3`, `[SCHED] switch ...`)
-never appear, so the stall is inside the two `process_create_from_elf()` calls,
-before ring-3 is ever entered. Because the demo ends with `arch_enter_user_mode`,
-it also short-circuits the rest of boot — RAMFS/VFS init and the interactive
-shell are never reached. (Full detail in `docs/devlog/M7.md`.)
-
-### Tasks
-- Diagnose why `process_create_from_elf()` does not return for the synthetic
-  ELF (trapframe allocation, address-space setup, ELF parse, or stack mapping).
-- Confirm the ring-3 transition (`arch_enter_user_mode`) reaches user mode and
-  emit at least one `[SCHED] switch` between the two processes.
-- Gate the demo behind a build flag (e.g. `M7_RING3_DEMO`, like
-  `M4_SELFTEST_ENABLE`) so normal boot still reaches the shell.
-
-### Done when
-- With the demo flag off: kernel boots to the interactive shell on both MB2 and
-  UEFI paths (smoke PASS).
-- With the demo flag on: debugcon shows `[SCHED] switch <a> -> <b>` alternating
-  between the two ring-3 processes; no triple fault.
-- Tag `M7_STABLE`.
+### Next — M8 (see §3)
+Preemptive multitasking: `SYS_EXIT` + reaping, timer-driven preemption, serial
+console. Note for M8: re-enable timer-driven switching (reverting the M7
+cooperative-only `sched_on_timer_tick`) with a proper quantum, and make
+`vmm_space_destroy` free the per-space private `PML4[0]` PDPT added in M7.
 
 ---
 

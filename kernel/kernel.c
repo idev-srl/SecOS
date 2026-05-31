@@ -98,7 +98,15 @@ static void kernel_main_phase2(void) {
     m4_run_selftests();
 #endif
 
-    // [M7] Cooperative scheduling test — two ring3 processes yielding to each other
+    // [M7] Cooperative scheduling demo — two ring3 processes yielding to each
+    // other via SYS_YIELD.  Disabled by default so normal boot reaches the
+    // shell; the self-test harness builds with -DM7_RING3_DEMO=1.
+    // NOTE: arch_enter_user_mode() does not return, so when enabled this demo
+    // takes over the CPU (the cooperative yield loop runs forever).
+#ifndef M7_RING3_DEMO
+#define M7_RING3_DEMO 0
+#endif
+#if M7_RING3_DEMO
     // User code: mov rax,0 / int 0x80 / jmp loop  (SYS_YIELD=0)
     //   48 C7 C0 00 00 00 00   mov rax, 0
     //   CD 80                  int 0x80
@@ -161,6 +169,7 @@ static void kernel_main_phase2(void) {
             // NOT REACHED
         }
     }
+#endif /* M7_RING3_DEMO */
 
     // Initialize native RAMFS (fallback)
     extern int ramfs_init(void); ramfs_init();

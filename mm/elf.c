@@ -104,18 +104,19 @@ int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t
         const uint8_t* src = base + ph->p_offset;
         for (uint64_t off = 0; off < filesz; off++) {
             uint64_t va = vaddr + off;
+            // vmm_translate_in_space() already returns frame_base | (va & 0xFFF),
+            // so phys_to_virt(phys) is the exact byte address — do NOT index by
+            // (va & 0xFFF) again or the copy gets a 2x stride.
             uint64_t phys = vmm_translate_in_space(space, va);
             if (!phys) { terminal_writestring("[ELF] translate fail space\n"); return ELF_ERR_MAP; }
-            uint8_t* dst = (uint8_t*)phys_to_virt(phys);
-            dst[va & 0xFFFULL] = src[off];
+            *(uint8_t*)phys_to_virt(phys) = src[off];
         }
         // Zero tail se memsz > filesz
         for (uint64_t off = filesz; off < memsz; off++) {
             uint64_t va = vaddr + off;
             uint64_t phys = vmm_translate_in_space(space, va);
             if (!phys) continue;
-            uint8_t* dst = (uint8_t*)phys_to_virt(phys);
-            dst[va & 0xFFFULL] = 0;
+            *(uint8_t*)phys_to_virt(phys) = 0;
         }
         terminal_writestring("[ELF] Segmento caricato: vaddr=");
         char hx[]="0123456789ABCDEF"; for(int b=60;b>=0;b-=4) terminal_putchar(hx[(vaddr>>b)&0xF]);
