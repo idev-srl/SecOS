@@ -749,9 +749,14 @@ int vmm_space_destroy(vmm_space_t* space) {
             }
             pmm_free_frame((void*)pdt_phys);
             n_tables++;
-            pdpt[pi] = 0; // zero entry in shared kernel PDPT
+            pdpt[pi] = 0;
         }
-        // PDPT is shared with kernel_space — do NOT free
+        // [M8] Since M7 each user space owns a PRIVATE PDPT for PML4[0]
+        // (kernel low entries are copied, not shared at this level), so the
+        // PDPT frame itself must be freed.  Its PDPT[0] points to the shared
+        // kernel low-identity PD, which we correctly never walked or freed.
+        pmm_free_frame((void*)pdpt_phys);
+        n_tables++;
     }
 
     // PML4 frame is unique per user space

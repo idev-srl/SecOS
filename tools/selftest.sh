@@ -67,7 +67,26 @@ n_rev=$(grep -c "switch 0x0000000000000002 -> 0x0000000000000001" "$LOG" || true
 [[ "$n_fwd" -ge 2 && "$n_rev" -ge 2 ]]; check "M7 ring-3 cooperative yield alternates (fwd=$n_fwd rev=$n_rev)" $?
 
 # No CPU exception anywhere
-! grep -q "\[EXC\]" "$LOG"; check "no CPU exception ([EXC]) during run" $?
+! grep -q "\[EXC\]" "$LOG"; check "no CPU exception ([EXC]) during M7 run" $?
+
+# ---- M8: preemptive multitasking + exit/reap + no-leak ----
+M8LOG=/tmp/secos_selftest_m8.log
+echo "[selftest] Building M8 image (M8_SCHED_DEMO=1)..."
+make clean >/dev/null 2>&1 || true
+if ! make CFLAGS_EXTRA=-DM8_SCHED_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M8 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M8 (mb2, $((TIMEOUT+6))s)..."
+tools/smoke.sh --mb2 --timeout "$((TIMEOUT+6))" --log "$M8LOG" >/dev/null 2>&1 || true
+
+n_pre=$(grep -c "SCHED] preempt" "$M8LOG" || true)
+[[ "$n_pre" -ge 2 ]]; check "M8 preemptive switches occur (preempt=$n_pre)" $?
+n_exit=$(grep -c "SCHED] exit" "$M8LOG" || true)
+[[ "$n_exit" -ge 4 ]]; check "M8 processes exit via SYS_EXIT (exit=$n_exit)" $?
+grep -q "PMM stable across rounds: NO LEAK" "$M8LOG"; check "M8 no PMM leak across rounds" $?
+grep -q "\[M8\] DONE" "$M8LOG"; check "M8 demo completed ([M8] DONE)" $?
+! grep -q "\[EXC\]" "$M8LOG"; check "no CPU exception ([EXC]) during M8 run" $?
 
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"

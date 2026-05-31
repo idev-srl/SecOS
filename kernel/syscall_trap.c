@@ -57,6 +57,13 @@ uint64_t syscall_handler(trapframe_t* tf) {
         return 0;
     }
 
+    // [M8] SYS_EXIT: terminate the caller. Marks it ZOMBIE and switches away;
+    // does NOT return (the task is reaped later from the idle/scheduler context).
+    if (num == SYS_EXIT) {
+        sched_exit_current(tf);
+        return 0; // not reached when a switch occurs
+    }
+
     uint64_t ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
 
     // Save trapframe snapshot into current process (persistent copy)

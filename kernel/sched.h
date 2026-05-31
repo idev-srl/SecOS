@@ -3,11 +3,17 @@
 #include "process.h"
 
 void sched_init(void);
-void sched_on_timer_tick(void); // chiamato da IRQ0
+void sched_on_timer_tick(trapframe_t* tf); // chiamato da IRQ0 (M8: preemption)
 process_t* sched_get_current(void);
 void sched_set_current(process_t* p);
 int sched_add_process(process_t* p); // opzionale (wrapper)
 void sched_yield(void); // invocare per switch cooperativo (stub)
 void sched_yield_from_syscall(trapframe_t* tf); // [M7] cooperative yield from INT 0x80
+
+// [M8] process lifecycle + idle/preemption
+void sched_set_idle(process_t* idle);     // register the kernel idle task
+void sched_exit_current(trapframe_t* tf);  // SYS_EXIT: zombie + switch away (no return)
+void sched_reap_zombies(void);             // free ZOMBIE processes (not current)
+int  sched_count_alive_user(void);         // user processes not yet ZOMBIE
 
 #endif

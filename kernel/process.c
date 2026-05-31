@@ -88,7 +88,10 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     p->kstack_top = 0;
     p->kstack_slot = 0;
     p->tf = NULL;
-    p->state = PROC_NEW;
+    // [M8] Non-runnable while under construction: with preemptive scheduling
+    // active, the scheduler must not pick this process (tf still NULL) until it
+    // is fully built. Promoted to PROC_NEW at the end.
+    p->state = PROC_BLOCKED;
     p->manifest = NULL;
     // Tracking pagine: aggiungi pagine stack (eccetto guard) se pages!=NULL
     p->mapped_pages = pages;
@@ -181,6 +184,8 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     }
     // Hardening mapping condiviso
     vmm_harden_user_space(space);
+    // [M8] Fully built — now safe for the scheduler to pick.
+    p->state = PROC_NEW;
     terminal_writestring("[PROC] creato PID=");
     char hx[]="0123456789ABCDEF"; for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->pid>>i)&0xF]);
     terminal_writestring(" entry="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(entry>>i)&0xF]);
@@ -202,17 +207,16 @@ void process_print(const process_t* p) {
 int process_destroy(process_t* p) {
     if (!p) return -1;
     extern int elf_unload_process(process_t* p);
-    elf_unload_process(p);
-    if (p->manifest) kfree(p->manifest);
-    if (p->mapped_pages) { kfree(p->mapped_pages); p->mapped_pages=NULL; }
+    elf_unload_process(p);                       // unmap + free user page frames, zero PTEs
+    if (p->manifest) { kfree(p->manifest); p->manifest = NULL; }
+    if (p->mapped_pages) { kfree(p->mapped_pages); p->mapped_pages = NULL; }
     // [M6] Free saved trapframe
     if (p->tf) { kfree(p->tf); p->tf = NULL; }
     // [M5] Free per-process kernel stack
     if (p->kstack_top) { vmm_free_kernel_stack_for_slot(p->kstack_slot); p->kstack_top = 0; }
-    if (p->space) {
-        pmm_free_frame((void*)(p->space->pml4_phys & 0x000FFFFFFFFFF000ULL));
-        kfree(p->space);
-    }
+    // [M8] Free the whole address space: PT/PD page-table frames, the private
+    // PML4[0] PDPT, and the PML4 itself (also kfree's the vmm_space_t).
+    if (p->space) { vmm_space_destroy(p->space); p->space = NULL; }
     proc_remove(p);
     kfree(p);
     terminal_writestring("[PROC] distrutto\n");

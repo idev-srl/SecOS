@@ -66,6 +66,115 @@ static void print_banner(void) {
 }
 
 
+// ---- [M8] Preemptive scheduling demo (gated; off by default) ----
+// Spawns user processes that compute then SYS_EXIT, scheduled preemptively by
+// the timer, with a kernel idle task that reaps zombies and checks for leaks.
+#ifndef M8_SCHED_DEMO
+#define M8_SCHED_DEMO 0
+#endif
+#if M8_SCHED_DEMO
+#include "../mm/elf.h"
+#include "syscall.h"
+#include "trapframe.h"
+
+#define M8_NPROC  2
+#define M8_ROUNDS 4   // run several spawn-all/exit-all rounds; assert the last two
+                      // leave PMM free identical (stable => no per-round leak).
+static uint8_t  m8_idle_stack[16384] __attribute__((aligned(16)));
+static unsigned char m8_elf[512];
+static uint64_t m8_free[M8_ROUNDS + 2];
+static int      m8_round = 0;
+
+static void m8_build_elf(void) {
+    for (int i = 0; i < 512; i++) m8_elf[i] = 0;
+    m8_elf[0]=0x7F; m8_elf[1]='E'; m8_elf[2]='L'; m8_elf[3]='F';
+    m8_elf[4]=2; m8_elf[5]=1; m8_elf[6]=1;
+    *(uint16_t*)(m8_elf+16)=2; *(uint16_t*)(m8_elf+18)=0x3E; *(uint32_t*)(m8_elf+20)=1;
+    *(uint64_t*)(m8_elf+24)=USER_CODE_BASE; *(uint64_t*)(m8_elf+32)=64;
+    *(uint16_t*)(m8_elf+52)=64; *(uint16_t*)(m8_elf+54)=56; *(uint16_t*)(m8_elf+56)=1;
+    *(uint32_t*)(m8_elf+64)=1; *(uint32_t*)(m8_elf+68)=PF_R|PF_X;
+    *(uint64_t*)(m8_elf+72)=0x100ULL; *(uint64_t*)(m8_elf+80)=USER_CODE_BASE;
+    *(uint64_t*)(m8_elf+88)=USER_CODE_BASE; *(uint64_t*)(m8_elf+96)=0x20ULL;
+    *(uint64_t*)(m8_elf+104)=0x20ULL; *(uint64_t*)(m8_elf+112)=0x1000ULL;
+    // mov rbx,0x200000 / loop: dec rbx / jnz loop / mov rax,SYS_EXIT / int 0x80
+    unsigned char* c = m8_elf + 0x100;
+    c[0]=0x48; c[1]=0xC7; c[2]=0xC3; c[3]=0x00; c[4]=0x00; c[5]=0x20; c[6]=0x00; // mov rbx,0x200000
+    c[7]=0x48; c[8]=0xFF; c[9]=0xCB;                                            // dec rbx
+    c[10]=0x75; c[11]=0xFB;                                                     // jnz -5
+    c[12]=0x48; c[13]=0xC7; c[14]=0xC0; c[15]=SYS_EXIT; c[16]=0; c[17]=0; c[18]=0; // mov rax,SYS_EXIT
+    c[19]=0xCD; c[20]=0x80;                                                     // int 0x80
+}
+
+static void m8_spawn_round(void) {
+    for (int i = 0; i < M8_NPROC; i++) {
+        process_t* p = process_create_from_elf(m8_elf, 512);
+        if (p) p->state = PROC_READY;
+    }
+}
+
+__attribute__((noreturn)) static void m8_idle_entry(void) {
+    for (;;) {
+        // Critical section: the idle task is restarted from the top each time
+        // it is scheduled, so spawn+bookkeeping must be atomic w.r.t. timer
+        // preemption (otherwise a mid-spawn preempt loses progress).
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        int alive = sched_count_alive_user();
+        if (m8_round == 0) {
+            debugcon_writestring("[M8] round 1: spawning\n");
+            m8_spawn_round(); m8_round = 1;
+        } else if (alive == 0 && m8_round <= M8_ROUNDS) {
+            m8_free[m8_round] = pmm_get_free_memory();
+            debugcon_writestring("[M8] round "); debugcon_print_hex((uint64_t)m8_round);
+            debugcon_writestring(" complete, free="); debugcon_print_hex(m8_free[m8_round]);
+            debugcon_writestring("\n");
+            if (m8_round < M8_ROUNDS) {
+                m8_round++;
+                debugcon_writestring("[M8] round "); debugcon_print_hex((uint64_t)m8_round);
+                debugcon_writestring(": spawning\n");
+                m8_spawn_round();
+            } else {
+                // Compare the last two rounds: equal => no per-round leak.
+                if (m8_free[M8_ROUNDS] == m8_free[M8_ROUNDS - 1])
+                    debugcon_writestring("[M8] PMM stable across rounds: NO LEAK\n");
+                else
+                    debugcon_writestring("[M8] PMM MISMATCH across rounds: possible leak\n");
+                debugcon_writestring("[M8] DONE\n");
+                m8_round = M8_ROUNDS + 1; // sentinel: idle quietly hereafter
+            }
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m8_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    static process_t  idle;
+    static trapframe_t idle_tf;
+    m8_build_elf();
+    debugcon_writestring("[M8] preemptive scheduling demo, nproc=");
+    debugcon_print_hex((uint64_t)M8_NPROC); debugcon_writestring("\n");
+
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0;
+    idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m8_idle_stack + sizeof(m8_idle_stack));
+    idle.tf = &idle_tf;
+    idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m8_idle_entry;
+    idle_tf.cs = 0x08; idle_tf.ss = 0x10; idle_tf.rflags = 0x202;
+    idle_tf.rsp = idle.kstack_top;
+
+    sched_set_idle(&idle);
+    sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M8] entering idle/scheduler\n");
+    arch_iret_to_tf(&idle_tf); // does not return
+}
+#endif /* M8_SCHED_DEMO */
+
 // ---- Phase 2: runs on the new guarded kernel stack ----
 // Called by trampoline_switch_stack after RSP has been moved to M2_KSTACK_TOP.
 // Interrupts are still disabled; idt_init() will enable them.
@@ -170,6 +279,10 @@ static void kernel_main_phase2(void) {
         }
     }
 #endif /* M7_RING3_DEMO */
+
+#if M8_SCHED_DEMO
+    m8_run_demo(); // preemptive scheduling demo — does not return
+#endif
 
     // Initialize native RAMFS (fallback)
     extern int ramfs_init(void); ramfs_init();

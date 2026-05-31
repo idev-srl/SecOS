@@ -6,6 +6,7 @@
  */
 #include "timer.h"
 #include "sched.h"
+#include "trapframe.h"
 
 #define PIT_CHANNEL0 0x40
 #define PIT_COMMAND  0x43
@@ -30,14 +31,16 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
-// Timer interrupt handler (IRQ0)
-void timer_handler(void) {
+// Timer interrupt handler (IRQ0). Receives the interrupted trapframe so the
+// scheduler can preempt (M8). On a preemptive switch sched_on_timer_tick()
+// does not return (it iretq's into the next task and EOIs itself).
+void timer_handler(trapframe_t* tf) {
     timer_ticks++;
-    sched_on_timer_tick();
-    // Execute registered callbacks
+    // Execute registered callbacks first (uptime, cursor blink, ...).
     for(int i=0;i<tick_cb_count;i++) {
         if (tick_cbs[i]) tick_cbs[i]();
     }
+    sched_on_timer_tick(tf);
 }
 
 // Initialize PIT timer

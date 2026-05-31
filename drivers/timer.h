@@ -9,12 +9,13 @@
  */
 
 #include <stdint.h>
+#include "trapframe.h"
 
 // Inizializza il timer PIT
 void timer_init(uint32_t frequency);
 
-// Handler interrupt (chiamato da assembly)
-void timer_handler(void);
+// Handler interrupt (chiamato da assembly) — riceve il trapframe interrotto (M8)
+void timer_handler(trapframe_t* tf);
 
 // Ottieni il numero di tick dall'avvio
 uint64_t timer_get_ticks(void);

@@ -149,6 +149,9 @@ global isr_timer
 extern timer_handler
 
 isr_timer:
+    ; Build a canonical trapframe_t so the handler can preempt (M8).
+    push 0              ; err_code (dummy)
+    push 0x20           ; int_no (timer vector)
     push rax
     push rbx
     push rcx
@@ -164,14 +167,17 @@ isr_timer:
     push r13
     push r14
     push r15
-    
-    ; Call the C handler
+
+    ; rdi = &trapframe (points at r15).  On a preemptive switch the C handler
+    ; sends EOI itself and does NOT return (it iretq's into the next task);
+    ; otherwise it returns here and we EOI + iretq into the same task.
+    mov rdi, rsp
     call timer_handler
-    
+
     ; Send EOI (End Of Interrupt) to the PIC
     mov al, 0x20
     out 0x20, al
-    
+
     pop r15
     pop r14
     pop r13
@@ -187,7 +193,8 @@ isr_timer:
     pop rcx
     pop rbx
     pop rax
-    
+
+    add rsp, 16         ; drop int_no + err_code
     iretq
 
 ; Keyboard handler (IRQ1 = interrupt 0x21)

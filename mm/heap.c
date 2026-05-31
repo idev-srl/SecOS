@@ -108,38 +108,17 @@ static heap_block_t* expand_heap(size_t required_size) {
 
 // Allocate memory
 void* kmalloc(size_t size) {
-    // DEBUG
-    terminal_writestring("[kmalloc] Entry, size=");
-    char buf[16];
-    itoa_dec(size, buf);
-    terminal_writestring(buf);
-    terminal_writestring("\n");
-    
-    if (size == 0) {
-        terminal_writestring("[kmalloc] Size 0, return NULL\n");
-        return NULL;
-    }
-    
-    // Verify heap is initialized
-    if (heap_start == NULL) {
-        terminal_writestring("[kmalloc] heap_start is NULL!\n");
-        return NULL;
-    }
-    
-    terminal_writestring("[kmalloc] heap_start OK\n");
-    
+    if (size == 0) return NULL;
+    if (heap_start == NULL) return NULL;
+
     // Align size to 8 bytes
     size = align_up(size, 8);
-    
-    terminal_writestring("[kmalloc] Searching for free block...\n");
-    
+
     heap_block_t* current = heap_start;
-    
+
     // Search free block large enough (with potential splitting)
     while (current != NULL) {
-        terminal_writestring("[kmalloc] Checking block\n");
         if (current->is_free && current->size >= size) {
-            terminal_writestring("[kmalloc] Found free block!\n");
             // If block is much larger, split it
             size_t remaining = current->size - size;
             if (remaining > HEAP_BLOCK_HEADER_SIZE + 16) {
@@ -151,16 +130,13 @@ void* kmalloc(size_t size) {
                 new_block->next = current->next;
                 current->next = new_block;
                 current->size = size; // resize allocated block
-                terminal_writestring("[kmalloc] Block split\n");
             }
             current->is_free = false;
             total_allocated += current->size;
-            terminal_writestring("[kmalloc] Returning pointer\n");
             return (void*)((uint8_t*)current + HEAP_BLOCK_HEADER_SIZE);
         }
         current = current->next;
     }
-    terminal_writestring("[kmalloc] No free block, need to expand\n");
     // Try to expand the heap
     heap_block_t* new_block = expand_heap(size);
     if (!new_block) {
@@ -178,7 +154,6 @@ void* kmalloc(size_t size) {
         tail->next = new_block->next;
         new_block->next = tail;
         new_block->size = size;
-        terminal_writestring("[kmalloc] Expanded and split new block\n");
     }
     new_block->is_free = false;
     total_allocated += new_block->size;
