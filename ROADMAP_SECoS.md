@@ -1,224 +1,178 @@
- MILESTONE STATUS
- ─────────────────────────────────────────────────────────
-  M0  DONE       Tag: —                    UEFI boot chain
-  M1  DONE       Tag: M1_STABLE            Memory model hardening
-  M2  DONE       Tag: M2_STABLE            Stack hardening + IST guard pages + physmap reorder
-  M3  DONE       Tag: M3_ISOLATION_BASE    User/Kernel isolation (user_range_valid, copy_from/to_user, syscall hardening)
-  M4  DONE       Tag: M4_STABLE            Stabilization + isolation selftest (12/12 PASS) + vmm_map_in_space hardening
-  M5  DONE       Tag: —                    Trapframe syscall entry + bounded kernel-stack slots
-  M6  DONE       Tag: —                    Minimal context switch (saved trapframe + iretq)
-  M7  WIP        Tag: —                    Ring-3 entry + SYS_YIELD cooperative scheduling (runtime demo not yet passing)
- ─────────────────────────────────────────────────────────
+# SECoS — Roadmap
 
- NOTE: Several issues in the critical analysis below have since been addressed:
-   #5 (linker COMMON / _bss_start) and #8 (vmm_space_destroy frees page tables)
-   were fixed in M1; #9 (kernel stack guard pages) in M2; #6 (scheduler context
-   switch) is implemented in M6/M7. The remaining UEFI-handoff items are open.
+Single, linear milestone scheme (M0 → present → future). Earlier revisions of
+this file mixed two conflicting numbering schemes (the executed git milestones
+and an older pre-analysis plan); that has been collapsed into one timeline.
 
+- **Done:** M0–M6
+- **In progress:** M7 (ring-3 + cooperative scheduling — runtime demo not yet passing)
+- **Planned:** M8+
 
- 1) ANALISI ARCHITETTURALE CRITICA
+Per-milestone implementation notes live in `docs/devlog/M*.md`.
 
-  1. UEFI page tables mai attivate. uefi/boot.c:118 — le tabelle custom sono allocate con AllocatePool (non
-  page-aligned, requisito CR3 violato) e l'attivazione e' commentata. Il kernel eredita CR3 del firmware UEFI, su cui
-  non ha controllo.
-  2. Console calls dopo ExitBootServices. uefi/boot.c:168,194,199 — puts16() chiama ConOut->OutputString, un Boot
-  Service. Dopo ExitBootServices() (linea 163) e' comportamento indefinito. Su firmware reale = crash.
-  3. PMM clamp a 128MB nel path UEFI. pmm.c:278 — regioni oltre 128MB troncate a zero, nonostante identity mapping copra
-   512MB. Il kernel UEFI usa al massimo ~128MB di RAM fisica.
-  4. Bitmap PMM piazzata a _kernel_end senza protezione. pmm.c:100 — nessuna verifica che la bitmap non collida con
-  segmenti ELF copiati dal bootloader (che scrive a vaddr = indirizzo fisico identity-mapped).
-  5. _bss_start dichiarato DOPO *(COMMON) nel linker script. linker.ld:35-36 — i simboli COMMON non ricadono tra
-  _bss_start e _bss_end, quindi vmm_protect_kernel_sections non applica W^X su quelle pagine.
-  6. Scheduler senza context switch. sched.c:47 — sched_yield() cambia puntatori e stato, ma non salva/ripristina
-  registri ne' CR3. I processi non girano realmente.
-  7. VMM accede a page tables tramite cast fisico diretto. vmm.c:96,104 — (uint64_t*)pml4_phys assume identity mapping.
-  Funziona solo finche' le page table risiedono sotto 512MB. Dopo physmap_init dovrebbe usare phys_to_virt().
-  8. vmm_space_destroy non libera frame delle page tables. vmm.c:358-362 — chiama solo kfree(space) senza walk
-  ricorsivo. Memory leak permanente per ogni processo distrutto.
-  9. Stack kernel fisso a 16KB senza guard page. boot.asm:41 — overflow silenzioso corrompe .bss.
-  vmm_protect_kernel_sections dichiara guard page nel commento ma non la implementa (vmm.c:239).
-  10. UEFI bootloader usa AllocatePool per page tables. uefi/boot.c:101-103 — AllocatePool garantisce allineamento a 8
-  byte, non 4KB. Se le tabelle venissero attivate, CR3 con indirizzo non allineato causa #GP.
-  11. secos_boot_info e' static nel bootloader. uefi/boot.c:171 — risiede in segmento EFI_LOADER_DATA. Il kernel la
-  referenzia via pointer ma il PMM potrebbe riciclare quei frame.
-  12. Nessun GDT kernel-owned. Il kernel usa il GDT del bootloader (boot.asm:263), 3 entry senza TSS descriptor.
-  tss_init() deve avere un GDT proprio per caricare il selettore TSS.
-  13. find_free_frame O(n) bit-a-bit. pmm.c:46-53 — scan lineare su ogni bit. Accettabile ora, ma scala male oltre 1GB.
-  14. ELF segment copy nel bootloader sovrascrive memoria kernel. uefi/boot.c:133-140 — dst = (uint8_t*)vaddr scrive
-  direttamente sull'identity mapping. Se vaddr coincide con aree usate dal firmware o dal bootloader stesso, corruzione
-  silenziosa.
-  15. kernel_main riceve uint64_t multiboot_info come secondo parametro. kernel.c:60 — ma il path UEFI passa un pointer
-  a struct. La firma e' semanticamente confusa e type-unsafe (non si distingue pointer da intero).
+---
 
-  ---
-  2) ROADMAP TECNICA
+## 1. Milestone status
 
-  M0 — Handoff UEFI corretto e boot affidabile
+| ID | Status | Tag | Summary |
+|----|--------|-----|---------|
+| M0 | DONE | — | UEFI boot chain (external loader → `kernel_main`) |
+| M1 | DONE | `M1_STABLE` | Kernel-owned page tables, `phys_to_virt` access, `vmm_space_destroy` frees frames, kernel-owned GDT+TSS, linker COMMON fix |
+| M2 | DONE | `M2_STABLE` | Virtual kernel-stack region, guard pages (main + IST1/2/3), debugcon boot markers, smoke harness |
+| M3 | DONE | `M3_ISOLATION_BASE` | User/kernel isolation: `user_range_valid`, `copy_from/to_user`, syscall pointer hardening, `vmm_map` supervisor enforcement |
+| M4 | DONE | `M4_STABLE` | Stabilization: 12/12 in-kernel isolation selftest, `vmm_map_in_space` supervisor enforcement |
+| M5 | DONE | — | Trapframe-based `INT 0x80` entry + C `syscall_handler`; bounded kernel-stack slots |
+| M6 | DONE | — | Minimal context switch: per-PCB trapframe, `arch_iret_to_tf`, CR3 switch on resume |
+| M7 | **WIP** | — | Ring-3 entry (`arch_enter_user_mode`) + `SYS_YIELD` cooperative scheduling — **runtime demo not yet passing** |
 
-  Obiettivo: Eliminare comportamento indefinito nel bootloader UEFI, garantire che il kernel riceva un ambiente
-  deterministico.
+---
 
-  Task:
-  - Rimuovere TUTTE le chiamate puts16() dopo ExitBootServices() (boot.c:168,194,199). Il debug post-EBS deve usare
-  serial port o scrivere direttamente in framebuffer.
-  - Sostituire AllocatePool con AllocatePages (tipo EfiLoaderData, AllocateAnyPages) per pml4/pdpt/pdt — garantisce
-  allineamento 4KB.
-  - Attivare le page tables custom PRIMA del jump al kernel (de-commentare e correggere activate_page_tables, linea
-  118).
-  - Copiare secos_boot_info in un buffer nel kernel (.bss o primo frame allocato) prima che PMM possa riciclare la
-  memoria del bootloader.
-  - Alzare il clamp PMM UEFI da 128MB a 512MB (pmm.c:278), coerente con l'identity mapping.
-  - Correggere il linker script: spostare _bss_start PRIMA di *(COMMON).
+## 2. Current focus — finish M7
 
-  Dipendenze: Nessuna.
+### Problem
+At HEAD the boot path runs an M7 demo from `kernel_main_phase2`: it builds a
+synthetic 512-byte ELF (`mov rax,0 / int 0x80 / jmp loop`), creates two
+processes, and calls `arch_enter_user_mode(p1)` (marked `// NOT REACHED`).
+The smoke test reports PASS (no triple fault), but debugcon output stalls at:
 
-  Rischi: Attivare le nuove page tables puo' esporre mapping mancanti. Testare con OVMF e almeno un firmware reale. Se
-  il kernel crasha subito, il problema e' un mapping mancante nella PDT (aggiungere entry per area framebuffer se
-  necessario).
+```
+[M7] Creating two ring3 yield-loop processes
+```
 
-  Done quando: QEMU + OVMF boot senza UB, kernel stampa banner, PMM riporta ~480MB+ free su VM con 512MB, #GP test su
-  indirizzo non mappato produce page fault gestito.
+The follow-up lines (`[M7] p1 pid=...`, `[M7] Entering ring3`, `[SCHED] switch ...`)
+never appear, so the stall is inside the two `process_create_from_elf()` calls,
+before ring-3 is ever entered. Because the demo ends with `arch_enter_user_mode`,
+it also short-circuits the rest of boot — RAMFS/VFS init and the interactive
+shell are never reached. (Full detail in `docs/devlog/M7.md`.)
 
-  ---
-  M1 — Memory model robusto  [DONE — tag M1_STABLE]
+### Tasks
+- Diagnose why `process_create_from_elf()` does not return for the synthetic
+  ELF (trapframe allocation, address-space setup, ELF parse, or stack mapping).
+- Confirm the ring-3 transition (`arch_enter_user_mode`) reaches user mode and
+  emit at least one `[SCHED] switch` between the two processes.
+- Gate the demo behind a build flag (e.g. `M7_RING3_DEMO`, like
+  `M4_SELFTEST_ENABLE`) so normal boot still reaches the shell.
 
-  Obiettivo: Il kernel possiede le proprie page tables, accede alla memoria fisica in modo corretto e protegge le
-  sezioni kernel.
+### Done when
+- With the demo flag off: kernel boots to the interactive shell on both MB2 and
+  UEFI paths (smoke PASS).
+- With the demo flag on: debugcon shows `[SCHED] switch <a> -> <b>` alternating
+  between the two ring-3 processes; no triple fault.
+- Tag `M7_STABLE`.
 
-  Task:
-  - Ricostruire page tables kernel-owned all'avvio di vmm_init(): allocare nuove PML4/PDPT/PDT/PT via PMM, replicare
-  identity mapping 512MB + physmap, caricare CR3 con le nuove tabelle. Non dipendere piu' dalle tabelle del
-  bootloader/UEFI.
-  - Transizione da identity cast a physmap. In get_or_create_table, get_pt, get_pt_space: dopo physmap init, usare
-  phys_to_virt() per accedere a page table entries. Mantenere il fallback identity solo prima di vmm_init_physmap().
-  - Guard page kernel stack. Unmap la pagina a stack_bottom - PAGE_SIZE. Triple fault su overflow diventa double fault
-  gestito (IST gia' configurato).
-  - GDT kernel-owned con entry null, code64, data64, TSS64 (16 byte). Caricare via lgdt in vmm_init() o funzione
-  dedicata. tss_init() scrive il descriptor TSS nel nuovo GDT.
-  - Fix vmm_space_destroy: walk ricorsivo PML4→PDPT→PDT→PT, free di ogni frame allocato per user-space (non liberare
-  frame kernel condivisi).
-  - Implementare guard page stack utente in vmm_alloc_user_stack_in_space: la pagina sotto lo stack bottom deve restare
-  unmapped.
+---
 
-  Dipendenze: M0 completata (bootloader corretto).
+## 3. Planned milestones
 
-  Rischi: La transizione identity→physmap e' il punto piu' critico. Se un singolo accesso a page table usa il path
-  sbagliato, triple fault. Procedere in due fasi: (a) prima far funzionare physmap access, (b) poi rimuovere identity
-  fallback. Aggiungere assert su allineamento in ogni get_or_create_table.
+> Future milestones continue the single timeline (M8+). They are grounded in
+> open work already visible in the codebase, not speculative features.
 
-  Done quando: vmm_translate() funziona per indirizzi kernel, physmap, e user-space. vmm_space_destroy libera tutti i
-  frame (verificabile con PMM stats prima/dopo). Guard page kernel stack provoca double fault catchato dall'IST.
+### M8 — Real multiprogramming
+**Goal:** processes start, run, and exit cleanly under a preemptive scheduler.
 
-  ---
-  M2 — Context switch e multiprogrammazione reale
+- `SYS_EXIT`: release the address space (`vmm_space_destroy`), remove the PCB
+  from the process table, schedule the next process. Verify no PMM leak across
+  repeated spawn/exit (PMM stats stable).
+- Timer-driven preemption: per-PCB tick budget; yield after N ticks (not every
+  tick), driven from the IRQ0 handler on top of the M6/M7 trapframe machinery.
+- `TSS.RSP0` update on every switch; `ps` shell command shows live RUNNING/READY
+  states for multiple PIDs.
 
-  Obiettivo: Due o piu' processi ELF user-space girano in round-robin con isolamento di address space.
+**Depends:** M7. **Done when:** two ELF processes produce interleaved output via
+`SYS_WRITE`; `ps` reflects alternating states; clean exit leaves PMM stable.
 
-  Task:
-  - Context switch completo in assembly: salvare RSP, RBP, RBX, R12-R15, CR3 del processo corrente nel PCB. Caricare
-  quelli del prossimo. Usare iretq per il ritorno a user-space (RSP, SS, RFLAGS, CS, RIP dallo stack).
-  - TSS.RSP0 update ad ogni switch: puntare allo stack kernel del processo entrante.
-  - CR3 switch in sched_yield(): vmm_switch_space(next->space) prima del salto.
-  - Quantum-based preemption: contatore tick nel PCB, yield dopo N tick (suggerito: 10ms = 10 tick a 1000Hz). Non yield
-  ad ogni tick.
-  - Syscall exit(): rilasciare address space (vmm_space_destroy corretto da M1), rimuovere da process table, schedule
-  next.
-  - Test: due processi ELF che stampano identificatori alternati via syscall write. Verificare interleaving.
+### M9 — Memory scalability
+**Goal:** the kernel manages all reported RAM and runs from the higher half.
 
-  Dipendenze: M1 completata (page tables kernel-owned, space destroy funzionante, GDT con TSS).
+- Higher-half kernel at `0xFFFFFFFF80000000`: keep identity map transiently for
+  boot, drop it after switch; update linker script, bootloader PML4 entry, and
+  any residual physical casts.
+- PMM scalability: replace the linear bitmap scan (`find_free_frame`) with a
+  free-list or buddy allocator; remove the early 128 MB / 512 MB clamps and
+  handle the full memory map (test with QEMU `-m 2G`).
+- Demand paging: complete `vmm_handle_page_fault` on-demand allocation for
+  registered user regions, with validation and per-process limits.
 
-  Rischi: Bug nel context switch assembly sono difficili da diagnosticare. Implementare prima uno switch cooperativo
-  (syscall yield) prima del preemptivo. Verificare che iretq stack frame sia corretto (SS=0x1B, CS=0x23 per ring3).
-  Rischio di stack corruption se RSP0 non aggiornato.
+**Depends:** M8. **Done when:** kernel runs higher-half with the low identity
+map removed; PMM reports >512 MB free on a 2 GB VM; demand-paged user region
+faults in correctly; a W+X page request is rejected (panic/#GP).
 
-  Done quando: Due processi ELF producono output interleaved. ps nella shell mostra PID diversi con stato RUNNING/READY
-  alternato. Nessun memory leak dopo exit() di un processo (PMM stats stabili).
+### M10 — UEFI handoff hardening
+**Goal:** the UEFI path is deterministic and safe on real firmware.
 
-  ---
-  M3 — Solidificazione e scalabilita' memoria
+- Implement real post-ExitBootServices ELF segment mapping with 4 KB pages and
+  W^X (currently a placeholder that relies on the firmware identity map; see
+  `uefi/boot.c`).
+- Copy `secos_boot_info` and the memory-map descriptors into a kernel-owned
+  frame before the PMM can recycle `EFI_LOADER_DATA`.
+- Re-audit PMM bitmap placement at `_kernel_end` for collisions with loaded
+  kernel segments.
+- Add a serial (COM1 / 0x3F8) console driver for headless debug and post-EBS
+  diagnostics (no serial driver exists yet).
 
-  Obiettivo: Il sistema gestisce memoria oltre 512MB, ha protezione W^X completa e foundation per sviluppo futuro.
+**Depends:** M9 (higher-half makes mapping ownership clean). **Done when:**
+boot is UB-free on OVMF and at least one real firmware; boot info survives PMM
+init; serial output works.
 
-  Task:
-  - Higher-half kernel. Spostare il kernel a 0xFFFFFFFF80000000 (top 2GB). Identity mapping mantenuta transitoriamente
-  per boot, rimossa dopo setup. Aggiornare linker script (. = 0xFFFFFFFF80200000), bootloader (aggiungere entry PML4 per
-   higher-half), e tutti i cast fisici residui.
-  - Demand paging. Estendere vmm_handle_page_fault per allocare on-demand pagine user-space da regioni registrate con
-  vmm_region_add. Gia' abbozzato (vmm.c:579-587), completare con validazione e limiti.
-  - PMM scalabile. Sostituire bitmap scan lineare con free-list o buddy allocator. Rimuovere il clamp a 512MB, gestire
-  tutta la RAM fisica riportata dalla memory map.
-  - W^X enforcement completo. Verificare che OGNI pagina mappata rispetti W^X. Aggiungere check in vmm_map e
-  vmm_alloc_page: rifiutare flag RW|~NX simultanei (writable + executable).
-  - Serial console driver per debug post-ExitBootServices e ambienti headless.
+### M11 — Driver Space enforcement
+**Goal:** Driver Space becomes a verifiable security boundary.
 
-  Dipendenze: M2 completata (context switch funzionante necessario per testare demand paging in user-space).
+- Add `proc_type` (`PROC_TYPE_USER` / `PROC_TYPE_DRIVER`) to the PCB, set by the
+  loader from the ELF manifest (`MANIFEST_FLAG_DRIVER`).
+- Reject `SYS_DRIVER` for `PROC_TYPE_USER` with `DRV_ERR_PERM` before touching
+  the device registry.
+- Implement `DRIVER_OP_MAP_MEM`: validate `mem_offset`/`mem_length` against the
+  device descriptor; map into the driver process (USER=1, RW=1, NX=1); track for
+  precise cleanup; unbind on process destroy.
+- Automatic restart of a critical driver on abnormal exit (bounded N restarts in
+  K ticks, then `DEV_FLAG_FAILED`); `DRIVER_OP_IRQ_SUBSCRIBE` delivering IRQ
+  events to a driver via an IPC queue consumed through `SYS_READ`.
 
-  Rischi: Higher-half migration tocca ogni indirizzo hardcoded nel kernel. Procedere con una fase intermedia: mappare il
-   kernel sia a 2MB sia a higher-half, switchare, poi rimuovere il mapping basso. Buddy allocator puo' essere
-  implementato incrementalmente sopra il bitmap esistente.
+**Depends:** M8 (lifecycle/IPC), M9 (reliable MAP_MEM). **Done when:** a user
+process gets `DRV_ERR_PERM` on `SYS_DRIVER`; a crashing driver auto-restarts;
+MAP_MEM maps and frees correctly (PMM stable); a simulated IRQ reaches the
+driver without a race.
 
-  Done quando: Kernel gira a 0xFFFFFFFF80…, identity mapping low rimossa. PMM gestisce >512MB (testare con QEMU -m 2G).
-  Page fault su pagina W+X genera #GP/panic. Serial output funzionante.
+---
 
-  ---
-  M4 — Driver Space enforcement
+## 4. Open architectural debt (re-audited against HEAD)
 
-  Obiettivo: Il Driver Space diventa un confine di sicurezza verificabile: processi driver
-  identificati esplicitamente, DRIVER_OP_MAP_MEM funzionante, restart automatico su crash,
-  IRQ subscribe via coda IPC.
+The original critical analysis (pre-M0) listed 15 issues. Most were closed by
+M1–M7; remaining ones feed the milestones above. Line numbers from the original
+analysis have drifted — locations below are indicative.
 
-  Task:
-  - Aggiungere campo proc_type (PROC_TYPE_USER / PROC_TYPE_DRIVER) al PCB; il loader lo imposta
-  in base al manifest ELF (MANIFEST_FLAG_DRIVER).
-  - Vietare SYS_DRIVER ai processi PROC_TYPE_USER: il dispatcher ritorna DRV_ERR_PERM senza
-  consultare il registro dispositivi.
-  - Implementare DRIVER_OP_MAP_MEM: validare mem_offset e mem_length contro device_desc_t.mem_base
-  e mem_size, creare mapping virtuale nel processo driver (USER=1, RW=1, NX=1), registrarlo nel PCB
-  per cleanup preciso.
-  - Cleanup mapping su unload: vmm_space_destroy gia' funzionante (M1); aggiungere rimozione
-  binding dal registro dispositivi al momento della distruzione del processo.
-  - Restart automatico driver critico: kernel rileva exit anomala, ricarica ELF dal RAMFS,
-  ripristina binding. Limite N restart in K tick; oltre soglia: DEV_FLAG_FAILED.
-  - DRIVER_OP_IRQ_SUBSCRIBE: associa un IRQ a un processo driver; l'ISR kernel inserisce evento
-  in coda IPC; il driver consuma via SYS_READ su fd speciale.
+| # | Issue | Status | Where it lands |
+|---|-------|--------|----------------|
+| 1 | UEFI page tables never activated | **Fixed** | `AllocatePages` + `activate_page_tables()` called pre-handoff |
+| 2 | Console calls after ExitBootServices | **Fixed** | explicit "no boot-services past this point" guard in `uefi/boot.c` |
+| 3 | PMM clamp limits usable RAM | **Partial** | 512 MB map limit + a 128 MB early-region clamp remain → M9 |
+| 4 | PMM bitmap may collide with loaded ELF segments | **Open (re-audit)** | M10 |
+| 5 | `_bss_start` after `*(COMMON)` in linker script | **Fixed** | M1 |
+| 6 | Scheduler without real context switch | **Implemented** | M6/M7 (demo still WIP) |
+| 7 | VMM accesses page tables via raw physical cast | **Fixed** | `phys_to_virt` (M1.2) |
+| 8 | `vmm_space_destroy` leaks page-table frames | **Fixed** | M1 |
+| 9 | Kernel stack without guard page | **Fixed** | M2 |
+| 10 | `AllocatePool` for page tables (mis-aligned) | **Fixed** | now `AllocatePages` |
+| 11 | `secos_boot_info` in recyclable `EFI_LOADER_DATA` | **Partial** | still static, mitigated by identity-map assumption → copy to kernel frame in M10 |
+| 12 | No kernel-owned GDT with TSS descriptor | **Fixed** | `arch/x86/tss.c` builds GDT + TSS |
+| 13 | `find_free_frame` is O(n) bitwise | **Open** | acceptable now; buddy/free-list in M9 |
+| 14 | UEFI ELF segment copy relies on identity map | **Open** | real 4 KB mapping in M10 |
+| 15 | `kernel_main(uint32_t, uint64_t)` magic-based signature | **Open (by design)** | dual-boot dispatch is intentional; optionally formalize as typed `boot_params` |
 
-  Dipendenze: M3 completata (VMM higher-half funzionante necessario per MAP_MEM affidabile;
-  context switch M2 necessario per IPC e restart).
+---
 
-  Done quando: Un processo PROC_TYPE_USER riceve DRV_ERR_PERM su SYS_DRIVER. Un driver che
-  crasha viene riavviato automaticamente. MAP_MEM mappa la regione corretta e la dealloca
-  all'unload (PMM stats stabili). Un IRQ simulato via drvtest raggiunge il processo driver
-  via coda e viene consumato senza race.
+## 5. Open design decisions
 
-  ---
-  3) DECISIONI ARCHITETTURALI DA PRENDERE SUBITO
-
-  1. Kernel higher-half o identity-mapped? Tutta l'architettura VMM assume identity mapping per accesso a page tables.
-  Decidere ORA se migrare a higher-half (M3) influenza come scrivere il codice in M0-M2. Se si', usare phys_to_virt()
-  ovunque da subito.
-  2. Unica page table set ownership o split? Decidere se il kernel mantiene un unico PML4 (condiviso con processi user
-  via entry alte) o se ogni processo ha PML4 privata con entry kernel duplicate. La scelta impatta
-  vmm_space_create_user.
-  3. Boot path primario: UEFI o Multiboot? Mantenere entrambi ha costo. Se il target e' hardware moderno, deprecare
-  Multiboot e concentrare lo sforzo su UEFI. Se serve legacy, documentare quale path e' "golden".
-  4. Convenzione chiamata kernel_main. Definire una firma tipizzata (struct boot_params*) unica per tutti i path di
-  boot, eliminando la disambiguazione su magic number.
-  5. Allocatore fisico a lungo termine. Bitmap, free-list, o buddy? Decide la complessita' di M3 e le performance di
-  alloc/free per demand paging.
-
-  ---
-  4) 5 ERRORI POTENZIALMENTE FATALI SE NON CORRETTI ORA
-
-  1. Console calls dopo ExitBootServices (uefi/boot.c:168+). Su firmware reale, corruzione di stato UEFI runtime o hard
-  hang. Nessun output diagnostico possibile. Correggi prima di qualsiasi test su hardware.
-  2. Page tables non page-aligned (uefi/boot.c:101-103 usa AllocatePool). Se attivi activate_page_tables senza fix, CR3
-  non allineato = #GP immediato, sistema irrecuperabile. Devi usare AllocatePages.
-  3. VMM assume identity mapping per accesso a page tables (vmm.c:96,104). Qualsiasi page table allocata sopra i 512MB
-  identity-mapped diventa inaccessibile. Con >512MB di RAM e molti processi, le nuove PT potrebbero essere allocate in
-  frame alti = triple fault non diagnosticabile.
-  4. _bss_start dopo *(COMMON) nel linker script. Le variabili globali non inizializzate (COMMON) non sono protette da
-  W^X. Un buffer overflow in una di esse puo' sovrascrivere codice kernel senza che la protezione NX intervenga.
-  5. secos_boot_info in memoria riciclabile. La struct e' static nel bootloader (EFI_LOADER_DATA). Il PMM marca
-  EfiConventionalMemory come libera ma non protegge EfiLoaderData. Tuttavia, se il tipo di memoria e' riciclato (dipende
-   dal firmware), il kernel legge dati corrotti dal pointer bi. Su alcuni firmware, EfiLoaderData = available dopo EBS.
-  Copiare i dati in area kernel-owned prima di inizializzare il PMM.
+1. **Higher-half vs identity-mapped kernel.** Targeted for M9. Until then, all
+   new page-table access must go through `phys_to_virt()` (already the norm
+   since M1.2) so the migration does not require rewriting access paths.
+2. **Shared vs per-process PML4.** Decide whether the kernel keeps one PML4
+   (shared with user space via high entries) or each process gets a private
+   PML4 with duplicated kernel entries. Impacts `vmm_space_create_user`.
+3. **Primary boot path.** Both UEFI and Multiboot2 are maintained. If the target
+   is modern hardware, consider designating UEFI as the "golden" path and
+   demoting Multiboot2 to legacy/CI-only to cut maintenance cost.
+4. **Long-term physical allocator.** Bitmap → free-list or buddy (M9); the
+   choice drives demand-paging alloc/free performance.
+5. **Boot handoff ABI.** Keep the magic-based `kernel_main` signature, or move to
+   a single typed `struct boot_params*` shared by both boot paths (issue #15).
