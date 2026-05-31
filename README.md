@@ -6,9 +6,27 @@
 
 A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB Multiboot2 (legacy path), targeting x86-64 long mode.
 
-## Current Status — M4 Stable (`M4_STABLE`)
+## Current Status — M7 (Ring-3 + Cooperative Scheduling, in progress)
 
-**Milestone M4 (Stabilization & Isolation Test Suite)**: complete. See [`docs/devlog/M4.md`](docs/devlog/M4.md).
+**Milestone M7 (Ring-3 Entry + Cooperative Scheduling)**: code committed, runtime demo not yet passing. See [`docs/devlog/M7.md`](docs/devlog/M7.md).
+
+- `arch_enter_user_mode()` performs the ring-0 → ring-3 transition into a user process built from a synthetic ELF
+- `SYS_YIELD` (syscall 0) drives `sched_yield_from_syscall()`, which saves the caller trapframe, picks the next `READY` process and resumes it via `iretq`
+- Builds clean; MB2 + UEFI smoke tests PASS (no triple fault); 12/12 isolation selftests PASS
+- **Known issue:** at HEAD the boot path enters the M7 ring-3 demo and stalls after `[M7] Creating two ring3 yield-loop processes` — no `[SCHED] switch` lines appear and the interactive shell is not reached. The demo call in `kernel_main_phase2` is marked `// NOT REACHED` and currently short-circuits normal boot. Needs investigation before tagging.
+
+**Milestone M6 (Minimal Context Switch)**: complete. See [`docs/devlog/M6.md`](docs/devlog/M6.md).
+
+- `trapframe_t* tf` added to the PCB; `process_create_from_elf` builds the initial iret frame (RIP=entry, RSP=stack_top, RFLAGS=0x202)
+- `arch_iret_to_tf` / `arch_switch_to_process` restore all 15 GPRs and `iretq` into the target after `vmm_switch_space`
+- Syscall and exception handlers persist the live trapframe into `current->tf`
+
+**Milestone M5 (Trapframe Syscall Entry + Kernel Stack Hardening)**: complete. See [`docs/devlog/M5.md`](docs/devlog/M5.md).
+
+- Unified `INT 0x80` entry into the canonical `trapframe_t` layout (matches `isr_common` GPR save/restore); C `syscall_handler(trapframe_t*)`
+- Replaced PID-based kernel-stack slots with a bounded slot index
+
+**Milestone M4 (Stabilization & Isolation Test Suite)**: complete. Tag `M4_STABLE`. See [`docs/devlog/M4.md`](docs/devlog/M4.md).
 
 - 12-case in-kernel selftest suite for `user_range_valid` / `copy_from/to_user` (all PASS)
 - `vmm_map_in_space()` supervisor enforcement aligned with `vmm_map()` (R1 closed)
@@ -30,8 +48,6 @@ A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB 
 - Deterministic smoke test: `tools/smoke.sh` (exit 124 = PASS for both MB2 and UEFI)
 
 **M1 (Memory Model Hardening)**: complete. Tag `M1_STABLE`. See [`docs/devlog/M1.md`](docs/devlog/M1.md).
-
-**M5 (Context Switch + First User Task)**: planned.
 
 ### Running the Isolation Selftest
 
@@ -373,9 +389,9 @@ To test on real hardware:
 ## Future Developments
 
 This kernel is a solid starting point. You can extend it with:
- - **Preemptive scheduler** - Context switching using PCB.regs
- - **Ring3 transition** - Syscall gate and TSS.rsp0
- - **Security manifest** - Parse `.note.secos` section for policy
+ - **Ring-3 transition + context switch** - in progress (M5–M7): trapframe-based syscall entry, `arch_iret_to_tf`, and `SYS_YIELD` cooperative scheduling are implemented; the ring-3 demo does not yet complete (see Current Status)
+ - **Preemptive scheduler** - timer-driven (IRQ0) context switching on top of the M6/M7 trapframe machinery
+ - **Security manifest** - Parse `.note.secos` section for policy (loader support already present; see below)
 ## Security Manifest (.note.secos)
 
 The loader searches for an ELF note (PT_NOTE) with name `SECOS` and type `QSEC` containing a structure:

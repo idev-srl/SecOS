@@ -5,8 +5,16 @@
   M2  DONE       Tag: M2_STABLE            Stack hardening + IST guard pages + physmap reorder
   M3  DONE       Tag: M3_ISOLATION_BASE    User/Kernel isolation (user_range_valid, copy_from/to_user, syscall hardening)
   M4  DONE       Tag: M4_STABLE            Stabilization + isolation selftest (12/12 PASS) + vmm_map_in_space hardening
-  M5  PLANNED    —                         Context switch + first ring-3 user task
+  M5  DONE       Tag: —                    Trapframe syscall entry + bounded kernel-stack slots
+  M6  DONE       Tag: —                    Minimal context switch (saved trapframe + iretq)
+  M7  WIP        Tag: —                    Ring-3 entry + SYS_YIELD cooperative scheduling (runtime demo not yet passing)
  ─────────────────────────────────────────────────────────
+
+ NOTE: Several issues in the critical analysis below have since been addressed:
+   #5 (linker COMMON / _bss_start) and #8 (vmm_space_destroy frees page tables)
+   were fixed in M1; #9 (kernel stack guard pages) in M2; #6 (scheduler context
+   switch) is implemented in M6/M7. The remaining UEFI-handoff items are open.
+
 
  1) ANALISI ARCHITETTURALE CRITICA
 
