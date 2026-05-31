@@ -8,6 +8,7 @@
 #include "terminal.h"
 #include "fb.h"
 #include "fb_console.h"
+#include "serial.h"
 #include <stddef.h>
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
@@ -50,6 +51,9 @@ void terminal_initialize(void){
 }
 static void terminal_scroll(void){ for(size_t y=0;y<VGA_HEIGHT-1;y++) for(size_t x=0;x<VGA_WIDTH;x++) terminal_buffer[y*VGA_WIDTH+x] = terminal_buffer[(y+1)*VGA_WIDTH + x]; for(size_t x=0;x<VGA_WIDTH;x++) terminal_buffer[(VGA_HEIGHT-1)*VGA_WIDTH + x] = vga_entry(' ',terminal_color); }
 void terminal_putchar(char c){
+	// Mirror every character to COM1 so the console is usable headless
+	// (no-op until serial_init() runs; harmless when no -serial is attached).
+	serial_putchar(c);
 	if (use_fb_console) {
 #if ENABLE_FB
 		fb_console_putc(c);

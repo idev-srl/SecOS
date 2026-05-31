@@ -308,6 +308,9 @@ uint64_t g_multiboot_info  = 0;
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // --- Phase 1 begins (old .bss stack) ---
     terminal_initialize();
+    // COM1 serial console: mirrors terminal output and feeds the shell input
+    // path, so the interactive shell works headless over `-serial stdio`.
+    extern void serial_init(void); serial_init();
     // Crash-signature marker: visible in QEMU -debugcon log even before VGA is
     // readable.  BUILD_TS and GIT_HASH are injected by the Makefile as -D macros.
     debugcon_writestring("SECoS build " BUILD_TS " git:" GIT_HASH "\n");

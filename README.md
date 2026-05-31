@@ -179,10 +179,25 @@ sudo apt install nasm gcc binutils grub-common grub-pc-bin xorriso qemu-system-x
 ### Build ISO and run
 
 ```bash
-make iso      # produces myos.iso (GRUB bootable)
-make run      # build ISO + run in QEMU
-make clean    # remove all artifacts
+make iso         # produces myos.iso (GRUB bootable)
+make run         # build ISO + run in QEMU (graphical window)
+make run-serial  # build ISO + run headless: interact with the shell in THIS terminal over COM1
+make run-vnc     # build ISO + run with a VNC server on localhost:5900
+make clean       # remove all artifacts
 ```
+
+### Headless console (COM1 serial)
+
+The interactive shell is usable without a graphical window: terminal output is
+mirrored to COM1 and serial RX feeds the shell input path, so
+
+```bash
+make run-serial   # qemu ... -serial stdio -display none
+```
+
+drives the whole shell in the terminal (useful where WSLg/GTK/SDL do not work).
+Quit QEMU with `Ctrl-A` then `X`. The framebuffer window (`make run`) and VNC
+(`make run-vnc`) remain available.
 
 ## Boot Architecture
 

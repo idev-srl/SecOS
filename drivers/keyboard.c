@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "keyboard.h"
+#include "serial.h"
 
 #define KEYBOARD_DATA_PORT 0x60
 #define BUFFER_SIZE 256
@@ -64,7 +65,7 @@ static char buffer_get(void) {
 
 // Check if buffer has characters
 bool keyboard_has_char(void) {
-    return buffer_start != buffer_end;
+    return (buffer_start != buffer_end) || serial_has_char();
 }
 
 // Keyboard interrupt handler
@@ -122,9 +123,12 @@ void keyboard_init(void) {
 // Read a character (blocking)
 char keyboard_getchar(void) {
     while (!keyboard_has_char()) {
-    __asm__ volatile ("hlt");  // Wait for interrupt
+    __asm__ volatile ("hlt");  // Wait for interrupt (timer wakes ~1kHz to poll serial)
     }
-    return buffer_get();
+    // PS/2 keystrokes take priority; otherwise drain a serial byte.
+    if (buffer_start != buffer_end) return buffer_get();
+    int sc = serial_poll_char();
+    return (sc >= 0) ? (char)sc : 0;
 }
 
 // Read a full line (until Enter)
