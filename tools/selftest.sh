@@ -43,7 +43,7 @@ check() { # check "name" <0-if-ok>
 
 echo "[selftest] Building self-test image (M7_RING3_DEMO=1, M4 selftest on)..."
 make clean >/dev/null 2>&1 || true
-if ! make CFLAGS_EXTRA=-DM7_RING3_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+if ! make CFLAGS_EXTRA="-DM7_RING3_DEMO=1 -DDEV_ALLOW_UNSIGNED" >/tmp/secos_selftest_build.log 2>&1; then
     echo "[selftest] BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     tail -20 /tmp/secos_selftest_build.log >&2
     exit 2
@@ -76,7 +76,7 @@ n_rev=$(grep -c "switch 0x0000000000000002 -> 0x0000000000000001" "$LOG" || true
 M8LOG=/tmp/secos_selftest_m8.log
 echo "[selftest] Building M8 image (M8_SCHED_DEMO=1)..."
 make clean >/dev/null 2>&1 || true
-if ! make CFLAGS_EXTRA=-DM8_SCHED_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+if ! make CFLAGS_EXTRA="-DM8_SCHED_DEMO=1 -DDEV_ALLOW_UNSIGNED" >/tmp/secos_selftest_build.log 2>&1; then
     echo "[selftest] M8 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     tail -20 /tmp/secos_selftest_build.log >&2; exit 2
 fi
@@ -90,6 +90,23 @@ n_exit=$(grep -c "SCHED] exit" "$M8LOG" || true)
 grep -q "PMM stable across rounds: NO LEAK" "$M8LOG"; check "M8 no PMM leak across rounds" $?
 grep -q "\[M8\] DONE" "$M8LOG"; check "M8 demo completed ([M8] DONE)" $?
 ! grep -q "\[EXC\]" "$M8LOG"; check "no CPU exception ([EXC]) during M8 run" $?
+
+# ---- M9: signed userland (enforcement ON, no DEV_ALLOW_UNSIGNED) ----
+M9LOG=/tmp/secos_selftest_m9.log
+echo "[selftest] Building M9 image (M9_USER_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make CFLAGS_EXTRA=-DM9_USER_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M9 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M9 (mb2, ${TIMEOUT}s)..."
+tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$M9LOG" >/dev/null 2>&1 || true
+
+grep -q "\[M9\] tampered ELF REFUSED" "$M9LOG"; check "M9 tampered ELF refused by loader gate" $?
+grep -q "\[SEC\] ELF signature OK" "$M9LOG";    check "M9 signed ELF passes signature gate" $?
+grep -q "signed SecOS user program running in ring 3" "$M9LOG"; check "M9 signed user program runs (SYS_WRITE)" $?
+grep -q "\[M9\] user program exited; DONE" "$M9LOG"; check "M9 user program exits cleanly" $?
+! grep -q "\[EXC\]" "$M9LOG"; check "no CPU exception ([EXC]) during M9 run" $?
 
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"

@@ -126,6 +126,22 @@ iso: $(KERNEL)
 	@echo "Verifica contenuto ISO..."
 	@ls -lh $(ISO)
 
+# --- User programs (signed) ---
+# Build + sign the user programs and regenerate the embedded C headers. The
+# kernel includes the committed crypto/user_*_elf.h, so this only needs to run
+# when a user program changes (keeps the kernel build python-free).
+USER_CFLAGS = -ffreestanding -nostdlib -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 -Wall -Iuser
+.PHONY: user-progs
+user-progs:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S    -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note.S    -o user/note.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/hello.c   -o user/hello.o
+	$(LD) -T user/user.ld -o user/hello.elf user/crt0.o user/note.o user/libsecos.o user/hello.o
+	python3 tools/secos-sign user/hello.elf --dev
+	python3 tools/elf2h.py user/hello.elf user_hello_elf crypto/user_hello_elf.h
+	@echo "user-progs: built+signed user/hello.elf -> crypto/user_hello_elf.h"
+
 # Run with QEMU (graphical window — needs a working display backend)
 run: iso
 	qemu-system-x86_64 -cdrom $(ISO) -debugcon stdio -global isa-debugcon.iobase=0xe9

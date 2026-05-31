@@ -4,9 +4,10 @@ Single, linear milestone scheme (M0 → present → future). Earlier revisions o
 this file mixed two conflicting numbering schemes (the executed git milestones
 and an older pre-analysis plan); that has been collapsed into one timeline.
 
-- **Done:** M0–M8 (M8 = preemptive multitasking + exit/reap + no-leak, verified N=4/N=6)
+- **Done:** M0–M9 (M9 = real userland + mandatory ELF signing; signed `hello`
+  built by the toolchain, loaded from the VFS, verified, and run in ring-3)
 - **In progress:** —
-- **Planned:** M9+ (next: real userland)
+- **Planned:** M10+ (next: storage & persistence, virtio-blk)
 
 Per-milestone implementation notes live in `docs/devlog/M*.md`. The detailed
 execution plan — mission, definition of done, per-phase acceptance gates, and
@@ -73,9 +74,12 @@ cooperative-only `sched_on_timer_tick`) with a proper quantum, and make
 **Depends:** M7. **Done when:** two ELF processes produce interleaved output via
 `SYS_WRITE`; `ps` reflects alternating states; clean exit leaves PMM stable.
 
-### M9 — Real userland + signed ELFs (identity-defining)
+### M9 — Real userland + signed ELFs (identity-defining)  [DONE — tag `M9_STABLE`]
 **Goal:** independent, **signed** ELF programs, built by a user toolchain, run
 from the VFS — with mandatory signature verification as the root of trust.
+All verified by `tools/selftest.sh` (14/14). Details in `docs/devlog/M9.md`;
+`SYS_SPAWN`/`SYS_WAIT` and a `proc_type`-driven driver-mode tie-in remain for
+later milestones.
 
 - **Crypto:** in-kernel SHA-256 + Ed25519 *verify* (freestanding, no malloc),
   known-answer self-tests.

@@ -102,8 +102,8 @@ no triple fault; demo-off → boots to shell; harness prints a green summary.
 **Gate:** N ELF processes interleave output via the harness, all exit cleanly,
 PMM stats identical before/after (no leak). Tag `M8`.
 
-### Phase C — Real userland + signed ELFs (identity-defining step)
-**Milestone:** M9
+### Phase C — Real userland + signed ELFs (identity-defining step)  [DONE — `M9_STABLE`]
+**Milestone:** M9 — verified by `tools/selftest.sh` (14/14); see `docs/devlog/M9.md`.
 
 Userland and **mandatory ELF signing** are built together here: the loader is
 the verification point and the user toolchain is the signing point, so both land

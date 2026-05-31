@@ -64,6 +64,10 @@ int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t
         const Elf64_Phdr* ph = (const Elf64_Phdr*)(base + eh->e_phoff + i * sizeof(Elf64_Phdr));
         if ((const uint8_t*)ph + sizeof(Elf64_Phdr) > base + size) return ELF_ERR_RANGE;
         if (ph->p_type != PT_LOAD) continue;
+        // Skip empty segments before any range check: a linker may emit a
+        // zero-size PT_LOAD (e.g. an empty .data/.bss at vaddr 0) which must not
+        // be rejected by the user-range validation below.
+        if (ph->p_memsz == 0 && ph->p_filesz == 0) continue;
         // Validazioni flags: proibire W|X contemporanei
         if ((ph->p_flags & PF_X) && (ph->p_flags & PF_W)) { terminal_writestring("[ELF] segment W|X rifiutato\n"); return ELF_ERR_FLAG; }
         // Range file

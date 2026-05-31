@@ -17,3 +17,8 @@ build/
 dist/
 old/
 .vscode/
+
+# User program build artifacts (the committed artifact is crypto/user_*_elf.h)
+user/*.elf
+user/*.o
+__pycache__/

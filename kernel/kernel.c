@@ -175,6 +175,75 @@ static void m8_run_demo(void) {
 }
 #endif /* M8_SCHED_DEMO */
 
+// ---- [M9] Signed userland demo (gated; off by default) ----
+// Loads a toolchain-built, Ed25519-signed `hello` from the VFS, verifies its
+// signature (the loader gate), and runs it in ring-3. Also proves a tampered
+// copy is refused. Built WITHOUT -DDEV_ALLOW_UNSIGNED so the gate is enforced.
+#ifndef M9_USER_DEMO
+#define M9_USER_DEMO 0
+#endif
+#if M9_USER_DEMO
+#include "trapframe.h"
+#include "../crypto/user_hello_elf.h"
+extern int  vfs_create(const char* path, const void* data, size_t size);
+extern int  vfs_read_all(const char* path, void* buf, size_t bufsize);
+
+static uint8_t  m9_idle_stack[16384] __attribute__((aligned(16)));
+static uint8_t  m9_loadbuf[8192];
+static int      m9_spawned = 0, m9_done = 0;
+
+__attribute__((noreturn)) static void m9_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (!m9_spawned) {
+            m9_spawned = 1;
+            int n = vfs_read_all("/bin/hello", m9_loadbuf, sizeof(m9_loadbuf));
+            debugcon_writestring("[M9] loaded /bin/hello from VFS, bytes=");
+            debugcon_print_hex((uint64_t)(uint32_t)n); debugcon_writestring("\n");
+            process_t* p = (n > 0) ? process_create_from_elf(m9_loadbuf, (size_t)n) : 0;
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M9] spawned signed hello\n"); }
+            else   { debugcon_writestring("[M9] FAIL: signed hello not loaded/refused\n"); }
+        } else if (sched_count_alive_user() == 0 && !m9_done) {
+            m9_done = 1;
+            debugcon_writestring("[M9] user program exited; DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m9_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M9] signed userland demo\n");
+
+    // Enforcement check: a tampered copy must be REFUSED by the loader gate.
+    static uint8_t tampered[8192];
+    for (size_t i = 0; i < user_hello_elf_len && i < sizeof(tampered); i++) tampered[i] = user_hello_elf[i];
+    tampered[0x100] ^= 0x01; // flip a code byte -> signature no longer matches
+    process_t* bad = process_create_from_elf(tampered, user_hello_elf_len);
+    debugcon_writestring(bad ? "[M9] FAIL: tampered ELF accepted\n"
+                             : "[M9] tampered ELF REFUSED (good)\n");
+
+    // Publish the signed hello into the VFS, to be loaded back from there.
+    if (vfs_create("/bin/hello", user_hello_elf, user_hello_elf_len) != 0)
+        debugcon_writestring("[M9] WARN: vfs_create /bin/hello failed\n");
+
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m9_idle_stack + sizeof(m9_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m9_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M9] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf); // does not return
+}
+#endif /* M9_USER_DEMO */
+
 // ---- Phase 2: runs on the new guarded kernel stack ----
 // Called by trampoline_switch_stack after RSP has been moved to M2_KSTACK_TOP.
 // Interrupts are still disabled; idt_init() will enable them.
@@ -303,6 +372,9 @@ static void kernel_main_phase2(void) {
         if (vfs_mount_ramfs() == 0) terminal_writestring("[VFS] root RAMFS fallback mounted\n");
         else terminal_writestring("[VFS] fallback RAMFS FAIL\n");
     }
+#if M9_USER_DEMO
+    m9_run_demo(); // signed-userland demo (needs VFS) — does not return
+#endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);
     shell_run_line("vls /");

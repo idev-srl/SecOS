@@ -10,7 +10,9 @@
 #include "terminal.h"
 #include "panic.h"
 #include "mm/elf_manifest.h"
+#include "mm/elf_sign.h"
 #include "pmm.h"
+#include "debugcon.h"
 
 #define MAX_PROCESSES 32
 static process_t* proc_table[MAX_PROCESSES];
@@ -62,6 +64,25 @@ void process_foreach(void (*cb)(process_t*, void*), void* user) {
 
 process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     if (!proc_inited) process_init_system();
+
+    // [M9] Code-signing gate (root of trust). Every ELF must carry a valid
+    // Ed25519 signature (docs/SIGNING.md) to run. -DDEV_ALLOW_UNSIGNED downgrades
+    // refusal to a warning for bootstrap (e.g. the M7/M8 synthetic demos).
+    {
+        int sv = elf_signature_verify(elf_buf, size);
+#ifdef DEV_ALLOW_UNSIGNED
+        if (sv != ELF_SIG_OK)
+            debugcon_writestring("[SEC] WARN: unsigned/invalid ELF allowed (DEV_ALLOW_UNSIGNED)\n");
+#else
+        if (sv != ELF_SIG_OK) {
+            terminal_writestring("[SEC] REFUSED: ELF signature missing/invalid\n");
+            debugcon_writestring("[SEC] REFUSED unsigned/invalid ELF\n");
+            return NULL;
+        }
+        debugcon_writestring("[SEC] ELF signature OK\n");
+#endif
+    }
+
     vmm_space_t* space = vmm_space_create_user();
     if (!space) { terminal_writestring("[PROC] space alloc failed\n"); return NULL; }
     uint64_t entry=0;

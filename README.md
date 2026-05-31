@@ -6,7 +6,14 @@
 
 A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB Multiboot2 (legacy path), targeting x86-64 long mode.
 
-## Current Status — M8 (Preemptive Multitasking)
+## Current Status — M9 (Real userland + signed ELFs)
+
+**Milestone M9 (Real userland + mandatory ELF signing)**: complete. Tag `M9_STABLE`. See [`docs/devlog/M9.md`](docs/devlog/M9.md) and [`docs/SIGNING.md`](docs/SIGNING.md).
+
+- In-kernel crypto: SHA-256/512 + Ed25519 *verify* (freestanding), known-answer self-tests
+- **Every ELF must be signed to run** — Ed25519, refuse-by-default, `-DDEV_ALLOW_UNSIGNED` for bootstrap; the signature is the root of trust for the manifest (the basis of the three modes)
+- User toolchain: `crt0` + a minimal POSIX-friendly libc; `make user-progs` builds + signs `user/hello.c`
+- A signed `hello`, built by the toolchain, is loaded **from the VFS**, signature-verified by the kernel, and run in ring-3 (prints via `SYS_WRITE`); a tampered copy is refused. `tools/selftest.sh`: 14/14
 
 **Milestone M8 (Preemptive Multitasking + Process Lifecycle)**: complete (verified N=4/N=6). See [`docs/devlog/M8.md`](docs/devlog/M8.md).
 
