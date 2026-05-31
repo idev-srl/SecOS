@@ -8,7 +8,18 @@ development. Per-milestone implementation notes go in `docs/devlog/M*.md`.
 ## Locked decisions (2026-05-31)
 
 - **Ambition:** full secure OS. Phases **A–E are mandatory**; F–G are stretch.
-- **ABI:** small custom syscall ABI + a minimal in-house libc. **No POSIX.**
+- **ABI:** small custom syscall ABI underneath; the in-house libc exposes a
+  **POSIX-friendly surface** on top so open-source C ports easily. (Refines the
+  earlier "no POSIX": the *syscall ABI* stays custom and minimal; the *libc API*
+  is POSIX-flavored for portability.)
+- **Mandatory ELF signing (root of trust):** **every** executable — user *and*
+  driver — must carry a valid signature to run. **Ed25519 + SHA-256**;
+  **refuse-by-default**, with a `-DDEV_ALLOW_UNSIGNED` build override for
+  bootstrap. The signature is the root of trust for all `.note.secos` manifest
+  claims (mode user/driver, capabilities, limits). v0 uses a **single project
+  key** (format ready for a future keyring). See `docs/SIGNING.md`.
+- **Open-source import:** **port from source** against the SecOS libc, then sign
+  — NOT Linux-binary compatibility (no Linux syscall layer / dynamic linker).
 - **Platform:** UEFI is the golden path; Multiboot2 is kept for CI only.
   **Storage:** virtio-blk (clean, modern, QEMU-native).
 
@@ -91,18 +102,44 @@ no triple fault; demo-off → boots to shell; harness prints a green summary.
 **Gate:** N ELF processes interleave output via the harness, all exit cleanly,
 PMM stats identical before/after (no leak). Tag `M8`.
 
-### Phase C — Real userland (identity-defining step)
+### Phase C — Real userland + signed ELFs (identity-defining step)
 **Milestone:** M9
-- Separate **user build** target: `crt0` + a minimal libc (syscall wrappers for
-  `write/read/open/close/exit/getpid/yield`, plus `spawn/wait` once available).
-- Custom syscall ABI finalized (small, documented in `docs/SYSCALL_ABI.md`).
-- Embed an **initrd** (or a CPIO/ramdisk) of user ELFs; the loader runs an ELF
-  resolved through the VFS rather than a hand-built buffer.
-- `SYS_SPAWN` (load+start an ELF by path) and `SYS_WAIT`.
 
-**Gate:** a `hello` ELF **built by the user toolchain, not the kernel** is loaded
-from the VFS and prints via `SYS_WRITE`, captured on serial/debugcon by the
-harness. Tag `M9`.
+Userland and **mandatory ELF signing** are built together here: the loader is
+the verification point and the user toolchain is the signing point, so both land
+in M9. **The signature is the root of trust for the privilege/capability claims
+in the `.note.secos` manifest** — incl. the user/driver distinction (the three
+modes). An unsigned ELF cannot run (and cannot claim driver capabilities).
+Locked decisions (2026-05-31): **Ed25519 + SHA-256**, **refuse-by-default** with
+a `-DDEV_ALLOW_UNSIGNED` build override for bootstrap. See `docs/SIGNING.md`.
+
+- **Crypto foundation (in-kernel, freestanding, no malloc):** SHA-256 +
+  Ed25519 *verify*. Known-answer self-tests in the harness.
+- **Manifest v2 (`.note.secos`):** extend with `proc_type` (USER/DRIVER),
+  requested capabilities, resource limits; define the **signed digest** =
+  SHA-256 over (PT_LOAD segment contents at their vaddrs + the manifest fields),
+  computed deterministically. The Ed25519 signature lives in a second note
+  (`SECOS`/`QSIG`).
+- **Signing tool (host, build-time):** `tools/secos-sign` computes the digest,
+  signs with the project Ed25519 private key, embeds the `QSIG` note; plus a
+  keygen step. The trusted **public key is embedded in the kernel**.
+- **Loader gate:** parse manifest → recompute digest → `ed25519_verify` against
+  the embedded public key → **refuse** on missing/invalid signature (unless
+  `DEV_ALLOW_UNSIGNED`). A DRIVER-type process is only created if the ELF is
+  validly signed AND its manifest declares `MANIFEST_FLAG_DRIVER` (ties into
+  M11). PCB gains `proc_type`.
+- **User build target:** `crt0` + in-house libc — thin syscall wrappers
+  (`write/read/open/close/exit/getpid/yield`, later `spawn/wait`) plus a
+  **POSIX-friendly surface** (`string.h`, `malloc`, `printf`, `fd` I/O…) so
+  open-source C recompiles for SecOS. Build user ELFs and **sign every one** with
+  `tools/secos-sign`. Custom syscall ABI documented in `docs/SYSCALL_ABI.md`.
+- **Run from VFS:** embed an initrd of signed user ELFs; the loader runs an ELF
+  resolved through the VFS instead of a hand-built buffer. `SYS_SPAWN` / `SYS_WAIT`.
+
+**Gate:** crypto known-answer tests pass; a `hello` ELF **built and signed by the
+user toolchain** is loaded from the VFS and prints via `SYS_WRITE` (harness
+captures it); an **unsigned/tampered** ELF is **refused** by the loader; with
+`-DDEV_ALLOW_UNSIGNED` it loads (bootstrap path). Tag `M9`.
 
 ### Phase D — Storage & persistence
 **Milestone:** M10

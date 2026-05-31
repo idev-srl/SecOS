@@ -73,18 +73,26 @@ cooperative-only `sched_on_timer_tick`) with a proper quantum, and make
 **Depends:** M7. **Done when:** two ELF processes produce interleaved output via
 `SYS_WRITE`; `ps` reflects alternating states; clean exit leaves PMM stable.
 
-### M9 — Real userland (identity-defining)
-**Goal:** independent ELF programs, built by a user toolchain, run from the VFS.
+### M9 — Real userland + signed ELFs (identity-defining)
+**Goal:** independent, **signed** ELF programs, built by a user toolchain, run
+from the VFS — with mandatory signature verification as the root of trust.
 
-- Separate user build target: `crt0` + a minimal in-house libc (syscall wrappers
-  for `write/read/open/close/exit/getpid/yield`, later `spawn/wait`). No POSIX.
-- Finalize the small custom syscall ABI (documented in `docs/SYSCALL_ABI.md`).
-- Embed an initrd/ramdisk of user ELFs; the loader runs an ELF resolved through
-  the VFS instead of a hand-built buffer. Add `SYS_SPAWN` and `SYS_WAIT`.
+- **Crypto:** in-kernel SHA-256 + Ed25519 *verify* (freestanding, no malloc),
+  known-answer self-tests.
+- **Signing:** every ELF (user *and* driver) must be signed to run; Ed25519,
+  refuse-by-default with `-DDEV_ALLOW_UNSIGNED`. Manifest v2 (`proc_type`,
+  `caps_mask`) + `QSIG` signature note; embedded trusted public key; loader gate.
+  Host tools `secos-keygen` / `secos-sign`. See `docs/SIGNING.md`.
+- **Userland:** `crt0` + in-house libc — custom syscall ABI underneath, a
+  POSIX-friendly API on top so open-source C ports from source. Documented in
+  `docs/SYSCALL_ABI.md`.
+- **Run from VFS:** embed an initrd of signed ELFs; the loader runs an ELF
+  resolved through the VFS instead of a hand-built buffer. Add `SYS_SPAWN`/`SYS_WAIT`.
 
-**Depends:** M8. **Done when:** a `hello` ELF built by the user toolchain (not
-the kernel) is loaded from the VFS and prints via `SYS_WRITE`, captured by the
-self-test harness.
+**Depends:** M8. **Done when:** crypto KATs pass; a `hello` ELF built+signed by
+the toolchain loads from the VFS and prints via `SYS_WRITE` (harness-captured);
+an unsigned/tampered ELF is refused; `-DDEV_ALLOW_UNSIGNED` allows the bootstrap
+path.
 
 ### M10 — Storage & persistence
 **Goal:** load programs and persist data on a real disk.
