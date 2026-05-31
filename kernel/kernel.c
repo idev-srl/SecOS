@@ -77,7 +77,7 @@ static void print_banner(void) {
 #include "syscall.h"
 #include "trapframe.h"
 
-#define M8_NPROC  2
+#define M8_NPROC  4
 #define M8_ROUNDS 4   // run several spawn-all/exit-all rounds; assert the last two
                       // leave PMM free identical (stable => no per-round leak).
 static uint8_t  m8_idle_stack[16384] __attribute__((aligned(16)));

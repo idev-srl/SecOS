@@ -189,12 +189,19 @@ void kfree(void* ptr) {
     block->is_free = true;
     total_freed += block->size;
     
-    // Coalesce adjacent free blocks
+    // Coalesce adjacent free blocks.
+    // CRITICAL: only merge blocks that are PHYSICALLY contiguous. Heap frames
+    // come from separate pmm_alloc_frame() calls and are not necessarily
+    // adjacent in memory; merging non-contiguous blocks would inflate `size`
+    // across the gap and let a later allocation write outside the heap (e.g.
+    // over a live process's page tables). Two halves of a split block ARE
+    // adjacent and coalesce correctly.
     heap_block_t* current = heap_start;
-    
     while (current != NULL && current->next != NULL) {
-        if (current->is_free && current->next->is_free) {
-            // Merge blocks
+        uint8_t* current_end = (uint8_t*)current + HEAP_BLOCK_HEADER_SIZE + current->size;
+        if (current->is_free && current->next->is_free &&
+            current_end == (uint8_t*)current->next) {
+            // Physically contiguous — safe to merge
             current->size += HEAP_BLOCK_HEADER_SIZE + current->next->size;
             current->next = current->next->next;
         } else {

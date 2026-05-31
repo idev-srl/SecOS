@@ -6,14 +6,14 @@
 
 A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB Multiboot2 (legacy path), targeting x86-64 long mode.
 
-## Current Status — M8 (Preemptive Multitasking, core done)
+## Current Status — M8 (Preemptive Multitasking)
 
-**Milestone M8 (Preemptive Multitasking + Process Lifecycle)**: core complete (verified at N=2). See [`docs/devlog/M8.md`](docs/devlog/M8.md).
+**Milestone M8 (Preemptive Multitasking + Process Lifecycle)**: complete (verified N=4/N=6). See [`docs/devlog/M8.md`](docs/devlog/M8.md).
 
 - Timer-driven preemptive scheduler (trapframe `isr_timer`, quantum, ring-3-only preemption) + kernel idle task
 - `SYS_EXIT` → zombie + reaping; `vmm_space_destroy` fixed to free the private `PML4[0]` PDPT; no PMM leak across rounds
+- Fixed a heap allocator bug (`kfree` coalesced non-physically-contiguous blocks) that corrupted page tables at N≥3
 - Build the demo: `make CFLAGS_EXTRA=-DM8_SCHED_DEMO=1`; verify with `tools/selftest.sh`
-- ⚠️ Known issue: N≥3 spawn corruption (a frame-aliasing/identity-map bug, not the scheduler) — first M9 item; demo uses N=2
 
 
 

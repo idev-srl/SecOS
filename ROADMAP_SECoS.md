@@ -4,8 +4,8 @@ Single, linear milestone scheme (M0 → present → future). Earlier revisions o
 this file mixed two conflicting numbering schemes (the executed git milestones
 and an older pre-analysis plan); that has been collapsed into one timeline.
 
-- **Done:** M0–M7; M8 core (preemptive multitasking + exit/reap + no-leak, verified at N=2)
-- **In progress:** M8 multi-process edge case (N≥3 spawn corruption — see `docs/devlog/M8.md`)
+- **Done:** M0–M8 (M8 = preemptive multitasking + exit/reap + no-leak, verified N=4/N=6)
+- **In progress:** —
 - **Planned:** M9+ (next: real userland)
 
 Per-milestone implementation notes live in `docs/devlog/M*.md`. The detailed
@@ -57,19 +57,18 @@ cooperative-only `sched_on_timer_tick`) with a proper quantum, and make
 > Per the locked plan, **M8–M11 are mandatory** and **M12–M13 are stretch**.
 > See [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) for acceptance gates.
 
-### M8 — Real multiprogramming  [CORE DONE, N=2 verified]
+### M8 — Real multiprogramming  [DONE — verified N=4/N=6]
 **Goal:** processes start, run, and exit cleanly under a preemptive scheduler.
 
 - ✅ `SYS_EXIT` → ZOMBIE + switch; reaped from idle via `process_destroy` /
   `vmm_space_destroy` (now frees the M7 private `PML4[0]` PDPT). No PMM leak
-  across rounds (verified at N=2).
+  across rounds.
 - ✅ Timer-driven preemption: trapframe `isr_timer`, quantum-based switch, only
   preempts ring-3, EOIs before switching; kernel idle task as fallback.
 - ✅ Construction race fix (`PROC_BLOCKED` until the trapframe is ready).
-- ⚠️ **Open:** N≥3 spawn corruption (a process's `PML4[0]` gets zeroed when the
-  next is created, after a few rounds) — frame-aliasing/identity-map issue, not
-  the scheduler; first M9 investigation item. `ps` live states / interleaved
-  user output still pending.
+- ✅ Fixed the heap allocator bug that corrupted page tables at N≥3 (`kfree`
+  coalesced non-physically-contiguous blocks — see `docs/devlog/M8.md`).
+- Still pending (small): `ps` live states / interleaved user output.
 
 **Depends:** M7. **Done when:** two ELF processes produce interleaved output via
 `SYS_WRITE`; `ps` reflects alternating states; clean exit leaves PMM stable.
