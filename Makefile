@@ -54,6 +54,8 @@ SRC_C   = \
 	$(FS_DIR)/ext2.c \
 	$(FS_DIR)/ext2ramdev.c \
 	$(CRYPTO_DIR)/sha256.c \
+	$(CRYPTO_DIR)/sha512.c \
+	$(CRYPTO_DIR)/ed25519.c \
 	$(CRYPTO_DIR)/crypto_selftest.c
 
 OBJS_ASM = $(SRC_ASM:%.asm=%.o)
