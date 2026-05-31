@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+# SecOS code-signing — sign an ELF in place by filling its QSIG note.
+# SPDX-License-Identifier: MIT
+#
+# Usage:
+#   tools/secos-sign <elf> [--seed-hex HEX | --dev]
+#
+# The ELF must already contain a `.note.secos` with a QSIG note (sig zeroed),
+# i.e. be linked with the SecOS user crt0/manifest. Signing computes the digest
+# (SHA-256 over the whole file with the 64 sig bytes zeroed) and writes the
+# Ed25519 signature into the note in place.
+import sys, os
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from secos_signlib import DEV_SEED, find_qsig_sig_offset, compute_digest
+
+def main():
+    path = None; seed = DEV_SEED
+    args = sys.argv[1:]; i = 0
+    while i < len(args):
+        if args[i] == "--dev": seed = DEV_SEED
+        elif args[i] == "--seed-hex": i += 1; seed = bytes.fromhex(args[i])
+        elif not args[i].startswith("-"): path = args[i]
+        i += 1
+    if not path:
+        sys.stderr.write("usage: secos-sign <elf> [--dev|--seed-hex HEX]\n"); sys.exit(2)
+    data = bytearray(open(path, "rb").read())
+    off = find_qsig_sig_offset(data)
+    if off is None:
+        sys.stderr.write("[sign] ERROR: no QSIG note found in %s (link with SecOS crt0?)\n" % path)
+        sys.exit(1)
+    for k in range(64): data[off + k] = 0
+    digest = compute_digest(data, off)
+    sig = Ed25519PrivateKey.from_private_bytes(seed).sign(digest)
+    data[off:off + 64] = sig
+    open(path, "wb").write(data)
+    sys.stderr.write("[sign] %s signed (digest %s)\n" % (path, digest.hex()[:16]))
+
+if __name__ == "__main__":
+    main()

@@ -37,23 +37,23 @@ This is a closed, signed-execution model (cf. iOS / locked-down enterprise OSes)
 
 ## 3. What is signed (the signed digest)
 
-The digest is computed **deterministically** over content that fully determines
-what executes:
-
 ```
-SHA-256(
-   for each PT_LOAD segment, in ascending p_vaddr order:
-       p_vaddr (8) || p_memsz (8) || p_flags (4) || segment_file_bytes
-   || manifest_canonical_bytes        // version, flags, proc_type, caps, limits, entry
-)
+digest = SHA-256( entire ELF file, with the 64-byte QSIG `sig` field set to 0 )
+signature = Ed25519_sign(digest)        // signs the 32-byte digest
 ```
 
-Notes:
-- Covers the **loaded image** (what runs) and the **manifest** (mode/caps/limits),
-  so tampering with either invalidates the signature.
-- The signature note itself is **excluded** from the digest.
-- Field order/endianness are fixed (little-endian) so host signer and kernel
-  verifier agree byte-for-byte.
+This is the single source of truth: host signer and kernel verifier perform the
+**identical** computation — hash the whole file, treating the 64 signature bytes
+as zero. Rationale:
+
+- Covers **everything** security-relevant — ELF header (entry point), program
+  headers (segment vaddrs/flags), the loaded segments, and the manifest — so any
+  tampering invalidates the signature. (Simpler and stronger than hashing only
+  PT_LOAD segments: there is nothing to keep in sync between the two sides except
+  "where are the 64 sig bytes".)
+- Only the `sig[64]` field is excluded (zeroed); the rest of the QSIG note
+  (version, key_id) is covered.
+- Implemented in `tools/secos_signlib.py` (host) and `mm/elf_sign.c` (kernel).
 
 ## 4. ELF carrier format (`.note.secos`)
 
@@ -89,8 +89,17 @@ system can bootstrap before the toolchain/keys exist. Off in any real build.
 - `tools/secos-keygen` — generate the Ed25519 keypair; the public key is emitted
   as a C array embedded in the kernel, the private key stays on the build host
   (never committed in real use).
-- `tools/secos-sign <elf>` — compute the digest (§3), Ed25519-sign it, append/patch
-  the `QSIG` note. Every user/driver ELF is signed as a build step.
+- `tools/secos-sign <elf>` — compute the digest (§3), Ed25519-sign it, and patch
+  the `QSIG` note's `sig` field in place (the ELF must already carry the note,
+  linked in via the user crt0/manifest). Every user/driver ELF is signed.
+- `tools/gen_signed_test.py` — builds a minimal signed ELF and emits
+  `crypto/signed_test_elf.h` for the kernel's signature-verify self-test.
+
+**DEV key (bootstrap):** `tools/secos-keygen --dev` derives the keypair from a
+**fixed dev seed** (in `secos_signlib.py`) so the build can sign without secrets
+while bootstrapping. The committed `crypto/secos_pubkey.h` is this DEV public
+key. **Production replaces it** with a real random key whose private half is kept
+offline (`secos-keygen` with no `--dev` prints a random seed to store securely).
 
 ## 7. Open-source software
 

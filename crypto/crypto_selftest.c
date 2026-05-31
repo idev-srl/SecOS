@@ -7,6 +7,8 @@
 #include "sha256.h"
 #include "sha512.h"
 #include "ed25519.h"
+#include "elf_sign.h"
+#include "signed_test_elf.h"
 #include "debugcon.h"
 
 static int eq(const uint8_t* a, const uint8_t* b, int n) {
@@ -86,6 +88,23 @@ int crypto_selftest(void) {
         fails += report("Ed25519 reject(tampered sig)", ed25519_verify((const uint8_t*)msg, 22, bad, pk) == 0);
         /* Negative: right sig, wrong message */
         fails += report("Ed25519 reject(wrong msg)",    ed25519_verify((const uint8_t*)"secos code-signing KAT", 22, sig_m, pk) == 0);
+    }
+
+    /* ELF signature verification (end-to-end: host-signed DEV ELF vs kernel verify) */
+    {
+        fails += report("ELF sig verify(valid)",
+                        elf_signature_verify(signed_test_elf, signed_test_elf_len) == ELF_SIG_OK);
+
+        static uint8_t buf[1024];
+        for (size_t i = 0; i < signed_test_elf_len && i < sizeof(buf); i++) buf[i] = signed_test_elf[i];
+        buf[0x100] ^= 0x01; /* flip a code byte -> digest changes */
+        fails += report("ELF sig reject(tampered code)",
+                        elf_signature_verify(buf, signed_test_elf_len) == ELF_SIG_BAD);
+
+        for (size_t i = 0; i < signed_test_elf_len && i < sizeof(buf); i++) buf[i] = signed_test_elf[i];
+        buf[584] ^= 0x01; /* flip a signature byte (QSIG sig @584) */
+        fails += report("ELF sig reject(tampered sig)",
+                        elf_signature_verify(buf, signed_test_elf_len) == ELF_SIG_BAD);
     }
 
     debugcon_writestring(fails ? "[CRYPTO] --- FAIL ---\n" : "[CRYPTO] --- all PASS ---\n");
