@@ -8,7 +8,11 @@ and an older pre-analysis plan); that has been collapsed into one timeline.
 - **In progress:** M7 (ring-3 + cooperative scheduling — runtime demo not yet passing)
 - **Planned:** M8+
 
-Per-milestone implementation notes live in `docs/devlog/M*.md`.
+Per-milestone implementation notes live in `docs/devlog/M*.md`. The detailed
+execution plan — mission, definition of done, per-phase acceptance gates, and
+the autonomous-development methodology — is in
+[`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md). Locked direction:
+full secure OS, custom minimal ABI, UEFI-golden + virtio-blk.
 
 ---
 
@@ -66,6 +70,8 @@ shell are never reached. (Full detail in `docs/devlog/M7.md`.)
 
 > Future milestones continue the single timeline (M8+). They are grounded in
 > open work already visible in the codebase, not speculative features.
+> Per the locked plan, **M8–M11 are mandatory** and **M12–M13 are stretch**.
+> See [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) for acceptance gates.
 
 ### M8 — Real multiprogramming
 **Goal:** processes start, run, and exit cleanly under a preemptive scheduler.
@@ -81,57 +87,69 @@ shell are never reached. (Full detail in `docs/devlog/M7.md`.)
 **Depends:** M7. **Done when:** two ELF processes produce interleaved output via
 `SYS_WRITE`; `ps` reflects alternating states; clean exit leaves PMM stable.
 
-### M9 — Memory scalability
-**Goal:** the kernel manages all reported RAM and runs from the higher half.
+### M9 — Real userland (identity-defining)
+**Goal:** independent ELF programs, built by a user toolchain, run from the VFS.
 
-- Higher-half kernel at `0xFFFFFFFF80000000`: keep identity map transiently for
-  boot, drop it after switch; update linker script, bootloader PML4 entry, and
-  any residual physical casts.
-- PMM scalability: replace the linear bitmap scan (`find_free_frame`) with a
-  free-list or buddy allocator; remove the early 128 MB / 512 MB clamps and
-  handle the full memory map (test with QEMU `-m 2G`).
-- Demand paging: complete `vmm_handle_page_fault` on-demand allocation for
-  registered user regions, with validation and per-process limits.
+- Separate user build target: `crt0` + a minimal in-house libc (syscall wrappers
+  for `write/read/open/close/exit/getpid/yield`, later `spawn/wait`). No POSIX.
+- Finalize the small custom syscall ABI (documented in `docs/SYSCALL_ABI.md`).
+- Embed an initrd/ramdisk of user ELFs; the loader runs an ELF resolved through
+  the VFS instead of a hand-built buffer. Add `SYS_SPAWN` and `SYS_WAIT`.
 
-**Depends:** M8. **Done when:** kernel runs higher-half with the low identity
-map removed; PMM reports >512 MB free on a 2 GB VM; demand-paged user region
-faults in correctly; a W+X page request is rejected (panic/#GP).
+**Depends:** M8. **Done when:** a `hello` ELF built by the user toolchain (not
+the kernel) is loaded from the VFS and prints via `SYS_WRITE`, captured by the
+self-test harness.
 
-### M10 — UEFI handoff hardening
-**Goal:** the UEFI path is deterministic and safe on real firmware.
+### M10 — Storage & persistence
+**Goal:** load programs and persist data on a real disk.
 
-- Implement real post-ExitBootServices ELF segment mapping with 4 KB pages and
-  W^X (currently a placeholder that relies on the firmware identity map; see
-  `uefi/boot.c`).
-- Copy `secos_boot_info` and the memory-map descriptors into a kernel-owned
-  frame before the PMM can recycle `EFI_LOADER_DATA`.
-- Re-audit PMM bitmap placement at `_kernel_end` for collisions with loaded
-  kernel segments.
-- Add a serial (COM1 / 0x3F8) console driver for headless debug and post-EBS
-  diagnostics (no serial driver exists yet).
+- virtio-blk driver exposing `block_read/block_write`.
+- FAT32 (and/or ext2) **read-write** through the VFS over the block device.
+- Mount a data filesystem at boot; load user programs from the disk image.
 
-**Depends:** M9 (higher-half makes mapping ownership clean). **Done when:**
-boot is UB-free on OVMF and at least one real firmware; boot info survives PMM
-init; serial output works.
+**Depends:** M9. **Done when:** write a file, reboot the VM, read it back
+identical; run a program loaded from disk — all harness-asserted.
 
-### M11 — Driver Space enforcement
-**Goal:** Driver Space becomes a verifiable security boundary.
+### M11 — Driver Space for real (proves the security thesis)
+**Goal:** Driver Space becomes a verifiable security boundary with a user-space driver.
 
 - Add `proc_type` (`PROC_TYPE_USER` / `PROC_TYPE_DRIVER`) to the PCB, set by the
-  loader from the ELF manifest (`MANIFEST_FLAG_DRIVER`).
-- Reject `SYS_DRIVER` for `PROC_TYPE_USER` with `DRV_ERR_PERM` before touching
-  the device registry.
-- Implement `DRIVER_OP_MAP_MEM`: validate `mem_offset`/`mem_length` against the
-  device descriptor; map into the driver process (USER=1, RW=1, NX=1); track for
-  precise cleanup; unbind on process destroy.
-- Automatic restart of a critical driver on abnormal exit (bounded N restarts in
-  K ticks, then `DEV_FLAG_FAILED`); `DRIVER_OP_IRQ_SUBSCRIBE` delivering IRQ
-  events to a driver via an IPC queue consumed through `SYS_READ`.
+  loader from the ELF manifest (`MANIFEST_FLAG_DRIVER`); reject `SYS_DRIVER` for
+  USER processes with `DRV_ERR_PERM`.
+- Move one driver (target: keyboard) to a **user-space process**: real
+  register/MMIO access via validated `DRIVER_OP_*`, capability + range checks,
+  audit log. Implement `DRIVER_OP_MAP_MEM` with precise cleanup on unload.
+- IRQ delivery via an IPC queue consumed through `SYS_READ` on a special fd;
+  bounded auto-restart of a crashing driver (`DEV_FLAG_FAILED` past threshold).
 
-**Depends:** M8 (lifecycle/IPC), M9 (reliable MAP_MEM). **Done when:** a user
-process gets `DRV_ERR_PERM` on `SYS_DRIVER`; a crashing driver auto-restarts;
-MAP_MEM maps and frees correctly (PMM stable); a simulated IRQ reaches the
-driver without a race.
+**Depends:** M8 (lifecycle/IPC), M10 (block device for the disk driver case).
+**Done when:** a user-space driver delivers real input/events end-to-end; a
+capability/range violation is denied **and** audited; a USER process gets
+`DRV_ERR_PERM`.
+
+### M12 — Hardening & memory scalability (stretch)
+**Goal:** the kernel manages all RAM, runs higher-half, and UEFI handoff is firmware-safe.
+
+- Higher-half kernel at `0xFFFFFFFF80000000`; drop the low identity map after the
+  switch; update linker script, bootloader PML4 entry, residual physical casts.
+- PMM scalability: replace the linear bitmap scan with a free-list/buddy
+  allocator; remove the 128 MB / 512 MB clamps (test with QEMU `-m 2G`).
+- Complete demand paging with per-process limits.
+- UEFI handoff hardening: real 4 KB post-EBS ELF mapping with W^X; copy
+  `secos_boot_info` + memory map into a kernel-owned frame; re-audit PMM bitmap
+  placement at `_kernel_end`. Full W^X audit.
+
+**Depends:** M11. **Done when:** UEFI boot on real firmware; PMM reports >512 MB
+free on a 2 GB VM; a W+X page request is rejected (panic/#GP).
+
+### M13 — Usability & policy enforcement (stretch)
+**Goal:** a usable system with end-to-end manifest policy.
+
+- Shell that launches user programs from the FS; minimal IPC/pipes; a few more
+  syscalls; end-to-end `.note.secos` enforcement (`max_mem`, capability gating).
+
+**Depends:** M11. **Done when:** the shell runs on-disk programs; a program
+exceeding its manifest `max_mem` is aborted at load.
 
 ---
 
@@ -145,25 +163,25 @@ analysis have drifted — locations below are indicative.
 |---|-------|--------|----------------|
 | 1 | UEFI page tables never activated | **Fixed** | `AllocatePages` + `activate_page_tables()` called pre-handoff |
 | 2 | Console calls after ExitBootServices | **Fixed** | explicit "no boot-services past this point" guard in `uefi/boot.c` |
-| 3 | PMM clamp limits usable RAM | **Partial** | 512 MB map limit + a 128 MB early-region clamp remain → M9 |
-| 4 | PMM bitmap may collide with loaded ELF segments | **Open (re-audit)** | M10 |
+| 3 | PMM clamp limits usable RAM | **Partial** | 512 MB map limit + a 128 MB early-region clamp remain → M12 |
+| 4 | PMM bitmap may collide with loaded ELF segments | **Open (re-audit)** | M12 |
 | 5 | `_bss_start` after `*(COMMON)` in linker script | **Fixed** | M1 |
 | 6 | Scheduler without real context switch | **Implemented** | M6/M7 (demo still WIP) |
 | 7 | VMM accesses page tables via raw physical cast | **Fixed** | `phys_to_virt` (M1.2) |
 | 8 | `vmm_space_destroy` leaks page-table frames | **Fixed** | M1 |
 | 9 | Kernel stack without guard page | **Fixed** | M2 |
 | 10 | `AllocatePool` for page tables (mis-aligned) | **Fixed** | now `AllocatePages` |
-| 11 | `secos_boot_info` in recyclable `EFI_LOADER_DATA` | **Partial** | still static, mitigated by identity-map assumption → copy to kernel frame in M10 |
+| 11 | `secos_boot_info` in recyclable `EFI_LOADER_DATA` | **Partial** | still static, mitigated by identity-map assumption → copy to kernel frame in M12 |
 | 12 | No kernel-owned GDT with TSS descriptor | **Fixed** | `arch/x86/tss.c` builds GDT + TSS |
-| 13 | `find_free_frame` is O(n) bitwise | **Open** | acceptable now; buddy/free-list in M9 |
-| 14 | UEFI ELF segment copy relies on identity map | **Open** | real 4 KB mapping in M10 |
+| 13 | `find_free_frame` is O(n) bitwise | **Open** | acceptable now; buddy/free-list in M12 |
+| 14 | UEFI ELF segment copy relies on identity map | **Open** | real 4 KB mapping in M12 |
 | 15 | `kernel_main(uint32_t, uint64_t)` magic-based signature | **Open (by design)** | dual-boot dispatch is intentional; optionally formalize as typed `boot_params` |
 
 ---
 
 ## 5. Open design decisions
 
-1. **Higher-half vs identity-mapped kernel.** Targeted for M9. Until then, all
+1. **Higher-half vs identity-mapped kernel.** Targeted for M12. Until then, all
    new page-table access must go through `phys_to_virt()` (already the norm
    since M1.2) so the migration does not require rewriting access paths.
 2. **Shared vs per-process PML4.** Decide whether the kernel keeps one PML4
