@@ -132,6 +132,7 @@ static void sh_rftruncate(const char* a);
 static void sh_vls(const char* a); static void sh_vcat(const char* a); static void sh_vinfo(const char* a); static void sh_vpwd(const char* a); static void sh_vmount(const char* a);
 static void sh_vcreate(const char* a); static void sh_vwrite(const char* a); static void sh_vtruncate2(const char* a);
 static void sh_ext2mount(const char* a);
+static void sh_run(const char* a);
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
 static void sh_drvtest(const char* a);
 #if ENABLE_RTC
@@ -208,6 +209,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"vwrite",    sh_vwrite},
     {"vtruncate", sh_vtruncate2},
     {"ext2mount", sh_ext2mount},
+    {"run",       sh_run},
     {"drvreg",    sh_drvreg},
     {"drvunreg",  sh_drvunreg},
     {"drvlog",    sh_drvlog},
@@ -815,7 +817,26 @@ static void sh_vmount(const char* a){ (void)a; terminal_writestring("[vmount] ro
 static void sh_vcreate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vcreate <path> <content>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[vcreate] missing content\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_create(const char*, const void*, size_t); if(vfs_create(name,data,len)==0) terminal_writestring("[vcreate] OK\n"); else terminal_writestring("[vcreate] FAIL\n"); }
 static void sh_vwrite(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vwrite <path> <offset> <data>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vwrite] missing offset\n"); return; } size_t off=0; while(*a>='0'&&*a<='9'){ off=off*10+(*a-'0'); a++; } while(*a==' ') a++; if(!*a){ terminal_writestring("[vwrite] missing data\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_write(const char*, size_t, const void*, size_t); int r=vfs_write(name,off,data,len); if(r>=0){ terminal_writestring("[vwrite] wrote "); print_dec(r); terminal_writestring(" bytes\n"); } else terminal_writestring("[vwrite] FAIL\n"); }
 static void sh_vtruncate2(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vtruncate <path> <size>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vtruncate] missing size\n"); return; } size_t sz=0; while(*a>='0'&&*a<='9'){ sz=sz*10+(*a-'0'); a++; } extern int vfs_truncate(const char*, size_t); if(vfs_truncate(name,sz)==0) terminal_writestring("[vtruncate] OK\n"); else terminal_writestring("[vtruncate] FAIL\n"); }
-static void sh_ext2mount(const char* a){ (void)a; extern int ext2_mount(const char* dev_name); if(ext2_mount("ext2ram")==0) terminal_writestring("[ext2mount] EXT2 mounted as root (stub)\n"); else terminal_writestring("[ext2mount] mount failed\n"); }
+static void sh_ext2mount(const char* a){ while(*a==' ') a++; const char* mp = (*a) ? a : "/mnt"; extern int ext2_mount(const char* dev_name, const char* mount_point); if(ext2_mount("vda", mp)==0){ terminal_writestring("[ext2mount] ext2/ext4 mounted at "); terminal_writestring(mp); terminal_writestring("\n"); } else terminal_writestring("[ext2mount] mount failed\n"); }
+// [M10] run <path>: load+signature-verify a signed ELF from the VFS, spawn it
+// ring-3 and wait for it to exit. Works because the shell runs as the scheduler
+// idle task: the timer preempts us into the spawned process; SYS_EXIT returns
+// here. An unsigned/tampered/missing ELF is refused by the loader gate.
+static void sh_run(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Usage: run <path>\n"); return; }
+    char path[256]; size_t i=0; while(a[i] && a[i]!=' ' && i<sizeof(path)-1){ path[i]=a[i]; i++; } path[i]=0;
+    extern int ksys_spawn(const char*);
+    extern int ksys_wait(int);
+    extern void sched_reap_zombies(void);
+    int pid = ksys_spawn(path);
+    if(pid<0){ terminal_writestring("[run] load/verify failed (missing or unsigned?): "); terminal_writestring(path); terminal_writestring("\n"); return; }
+    terminal_writestring("[run] pid="); print_dec(pid); terminal_writestring(" "); terminal_writestring(path); terminal_writestring("\n");
+    // Let the scheduler run it; we (idle) get preempted in and resumed on exit.
+    while(ksys_wait(pid)==1){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
+    sched_reap_zombies();
+    terminal_writestring("[run] pid="); print_dec(pid); terminal_writestring(" exited\n");
+}
 // --- Driver space commands ---
 static void sh_drvreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev = dev*10 + (*a-'0'); a++; } extern int driver_register_binding(process_t*, int); extern const device_desc_t* driver_get_device(int); extern process_t* sched_get_current(void); extern process_t* process_get_last(void);
     process_t* target = sched_get_current(); if(!target){ // fallback: last created process

@@ -10,6 +10,8 @@
 #define SYS_CLOSE   5
 #define SYS_GETPID  6
 #define SYS_DRIVER  7  // driver space mediated hardware access
+#define SYS_SPAWN   8  // load+verify a signed ELF from a VFS path, return pid
+#define SYS_WAIT    9  // wait for a child pid to become ZOMBIE, return status
 
 // Flags for open (simplified)
 #define O_RDONLY 0x0
@@ -26,6 +28,8 @@ int ksys_write(int fd, const void* buf, int len);
 int ksys_read(int fd, void* buf, int len);
 int ksys_getpid(void);
 void ksys_exit(int status);
+int ksys_spawn(const char* path);   // returns pid (>0) or -1
+int ksys_wait(int pid);             // returns 0 when pid has exited, -1 if unknown
 
 // Driver interface forward declaration (struct defined in driver_if.h)
 struct driver_call;

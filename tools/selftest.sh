@@ -108,6 +108,41 @@ grep -q "signed SecOS user program running in ring 3" "$M9LOG"; check "M9 signed
 grep -q "\[M9\] user program exited; DONE" "$M9LOG"; check "M9 user program exits cleanly" $?
 ! grep -q "\[EXC\]" "$M9LOG"; check "no CPU exception ([EXC]) during M9 run" $?
 
+# ---- M10: storage & persistence (virtio-blk + FAT32/ext2/ext4 + run from disk) ----
+echo "[selftest] Building M10 image (M10_RUN_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA=-DM10_RUN_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M10 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+
+# Run the M10 image against a virtio-blk disk of the given filesystem.
+run_m10_fs() { # run_m10_fs <fs>   (fs = fat32 | ext2 | ext4)
+    local fs="$1" log="/tmp/secos_selftest_m10_${1}.log"
+    make "disk-${fs}" >/dev/null 2>&1 || { echo "  [FAIL] M10/${fs} disk image build"; FAIL=$((FAIL+1)); return; }
+    : > "$log"
+    set +e
+    timeout "$((TIMEOUT+6))" qemu-system-x86_64 \
+        -cdrom myos.iso \
+        -drive file=disk.img,if=virtio,format=raw -boot d \
+        -debugcon file:"$log" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -no-shutdown -display none -m 256M
+    set -e
+    grep -q "\[VIRTIO-BLK\] ready" "$log";                 check "M10/${fs} virtio-blk online" $?
+    grep -q "\[M10\] disk mounted at /mnt"  "$log";        check "M10/${fs} disk FS mounted at /mnt" $?
+    grep -q "\[M10\] disk write+readback: OK" "$log";      check "M10/${fs} VFS write+readback persists" $?
+    grep -q "\[M10\] tampered disk ELF REFUSED" "$log";    check "M10/${fs} tampered disk ELF refused (signing gate)" $?
+    grep -q "\[M10\] wrote signed hello.elf to disk" "$log"; check "M10/${fs} wrote signed ELF to disk" $?
+    grep -q "signed SecOS user program running in ring 3" "$log"; check "M10/${fs} signed ELF runs ring-3 from disk" $?
+    local nexit; nexit=$(grep -c "SCHED] exit" "$log" || true)
+    [[ "$nexit" -ge 1 ]];                                  check "M10/${fs} program exits via SYS_EXIT (exit=$nexit)" $?
+    ! grep -q "\[EXC\]" "$log";                            check "M10/${fs} no CPU exception ([EXC])" $?
+}
+echo "[selftest] Running M10 (fat32, ext2, ext4 with virtio-blk disk)..."
+run_m10_fs fat32
+run_m10_fs ext2
+run_m10_fs ext4
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

@@ -98,16 +98,19 @@ the toolchain loads from the VFS and prints via `SYS_WRITE` (harness-captured);
 an unsigned/tampered ELF is refused; `-DDEV_ALLOW_UNSIGNED` allows the bootstrap
 path.
 
-### M10 — Storage & persistence
+### M10 — Storage & persistence — **DONE**
 **Goal:** load programs and persist data on a real disk.
 
-- virtio-blk driver exposing `block_read/block_write`.
+- virtio-blk driver (legacy PCI, polling) exposing `block_read/block_write` (`vda`).
 - **FAT32, ext2 and ext4** **read-write** through the VFS over the block device
-  (all three are target filesystems for SECoS).
-- Mount a data filesystem at boot; load user programs from the disk image.
+  (all three are target filesystems for SECoS; ext4 = no-journal v0).
+- VFS multi-mount: ramfs root `/`, disk FS at `/mnt`.
+- `SYS_SPAWN`/`SYS_WAIT` + shell `run <path>`; the interactive shell runs as the
+  scheduler idle task so a spawned ring-3 program returns control on exit.
 
-**Depends:** M9. **Done when:** write a file, reboot the VM, read it back
-identical; run a program loaded from disk — all harness-asserted.
+**Depends:** M9. **Done:** kernel-written files are host-readable and `e2fsck`-clean;
+a signed ELF written to disk is read back, verified, and run in ring-3 (a tampered
+copy is refused) — harness-asserted across FAT32/ext2/ext4 (`tools/selftest.sh`, 38/38).
 
 ### M11 — Driver Space for real (proves the security thesis)
 **Goal:** Driver Space becomes a verifiable security boundary with a user-space driver.

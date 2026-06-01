@@ -4,7 +4,8 @@ _Last updated: end of M9. Read this first to pick up exactly where we left off._
 
 ## Where we are
 
-- **Done through M9.** Latest tag **`M9_STABLE`**, HEAD commit **`ccb192e`**.
+- **Done through M10.** (Latest tag still `M9_STABLE`; M10 work committed on top.)
+- Through M9: tag **`M9_STABLE`**. M10 adds virtio-blk + FAT32/ext2/ext4 RW + run-from-disk.
 - Branches: work is on **`milestone/M7`**; **`main`** mirrors it (both at the same
   commit, pushed to `origin`). The branch name is historical — it actually holds
   everything through M9. Don't be confused by the name.
@@ -39,9 +40,9 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | M0–M6 | done | boot, paging/W^X, isolation, trapframe syscall, context switch |
 | M7 | done (`M7_STABLE`) | ring-3 + `SYS_YIELD` cooperative; fixed 4 bugs (notably clear `EFLAGS.NT` before `iretq`; private `PML4[0]` PDPT per space; ELF copy stride) |
 | M8 | done | preemptive sched + `SYS_EXIT`/reap + idle task + no leak (N=4/6); fixed `kfree` coalescing of non-contiguous blocks |
-| **M9** | **done (`M9_STABLE`)** | crypto (SHA-256/512 + Ed25519 verify), signing format+tools+gate, userland (crt0+libc), signed `hello` runs from VFS |
-| M10 | **next** | storage & persistence: virtio-blk + RW FAT32/ext2/ext4 via VFS; load programs from disk |
-| M11 | planned | Driver Space for real (user-space driver; ties `proc_type` + manifest DRIVER flag to the signature trust root — already designed) |
+| M9 | done (`M9_STABLE`) | crypto (SHA-256/512 + Ed25519 verify), signing format+tools+gate, userland (crt0+libc), signed `hello` runs from VFS |
+| **M10** | **done** | storage & persistence: virtio-blk (`vda`) + RW **FAT32/ext2/ext4** via VFS multi-mount (`/mnt`); `SYS_SPAWN`/`SYS_WAIT` + shell `run`; signed ELF written to disk → read → verify → ring-3. Harness 38/38. See `docs/devlog/M10.md` |
+| M11 | **next** | Driver Space for real (user-space driver; ties `proc_type` + manifest DRIVER flag to the signature trust root — already designed) |
 | M12–M13 | stretch | higher-half + buddy PMM + demand paging + UEFI hardening; shell-launches-programs + manifest enforcement |
 
 ## Build / test / run
@@ -50,7 +51,8 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 make                       # build kernel.bin (default; signing gate ENFORCED, dormant at boot)
 make iso                   # myos.iso (GRUB Multiboot2)
 make user-progs            # build + SIGN user/hello.c -> crypto/user_hello_elf.h (needs python3 + `cryptography`)
-tools/selftest.sh          # THE gate: builds M7/M8/M9 variants, asserts from debugcon. Expect 14/14.
+tools/selftest.sh          # THE gate: builds M7/M8/M9/M10 variants, asserts from debugcon. Expect 38/38.
+make disk-fat32            # 64MB test disk (also disk-ext2 / disk-ext4); make run-disk attaches it (-boot d!)
 tools/smoke.sh --mb2 -t 8 --log /tmp/x.log   # single boot; exit 124->0 = alive = PASS
 make run-serial            # interactive shell IN THE TERMINAL over COM1 (WSLg GUI is broken here; serial is the way)
 ```
@@ -80,16 +82,25 @@ framebuffer/serial, not debugcon — so harness assertions read debugcon only.
 - Talk to the user in **Italian**; all project content (code, comments, commits,
   docs) in **English only**.
 
-## Suggested first move next session (M10)
+## M10 recap (done)
 
-Storage & persistence. Concrete starting steps:
-1. A **virtio-blk** driver (MMIO/PCI) exposing `block_read/block_write` (QEMU
-   `-drive ...,if=virtio`); wire into `fs/block.c`.
-2. Make **FAT32, ext2 and ext4** **read-write** through the VFS over the block
-   device (all three are SECoS target filesystems).
-3. Mount a data FS at boot; load a **signed** program from disk (the signing gate
-   already verifies whatever `process_create_from_elf` is handed).
-4. Add `SYS_SPAWN <path>` / `SYS_WAIT` and a shell `run <path>` (loader/VFS/sig
-   plumbing is already in place from M9).
-Gate idea: write a file, reboot the VM, read it back identical; run a signed
-program loaded from the disk image — all harness-asserted.
+Storage & persistence is complete (`docs/devlog/M10.md`): virtio-blk (`vda`),
+VFS multi-mount (`/mnt`), FAT32 + ext2 + ext4 read-write (ext4 no-journal v0),
+`SYS_SPAWN`/`SYS_WAIT` + shell `run <path>` with the shell running as the
+scheduler idle task. Kernel writes are host-readable and `e2fsck`-clean; a signed
+ELF is written to disk, read back, verified and run in ring-3 (tampered refused).
+Harness 38/38.
+
+## Suggested first move next session (M11 — Driver Space for real)
+
+A user-space driver behind the capability boundary (`docs/DRIVER_SPACE.md`):
+1. Mark a process as a **driver** (`proc_type`) from its signed `.note.secos`
+   manifest DRIVER flag — the signature is the trust root for the claim.
+2. Give it capability-mediated HW access (the existing `SYS_DRIVER` mediation +
+   `driver_if.c`), denying anything outside its granted capabilities, with audit.
+3. Demonstrate one real user-space driver (e.g. a simple device) and assert the
+   boundary (an un-capabilitied access is refused) non-interactively.
+
+Open M10 follow-ups (not blocking M11): ext4 JBD2 journaling + `metadata_csum`;
+`SYS_WAIT` blocking semantics for a user caller (currently poll-style: 0=done,
+1=running); virtqueue revisit if the kernel moves higher-half (M12).

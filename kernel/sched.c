@@ -81,8 +81,11 @@ void sched_on_timer_tick(trapframe_t* tf) {
 
     if (current == idle_task) {
         // Idle is always safe to preempt: hand the CPU to a runnable user task.
+        // Save idle's interrupted context so that returning to it (after the
+        // user task exits) resumes where it was — this lets the interactive
+        // shell run as the idle task and get control back after `run`.
         process_t* next = pick_user(NULL);
-        if (next) { pic_eoi(); switch_to(next); }   // no need to save idle (restartable)
+        if (next) { if (idle_task->tf) save_tf(idle_task, tf); pic_eoi(); switch_to(next); }
         return;
     }
 

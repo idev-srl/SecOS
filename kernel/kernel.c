@@ -245,6 +245,76 @@ static void m9_run_demo(void) {
 }
 #endif /* M9_USER_DEMO */
 
+// ---- [M10] Interactive shell as the scheduler idle task ----
+// Running the shell as the idle task lets `run <path>` spawn a ring-3 process:
+// the timer preempts idle (shell) into the user task; on SYS_EXIT the scheduler
+// returns to the saved idle context, so the shell regains control.
+#if M10_RUN_DEMO
+#include "../crypto/user_hello_elf.h"
+#endif
+extern void shell_init(void);
+extern void shell_run(void);
+extern void shell_run_line(const char* line);
+static uint8_t   m10_idle_stack[32768] __attribute__((aligned(16)));
+static process_t m10_idle;
+static trapframe_t m10_idle_tf;
+
+__attribute__((noreturn)) static void m10_shell_idle_entry(void) {
+    shell_init();
+#if ENABLE_FB
+    extern void fb_console_draw_logo(void); fb_console_draw_logo();
+    extern void fb_console_flush(void); fb_console_flush();
+#endif
+#if M10_RUN_DEMO
+    // Non-interactive gate: write the embedded signed hello onto the disk FS,
+    // then run it back from disk (full chain: write->read->verify->ring3->exit).
+    {
+        extern int vfs_create(const char*, const void*, size_t);
+        extern int vfs_remove(const char*);
+        vfs_remove("/mnt/hello.elf");
+        if (vfs_create("/mnt/hello.elf", user_hello_elf, user_hello_elf_len) == 0)
+            debugcon_writestring("[M10] wrote signed hello.elf to disk\n");
+        else
+            debugcon_writestring("[M10] FAIL: could not write hello.elf to disk\n");
+        // Negative test: a tampered copy on disk must be REFUSED by the gate.
+        {
+            extern int ksys_spawn(const char*);
+            static uint8_t bad[8192];
+            for (size_t i = 0; i < user_hello_elf_len && i < sizeof(bad); i++) bad[i] = user_hello_elf[i];
+            bad[0x100] ^= 0x01; // flip a code byte -> signature mismatch
+            vfs_remove("/mnt/bad.elf");
+            vfs_create("/mnt/bad.elf", bad, user_hello_elf_len);
+            int br = ksys_spawn("/mnt/bad.elf");
+            debugcon_writestring(br < 0 ? "[M10] tampered disk ELF REFUSED (good)\n"
+                                        : "[M10] FAIL: tampered disk ELF accepted\n");
+        }
+        shell_run_line("run /mnt/hello.elf");
+    }
+#endif
+    shell_run();
+    for (;;) __asm__ volatile("hlt");
+}
+
+// Set up the shell idle task and enter the scheduler (does not return).
+static void m10_enter_shell(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    for (unsigned i=0;i<sizeof(m10_idle);i++)    ((uint8_t*)&m10_idle)[i]=0;
+    for (unsigned i=0;i<sizeof(m10_idle_tf);i++) ((uint8_t*)&m10_idle_tf)[i]=0;
+    m10_idle.pid = 0;
+    m10_idle.space = vmm_get_kernel_space();
+    m10_idle.kstack_top = (uint64_t)(m10_idle_stack + sizeof(m10_idle_stack));
+    m10_idle.tf = &m10_idle_tf;
+    m10_idle.state = PROC_RUNNING;
+    m10_idle_tf.rip = (uint64_t)m10_shell_idle_entry;
+    m10_idle_tf.cs = 0x08; m10_idle_tf.ss = 0x10; m10_idle_tf.rflags = 0x202;
+    m10_idle_tf.rsp = m10_idle.kstack_top;
+    sched_set_idle(&m10_idle);
+    sched_set_current(&m10_idle);
+    tss_set_kernel_stack(m10_idle.kstack_top);
+    arch_iret_to_tf(&m10_idle_tf); // does not return
+}
+
 // ---- Phase 2: runs on the new guarded kernel stack ----
 // Called by trampoline_switch_stack after RSP has been moved to M2_KSTACK_TOP.
 // Interrupts are still disabled; idt_init() will enable them.
@@ -394,46 +464,50 @@ static void kernel_main_phase2(void) {
             }
         }
     }
-    // Register ext2ram block device and attempt ext2 mount
-    extern int ext2ramdev_register(void); ext2ramdev_register();
-    extern int ext2_mount(const char* dev_name);
-    int ext2_res = ext2_mount("ext2ram");
-    if (ext2_res == 0) {
-        terminal_writestring("[EXT2] mount succeeded (stub, root replaced)\n");
-    } else {
+    // Root filesystem is always RAMFS.
+    {
         extern int vfs_mount_ramfs(void);
-        if (vfs_mount_ramfs() == 0) terminal_writestring("[VFS] root RAMFS fallback mounted\n");
-        else terminal_writestring("[VFS] fallback RAMFS FAIL\n");
+        if (vfs_mount_ramfs() == 0) terminal_writestring("[VFS] root RAMFS mounted\n");
+        else terminal_writestring("[VFS] root RAMFS FAIL\n");
     }
-    // Mount the virtio-blk disk's FAT32 filesystem at /mnt (multi-mount VFS).
+    // Mount the virtio-blk disk at /mnt: try FAT32, then ext2/ext4 (multi-mount).
     {
         extern int fat32_mount(const char* dev_name, const char* mount_point);
+        extern int ext2_mount(const char* dev_name, const char* mount_point);
         extern int vfs_remove(const char* path);
         extern int vfs_read_all(const char* path, void* buf, size_t bufsize);
         extern int vfs_create(const char* path, const void* data, size_t size);
-        if (block_find("vda") && fat32_mount("vda", "/mnt") == 0) {
-            debugcon_writestring("[M10] FAT32 mounted at /mnt\n");
-            // Read a file pre-populated on the host image (proves persisted read).
+        const char* fsname = 0;
+        if (block_find("vda")) {
+            if      (fat32_mount("vda", "/mnt") == 0) fsname = "FAT32";
+            else if (ext2_mount ("vda", "/mnt") == 0) fsname = "extN";
+        }
+        if (fsname) {
+            debugcon_writestring("[M10] disk mounted at /mnt fs=");
+            debugcon_writestring(fsname); debugcon_writestring("\n");
+            // Read a host-populated marker file (proves persisted read). FAT
+            // upcases to 8.3; ext keeps the lowercase name.
             static char rdbuf[64];
             for (int i = 0; i < 64; i++) rdbuf[i] = 0;
             int n = vfs_read_all("/mnt/HELLO.TXT", rdbuf, sizeof(rdbuf));
-            debugcon_writestring("[M10] read /mnt/HELLO.TXT n=");
+            if (n <= 0) { for (int i=0;i<64;i++) rdbuf[i]=0; n = vfs_read_all("/mnt/hello.txt", rdbuf, sizeof(rdbuf)); }
+            debugcon_writestring("[M10] read /mnt hello n=");
             debugcon_print_hex((uint64_t)n);
             if (n > 0) { debugcon_writestring(" data=\""); debugcon_writestring(rdbuf); debugcon_writestring("\""); }
             debugcon_writestring("\n");
             // Write a new file, read it back, verify byte-identical.
-            const char* msg = "SECoS FAT32 write OK\n";
+            const char* msg = "SECoS disk write OK\n";
             size_t mlen = 0; while (msg[mlen]) mlen++;
-            vfs_remove("/mnt/SECOS.TXT"); // ignore error if absent
-            int cr = vfs_create("/mnt/SECOS.TXT", msg, mlen);
+            vfs_remove("/mnt/secos_w.txt"); // ignore error if absent
+            int cr = vfs_create("/mnt/secos_w.txt", msg, mlen);
             static char back[64]; for (int i = 0; i < 64; i++) back[i] = 0;
-            int rn = vfs_read_all("/mnt/SECOS.TXT", back, sizeof(back));
+            int rn = vfs_read_all("/mnt/secos_w.txt", back, sizeof(back));
             int match = (cr == 0 && rn == (int)mlen);
             for (size_t i = 0; match && i < mlen; i++) if (back[i] != msg[i]) match = 0;
-            debugcon_writestring(match ? "[M10] FAT32 write+readback: OK\n"
-                                       : "[M10] FAT32 write+readback: FAIL\n");
+            debugcon_writestring(match ? "[M10] disk write+readback: OK\n"
+                                       : "[M10] disk write+readback: FAIL\n");
         } else {
-            debugcon_writestring("[M10] FAT32 mount skipped/failed (no vda?)\n");
+            debugcon_writestring("[M10] no disk mounted at /mnt (no vda?)\n");
         }
     }
 #if M9_USER_DEMO
@@ -523,13 +597,10 @@ static void kernel_main_phase2(void) {
 #endif
 #endif
 
-    shell_init();
-#if ENABLE_FB
-    extern void fb_console_draw_logo(void); fb_console_draw_logo();
-    extern void fb_console_flush(void); fb_console_flush();
-#endif
-    shell_run();
-    while (1) { __asm__ volatile ("hlt"); }
+    // Enter the interactive shell as the scheduler idle task (does not return).
+    // This enables `run <path>` to execute ring-3 programs and return to the
+    // shell on their exit.
+    m10_enter_shell();
 }
 
 // ---- Phase 1: runs on the old .bss stack from boot.asm ----

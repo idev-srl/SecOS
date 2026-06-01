@@ -30,5 +30,6 @@ typedef struct ext2_superblock {
     uint16_t magic; // 0xEF53
 } ext2_superblock_t;
 
-// Mount ext2 read-only from block device name; returns 0 on success
-int ext2_mount(const char* dev_name);
+// Mount ext2/ext4 (no-journal) read-write from block device name at the given
+// VFS mount point; returns 0 on success.
+int ext2_mount(const char* dev_name, const char* mount_point);

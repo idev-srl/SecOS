@@ -156,11 +156,17 @@ disk-fat32:
 	mcopy -i $(DISK_IMG) /tmp/secos_disktest.txt ::HELLO.TXT
 	@echo "disk-fat32: $(DISK_IMG) (FAT32, 64MB, contains HELLO.TXT)"
 disk-ext2:
+	rm -rf /tmp/secos_diskstage && mkdir -p /tmp/secos_diskstage
+	printf 'hello from disk\n' > /tmp/secos_diskstage/hello.txt
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
-	mkfs.ext2 -q -L SECOSDATA $(DISK_IMG)
+	mkfs.ext2 -q -L SECOSDATA -d /tmp/secos_diskstage $(DISK_IMG)
+	@echo "disk-ext2: $(DISK_IMG) (ext2, 64MB, contains hello.txt)"
 disk-ext4:
+	rm -rf /tmp/secos_diskstage && mkdir -p /tmp/secos_diskstage
+	printf 'hello from disk\n' > /tmp/secos_diskstage/hello.txt
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
-	mkfs.ext4 -q -O ^has_journal -L SECOSDATA $(DISK_IMG)
+	mkfs.ext4 -q -O ^has_journal,^metadata_csum -L SECOSDATA -d /tmp/secos_diskstage $(DISK_IMG)
+	@echo "disk-ext4: $(DISK_IMG) (ext4 no-journal/no-csum, extents+64bit, 64MB, hello.txt)"
 
 # Run with QEMU (graphical window — needs a working display backend)
 run: iso
