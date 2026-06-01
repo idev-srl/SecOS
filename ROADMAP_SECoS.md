@@ -102,7 +102,8 @@ path.
 **Goal:** load programs and persist data on a real disk.
 
 - virtio-blk driver exposing `block_read/block_write`.
-- FAT32 (and/or ext2) **read-write** through the VFS over the block device.
+- **FAT32, ext2 and ext4** **read-write** through the VFS over the block device
+  (all three are target filesystems for SECoS).
 - Mount a data filesystem at boot; load user programs from the disk image.
 
 **Depends:** M9. **Done when:** write a file, reboot the VM, read it back

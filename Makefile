@@ -33,6 +33,7 @@ SRC_C   = \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \
+	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
 	$(MM_DIR)/elf.c \
 	$(MM_DIR)/elf_unload.c \
@@ -142,9 +143,34 @@ user-progs:
 	python3 tools/elf2h.py user/hello.elf user_hello_elf crypto/user_hello_elf.h
 	@echo "user-progs: built+signed user/hello.elf -> crypto/user_hello_elf.h"
 
+# --- Test disk images (virtio-blk) ---
+# A small FAT32 data disk with a known test file. Used by the storage smoke
+# tests; attach with -drive file=$(DISK_IMG),if=virtio,format=raw.
+DISK_IMG = disk.img
+.PHONY: disk disk-fat32 disk-ext2 disk-ext4
+disk: disk-fat32
+disk-fat32:
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
+	mkfs.fat -F 32 -n SECOSDATA $(DISK_IMG) >/dev/null
+	printf 'hello from disk\n' > /tmp/secos_disktest.txt
+	mcopy -i $(DISK_IMG) /tmp/secos_disktest.txt ::HELLO.TXT
+	@echo "disk-fat32: $(DISK_IMG) (FAT32, 64MB, contains HELLO.TXT)"
+disk-ext2:
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
+	mkfs.ext2 -q -L SECOSDATA $(DISK_IMG)
+disk-ext4:
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
+	mkfs.ext4 -q -O ^has_journal -L SECOSDATA $(DISK_IMG)
+
 # Run with QEMU (graphical window — needs a working display backend)
 run: iso
 	qemu-system-x86_64 -cdrom $(ISO) -debugcon stdio -global isa-debugcon.iobase=0xe9
+
+# Run headless with a virtio-blk disk attached (debugcon to stdio).
+.PHONY: run-disk
+run-disk: iso
+	qemu-system-x86_64 -cdrom $(ISO) -drive file=$(DISK_IMG),if=virtio,format=raw \
+		-debugcon stdio -global isa-debugcon.iobase=0xe9 -display none -no-reboot -m 256M
 
 # Headless: interact with the shell entirely in this terminal over COM1.
 # No GUI/VNC needed (works where WSLg/GTK does not). Ctrl-A X to quit QEMU.

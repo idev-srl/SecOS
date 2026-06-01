@@ -15,9 +15,14 @@ typedef struct block_dev {
     uint64_t sector_count; // total sectors
     // Read sectors: returns number of sectors read or -1
     int (*read)(struct block_dev* dev, uint64_t lba, void* buf, uint32_t count);
+    // Write sectors: returns number of sectors written or -1 (NULL if read-only)
+    int (*write)(struct block_dev* dev, uint64_t lba, const void* buf, uint32_t count);
 } block_dev_t;
 
 // Register a block device (returns 0 OK, -1 fail). Max small fixed table.
 int block_register(block_dev_t* dev);
 // Find device by name
 block_dev_t* block_find(const char* name);
+// Convenience wrappers: returns sectors transferred or -1 (write -1 if read-only).
+int block_read(block_dev_t* dev, uint64_t lba, void* buf, uint32_t count);
+int block_write(block_dev_t* dev, uint64_t lba, const void* buf, uint32_t count);

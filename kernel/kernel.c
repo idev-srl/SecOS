@@ -40,6 +40,7 @@
 #include "panic.h"
 #include "driver_if.h" // driver registry init
 #include "debugcon.h"   // ISA debugcon boot markers (port 0xE9)
+#include "block.h"      // block device registry (virtio-blk smoke check)
 #include "selftest.h"   // M4 isolation selftest
 #include "process.h"    // M6 ring3 entry
 #if CONFIG_UEFI
@@ -361,6 +362,38 @@ static void kernel_main_phase2(void) {
     extern int ramfs_init(void); ramfs_init();
     // Initialize VFS
     extern void vfs_init(void); vfs_init();
+    // Probe for a virtio-blk disk (QEMU -drive if=virtio). Optional: absent on
+    // the plain ISO boot. Read sector 0 as a smoke check (logged on debugcon).
+    {
+        extern int virtio_blk_init(void);
+        extern block_dev_t* block_find(const char* name);
+        if (virtio_blk_init() == 0) {
+            block_dev_t* vda = block_find("vda");
+            if (vda) {
+                static uint8_t s0[512];
+                int r = vda->read(vda, 0, s0, 1);
+                debugcon_writestring("[M10] virtio-blk read sector0 r=");
+                debugcon_print_hex((uint64_t)r);
+                debugcon_writestring(" bytes[0..3]=");
+                debugcon_print_hex(((uint64_t)s0[0]<<24)|((uint64_t)s0[1]<<16)|((uint64_t)s0[2]<<8)|s0[3]);
+                debugcon_writestring("\n");
+#if M10_BLK_WRITE_TEST
+                /* Write a pattern to a high scratch sector, read it back. */
+                if (vda->write) {
+                    static uint8_t wb[512], rb[512];
+                    for (int i = 0; i < 512; i++) wb[i] = (uint8_t)(i ^ 0xA5);
+                    uint64_t scratch = (vda->sector_count > 1) ? (vda->sector_count - 1) : 0;
+                    int wr = vda->write(vda, scratch, wb, 1);
+                    int rr = vda->read(vda, scratch, rb, 1);
+                    int ok = (wr == 1 && rr == 1);
+                    for (int i = 0; ok && i < 512; i++) if (rb[i] != wb[i]) ok = 0;
+                    debugcon_writestring(ok ? "[M10] virtio-blk write+readback: OK\n"
+                                            : "[M10] virtio-blk write+readback: FAIL\n");
+                }
+#endif
+            }
+        }
+    }
     // Register ext2ram block device and attempt ext2 mount
     extern int ext2ramdev_register(void); ext2ramdev_register();
     extern int ext2_mount(const char* dev_name);
@@ -371,6 +404,37 @@ static void kernel_main_phase2(void) {
         extern int vfs_mount_ramfs(void);
         if (vfs_mount_ramfs() == 0) terminal_writestring("[VFS] root RAMFS fallback mounted\n");
         else terminal_writestring("[VFS] fallback RAMFS FAIL\n");
+    }
+    // Mount the virtio-blk disk's FAT32 filesystem at /mnt (multi-mount VFS).
+    {
+        extern int fat32_mount(const char* dev_name, const char* mount_point);
+        extern int vfs_remove(const char* path);
+        extern int vfs_read_all(const char* path, void* buf, size_t bufsize);
+        extern int vfs_create(const char* path, const void* data, size_t size);
+        if (block_find("vda") && fat32_mount("vda", "/mnt") == 0) {
+            debugcon_writestring("[M10] FAT32 mounted at /mnt\n");
+            // Read a file pre-populated on the host image (proves persisted read).
+            static char rdbuf[64];
+            for (int i = 0; i < 64; i++) rdbuf[i] = 0;
+            int n = vfs_read_all("/mnt/HELLO.TXT", rdbuf, sizeof(rdbuf));
+            debugcon_writestring("[M10] read /mnt/HELLO.TXT n=");
+            debugcon_print_hex((uint64_t)n);
+            if (n > 0) { debugcon_writestring(" data=\""); debugcon_writestring(rdbuf); debugcon_writestring("\""); }
+            debugcon_writestring("\n");
+            // Write a new file, read it back, verify byte-identical.
+            const char* msg = "SECoS FAT32 write OK\n";
+            size_t mlen = 0; while (msg[mlen]) mlen++;
+            vfs_remove("/mnt/SECOS.TXT"); // ignore error if absent
+            int cr = vfs_create("/mnt/SECOS.TXT", msg, mlen);
+            static char back[64]; for (int i = 0; i < 64; i++) back[i] = 0;
+            int rn = vfs_read_all("/mnt/SECOS.TXT", back, sizeof(back));
+            int match = (cr == 0 && rn == (int)mlen);
+            for (size_t i = 0; match && i < mlen; i++) if (back[i] != msg[i]) match = 0;
+            debugcon_writestring(match ? "[M10] FAT32 write+readback: OK\n"
+                                       : "[M10] FAT32 write+readback: FAIL\n");
+        } else {
+            debugcon_writestring("[M10] FAT32 mount skipped/failed (no vda?)\n");
+        }
     }
 #if M9_USER_DEMO
     m9_run_demo(); // signed-userland demo (needs VFS) — does not return

@@ -63,6 +63,10 @@ void vfs_init(void);
 int vfs_mount_root(const vfs_fs_ops_t* ops, const char* fs_name);
 // Replace current root FS (unmount old conceptually). Returns 0 success.
 int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name);
+// Mount a filesystem at an absolute mount point (e.g. "/mnt"). Returns 0 success.
+int vfs_mount(const char* mount_point, const vfs_fs_ops_t* ops, const char* fs_name);
+// Unmount the filesystem at the given mount point. Returns 0 success.
+int vfs_unmount(const char* mount_point);
 // Lookup inode by absolute path
 vfs_inode_t* vfs_lookup(const char* path);
 // Iterate directory children

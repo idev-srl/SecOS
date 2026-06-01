@@ -144,7 +144,8 @@ captures it); an **unsigned/tampered** ELF is **refused** by the loader; with
 ### Phase D — Storage & persistence
 **Milestone:** M10
 - **virtio-blk** driver (MMIO/PCI) exposing `block_read/block_write`.
-- Wire FAT32 (and/or ext2) **read-write** through the VFS over the block device.
+- Wire **FAT32, ext2 and ext4** **read-write** through the VFS over the block
+  device (all three are target filesystems for SECoS).
 - Load user programs from the disk image; mount the data FS at boot.
 
 **Gate:** write a file, reboot the VM, read it back identical; run a program

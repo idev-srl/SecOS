@@ -40,7 +40,7 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | M7 | done (`M7_STABLE`) | ring-3 + `SYS_YIELD` cooperative; fixed 4 bugs (notably clear `EFLAGS.NT` before `iretq`; private `PML4[0]` PDPT per space; ELF copy stride) |
 | M8 | done | preemptive sched + `SYS_EXIT`/reap + idle task + no leak (N=4/6); fixed `kfree` coalescing of non-contiguous blocks |
 | **M9** | **done (`M9_STABLE`)** | crypto (SHA-256/512 + Ed25519 verify), signing format+tools+gate, userland (crt0+libc), signed `hello` runs from VFS |
-| M10 | **next** | storage & persistence: virtio-blk + RW FAT32/ext2 via VFS; load programs from disk |
+| M10 | **next** | storage & persistence: virtio-blk + RW FAT32/ext2/ext4 via VFS; load programs from disk |
 | M11 | planned | Driver Space for real (user-space driver; ties `proc_type` + manifest DRIVER flag to the signature trust root — already designed) |
 | M12–M13 | stretch | higher-half + buddy PMM + demand paging + UEFI hardening; shell-launches-programs + manifest enforcement |
 
@@ -85,7 +85,8 @@ framebuffer/serial, not debugcon — so harness assertions read debugcon only.
 Storage & persistence. Concrete starting steps:
 1. A **virtio-blk** driver (MMIO/PCI) exposing `block_read/block_write` (QEMU
    `-drive ...,if=virtio`); wire into `fs/block.c`.
-2. Make FAT32 (or ext2) **read-write** through the VFS over the block device.
+2. Make **FAT32, ext2 and ext4** **read-write** through the VFS over the block
+   device (all three are SECoS target filesystems).
 3. Mount a data FS at boot; load a **signed** program from disk (the signing gate
    already verifies whatever `process_create_from_elf` is handed).
 4. Add `SYS_SPAWN <path>` / `SYS_WAIT` and a shell `run <path>` (loader/VFS/sig
