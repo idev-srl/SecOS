@@ -8,6 +8,7 @@
 #include "multiboot.h"
 #include "multiboot2.h"
 #include "terminal.h"
+#include "debugcon.h"
 // print_hex definita in kernel, forward decl per debug
 extern void print_hex(uint64_t value);
 
@@ -42,14 +43,50 @@ static inline bool bitmap_test(uint32_t frame) {
     return (frame_bitmap[idx] & (1 << bit)) != 0;
 }
 
-// Find first free frame
-static uint32_t find_free_frame(void) {
-    for (uint32_t i = 0; i < total_frames; i++) {
-        if (!bitmap_test(i)) {
-            return i;
+// [M12] Rolling hint so allocation does not rescan from frame 0 every time.
+static uint64_t next_free_hint = 0;
+
+// Find first free frame at or after `start`, skipping fully-used 32-bit words.
+static uint32_t find_free_frame_from(uint64_t start) {
+    uint64_t i = start;
+    // Align scan to word boundary for the skip fast-path.
+    while (i < total_frames && (i % 32) != 0) {
+        if (!bitmap_test((uint32_t)i)) return (uint32_t)i;
+        i++;
+    }
+    uint64_t words = (total_frames + 31) / 32;
+    for (uint64_t w = i / 32; w < words; w++) {
+        if (frame_bitmap[w] == 0xFFFFFFFFu) continue; // whole word used
+        uint32_t base = (uint32_t)(w * 32);
+        for (uint32_t b = 0; b < 32; b++) {
+            uint32_t f = base + b;
+            if (f >= total_frames) return (uint32_t)-1;
+            if (!bitmap_test(f)) return f;
         }
     }
     return (uint32_t)-1;
+}
+
+// Find first free frame (wraps using the rolling hint).
+static uint32_t find_free_frame(void) {
+    uint32_t f = find_free_frame_from(next_free_hint);
+    if (f == (uint32_t)-1 && next_free_hint != 0) f = find_free_frame_from(0);
+    return f;
+}
+
+// Find the base of a run of `count` contiguous free frames, or -1.
+static uint64_t find_free_run(size_t count) {
+    if (count == 0) return (uint64_t)-1;
+    uint64_t run = 0, run_start = 0;
+    for (uint64_t f = 0; f < total_frames; f++) {
+        if (!bitmap_test((uint32_t)f)) {
+            if (run == 0) run_start = f;
+            if (++run == count) return run_start;
+        } else {
+            run = 0;
+        }
+    }
+    return (uint64_t)-1;
 }
 
 // Convert number to decimal string
@@ -86,12 +123,17 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
         if (end > max_addr) max_addr = end;
         total_memory += regions[i].len;
     }
-    // Build bitmap of frames
-    // Limit frames actually identity-mapped early (512MB => 256 * 2MB)
-    uint64_t mapped_limit = 512ULL * 1024 * 1024;
+    // Build bitmap of frames.
+    // [M12] Manage ALL reported RAM (the physmap at VMM_PHYSMAP_BASE maps it all,
+    // and the heap/page-tables address frames via phys_to_virt). The old 512 MB
+    // total_frames clamp + 128 MB identity-region clamps are gone. We keep a
+    // defensive cap so a pathological/sparse memory map cannot blow the bitmap,
+    // which lives at _kernel_end inside the 512 MB identity window: cap the
+    // bitmap at 32 MB → up to ~1 TB of RAM, comfortably within identity.
     total_frames = (max_addr + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE; // round up
-    uint64_t mapped_frames_limit = mapped_limit / PMM_FRAME_SIZE;
-    if (total_frames > mapped_frames_limit) total_frames = mapped_frames_limit;
+    const uint64_t MAX_BITMAP_BYTES = 32ULL * 1024 * 1024;
+    uint64_t max_frames_for_bitmap = MAX_BITMAP_BYTES * 8;
+    if (total_frames > max_frames_for_bitmap) total_frames = max_frames_for_bitmap;
     max_phys_addr_seen = max_addr;
     uint64_t bitmap_size = (total_frames + 7) / 8; // bytes rounded up
     terminal_writestring("[PMM] max_addr="); print_hex(max_addr); terminal_writestring(" total_frames="); {
@@ -110,10 +152,7 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
     for (int r=0;r<region_count;r++) {
         uint64_t start_frame = regions[r].addr / PMM_FRAME_SIZE;
         uint64_t end_frame   = (regions[r].addr + regions[r].len) / PMM_FRAME_SIZE;
-        if (end_frame > total_frames) end_frame = total_frames; // clamp to discovered limit
-    // Do not free frames beyond current identity mapping limit
-        uint64_t mapped_frames = mapped_limit / PMM_FRAME_SIZE;
-        if (end_frame > mapped_frames) end_frame = mapped_frames;
+        if (end_frame > total_frames) end_frame = total_frames; // clamp to bitmap extent
         if (regions[r].len == 0) continue;
     // Compact region log (index and size in MB)
     terminal_writestring("[PMM] region "); { char b[32]; itoa_dec(r, b); terminal_writestring(b); }
@@ -135,7 +174,7 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
     if (used_frames == 0 || used_frames == total_frames || pmm_get_free_memory() == 0) {
         terminal_writestring("[PMM][WARN] Nessun frame libero dalle regioni; applico fallback sintetico\n");
         uint64_t fallback_start = ((uint64_t)frame_bitmap + bitmap_size + PMM_FRAME_SIZE -1) & ~(PMM_FRAME_SIZE-1);
-        uint64_t fallback_end = mapped_limit;
+        uint64_t fallback_end = total_frames * PMM_FRAME_SIZE;
         uint64_t start_f = fallback_start / PMM_FRAME_SIZE;
         uint64_t end_f = fallback_end / PMM_FRAME_SIZE;
         if (end_f > total_frames) end_f = total_frames;
@@ -151,6 +190,14 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
     terminal_writestring("[OK] PMM initialized\n");
     pmm_print_stats();
+    // [M12] debugcon report so memory scalability is verifiable non-interactively.
+    debugcon_writestring("[PMM] total_MB=");
+    debugcon_print_hex(total_memory / 1024 / 1024);
+    debugcon_writestring(" free_MB=");
+    debugcon_print_hex(pmm_get_free_memory() / 1024 / 1024);
+    debugcon_writestring(" frames=");
+    debugcon_print_hex(total_frames);
+    debugcon_writestring("\n");
 }
 
 uint64_t pmm_get_max_phys(void) { return max_phys_addr_seen; }
@@ -185,15 +232,8 @@ void pmm_init(void* mboot_info_ptr) {
         }
         mmap = (struct multiboot_mmap_entry*)((uint64_t)mmap + mmap->size + sizeof(mmap->size));
     }
-    // Clamp region length to 128MB identity map for early phase
-    uint64_t identity_limit = 128ULL * 1024 * 1024;
-    for (int r=0; r<rc; r++) {
-        uint64_t end = regions[r].addr + regions[r].len;
-        if (end > identity_limit) {
-            if (regions[r].addr >= identity_limit) { regions[r].len = 0; }
-            else regions[r].len = identity_limit - regions[r].addr;
-        }
-    }
+    // [M12] No 128 MB identity clamp: the physmap covers all RAM and frames are
+    // addressed via phys_to_virt. pmm_build_from_regions caps the bitmap defensively.
     pmm_build_from_regions(regions, rc);
 }
 
@@ -274,14 +314,7 @@ void pmm_init_uefi(void* mem_descs, uint64_t desc_count, uint64_t desc_size, uin
         terminal_writestring("[UEFI][PMM][WARN] Nessuna regione EfiConventionalMemory, fallback sintetico\n");
         struct avail_region fr[1]; fr[0].addr = 0x00100000ULL; fr[0].len = 63ULL * 1024 * 1024; pmm_build_from_regions(fr, 1); return;
     }
-    // Clamp identità early come percorso MB2
-    uint64_t identity_limit = 128ULL * 1024 * 1024;
-    for (int r=0; r<rc; r++) {
-        uint64_t end = regions[r].addr + regions[r].len;
-        if (end > identity_limit) {
-            if (regions[r].addr >= identity_limit) regions[r].len = 0; else regions[r].len = identity_limit - regions[r].addr;
-        }
-    }
+    // [M12] No 128 MB identity clamp (physmap covers all RAM; see pmm_init).
     pmm_build_from_regions(regions, rc);
     terminal_writestring("[UEFI][PMM] Inizializzazione da descriptors completata\n");
 }
@@ -289,27 +322,49 @@ void pmm_init_uefi(void* mem_descs, uint64_t desc_count, uint64_t desc_size, uin
 // Allocate one physical frame
 void* pmm_alloc_frame(void) {
     uint32_t frame = find_free_frame();
-    
+
     if (frame == (uint32_t)-1) {
     return NULL;  // Out of memory
     }
-    
+
     bitmap_set(frame);
     used_frames++;
-    
+    next_free_hint = (uint64_t)frame + 1; // [M12] advance rolling hint
+
     return (void*)((uint64_t)frame * PMM_FRAME_SIZE);
+}
+
+// [M12] Allocate `count` physically-contiguous frames.
+void* pmm_alloc_contiguous(size_t count) {
+    if (count == 0) return NULL;
+    if (count == 1) return pmm_alloc_frame();
+    uint64_t base = find_free_run(count);
+    if (base == (uint64_t)-1) return NULL; // no contiguous run
+    for (uint64_t f = base; f < base + count; f++) { bitmap_set((uint32_t)f); used_frames++; }
+    next_free_hint = base + count;
+    return (void*)(base * PMM_FRAME_SIZE);
+}
+
+// [M12] Free `count` contiguous frames.
+void pmm_free_contiguous(void* addr, size_t count) {
+    uint64_t base = (uint64_t)addr / PMM_FRAME_SIZE;
+    for (uint64_t f = base; f < base + count; f++) {
+        if (bitmap_test((uint32_t)f)) { bitmap_clear((uint32_t)f); used_frames--; }
+    }
+    if (base < next_free_hint) next_free_hint = base; // reuse freed space sooner
 }
 
 // Free a physical frame
 void pmm_free_frame(void* addr) {
     uint32_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
-    
+
     if (!bitmap_test(frame)) {
     return;  // Already free
     }
-    
+
     bitmap_clear(frame);
     used_frames--;
+    if (frame < next_free_hint) next_free_hint = frame; // [M12] reuse sooner
 }
 
 // Get total memory (sum of regions)

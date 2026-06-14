@@ -23,6 +23,14 @@ void pmm_init_uefi(void* mem_descs, uint64_t desc_count, uint64_t desc_size, uin
 // Allocate a physical frame
 void* pmm_alloc_frame(void);
 
+// [M12] Allocate `count` physically-contiguous frames; returns the base
+// physical address, or NULL if no run of that length is free. Used by the heap
+// to back allocations larger than one frame (the physmap maps contiguous
+// physical memory to contiguous virtual memory, so this yields a usable region).
+void* pmm_alloc_contiguous(size_t count);
+// [M12] Free `count` frames previously returned by pmm_alloc_contiguous.
+void pmm_free_contiguous(void* addr, size_t count);
+
 // Free a physical frame
 void pmm_free_frame(void* addr);
 

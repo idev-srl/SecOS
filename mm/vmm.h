@@ -43,6 +43,8 @@ void vmm_init(void);
 // Map a 4K page (create tables if needed)
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags);
 int vmm_map_in_space(vmm_space_t* space, uint64_t virt, uint64_t phys, uint64_t flags);
+// [M12] W^X self-test (logs [WX] marker; a W+X request must be refused).
+void vmm_wx_selftest(void);
 
 // Unmap a 4K page
 int vmm_unmap(uint64_t virt);

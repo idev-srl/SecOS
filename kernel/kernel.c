@@ -260,18 +260,22 @@ static void m9_run_demo(void) {
 #include "trapframe.h"
 #include "../crypto/user_driver_elf.h"
 #include "../crypto/user_userprobe_elf.h"
+extern int vfs_create(const char* path, const void* data, size_t size);
+extern int vfs_read_all(const char* path, void* buf, size_t bufsize);
 
 static uint8_t m11_idle_stack[16384] __attribute__((aligned(16)));
+static uint8_t m11_loadbuf[16384];
 static int     m11_step = 0, m11_done = 0;
 
-// Load the embedded signed ELF directly. We deliberately avoid the VFS/ramfs
-// roundtrip here: ramfs copies file data with a single kmalloc(), and the M11
-// allocator (mm/heap.c) can only serve allocations up to one frame (~4 KB)
-// reliably (a buddy allocator is an M12 item), so copying a ~7 KB ELF is
-// non-deterministic. process_create_from_elf still signature-verifies the
-// image, so the trust root is unchanged.
-static void m11_spawn(const uint8_t* img, size_t len, const char* what) {
-    process_t* p = process_create_from_elf(img, len);
+// Load the signed ELF back from the VFS (ramfs). Since M12 the heap serves
+// multi-frame allocations, so ramfs can store a ~8 KB ELF intact — this loads
+// the same path that silently corrupted under the M11-era one-frame heap.
+static void m11_spawn(const char* path, const char* what) {
+    int n = vfs_read_all(path, m11_loadbuf, sizeof(m11_loadbuf));
+    debugcon_writestring("[M11] loaded "); debugcon_writestring(path);
+    debugcon_writestring(" bytes="); debugcon_print_hex((uint64_t)(uint32_t)n);
+    debugcon_writestring("\n");
+    process_t* p = (n > 0) ? process_create_from_elf(m11_loadbuf, (size_t)n) : 0;
     if (p) {
         p->state = PROC_READY;
         debugcon_writestring("[M11] spawned "); debugcon_writestring(what);
@@ -290,11 +294,11 @@ __attribute__((noreturn)) static void m11_idle_entry(void) {
         if (m11_step == 0) {
             m11_step = 1;
             debugcon_writestring("[M11] --- driver-type probe (granted dev0) ---\n");
-            m11_spawn(user_driver_elf, user_driver_elf_len, "driver");
+            m11_spawn("/bin/driver", "driver");
         } else if (m11_step == 1 && sched_count_alive_user() == 0) {
             m11_step = 2;
             debugcon_writestring("[M11] --- user-type probe (no driver rights) ---\n");
-            m11_spawn(user_userprobe_elf, user_userprobe_elf_len, "userprobe");
+            m11_spawn("/bin/userprobe", "userprobe");
         } else if (m11_step == 2 && sched_count_alive_user() == 0 && !m11_done) {
             m11_done = 1;
             debugcon_writestring("[M11] DONE\n");
@@ -307,6 +311,12 @@ static void m11_run_demo(void) {
     extern void tss_set_kernel_stack(uint64_t);
     extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
     debugcon_writestring("[M11] driver space demo\n");
+    // [M12] Publish the signed ELFs into the VFS; the M12 heap makes the
+    // large-file ramfs copy reliable (closes the M11 gotcha).
+    if (vfs_create("/bin/driver", user_driver_elf, user_driver_elf_len) != 0)
+        debugcon_writestring("[M11] WARN: vfs_create /bin/driver failed\n");
+    if (vfs_create("/bin/userprobe", user_userprobe_elf, user_userprobe_elf_len) != 0)
+        debugcon_writestring("[M11] WARN: vfs_create /bin/userprobe failed\n");
 
     static process_t  idle; static trapframe_t idle_tf;
     for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
@@ -428,6 +438,26 @@ static void kernel_main_phase2(void) {
     // [M9] Crypto known-answer self-tests (SHA-256, Ed25519 verify). Cheap; the
     // signing trust root depends on these being correct.
     { extern int crypto_selftest(void); crypto_selftest(); }
+
+    // [M12] W^X runtime gate self-test: a W+X mapping request must be refused.
+    vmm_wx_selftest();
+
+    // [M12] Heap large-allocation self-test: kmalloc > one frame must return a
+    // correctly-sized, writable region (multi-frame contiguous backing) — the
+    // M11 gotcha. Write a pattern across the whole block and read it back.
+    {
+        extern void* kmalloc(size_t); extern void kfree(void*);
+        size_t big = 64 * 1024; // 16 frames
+        uint8_t* p = (uint8_t*)kmalloc(big);
+        int ok = (p != 0);
+        if (ok) {
+            for (size_t i = 0; i < big; i++) p[i] = (uint8_t)(i * 31 + 7);
+            for (size_t i = 0; i < big && ok; i++) if (p[i] != (uint8_t)(i * 31 + 7)) ok = 0;
+            kfree(p);
+        }
+        debugcon_writestring(ok ? "[HEAP] large kmalloc(64K) OK\n"
+                                : "[HEAP] FAIL: large kmalloc(64K)\n");
+    }
 
     // [M7] Cooperative scheduling demo — two ring3 processes yielding to each
     // other via SYS_YIELD.  Disabled by default so normal boot reaches the

@@ -4,11 +4,12 @@ Single, linear milestone scheme (M0 → present → future). Earlier revisions o
 this file mixed two conflicting numbering schemes (the executed git milestones
 and an older pre-analysis plan); that has been collapsed into one timeline.
 
-- **Done:** M0–M11 (M10 = storage & persistence: virtio-blk + RW FAT32/ext2/ext4;
-  M11 = Driver Space for real: signature-rooted `proc_type` + capability-mediated
-  `SYS_DRIVER` with a signed user-space driver). Harness 47/47.
+- **Done:** M0–M12 (M11 = Driver Space for real: signature-rooted `proc_type` +
+  capability-mediated `SYS_DRIVER`; M12 core = memory scalability — PMM manages
+  all RAM, physmap-addressed multi-frame heap — + W^X hard gate). Harness 51/51.
 - **In progress:** —
-- **Planned:** M12 (higher-half + buddy/multi-frame allocator + demand paging)
+- **Planned:** M13 (usability & policy: shell launches on-disk programs +
+  end-to-end manifest enforcement)
 
 Per-milestone implementation notes live in `docs/devlog/M*.md`. The detailed
 execution plan — mission, definition of done, per-phase acceptance gates, and
@@ -134,20 +135,27 @@ copy is refused) — harness-asserted across FAT32/ext2/ext4 (`tools/selftest.sh
 capability violation is denied **and** audited; a USER process is refused.
 See `docs/devlog/M11.md`. Harness 47/47.
 
-### M12 — Hardening & memory scalability (stretch)
+### M12 — Hardening & memory scalability — **CORE DONE**
 **Goal:** the kernel manages all RAM, runs higher-half, and UEFI handoff is firmware-safe.
 
-- Higher-half kernel at `0xFFFFFFFF80000000`; drop the low identity map after the
-  switch; update linker script, bootloader PML4 entry, residual physical casts.
-- PMM scalability: replace the linear bitmap scan with a free-list/buddy
-  allocator; remove the 128 MB / 512 MB clamps (test with QEMU `-m 2G`).
-- Complete demand paging with per-process limits.
-- UEFI handoff hardening: real 4 KB post-EBS ELF mapping with W^X; copy
-  `secos_boot_info` + memory map into a kernel-owned frame; re-audit PMM bitmap
-  placement at `_kernel_end`. Full W^X audit.
+- **Done — PMM scalability**: removed the 128 MB / 512 MB clamps (kernel manages
+  all RAM via the physmap; frames above the identity window are addressed by
+  `phys_to_virt`). `find_free_frame` skips full bitmap words from a rolling
+  cursor; `pmm_alloc_contiguous` backs multi-frame allocations. `-m 2G` → ~2045
+  MB free.
+- **Done — heap**: physmap-addressed + multi-frame `expand_heap` +
+  `kmalloc` NULL-on-fail (fixes the M11 >4 KB gotcha; the M11 demo loads via VFS
+  again).
+- **Done — W^X hard gate**: `vmm_map`/`vmm_map_in_space` reject RW-without-NX;
+  boot self-test asserts a W+X request is refused.
+- **Deferred** (rationale in `docs/devlog/M12.md`): higher-half kernel relocation
+  (physmap already gives high-half access to all RAM; relocation would touch both
+  boot paths + virtio DMA's `phys==virt`); full demand paging (`vmm_region` path
+  dormant); UEFI handoff hardening; W^X of the 0–512 MB identity huge-page map.
 
-**Depends:** M11. **Done when:** UEFI boot on real firmware; PMM reports >512 MB
-free on a 2 GB VM; a W+X page request is rejected (panic/#GP).
+**Depends:** M11. **Done when (met):** PMM reports >512 MB free on a 2 GB VM; a
+W+X page request is rejected. (UEFI-on-real-firmware deferred.) Harness 51/51.
+See `docs/devlog/M12.md`.
 
 ### M13 — Usability & policy enforcement (stretch)
 **Goal:** a usable system with end-to-end manifest policy.

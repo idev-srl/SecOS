@@ -8,6 +8,7 @@
 #include "pmm.h"
 #include "terminal.h"
 #include "panic.h"
+#include "debugcon.h"
 #include "heap.h" // kmalloc/kfree
 
 // Basic page table constants
@@ -840,6 +841,13 @@ void vmm_init_physmap(void) {
 
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
     if (virt & 0xFFF || phys & 0xFFF) return -1; // not aligned
+    // [M12] W^X hard gate: never map a page writable AND executable. A page is
+    // executable when NX (bit 63) is clear; writable when RW is set. Reject the
+    // call rather than relying on callers/the ELF loader alone.
+    if ((flags & VMM_FLAG_RW) && !(flags & VMM_FLAG_NOEXEC)) {
+        terminal_writestring("[VMM][WX] POLICY VIOLATION: W+X mapping rejected\n");
+        return -5;
+    }
     // [M3] Supervisor enforcement: kernel-canonical VAs (>= 0xFFFF800000000000)
     // must NEVER carry VMM_FLAG_USER.  Reject the call and log the violation.
     if ((flags & VMM_FLAG_USER) && (virt >= 0xFFFF800000000000ULL)) {
@@ -857,6 +865,11 @@ int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
 int vmm_map_in_space(vmm_space_t* space, uint64_t virt, uint64_t phys, uint64_t flags) {
     if (!space) return -10;
     if (virt & 0xFFF || phys & 0xFFF) return -1; // not aligned
+    /* [M12] W^X hard gate: reject writable+executable mappings (see vmm_map). */
+    if ((flags & VMM_FLAG_RW) && !(flags & VMM_FLAG_NOEXEC)) {
+        terminal_writestring("[VMM][WX] POLICY VIOLATION: W+X mapping rejected (space)\n");
+        return -5;
+    }
     /* [M4] Supervisor enforcement: mirror vmm_map() policy.
      * Kernel-canonical VAs must never carry VMM_FLAG_USER. */
     if ((flags & VMM_FLAG_USER) && (virt >= 0xFFFF800000000000ULL)) {
@@ -930,6 +943,15 @@ int vmm_alloc_page_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
 }
 
 vmm_space_t* vmm_get_kernel_space(void) { return &kernel_space; }
+
+// [M12] W^X self-test: a writable+executable mapping request must be refused by
+// the vmm_map gate. The check fires before any page-table walk, so passing an
+// already-mapped scratch VA has no side effects. Logs a [WX] marker.
+void vmm_wx_selftest(void) {
+    int r = vmm_map(VMM_PHYSMAP_BASE, 0x100000ULL, VMM_FLAG_RW); // RW, no NX => W+X
+    if (r == -5) debugcon_writestring("[WX] W+X mapping rejected (good)\n");
+    else         debugcon_writestring("[WX] FAIL: W+X mapping accepted\n");
+}
 
 vmm_space_t* vmm_clone_space(vmm_space_t* src) {
     (void)src; return NULL; // cloning stub (not implemented)

@@ -1,15 +1,14 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: end of M11 (Driver Space for real). Read this first._
+_Last updated: end of M12 (memory scalability + W^X hard gate). Read this first._
 
 ## Where we are
 
-- **Done through M11.** HEAD = **`c84d968`** on branch **`milestone/M7`**
-  (historical name; actually holds everything through M10). Tag `M9_STABLE` is the
-  last tag. **M11 is staged in the working tree, NOT yet committed** (commit/push
-  when the user asks).
+- **Done through M12.** Branch **`milestone/M7`** (historical name). Tag
+  `M9_STABLE` is the last tag. M11 committed (`a2ef931`). **M12 is staged in the
+  working tree, NOT yet committed** (commit/push when the user asks).
 - Build is green: `make` clean (no warnings), and the full self-test harness
-  `tools/selftest.sh` is **47/47** (M4 + crypto + M7 + M8 + M9 + M10×{fat32,ext2,ext4} + M11).
+  `tools/selftest.sh` is **51/51** (M4 + crypto + M7 + M8 + M9 + M10×{fat32,ext2,ext4} + M11 + M12).
 - Only `edk2/` is untracked (a large vendored tree, not part of the build) — leave it.
   Local build artifacts `secos-uefi.{img,vmdk}` and `disk.img` are gitignored.
 
@@ -42,9 +41,9 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | M8 | done | preemptive sched + `SYS_EXIT`/reap + idle task + no leak (N=4/6); fixed `kfree` coalescing of non-contiguous blocks |
 | M9 | done (`M9_STABLE`) | crypto (SHA-256/512 + Ed25519 verify), signing format+tools+gate, userland (crt0+libc), signed `hello` runs from VFS |
 | M10 | done | storage & persistence: virtio-blk (`vda`) + RW **FAT32/ext2/ext4** via VFS multi-mount (`/mnt`); `SYS_SPAWN`/`SYS_WAIT` + shell `run`; signed ELF written to disk → read → verify → ring-3. See `docs/devlog/M10.md` |
-| **M11** | **done** | Driver Space for real: `.note.secos` v2 manifest carries `proc_type`/`dev_id`/`dev_caps` (signature-rooted); loader auto-binds a `PROC_TYPE_DRIVER` to its device with the granted cap subset; `SYS_DRIVER` enforces driver-only + per-binding caps + `[DRV-AUDIT]`. Signed user-space driver demo + user-denied probe. Harness 47/47. See `docs/devlog/M11.md` |
-| M12 | **next** | higher-half + **buddy/multi-frame allocator** (kmalloc >4 KB currently unreliable — see M11 gotcha) + demand paging + UEFI hardening |
-| M13 | stretch | shell-launches-programs + full manifest enforcement; real `DRIVER_OP_MAP_MEM`, IRQ-to-driver, DMA sandbox, driver restart |
+| M11 | done | Driver Space for real: `.note.secos` v2 manifest carries `proc_type`/`dev_id`/`dev_caps` (signature-rooted); loader auto-binds a `PROC_TYPE_DRIVER` to its device with the granted cap subset; `SYS_DRIVER` enforces driver-only + per-binding caps + `[DRV-AUDIT]`. See `docs/devlog/M11.md` |
+| **M12** | **core done** | Memory scalability + W^X hard gate: PMM manages all RAM (clamps gone; word-skip+cursor; `pmm_alloc_contiguous`); heap on physmap + multi-frame + NULL-on-fail (fixes the M11 >4 KB gotcha, demo loads via VFS again); `vmm_map` rejects W+X (`-5`). `-m 2G` → ~2045 MB free. **Deferred**: higher-half relocation, full demand paging, identity-region W^X (rationale in devlog). Harness 51/51. See `docs/devlog/M12.md` |
+| M13 | **next** | usability & policy: shell launches on-disk programs; minimal IPC/pipes; end-to-end `.note.secos` enforcement (`max_mem`, capability gating). Plus deferred driver-space items: real `DRIVER_OP_MAP_MEM`, IRQ-to-driver, DMA sandbox, driver restart |
 
 ## Build / test / run
 
@@ -86,6 +85,23 @@ framebuffer/serial, not debugcon — so harness assertions read debugcon only.
   is an M12 item.
 - Talk to the user in **Italian**; all project content (code, comments, commits,
   docs) in **English only**.
+
+## M12 recap (core done)
+
+Memory scalability + W^X (`docs/devlog/M12.md`):
+- **PMM**: removed the 512 MB `total_frames` clamp and the 128 MB per-region
+  identity clamps — the kernel manages all RAM (frames above the identity window
+  are reached via the physmap; 32 MB bitmap cap ≈ 1 TB). `find_free_frame` skips
+  full bitmap words from a rolling cursor; `pmm_alloc_contiguous`/`_free_contiguous`.
+- **Heap**: addresses memory through the physmap (`phys_to_virt`); `expand_heap`
+  allocates enough **contiguous** frames; `kmalloc` returns NULL instead of an
+  undersized block. Fixes the M11 gotcha — the M11 demo loads from the VFS again.
+- **W^X**: `vmm_map`/`vmm_map_in_space` reject RW-without-NX (`-5`); boot tests
+  `[WX]` + `[HEAP] large kmalloc(64K) OK`. `-m 2G` → ~2045 MB free. 51/51.
+- **Deferred** (rationale in devlog): higher-half kernel relocation (physmap
+  already gives high-half access to all RAM; relocation touches both boot paths +
+  virtio DMA's `phys==virt` assumption), full demand paging (`vmm_region` path is
+  dormant), W^X of the 0–512 MB identity huge-page map (still RWX).
 
 ## M11 recap (done)
 
@@ -147,18 +163,20 @@ qemu-system-x86_64 -cdrom myos.iso -drive file=disk.img,if=virtio,format=raw \
   would be needed (future work). The user was going to try the VMDK in VMware;
   if it didn't boot, ask for the serial log (loader prints `[OK]/[ERR]` lines).
 
-## Suggested first move next session (M12 — memory + higher-half)
+## Suggested first move next session (M13 — usability & policy)
 
-The most load-bearing M12 task is a **real allocator**: `mm/heap.c` builds the
-heap one PMM frame at a time, so `kmalloc` > ~4 KB is unreliable and can silently
-return an undersized block (M11 hit this — see `docs/devlog/M11.md`). Fix:
-1. A **buddy / multi-frame** allocator (or at least a contiguous-frame path in
-   the PMM + a `kmalloc` that returns NULL instead of an undersized block).
-2. Then large files/ELFs can go through the VFS/ramfs again (M11's driver demo
-   currently loads the embedded signed ELF directly to dodge the heap limit).
-3. Higher-half kernel + demand paging + UEFI hardening round out M12.
+M12 core (allocator + PMM + W^X) is done, so the heap no longer constrains
+file/ELF size. Good M13 targets:
+1. **Shell launches on-disk programs** end to end (the `run <path>` plumbing
+   exists; make it the primary flow) + a couple more syscalls / minimal IPC/pipes.
+2. **End-to-end `.note.secos` enforcement**: abort a program at load if it
+   exceeds its manifest `max_mem`; gate capabilities by manifest (the driver
+   path already does this — extend to user limits).
 
-Open follow-ups (not blocking M12):
+Carry-over follow-ups (deferred from M12/M11, not blocking M13):
+- **M12 stretch**: higher-half kernel relocation (needs work on both boot paths +
+  virtio DMA's `phys==virt`); full demand paging (`vmm_region` path is dormant);
+  W^X of the 0–512 MB identity huge-page map (still RWX).
 - **M11 driver space**: real `DRIVER_OP_MAP_MEM` (map device MMIO into the driver
   address space — still a validating stub); IRQ-to-driver (`IRQ_SUBSCRIBE` + IPC
   queue); DMA sandbox; automatic restart of a crashed critical driver.

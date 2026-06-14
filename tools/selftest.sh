@@ -169,6 +169,32 @@ n_audit=$(grep -c "\[DRV-AUDIT\]" "$M11LOG" || true)
 grep -q "\[M11\] DONE" "$M11LOG"; check "M11 demo completed ([M11] DONE)" $?
 ! grep -q "\[EXC\]" "$M11LOG"; check "no CPU exception ([EXC]) during M11 run" $?
 
+# ---- M12: memory scalability + W^X hard gate ----
+M12LOG=/tmp/secos_selftest_m12.log
+echo "[selftest] Building M12 image (default; W^X + heap selftests run at boot)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M12 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M12 (mb2, -m 2G, ${TIMEOUT}s)..."
+: > "$M12LOG"
+set +e
+timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso \
+    -debugcon file:"$M12LOG" -global isa-debugcon.iobase=0xe9 \
+    -no-reboot -display none -m 2G
+set -e
+
+# PMM manages all RAM on a 2 GB VM (was clamped to ~512 MB before M12).
+freehex=$(grep -oE "free_MB=0x[0-9A-Fa-f]+" "$M12LOG" | head -1 | sed 's/free_MB=0x//')
+freedec=$(( 16#${freehex:-0} ))
+[[ "$freedec" -gt 512 ]]; check "M12 PMM reports >512 MB free on a 2 GB VM (free=${freedec} MB)" $?
+# W^X hard gate: a W+X mapping request is refused by vmm_map.
+grep -q "\[WX\] W+X mapping rejected (good)" "$M12LOG"; check "M12 W^X gate rejects a W+X mapping" $?
+# Heap serves a multi-frame allocation correctly (the M11 >4 KB gotcha).
+grep -q "\[HEAP\] large kmalloc(64K) OK" "$M12LOG"; check "M12 heap serves large (64K) kmalloc" $?
+! grep -q "\[EXC\]" "$M12LOG"; check "no CPU exception ([EXC]) during M12 2G boot" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

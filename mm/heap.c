@@ -6,6 +6,7 @@
  */
 #include "heap.h"
 #include "pmm.h"
+#include "vmm.h"   // [M12] phys_to_virt for physmap-addressed heap
 #include "terminal.h"
 
 // Header for each heap block
@@ -51,9 +52,13 @@ static void itoa_dec(uint64_t value, char* buffer) {
 
 // Initialize heap
 void heap_init(void) {
-    // Allocate the first frame for the heap
-    heap_start = (heap_block_t*)pmm_alloc_frame();
-    
+    // [M12] Address heap memory through the physmap (phys_to_virt) rather than
+    // the identity map, so the heap works with any physical frame the PMM hands
+    // out — including frames above the 512 MB identity window. Physmap is active
+    // by the time heap_init() runs (vmm_init_physmap is called in phase 1).
+    void* frame = pmm_alloc_frame();
+    heap_start = frame ? (heap_block_t*)phys_to_virt((uint64_t)frame) : NULL;
+
     if (heap_start == NULL) {
         terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
         terminal_writestring("[ERROR] Unable to allocate initial heap!\n");
@@ -81,28 +86,36 @@ void heap_init(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
 
-// Expand heap by allocating a new physical frame
+// Expand the heap with a region big enough for `required_size` bytes.
+// [M12] Allocate as many *physically-contiguous* frames as the request needs
+// (the physmap maps contiguous physical memory to contiguous virtual memory, so
+// the region is a single usable block). Previously this added exactly one frame,
+// so any kmalloc > ~4 KB could silently get an undersized block.
 static heap_block_t* expand_heap(size_t required_size) {
     // Find last block
     heap_block_t* current = heap_start;
     while (current->next != NULL) {
         current = current->next;
     }
-    
-    // Allocate a new frame
-    void* new_frame = pmm_alloc_frame();
-    if (new_frame == NULL) {
+
+    // Frames needed to hold header + payload.
+    size_t need = required_size + HEAP_BLOCK_HEADER_SIZE;
+    size_t frames = (need + PMM_FRAME_SIZE - 1) / PMM_FRAME_SIZE;
+    if (frames == 0) frames = 1;
+
+    void* base = pmm_alloc_contiguous(frames);
+    if (base == NULL) {
         return NULL;
     }
-    
-    // Create a new block in the allocated frame
-    heap_block_t* new_block = (heap_block_t*)new_frame;
-    new_block->size = PMM_FRAME_SIZE - HEAP_BLOCK_HEADER_SIZE;
+
+    // Address the region through the physmap.
+    heap_block_t* new_block = (heap_block_t*)phys_to_virt((uint64_t)base);
+    new_block->size = frames * PMM_FRAME_SIZE - HEAP_BLOCK_HEADER_SIZE;
     new_block->is_free = true;
     new_block->next = NULL;
-    
+
     current->next = new_block;
-    
+
     return new_block;
 }
 
