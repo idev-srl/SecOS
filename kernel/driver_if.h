@@ -26,6 +26,7 @@
 #define DRV_ERR_DEVICE    -4
 #define DRV_ERR_ARGS      -5
 #define DRV_ERR_RATE      -6  // superato limite chiamate nella finestra
+#define DRV_ERR_NOTDRV    -7  // [M11] il chiamante non è un processo driver
 
 typedef struct driver_call {
     int opcode;         // requested operation
@@ -61,14 +62,22 @@ typedef struct device_desc {
 typedef struct driver_binding {
     process_t* proc;    // owning driver process
     int device_id;      // bound device
+    uint32_t caps;      // [M11] granted capability subset (DEV_CAP_*) for this binding
 } driver_binding_t;
 
 // Registry functions
 int driver_registry_init(void);
 const device_desc_t* driver_get_device(int device_id);
 int driver_register_binding(process_t* p, int device_id);
+// [M11] Bind with an explicit granted-capability subset (trust-rooted in the
+// signed manifest). check_driver_permissions enforces against these caps.
+int driver_register_binding_caps(process_t* p, int device_id, uint32_t caps);
 int driver_remove_binding(process_t* p, int device_id);
+// [M11] Remove every binding owned by p (called on process teardown).
+void driver_remove_all_bindings(process_t* p);
 int driver_is_bound(process_t* p, int device_id);
+// [M11] Granted caps for (p, device_id); 0 if not bound.
+uint32_t driver_binding_caps(process_t* p, int device_id);
 
 // Policy check: ritorna DRV_OK o codice errore
 int check_driver_permissions(process_t* p, const driver_call_t* req);

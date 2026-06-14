@@ -6,6 +6,7 @@
 #include "driver_if.h"
 #include "terminal.h"
 #include "process.h"
+#include "debugcon.h"
 #include "heap.h" // kmalloc/kfree
 
 static device_desc_t g_devices[MAX_DEVICES];
@@ -15,9 +16,12 @@ static driver_binding_t g_bindings[MAX_DRIVER_BINDINGS];
 int driver_registry_init(void){
     g_device_count = 0;
     for(int i=0;i<MAX_DEVICES;i++){ g_devices[i].device_id=-1; }
-    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ g_bindings[i].proc=NULL; g_bindings[i].device_id=-1; }
-    // Example seed devices: 0 (timer), 1 (framebuffer)
-    g_devices[0].device_id=0; g_devices[0].reg_base=0xF0000000ULL; g_devices[0].reg_size=0x1000; g_devices[0].mem_base=0xF1000000ULL; g_devices[0].mem_size=0x10000; g_devices[0].caps_mask=DEV_CAP_READ_REG|DEV_CAP_WRITE_REG|DEV_CAP_GET_INFO; g_device_count++;
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ g_bindings[i].proc=NULL; g_bindings[i].device_id=-1; g_bindings[i].caps=0; }
+    // Example seed devices: 0 (timer), 1 (framebuffer).
+    // [M11] Device 0 also advertises MAP_MEM support so the granted-capability
+    // boundary is meaningful: a driver granted only READ/WRITE/GET_INFO is
+    // refused MAP_MEM by its *manifest grant* even though the device supports it.
+    g_devices[0].device_id=0; g_devices[0].reg_base=0xF0000000ULL; g_devices[0].reg_size=0x1000; g_devices[0].mem_base=0xF1000000ULL; g_devices[0].mem_size=0x10000; g_devices[0].caps_mask=DEV_CAP_READ_REG|DEV_CAP_WRITE_REG|DEV_CAP_GET_INFO|DEV_CAP_MAP_MEM|DEV_CAP_UNMAP_MEM; g_device_count++;
     g_devices[1].device_id=1; g_devices[1].reg_base=0xE0000000ULL; g_devices[1].reg_size=0x2000; g_devices[1].mem_base=0xE1000000ULL; g_devices[1].mem_size=0x20000; g_devices[1].caps_mask=DEV_CAP_READ_REG|DEV_CAP_GET_INFO; g_device_count++;
     terminal_writestring("[DRV] registry initialized\n");
     return 0;
@@ -28,24 +32,46 @@ const device_desc_t* driver_get_device(int device_id){
     return NULL;
 }
 
-int driver_register_binding(process_t* p, int device_id){
-    if(!p) return DRV_ERR_ARGS; if(!driver_get_device(device_id)) return DRV_ERR_DEVICE;
-    // Already bound check
-    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id) return DRV_OK; }
+int driver_register_binding_caps(process_t* p, int device_id, uint32_t caps){
+    if(!p) return DRV_ERR_ARGS;
+    const device_desc_t* dev = driver_get_device(device_id);
+    if(!dev) return DRV_ERR_DEVICE;
+    // Never grant more than the device actually supports.
+    caps &= dev->caps_mask;
+    // Already bound: refresh granted caps (idempotent).
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id){ g_bindings[i].caps=caps; return DRV_OK; } }
     // Find free slot
-    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(!g_bindings[i].proc){ g_bindings[i].proc=p; g_bindings[i].device_id=device_id; return DRV_OK; } }
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(!g_bindings[i].proc){ g_bindings[i].proc=p; g_bindings[i].device_id=device_id; g_bindings[i].caps=caps; return DRV_OK; } }
     return DRV_ERR_PERM; // no free slot
+}
+
+// Manual/dev path (shell drvreg): grant the device's full capability set.
+int driver_register_binding(process_t* p, int device_id){
+    const device_desc_t* dev = driver_get_device(device_id);
+    if(!dev) return p ? DRV_ERR_DEVICE : DRV_ERR_ARGS;
+    return driver_register_binding_caps(p, device_id, dev->caps_mask);
 }
 
 int driver_remove_binding(process_t* p, int device_id){
     if(!p) return DRV_ERR_ARGS;
-    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id){ g_bindings[i].proc=NULL; g_bindings[i].device_id=-1; return DRV_OK; } }
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id){ g_bindings[i].proc=NULL; g_bindings[i].device_id=-1; g_bindings[i].caps=0; return DRV_OK; } }
     return DRV_ERR_DEVICE; // binding not found
+}
+
+void driver_remove_all_bindings(process_t* p){
+    if(!p) return;
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p){ g_bindings[i].proc=NULL; g_bindings[i].device_id=-1; g_bindings[i].caps=0; } }
 }
 
 int driver_is_bound(process_t* p, int device_id){
     if(!p) return 0;
     for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id) return 1; }
+    return 0;
+}
+
+uint32_t driver_binding_caps(process_t* p, int device_id){
+    if(!p) return 0;
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id) return g_bindings[i].caps; }
     return 0;
 }
 
@@ -63,11 +89,19 @@ static uint32_t opcode_cap_bit(int opcode){
 
 int check_driver_permissions(process_t* p, const driver_call_t* req){
     if(!p||!req) return DRV_ERR_ARGS;
+    // [M11] The driver privilege is the security boundary: only a process that
+    // the signed manifest marked PROC_TYPE_DRIVER may use SYS_DRIVER at all.
+    // A plain user process is refused before any device/binding check.
+    if(p->proc_type != PROC_TYPE_DRIVER) return DRV_ERR_NOTDRV;
     const device_desc_t* dev = driver_get_device(req->device_id);
     if(!dev) return DRV_ERR_DEVICE;
     if(!driver_is_bound(p, req->device_id)) return DRV_ERR_PERM;
     uint32_t need = opcode_cap_bit(req->opcode);
     if(need==0) return DRV_ERR_OPCODE;
+    // Enforce against the *granted* capability subset (trust-rooted in the
+    // manifest), not just what the device supports. A driver granted only
+    // READ/WRITE/GET_INFO is refused MAP_MEM even on a device that supports it.
+    if(!(driver_binding_caps(p, req->device_id) & need)) return DRV_ERR_PERM;
     if(!(dev->caps_mask & need)) return DRV_ERR_PERM;
     // Range checks
     if(req->opcode==DRIVER_OP_READ_REG || req->opcode==DRIVER_OP_WRITE_REG){
@@ -158,6 +192,15 @@ int unmap_device_memory(process_t* p, int device_id, uint64_t phys_addr, size_t 
 static driver_audit_entry_t audit_buf[DRIVER_AUDIT_CAPACITY];
 static int audit_index=0; static int audit_full=0;
 extern uint64_t timer_get_ticks(void); // ipotetica funzione globale
-void driver_audit_log(const driver_call_t* req, int result, process_t* p){ if(!req) return; driver_audit_entry_t e; e.tick=timer_get_ticks(); e.pid=p? (int)p->pid: -1; e.device_id=req->device_id; e.opcode=req->opcode; e.target=req->target; e.value=req->value; e.flags=req->flags; e.result=result; audit_buf[audit_index]=e; audit_index=(audit_index+1)%DRIVER_AUDIT_CAPACITY; if(audit_index==0) audit_full=1; }
+void driver_audit_log(const driver_call_t* req, int result, process_t* p){ if(!req) return; driver_audit_entry_t e; e.tick=timer_get_ticks(); e.pid=p? (int)p->pid: -1; e.device_id=req->device_id; e.opcode=req->opcode; e.target=req->target; e.value=req->value; e.flags=req->flags; e.result=result; audit_buf[audit_index]=e; audit_index=(audit_index+1)%DRIVER_AUDIT_CAPACITY; if(audit_index==0) audit_full=1;
+    // [M11] Mirror every audited event to debugcon so the capability boundary is
+    // verifiable non-interactively (denials are always audited; successes only
+    // with DRV_FLAG_REQUIRE_AUDIT — see handle_driver_call).
+    debugcon_writestring("[DRV-AUDIT] pid="); debugcon_print_hex((uint64_t)(uint32_t)e.pid);
+    debugcon_writestring(" dev="); debugcon_print_hex((uint64_t)(uint32_t)e.device_id);
+    debugcon_writestring(" op="); debugcon_print_hex((uint64_t)(uint32_t)e.opcode);
+    debugcon_writestring(" res="); debugcon_print_hex((uint64_t)(uint32_t)e.result);
+    debugcon_writestring("\n");
+}
 int driver_audit_dump(driver_audit_entry_t* out_buf, int max){ if(!out_buf||max<=0) return 0; int count = audit_full? DRIVER_AUDIT_CAPACITY : audit_index; if(max>count) max=count; // copia partendo dall'entry più recente
  int written=0; for(int i=0;i<max;i++){ int idx = (audit_index - 1 - i); if(idx<0) idx += DRIVER_AUDIT_CAPACITY; out_buf[written++] = audit_buf[idx]; } return written; }

@@ -845,7 +845,12 @@ static void sh_drvreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writ
     }
     if(!target){ terminal_writestring("[drvreg] no process: run 'elfload' first\n"); return; }
     if(!driver_get_device(dev)){ terminal_writestring("[drvreg] device not found\n"); return; }
-    int r = driver_register_binding(target, dev); if(r==DRV_OK) terminal_writestring("[drvreg] OK\n"); else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvreg] FAIL device\n"); else if(r==DRV_ERR_PERM) terminal_writestring("[drvreg] FAIL no slot\n"); else terminal_writestring("[drvreg] FAIL\n"); }
+    int r = driver_register_binding(target, dev);
+    // [M11] Manual/dev binding path: also mark the target a driver so SYS_DRIVER
+    // (which now requires PROC_TYPE_DRIVER) accepts it. The signed-manifest path
+    // is the production route; this is the interactive harness.
+    if(r==DRV_OK){ target->proc_type = PROC_TYPE_DRIVER; target->drv_dev_id = dev; target->drv_caps = driver_binding_caps(target, dev); terminal_writestring("[drvreg] OK\n"); }
+    else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvreg] FAIL device\n"); else if(r==DRV_ERR_PERM) terminal_writestring("[drvreg] FAIL no slot\n"); else terminal_writestring("[drvreg] FAIL\n"); }
 static void sh_drvunreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvunreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev=dev*10+(*a-'0'); a++; } extern int driver_remove_binding(process_t*, int); extern process_t* sched_get_current(void); extern process_t* process_get_last(void); process_t* target = sched_get_current(); if(!target) target = process_get_last(); if(!target){ terminal_writestring("[drvunreg] no process (create with elfload)\n"); return; } int r=driver_remove_binding(target, dev); if(r==DRV_OK) terminal_writestring("[drvunreg] OK (removed)\n"); else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvunreg] FAIL binding not found\n"); else terminal_writestring("[drvunreg] FAIL\n"); }
 static void sh_drvlog(const char* a){
     extern int driver_audit_dump(driver_audit_entry_t*, int);

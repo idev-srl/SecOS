@@ -18,6 +18,7 @@ int elf_manifest_parse(const void* elf_buf, size_t size, elf_manifest_t* out) {
     // Scansiona PHDR in cerca di PT_NOTE
     const Elf64_Phdr* ph;
     const elf_manifest_raw_t* raw = NULL;
+    uint32_t raw_descsz = 0;
     for (int i=0;i<eh->e_phnum;i++) {
         ph = (const Elf64_Phdr*)(base + eh->e_phoff + i*sizeof(Elf64_Phdr));
         if ((const uint8_t*)ph + sizeof(Elf64_Phdr) > base + size) return MANIFEST_ERR_RANGE;
@@ -37,8 +38,11 @@ int elf_manifest_parse(const void* elf_buf, size_t size, elf_manifest_t* out) {
             if (namesz && descsz && type == SECOS_NOTE_TYPE) {
                 // Verifica nome
                 if (namesz >= sizeof(SECOS_NOTE_NAME) && name[0]=='S' && name[1]=='E' && name[2]=='C' && name[3]=='O' && name[4]=='S') {
-                    if (descsz >= sizeof(elf_manifest_raw_t)) {
+                    // Il manifest base (v1) ha descsz==24; v2 (driver) ha descsz>=40.
+                    // Accetta qualunque desc con almeno il blocco base.
+                    if (descsz >= 24) {
                         raw = (const elf_manifest_raw_t*)desc;
+                        raw_descsz = descsz;
                         break;
                     }
                 }
@@ -52,9 +56,26 @@ int elf_manifest_parse(const void* elf_buf, size_t size, elf_manifest_t* out) {
     out->flags   = raw->flags;
     out->max_mem = raw->max_mem;
     out->entry_hint = raw->entry_hint;
+    // [M11] Campi driver (v2): presenti solo se il desc è abbastanza grande E
+    // la versione li dichiara. Altrimenti default USER, nessun grant.
+    out->proc_type = MANIFEST_PROC_TYPE_USER;
+    out->dev_id    = 0;
+    out->dev_caps  = 0;
+    if (raw->version >= MANIFEST_VERSION_DRIVER &&
+        raw_descsz >= sizeof(elf_manifest_raw_t)) {
+        out->proc_type = raw->proc_type;
+        out->dev_id    = raw->dev_id;
+        out->dev_caps  = raw->dev_caps;
+    }
     terminal_writestring("[MANIFEST] parsed versione=");
     char hx[]="0123456789ABCDEF"; for(int i=4;i>=0;i-=4) terminal_putchar(hx[(out->version>>i)&0xF]);
-    terminal_writestring(" flags="); for(int i=31;i>=0;i-=4) terminal_putchar(hx[(out->flags>>i)&0xF]); terminal_writestring("\n");
+    terminal_writestring(" flags="); for(int i=31;i>=0;i-=4) terminal_putchar(hx[(out->flags>>i)&0xF]);
+    if (out->proc_type == MANIFEST_PROC_TYPE_DRIVER) {
+        terminal_writestring(" type=DRIVER dev=");
+        for(int i=4;i>=0;i-=4) terminal_putchar(hx[(out->dev_id>>i)&0xF]);
+        terminal_writestring(" caps="); for(int i=7;i>=0;i-=4) terminal_putchar(hx[(out->dev_caps>>i)&0xF]);
+    }
+    terminal_writestring("\n");
     return MANIFEST_OK;
 }
 

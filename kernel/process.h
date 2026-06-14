@@ -12,6 +12,12 @@
 #include "trapframe.h"
 #include "../mm/elf.h" // for ELF_OK
 
+// [M11] Process privilege type. A "driver" is a Ring-3 process granted
+// capability-mediated hardware access (SYS_DRIVER). The claim is rooted in the
+// signed `.note.secos` manifest — see mm/elf_manifest.h / docs/DRIVER_SPACE.md.
+#define PROC_TYPE_USER    0
+#define PROC_TYPE_DRIVER  1
+
 typedef struct process {
     uint32_t pid;
     vmm_space_t* space;
@@ -28,6 +34,11 @@ typedef struct process {
         uint64_t rbp;
     } regs;
     void* manifest; // stub pointer to future manifest_t
+    // [M11] Driver Space: privilege type + granted device binding (from the
+    // signed manifest). proc_type defaults to PROC_TYPE_USER.
+    int      proc_type;     // PROC_TYPE_USER / PROC_TYPE_DRIVER
+    int      drv_dev_id;    // device id bound to this driver, -1 if none
+    uint32_t drv_caps;      // granted capability mask (DEV_CAP_*), 0 if none
     uint64_t* mapped_pages; // array of virtual page addresses (code+data+stack)
     uint32_t mapped_page_count; // page count
     // Runtime metrics

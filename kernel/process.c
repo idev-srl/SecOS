@@ -11,6 +11,7 @@
 #include "panic.h"
 #include "mm/elf_manifest.h"
 #include "mm/elf_sign.h"
+#include "driver_if.h"
 #include "pmm.h"
 #include "debugcon.h"
 
@@ -114,6 +115,11 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     // is fully built. Promoted to PROC_NEW at the end.
     p->state = PROC_BLOCKED;
     p->manifest = NULL;
+    // [M11] Default privilege: USER, no device binding. Upgraded below only if
+    // the (already signature-verified) manifest declares PROC_TYPE_DRIVER.
+    p->proc_type = PROC_TYPE_USER;
+    p->drv_dev_id = -1;
+    p->drv_caps = 0;
     // Tracking pagine: aggiungi pagine stack (eccetto guard) se pages!=NULL
     p->mapped_pages = pages;
     p->mapped_page_count = page_count;
@@ -158,6 +164,33 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
                 }
             }
             p->manifest = mf;
+            // [M11] Driver Space: the signed manifest is the trust root for the
+            // driver claim. If it declares PROC_TYPE_DRIVER, validate the device
+            // and grant only capabilities the device actually supports (subset),
+            // then bind the process. A bogus claim degrades to USER (the process
+            // still runs, but SYS_DRIVER will refuse it).
+            if (mf->proc_type == MANIFEST_PROC_TYPE_DRIVER) {
+                const device_desc_t* dev = driver_get_device((int)mf->dev_id);
+                if (!dev) {
+                    debugcon_writestring("[M11] driver claim refused: unknown device\n");
+                } else {
+                    uint32_t granted = mf->dev_caps & dev->caps_mask;
+                    if (granted != mf->dev_caps)
+                        debugcon_writestring("[M11] WARN: requested caps reduced to device-supported subset\n");
+                    if (driver_register_binding_caps(p, (int)mf->dev_id, granted) == DRV_OK) {
+                        p->proc_type = PROC_TYPE_DRIVER;
+                        p->drv_dev_id = (int)mf->dev_id;
+                        p->drv_caps = granted;
+                        debugcon_writestring("[M11] driver bound dev=");
+                        debugcon_print_hex((uint64_t)mf->dev_id);
+                        debugcon_writestring(" caps=");
+                        debugcon_print_hex((uint64_t)granted);
+                        debugcon_writestring("\n");
+                    } else {
+                        debugcon_writestring("[M11] driver bind failed (no slot)\n");
+                    }
+                }
+            }
         } else {
             terminal_writestring("[MANIFEST] validation fail, scarto manifest\n");
             kfree(mf);
@@ -227,6 +260,10 @@ void process_print(const process_t* p) {
 
 int process_destroy(process_t* p) {
     if (!p) return -1;
+    // [M11] Drop any driver bindings first: the registry holds a process_t*; a
+    // stale pointer surviving kfree(p) could later alias a reused process and
+    // grant it the dead driver's device — clear it unconditionally.
+    driver_remove_all_bindings(p);
     extern int elf_unload_process(process_t* p);
     elf_unload_process(p);                       // unmap + free user page frames, zero PTEs
     if (p->manifest) { kfree(p->manifest); p->manifest = NULL; }

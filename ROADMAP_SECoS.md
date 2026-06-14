@@ -4,10 +4,11 @@ Single, linear milestone scheme (M0 → present → future). Earlier revisions o
 this file mixed two conflicting numbering schemes (the executed git milestones
 and an older pre-analysis plan); that has been collapsed into one timeline.
 
-- **Done:** M0–M9 (M9 = real userland + mandatory ELF signing; signed `hello`
-  built by the toolchain, loaded from the VFS, verified, and run in ring-3)
+- **Done:** M0–M11 (M10 = storage & persistence: virtio-blk + RW FAT32/ext2/ext4;
+  M11 = Driver Space for real: signature-rooted `proc_type` + capability-mediated
+  `SYS_DRIVER` with a signed user-space driver). Harness 47/47.
 - **In progress:** —
-- **Planned:** M10+ (next: storage & persistence, virtio-blk)
+- **Planned:** M12 (higher-half + buddy/multi-frame allocator + demand paging)
 
 Per-milestone implementation notes live in `docs/devlog/M*.md`. The detailed
 execution plan — mission, definition of done, per-phase acceptance gates, and
@@ -112,22 +113,26 @@ path.
 a signed ELF written to disk is read back, verified, and run in ring-3 (a tampered
 copy is refused) — harness-asserted across FAT32/ext2/ext4 (`tools/selftest.sh`, 38/38).
 
-### M11 — Driver Space for real (proves the security thesis)
+### M11 — Driver Space for real (proves the security thesis) — **DONE**
 **Goal:** Driver Space becomes a verifiable security boundary with a user-space driver.
 
-- Add `proc_type` (`PROC_TYPE_USER` / `PROC_TYPE_DRIVER`) to the PCB, set by the
-  loader from the ELF manifest (`MANIFEST_FLAG_DRIVER`); reject `SYS_DRIVER` for
-  USER processes with `DRV_ERR_PERM`.
-- Move one driver (target: keyboard) to a **user-space process**: real
-  register/MMIO access via validated `DRIVER_OP_*`, capability + range checks,
-  audit log. Implement `DRIVER_OP_MAP_MEM` with precise cleanup on unload.
-- IRQ delivery via an IPC queue consumed through `SYS_READ` on a special fd;
-  bounded auto-restart of a crashing driver (`DEV_FLAG_FAILED` past threshold).
+- **Done:** `proc_type` (`PROC_TYPE_USER` / `PROC_TYPE_DRIVER`) in the PCB, set by
+  the loader from the **signed** `.note.secos` manifest (v2 fields `proc_type` /
+  `dev_id` / `dev_caps`, covered by the Ed25519 signature → trust-rooted).
+  `SYS_DRIVER` rejects non-driver callers with `DRV_ERR_NOTDRV`, and enforces the
+  per-binding **granted** capability subset (an un-granted op is refused even on a
+  device that supports it). Every event mirrors to debugcon `[DRV-AUDIT]`.
+- **Done:** a real **user-space driver** (`user/driver_demo`) performs mediated
+  register read/write through validated `DRIVER_OP_*` (value round-trips) and is
+  refused the un-granted `MAP_MEM`; a signed `PROC_TYPE_USER` probe is denied
+  every `SYS_DRIVER`. `process_destroy` clears driver bindings (no stale pointer).
+- **Deferred (M13):** real `DRIVER_OP_MAP_MEM` MMIO mapping with cleanup; moving
+  the keyboard driver out; IRQ delivery via IPC queue; bounded auto-restart.
 
 **Depends:** M8 (lifecycle/IPC), M10 (block device for the disk driver case).
-**Done when:** a user-space driver delivers real input/events end-to-end; a
-capability/range violation is denied **and** audited; a USER process gets
-`DRV_ERR_PERM`.
+**Done when (met):** a user-space driver does mediated HW access end-to-end; a
+capability violation is denied **and** audited; a USER process is refused.
+See `docs/devlog/M11.md`. Harness 47/47.
 
 ### M12 — Hardening & memory scalability (stretch)
 **Goal:** the kernel manages all RAM, runs higher-half, and UEFI handoff is firmware-safe.

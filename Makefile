@@ -134,14 +134,26 @@ iso: $(KERNEL)
 USER_CFLAGS = -ffreestanding -nostdlib -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 -Wall -Iuser
 .PHONY: user-progs
 user-progs:
-	$(CC) $(USER_CFLAGS) -c user/crt0.S    -o user/crt0.o
-	$(CC) $(USER_CFLAGS) -c user/note.S    -o user/note.o
-	$(CC) $(USER_CFLAGS) -c user/libsecos.c -o user/libsecos.o
-	$(CC) $(USER_CFLAGS) -c user/hello.c   -o user/hello.o
+	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note.S       -o user/note.o
+	$(CC) $(USER_CFLAGS) -c user/note_driver.S -o user/note_driver.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c   -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/hello.c      -o user/hello.o
+	$(CC) $(USER_CFLAGS) -c user/drvprobe.c   -o user/drvprobe.o
+	$(CC) $(USER_CFLAGS) -c user/driver_demo.c -o user/driver_demo.o
+	$(CC) $(USER_CFLAGS) -c user/userprobe.c  -o user/userprobe.o
 	$(LD) -T user/user.ld -o user/hello.elf user/crt0.o user/note.o user/libsecos.o user/hello.o
 	python3 tools/secos-sign user/hello.elf --dev
 	python3 tools/elf2h.py user/hello.elf user_hello_elf crypto/user_hello_elf.h
-	@echo "user-progs: built+signed user/hello.elf -> crypto/user_hello_elf.h"
+	# [M11] Signed user-space driver (PROC_TYPE_DRIVER manifest)
+	$(LD) -T user/user.ld -o user/driver_demo.elf user/crt0.o user/note_driver.o user/libsecos.o user/drvprobe.o user/driver_demo.o
+	python3 tools/secos-sign user/driver_demo.elf --dev
+	python3 tools/elf2h.py user/driver_demo.elf user_driver_elf crypto/user_driver_elf.h
+	# [M11] Signed plain-user probe (PROC_TYPE_USER manifest) — driver calls denied
+	$(LD) -T user/user.ld -o user/userprobe.elf user/crt0.o user/note.o user/libsecos.o user/drvprobe.o user/userprobe.o
+	python3 tools/secos-sign user/userprobe.elf --dev
+	python3 tools/elf2h.py user/userprobe.elf user_userprobe_elf crypto/user_userprobe_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe -> crypto/*.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke

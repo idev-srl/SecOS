@@ -245,6 +245,84 @@ static void m9_run_demo(void) {
 }
 #endif /* M9_USER_DEMO */
 
+// ---- [M11] Driver Space demo (gated; off by default) ----
+// Runs two signed ring-3 programs back-to-back to prove the capability boundary
+// is rooted in the signature:
+//   1. /bin/driver   — manifest declares PROC_TYPE_DRIVER (dev 0, caps
+//      READ|WRITE|GET_INFO). Granted ops succeed via SYS_DRIVER; an un-granted
+//      op (MAP_MEM) is refused (DRV_ERR_PERM) even though the device supports it.
+//   2. /bin/userprobe — manifest is PROC_TYPE_USER. Every SYS_DRIVER call is
+//      refused (DRV_ERR_NOTDRV): a plain user process has no driver rights.
+#ifndef M11_DRIVER_DEMO
+#define M11_DRIVER_DEMO 0
+#endif
+#if M11_DRIVER_DEMO
+#include "trapframe.h"
+#include "../crypto/user_driver_elf.h"
+#include "../crypto/user_userprobe_elf.h"
+
+static uint8_t m11_idle_stack[16384] __attribute__((aligned(16)));
+static int     m11_step = 0, m11_done = 0;
+
+// Load the embedded signed ELF directly. We deliberately avoid the VFS/ramfs
+// roundtrip here: ramfs copies file data with a single kmalloc(), and the M11
+// allocator (mm/heap.c) can only serve allocations up to one frame (~4 KB)
+// reliably (a buddy allocator is an M12 item), so copying a ~7 KB ELF is
+// non-deterministic. process_create_from_elf still signature-verifies the
+// image, so the trust root is unchanged.
+static void m11_spawn(const uint8_t* img, size_t len, const char* what) {
+    process_t* p = process_create_from_elf(img, len);
+    if (p) {
+        p->state = PROC_READY;
+        debugcon_writestring("[M11] spawned "); debugcon_writestring(what);
+        debugcon_writestring(" proc_type="); debugcon_print_hex((uint64_t)(uint32_t)p->proc_type);
+        debugcon_writestring("\n");
+    } else {
+        debugcon_writestring("[M11] FAIL: "); debugcon_writestring(what);
+        debugcon_writestring(" not loaded/refused\n");
+    }
+}
+
+__attribute__((noreturn)) static void m11_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m11_step == 0) {
+            m11_step = 1;
+            debugcon_writestring("[M11] --- driver-type probe (granted dev0) ---\n");
+            m11_spawn(user_driver_elf, user_driver_elf_len, "driver");
+        } else if (m11_step == 1 && sched_count_alive_user() == 0) {
+            m11_step = 2;
+            debugcon_writestring("[M11] --- user-type probe (no driver rights) ---\n");
+            m11_spawn(user_userprobe_elf, user_userprobe_elf_len, "userprobe");
+        } else if (m11_step == 2 && sched_count_alive_user() == 0 && !m11_done) {
+            m11_done = 1;
+            debugcon_writestring("[M11] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m11_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M11] driver space demo\n");
+
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m11_idle_stack + sizeof(m11_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m11_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M11] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf); // does not return
+}
+#endif /* M11_DRIVER_DEMO */
+
 // ---- [M10] Interactive shell as the scheduler idle task ----
 // Running the shell as the idle task lets `run <path>` spawn a ring-3 process:
 // the timer preempts idle (shell) into the user task; on SYS_EXIT the scheduler
@@ -512,6 +590,9 @@ static void kernel_main_phase2(void) {
     }
 #if M9_USER_DEMO
     m9_run_demo(); // signed-userland demo (needs VFS) — does not return
+#endif
+#if M11_DRIVER_DEMO
+    m11_run_demo(); // driver-space demo (needs VFS) — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);
