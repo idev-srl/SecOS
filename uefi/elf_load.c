@@ -139,8 +139,10 @@ EFI_STATUS elf_load_kernel(EFI_SYSTEM_TABLE* SystemTable, void** entry_out) {
             if (ph[i].p_align && (ph[i].p_align & (ph[i].p_align - 1)) != 0) return EFI_ERR(15);
             // p_filesz <= p_memsz
             if (ph[i].p_filesz > ph[i].p_memsz) return EFI_ERR(16);
-            // Limite range identity (512MB) provvisorio
-            if (ph[i].p_vaddr + ph[i].p_memsz > (512ULL * 1024 * 1024)) return EFI_ERR(17);
+            // [M12] The kernel is higher-half (p_vaddr high) but loads at its LMA
+            // (p_paddr, low). Bound the PHYSICAL placement to the 512MB identity
+            // window the bootloader maps.
+            if (ph[i].p_paddr + ph[i].p_memsz > (512ULL * 1024 * 1024)) return EFI_ERR(17);
             load_list[load_count++] = &ph[i];
         }
     }
@@ -174,6 +176,7 @@ EFI_STATUS elf_load_kernel(EFI_SYSTEM_TABLE* SystemTable, void** entry_out) {
         if (g_loaded_segment_count < SECOS_MAX_SEGMENTS) {
             secos_loaded_segment_t* s = &g_loaded_segments[g_loaded_segment_count++];
             s->vaddr = ph[i].p_vaddr;
+            s->paddr = ph[i].p_paddr;   // [M12] LMA: where to physically place the segment
             s->memsz = ph[i].p_memsz;
             s->filesz = ph[i].p_filesz;
             s->flags = ph[i].p_flags;

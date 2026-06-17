@@ -5,8 +5,9 @@ this file mixed two conflicting numbering schemes (the executed git milestones
 and an older pre-analysis plan); that has been collapsed into one timeline.
 
 - **Done:** M0–M12 (M11 = Driver Space for real: signature-rooted `proc_type` +
-  capability-mediated `SYS_DRIVER`; M12 core = memory scalability — PMM manages
-  all RAM, physmap-addressed multi-frame heap — + W^X hard gate). Harness 51/51.
+  capability-mediated `SYS_DRIVER`; M12 = memory scalability — PMM manages all
+  RAM, physmap-addressed multi-frame heap — + W^X hard gate + **higher-half
+  kernel** at `0xFFFFFFFF80000000`, both MB2 and UEFI). Harness 51/51.
 - **In progress:** —
 - **Planned:** M13 (usability & policy: shell launches on-disk programs +
   end-to-end manifest enforcement)
@@ -135,7 +136,7 @@ copy is refused) — harness-asserted across FAT32/ext2/ext4 (`tools/selftest.sh
 capability violation is denied **and** audited; a USER process is refused.
 See `docs/devlog/M11.md`. Harness 47/47.
 
-### M12 — Hardening & memory scalability — **CORE DONE**
+### M12 — Hardening & memory scalability — **DONE**
 **Goal:** the kernel manages all RAM, runs higher-half, and UEFI handoff is firmware-safe.
 
 - **Done — PMM scalability**: removed the 128 MB / 512 MB clamps (kernel manages
@@ -148,14 +149,18 @@ See `docs/devlog/M11.md`. Harness 47/47.
   again).
 - **Done — W^X hard gate**: `vmm_map`/`vmm_map_in_space` reject RW-without-NX;
   boot self-test asserts a W+X request is refused.
-- **Deferred** (rationale in `docs/devlog/M12.md`): higher-half kernel relocation
-  (physmap already gives high-half access to all RAM; relocation would touch both
-  boot paths + virtio DMA's `phys==virt`); full demand paging (`vmm_region` path
-  dormant); UEFI handoff hardening; W^X of the 0–512 MB identity huge-page map.
+- **Done — higher-half kernel**: linked + runs at `KERNEL_VMA=0xFFFFFFFF80000000`
+  (`-mcmodel=kernel`); low `.boot` section + high kernel via `AT()`; both
+  Multiboot2 (`boot.asm` dual-map + high jump) and UEFI (loader loads at LMA,
+  maps PML4[511]) boot higher-half. `kvirt_to_phys` fixes symbol-as-physical
+  spots (PMM bitmap, virtio DMA). Low identity map kept by design.
+- **Deferred** (rationale in `docs/devlog/M12.md`): full demand paging
+  (`vmm_region` path dormant); UEFI handoff hardening; W^X of the 0–512 MB
+  identity huge-page map.
 
 **Depends:** M11. **Done when (met):** PMM reports >512 MB free on a 2 GB VM; a
-W+X page request is rejected. (UEFI-on-real-firmware deferred.) Harness 51/51.
-See `docs/devlog/M12.md`.
+W+X page request is rejected; the kernel runs higher-half on MB2 and UEFI.
+Harness 51/51; `smoke.sh --mb2` and `--uefi` PASS. See `docs/devlog/M12.md`.
 
 ### M13 — Usability & policy enforcement (stretch)
 **Goal:** a usable system with end-to-end manifest policy.

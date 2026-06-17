@@ -242,7 +242,8 @@ static const EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID = {0x964e5b22,0x6459,
 #define SECOS_MAX_SEGMENTS 16
 #endif
 typedef struct {
-    uint64_t vaddr;       // Indirizzo virtuale target
+    uint64_t vaddr;       // Indirizzo virtuale target (higher-half per il kernel)
+    uint64_t paddr;       // [M12] Indirizzo fisico (LMA) dove caricare il segmento
     uint64_t memsz;       // Dimensione richiesta in memoria
     uint64_t filesz;      // Dimensione effettiva nel file
     uint32_t flags;       // Flag ELF (PF_X=1 PF_W=2 PF_R=4)

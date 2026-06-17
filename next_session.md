@@ -1,14 +1,17 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: end of M12 (memory scalability + W^X hard gate). Read this first._
+_Last updated: end of M12 (memory scalability + W^X + higher-half). Read this first._
 
 ## Where we are
 
-- **Done through M12.** Branch **`milestone/M7`** (historical name). Tag
-  `M9_STABLE` is the last tag. M11 committed (`a2ef931`). **M12 is staged in the
-  working tree, NOT yet committed** (commit/push when the user asks).
-- Build is green: `make` clean (no warnings), and the full self-test harness
-  `tools/selftest.sh` is **51/51** (M4 + crypto + M7 + M8 + M9 + M10×{fat32,ext2,ext4} + M11 + M12).
+- **Done through M12** (incl. higher-half kernel). Branch **`milestone/M7`**
+  (historical name). Tag `M9_STABLE` is the last tag. M11 committed (`a2ef931`),
+  M12 memory/W^X committed (`e3b3470`); the higher-half work is committed on top
+  and **pushed**.
+- Build is green: `make` clean (0 warnings), the full self-test harness
+  `tools/selftest.sh` is **51/51**, and BOTH boot paths run higher-half
+  (`smoke.sh --mb2` and `smoke.sh --uefi` PASS). The kernel runs at
+  `0xFFFFFFFF80000000`.
 - Only `edk2/` is untracked (a large vendored tree, not part of the build) — leave it.
   Local build artifacts `secos-uefi.{img,vmdk}` and `disk.img` are gitignored.
 
@@ -42,7 +45,7 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | M9 | done (`M9_STABLE`) | crypto (SHA-256/512 + Ed25519 verify), signing format+tools+gate, userland (crt0+libc), signed `hello` runs from VFS |
 | M10 | done | storage & persistence: virtio-blk (`vda`) + RW **FAT32/ext2/ext4** via VFS multi-mount (`/mnt`); `SYS_SPAWN`/`SYS_WAIT` + shell `run`; signed ELF written to disk → read → verify → ring-3. See `docs/devlog/M10.md` |
 | M11 | done | Driver Space for real: `.note.secos` v2 manifest carries `proc_type`/`dev_id`/`dev_caps` (signature-rooted); loader auto-binds a `PROC_TYPE_DRIVER` to its device with the granted cap subset; `SYS_DRIVER` enforces driver-only + per-binding caps + `[DRV-AUDIT]`. See `docs/devlog/M11.md` |
-| **M12** | **core done** | Memory scalability + W^X hard gate: PMM manages all RAM (clamps gone; word-skip+cursor; `pmm_alloc_contiguous`); heap on physmap + multi-frame + NULL-on-fail (fixes the M11 >4 KB gotcha, demo loads via VFS again); `vmm_map` rejects W+X (`-5`). `-m 2G` → ~2045 MB free. **Deferred**: higher-half relocation, full demand paging, identity-region W^X (rationale in devlog). Harness 51/51. See `docs/devlog/M12.md` |
+| **M12** | **done** | Memory scalability + W^X hard gate + **higher-half kernel**: PMM manages all RAM (clamps gone; word-skip+cursor; `pmm_alloc_contiguous`); heap on physmap + multi-frame + NULL-on-fail (fixes the M11 >4 KB gotcha, demo loads via VFS again); `vmm_map` rejects W+X (`-5`); `-m 2G` → ~2045 MB free. Kernel linked+runs at `0xFFFFFFFF80000000` (low `.boot` + high kernel; both MB2 and UEFI). **Deferred**: full demand paging, identity-region W^X. Harness 51/51, `--mb2`+`--uefi` PASS. See `docs/devlog/M12.md` |
 | M13 | **next** | usability & policy: shell launches on-disk programs; minimal IPC/pipes; end-to-end `.note.secos` enforcement (`max_mem`, capability gating). Plus deferred driver-space items: real `DRIVER_OP_MAP_MEM`, IRQ-to-driver, DMA sandbox, driver restart |
 
 ## Build / test / run
@@ -98,9 +101,14 @@ Memory scalability + W^X (`docs/devlog/M12.md`):
   undersized block. Fixes the M11 gotcha — the M11 demo loads from the VFS again.
 - **W^X**: `vmm_map`/`vmm_map_in_space` reject RW-without-NX (`-5`); boot tests
   `[WX]` + `[HEAP] large kmalloc(64K) OK`. `-m 2G` → ~2045 MB free. 51/51.
-- **Deferred** (rationale in devlog): higher-half kernel relocation (physmap
-  already gives high-half access to all RAM; relocation touches both boot paths +
-  virtio DMA's `phys==virt` assumption), full demand paging (`vmm_region` path is
+- **Higher-half**: kernel linked + runs at `KERNEL_VMA=0xFFFFFFFF80000000`
+  (`-mcmodel=kernel -fno-pic`). `linker.ld` keeps a low `.boot` (MB2 header +
+  32-bit setup + initial tables) and links the rest HIGH/loads LOW via `AT()`.
+  `boot.asm` maps low identity + high half then jumps high; the UEFI loader loads
+  segments at their LMA (`p_paddr`) and maps PML4[511]. `kvirt_to_phys` fixes the
+  two symbol-as-physical spots (PMM bitmap math, virtio DMA). **Low identity map
+  kept** (virtio DMA + early frame access). Both `--mb2` and `--uefi` PASS.
+- **Deferred** (rationale in devlog): full demand paging (`vmm_region` path is
   dormant), W^X of the 0–512 MB identity huge-page map (still RWX).
 
 ## M11 recap (done)
@@ -174,9 +182,9 @@ file/ELF size. Good M13 targets:
    path already does this — extend to user limits).
 
 Carry-over follow-ups (deferred from M12/M11, not blocking M13):
-- **M12 stretch**: higher-half kernel relocation (needs work on both boot paths +
-  virtio DMA's `phys==virt`); full demand paging (`vmm_region` path is dormant);
-  W^X of the 0–512 MB identity huge-page map (still RWX).
+- **M12 stretch**: full demand paging (`vmm_region` path is dormant); W^X of the
+  0–512 MB identity huge-page map (still RWX); optionally drop the low identity
+  map entirely (would require reworking virtio DMA + early frame access off it).
 - **M11 driver space**: real `DRIVER_OP_MAP_MEM` (map device MMIO into the driver
   address space — still a validating stub); IRQ-to-driver (`IRQ_SUBSCRIBE` + IPC
   queue); DMA sandbox; automatic restart of a crashed critical driver.

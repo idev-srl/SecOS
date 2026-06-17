@@ -9,6 +9,7 @@
 #include "multiboot2.h"
 #include "terminal.h"
 #include "debugcon.h"
+#include "vmm.h"   // [M12] KERNEL_VMA_BASE / kvirt_to_phys for the higher-half bitmap
 // print_hex definita in kernel, forward decl per debug
 extern void print_hex(uint64_t value);
 
@@ -139,7 +140,12 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
     terminal_writestring("[PMM] max_addr="); print_hex(max_addr); terminal_writestring(" total_frames="); {
         char buf[32]; itoa_dec(total_frames, buf); terminal_writestring(buf); }
     terminal_writestring(" bitmap_size="); { char buf2[32]; itoa_dec(bitmap_size, buf2); terminal_writestring(buf2); terminal_writestring(" bytes\n"); }
-    frame_bitmap = (uint32_t*)((uint64_t)&_kernel_end);
+    // [M12] _kernel_end is a higher-half VMA; access the bitmap through it (the
+    // CPU resolves it to physical via the high-half map), but do all frame-number
+    // math in PHYSICAL space.
+    uint64_t bitmap_virt = (uint64_t)&_kernel_end;
+    uint64_t bitmap_phys = kvirt_to_phys(bitmap_virt);
+    frame_bitmap = (uint32_t*)bitmap_virt;
     // Zero bitmap
     uint64_t dwords = (bitmap_size + 3) / 4;
     for (uint64_t i = 0; i < dwords; i++) {
@@ -165,15 +171,15 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
             }
         }
     }
-    // Protect kernel+bitmap area (mark as used)
-    uint64_t kernel_end_frame = ((uint64_t)frame_bitmap + bitmap_size) / PMM_FRAME_SIZE + 1;
+    // Protect kernel+bitmap area (mark as used). Math in PHYSICAL space.
+    uint64_t kernel_end_frame = (bitmap_phys + bitmap_size) / PMM_FRAME_SIZE + 1;
     for (uint64_t f=0; f<kernel_end_frame; f++) {
         if (!bitmap_test(f)) { bitmap_set(f); used_frames++; }
     }
     // Fallback: if no free frames create synthetic region after kernel within mapped limit
     if (used_frames == 0 || used_frames == total_frames || pmm_get_free_memory() == 0) {
         terminal_writestring("[PMM][WARN] Nessun frame libero dalle regioni; applico fallback sintetico\n");
-        uint64_t fallback_start = ((uint64_t)frame_bitmap + bitmap_size + PMM_FRAME_SIZE -1) & ~(PMM_FRAME_SIZE-1);
+        uint64_t fallback_start = (bitmap_phys + bitmap_size + PMM_FRAME_SIZE -1) & ~(PMM_FRAME_SIZE-1);
         uint64_t fallback_end = total_frames * PMM_FRAME_SIZE;
         uint64_t start_f = fallback_start / PMM_FRAME_SIZE;
         uint64_t end_f = fallback_end / PMM_FRAME_SIZE;

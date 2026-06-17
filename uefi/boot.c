@@ -121,15 +121,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     // Fase 2: costruzione tabelle di pagine (PML4, PDPT, PDT, PT) minimale
     // Strategia: identity map area bassa (<=512MB) + mappa segmenti kernel alle loro vaddr se rientrano.
     // Per semplicità: usiamo pagine da 2MB (PS) come nel percorso BIOS iniziale.
-    uint64_t pml4_phys = 0, pdpt_phys = 0, pdt_phys = 0;
-    uint8_t* pml4 = NULL; uint8_t* pdpt = NULL; uint8_t* pdt = NULL;
-    CHECK_OK("AllocPages PML4", SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pml4_phys));
-    CHECK_OK("AllocPages PDPT", SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdpt_phys));
-    CHECK_OK("AllocPages PDT",  SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdt_phys));
-    // Se arriviamo qui, le allocazioni sono andate a buon fine, quindi possiamo procedere
-    pml4 = (uint8_t*)pml4_phys; pdpt = (uint8_t*)pdpt_phys; pdt = (uint8_t*)pdt_phys;
-    for(int i=0;i<4096;i++){ pml4[i]=0; pdpt[i]=0; pdt[i]=0; }
-    // Link PML4->PDPT, PDPT->PDT
+    // [M12] Higher-half: PML4[0] -> identity 0-512MB (for the bootloader's own
+    // running code/stack/bootinfo, all < 512MB), and PML4[511] -> the SAME 512MB
+    // page-directory so the kernel is reachable at KERNEL_VMA (0xFFFFFFFF80000000).
+    uint64_t pml4_phys = 0, pdpt_phys = 0, pdt_phys = 0, pdpt_hi_phys = 0;
+    uint8_t* pml4 = NULL; uint8_t* pdpt = NULL; uint8_t* pdt = NULL; uint8_t* pdpt_hi = NULL;
+    CHECK_OK("AllocPages PML4",   SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pml4_phys));
+    CHECK_OK("AllocPages PDPT",   SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdpt_phys));
+    CHECK_OK("AllocPages PDT",    SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdt_phys));
+    CHECK_OK("AllocPages PDPThi", SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdpt_hi_phys));
+    pml4 = (uint8_t*)pml4_phys; pdpt = (uint8_t*)pdpt_phys; pdt = (uint8_t*)pdt_phys; pdpt_hi = (uint8_t*)pdpt_hi_phys;
+    for(int i=0;i<4096;i++){ pml4[i]=0; pdpt[i]=0; pdt[i]=0; pdpt_hi[i]=0; }
+    // PML4[0] -> PDPT[0] -> PDT (low identity)
     ((uint64_t*)pml4)[0] = (uint64_t)pdpt | 0x3;
     ((uint64_t*)pdpt)[0] = (uint64_t)pdt | 0x3;
     // Identity map prime 512MB con entry 2MB
@@ -137,6 +140,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         uint64_t phys = (uint64_t)e << 21; // e*2MB
         ((uint64_t*)pdt)[e] = phys | 0x83; // Present|Write|PS
     }
+    // PML4[511] -> PDPThi[510] -> same PDT (high half KERNEL_VMA -> phys 0)
+    ((uint64_t*)pml4)[511]    = (uint64_t)pdpt_hi | 0x3;
+    ((uint64_t*)pdpt_hi)[510] = (uint64_t)pdt | 0x3;
 
     // Fase 3: Rimappare segmenti ELF (placeholder: già copiati in pool; mapping reale post-ExitBootServices non ancora implementato).
     // Per implementazione completa servirebbe allocare memoria fisica alle vaddr e copiare i dati fuori da pool temporaneo.
@@ -144,13 +150,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         puts16(SystemTable, WIDE("[INFO] Copia segmenti ELF nelle vaddr target (assunzione identity)\r\n"));
         for (uint16_t si = 0; si < g_loaded_segment_count; ++si) {
             secos_loaded_segment_t* seg = &g_loaded_segments[si];
-            uint64_t vaddr = seg->vaddr;
+            uint64_t paddr = seg->paddr;     // [M12] place at the LMA (low identity)
             uint64_t filesz = seg->filesz;
             uint64_t memsz = seg->memsz;
             uint8_t* src = seg->data;
-            uint8_t* dst = (uint8_t*)vaddr;
-            // Verifica che rientri nei 512MB identity (semplice controllo)
-            if (vaddr + memsz > (512ULL * 1024 * 1024)) {
+            uint8_t* dst = (uint8_t*)paddr;  // identity: phys == current VA (UEFI maps low)
+            // Verifica che la collocazione fisica rientri nei 512MB identity.
+            if (paddr + memsz > (512ULL * 1024 * 1024)) {
                 puts16(SystemTable, WIDE("[WARN] Segmento oltre area identity mappata, salto\r\n"));
                 continue;
             }
@@ -158,8 +164,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
             for (uint64_t k = 0; k < filesz; ++k) dst[k] = src[k];
             // Zero padding BSS
             for (uint64_t k = filesz; k < memsz; ++k) dst[k] = 0;
-            puts16(SystemTable, WIDE("[OK] Segmento copiato vaddr= "));
-            print_hex64(SystemTable, vaddr);
+            puts16(SystemTable, WIDE("[OK] Segmento copiato paddr= "));
+            print_hex64(SystemTable, paddr);
             puts16(SystemTable, WIDE(" size= "));
             print_hex64(SystemTable, memsz);
             puts16(SystemTable, WIDE(" flags= "));

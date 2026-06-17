@@ -29,6 +29,11 @@ typedef struct vmm_space {
 // Virtual base of physmap (chosen in unused high area)
 #define VMM_PHYSMAP_BASE 0xFFFF888000000000ULL
 
+// [M12] Higher-half kernel base: the kernel image is linked at this VMA and the
+// low identity (0-512MB) maps to it via PML4[511]. A kernel-image symbol's
+// physical address is its VMA minus this base.
+#define KERNEL_VMA_BASE 0xFFFFFFFF80000000ULL
+
 // Initialize physmap for all physical memory (rounded up to 2MB boundary)
 void vmm_init_physmap(void);
 void vmm_extend_physmap(uint64_t phys_end); // extend physmap if needed (2MB granularity)
@@ -36,6 +41,18 @@ void vmm_extend_physmap(uint64_t phys_end); // extend physmap if needed (2MB gra
 // Helper conversions
 static inline uint64_t phys_to_virt(uint64_t phys) { return VMM_PHYSMAP_BASE + phys; }
 static inline uint64_t virt_to_phys(uint64_t virt) { return (virt >= VMM_PHYSMAP_BASE) ? (virt - VMM_PHYSMAP_BASE) : 0; }
+
+// [M12] Translate any kernel-reachable virtual address to physical:
+//   - kernel image (>= KERNEL_VMA_BASE)  -> v - KERNEL_VMA_BASE
+//   - physmap      (>= VMM_PHYSMAP_BASE) -> v - VMM_PHYSMAP_BASE
+//   - otherwise (low identity)           -> v
+// Used where a static/kernel pointer must be handed to hardware as a physical
+// address (e.g. virtio DMA descriptors).
+static inline uint64_t kvirt_to_phys(uint64_t v) {
+    if (v >= KERNEL_VMA_BASE)  return v - KERNEL_VMA_BASE;
+    if (v >= VMM_PHYSMAP_BASE) return v - VMM_PHYSMAP_BASE;
+    return v;
+}
 
 // Initialize VMM on current space (uses existing CR3)
 void vmm_init(void);

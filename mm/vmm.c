@@ -162,25 +162,35 @@ static uint64_t vmm_build_kernel_pml4_identity_512mb(void) {
     uint64_t pml4_phys = (uint64_t)pmm_alloc_frame();
     uint64_t pdpt_phys = (uint64_t)pmm_alloc_frame();
     uint64_t pdt_phys  = (uint64_t)pmm_alloc_frame();
-    if (!pml4_phys || !pdpt_phys || !pdt_phys) {
+    uint64_t pdpt_hi_phys = (uint64_t)pmm_alloc_frame();   // [M12] high-half PDPT
+    if (!pml4_phys || !pdpt_phys || !pdt_phys || !pdpt_hi_phys) {
         terminal_writestring("[ERR] M1.1: PMM alloc failed for kernel page tables\n");
         return 0;
     }
     zero_frame(pml4_phys);
     zero_frame(pdpt_phys);
     zero_frame(pdt_phys);
+    zero_frame(pdpt_hi_phys);
 
     // Identity cast: frames are within 0–512MB, bootloader tables are still active
-    uint64_t* pml4 = (uint64_t*)pml4_phys;
-    uint64_t* pdpt = (uint64_t*)pdpt_phys;
-    uint64_t* pdt  = (uint64_t*)pdt_phys;
+    uint64_t* pml4    = (uint64_t*)pml4_phys;
+    uint64_t* pdpt    = (uint64_t*)pdpt_phys;
+    uint64_t* pdt     = (uint64_t*)pdt_phys;
+    uint64_t* pdpt_hi = (uint64_t*)pdpt_hi_phys;
 
+    // Low identity 0–512MB (PML4[0] -> PDPT[0] -> PDT, 2MB pages). Still needed
+    // during early init (frames addressed by physical == virtual) and for the
+    // boot transition; the physmap and high half take over afterwards.
     pml4[0] = pdpt_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW;
     pdpt[0] = pdt_phys  | VMM_FLAG_PRESENT | VMM_FLAG_RW;
-    // 256 entries × 2MB = 512MB identity map
     for (int i = 0; i < 256; i++) {
         pdt[i] = ((uint64_t)i << 21) | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS;
     }
+    // [M12] High half: KERNEL_VMA_BASE (0xFFFFFFFF80000000) = PML4[511] -> PDPT[510]
+    // -> the SAME 512MB page-directory, so the kernel image (phys < 512MB) is
+    // reachable at its link VMA. The kernel runs here after this PML4 is loaded.
+    pml4[511]     = pdpt_hi_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    pdpt_hi[510]  = pdt_phys     | VMM_FLAG_PRESENT | VMM_FLAG_RW;
     return pml4_phys;
 }
 

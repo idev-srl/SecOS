@@ -1,139 +1,97 @@
-; SecOS Kernel - Minimal Long Mode Bootloader
+; SecOS Kernel - Higher-half Long Mode Bootloader
 ; Copyright (c) 2025 iDev srl
 ; Author: Luigi De Astis <l.deastis@idev-srl.com>
 ; SPDX-License-Identifier: MIT
-; boot.asm - Minimal Long Mode bootloader
+;
+; The kernel runs at the canonical high half KERNEL_VMA = 0xFFFFFFFF80000000.
+; This file's low .boot.* sections run at their physical load address (identity)
+; to perform the 32-bit Multiboot2 -> long-mode transition, build page tables
+; that map BOTH the low identity (0-512MB) and the high half, then jump to the
+; high-half kernel entry. The UEFI path enters at _uefi_start (already 64-bit;
+; the external loader has mapped the high half) and joins the same flow.
 BITS 32
 
-; Multiboot2 minimal header (dedicated section placed at file start)
+KERNEL_VMA equ 0xFFFFFFFF80000000
+
+; --- Multiboot2 header (collected first into .boot by the linker) ---
 section .multiboot
 align 8
-; --- Multiboot2 header (minimal: framebuffer request 1024x768x32) ---
-; Tag order:
-;  type=5 framebuffer request (size=20) + padding (4)
-;  type=0 end
-
 mb2_header_start:
     dd 0xE85250D6            ; magic
     dd 0x0                   ; arch
     dd mb2_header_end - mb2_header_start ; header_length
     dd 0 - (0xE85250D6 + 0x0 + (mb2_header_end - mb2_header_start)) ; checksum
-    ; Framebuffer tag (type=5) request (width,height,depth). Size=20 (header 8 + payload 12). Must pad to 8-align next tag.
-    dw 5                     ; type
+    dw 5                     ; type=5 framebuffer request
     dw 0                     ; flags
-    dd 20                    ; size (does NOT include padding)
+    dd 20                    ; size
     dd 1024                  ; width
     dd 768                   ; height
     dd 32                    ; depth
-    dd 0                     ; 4-byte padding to align following tag to 8-byte boundary
-    ; End tag
-    dw 0                     ; type=0 end
-    dw 0                     ; flags
-    dd 8                     ; size=8
+    dd 0                     ; padding to 8-align
+    dw 0                     ; end tag
+    dw 0
+    dd 8
 mb2_header_end:
 
-; Kernel stack
-section .bss
+; --- Low boot BSS: page tables, boot stack, MB info copy buffer ---
+section .boot.bss nobits alloc noexec write align=4096
+align 4096
+pml4:     resb 4096
+pdpt_low: resb 4096          ; PML4[0]   -> identity 0-512MB
+pdt:      resb 4096          ; shared 512MB page-directory (2MB pages)
+pdpt_hi:  resb 4096          ; PML4[511] -> high half (0xFFFFFFFF80000000)
 align 16
-global stack_bottom
-global stack_top
-stack_bottom:
-    resb 16384
-stack_top:
-
-; Buffer to copy multiboot structure (up to 8KB)
+boot_stack_bottom:
+    resb 4096
+boot_stack_top:
 align 16
-global mb2_copy
 mb2_copy:
     resb 8192
 
-; Page tables (identity + higher-half mappings prepared later)
-align 4096
-pml4:
-    resb 4096
-pdpt:
-    resb 4096
-pdt:
-    resb 4096
-
-section .data
-; Saved multiboot parameters
+; --- Low boot data: saved MB params + boot GDT (used by both transitions) ---
+section .boot.data progbits alloc noexec write align=16
 mb_magic: dq 0
-mb_info: dq 0
+mb_info:  dq 0
+align 16
+gdt:
+    dq 0                                    ; Null
+    dq 0x00209A0000000000                   ; Code (64-bit)
+    dq 0x0000920000000000                   ; Data
+gdt_pointer:
+    dw gdt_pointer - gdt - 1
+    dq gdt
 
-; Resto del codice
-section .text
+; --- Low boot text: 32-bit setup + 64-bit low trampoline ---
+section .boot.text progbits alloc exec nowrite align=16
 global _start
 extern kernel_main
 
-%define DEBUG_PORT 0
-%macro PORT_CH 1
-%if DEBUG_PORT
-    mov al, %1
-    out 0xE9, al
-%endif
-%endmacro
-
 _start:
     cli
-    mov esp, stack_top
-         ; Salva parametri MULTIBOOT appena entrati
-         mov [mb_magic], eax
-         mov [mb_info], ebx
-         ; Verifica subito magic prima di altre operazioni di dump
-        cmp eax, 0x36d76289
-        jne .no_mb2_early
-        PORT_CH 'M'
-        jmp .after_magic_early
-    .no_mb2_early:
-        PORT_CH 'h'
-.after_magic_early:
-    PORT_CH 'H'
-; (header byte dump removed in cleaned build)
-    ; Verifica checksum runtime: somma primi 16 byte deve essere 0 mod 2^32
-    mov esi, mb2_header_start
-    mov eax, [esi]
-    add eax, [esi+8]
-    add eax, [esi+12]
-    test eax, eax
-    jnz .chk_fail
-    PORT_CH 'Z'
-    jmp .after_chk
-.chk_fail:
-    PORT_CH '!'
-    PORT_CH 'B'
-.after_chk:
-; (EBX nibble dump removed)
-    ; Se magic MB2 (abbiamo emesso 'M' già) prova a copiare struttura info in buffer sicuro
-    cmp byte [mb_magic], 0x89        ; check lowest byte of magic 0x36d76289 (quick heuristic)
+    mov esp, boot_stack_top
+    mov [mb_magic], eax
+    mov [mb_info], ebx
+
+    ; Copy Multiboot2 info into a safe buffer if it looks sane (<=8KB).
+    cmp eax, 0x36d76289
     jne .skip_copy
+    mov esi, ebx
     test esi, esi
     jz .skip_copy
-    mov edi, esi
-    ; Leggi total_size (primi 4 byte) se accessibile
-    mov eax, [esi]
+    mov eax, [esi]              ; total_size
     test eax, eax
     jz .skip_copy
     cmp eax, 8192
     ja .skip_copy
     mov ecx, eax
     mov edi, mb2_copy
-    mov edx, ecx
     rep movsb
-    ; Aggiorna mb_info con nuovo indirizzo buffer
-    mov eax, mb2_copy
-    mov [mb_info], eax
-    PORT_CH 'C'
+    mov dword [mb_info], mb2_copy
 .skip_copy:
-    ; Debug: emetti 'H' se magic = MB2
-    cmp eax, 0x36d76289
-    jne .no_mb2
-    jmp .after_mb2
-.no_mb2:
-    PORT_CH 'h'
-.after_mb2:
 
-    ; Verifica CPUID
+    ; CPUID availability
+    pushfd
+    pop eax
     mov ecx, eax
     xor eax, (1 << 21)
     push eax
@@ -142,130 +100,124 @@ _start:
     pop eax
     xor eax, ecx
     jz .no_cpuid
-    ; CPUID disponibile
-    
-    ; Verifica Long Mode
+
+    ; Long mode availability
     mov eax, 0x80000000
     cpuid
     cmp eax, 0x80000001
     jb .no_long_mode
-    
     mov eax, 0x80000001
     cpuid
     test edx, (1 << 29)
     jz .no_long_mode
-    ; Long mode support verificato
-    
-    ; Setup page tables
-    ; Zero out tables
+
+    ; Zero the page tables (4 * 4096 = 16384 bytes = 4096 dwords)
     mov edi, pml4
-    mov ecx, 3072
+    mov ecx, 4096
     xor eax, eax
     rep stosd
-    
-    ; Link tables
-    mov eax, pdpt
+
+    ; PML4[0] -> pdpt_low ; pdpt_low[0] -> pdt   (low identity)
+    mov eax, pdpt_low
     or eax, 0x3
     mov [pml4], eax
-    
     mov eax, pdt
     or eax, 0x3
-    mov [pdpt], eax
-    
-    ; Mappa 512MB con pagine da 2MB (256 entries)
-    ; Flags: Present|Write|PS=2MB => 0x83
-    xor ebx, ebx            ; ebx = index
-    mov ecx, 256            ; number of 2MB entries
+    mov [pdpt_low], eax
+
+    ; PML4[511] -> pdpt_hi ; pdpt_hi[510] -> pdt  (high half)
+    ; 0xFFFFFFFF80000000: PML4 idx 511 (off 0xFF8), PDPT idx 510 (off 0xFF0).
+    mov eax, pdpt_hi
+    or eax, 0x3
+    mov [pml4 + 511*8], eax
+    mov eax, pdt
+    or eax, 0x3
+    mov [pdpt_hi + 510*8], eax
+
+    ; Fill the shared 512MB page-directory with 256 * 2MB pages.
+    xor ebx, ebx
 .map_loop:
     mov eax, ebx
-    shl eax, 21             ; eax = base phys = index * 2MB
-    or eax, 0x83
+    shl eax, 21                 ; phys = idx * 2MB
+    or eax, 0x83                ; Present|Write|PS
     mov [pdt + ebx*8], eax
     inc ebx
-    cmp ebx, ecx
+    cmp ebx, 256
     jl .map_loop
-    ; Identity map 512MB completata
-    
+
     ; Enable PAE
     mov eax, cr4
     or eax, (1 << 5)
     mov cr4, eax
-    
+
     ; Load PML4
     mov eax, pml4
     mov cr3, eax
-    ; CR3 caricato
-    
-    ; Enable long mode + NXE (bit 11 di EFER) per usare NX pages
-    mov ecx, 0xC0000080          ; EFER
+
+    ; Enable Long Mode + NX in EFER
+    mov ecx, 0xC0000080
     rdmsr
-    or eax, (1 << 8)             ; LME
-    or eax, (1 << 11)            ; NXE
+    or eax, (1 << 8)            ; LME
+    or eax, (1 << 11)           ; NXE
     wrmsr
-    ; LME+NXE abilitati
-    
+
     ; Enable paging
     mov eax, cr0
     or eax, (1 << 31)
     mov cr0, eax
-    ; Paging abilitato
-    
-    ; Load GDT
-    lgdt [gdt.pointer]
-    ; GDT caricata
-    jmp 0x08:long_mode
+
+    ; Load boot GDT and far-jump into 64-bit (low identity) trampoline
+    lgdt [gdt_pointer]
+    jmp 0x08:long_mode_low
 
 .no_cpuid:
     mov al, 'C'
-    jmp error
-
+    jmp .error
 .no_long_mode:
     mov al, 'L'
-    jmp error
-error:
+.error:
     mov dword [0xb8000], 0x4f524f45
     mov byte [0xb8004], al
-    jmp error
+    jmp .error
 
+; 64-bit trampoline still executing at the low identity address. Set up the
+; SysV args for kernel_main, then jump to the high-half entry (indirect, so the
+; full 64-bit target address is reachable).
 BITS 64
-long_mode:
-    ; Entrato in long mode
-    ; Setup segments
+long_mode_low:
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
-    
-    ; Non azzeriamo più la VGA text memory se useremo il framebuffer
-    
-    ; Setup stack
-    mov rsp, stack_top
-    
-    ; Get multiboot params
-    ; Carica parametri 64-bit per SysV: RDI=magic (zero-extended), RSI=info pointer
-    mov eax, dword [mb_magic]   ; magic 32-bit
-    mov rdi, rax
-    mov eax, dword [mb_info]    ; info low 32-bit
-    mov rsi, rax                ; zero-extend
-    ; marker before calling kernel_main
-    PORT_CH 'I'
-    
-    ; Call kernel
+    mov eax, dword [mb_magic]
+    mov rdi, rax               ; arg0 = multiboot magic
+    mov eax, dword [mb_info]
+    mov rsi, rax               ; arg1 = multiboot info pointer
+    mov rax, long_mode_high
+    jmp rax
+
+; --- High-half kernel entry ---
+section .text
+BITS 64
+long_mode_high:
+    lea rsp, [rel stack_top]   ; switch to the high-half boot stack
     call kernel_main
-    PORT_CH 'K'
 .hang:
     cli
     hlt
+    jmp .hang
 
 ; ── UEFI entry point ─────────────────────────────────────────────────────────
-; Called by UEFI bootloader already in 64-bit long mode.
-; Calling convention: SysV AMD64 (RDI = magic=0, RSI = &secos_boot_info).
-; Reloads our own GDT/segments, sets stack, calls kernel_main directly.
+; Entered in 64-bit long mode by the external UEFI loader, which has already
+; mapped the kernel high half and the low identity. RDI=0 (magic), RSI=&bootinfo.
 global _uefi_start
 _uefi_start:
-    lgdt [rel gdt.pointer]
+    ; Load the boot GDT (low identity, still mapped) via an absolute pointer:
+    ; a RIP-relative lgdt from the high half cannot reach the low descriptor.
+    mov rax, gdt_pointer
+    lgdt [rax]
     mov ax, 0x10
     mov ds, ax
     mov es, ax
@@ -273,16 +225,17 @@ _uefi_start:
     mov gs, ax
     mov ss, ax
     lea rsp, [rel stack_top]
-    PORT_CH 'U'                 ; debug probe (only if DEBUG_PORT=1)
     call kernel_main
     cli
+.uhang:
     hlt
-section .rodata
+    jmp .uhang
+
+; High-half boot stack (used by both entries until the kernel switches stacks)
+section .bss
 align 16
-gdt:
-    dq 0                                    ; Null
-    dq 0x00209A0000000000                  ; Code
-    dq 0x0000920000000000                  ; Data
-.pointer:
-    dw $ - gdt - 1
-    dq gdt
+global stack_bottom
+global stack_top
+stack_bottom:
+    resb 16384
+stack_top:

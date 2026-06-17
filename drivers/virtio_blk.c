@@ -21,6 +21,7 @@
 #include "io.h"
 #include "block.h"
 #include "debugcon.h"
+#include "vmm.h"   // [M12] kvirt_to_phys for higher-half DMA address translation
 #include <stddef.h>
 
 /* ── PCI identity ────────────────────────────────────────────────────────── */
@@ -107,7 +108,11 @@ static uint16_t            g_last_used;    /* last seen used->idx */
 static uint16_t g_io_base;
 static int      g_ready;
 
-static inline uint64_t phys_of(const void* p) { return (uint64_t)(uintptr_t)p; }
+/* [M12] Higher-half: a kernel-image static's symbol address is a high VMA, not
+ * its physical address. Translate to physical for the device (DMA descriptors,
+ * queue PFN). The derived CPU pointers (g_desc/g_avail/g_used) then address the
+ * low identity map, which the kernel keeps mapped (the DMA region is < 512 MB). */
+static inline uint64_t phys_of(const void* p) { return kvirt_to_phys((uint64_t)(uintptr_t)p); }
 
 /* Round up to the next 4 KiB boundary. */
 static inline uint64_t align4k(uint64_t x) { return (x + 0xFFF) & ~0xFFFULL; }
