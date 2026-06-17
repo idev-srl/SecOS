@@ -5,14 +5,17 @@ _Last updated: end of M13 (usability & policy enforcement). Read this first._
 ## Where we are
 
 - **Done through M13** — M0–M13 complete (phases A–E of the plan). Branch
-  **`milestone/M7`** (historical name). Tag `M9_STABLE` is the last tag. M11
-  (`a2ef931`), M12 memory/W^X (`e3b3470`), M12 higher-half (`3186c1e`) pushed; M13
-  committed on top and **pushed**.
+  **`milestone/M7`** (historical name). **HEAD = `b7d3a86`, fully pushed to
+  `origin/milestone/M7`** (nothing pending). Commit trail: M11 `a2ef931`, M12
+  memory/W^X `e3b3470`, M12 higher-half `3186c1e`, M13 `b7d3a86`. Tag `M9_STABLE`
+  is the last tag (consider tagging `M13_STABLE` / the phase-A–E completion).
 - Build is green: `make` clean (0 warnings), the full self-test harness
   `tools/selftest.sh` is **56/56**, both boot paths run higher-half at
   `0xFFFFFFFF80000000` (`smoke.sh --mb2` and `--uefi` PASS).
 - Only `edk2/` is untracked (a large vendored tree, not part of the build) — leave it.
-  Local build artifacts `secos-uefi.{img,vmdk}` and `disk.img` are gitignored.
+  `.gitignore` shows a stale local modification from before this work — harmless,
+  not committed. Build artifacts `secos-uefi.{img,vmdk}`, `disk.img`, `*.o`,
+  `user/*.elf`, `uefi_loader.elf` are gitignored/untracked.
 
 ## What SECoS is (identity)
 
