@@ -4,13 +4,13 @@ Single, linear milestone scheme (M0 → present → future). Earlier revisions o
 this file mixed two conflicting numbering schemes (the executed git milestones
 and an older pre-analysis plan); that has been collapsed into one timeline.
 
-- **Done:** M0–M12 (M11 = Driver Space for real: signature-rooted `proc_type` +
-  capability-mediated `SYS_DRIVER`; M12 = memory scalability — PMM manages all
-  RAM, physmap-addressed multi-frame heap — + W^X hard gate + **higher-half
-  kernel** at `0xFFFFFFFF80000000`, both MB2 and UEFI). Harness 51/51.
+- **Done:** M0–M13 — the full mandatory plan (phases A–E). M11 = Driver Space for
+  real; M12 = memory scalability + W^X hard gate + higher-half kernel
+  (`0xFFFFFFFF80000000`, MB2 + UEFI); M13 = usability & policy (manifest
+  `max_mem` enforced at load, `SYS_GETTICKS`, kernel IPC channels). Harness 56/56.
 - **In progress:** —
-- **Planned:** M13 (usability & policy: shell launches on-disk programs +
-  end-to-end manifest enforcement)
+- **Planned:** stretch/hardening only (full demand paging, drop low identity map,
+  real `DRIVER_OP_MAP_MEM` / IRQ-to-driver, ext4 journaling, blocking sleep/argv)
 
 Per-milestone implementation notes live in `docs/devlog/M*.md`. The detailed
 execution plan — mission, definition of done, per-phase acceptance gates, and
@@ -162,14 +162,23 @@ See `docs/devlog/M11.md`. Harness 47/47.
 W+X page request is rejected; the kernel runs higher-half on MB2 and UEFI.
 Harness 51/51; `smoke.sh --mb2` and `--uefi` PASS. See `docs/devlog/M12.md`.
 
-### M13 — Usability & policy enforcement (stretch)
+### M13 — Usability & policy enforcement — **DONE**
 **Goal:** a usable system with end-to-end manifest policy.
 
-- Shell that launches user programs from the FS; minimal IPC/pipes; a few more
-  syscalls; end-to-end `.note.secos` enforcement (`max_mem`, capability gating).
+- **Done — on-disk launch**: shell `run <path>` (M10) loads/verifies and runs a
+  signed on-disk program; exercised by the M10 harness across FAT32/ext2/ext4.
+- **Done — manifest `max_mem` enforcement**: `process_create_from_elf` refuses a
+  process whose mapped footprint exceeds its signed manifest's `max_mem`
+  (0 = unlimited), with a leak-free teardown. Signature-rooted.
+- **Done — more syscalls + minimal IPC**: `SYS_GETTICKS` (uptime), `SYS_MSG_SEND`
+  / `SYS_MSG_RECV` over kernel IPC channels (`kernel/ipc.c`, ring buffers). Two
+  separately-spawned ring-3 programs communicate (no fork/fd inheritance).
+- **Deferred**: blocking `SYS_SLEEP`/channel wait; `argv`/env to spawned
+  programs; richer pipe semantics (EOF, multiple readers).
 
-**Depends:** M11. **Done when:** the shell runs on-disk programs; a program
-exceeding its manifest `max_mem` is aborted at load.
+**Depends:** M11. **Done when (met):** the shell runs on-disk programs; a program
+exceeding its manifest `max_mem` is aborted at load. Harness 56/56. See
+`docs/devlog/M13.md`.
 
 ---
 

@@ -15,6 +15,11 @@ void    _exit(int code) __attribute__((noreturn));
 int     getpid(void);
 void    sched_yield(void);
 
+/* [M13] uptime + minimal IPC channels */
+unsigned long getticks(void);                            /* uptime in timer ticks */
+long    msg_send(int chan, const void* buf, long len);   /* bytes accepted, or <0 */
+long    msg_recv(int chan, void* buf, long len);         /* bytes read (0 empty), or <0 */
+
 /* tiny libc helpers */
 size_t  strlen(const char* s);
 int     puts(const char* s);   /* writes s + '\n' to stdout (fd 1) */

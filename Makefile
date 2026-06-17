@@ -45,6 +45,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/syscall.c \
 	$(KERNEL_DIR)/syscall_trap.c \
 	$(KERNEL_DIR)/driver_if.c \
+	$(KERNEL_DIR)/ipc.c \
 	$(KERNEL_DIR)/selftest.c \
 	user/testdriver.c \
 	$(LIB_DIR)/terminal.c \
@@ -142,6 +143,9 @@ user-progs:
 	$(CC) $(USER_CFLAGS) -c user/drvprobe.c   -o user/drvprobe.o
 	$(CC) $(USER_CFLAGS) -c user/driver_demo.c -o user/driver_demo.o
 	$(CC) $(USER_CFLAGS) -c user/userprobe.c  -o user/userprobe.o
+	$(CC) $(USER_CFLAGS) -c user/note_maxmem.S -o user/note_maxmem.o
+	$(CC) $(USER_CFLAGS) -c user/ipc_send.c   -o user/ipc_send.o
+	$(CC) $(USER_CFLAGS) -c user/ipc_recv.c   -o user/ipc_recv.o
 	$(LD) -T user/user.ld -o user/hello.elf user/crt0.o user/note.o user/libsecos.o user/hello.o
 	python3 tools/secos-sign user/hello.elf --dev
 	python3 tools/elf2h.py user/hello.elf user_hello_elf crypto/user_hello_elf.h
@@ -153,7 +157,18 @@ user-progs:
 	$(LD) -T user/user.ld -o user/userprobe.elf user/crt0.o user/note.o user/libsecos.o user/drvprobe.o user/userprobe.o
 	python3 tools/secos-sign user/userprobe.elf --dev
 	python3 tools/elf2h.py user/userprobe.elf user_userprobe_elf crypto/user_userprobe_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe -> crypto/*.h"
+	# [M13] IPC producer/consumer (signed, normal manifest)
+	$(LD) -T user/user.ld -o user/ipc_send.elf user/crt0.o user/note.o user/libsecos.o user/ipc_send.o
+	python3 tools/secos-sign user/ipc_send.elf --dev
+	python3 tools/elf2h.py user/ipc_send.elf user_ipc_send_elf crypto/user_ipc_send_elf.h
+	$(LD) -T user/user.ld -o user/ipc_recv.elf user/crt0.o user/note.o user/libsecos.o user/ipc_recv.o
+	python3 tools/secos-sign user/ipc_recv.elf --dev
+	python3 tools/elf2h.py user/ipc_recv.elf user_ipc_recv_elf crypto/user_ipc_recv_elf.h
+	# [M13] max_mem-limited build of hello (manifest limit too small -> refused at load)
+	$(LD) -T user/user.ld -o user/maxmem.elf user/crt0.o user/note_maxmem.o user/libsecos.o user/hello.o
+	python3 tools/secos-sign user/maxmem.elf --dev
+	python3 tools/elf2h.py user/maxmem.elf user_maxmem_elf crypto/user_maxmem_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem -> crypto/*.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke

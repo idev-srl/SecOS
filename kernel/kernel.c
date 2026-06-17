@@ -333,6 +333,79 @@ static void m11_run_demo(void) {
 }
 #endif /* M11_DRIVER_DEMO */
 
+// ---- [M13] Usability & policy demo (gated; off by default) ----
+// Proves, non-interactively: (1) manifest max_mem enforcement — a signed program
+// whose manifest declares a too-small max_mem is REFUSED at load; (2) minimal IPC
+// — a producer sends a message on kernel channel 0 (and reports its uptime via
+// SYS_GETTICKS) then exits; a separately-spawned consumer reads the queued
+// message. The channel is kernel-owned, so it survives the producer's exit.
+#ifndef M13_DEMO
+#define M13_DEMO 0
+#endif
+#if M13_DEMO
+#include "trapframe.h"
+#include "../crypto/user_maxmem_elf.h"
+#include "../crypto/user_ipc_send_elf.h"
+#include "../crypto/user_ipc_recv_elf.h"
+
+static uint8_t m13_idle_stack[16384] __attribute__((aligned(16)));
+static int     m13_step = 0, m13_done = 0;
+
+static void m13_spawn(const uint8_t* img, size_t len, const char* what) {
+    process_t* p = process_create_from_elf(img, len);
+    if (p) { p->state = PROC_READY;
+        debugcon_writestring("[M13] spawned "); debugcon_writestring(what); debugcon_writestring("\n");
+    } else {
+        debugcon_writestring("[M13] FAIL: "); debugcon_writestring(what); debugcon_writestring(" not loaded\n");
+    }
+}
+
+__attribute__((noreturn)) static void m13_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m13_step == 0) {
+            m13_step = 1;
+            // (1) max_mem enforcement: this signed ELF declares max_mem=4KB and
+            // must be refused at load (process_create_from_elf returns NULL).
+            debugcon_writestring("[M13] --- manifest max_mem enforcement ---\n");
+            process_t* bad = process_create_from_elf(user_maxmem_elf, user_maxmem_elf_len);
+            debugcon_writestring(bad ? "[M13] FAIL: over-limit program accepted\n"
+                                     : "[M13] max_mem program REFUSED at load (good)\n");
+            // (2) IPC: spawn the producer first; it sends to channel 0 and exits.
+            debugcon_writestring("[M13] --- IPC channel 0 (producer/consumer) ---\n");
+            m13_spawn(user_ipc_send_elf, user_ipc_send_elf_len, "ipc_send");
+        } else if (m13_step == 1 && sched_count_alive_user() == 0) {
+            m13_step = 2;
+            // Consumer reads the message the producer left queued on channel 0.
+            m13_spawn(user_ipc_recv_elf, user_ipc_recv_elf_len, "ipc_recv");
+        } else if (m13_step == 2 && sched_count_alive_user() == 0 && !m13_done) {
+            m13_done = 1;
+            debugcon_writestring("[M13] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m13_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M13] usability & policy demo\n");
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m13_idle_stack + sizeof(m13_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m13_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M13] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf); // does not return
+}
+#endif /* M13_DEMO */
+
 // ---- [M10] Interactive shell as the scheduler idle task ----
 // Running the shell as the idle task lets `run <path>` spawn a ring-3 process:
 // the timer preempts idle (shell) into the user task; on SYS_EXIT the scheduler
@@ -428,6 +501,7 @@ static void kernel_main_phase2(void) {
     heap_init();
     sched_init();
     driver_registry_init();
+    { extern void ipc_init(void); ipc_init(); }  // [M13] kernel IPC channels
     timer_init(1000);
     keyboard_init();
 
@@ -623,6 +697,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M11_DRIVER_DEMO
     m11_run_demo(); // driver-space demo (needs VFS) — does not return
+#endif
+#if M13_DEMO
+    m13_run_demo(); // usability & policy demo — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);

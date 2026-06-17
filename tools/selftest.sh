@@ -195,6 +195,26 @@ grep -q "\[WX\] W+X mapping rejected (good)" "$M12LOG"; check "M12 W^X gate reje
 grep -q "\[HEAP\] large kmalloc(64K) OK" "$M12LOG"; check "M12 heap serves large (64K) kmalloc" $?
 ! grep -q "\[EXC\]" "$M12LOG"; check "no CPU exception ([EXC]) during M12 2G boot" $?
 
+# ---- M13: usability & policy (manifest max_mem, IPC channels, getticks) ----
+M13LOG=/tmp/secos_selftest_m13.log
+echo "[selftest] Building M13 image (M13_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make CFLAGS_EXTRA=-DM13_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M13 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M13 (mb2, ${TIMEOUT}s)..."
+tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$M13LOG" >/dev/null 2>&1 || true
+
+# Manifest memory-limit enforcement: an over-limit signed program is refused at load.
+grep -q "\[M13\] max_mem program REFUSED at load (good)" "$M13LOG"; check "M13 manifest max_mem refused at load (headline)" $?
+# New syscall SYS_GETTICKS returns a non-zero uptime (the producer prints it).
+grep -qE "\[ipc_send\] sent=10 ticks=[1-9]" "$M13LOG"; check "M13 SYS_GETTICKS returns uptime + IPC send" $?
+# Minimal IPC: the consumer receives the producer's message over kernel channel 0.
+grep -q "M13-IPC-OK" "$M13LOG"; check "M13 IPC message delivered consumer<-producer (channel 0)" $?
+grep -q "\[M13\] DONE" "$M13LOG"; check "M13 demo completed ([M13] DONE)" $?
+! grep -q "\[EXC\]" "$M13LOG"; check "no CPU exception ([EXC]) during M13 run" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

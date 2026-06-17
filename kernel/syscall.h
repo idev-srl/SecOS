@@ -12,6 +12,9 @@
 #define SYS_DRIVER  7  // driver space mediated hardware access
 #define SYS_SPAWN   8  // load+verify a signed ELF from a VFS path, return pid
 #define SYS_WAIT    9  // wait for a child pid to become ZOMBIE, return status
+#define SYS_GETTICKS 10 // [M13] uptime in timer ticks
+#define SYS_MSG_SEND 11 // [M13] send bytes to a kernel IPC channel (chan,buf,len)
+#define SYS_MSG_RECV 12 // [M13] receive bytes from a kernel IPC channel (chan,buf,len)
 
 // Flags for open (simplified)
 #define O_RDONLY 0x0

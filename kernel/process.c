@@ -149,16 +149,25 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     if (mf && elf_manifest_parse(elf_buf, size, mf) == 0) {
         // Validazione entry e flags
         if (elf_manifest_validate(mf, entry) == MANIFEST_OK) {
-            // Enforce max_mem se valorizzato
+            // [M13] Enforce the manifest memory limit: abort at load if the
+            // process's mapped footprint exceeds max_mem (0 = unlimited). The
+            // signature covers the manifest, so the limit is trust-rooted.
             if (mf->max_mem) {
                 uint64_t used_mem = (uint64_t)p->mapped_page_count * 4096ULL;
                 if (used_mem > mf->max_mem) {
                     terminal_writestring("[MANIFEST] max_mem superato, abort processo\n");
+                    debugcon_writestring("[M13] max_mem exceeded -> process REFUSED (used=");
+                    debugcon_print_hex(used_mem);
+                    debugcon_writestring(" limit=");
+                    debugcon_print_hex(mf->max_mem);
+                    debugcon_writestring(")\n");
                     kfree(mf);
-                    // Cleanup parziale
+                    // Leak-free teardown: unmap user pages, then vmm_space_destroy
+                    // frees the page-table frames, the private PDPT and the PML4
+                    // (and kfrees the vmm_space_t). Mirrors process_destroy.
                     elf_unload_process(p);
-                    pmm_free_frame((void*)(space->pml4_phys & 0x000FFFFFFFFFF000ULL));
-                    kfree(space);
+                    if (p->mapped_pages) kfree(p->mapped_pages);
+                    vmm_space_destroy(space);
                     kfree(p);
                     return NULL;
                 }

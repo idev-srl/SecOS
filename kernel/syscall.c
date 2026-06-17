@@ -11,8 +11,11 @@
 #include "sched.h"
 #include "vfs.h"
 #include "driver_if.h"
+#include "ipc.h"
 #include "debugcon.h"
 #include "../mm/user_copy.h"
+
+extern uint64_t timer_get_ticks(void);
 
 static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; return i; } } return -1; }
 
@@ -112,6 +115,33 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
 
     case SYS_WAIT:
         return (uint64_t)(int64_t)ksys_wait((int)a0);
+
+    case SYS_GETTICKS:
+        /* [M13] Uptime in timer ticks. No user pointers involved. */
+        return timer_get_ticks();
+
+    case SYS_MSG_SEND: {
+        /* [M13] (a0=chan, a1=buf, a2=len) -> kernel IPC channel. */
+        int chan = (int)a0; const void* ubuf = (const void*)a1; int len = (int)a2;
+        if (len <= 0 || len > 256 || !user_range_valid(ubuf, (size_t)len))
+            return (uint64_t)(int64_t)-EFAULT;
+        uint8_t kbuf[256];
+        if (copy_from_user(kbuf, ubuf, (size_t)len) != 0)
+            return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ipc_send(chan, kbuf, len);
+    }
+
+    case SYS_MSG_RECV: {
+        /* [M13] (a0=chan, a1=buf, a2=len) <- kernel IPC channel (non-blocking). */
+        int chan = (int)a0; void* ubuf = (void*)a1; int len = (int)a2;
+        if (len <= 0 || len > 256 || !user_range_valid(ubuf, (size_t)len))
+            return (uint64_t)(int64_t)-EFAULT;
+        uint8_t kbuf[256];
+        int n = ipc_recv(chan, kbuf, len);
+        if (n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0)
+            return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)n;
+    }
 
     case SYS_DRIVER: {
         /*
