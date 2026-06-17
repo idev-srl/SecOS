@@ -168,6 +168,7 @@ uint64_t vmm_alloc_user_stack(int pages);     // allocate stack pages
 vmm_space_t* vmm_space_create_user(void);     // create new address space
 int vmm_space_destroy(vmm_space_t* space);    // destroy address space
 uint32_t vmm_count_user_pages(vmm_space_t* space); // [M14] present user leaf pages (demand-paging metric)
+int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code); // [M15] 0=handled, -1=unhandled
 // Hardening: remove USER bit from shared kernel entries
 void vmm_harden_user_space(vmm_space_t* space);
 

@@ -50,6 +50,7 @@ typedef struct process {
     vma_set_t vmas;
     uint8_t*  image;
     size_t    image_size;
+    int      exit_code;      // [M15] 0=normal (SYS_EXIT); 128+vec=killed by fault
     // Runtime metrics
     uint64_t cpu_ticks;      // accumulated CPU ticks (scheduler)
     uint64_t user_mem_bytes; // virtual memory footprint (updated at creation / future extensions)

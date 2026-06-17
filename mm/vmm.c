@@ -1053,7 +1053,10 @@ void vmm_dump_entry(uint64_t virt) {
 // kernel-mode faults on user addresses: copy_from/to_user dereferences user VAs
 // directly, so a not-yet-faulted syscall buffer faults in kernel mode and is
 // handled here too (we key on the address + VMA, not the U/S error-code bit).
-void vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+// Returns 0 if the fault was serviced (the instruction should retry); -1 if it
+// is a genuine violation. [M15] On -1 the caller (exception_handler) decides
+// kill (ring-3) vs panic (ring-0) — this function no longer halts.
+int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     // Fast path: demand-page a reserved VMA. Only not-present faults qualify (a
     // protection fault — present bit set — is a real access violation).
     if (!(error_code & 1)) {
@@ -1066,29 +1069,19 @@ void vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
                 debugcon_writestring("[PF] demand page ");
                 debugcon_print_hex(fault_addr & ~0xFFFULL);
                 debugcon_writestring("\n");
-                return; // retry the faulting access
+                return 0; // retry the faulting access
             }
         }
     }
 
     // Unhandled: a genuine violation (protection, no VMA, or alloc failure).
-    // Emit full diagnostics, then halt.
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-    terminal_writestring("[PAGEFAULT] address: ");
-    char hex[17]; hex[16]='\0'; uint64_t v=fault_addr; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
-    terminal_writestring("0x"); terminal_writestring(hex);
-    terminal_writestring(" EC="); v=error_code; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; } terminal_writestring("0x"); terminal_writestring(hex);
-    terminal_writestring(" ");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    terminal_writestring("(" );
-    if (error_code & 1) terminal_writestring("present "); else terminal_writestring("not-present ");
-    if (error_code & 2) terminal_writestring("write "); else terminal_writestring("read ");
-    if (error_code & 4) terminal_writestring("user "); else terminal_writestring("kernel ");
-    if (error_code & 8) terminal_writestring("rsvd ");
-    if (error_code & 16) terminal_writestring("instr ");
-    terminal_writestring(")\n");
+    // Report tersely on debugcon and let the caller terminate the offender.
     debugcon_writestring("[PF] UNHANDLED fault addr=0x"); debugcon_print_hex(fault_addr);
-    debugcon_writestring(" ec=0x"); debugcon_print_hex(error_code); debugcon_writestring("\n");
-    terminal_writestring("[PANIC] Unhandled page fault\n");
-    while(1){ __asm__ volatile("hlt"); }
+    debugcon_writestring(" ec=0x"); debugcon_print_hex(error_code);
+    debugcon_writestring(error_code & 1 ? " (protection" : " (not-present");
+    debugcon_writestring(error_code & 2 ? ",write" : ",read");
+    debugcon_writestring(error_code & 4 ? ",user" : ",kernel");
+    if (error_code & 16) debugcon_writestring(",instr");
+    debugcon_writestring(")\n");
+    return -1;
 }

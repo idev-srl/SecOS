@@ -142,19 +142,36 @@ void exception_handler(struct registers* regs) {
 
     if (int_no == 14) { // Page Fault
         uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-        extern void vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code);
-        vmm_handle_page_fault(cr2, err_code);
-        return;
+        extern int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code);
+        if (vmm_handle_page_fault(cr2, err_code) == 0) return; // demand-paged / handled
+        // else: a genuine fault — fall through to the kill/panic logic below.
     }
 
     if (int_no < 32) {
         // Headless crash diagnosis: surface the fault on debugcon (the smoke
         // harness captures port 0xE9; the framebuffer is not visible there).
+        int from_user = ((regs->cs & 3) == 3);
         { debugcon_writestring("[EXC] int="); debugcon_print_hex(int_no);
           debugcon_writestring(" err="); debugcon_print_hex(err_code);
           debugcon_writestring(" rip="); debugcon_print_hex(regs->rip);
           debugcon_writestring(" cs="); debugcon_print_hex(regs->cs);
-          debugcon_writestring(" rsp="); debugcon_print_hex(regs->rsp); debugcon_writestring("\n"); }
+          debugcon_writestring(" rsp="); debugcon_print_hex(regs->rsp);
+          debugcon_writestring(from_user ? " ring3\n" : " ring0\n"); }
+
+        // [M15] A ring-3 fault is the offending PROCESS's bug, not the kernel's:
+        // terminate that process and return to the scheduler instead of halting
+        // the whole machine. A ring-0 fault is a real kernel bug -> panic below.
+        if (from_user) {
+            process_t* cur = sched_get_current();
+            if (cur) {
+                debugcon_writestring("[EXC] ring3 fault -> kill pid=");
+                debugcon_print_hex(cur->pid); debugcon_writestring("\n");
+                extern void sched_kill_current(int reason) __attribute__((noreturn));
+                sched_kill_current((int)int_no); // NORETURN: switches to next task
+            }
+        }
+
+        // Kernel-mode fault (or no current process): unrecoverable -> panic/halt.
         terminal_initialize();
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_RED));
         terminal_writestring("\n=== EXCEPTION ===\n");

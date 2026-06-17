@@ -13,6 +13,7 @@ void sched_yield_from_syscall(trapframe_t* tf); // [M7] cooperative yield from I
 // [M8] process lifecycle + idle/preemption
 void sched_set_idle(process_t* idle);     // register the kernel idle task
 void sched_exit_current(trapframe_t* tf);  // SYS_EXIT: zombie + switch away (no return)
+void sched_kill_current(int reason) __attribute__((noreturn)); // [M15] fault -> kill + switch away
 void sched_reap_zombies(void);             // free ZOMBIE processes (not current)
 int  sched_count_alive_user(void);         // user processes not yet ZOMBIE
 

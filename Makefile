@@ -169,7 +169,12 @@ user-progs:
 	$(LD) -T user/user.ld -o user/maxmem.elf user/crt0.o user/note_maxmem.o user/libsecos.o user/hello.o
 	python3 tools/secos-sign user/maxmem.elf --dev
 	python3 tools/elf2h.py user/maxmem.elf user_maxmem_elf crypto/user_maxmem_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem -> crypto/*.h"
+	# [M15] crashtest: deliberately faults in ring-3 -> kernel kills it (no halt)
+	$(CC) $(USER_CFLAGS) -c user/crashtest.c   -o user/crashtest.o
+	$(LD) -T user/user.ld -o user/crashtest.elf user/crt0.o user/note.o user/libsecos.o user/crashtest.o
+	python3 tools/secos-sign user/crashtest.elf --dev
+	python3 tools/elf2h.py user/crashtest.elf user_crash_elf crypto/user_crash_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest -> crypto/*.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke

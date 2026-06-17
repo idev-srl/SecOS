@@ -472,6 +472,71 @@ static void m14_run_demo(void) {
 }
 #endif /* M14_DEMAND_DEMO */
 
+// ---- [M15] Fault-kill demo (gated; off by default) ----
+// Proves, non-interactively, that a ring-3 fault terminates only the offending
+// process and the kernel keeps running: (1) a signed `crashtest` does a wild
+// write to NULL — the kernel kills it ([KILL] pid=...) and it never prints
+// "STILL ALIVE"; (2) afterwards a signed `hello` is spawned and runs normally,
+// proving the scheduler/kernel survived the fault.
+#ifndef M15_KILL_DEMO
+#define M15_KILL_DEMO 0
+#endif
+#if M15_KILL_DEMO
+#include "trapframe.h"
+#include "../crypto/user_crash_elf.h"
+#include "../crypto/user_hello_elf.h"
+
+static uint8_t m15_idle_stack[16384] __attribute__((aligned(16)));
+static int m15_step = 0, m15_done = 0;
+
+static void m15_spawn(const uint8_t* img, size_t len, const char* what) {
+    process_t* p = process_create_from_elf(img, len);
+    if (p) { p->state = PROC_READY;
+        debugcon_writestring("[M15] spawned "); debugcon_writestring(what); debugcon_writestring("\n");
+    } else {
+        debugcon_writestring("[M15] FAIL: "); debugcon_writestring(what); debugcon_writestring(" not loaded\n");
+    }
+}
+
+__attribute__((noreturn)) static void m15_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m15_step == 0) {
+            m15_step = 1;
+            debugcon_writestring("[M15] --- ring-3 fault must kill only the process ---\n");
+            m15_spawn(user_crash_elf, user_crash_elf_len, "crashtest");
+        } else if (m15_step == 1 && sched_count_alive_user() == 0) {
+            m15_step = 2;
+            debugcon_writestring("[M15] crashtest gone; kernel alive -> spawning hello\n");
+            m15_spawn(user_hello_elf, user_hello_elf_len, "hello");
+        } else if (m15_step == 2 && sched_count_alive_user() == 0 && !m15_done) {
+            m15_done = 1;
+            debugcon_writestring("[M15] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m15_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M15] fault-kill demo\n");
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m15_idle_stack + sizeof(m15_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m15_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M15] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf); // does not return
+}
+#endif /* M15_KILL_DEMO */
+
 // ---- [M10] Interactive shell as the scheduler idle task ----
 // Running the shell as the idle task lets `run <path>` spawn a ring-3 process:
 // the timer preempts idle (shell) into the user task; on SYS_EXIT the scheduler
@@ -769,6 +834,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M14_DEMAND_DEMO
     m14_run_demo(); // demand paging demo — does not return
+#endif
+#if M15_KILL_DEMO
+    m15_run_demo(); // fault-kill demo — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);

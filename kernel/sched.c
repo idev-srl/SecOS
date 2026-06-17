@@ -169,6 +169,7 @@ void sched_exit_current(trapframe_t* tf) {
     debugcon_writestring("[SCHED] exit ");
     debugcon_print_hex(current->pid);
     debugcon_writestring("\n");
+    current->exit_code = 0;            // [M15] normal exit (SYS_EXIT)
     current->state = PROC_ZOMBIE;
 
     process_t* next = pick_user(current);
@@ -176,4 +177,27 @@ void sched_exit_current(trapframe_t* tf) {
     // We are running on the exiting task's kernel stack, so it cannot reap
     // itself; the next scheduling context (often idle) calls sched_reap_zombies.
     switch_to(next);
+}
+
+// [M15] Terminate the current process after an unrecoverable ring-3 fault and
+// switch to the next runnable task — the same mechanism as a SYS_EXIT, but
+// driven by the exception handler. NEVER returns. If there is no killable
+// current (idle/none), the fault is unrecoverable and we halt (a kernel bug).
+void sched_kill_current(int reason) {
+    if (!current || current == idle_task) {
+        debugcon_writestring("[KILL] no killable process -> halt\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    debugcon_writestring("[KILL] pid=");
+    debugcon_print_hex(current->pid);
+    debugcon_writestring(" reason=");
+    debugcon_print_hex((uint64_t)reason);
+    debugcon_writestring("\n");
+    // Encode the fault as a signal-style status (128 + vector), à la POSIX.
+    current->exit_code = 128 + (reason & 0x7F);
+    current->state = PROC_ZOMBIE;
+
+    process_t* next = pick_user(current);
+    if (!next) next = idle_task;       // idle reaps the zombie and carries on
+    switch_to(next);                   // NORETURN
 }

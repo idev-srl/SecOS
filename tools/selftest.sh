@@ -235,6 +235,27 @@ grep -q "signed SecOS user program running in ring 3" "$M14LOG"; check "M14 dema
 grep -q "\[M14\] DONE" "$M14LOG"; check "M14 demo completed ([M14] DONE)" $?
 ! grep -q "\[EXC\]" "$M14LOG"; check "no CPU exception ([EXC]) during M14 run" $?
 
+# ---- M15: fault-driven process kill (kernel survives a ring-3 fault) ----
+M15LOG=/tmp/secos_selftest_m15.log
+echo "[selftest] Building M15 image (M15_KILL_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make CFLAGS_EXTRA=-DM15_KILL_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M15 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M15 (mb2, ${TIMEOUT}s)..."
+tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$M15LOG" >/dev/null 2>&1 || true
+
+# The faulting program ran up to the wild write...
+grep -q "\[crash\] about to fault" "$M15LOG"; check "M15 faulting program reached the fault" $?
+# ...and was terminated BEFORE its post-fault line (the fault killed it).
+! grep -q "STILL ALIVE" "$M15LOG"; check "M15 killed process never continued past the fault" $?
+# The kernel reports the kill of the offending ring-3 process.
+grep -q "\[KILL\] pid=" "$M15LOG"; check "M15 kernel killed the faulting ring-3 process ([KILL])" $?
+# And the kernel SURVIVED: a subsequently-spawned program runs normally.
+grep -q "signed SecOS user program running in ring 3" "$M15LOG"; check "M15 kernel survives: later program runs ring-3" $?
+grep -q "\[M15\] DONE" "$M15LOG"; check "M15 demo completed ([M15] DONE)" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

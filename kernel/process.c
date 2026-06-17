@@ -163,6 +163,7 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     // mapped_page_count/user_mem_bytes report the RESERVED footprint (sum of VMA
     // sizes), which is also what the manifest max_mem limit is checked against.
     p->cpu_ticks = 0;
+    p->exit_code = 0;
     p->user_mem_bytes = footprint;
     p->mapped_page_count = (uint32_t)(footprint / 4096ULL);
     // Manifest stub
