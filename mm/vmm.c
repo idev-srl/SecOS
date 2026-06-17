@@ -10,6 +10,9 @@
 #include "panic.h"
 #include "debugcon.h"
 #include "heap.h" // kmalloc/kfree
+#include "vma.h"       // [M14] per-process demand paging
+#include "process.h"   // [M14] process_t (current process VMAs)
+#include "sched.h"     // [M14] sched_get_current()
 
 // Basic page table constants
 #define PAGE_SIZE 4096ULL
@@ -785,6 +788,40 @@ int vmm_space_destroy(vmm_space_t* space) {
     return 0;
 }
 
+// [M14] Count present 4KB leaf pages in the user range of 'space'. Walks the
+// same private-PDPT range as vmm_space_destroy() but only counts (no free). Used
+// to demonstrate demand paging: right after a lazy load this returns 0; it grows
+// as pages fault in. Read-only; safe to call any time.
+uint32_t vmm_count_user_pages(vmm_space_t* space) {
+    if (!space) return 0;
+    uint64_t pml4_phys = space->pml4_phys & ADDRESS_MASK;
+    uint64_t* pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(pml4_phys) : (uint64_t*)pml4_phys;
+    int pdpt_lo = (int)((USER_CODE_BASE >> 30) & 0x1FF);
+    int pdpt_hi = (int)((USER_STACK_TOP  >> 30) & 0x1FF);
+    uint32_t n = 0;
+    uint64_t pml4e = pml4[0];
+    if (!(pml4e & VMM_FLAG_PRESENT)) return 0;
+    uint64_t pdpt_phys = pml4e & ADDRESS_MASK;
+    uint64_t* pdpt = physmap_initialized ? (uint64_t*)phys_to_virt(pdpt_phys) : (uint64_t*)pdpt_phys;
+    for (int pi = pdpt_lo; pi <= pdpt_hi; pi++) {
+        uint64_t pdpte = pdpt[pi];
+        if (!(pdpte & VMM_FLAG_PRESENT)) continue;
+        uint64_t pdt_phys = pdpte & ADDRESS_MASK;
+        uint64_t* pdt = physmap_initialized ? (uint64_t*)phys_to_virt(pdt_phys) : (uint64_t*)pdt_phys;
+        for (int di = 0; di < 512; di++) {
+            uint64_t pdte = pdt[di];
+            if (!(pdte & VMM_FLAG_PRESENT)) continue;
+            if (pdte & VMM_FLAG_PS) continue;
+            uint64_t pt_phys = pdte & ADDRESS_MASK;
+            uint64_t* pt = physmap_initialized ? (uint64_t*)phys_to_virt(pt_phys) : (uint64_t*)pt_phys;
+            for (int ti = 0; ti < 512; ti++) {
+                if (pt[ti] & VMM_FLAG_PRESENT) n++;
+            }
+        }
+    }
+    return n;
+}
+
 // Map all available physical memory using 2MB huge pages to reduce table count.
 void vmm_init_physmap(void) {
     if (physmap_initialized) return;
@@ -1008,26 +1045,34 @@ void vmm_dump_entry(uint64_t virt) {
     terminal_writestring(" -> phys 0x"); terminal_writestring(hex); terminal_writestring("\n");
 }
 
-// --- Region allocator stub ---
-typedef struct vmm_region { uint64_t start; uint64_t size; uint64_t flags; } vmm_region_t;
-static vmm_region_t regions[32];
-static int region_count = 0;
-
-int vmm_region_add(uint64_t start, uint64_t size, uint64_t flags) {
-    if (region_count >= 32) return -1;
-    regions[region_count++] = (vmm_region_t){start,size,flags};
-    return 0;
-}
-
-const vmm_region_t* vmm_region_find(uint64_t addr) {
-    for (int i=0;i<region_count;i++) {
-        if (addr >= regions[i].start && addr < regions[i].start + regions[i].size) return &regions[i];
-    }
-    return NULL;
-}
-
 // Page Fault handler (called by exception_handler for INT 14)
+//
+// [M14] Demand paging. A not-present fault on an address covered by a VMA of the
+// current process is serviced by materializing that one page (vma_fault_in), then
+// returning so the faulting instruction retries. This covers user faults AND
+// kernel-mode faults on user addresses: copy_from/to_user dereferences user VAs
+// directly, so a not-yet-faulted syscall buffer faults in kernel mode and is
+// handled here too (we key on the address + VMA, not the U/S error-code bit).
 void vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+    // Fast path: demand-page a reserved VMA. Only not-present faults qualify (a
+    // protection fault — present bit set — is a real access violation).
+    if (!(error_code & 1)) {
+        process_t* cur = sched_get_current();
+        if (cur && cur->space) {
+            const vma_t* vv = vma_find(&cur->vmas, fault_addr);
+            if (vv && vma_fault_in(cur->space, vv, fault_addr) == 0) {
+                // Quiet success path (faults are frequent): a terse debugcon
+                // marker only, no framebuffer output.
+                debugcon_writestring("[PF] demand page ");
+                debugcon_print_hex(fault_addr & ~0xFFFULL);
+                debugcon_writestring("\n");
+                return; // retry the faulting access
+            }
+        }
+    }
+
+    // Unhandled: a genuine violation (protection, no VMA, or alloc failure).
+    // Emit full diagnostics, then halt.
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
     terminal_writestring("[PAGEFAULT] address: ");
     char hex[17]; hex[16]='\0'; uint64_t v=fault_addr; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
@@ -1035,8 +1080,6 @@ void vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     terminal_writestring(" EC="); v=error_code; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; } terminal_writestring("0x"); terminal_writestring(hex);
     terminal_writestring(" ");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    // Decode error code bits
-    // bit0 Present, bit1 W/R, bit2 U/S, bit3 RSVD, bit4 Instr fetch
     terminal_writestring("(" );
     if (error_code & 1) terminal_writestring("present "); else terminal_writestring("not-present ");
     if (error_code & 2) terminal_writestring("write "); else terminal_writestring("read ");
@@ -1044,17 +1087,8 @@ void vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     if (error_code & 8) terminal_writestring("rsvd ");
     if (error_code & 16) terminal_writestring("instr ");
     terminal_writestring(")\n");
-
-    const vmm_region_t* r = vmm_region_find(fault_addr);
-    if (r && !(error_code & 1)) {
-    // Demand-zero page if page-aligned
-        uint64_t page = fault_addr & ~0xFFFULL;
-        if (vmm_alloc_page(page, r->flags) == 0) {
-            terminal_writestring("[PAGEFAULT] Demand alloc page -> OK\n");
-            return; // handler returns allowing execution to continue
-        }
-    terminal_writestring("[PAGEFAULT] Demand alloc failed\n");
-    }
+    debugcon_writestring("[PF] UNHANDLED fault addr=0x"); debugcon_print_hex(fault_addr);
+    debugcon_writestring(" ec=0x"); debugcon_print_hex(error_code); debugcon_writestring("\n");
     terminal_writestring("[PANIC] Unhandled page fault\n");
     while(1){ __asm__ volatile("hlt"); }
 }

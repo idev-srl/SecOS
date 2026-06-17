@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "vmm.h"
+#include "vma.h"
 struct process; // forward
 
 // ELF64 header structures (solo campi necessari)
@@ -66,6 +67,17 @@ typedef struct {
 // space: address space user dove mappare
 // entry_out: ritorna entry point virtuale
 int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t* entry_out, uint64_t** pages_out, uint32_t* page_count_out);
+
+// [M14] Demand-paging loader: validate PT_LOAD segments (same security checks as
+// elf_load_image) but, instead of eagerly mapping+filling pages, register one
+// FILE-backed VMA per segment in 'vset'. No frame is allocated and no page table
+// is touched here — pages materialize on first touch via the #PF handler.
+// 'image' must be a kernel buffer pinned for the process lifetime (FILE VMAs
+// reference it). 'footprint_out' returns the reserved virtual footprint (sum of
+// segment page ranges) for manifest max_mem enforcement.
+int elf_load_image_lazy(const uint8_t* image, size_t size, vmm_space_t* space,
+                        uint64_t* entry_out, vma_set_t* vset, uint64_t* footprint_out);
+
 int elf_unload_process(struct process* p); // forward dichiarazione process
 
 #endif // ELF_H

@@ -136,3 +136,62 @@ int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t
     }
     return ELF_OK;
 }
+
+// [M14] Demand-paging loader. Same PT_LOAD validation as elf_load_image, but
+// instead of allocating/mapping/copying pages it registers one FILE-backed VMA
+// per loadable segment. No frame is touched; pages materialize on first access
+// in vmm_handle_page_fault() -> vma_fault_in(). 'image' is pinned for the
+// process lifetime (the VMAs point into it).
+int elf_load_image_lazy(const uint8_t* image, size_t size, vmm_space_t* space,
+                        uint64_t* entry_out, vma_set_t* vset, uint64_t* footprint_out) {
+    (void)space; // page tables are not touched here
+    if (!image || size < sizeof(Elf64_Ehdr) || !vset) return ELF_ERR_FMT;
+    const Elf64_Ehdr* eh = (const Elf64_Ehdr*)image;
+    if (check_magic(eh) != 0) { terminal_writestring("[ELF] Magic err\n"); return ELF_ERR_MAGIC; }
+    if (eh->e_phoff == 0 || eh->e_phnum == 0) { terminal_writestring("[ELF] No PH\n"); return ELF_ERR_FMT; }
+    if (eh->e_phentsize != sizeof(Elf64_Phdr)) { terminal_writestring("[ELF] PH size mismatch\n"); return ELF_ERR_FMT; }
+
+    if (entry_out) *entry_out = eh->e_entry;
+    uint64_t footprint = 0;
+
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr* ph = (const Elf64_Phdr*)(image + eh->e_phoff + i * sizeof(Elf64_Phdr));
+        if ((const uint8_t*)ph + sizeof(Elf64_Phdr) > image + size) return ELF_ERR_RANGE;
+        if (ph->p_type != PT_LOAD) continue;
+        if (ph->p_memsz == 0 && ph->p_filesz == 0) continue;
+        // Security invariants enforced at load time (fail fast), mirroring the
+        // eager loader: reject W|X, validate file range, virtual range, p_align.
+        if ((ph->p_flags & PF_X) && (ph->p_flags & PF_W)) { terminal_writestring("[ELF] segment W|X rifiutato\n"); return ELF_ERR_FLAG; }
+        if (ph->p_offset + ph->p_filesz > size) { terminal_writestring("[ELF] segment range oltre file\n"); return ELF_ERR_RANGE; }
+        if (ph->p_flags & PF_X) {
+            if (ph->p_vaddr < USER_CODE_BASE || ph->p_vaddr >= USER_DATA_BASE) { terminal_writestring("[ELF] code fuori range\n"); return ELF_ERR_RANGE; }
+        } else {
+            if (ph->p_vaddr < USER_DATA_BASE || ph->p_vaddr >= USER_STACK_TOP - 0x100000) { terminal_writestring("[ELF] data fuori range\n"); return ELF_ERR_RANGE; }
+        }
+        if (ph->p_align != 0 && ph->p_align != 0x1000ULL) { terminal_writestring("[ELF] p_align non supportato\n"); return ELF_ERR_FMT; }
+
+        uint64_t vaddr  = ph->p_vaddr;
+        uint64_t memsz  = ph->p_memsz; if (memsz < ph->p_filesz) memsz = ph->p_filesz;
+        if (memsz == 0) continue;
+        uint64_t start  = vaddr & ~0xFFFULL;
+        uint64_t end    = (vaddr + memsz + 0xFFFULL) & ~0xFFFULL;
+        int exec = (ph->p_flags & PF_X) ? 1 : 0;
+        // Leaf flags: code is RX (no RW, executable -> no NX); data is RW + NX.
+        // vmm_map_in_space() adds PRESENT and enforces the W^X gate.
+        uint64_t flags = exec ? (VMM_FLAG_USER)
+                              : (VMM_FLAG_USER | VMM_FLAG_RW | VMM_FLAG_NOEXEC);
+        uint64_t file_pad = vaddr - start;       // leading in-page padding -> zero
+        if (vma_add(vset, start, end, flags, VMA_TYPE_FILE, image,
+                    ph->p_offset, file_pad, ph->p_filesz) != 0) {
+            terminal_writestring("[ELF] too many VMAs\n");
+            return ELF_ERR_MAP;
+        }
+        footprint += (end - start);
+        terminal_writestring("[ELF] lazy seg vaddr=");
+        char hx[]="0123456789ABCDEF"; for(int b=60;b>=0;b-=4) terminal_putchar(hx[(vaddr>>b)&0xF]);
+        terminal_writestring(exec?" X-":" -W"); terminal_writestring("\n");
+    }
+    if (footprint_out) *footprint_out = footprint;
+    terminal_writestring("[ELF] lazy load completato\n");
+    return ELF_OK;
+}

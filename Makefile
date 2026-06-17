@@ -35,6 +35,7 @@ SRC_C   = \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \
 	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
+	$(MM_DIR)/vma.c \
 	$(MM_DIR)/elf.c \
 	$(MM_DIR)/elf_unload.c \
 	$(MM_DIR)/elf_manifest.c \

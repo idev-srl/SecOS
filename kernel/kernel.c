@@ -406,6 +406,72 @@ static void m13_run_demo(void) {
 }
 #endif /* M13_DEMO */
 
+// ---- [M14] Demand paging demo (gated; off by default) ----
+// Proves, non-interactively, that user pages are NOT eagerly mapped: a signed
+// program is loaded (process_create_from_elf) and BEFORE it runs we count the
+// present leaf pages in its address space — it must be 0, while the reserved
+// footprint (code+data+stack VMAs) is non-zero. The program is then scheduled;
+// its code/data/stack pages materialize one at a time via the #PF handler
+// ([PF] demand page markers), it prints and exits. A final count is > 0.
+#ifndef M14_DEMAND_DEMO
+#define M14_DEMAND_DEMO 0
+#endif
+#if M14_DEMAND_DEMO
+#include "trapframe.h"
+#include "../crypto/user_hello_elf.h"
+
+static uint8_t m14_idle_stack[16384] __attribute__((aligned(16)));
+static int m14_step = 0, m14_done = 0;
+static process_t* m14_proc = 0;
+
+__attribute__((noreturn)) static void m14_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m14_step == 0) {
+            m14_step = 1;
+            debugcon_writestring("[M14] --- demand paging: lazy load ---\n");
+            m14_proc = process_create_from_elf(user_hello_elf, user_hello_elf_len);
+            if (!m14_proc) {
+                debugcon_writestring("[M14] FAIL: hello not loaded\n");
+                m14_done = 1; debugcon_writestring("[M14] DONE\n");
+            } else {
+                // Headline proof: reserved footprint > 0, but nothing mapped yet.
+                uint32_t mapped = vmm_count_user_pages(m14_proc->space);
+                debugcon_writestring("[M14] reserved footprint=");
+                debugcon_print_hex(m14_proc->user_mem_bytes);
+                debugcon_writestring(" mapped at load=");
+                debugcon_print_hex((uint64_t)mapped);
+                debugcon_writestring("\n");
+                m14_proc->state = PROC_READY; // let the scheduler run it
+            }
+        } else if (m14_step == 1 && m14_proc && sched_count_alive_user() == 0 && !m14_done) {
+            m14_step = 2; m14_done = 1;
+            debugcon_writestring("[M14] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m14_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M14] demand paging demo\n");
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m14_idle_stack + sizeof(m14_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m14_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M14] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf); // does not return
+}
+#endif /* M14_DEMAND_DEMO */
+
 // ---- [M10] Interactive shell as the scheduler idle task ----
 // Running the shell as the idle task lets `run <path>` spawn a ring-3 process:
 // the timer preempts idle (shell) into the user task; on SYS_EXIT the scheduler
@@ -700,6 +766,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M13_DEMO
     m13_run_demo(); // usability & policy demo — does not return
+#endif
+#if M14_DEMAND_DEMO
+    m14_run_demo(); // demand paging demo — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);

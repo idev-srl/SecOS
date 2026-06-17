@@ -11,6 +11,7 @@
 #include "vmm.h"
 #include "trapframe.h"
 #include "../mm/elf.h" // for ELF_OK
+#include "../mm/vma.h" // [M14] per-process VMAs for demand paging
 
 // [M11] Process privilege type. A "driver" is a Ring-3 process granted
 // capability-mediated hardware access (SYS_DRIVER). The claim is rooted in the
@@ -41,6 +42,14 @@ typedef struct process {
     uint32_t drv_caps;      // granted capability mask (DEV_CAP_*), 0 if none
     uint64_t* mapped_pages; // array of virtual page addresses (code+data+stack)
     uint32_t mapped_page_count; // page count
+    // [M14] Demand paging: pages are not eagerly mapped. 'vmas' describes the
+    // reserved virtual ranges; the #PF handler materializes pages on first
+    // touch. 'image'/'image_size' is the pinned ELF copy backing FILE VMAs
+    // (freed at process_destroy). Teardown of faulted frames is handled by
+    // vmm_space_destroy(), which frees every present leaf in the user range.
+    vma_set_t vmas;
+    uint8_t*  image;
+    size_t    image_size;
     // Runtime metrics
     uint64_t cpu_ticks;      // accumulated CPU ticks (scheduler)
     uint64_t user_mem_bytes; // virtual memory footprint (updated at creation / future extensions)

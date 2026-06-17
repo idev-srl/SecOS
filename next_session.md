@@ -1,16 +1,17 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: end of M13 (usability & policy enforcement). Read this first._
+_Last updated: end of M14 (full demand paging). Read this first._
 
 ## Where we are
 
-- **Done through M13** — M0–M13 complete (phases A–E of the plan). Branch
-  **`milestone/M7`** (historical name). **HEAD = `b7d3a86`, fully pushed to
-  `origin/milestone/M7`** (nothing pending). Commit trail: M11 `a2ef931`, M12
-  memory/W^X `e3b3470`, M12 higher-half `3186c1e`, M13 `b7d3a86`. Tag `M9_STABLE`
-  is the last tag (consider tagging `M13_STABLE` / the phase-A–E completion).
+- **Done through M14** — M0–M13 complete (phases A–E) + **M14 (full demand
+  paging, stretch) done**. Branch **`milestone/M7`** (historical name).
+  **HEAD = `c9b8a4d` ([M14] Full demand paging), committed but NOT yet pushed**
+  to `origin/milestone/M7`. Commit trail: M11 `a2ef931`, M12 memory/W^X
+  `e3b3470`, M12 higher-half `3186c1e`, M13 `b7d3a86`, M14 `c9b8a4d`. Tag
+  `M9_STABLE` is the last tag (consider tagging `M14_STABLE`).
 - Build is green: `make` clean (0 warnings), the full self-test harness
-  `tools/selftest.sh` is **56/56**, both boot paths run higher-half at
+  `tools/selftest.sh` is **61/61** (+5 M14), both boot paths run higher-half at
   `0xFFFFFFFF80000000` (`smoke.sh --mb2` and `--uefi` PASS).
 - Only `edk2/` is untracked (a large vendored tree, not part of the build) — leave it.
   `.gitignore` shows a stale local modification from before this work — harmless,
@@ -48,8 +49,9 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | M10 | done | storage & persistence: virtio-blk (`vda`) + RW **FAT32/ext2/ext4** via VFS multi-mount (`/mnt`); `SYS_SPAWN`/`SYS_WAIT` + shell `run`; signed ELF written to disk → read → verify → ring-3. See `docs/devlog/M10.md` |
 | M11 | done | Driver Space for real: `.note.secos` v2 manifest carries `proc_type`/`dev_id`/`dev_caps` (signature-rooted); loader auto-binds a `PROC_TYPE_DRIVER` to its device with the granted cap subset; `SYS_DRIVER` enforces driver-only + per-binding caps + `[DRV-AUDIT]`. See `docs/devlog/M11.md` |
 | M12 | done | Memory scalability + W^X hard gate + **higher-half kernel**: PMM manages all RAM (clamps gone; word-skip+cursor; `pmm_alloc_contiguous`); heap on physmap + multi-frame + NULL-on-fail; `vmm_map` rejects W+X (`-5`); `-m 2G` → ~2045 MB free. Kernel runs at `0xFFFFFFFF80000000` (both MB2 and UEFI). See `docs/devlog/M12.md` |
-| **M13** | **done** | usability & policy: **manifest `max_mem` enforced at load** (leak-free abort, signature-rooted); `SYS_GETTICKS` + **kernel IPC channels** (`SYS_MSG_SEND`/`RECV`, `kernel/ipc.c`); shell `run` = on-disk launcher; producer/consumer demo exchange a message over channel 0. Harness 56/56. See `docs/devlog/M13.md` |
-| next | **stretch/hardening** | full demand paging; drop low identity map; real `DRIVER_OP_MAP_MEM` + IRQ-to-driver + DMA sandbox + driver restart; ext4 JBD2 journaling + `metadata_csum`; blocking `SYS_SLEEP`/channel wait; argv to spawned programs |
+| **M13** | **done** | usability & policy: **manifest `max_mem` enforced at load** (leak-free abort, signature-rooted); `SYS_GETTICKS` + **kernel IPC channels** (`SYS_MSG_SEND`/`RECV`, `kernel/ipc.c`); shell `run` = on-disk launcher; producer/consumer demo exchange a message over channel 0. See `docs/devlog/M13.md` |
+| **M14** | **done (stretch)** | **full demand paging**: per-process VMAs (`mm/vma.{c,h}`) replace eager mapping; `elf_load_image_lazy` reserves FILE/ANON regions; `vmm_handle_page_fault` materializes pages on first touch (`[PF] demand page`); pinned per-process ELF image; syscall buffers fault in via kernel-mode #PF (no `user_copy` change); stack guard = absence of a VMA; `max_mem` vs reserved footprint. Harness **61/61**. See `docs/devlog/M14.md` |
+| next | **stretch/hardening** | copy-on-write / page-out (M14 has no backing store beyond the pinned image); per-fault process kill (unhandled user fault still halts); shared read-only text (page cache); drop low identity map; real `DRIVER_OP_MAP_MEM` + IRQ-to-driver + DMA sandbox + driver restart; ext4 JBD2 journaling + `metadata_csum`; blocking `SYS_SLEEP`/channel wait; argv to spawned programs |
 
 ## Build / test / run
 
@@ -190,13 +192,36 @@ qemu-system-x86_64 -cdrom myos.iso -drive file=disk.img,if=virtio,format=raw \
   would be needed (future work). The user was going to try the VMDK in VMware;
   if it didn't boot, ask for the serial log (loader prints `[OK]/[ERR]` lines).
 
-## Suggested first move next session (M0–M13 done → stretch/hardening)
+## M14 recap (done, committed `c9b8a4d`)
 
-The mandatory plan (phases A–E, M0–M13) is complete. Remaining work is
-stretch/hardening; pick by interest:
-- **Memory**: full demand paging (the `vmm_region` path is dormant); W^X of the
-  0–512 MB identity huge-page map (still RWX); optionally drop the low identity
-  map entirely (needs reworking virtio DMA + early frame access off it).
+Full demand paging (`docs/devlog/M14.md`): user pages are no longer eagerly
+mapped. `process_create_from_elf` pins a private copy of the signature-verified
+ELF image and registers **per-process VMAs** (`mm/vma.{c,h}`, in `process_t`):
+FILE (lazy-copied from the image) for ELF segments, ANON (zero-fill) for
+stack/BSS. `elf_load_image_lazy` validates + reserves, touches no frame;
+`vmm_handle_page_fault` materializes pages on first touch via `vma_fault_in`
+(frame filled through the physmap RW alias → RX code fills with no W^X
+violation). Syscall buffers fault in via **kernel-mode #PF on a user address**
+(the handler keys on address+VMA, not the U/S bit) — `copy_from/to_user`
+dereferences directly, so no `user_copy.c` change. Teardown is automatic
+(`vmm_space_destroy` frees present leaves; `mapped_pages` removed, no leak). Stack
+**guard** = absence of a VMA below it. `max_mem` checked vs reserved footprint.
+Demo `M14_DEMAND_DEMO`: signed `hello` shows `mapped at load=0` for a `0x9000`
+reserved footprint, 2 pages fault in as it runs. Harness **61/61**. **Still to
+do:** `git push origin milestone/M7`, maybe tag `M14_STABLE`.
+
+## Suggested first move next session (M0–M14 done → stretch/hardening)
+
+The mandatory plan (phases A–E) is complete and M14 (demand paging, stretch) is
+done and committed (`c9b8a4d`). **Push it first** (`git push origin
+milestone/M7`). Remaining stretch work, pick by interest:
+- **Memory**: copy-on-write + page-out/swap (M14 has no backing store beyond the
+  pinned image; frames free only at exit); a shared read-only text page cache
+  (each process currently pins its own image copy); per-fault process kill (an
+  unhandled user fault still halts the kernel — thread the trapframe into
+  `vmm_handle_page_fault` for a SIGSEGV-style teardown); W^X of the 0–512 MB
+  identity huge-page map (still RWX); optionally drop the low identity map
+  entirely (needs reworking virtio DMA + early frame access off it).
 - **Driver space**: real `DRIVER_OP_MAP_MEM` (map device MMIO into the driver
   address space — still a validating stub); IRQ-to-driver (`IRQ_SUBSCRIBE` + IPC
   queue, building on M13's IPC channels); DMA sandbox; auto-restart of a crashed

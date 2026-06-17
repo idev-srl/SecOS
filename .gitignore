@@ -22,3 +22,4 @@ old/
 user/*.elf
 user/*.o
 __pycache__/
+*.vmdk

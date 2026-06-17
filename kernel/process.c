@@ -86,23 +86,61 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
 
     vmm_space_t* space = vmm_space_create_user();
     if (!space) { terminal_writestring("[PROC] space alloc failed\n"); return NULL; }
-    uint64_t entry=0;
-    uint64_t* pages=NULL; uint32_t page_count=0;
-    int r = elf_load_image(elf_buf, size, space, &entry, &pages, &page_count);
-    if (r != ELF_OK) {
-        terminal_writestring("[PROC] elf load fail\n");
-        pmm_free_frame((void*)(space->pml4_phys & 0x000FFFFFFFFFF000ULL));
-        kfree(space);
-        return NULL;
-    }
-    uint64_t st_top = vmm_alloc_user_stack_in_space(space, 8);
+
     process_t* p = (process_t*)kmalloc(sizeof(process_t));
     if (!p) {
-        if (pages) kfree(pages);
-        pmm_free_frame((void*)(space->pml4_phys & 0x000FFFFFFFFFF000ULL));
-        kfree(space);
+        terminal_writestring("[PROC] pcb alloc failed\n");
+        vmm_space_destroy(space);
         return NULL;
     }
+    // [M14] Demand paging: init the VMA set + pinned-image fields up front so the
+    // failure paths below can tear everything down uniformly.
+    p->vmas.count = 0;
+    p->image = NULL;
+    p->image_size = 0;
+    p->mapped_pages = NULL;
+    p->mapped_page_count = 0;
+
+    // [M14] Pin a private copy of the (already signature-verified) ELF image for
+    // the process lifetime: FILE-backed VMAs fill pages from it on demand. Freed
+    // in process_destroy.
+    p->image = (uint8_t*)kmalloc(size);
+    if (!p->image) {
+        terminal_writestring("[PROC] image pin alloc failed\n");
+        vmm_space_destroy(space);
+        kfree(p);
+        return NULL;
+    }
+    { const uint8_t* src = (const uint8_t*)elf_buf; for (size_t i = 0; i < size; i++) p->image[i] = src[i]; }
+    p->image_size = size;
+
+    uint64_t entry = 0;
+    uint64_t footprint = 0;
+    int r = elf_load_image_lazy(p->image, size, space, &entry, &p->vmas, &footprint);
+    if (r != ELF_OK) {
+        terminal_writestring("[PROC] elf lazy load fail\n");
+        kfree(p->image);
+        vmm_space_destroy(space);
+        kfree(p);
+        return NULL;
+    }
+    // [M14] Reserve the user stack as a demand-zero (ANON) VMA — 8 pages below
+    // USER_STACK_TOP. Pages fault in on first push; the absence of a VMA below
+    // the region is the guard (a stack underflow faults to the unhandled path).
+    const uint32_t STACK_PAGES = 8;
+    uint64_t st_top = USER_STACK_TOP;
+    uint64_t st_lo  = st_top - (uint64_t)STACK_PAGES * 0x1000ULL;
+    if (vma_add(&p->vmas, st_lo, st_top,
+                VMM_FLAG_USER | VMM_FLAG_RW | VMM_FLAG_NOEXEC,
+                VMA_TYPE_ANON, NULL, 0, 0, 0) != 0) {
+        terminal_writestring("[PROC] stack VMA add fail\n");
+        kfree(p->image);
+        vmm_space_destroy(space);
+        kfree(p);
+        return NULL;
+    }
+    footprint += (uint64_t)STACK_PAGES * 0x1000ULL;
+
     p->pid = next_pid++;
     p->space = space;
     p->entry = entry;
@@ -120,30 +158,13 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     p->proc_type = PROC_TYPE_USER;
     p->drv_dev_id = -1;
     p->drv_caps = 0;
-    // Tracking pagine: aggiungi pagine stack (eccetto guard) se pages!=NULL
-    p->mapped_pages = pages;
-    p->mapped_page_count = page_count;
+    // [M14] No eager page tracking: pages are demand-paged and freed at teardown
+    // by vmm_space_destroy() (which frees every present leaf in the user range).
+    // mapped_page_count/user_mem_bytes report the RESERVED footprint (sum of VMA
+    // sizes), which is also what the manifest max_mem limit is checked against.
     p->cpu_ticks = 0;
-    p->user_mem_bytes = (uint64_t)page_count * 4096ULL; // aggiornato dopo eventuale aggiunta stack
-    if (pages) {
-        // Pagine stack utente: N=8 mappate + 1 guard (non tracciare guard)
-        uint32_t stack_user_pages = 8 - 1; // exclude guard
-        uint64_t* newarr = (uint64_t*)kmalloc(sizeof(uint64_t)*(p->mapped_page_count + stack_user_pages));
-        if (newarr) {
-            for (uint32_t i=0;i<p->mapped_page_count;i++) newarr[i]=p->mapped_pages[i];
-            uint32_t idx = p->mapped_page_count;
-            uint64_t first = st_top - (8*0x1000ULL);
-            for (uint64_t va = first + 0x1000ULL; va < st_top; va += 0x1000ULL) {
-                newarr[idx++] = va;
-            }
-            kfree(p->mapped_pages);
-            p->mapped_pages = newarr;
-            p->mapped_page_count = idx;
-            p->user_mem_bytes = (uint64_t)p->mapped_page_count * 4096ULL;
-        } else {
-            terminal_writestring("[PROC] stack pages alloc fail\n");
-        }
-    }
+    p->user_mem_bytes = footprint;
+    p->mapped_page_count = (uint32_t)(footprint / 4096ULL);
     // Manifest stub
     elf_manifest_t* mf = (elf_manifest_t*)kmalloc(sizeof(elf_manifest_t));
     if (mf && elf_manifest_parse(elf_buf, size, mf) == 0) {
@@ -153,7 +174,11 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
             // process's mapped footprint exceeds max_mem (0 = unlimited). The
             // signature covers the manifest, so the limit is trust-rooted.
             if (mf->max_mem) {
-                uint64_t used_mem = (uint64_t)p->mapped_page_count * 4096ULL;
+                // [M14] Checked against the RESERVED footprint (sum of VMA sizes),
+                // not lazily-mapped pages — a program that reserves more address
+                // space than its signed limit is refused at load regardless of how
+                // little it touches at runtime.
+                uint64_t used_mem = footprint;
                 if (used_mem > mf->max_mem) {
                     terminal_writestring("[MANIFEST] max_mem superato, abort processo\n");
                     debugcon_writestring("[M13] max_mem exceeded -> process REFUSED (used=");
@@ -162,11 +187,11 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
                     debugcon_print_hex(mf->max_mem);
                     debugcon_writestring(")\n");
                     kfree(mf);
-                    // Leak-free teardown: unmap user pages, then vmm_space_destroy
-                    // frees the page-table frames, the private PDPT and the PML4
-                    // (and kfrees the vmm_space_t). Mirrors process_destroy.
-                    elf_unload_process(p);
-                    if (p->mapped_pages) kfree(p->mapped_pages);
+                    // Leak-free teardown: free the pinned image, then
+                    // vmm_space_destroy frees any faulted leaf frames, the
+                    // page-table frames, the private PDPT and the PML4 (and
+                    // kfrees the vmm_space_t). Mirrors process_destroy.
+                    if (p->image) kfree(p->image);
                     vmm_space_destroy(space);
                     kfree(p);
                     return NULL;
@@ -212,12 +237,22 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     p->regs.rsi = p->regs.rdi = p->regs.rbp = 0;
     // Init fd table
     for(int i=0;i<32;i++){ p->fds[i].inode=NULL; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].used=0; }
-    if (proc_add(p)!=0) { terminal_writestring("[PROC] table full\n"); kfree(p); return NULL; }
+    if (proc_add(p)!=0) {
+        terminal_writestring("[PROC] table full\n");
+        if (p->manifest) kfree(p->manifest);
+        if (p->image) kfree(p->image);
+        vmm_space_destroy(space);
+        kfree(p);
+        return NULL;
+    }
     // [M5] Allocate per-process guarded kernel stack using bounded slot
     p->kstack_top = vmm_alloc_kernel_stack_for_slot(p->kstack_slot);
     if (!p->kstack_top) {
         terminal_writestring("[PROC] kstack alloc failed\n");
         proc_remove(p);
+        if (p->manifest) kfree(p->manifest);
+        if (p->image) kfree(p->image);
+        vmm_space_destroy(space);
         kfree(p);
         return NULL;
     }
@@ -227,6 +262,9 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
         terminal_writestring("[PROC] trapframe alloc failed\n");
         vmm_free_kernel_stack_for_slot(p->kstack_slot); p->kstack_top = 0;
         proc_remove(p);
+        if (p->manifest) kfree(p->manifest);
+        if (p->image) kfree(p->image);
+        vmm_space_destroy(space);
         kfree(p);
         return NULL;
     }
@@ -277,6 +315,8 @@ int process_destroy(process_t* p) {
     elf_unload_process(p);                       // unmap + free user page frames, zero PTEs
     if (p->manifest) { kfree(p->manifest); p->manifest = NULL; }
     if (p->mapped_pages) { kfree(p->mapped_pages); p->mapped_pages = NULL; }
+    // [M14] Free the pinned ELF image backing the demand-paged FILE VMAs.
+    if (p->image) { kfree(p->image); p->image = NULL; p->image_size = 0; }
     // [M6] Free saved trapframe
     if (p->tf) { kfree(p->tf); p->tf = NULL; }
     // [M5] Free per-process kernel stack
