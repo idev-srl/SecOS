@@ -363,6 +363,32 @@ grep -q "\[m20\] read/mmap coherent OK" "$M20LOG"; check "M20 read() and mmap ar
 grep -q "\[M20\] DONE" "$M20LOG"; check "M20 demo completed ([M20] DONE)" $?
 ! grep -q "\[EXC\]" "$M20LOG"; check "no CPU exception ([EXC]) during M20 run" $?
 
+# ---- M21: AHCI (SATA) storage — the disk path for VMware / physical PCs ----
+M21LOG=/tmp/secos_selftest_m21.log
+echo "[selftest] Building M21 image (default; AHCI probe runs at boot)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M21 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+make disk-fat32 >/dev/null 2>&1 || { echo "  [FAIL] M21 disk image build"; FAIL=$((FAIL+1)); }
+echo "[selftest] Running M21 (q35 AHCI/SATA data disk, ${TIMEOUT}s)..."
+: > "$M21LOG"
+set +e
+# q35 routes `if=ide` to its built-in AHCI controller -> our driver drives it.
+timeout "$((TIMEOUT+4))" qemu-system-x86_64 -machine q35 -m 256M \
+    -cdrom myos.iso -boot d -drive file=disk.img,format=raw,if=ide \
+    -debugcon file:"$M21LOG" -global isa-debugcon.iobase=0xe9 \
+    -no-reboot -no-shutdown -display none
+set -e
+
+grep -q "\[AHCI\] SATA disk sda" "$M21LOG"; check "M21 AHCI finds a SATA disk (sda)" $?
+grep -q "\[AHCI\] ready" "$M21LOG"; check "M21 AHCI driver ready" $?
+grep -q "\[M10\] disk mounted at /mnt fs=FAT32" "$M21LOG"; check "M21 FAT32 mounts on the AHCI disk" $?
+grep -q "\[M10\] read /mnt hello" "$M21LOG"; check "M21 reads a file from the AHCI disk" $?
+grep -q "\[M10\] disk write+readback: OK" "$M21LOG"; check "M21 AHCI write+readback persists" $?
+! grep -q "\[EXC\]" "$M21LOG"; check "no CPU exception ([EXC]) during M21 run" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

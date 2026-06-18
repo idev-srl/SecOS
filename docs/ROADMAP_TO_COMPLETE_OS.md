@@ -137,12 +137,17 @@ multi-user file permissions are enforced.
   assumptions from M0–M14 must be found and fixed); an N-CPU scheduler with
   priorities and affinity. _The single biggest correctness effort in the plan._
 
+- **Storage drivers (pulled earlier — needed to run on real hardware/VMware):**
+  **AHCI/SATA** — _DONE (M21)_, in-kernel for now. **NVMe (M22)** — next; NVMe-only
+  laptops + VMware's NVMe option. **USB stack** — XHCI + USB core + HID keyboard +
+  Mass Storage (BOT/SCSI); needed to *use* USB devices after boot (booting from
+  USB is the firmware's job). These start in-kernel and move into Driver Space here.
 - **M25 — Real driver space + more devices.**
   `DRIVER_OP_MAP_MEM` for real (MMIO into the driver address space); **IRQ →
   driver** delivery (on M13 IPC + M17 wait queues); a **DMA sandbox**; driver
-  auto-restart. Add **AHCI/NVMe** (bare-metal / VMware storage) and
-  **virtio-rng** (entropy). _Security:_ this is the payoff of the M11 capability
-  model — drivers get exactly the MMIO/IRQ/DMA their signed manifest grants.
+  auto-restart. Move AHCI/NVMe/USB into ring-3 Driver Space; add **virtio-rng**
+  (entropy). _Security:_ this is the payoff of the M11 capability model — drivers
+  get exactly the MMIO/IRQ/DMA their signed manifest grants.
 
 **Exit criteria I:** boots and schedules on multiple cores with modern
 interrupts; user-space drivers handle real IRQs/DMA under capability limits; runs

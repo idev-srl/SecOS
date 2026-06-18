@@ -42,9 +42,21 @@ void     pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off
  * Returns 0 and fills *out on success, -1 if not found. */
 int pci_find(uint16_t want_vendor, uint16_t want_device, pci_device_t* out);
 
+/* [M21] Find the first function matching a class/subclass/prog-if (config bytes
+ * 0x0B/0x0A/0x09). Pass progif == 0xFF to match any prog-if. (AHCI = 01/06/01.)
+ * Returns 0 and fills *out on success, -1 if not found. */
+int pci_find_class(uint8_t cls, uint8_t subcls, uint8_t progif, pci_device_t* out);
+
 /* Enable I/O space + bus mastering for a located device. */
 void pci_enable_io_and_busmaster(const pci_device_t* d);
+
+/* [M21] Enable memory space + bus mastering (for MMIO devices like AHCI). */
+void pci_enable_mem_and_busmaster(const pci_device_t* d);
 
 /* Read BAR0 and return the I/O port base (low bits masked off).
  * Only valid when BAR0 is an I/O BAR (bit0 == 1). */
 uint16_t pci_bar0_io_base(const pci_device_t* d);
+
+/* [M21] Read BAR[idx] (idx 0..5) as a 32-bit memory BAR base (low 4 bits masked).
+ * Returns 0 if it is an I/O BAR. */
+uint32_t pci_bar_mem(const pci_device_t* d, int idx);

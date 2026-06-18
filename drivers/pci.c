@@ -72,9 +72,42 @@ int pci_find(uint16_t want_vendor, uint16_t want_device, pci_device_t* out) {
     return -1;
 }
 
+int pci_find_class(uint8_t cls, uint8_t subcls, uint8_t progif, pci_device_t* out) {
+    for (uint32_t bus = 0; bus < 256; bus++) {
+        for (uint8_t slot = 0; slot < 32; slot++) {
+            uint16_t vendor = pci_config_read16((uint8_t)bus, slot, 0, PCI_CFG_VENDOR_ID);
+            if (vendor == 0xFFFF) continue;
+            uint8_t header = pci_config_read8((uint8_t)bus, slot, 0, 0x0E);
+            uint8_t nfunc  = (header & 0x80) ? 8 : 1;
+            for (uint8_t func = 0; func < nfunc; func++) {
+                uint16_t v = pci_config_read16((uint8_t)bus, slot, func, PCI_CFG_VENDOR_ID);
+                if (v == 0xFFFF) continue;
+                uint8_t pif = pci_config_read8((uint8_t)bus, slot, func, 0x09);
+                uint8_t sub = pci_config_read8((uint8_t)bus, slot, func, 0x0A);
+                uint8_t bc  = pci_config_read8((uint8_t)bus, slot, func, 0x0B);
+                if (bc == cls && sub == subcls && (progif == 0xFF || pif == progif)) {
+                    if (out) {
+                        out->bus = (uint8_t)bus; out->slot = slot; out->func = func;
+                        out->vendor_id = v;
+                        out->device_id = pci_config_read16((uint8_t)bus, slot, func, PCI_CFG_DEVICE_ID);
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
 void pci_enable_io_and_busmaster(const pci_device_t* d) {
     uint16_t cmd = pci_config_read16(d->bus, d->slot, d->func, PCI_CFG_COMMAND);
     cmd |= (PCI_CMD_IO_SPACE | PCI_CMD_BUS_MASTER);
+    pci_config_write16(d->bus, d->slot, d->func, PCI_CFG_COMMAND, cmd);
+}
+
+void pci_enable_mem_and_busmaster(const pci_device_t* d) {
+    uint16_t cmd = pci_config_read16(d->bus, d->slot, d->func, PCI_CFG_COMMAND);
+    cmd |= (PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER);
     pci_config_write16(d->bus, d->slot, d->func, PCI_CFG_COMMAND, cmd);
 }
 
@@ -82,4 +115,11 @@ uint16_t pci_bar0_io_base(const pci_device_t* d) {
     uint32_t bar = pci_config_read32(d->bus, d->slot, d->func, PCI_CFG_BAR0);
     if (!(bar & 0x1)) return 0;          /* not an I/O BAR */
     return (uint16_t)(bar & 0xFFFCu);
+}
+
+uint32_t pci_bar_mem(const pci_device_t* d, int idx) {
+    if (idx < 0 || idx > 5) return 0;
+    uint32_t bar = pci_config_read32(d->bus, d->slot, d->func, (uint8_t)(PCI_CFG_BAR0 + idx * 4));
+    if (bar & 0x1) return 0;             /* I/O BAR, not memory */
+    return bar & 0xFFFFFFF0u;            /* mask type/prefetch bits */
 }

@@ -1042,8 +1042,13 @@ static void kernel_main_phase2(void) {
     // the plain ISO boot. Read sector 0 as a smoke check (logged on debugcon).
     {
         extern int virtio_blk_init(void);
+        extern int ahci_init(void); // [M21] AHCI/SATA — for VMware / physical PCs
         extern block_dev_t* block_find(const char* name);
-        if (virtio_blk_init() == 0) {
+        int have_virtio = (virtio_blk_init() == 0);
+        // [M21] Probe AHCI too (registers block dev "sda"). On QEMU q35 a SATA
+        // disk attaches to the built-in AHCI; on VMware/real PCs this is the path.
+        if (!have_virtio) ahci_init();
+        if (have_virtio) {
             block_dev_t* vda = block_find("vda");
             if (vda) {
                 static uint8_t s0[512];
@@ -1084,9 +1089,15 @@ static void kernel_main_phase2(void) {
         extern int vfs_read_all(const char* path, void* buf, size_t bufsize);
         extern int vfs_create(const char* path, const void* data, size_t size);
         const char* fsname = 0;
-        if (block_find("vda")) {
-            if      (fat32_mount("vda", "/mnt") == 0) fsname = "FAT32";
-            else if (ext2_mount ("vda", "/mnt") == 0) fsname = "extN";
+        // [M21] Try every disk present — virtio "vda" (QEMU) and AHCI "sda".."sdd"
+        // (VMware / physical PC) — and mount the first that holds a FAT32 or extN
+        // volume. On VMware the boot ESP and the data disk are both SATA, so the
+        // ESP's own disk is simply skipped here (it's GPT, not a raw FS volume).
+        static const char* cand[] = { "vda", "sda", "sdb", "sdc", "sdd" };
+        for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]) && !fsname; i++) {
+            if (!block_find(cand[i])) continue;
+            if      (fat32_mount(cand[i], "/mnt") == 0) fsname = "FAT32";
+            else if (ext2_mount (cand[i], "/mnt") == 0) fsname = "extN";
         }
         if (fsname) {
             debugcon_writestring("[M10] disk mounted at /mnt fs=");
@@ -1113,7 +1124,7 @@ static void kernel_main_phase2(void) {
             debugcon_writestring(match ? "[M10] disk write+readback: OK\n"
                                        : "[M10] disk write+readback: FAIL\n");
         } else {
-            debugcon_writestring("[M10] no disk mounted at /mnt (no vda?)\n");
+            debugcon_writestring("[M10] no disk mounted at /mnt (no vda/sda)\n");
         }
     }
 #if M9_USER_DEMO

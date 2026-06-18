@@ -6,11 +6,11 @@ QEMU (sanity check), **VMware**, or a **physical PC**.
 > **What you get:** the kernel boots to the **interactive SecOS shell** on the
 > screen (UEFI GOP framebuffer) with PS/2 keyboard input. Type `help`.
 >
-> **What does NOT work yet on VMware / real hardware:** the `/mnt` disk. SECoS only
-> has a **virtio-blk** driver; VMware and real PCs expose SATA/NVMe/AHCI instead,
-> for which there is no driver yet. So `vls /mnt` will be empty. The in-memory
-> RAMFS (`rf*` commands) and everything else work. (A real disk needs an AHCI/NVMe
-> driver — a future milestone.)
+> **Disks (M21):** SECoS now has an **AHCI/SATA** driver, so a **SATA** disk works
+> as `/mnt` on VMware and on physical PCs with SATA. Attach the data disk as
+> **SATA** (see §3). NVMe-only machines aren't supported yet (NVMe driver is a
+> future milestone); for those, `vls /mnt` is empty but the RAMFS (`rf*`) and
+> everything else still work.
 >
 > **Secure Boot must be OFF** — the loader is not signed for the Microsoft chain.
 
@@ -22,13 +22,15 @@ Debian/Ubuntu/WSL packages: `gnu-efi ovmf mtools gdisk dosfstools qemu-utils`
 ## 1. Build the bootable image
 
 ```bash
-make uefi-disk        # -> secos-uefi.img   (raw GPT+ESP disk; for USB / QEMU)
+make uefi-disk        # -> secos-uefi.img   (raw GPT+ESP boot disk; for USB / QEMU)
 make uefi-vmdk        # -> secos-uefi.vmdk  (also builds the .img; for VMware)
+make data-vmdk        # -> data.vmdk        (FAT32 DATA disk for /mnt; for VMware)
 ```
 
-Both contain an EFI System Partition (FAT32) with:
-`/EFI/BOOT/BOOTX64.EFI` (the loader) and `/kernel.elf` (the kernel). The loader
-reads `kernel.elf` from the ESP root.
+`secos-uefi.*` is the **boot** disk: an EFI System Partition (FAT32) with
+`/EFI/BOOT/BOOTX64.EFI` (the loader) + `/kernel.elf`. `data.vmdk` is a separate
+**data** disk (a raw FAT32 volume with a `HELLO.TXT`) that SECoS mounts at `/mnt`
+through its AHCI driver.
 
 ## 2. Sanity-check locally (QEMU + OVMF)
 
@@ -46,13 +48,22 @@ You should see the `secos$` shell prompt on the serial console. Exit QEMU with
    64-bit*.
 3. **Firmware type = UEFI** (VM Settings → Options → Advanced → Firmware type:
    UEFI). **Disable Secure Boot** (uncheck the Secure Boot box).
-4. **Remove the default disk** the wizard created, then **Add → Hard Disk → Use an
-   existing virtual disk** → select `secos-uefi.vmdk` (keep existing format).
-5. Memory: 256 MB+ is plenty.
-6. **Power on.** The SecOS shell appears on the VM console; type `help`.
+4. **Remove the default disk** the wizard created, then **Add → Hard Disk →
+   SATA → Use an existing virtual disk** → select `secos-uefi.vmdk` (keep format).
+   *Use the SATA controller type* (not SCSI/NVMe).
+5. **For working `/mnt`: Add a second Hard Disk → SATA → Use an existing virtual
+   disk → `data.vmdk`.** SECoS's AHCI driver finds it and mounts it at `/mnt`.
+   (The boot disk is skipped automatically — it's a GPT/ESP, not a raw FS.)
+6. Memory: 256 MB+ is plenty. **Power on.** The SecOS shell appears; try
+   `vls /mnt` and `vcat /mnt/HELLO.TXT`.
 
 Tip — capture output to a file: add a **Serial Port → Output to file** in VM
 settings; SECoS also writes the shell to COM1.
+
+> **Disk requirements:** use the **SATA** controller (AHCI). SCSI/NVMe/PVSCSI are
+> not supported yet. The data disk must be a **raw FAT32 (or ext2/ext4) volume**
+> with no partition table — `make data-vmdk` produces exactly that. A blank VMware
+> disk you create yourself will be unformatted and won't mount.
 
 ## 4. Physical PC (USB stick)
 
@@ -72,6 +83,12 @@ Then on the target PC:
 3. Boot from the USB stick (boot menu, often F12).
 4. The SecOS shell appears on the monitor; use the keyboard (`help`).
 
+For a working `/mnt` on a physical PC: connect a **SATA** drive whose whole
+device is a raw FAT32 (or ext2/ext4) volume — no partition table. You can make one
+on Linux with `mkfs.fat -F 32 /dev/sdX` (⚠️ erases the drive), then copy files with
+`mtools`. SECoS's AHCI driver will mount it at `/mnt`. NVMe-only laptops need the
+(future) NVMe driver.
+
 ## Troubleshooting
 
 - **Drops to the UEFI shell / "no bootable device":** the firmware didn't find
@@ -80,8 +97,10 @@ Then on the target PC:
 - **Black screen, no shell:** some firmwares don't give a GOP framebuffer SECoS
   can use. Capture COM1 (VMware: serial-to-file) to confirm it actually booted —
   you should still see the `secos$` banner there.
-- **`/mnt` empty / no disk:** expected — no AHCI/NVMe driver yet (see the note at
-  the top). Use the RAMFS (`rfls`, `rfwrite`, `rfcat`, …) instead.
+- **`/mnt` empty / no disk:** the data disk must be on a **SATA** controller
+  (AHCI) and be a **raw FAT32/ext2/ext4** volume (no partition table) — use
+  `make data-vmdk`. SCSI/NVMe controllers and unformatted/partitioned disks won't
+  mount yet. The RAMFS (`rfls`, `rfwrite`, `rfcat`, …) always works.
 - **OVMF + a second disk under `-bios OVMF.fd`** can be flaky (non-persistent
   NVRAM). For QEMU testing, the single-disk `make run-uefi-disk` is the reliable
   path; split `OVMF_CODE`/`OVMF_VARS` if you need persistence.

@@ -34,6 +34,7 @@ SRC_C   = \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \
 	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
+	$(DRIVERS_DIR)/ahci.c \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
 	$(MM_DIR)/vma.c \
 	$(MM_DIR)/pagecache.c \
@@ -311,6 +312,13 @@ uefi-disk: all uefi
 uefi-vmdk: uefi-disk
 	qemu-img convert -f raw -O vmdk secos-uefi.img secos-uefi.vmdk
 	@echo "✅ secos-uefi.vmdk ready for VMware"
+
+# [M21] Pre-formatted FAT32 DATA disk for VMware (attach as a second SATA disk,
+# driven by the AHCI driver, mounted at /mnt). Contains HELLO.TXT.
+.PHONY: data-vmdk
+data-vmdk: disk-fat32
+	qemu-img convert -f raw -O vmdk disk.img data.vmdk
+	@echo "✅ data.vmdk (FAT32) — attach in VMware as a SATA disk; mounts at /mnt"
 
 # Boot the built image locally in QEMU+OVMF (sanity check before real hardware).
 run-uefi-disk: uefi-disk

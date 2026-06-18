@@ -1,21 +1,28 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: M20 + consolidation to `main`. **Phases F+G complete.** Read this first._
+_Last updated: M21 (AHCI/SATA storage — VMware/hardware disks). Read this first._
 
 ## Where we are
 
-- **Done through M20** — M0–M13 (A–E) + M14 (demand paging) + Phase F (M15
-  fault-kill, M16 exec, M17 blocking) + **Phase G COMPLETE: M18 (mmap/brk/malloc),
-  M19 (COW fork), M20 (page cache + file-backed mmap)**. **Everything is now
-  consolidated on `main`** (the old `milestone/M7`, `milestone/M0`,
-  `debug/uefi-unsupported` branches were merged/removed). `origin/main` is the
-  single source of truth; develop on `main`.
+- **Done through M21** — M0–M13 (A–E) + M14 (demand paging) + Phase F (M15–M17) +
+  Phase G (M18–M20) + **M21 (AHCI/SATA block driver — `/mnt` works on VMware &
+  physical PCs)**. Consolidated on **`main`** (old milestone/* + debug/* branches
+  removed; `origin/main` is the single source of truth).
+- **Run on real hardware / VMware:** `docs/RUN_ON_HARDWARE.md`
+  (`make uefi-vmdk` boot disk + `make data-vmdk` SATA data disk). Verified in
+  QEMU q35 (built-in AHCI): ISO+SATA and UEFI+2×SATA both mount FAT32/ext2 RW.
 - **Long-term roadmap: `docs/ROADMAP_TO_COMPLETE_OS.md`** — Phases F–L (M15–M32).
-  **Next: pipes + TTY** (now unblocked by fork), then **Phase H** (storage
-  maturity: VFS perms/ownership/mount syscalls, devfs/procfs, ext4 journaling) and
-  **Phase I** (ACPI + APIC/IOAPIC + SMP — the big one).
-- Build is green: `make` clean (0 warnings), `tools/selftest.sh` **96/96** (+9
-  M18, +7 M19, +5 M20), both boot paths higher-half (`smoke.sh --mb2`/`--uefi`).
+  **Next: M22 (NVMe driver)** — NVMe-only laptops + VMware NVMe option (same
+  `block_dev_t` shape; admin/IO queues instead of SATA ports). Then a **USB stack**
+  (XHCI + USB core + HID keyboard + Mass Storage) — needed to *use* USB devices
+  after boot (booting from USB is the firmware's job). Then pipes/TTY, Phase H
+  (storage maturity), Phase I (ACPI+APIC+SMP).
+- Build is green: `make` clean (0 warnings), `tools/selftest.sh` **102/102**
+  (+9 M18, +7 M19, +5 M20, +6 M21), both boot paths higher-half.
+- **M21 note:** AHCI is testable in QEMU because `q35` has a built-in AHCI
+  controller (`-machine q35 -drive ...,if=ide` routes to it). The driver registers
+  multiple disks (sda..sdd) and the boot mount tries each, so VMware's "boot ESP +
+  data disk both SATA" works (the GPT ESP is skipped, the raw-FS data disk mounts).
 - **Self-test runner note:** the full suite takes ~12–15 min (≈14 variant builds).
   Run it as a SINGLE background process and wait for its completion — running
   several `selftest.sh` at once shares the build dir and corrupts/truncates logs.
@@ -67,7 +74,8 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | **M18** | **done (Phase G)** | **dynamic memory**: `SYS_MMAP/MUNMAP/BRK/MPROTECT` (14–17) on the M14 VMA framework; `brk`/`sbrk` heap, anon `mmap` arena, `mprotect` (`vmm_protect_in_space`+invlpg); W^X-enforced + bounded by manifest `max_mem` at runtime; VMA tombstones + `VMA_MAX`→64. libc `malloc`/`free`/`mmap`. Demo `M18_MEM_DEMO`. See `docs/devlog/M18.md` |
 | **M19** | **done (Phase G)** | **copy-on-write fork**: PMM frame refcounts (`pmm_share`/`pmm_unref`); `vmm_fork_space` (COW bit 9), `vmm_cow_fault`; `SYS_FORK` (18) / `process_fork`; libc `fork()`. **Fix**: intermediate PT entries always `RW|PRESENT` (leaf is sole protection authority). Demo `M19_FORK_DEMO`. See `docs/devlog/M19.md` |
 | **M20** | **done (Phase G)** | **unified page cache** (`mm/pagecache.c`, 128 pages keyed by inode+offset) backs file `read()` AND **file-backed `mmap`** (MAP_PRIVATE via `vma_add_file`/`file_inode`; fault copies cached page into a private frame). `SYS_MMAP` +`fd` arg; `ksys_read`→cache, `ksys_write` invalidates. libc `open`/`read`/`close`/`mmap_file`. Demo `M20_MMAP_DEMO`: mmap+read of a VFS file return identical (coherent) bytes. See `docs/devlog/M20.md` |
-| next | **Pipes/TTY → H → I** | **pipes + TTY** (unblocked by fork): anon pipes on the fd table, a ring-3 TTY line discipline (Ctrl-C→signal needs a signal mechanism). Then **Phase H** (VFS perms/ownership/mount syscalls, devfs/procfs, ext4 journaling) and **Phase I** (ACPI + APIC/IOAPIC + SMP). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
+| **M21** | **done** | **AHCI/SATA block driver** (`drivers/ahci.c`) — disk path for **VMware + physical PCs**. PCI class probe (01/06/01, ABAR=BAR5), IDENTIFY, polled DMA read/write (READ/WRITE DMA EXT). Registers sda..sdd; boot mount tries vda,sda..sdd (skips GPT ESP). `make data-vmdk`; `docs/RUN_ON_HARDWARE.md`. Tested in QEMU q35. See `docs/devlog/M21.md` |
+| next | **M22 → USB → …** | **M22 NVMe driver** (NVMe-only laptops / VMware NVMe). Then a **USB stack** (XHCI+core+HID keyboard+Mass Storage) to *use* USB post-boot. Then pipes/TTY, Phase H (storage maturity), Phase I (ACPI+APIC+SMP). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
 
 ## Build / test / run
 
