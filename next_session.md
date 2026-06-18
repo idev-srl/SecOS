@@ -1,14 +1,15 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: M20 (unified page cache). **Phase G complete.** Read this first._
+_Last updated: M20 + consolidation to `main`. **Phases F+G complete.** Read this first._
 
 ## Where we are
 
 - **Done through M20** — M0–M13 (A–E) + M14 (demand paging) + Phase F (M15
   fault-kill, M16 exec, M17 blocking) + **Phase G COMPLETE: M18 (mmap/brk/malloc),
-  M19 (COW fork), M20 (page cache + file-backed mmap)**. Branch **`milestone/M7`**.
-  **HEAD ≈ M20 commit. Pushed: M16+M17 (`558c121`) + tag `M17_STABLE`. M18
-  (`1666854`), M19 (`f613e1f`), M20 are committed but NOT yet pushed.**
+  M19 (COW fork), M20 (page cache + file-backed mmap)**. **Everything is now
+  consolidated on `main`** (the old `milestone/M7`, `milestone/M0`,
+  `debug/uefi-unsupported` branches were merged/removed). `origin/main` is the
+  single source of truth; develop on `main`.
 - **Long-term roadmap: `docs/ROADMAP_TO_COMPLETE_OS.md`** — Phases F–L (M15–M32).
   **Next: pipes + TTY** (now unblocked by fork), then **Phase H** (storage
   maturity: VFS perms/ownership/mount syscalls, devfs/procfs, ext4 journaling) and
@@ -222,27 +223,25 @@ dereferences directly, so no `user_copy.c` change. Teardown is automatic
 (`vmm_space_destroy` frees present leaves; `mapped_pages` removed, no leak). Stack
 **guard** = absence of a VMA below it. `max_mem` checked vs reserved footprint.
 Demo `M14_DEMAND_DEMO`: signed `hello` shows `mapped at load=0` for a `0x9000`
-reserved footprint, 2 pages fault in as it runs. Harness **61/61**. **Still to
-do:** `git push origin milestone/M7`, maybe tag `M14_STABLE`.
+reserved footprint, 2 pages fault in as it runs. Harness **61/61**. _(Historical
+recap — M14 is long merged into `main`.)_
 
-## Suggested first move next session (Phase F core done → Phase G)
+## Suggested first move next session (Phases F+G done → next)
 
-Phase F core (M15 fault-kill, M16 exec/argv/wait, M17 blocking sleep/recv) is
-done. **Push first** if the M16+M17 commit isn't on origin yet (`git push origin
-milestone/M7`; consider tag `M17_STABLE`). Then start **Phase G — VM
-completeness** per `docs/ROADMAP_TO_COMPLETE_OS.md`:
-- **M18 — mmap/mprotect/brk + user malloc**: `mmap`/`munmap`/`mprotect` (anon +
-  file-backed) on the M14 VMA path; `brk`/`sbrk`; a real `malloc`/`free` in libc.
-  The VMA framework already does demand paging, so this is mostly new syscalls +
-  VMA bookkeeping + mprotect honoring W^X.
-- **M19 — copy-on-write + fork**: needs a PMM frame refcount; `fork` shares pages
-  COW, `shm`. The M16 block/wake + M14 VMAs are the foundation.
-- **M20 — page cache**: unify file read/write with file-backed mmap; lets the
-  per-process pinned ELF image (M14) become a shared read-only text cache.
-- **Deferred from M17:** anonymous pipes + a ring-3 TTY (Ctrl-C→SIGINT) — revisit
-  once fork (M19) shares fds and a signal-delivery mechanism exists (Phase L).
-- Other open stretch: W^X of the 0–512 MB identity map, dropping the low identity
-  map, real `DRIVER_OP_MAP_MEM`/IRQ-to-driver, ext4 journaling.
+Phases F and G are complete (M15–M20). Work on **`main`** (everything is
+consolidated there; old milestone/* and debug/* branches are gone). Per
+`docs/ROADMAP_TO_COMPLETE_OS.md`, the next steps:
+- **Pipes + TTY** (now unblocked by fork): anonymous pipes on the `fds[]` table; a
+  ring-3 TTY line discipline. Ctrl-C→SIGINT needs a signal-delivery mechanism
+  (only fatal termination exists today — see M15).
+- **Phase H — storage maturity**: VFS permissions/ownership/timestamps, `mount`/
+  `umount` syscalls, symlinks, devfs + procfs; ext4 JBD2 journaling.
+- **Phase I — modern platform**: ACPI + APIC/IOAPIC (retire the PIC), TSC/HPET
+  timekeeping, then **SMP** (the single biggest correctness effort — do a locking
+  audit first).
+- Other open stretch: `MAP_SHARED` + shared read-only text (retire the M14
+  per-process pinned image via the M20 page cache); W^X of the 0–512 MB identity
+  map; real `DRIVER_OP_MAP_MEM`/IRQ-to-driver; argv populated env.
 - **Driver space**: real `DRIVER_OP_MAP_MEM` (map device MMIO into the driver
   address space — still a validating stub); IRQ-to-driver (`IRQ_SUBSCRIBE` + IPC
   queue, building on M13's IPC channels); DMA sandbox; auto-restart of a crashed

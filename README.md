@@ -6,7 +6,39 @@
 
 A minimal secure kernel written in C/ASM, boots via UEFI (primary path) or GRUB Multiboot2 (legacy path), targeting x86-64 long mode.
 
-## Current Status — M9 (Real userland + signed ELFs)
+## Current Status — M20 (Phase G complete)
+
+**Done: M0–M20** — `tools/selftest.sh` → **96/96**, both boot paths PASS, kernel runs
+higher-half at `0xFFFFFFFF80000000`. The mandatory plan (phases A–E, M0–M13) plus
+M14 (demand paging) and Phases F–G (process model + VM completeness) are complete.
+SECoS now runs a real multi-process userland — signed programs with argv, dynamic
+memory (`malloc`/`mmap`), copy-on-write `fork`, blocking `wait`/`sleep`/IPC, and
+file-backed `mmap` through a coherent page cache — that **survives faults** (a
+buggy ring-3 process is killed, not the kernel).
+
+The full strategic plan from here to a complete headless OS (networking, SMP,
+pipes/TTY, security hardening) is in
+[`docs/ROADMAP_TO_COMPLETE_OS.md`](docs/ROADMAP_TO_COMPLETE_OS.md).
+
+**Recent milestones (M10–M20)** — one devlog each under [`docs/devlog/`](docs/devlog/):
+
+| M | Theme |
+|---|-------|
+| **M10** | Storage & persistence: virtio-blk + VFS multi-mount (`/mnt`) + **read-write FAT32/ext2/ext4**; `SYS_SPAWN`/`SYS_WAIT` + shell `run <path>` |
+| **M11** | Driver Space rooted in the code signature: the signed `.note.secos` manifest grants device capabilities, `SYS_DRIVER` enforces them |
+| **M12** | Memory scalability (PMM manages all RAM) + W^X hard gate + **higher-half kernel** |
+| **M13** | Manifest `max_mem` enforcement + `SYS_GETTICKS` + kernel **IPC channels** |
+| **M14** | **Full demand paging** — per-process VMAs; pages materialize on first touch |
+| **M15** | **Fault-driven process kill** — a ring-3 fault terminates the process, not the kernel |
+| **M16** | **Exec model** — argv/env + blocking `SYS_WAIT` returning exit status |
+| **M17** | **Blocking primitives** — `SYS_SLEEP` + blocking IPC receive |
+| **M18** | **Dynamic memory** — `mmap`/`munmap`/`mprotect`/`brk` + libc `malloc`/`free` |
+| **M19** | **Copy-on-write `fork`** — PMM frame refcounts + COW page faults |
+| **M20** | **Unified page cache** — file `read()` and file-backed `mmap` share coherent pages |
+
+---
+
+**Earlier milestones (M0–M9):**
 
 **Milestone M9 (Real userland + mandatory ELF signing)**: complete. Tag `M9_STABLE`. See [`docs/devlog/M9.md`](docs/devlog/M9.md) and [`docs/SIGNING.md`](docs/SIGNING.md).
 
@@ -102,8 +134,18 @@ make iso CFLAGS_EXTRA=-DM4_SELFTEST_ENABLE=0
 - ✅ Interactive shell with commands
 - ✅ Error handling during boot & process unload (elfunload)
 - ✅ ps command (basic process listing)
+- ✅ **Mandatory Ed25519 code signing** — every ELF is verified before it runs (SHA-256 + Ed25519 in-kernel)
+- ✅ **Driver Space** — capability-mediated, signature-rooted ring-3 hardware access (`SYS_DRIVER`)
+- ✅ **Higher-half kernel** at `0xFFFFFFFF80000000`; PMM manages all RAM
+- ✅ **Storage**: virtio-blk + VFS multi-mount; **read-write FAT32 / ext2 / ext4**
+- ✅ **Full demand paging** (per-process VMAs; lazy page materialization)
+- ✅ **Process model**: `fork` (copy-on-write), `spawn` with argv/env, blocking `wait`/`sleep`, exit status, fault-driven kill
+- ✅ **Dynamic memory**: `mmap`/`munmap`/`mprotect`/`brk` + libc `malloc`/`free`
+- ✅ **IPC**: kernel channels (`SYS_MSG_SEND`/`RECV`, blocking)
+- ✅ **Unified page cache**: coherent file `read()` + file-backed `mmap`
+- ✅ POSIX-friendly libc over a custom minimal syscall ABI
 
-See our [Development Roadmap](ROADMAP_SECoS.md) for upcoming features!
+See [`docs/ROADMAP_TO_COMPLETE_OS.md`](docs/ROADMAP_TO_COMPLETE_OS.md) (strategic plan to a full headless OS) and [`ROADMAP_SECoS.md`](ROADMAP_SECoS.md) (technical roadmap).
 
 ## Build — UEFI Path (primary)
 
@@ -421,27 +463,35 @@ To test on real hardware:
 
 ## Future Developments
 
-This kernel is a solid starting point. You can extend it with:
- - **Ring-3 transition + context switch** - in progress (M5–M7): trapframe-based syscall entry, `arch_iret_to_tf`, and `SYS_YIELD` cooperative scheduling are implemented; the ring-3 demo does not yet complete (see Current Status)
- - **Preemptive scheduler** - timer-driven (IRQ0) context switching on top of the M6/M7 trapframe machinery
- - **Security manifest** - Parse `.note.secos` section for policy (loader support already present; see below)
+Phases A–G (M0–M20) are complete. The remaining path to a complete headless OS is
+laid out in [`docs/ROADMAP_TO_COMPLETE_OS.md`](docs/ROADMAP_TO_COMPLETE_OS.md)
+(Phases F–L). Next up:
+
+- **Pipes + TTY** — anonymous pipes and a ring-3 terminal line discipline (now unblocked by `fork`)
+- **Storage maturity (Phase H)** — VFS permissions/ownership, `mount`/`umount` syscalls, devfs/procfs, ext4 journaling
+- **Modern platform (Phase I)** — ACPI + APIC/IOAPIC, then **SMP** (multi-core)
+- **Networking (Phase J)** — virtio-net + a TCP/IP stack + BSD sockets
+- **Userland (Phase K)** — fuller libc, ported software (shell/lua/sqlite), init + signed packages
+- **Security hardening (Phase L)** — generalized capabilities + keyring/revocation, ASLR/SMEP/SMAP/CFI, measured boot
+
 ## Security Manifest (.note.secos)
 
-The loader searches for an ELF note (PT_NOTE) with name `SECOS` and type `QSEC` containing a structure:
+Every signed ELF carries an ELF note (PT_NOTE) named `SECOS`. The Ed25519 signature
+covers it, so its claims are trust-rooted. The manifest carries the process type
+(user / driver), device id + granted capabilities (Driver Space), and a memory
+limit:
+
 ```
-uint32_t version;
-uint32_t flags;   // MANIFEST_FLAG_REQUIRE_WX_BLOCK, STACK_GUARD, NX_DATA, RX_CODE
-uint64_t max_mem; // limite attivo: se usage > max_mem abort
-uint64_t entry_hint; // entry attesa (0 = ignora)
+uint32_t version;    // manifest version (v2 adds proc_type/dev_id/dev_caps)
+uint32_t flags;      // MANIFEST_FLAG_REQUIRE_WX_BLOCK, STACK_GUARD, NX_DATA, RX_CODE
+uint64_t max_mem;    // active limit: refused at load if the footprint exceeds it (0 = unlimited)
+uint64_t entry_hint; // expected entry point (0 = ignore)
+// v2: proc_type, dev_id, dev_caps  (Driver Space — see docs/DRIVER_SPACE.md)
 ```
-If present it is validated (entry match, supported flags). W|X segments are rejected unconditionally. The max_mem field is compared to total occupied memory (pages * 4096) after loading and before process start: if it exceeds the limit the process is aborted.
- - **ASLR** - Address space layout randomization for code and stack
- - **File system** - FAT32/exFAT + VFS
- - **File system** - RAM or disk-based filesystem
- - **Device drivers** - Mouse, serial port, AHCI/IDE
- - **Networking** - Basic TCP/IP stack
- - **Advanced shell** - Piping, redirection, job control
- - **Syscalls** - User/kernel space interface
+
+It is validated at load (entry match, supported flags). `W|X` segments are rejected
+unconditionally. `max_mem` bounds both the load-time footprint and runtime growth
+(`mmap`/`brk`). See [`docs/SIGNING.md`](docs/SIGNING.md).
 
 ## Debugging
 
