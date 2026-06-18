@@ -57,11 +57,14 @@ net_irq_mode_t net_request_irq(net_dev_t* dev);
  * stack, configure (static IP for now), and start. Returns the number of NICs. */
 int net_init(void);
 
+/* [M24] Boot ping self-test against an IPv4 (network byte order). */
+void net_ping_test(uint32_t dst_ip);
+
 /* Called from the timer tick (drives polled NICs + protocol timers like ARP/TCP
  * retransmit). Cheap no-op when networking is absent. */
 void net_tick(void);
 
-/* ---- Protocol layer entry points (implemented across net/*.c) ---- */
+/* ---- Protocol layer entry points (implemented across the net layer) ---- */
 void eth_input(net_dev_t* dev, const uint8_t* frame, uint32_t len);   /* L2 demux */
 /* Send a payload as an Ethernet frame to dst_mac with the given ethertype. */
 int  eth_send(net_dev_t* dev, const uint8_t dst_mac[6], uint16_t ethertype,
@@ -70,12 +73,16 @@ int  eth_send(net_dev_t* dev, const uint8_t dst_mac[6], uint16_t ethertype,
 /* ARP */
 void arp_input(net_dev_t* dev, const uint8_t* frame, uint32_t len);
 int  arp_resolve(net_dev_t* dev, uint32_t ip, uint8_t out_mac[6]);    /* 0 ok, -1 pending */
+int  arp_lookup(uint32_t ip, uint8_t out_mac[6]);                    /* passive: 0 hit, -1 miss */
 void arp_request(net_dev_t* dev, uint32_t target_ip);
+void arp_tick(void);                                                  /* cache aging */
 
 /* IPv4 / ICMP */
 void ipv4_input(net_dev_t* dev, const uint8_t* frame, uint32_t len, const uint8_t src_mac[6]);
 int  ipv4_send(net_dev_t* dev, uint32_t dst_ip, uint8_t proto, const void* payload, uint32_t len);
 void icmp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* pkt, uint32_t len);
+int  icmp_send_echo(net_dev_t* dev, uint32_t dst_ip, uint16_t id, uint16_t seq);
+uint32_t icmp_echo_replies(void);   /* count of received echo replies (ping test) */
 
 /* ---- byte order + checksum helpers ---- */
 static inline uint16_t htons(uint16_t x){ return (uint16_t)((x<<8)|(x>>8)); }

@@ -1235,6 +1235,9 @@ static void kernel_main_phase2(void) {
             debugcon_writestring(vfs_lookup(bn)?"[M23] /dev block node present\n":"[M23] /dev block node MISSING\n");
         }
     }
+    // [M24] Networking: probe NICs (e1000/e1000e/vmxnet3/igc), bring up the stack
+    // with a static IP. Use the shell `ping` / `netinfo` commands to exercise it.
+    { extern int net_init(void); net_init(); }
 #if M9_USER_DEMO
     m9_run_demo(); // signed-userland demo (needs VFS) — does not return
 #endif

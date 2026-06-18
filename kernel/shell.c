@@ -20,6 +20,7 @@
 #include "fs/ramfs.h" // RAMFS API
 #include "fs/vfs.h" // VFS API
 #include "fs/block.h" // [M22] block device introspection (blk/mountdev)
+#include "net.h"       // [M24] networking (netinfo/ping)
 #include "driver_if.h" // driver space API
 #include <stdint.h>
 #include <stddef.h>
@@ -139,6 +140,7 @@ static void sh_cd(const char* a); static void sh_pwd(const char* a); static void
 static void sh_cat(const char* a); static void sh_touch(const char* a); static void sh_mkdir(const char* a);
 static void sh_rm(const char* a); static void sh_df(const char* a); static void sh_free(const char* a);
 static void sh_uname(const char* a);
+static void sh_netinfo(const char* a); static void sh_ping(const char* a);   // [M24]
 const char* shell_get_cwd(void);   // [M23] current VFS working directory (for the prompt)
 static void sh_run(const char* a);
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
@@ -230,6 +232,8 @@ static const struct shell_cmd shell_cmds[] = {
     {"df",        sh_df},
     {"free",      sh_free},
     {"uname",     sh_uname},
+    {"netinfo",   sh_netinfo},
+    {"ping",      sh_ping},
     {"run",       sh_run},
     {"drvreg",    sh_drvreg},
     {"drvunreg",  sh_drvunreg},
@@ -1019,6 +1023,36 @@ static void sh_free(const char* a){ (void)a;
 }
 
 static void sh_uname(const char* a){ (void)a; terminal_writestring("SecOS " GIT_HASH " x86_64\n"); }
+
+// [M24] networking shell commands.
+static void print_ip(uint32_t ip_net){    // ip_net in network byte order
+    for(int b=0;b<4;b++){ print_dec((ip_net >> (8*b)) & 0xFF); if(b<3) terminal_writestring("."); }
+}
+static void sh_netinfo(const char* a){ (void)a;
+    net_dev_t* d = net_primary();
+    if(!d){ terminal_writestring("netinfo: no NIC\n"); return; }
+    static const char hx[] = "0123456789abcdef";
+    terminal_writestring(d->name); terminal_writestring("  MAC ");
+    for(int i=0;i<6;i++){ terminal_putchar(hx[(d->mac[i]>>4)&0xF]); terminal_putchar(hx[d->mac[i]&0xF]); if(i<5) terminal_putchar(':'); }
+    terminal_writestring("\n  IP ");   print_ip(d->ip);
+    terminal_writestring("  GW ");      print_ip(d->gateway);
+    terminal_writestring("  link ");    terminal_writestring(d->link_up?"up":"down");
+    terminal_writestring("\n");
+}
+static void sh_ping(const char* a){
+    while(*a==' ') a++;
+    net_dev_t* d = net_primary();
+    if(!d){ terminal_writestring("ping: no NIC\n"); return; }
+    uint32_t ip = d->gateway;   // default: gateway
+    if(*a){   // parse a.b.c.d -> network byte order
+        uint32_t parts[4]={0,0,0,0}; int pi=0;
+        while(*a && pi<4){ uint32_t v=0; while(*a>='0'&&*a<='9'){ v=v*10+(*a-'0'); a++; } parts[pi++]=v&0xFF; if(*a=='.') a++; }
+        ip = parts[0] | (parts[1]<<8) | (parts[2]<<16) | (parts[3]<<24);
+    }
+    terminal_writestring("PING "); print_ip(ip); terminal_writestring(" ...\n");
+    net_ping_test(ip);
+    terminal_writestring("(see serial/debug for result)\n");
+}
 // =========================================================================
 
 // [M10] run <path>: load+signature-verify a signed ELF from the VFS, spawn it
