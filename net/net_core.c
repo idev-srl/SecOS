@@ -70,9 +70,16 @@ uint16_t net_checksum(const void* data, uint32_t len) {
 
 int net_init(void) {
     extern int e1000_init(void);
-    int n = 0;
-    if (e1000_init() == 0) n++;
-    // (e1000e / vmxnet3 / igc are wired in once their driver branches merge.)
+    extern int e1000e_init(void);
+    extern int vmxnet3_init(void);
+    extern int igc_init(void);
+    // Probe each supported NIC; each is a no-op when its device is absent. The
+    // first one to register becomes the primary. (e1000 verified in QEMU;
+    // e1000e/vmxnet3/igc implemented but not yet tested on real hardware.)
+    e1000_init();
+    e1000e_init();
+    vmxnet3_init();
+    igc_init();
     if (g_ndev == 0) { debugcon_writestring("[NET] no NIC found\n"); return 0; }
 
     // [M24] Static IPv4 config for the primary NIC — QEMU user-mode networking

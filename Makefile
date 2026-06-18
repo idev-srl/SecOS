@@ -72,6 +72,9 @@ SRC_C   = \
 	$(CRYPTO_DIR)/ed25519.c \
 	$(CRYPTO_DIR)/crypto_selftest.c \
 	$(DRIVERS_DIR)/e1000.c \
+	$(DRIVERS_DIR)/e1000e.c \
+	$(DRIVERS_DIR)/vmxnet3.c \
+	$(DRIVERS_DIR)/igc.c \
 	$(NET_DIR)/net_core.c \
 	$(NET_DIR)/eth.c \
 	$(NET_DIR)/arp.c \
