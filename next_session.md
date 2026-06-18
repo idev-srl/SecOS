@@ -1,8 +1,60 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **M22 (NVMe + USB stack)**. NVMe storage + a polled xHCI USB stack
-with a HID boot keyboard and Bulk-Only Mass Storage. M21 (AHCI/SATA) is pushed +
-tagged `M21_STABLE`. Read this first._
+_Last updated: **M24 networking** — L2/L3 done, `ping` works. M21/M22/M23 done
+and pushed. HEAD `e651927` on `origin/main`. Read this first._
+
+## ▶▶ NEXT SESSION TASK: complete the network stack
+The user wants the rest of networking done, in this order:
+**1) UDP + DHCP + DNS → 2) TCP (the big one) → 3) sockets + `CAP_NET` → 4) MSI-X/NAPI RX (2.5 Gbps perf).**
+
+The L2/L3 foundation is in and **`ping` works** (see status below). Build on it:
+
+- **Wave 1 — UDP + DHCP + DNS.** Add `net/udp.c` (`udp_input`/`udp_send`, 16
+  ports max, pseudo-header checksum). `ipv4.c` already calls a weak `udp_input`.
+  Then `net/dhcp.c` (DISCOVER/OFFER/REQUEST/ACK over UDP 68→67, broadcast; set
+  `dev->ip/netmask/gateway/dns` from the lease — replaces the static config in
+  `net_init`). Then `net/dns.c` (A-record query over UDP 53 to `dev->dns`).
+  Shell: `dhcp`, `nslookup <name>`, `udpsend`. Test: QEMU SLIRP runs a DHCP
+  server (10.0.2.2) + DNS (10.0.2.3) — `dhcp` should get 10.0.2.15, `nslookup
+  example.com` should resolve. **Remember the RX gotcha** (run from shell/idle).
+- **Wave 2 — TCP.** `net/tcp.c`: the state machine (LISTEN/SYN-SENT/SYN-RCVD/
+  ESTABLISHED/FIN-WAIT/…), seq/ack, retransmit timer (use `net_tick`), a small
+  window, MSS. Start with active open (connect) + a tiny client; add passive
+  (listen/accept) after. Test: `nc -l` on the host vs a guest TCP connect, or an
+  HTTP GET to 10.0.2.2's hostfwd. This is the largest piece — do it incrementally
+  (3-way handshake first, then data, then teardown).
+- **Wave 3 — sockets + CAP_NET.** Syscalls `socket/bind/connect/listen/accept/
+  send/recv/sendto/recvfrom/close` (next free SYS numbers: lseek=19, stat=20 used
+  → start at **21**). libc wrappers in `user/libsecos.c`. Add a **`CAP_NET`** flag
+  to the `.note.secos` manifest (`mm/elf_manifest.*`) — a single general network
+  capability (NOT per-port/protocol); `process_create_from_elf` records it and
+  the socket syscalls refuse if absent. A signed demo program (gate `M24_NET_DEMO`)
+  doing a UDP echo or TCP GET proves it.
+- **Wave 4 — MSI-X/NAPI RX.** Replace timer-tick polling with real interrupts:
+  finish the M22 MSI-X plumbing (`pci_enable_msix`, `lapic`, IDT vectors), wire a
+  per-NIC ISR that does NAPI (ack → drain ring → re-arm). Needed for 2.5GbE
+  (igc). The `net_request_irq` contract already abstracts this — drivers only
+  provide `poll()`.
+
+### Key facts for the next session (don't relearn the hard way)
+- **NIC RX needs the shell/idle context**: the idle task `hlt`s between timer
+  ticks → yields the vCPU so QEMU delivers RX DMA; `net_tick` polls. A busy-spin
+  in early `kernel_main` never yields (`GPRC=0`, looks like an RX bug — it isn't).
+  Test networking from the **shell** (`ping`/`netinfo`), not early boot.
+- **Makefile has NO header-dep tracking + ignores CFLAGS_EXTRA changes**: after
+  editing any `.h` or toggling a `-D` flag, **`make clean` first** or you run a
+  stale kernel (this bit me twice this session — stale demo flag, stale struct).
+- **Don't build concurrently with `tools/selftest.sh`** (shared build dir + /tmp
+  logs → corruption). Run it as a single background job and wait.
+- **Worktree agents can contaminate the main checkout's branch** (HEAD got left
+  on a `feat/*` branch twice). After spawning worktree agents, verify
+  `git rev-parse --abbrev-ref HEAD` == `main` before committing, and that
+  `git rev-parse main` == `origin/main`.
+- Net code is **inert without a NIC** → self-tests unaffected (still **122/122**).
+  Test ping: `qemu-system-x86_64 -cdrom myos.iso -boot d -netdev user,id=n0
+  -device e1000,netdev=n0 ...` then shell `ping`. On VMware use an **e1000** NIC.
+- Locked decisions: all 4 NICs (incl **igc=2.5GbE**), **MSI-X+NAPI** target,
+  **CAP_NET** single manifest capability. See `memory/m24-networking-decisions.md`.
 
 ## ✅ Status: M24 networking L2/L3 done — `ping` WORKS
 Networking foundation landed and verified: NIC contract `net/net.h`, **4 NIC
