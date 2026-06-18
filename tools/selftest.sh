@@ -425,6 +425,46 @@ grep -q "\[M10\] disk mounted at /mnt fs=FAT32" "$M22ULOG"; check "M22 FAT32 mou
 grep -q "\[M10\] disk write+readback: OK" "$M22ULOG"; check "M22 USB write+readback persists" $?
 ! grep -q "\[EXC\]" "$M22ULOG"; check "no CPU exception ([EXC]) during M22 USB run" $?
 
+# ---- M23: POSIX FS personality (/dev, /proc, /sys + persistent ext2 root) ----
+M23LOG=/tmp/secos_selftest_m23.log
+M23RLOG=/tmp/secos_selftest_m23root.log
+echo "[selftest] Building M23 image (M23_FS_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA=-DM23_FS_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M23 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+make disk-fat32 >/dev/null 2>&1 || { echo "  [FAIL] M23 disk image build"; FAIL=$((FAIL+1)); }
+echo "[selftest] Running M23 demo (/dev + /proc + signed ring-3 program)..."
+: > "$M23LOG"; set +e
+timeout "$((TIMEOUT+4))" qemu-system-x86_64 -cdrom myos.iso -boot d \
+    -drive file=disk.img,if=virtio,format=raw \
+    -debugcon file:"$M23LOG" -global isa-debugcon.iobase=0xe9 \
+    -no-reboot -no-shutdown -display none -m 256M
+set -e
+grep -q "devfs(/dev)=0x0000000000000001" "$M23LOG"; check "M23 devfs mounted at /dev" $?
+grep -q "procfs(/proc)=0x0000000000000001" "$M23LOG"; check "M23 procfs mounted at /proc" $?
+grep -q "sysfs(/sys)=0x0000000000000001" "$M23LOG"; check "M23 sysfs mounted at /sys" $?
+grep -q "\[m23fs\] /dev/zero read OK" "$M23LOG"; check "M23 signed prog reads /dev/zero (ring-3)" $?
+grep -q "\[m23fs\] /dev/null write OK" "$M23LOG"; check "M23 signed prog writes /dev/null (ring-3)" $?
+grep -q "\[m23fs\] DONE" "$M23LOG"; check "M23 signed prog completes (/proc, stat, lseek)" $?
+! grep -q "\[EXC\]" "$M23LOG"; check "no CPU exception ([EXC]) during M23 demo" $?
+
+# Persistent ext2 root: build a system disk (marker /.secosroot) and confirm the
+# kernel adopts it as the VFS root. (Default build; no demo gate.)
+echo "[selftest] Running M23 persistent ext2 root..."
+make iso >/tmp/secos_selftest_build.log 2>&1
+make sysdisk-ext2 >/dev/null 2>&1 || { echo "  [FAIL] M23 sysdisk build"; FAIL=$((FAIL+1)); }
+: > "$M23RLOG"; set +e
+timeout "$((TIMEOUT+4))" qemu-system-x86_64 -cdrom myos.iso -boot d \
+    -drive file=sysdisk.img,if=virtio,format=raw \
+    -debugcon file:"$M23RLOG" -global isa-debugcon.iobase=0xe9 \
+    -no-reboot -no-shutdown -display none -m 256M
+set -e
+grep -q "\[M23\] persistent ext2 root on" "$M23RLOG"; check "M23 persistent ext2 root adopted" $?
+! grep -q "\[VFS\] root RAMFS mounted" "$M23RLOG"; check "M23 RAMFS root skipped when ext2 root present" $?
+! grep -q "\[EXC\]" "$M23RLOG"; check "no CPU exception ([EXC]) during M23 persistent-root boot" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

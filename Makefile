@@ -63,6 +63,9 @@ SRC_C   = \
 	$(FS_DIR)/fat32.c \
 	$(FS_DIR)/ext2.c \
 	$(FS_DIR)/ext2ramdev.c \
+	$(FS_DIR)/devfs.c \
+	$(FS_DIR)/procfs.c \
+	$(FS_DIR)/sysfs.c \
 	$(CRYPTO_DIR)/sha256.c \
 	$(CRYPTO_DIR)/sha512.c \
 	$(CRYPTO_DIR)/ed25519.c \
@@ -209,7 +212,12 @@ user-progs:
 	$(LD) -T user/user.ld -o user/m20_mmap.elf user/crt0.o user/note.o user/libsecos.o user/m20_mmap.o
 	python3 tools/secos-sign user/m20_mmap.elf --dev
 	python3 tools/elf2h.py user/m20_mmap.elf user_m20_mmap_elf crypto/user_m20_mmap_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap -> crypto/*.h"
+	# [M23] POSIX FS personality: a signed program using /dev + /proc + stat + lseek
+	$(CC) $(USER_CFLAGS) -c user/m23_fs.c      -o user/m23_fs.o
+	$(LD) -T user/user.ld -o user/m23_fs.elf user/crt0.o user/note.o user/libsecos.o user/m23_fs.o
+	python3 tools/secos-sign user/m23_fs.elf --dev
+	python3 tools/elf2h.py user/m23_fs.elf user_m23_fs_elf crypto/user_m23_fs_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs -> crypto/*.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke
@@ -235,6 +243,28 @@ disk-ext4:
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
 	mkfs.ext4 -q -O ^has_journal,^metadata_csum -L SECOSDATA -d /tmp/secos_diskstage $(DISK_IMG)
 	@echo "disk-ext4: $(DISK_IMG) (ext4 no-journal/no-csum, extents+64bit, 64MB, hello.txt)"
+
+# [M23] Persistent ext2 SYSTEM root disk: FHS skeleton + the /.secosroot marker
+# that makes the kernel adopt it as the VFS root "/". Attach as a SATA/NVMe/USB
+# data disk (or virtio "vda"); the kernel mounts it persistently at "/".
+SYSDISK_IMG = sysdisk.img
+.PHONY: sysdisk-ext2 sysdisk-vmdk
+sysdisk-ext2:
+	rm -rf /tmp/secos_sysroot
+	mkdir -p /tmp/secos_sysroot/bin /tmp/secos_sysroot/etc /tmp/secos_sysroot/dev
+	mkdir -p /tmp/secos_sysroot/proc /tmp/secos_sysroot/sys /tmp/secos_sysroot/tmp
+	mkdir -p /tmp/secos_sysroot/usr /tmp/secos_sysroot/opt /tmp/secos_sysroot/home
+	mkdir -p /tmp/secos_sysroot/lib /tmp/secos_sysroot/root /tmp/secos_sysroot/var
+	printf 'SecOS persistent root marker\n' > /tmp/secos_sysroot/.secosroot
+	printf 'SecOS 0.1.0-dev\n' > /tmp/secos_sysroot/etc/secos-release
+	printf 'Welcome to SecOS (persistent ext2 root)\n' > /tmp/secos_sysroot/etc/motd
+	printf 'hello from the persistent root\n' > /tmp/secos_sysroot/home/hello.txt
+	dd if=/dev/zero of=$(SYSDISK_IMG) bs=1M count=64 status=none
+	mkfs.ext2 -q -O ^has_journal,^metadata_csum -L SECOSROOT -d /tmp/secos_sysroot $(SYSDISK_IMG)
+	@echo "sysdisk-ext2: $(SYSDISK_IMG) (ext2 persistent root, marker /.secosroot)"
+sysdisk-vmdk: sysdisk-ext2
+	qemu-img convert -f raw -O vmdk $(SYSDISK_IMG) sysdisk.vmdk
+	@echo "sysdisk-vmdk: sysdisk.vmdk ready (attach as SATA/NVMe data disk in VMware)"
 
 # Run with QEMU (graphical window — needs a working display backend)
 run: iso

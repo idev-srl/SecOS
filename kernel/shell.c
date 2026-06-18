@@ -134,6 +134,12 @@ static void sh_vls(const char* a); static void sh_vcat(const char* a); static vo
 static void sh_vcreate(const char* a); static void sh_vwrite(const char* a); static void sh_vtruncate2(const char* a);
 static void sh_ext2mount(const char* a);
 static void sh_blk(const char* a); static void sh_mountdev(const char* a);
+// [M23] POSIX-style commands over the VFS (with a real working directory).
+static void sh_cd(const char* a); static void sh_pwd(const char* a); static void sh_ls(const char* a);
+static void sh_cat(const char* a); static void sh_touch(const char* a); static void sh_mkdir(const char* a);
+static void sh_rm(const char* a); static void sh_df(const char* a); static void sh_free(const char* a);
+static void sh_uname(const char* a);
+const char* shell_get_cwd(void);   // [M23] current VFS working directory (for the prompt)
 static void sh_run(const char* a);
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
 static void sh_drvtest(const char* a);
@@ -213,6 +219,17 @@ static const struct shell_cmd shell_cmds[] = {
     {"ext2mount", sh_ext2mount},
     {"blk",       sh_blk},
     {"mountdev",  sh_mountdev},
+    // [M23] POSIX-style commands over the VFS
+    {"cd",        sh_cd},
+    {"pwd",       sh_pwd},
+    {"ls",        sh_ls},
+    {"cat",       sh_cat},
+    {"touch",     sh_touch},
+    {"mkdir",     sh_mkdir},
+    {"rm",        sh_rm},
+    {"df",        sh_df},
+    {"free",      sh_free},
+    {"uname",     sh_uname},
     {"run",       sh_run},
     {"drvreg",    sh_drvreg},
     {"drvunreg",  sh_drvunreg},
@@ -239,11 +256,13 @@ static void shell_print_help_paged(void){
     for (unsigned i=0;i<sizeof(shell_cmds)/sizeof(shell_cmds[0]); i++) { if(pager_should_stop()) break; char namebuf[64]; int k=0; namebuf[k++]=' '; namebuf[k++]=' '; const char* n=shell_cmds[i].name; while(*n && k < (int)sizeof(namebuf)-1) namebuf[k++]=*n++; namebuf[k]=0; pager_print(namebuf); }
     if(!pager_should_stop()){
         pager_print("");
-        pager_print("RAMFS: rfls rfcat rfinfo rfadd rfwrite rfdel rfmkdir rfrmdir rfcd rfpwd rftree rfusage rfmv rftruncate");
-        pager_print("VFS: vls vcat vinfo vpwd vmount vcreate vwrite vtruncate");
+        pager_print("Files (POSIX): ls cd pwd cat touch mkdir rm  (work on /, /mnt, /dev, /proc, /sys)");
+        pager_print("System: uname free df mem uptime ps pinfo info clear echo sleep halt reboot");
+        pager_print("Storage: blk mountdev df  |  Run signed ELF: run <path> [args]");
         pager_print("Drivers: drvinfo drvreg drvunreg drvlog drvtest");
-        pager_print("System: help clear info uptime sleep mem memtest memstress colors color fbinfo fontdump halt reboot crash");
-        pager_print("Other: elfload elfload2 elfunload ps pinfo kill ext2mount usertest logo date (if enabled)");
+        pager_print("Legacy VFS:   vls vcat vinfo vcreate vwrite vtruncate vmount");
+        pager_print("Legacy RAMFS: rfls rfcat rfinfo rfadd rfwrite rfdel rfmkdir rfrmdir rfcd rfpwd rftree rfusage rfmv rftruncate");
+        pager_print("Other: elfload elfload2 elfunload kill ext2mount usertest colors color fbinfo fontdump logo crash date");
         pager_print("");
         pager_print("Use 'pager off' to disable paging or 'pager lines N' to change page size.");
     }
@@ -544,6 +563,9 @@ static void cmd_memstress(void) {
 static void show_prompt(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
     terminal_writestring("secos");
+    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_BLUE, VGA_COLOR_BLACK));
+    terminal_writestring(":");
+    terminal_writestring(shell_get_cwd());   // [M23] show the working directory
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
     terminal_writestring("$ ");
 }
@@ -866,6 +888,139 @@ static void sh_mountdev(const char* a){
     if(ext2_mount(dev, mp)==0){ terminal_writestring("[mountdev] ext2/4 mounted "); terminal_writestring(dev); terminal_writestring(" -> "); terminal_writestring(mp); terminal_writestring("\n"); return; }
     terminal_writestring("[mountdev] mount FAILED (device not FAT32/extN, or already mounted there)\n");
 }
+
+// ===================== [M23] POSIX-style shell commands =====================
+// A real VFS working directory (the legacy rf*/v* commands keep using absolute
+// paths / the RAMFS cwd; these operate on the unified VFS: root, /mnt, /dev,
+// /proc, /sys).
+static char g_cwd[256] = "/";
+
+// Resolve `in` against the working directory into a normalized absolute path
+// (handles ".", "..", "//"). Empty `in` resolves to the cwd.
+static void cwd_resolve(const char* in, char* out, size_t osz){
+    char raw[512]; size_t r=0;
+    if(in && in[0]=='/'){ raw[r++]='/'; }
+    else { size_t i=0; while(g_cwd[i] && r<sizeof(raw)-1) raw[r++]=g_cwd[i++]; if(r==0) raw[r++]='/'; }
+    if(in && in[0]){ if(r==0||raw[r-1]!='/'){ if(r<sizeof(raw)-1) raw[r++]='/'; } size_t i=0; while(in[i] && r<sizeof(raw)-1) raw[r++]=in[i++]; }
+    raw[r]=0;
+    char comps[24][64]; int nc=0; size_t i=0;
+    while(raw[i]){
+        while(raw[i]=='/') i++;
+        if(!raw[i]) break;
+        char c[64]; int k=0; while(raw[i] && raw[i]!='/' && k<63) c[k++]=raw[i++]; c[k]=0;
+        if(k==1 && c[0]=='.') continue;
+        if(k==2 && c[0]=='.' && c[1]=='.'){ if(nc>0) nc--; continue; }
+        if(nc<24){ int j=0; while(c[j] && j<63){ comps[nc][j]=c[j]; j++; } comps[nc][j]=0; nc++; }
+    }
+    size_t o=0; out[o++]='/';
+    for(int x=0;x<nc;x++){ if(o>1 && o<osz-1) out[o++]='/'; for(int j=0;comps[x][j] && o<osz-1;j++) out[o++]=comps[x][j]; }
+    if(o>=osz) o=osz-1; out[o]=0;
+}
+
+const char* shell_get_cwd(void){ return g_cwd; }
+
+static void sh_pwd(const char* a){ (void)a; terminal_writestring(g_cwd); terminal_writestring("\n"); }
+
+static void sh_cd(const char* a){
+    while(*a==' ') a++;
+    char p[256]; cwd_resolve(*a?a:"/", p, sizeof(p));
+    extern vfs_inode_t* vfs_lookup(const char*);
+    vfs_inode_t* ino = vfs_lookup(p);
+    if(!ino){ terminal_writestring("cd: no such file or directory: "); terminal_writestring(p); terminal_writestring("\n"); return; }
+    if(ino->type!=VFS_NODE_DIR){ terminal_writestring("cd: not a directory: "); terminal_writestring(p); terminal_writestring("\n"); return; }
+    size_t i=0; while(p[i] && i<sizeof(g_cwd)-1){ g_cwd[i]=p[i]; i++; } g_cwd[i]=0;
+}
+
+// readdir callback: print just the basename (with trailing '/' for dirs).
+static void ls_cb(const vfs_inode_t* c, void* u){ (void)u;
+    const char* b=c->path; for(const char* q=c->path;*q;q++) if(*q=='/') b=q+1;
+    char line[280]; int k=0; for(int j=0;b[j] && k<260;j++) line[k++]=b[j];
+    if(c->type==VFS_NODE_DIR && k<278) line[k++]='/';
+    line[k]=0; pager_print(line);
+}
+
+static void sh_ls(const char* a){
+    while(*a==' ') a++;
+    char p[256]; cwd_resolve(a, p, sizeof(p));
+    extern vfs_inode_t* vfs_lookup(const char*);
+    extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*);
+    vfs_inode_t* ino = vfs_lookup(p);
+    if(!ino){ terminal_writestring("ls: cannot access '"); terminal_writestring(p); terminal_writestring("'\n"); return; }
+    if(ino->type!=VFS_NODE_DIR){ terminal_writestring(p); terminal_writestring("\n"); return; }
+    pager_begin(); vfs_readdir(p, ls_cb, NULL); pager_end();
+}
+
+static void sh_cat(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("usage: cat <file>\n"); return; }
+    char p[256]; cwd_resolve(a, p, sizeof(p));
+    extern vfs_inode_t* vfs_lookup(const char*);
+    vfs_inode_t* ino = vfs_lookup(p);
+    if(!ino || ino->type!=VFS_NODE_FILE){ terminal_writestring("cat: "); terminal_writestring(p); terminal_writestring(": no such file\n"); return; }
+    // Stream up to a sane cap directly via the FS read op (works for generated
+    // /proc files and refuses to dump a whole disk).
+    static char buf[1024];
+    size_t off=0, cap=64*1024;
+    while(off<cap){
+        int r = ino->ops && ino->ops->read ? ino->ops->read(ino, off, buf, sizeof(buf)) : -1;
+        if(r<=0) break;
+        for(int i=0;i<r;i++) terminal_putchar(buf[i]);
+        off += (size_t)r;
+        if((size_t)r < sizeof(buf) && ino->size && off>=ino->size) break;
+    }
+}
+
+static void sh_touch(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("usage: touch <file>\n"); return; }
+    char p[256]; cwd_resolve(a, p, sizeof(p));
+    extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
+    if(vfs_lookup(p)) return;                       // exists: nothing to do
+    if(vfs_create(p, "", 0)!=0){ terminal_writestring("touch: cannot create "); terminal_writestring(p); terminal_writestring("\n"); }
+}
+
+static void sh_mkdir(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("usage: mkdir <dir>\n"); return; }
+    char p[256]; cwd_resolve(a, p, sizeof(p));
+    extern int vfs_mkdir(const char*);
+    if(vfs_mkdir(p)!=0){ terminal_writestring("mkdir: cannot create "); terminal_writestring(p); terminal_writestring("\n"); }
+}
+
+static void sh_rm(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("usage: rm <path>\n"); return; }
+    char p[256]; cwd_resolve(a, p, sizeof(p));
+    extern int vfs_remove(const char*);
+    if(vfs_remove(p)!=0){ terminal_writestring("rm: cannot remove "); terminal_writestring(p); terminal_writestring("\n"); }
+}
+
+static void sh_df(const char* a){ (void)a;
+    terminal_writestring("Type\tMounted on\n");
+    int n=vfs_mount_count();
+    for(int i=0;i<n;i++){ const char* mp=0,*fs=0; if(vfs_mount_info(i,&mp,&fs)) continue;
+        terminal_writestring(fs?fs:"?"); terminal_writestring("\t");
+        terminal_writestring(mp?mp:"?"); terminal_writestring("\n"); }
+    terminal_writestring("\nBlock devices:\n");
+    int bn=block_count();
+    if(bn==0) terminal_writestring("  (none)\n");
+    for(int i=0;i<bn;i++){ block_dev_t* b=block_get(i); if(!b) continue;
+        terminal_writestring("  "); terminal_writestring(b->name); terminal_writestring("  ");
+        print_dec(b->sector_count*(uint64_t)b->sector_size/(1024*1024)); terminal_writestring(" MB\n"); }
+}
+
+static void sh_free(const char* a){ (void)a;
+    extern uint64_t pmm_get_total_memory(void); extern uint64_t pmm_get_used_memory(void); extern uint64_t pmm_get_free_memory(void);
+    terminal_writestring("           total      used      free   (kB)\n");
+    terminal_writestring("Mem:    ");
+    print_dec(pmm_get_total_memory()/1024); terminal_writestring("   ");
+    print_dec(pmm_get_used_memory()/1024);  terminal_writestring("   ");
+    print_dec(pmm_get_free_memory()/1024);  terminal_writestring("\n");
+}
+
+static void sh_uname(const char* a){ (void)a; terminal_writestring("SecOS " GIT_HASH " x86_64\n"); }
+// =========================================================================
+
 // [M10] run <path>: load+signature-verify a signed ELF from the VFS, spawn it
 // ring-3 and wait for it to exit. Works because the shell runs as the scheduler
 // idle task: the timer preempts us into the spawned process; SYS_EXIT returns

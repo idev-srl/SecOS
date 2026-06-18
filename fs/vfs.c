@@ -11,7 +11,7 @@
 #include "vfs.h"
 #include <stddef.h>
 
-#define VFS_MAX_MOUNTS 4
+#define VFS_MAX_MOUNTS 12   // [M23] root + /mnt + /dev + /proc + /sys + headroom
 static vfs_mount_t g_mounts[VFS_MAX_MOUNTS];
 static int         g_mount_count = 0;
 
@@ -147,3 +147,11 @@ int vfs_rename(const char* oldp, const char* newp){
     return mo->ops->rename(ro, rn);
 }
 int vfs_truncate(const char* path, size_t new_size){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops) return -1; return m->ops->truncate(rel, new_size); }
+
+int vfs_mount_count(void){ return g_mount_count; }
+int vfs_mount_info(int i, const char** mp, const char** fsname){
+    if(i<0 || i>=g_mount_count) return -1;
+    if(mp) *mp = g_mounts[i].mount_point;
+    if(fsname) *fsname = g_mounts[i].fs_name;
+    return 0;
+}

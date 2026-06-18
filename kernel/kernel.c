@@ -41,6 +41,7 @@
 #include "driver_if.h" // driver registry init
 #include "debugcon.h"   // ISA debugcon boot markers (port 0xE9)
 #include "block.h"      // block device registry (virtio-blk smoke check)
+#include "vfs.h"        // [M23] VFS types (vfs_inode_t) for boot self-checks
 #include "selftest.h"   // M4 isolation selftest
 #include "process.h"    // M6 ring3 entry
 #if CONFIG_UEFI
@@ -830,6 +831,51 @@ static void m20_run_demo(void) {
 }
 #endif /* M20_MMAP_DEMO */
 
+// [M23] POSIX FS personality demo: run the signed `m23_fs`, which opens /dev/zero,
+// /dev/null, /proc/uptime and stat()/lseek()s a /dev block node — proving a
+// signed ring-3 program uses the Linux-style filesystem.
+#ifndef M23_FS_DEMO
+#define M23_FS_DEMO 0
+#endif
+#if M23_FS_DEMO
+#include "trapframe.h"
+#include "../crypto/user_m23_fs_elf.h"
+static uint8_t m23_idle_stack[16384] __attribute__((aligned(16)));
+static int m23_step = 0, m23_done = 0;
+__attribute__((noreturn)) static void m23_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m23_step == 0) {
+            m23_step = 1;
+            debugcon_writestring("[M23] --- POSIX FS personality demo ---\n");
+            process_t* p = process_create_from_elf(user_m23_fs_elf, user_m23_fs_elf_len);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M23] spawned m23_fs\n"); }
+            else   debugcon_writestring("[M23] FAIL: m23_fs not loaded\n");
+        } else if (m23_step == 1 && sched_count_alive_user() == 0 && !m23_done) {
+            m23_done = 1;
+            debugcon_writestring("[M23] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+static void m23_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    static process_t idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m23_idle_stack + sizeof(m23_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m23_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    arch_iret_to_tf(&idle_tf);
+}
+#endif /* M23_FS_DEMO */
+
 // ---- [M10] Interactive shell as the scheduler idle task ----
 // Running the shell as the idle task lets `run <path>` spawn a ring-3 process:
 // the timer preempts idle (shell) into the user task; on SYS_EXIT the scheduler
@@ -1083,14 +1129,39 @@ static void kernel_main_phase2(void) {
             }
         }
     }
-    // Root filesystem is always RAMFS.
+    // [M23] Persistent root: if a SecOS ext2 *system* disk is present (it carries
+    // the marker file /.secosroot), mount it as the VFS root "/". Plain ext2/ext4
+    // *data* disks lack the marker and are never grabbed as root — so the boot
+    // self-tests (no system disk) keep the RAMFS root unchanged.
+    int root_is_ext2 = 0;
     {
+        extern int ext2_mount_root(const char* dev_name);
+        extern block_dev_t* block_find(const char* name);
+        static const char* rc[] = { "vda","sda","sdb","sdc","sdd","nvme0n1","usb0" };
+        for (unsigned i=0;i<sizeof(rc)/sizeof(rc[0]) && !root_is_ext2;i++) {
+            if (!block_find(rc[i])) continue;
+            if (ext2_mount_root(rc[i]) == 0) {
+                root_is_ext2 = 1;
+                terminal_writestring("[M23] persistent ext2 root mounted from ");
+                terminal_writestring(rc[i]); terminal_writestring("\n");
+                debugcon_writestring("[M23] persistent ext2 root on ");
+                debugcon_writestring(rc[i]); debugcon_writestring("\n");
+                // Refresh /VERSION on the persistent root (best-effort).
+                extern int vfs_remove(const char*); extern int vfs_create(const char*, const void*, size_t);
+                const char* ver = "VERSION=0.1.0-dev\nBUILD_TS=" BUILD_TS "\nGIT_HASH=" GIT_HASH "\n";
+                size_t vl=0; while(ver[vl]) vl++; vfs_remove("/VERSION"); vfs_create("/VERSION", ver, vl);
+            }
+        }
+    }
+    // Root filesystem defaults to RAMFS when there is no persistent ext2 root.
+    if (!root_is_ext2) {
         extern int vfs_mount_ramfs(void);
         if (vfs_mount_ramfs() == 0) terminal_writestring("[VFS] root RAMFS mounted\n");
         else terminal_writestring("[VFS] root RAMFS FAIL\n");
     }
-    // Mount the virtio-blk disk at /mnt: try FAT32, then ext2/ext4 (multi-mount).
-    {
+    // Mount a disk at /mnt: try FAT32, then ext2/ext4 (multi-mount). Skipped when
+    // an ext2 disk is already the persistent root (single-root model).
+    if (!root_is_ext2) {
         extern int fat32_mount(const char* dev_name, const char* mount_point);
         extern int ext2_mount(const char* dev_name, const char* mount_point);
         extern int vfs_remove(const char* path);
@@ -1135,6 +1206,35 @@ static void kernel_main_phase2(void) {
             debugcon_writestring("[M10] no disk mounted at /mnt (no vda/sda)\n");
         }
     }
+    // [M23] POSIX-style filesystem layout: virtual filesystems + FHS skeleton.
+    {
+        extern int devfs_mount(const char*);
+        extern int procfs_mount(const char*);
+        extern int sysfs_mount(const char*);
+        extern int vfs_mkdir(const char*);
+        // FHS directory skeleton on the root (ramfs today; persistent ext2 root
+        // is the next step). Ignore "already exists".
+        static const char* fhs[] = { "/bin","/etc","/dev","/proc","/sys","/tmp",
+                                     "/usr","/opt","/home","/lib","/root","/var" };
+        for (unsigned i=0;i<sizeof(fhs)/sizeof(fhs[0]);i++) vfs_mkdir(fhs[i]);
+        int dv = devfs_mount("/dev");
+        int pr = procfs_mount("/proc");
+        int sy = sysfs_mount("/sys");
+        debugcon_writestring("[M23] devfs(/dev)="); debugcon_print_hex((uint64_t)(dv==0));
+        debugcon_writestring(" procfs(/proc)="); debugcon_print_hex((uint64_t)(pr==0));
+        debugcon_writestring(" sysfs(/sys)="); debugcon_print_hex((uint64_t)(sy==0));
+        debugcon_writestring("\n");
+        // Quick boot self-checks (debugcon, like the other subsystems).
+        static char pb[64]; for (int i=0;i<64;i++) pb[i]=0;
+        int n = vfs_read_all("/proc/version", pb, sizeof(pb));
+        if (n>0) { debugcon_writestring("[M23] /proc/version: "); debugcon_writestring(pb); }
+        if (block_find("vda")||block_find("sda")||block_find("nvme0n1")||block_find("usb0")) {
+            extern vfs_inode_t* vfs_lookup(const char*);
+            const char* bn = block_find("vda")?"/dev/vda":block_find("sda")?"/dev/sda":
+                             block_find("nvme0n1")?"/dev/nvme0n1":"/dev/usb0";
+            debugcon_writestring(vfs_lookup(bn)?"[M23] /dev block node present\n":"[M23] /dev block node MISSING\n");
+        }
+    }
 #if M9_USER_DEMO
     m9_run_demo(); // signed-userland demo (needs VFS) — does not return
 #endif
@@ -1164,6 +1264,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M20_MMAP_DEMO
     m20_run_demo(); // page cache demo — does not return
+#endif
+#if M23_FS_DEMO
+    m23_run_demo(); // POSIX FS personality demo — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);

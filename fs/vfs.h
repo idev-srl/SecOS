@@ -28,8 +28,15 @@ typedef struct vfs_inode {
 // Directory iteration callback
 typedef void (*vfs_iter_cb)(const vfs_inode_t* child, void* user);
 
+// [M23] Per-FS behaviour flags (default 0). Virtual filesystems whose contents
+// are generated/dynamic (devfs, procfs, sysfs) set VFS_FS_NOCACHE so reads go
+// straight to ->read() instead of through the unified page cache.
+#define VFS_FS_NOCACHE 0x1
+
 // Filesystem operations interface (per mounted FS root)
 typedef struct vfs_fs_ops {
+    // [M23] behaviour flags (VFS_FS_NOCACHE, ...). 0 for normal disk/ram FSes.
+    unsigned flags;
     // Lookup path (absolute, no trailing slash except root). Returns NULL if not found.
     vfs_inode_t* (*lookup)(const char* path);
     // Iterate direct children of a directory path.
@@ -85,3 +92,6 @@ int vfs_remove(const char* path);
 int vfs_rename(const char* oldp, const char* newp);
 // Truncate
 int vfs_truncate(const char* path, size_t new_size);
+// [M23] Mount-table introspection (for /proc/mounts, df, etc.).
+int vfs_mount_count(void);
+int vfs_mount_info(int i, const char** mount_point, const char** fs_name);

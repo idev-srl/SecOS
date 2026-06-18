@@ -169,14 +169,44 @@ int ksys_open(const char* path, int flags){ (void)flags; extern vfs_inode_t* vfs
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1; c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
 int ksys_read(int fd, void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32||!c->fds[fd].used) return -1; vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->read) return -1;
     // [M20] Read through the unified page cache so file read() and file-backed
-    // mmap see the same pages (coherent).
-    size_t off=c->fds[fd].offset; int r=pagecache_read(ino, off, buf, (uint64_t)len); if(r>0) c->fds[fd].offset += (uint64_t)r; return r; }
+    // mmap see the same pages (coherent). [M23] Virtual FSes (devfs/procfs/sysfs)
+    // are dynamic — bypass the cache and read live via ->read().
+    size_t off=c->fds[fd].offset; int r;
+    if(ino->ops->flags & VFS_FS_NOCACHE) r=ino->ops->read(ino, off, buf, (size_t)len);
+    else r=pagecache_read(ino, off, buf, (uint64_t)len);
+    if(r>0) c->fds[fd].offset += (uint64_t)r; return r; }
 int ksys_write(int fd, const void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
     // [M9] fd 1 (stdout) / 2 (stderr) -> console. The buffer was already
     // user_range_valid()'d by the SYS_WRITE dispatcher; CR3 is the caller's
     // address space during the syscall, so reading it directly is safe.
     if(fd==1||fd==2){ const char* p=(const char*)buf; for(int i=0;i<len;i++){ terminal_putchar(p[i]); debugcon_putchar(p[i]); } return len; }
     if(fd<0||fd>=32||!c->fds[fd].used) return -1; vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->write) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->write(ino, off, buf, (size_t)len); if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); } return r; }
+
+long ksys_lseek(int fd, long offset, int whence){
+    extern process_t* sched_get_current(void);
+    process_t* c=sched_get_current(); if(!c) return -1;
+    if(fd<0||fd>=32||!c->fds[fd].used) return -1;
+    vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1;
+    long base;
+    switch(whence){
+        case SEEK_SET: base=0; break;
+        case SEEK_CUR: base=(long)c->fds[fd].offset; break;
+        case SEEK_END: base=(long)ino->size; break;
+        default: return -1;
+    }
+    long np=base+offset; if(np<0) return -1;
+    c->fds[fd].offset=(uint64_t)np;
+    return np;
+}
+
+int ksys_stat(const char* path, struct secos_stat* st){
+    extern vfs_inode_t* vfs_lookup(const char*);
+    vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -1;
+    st->st_size=ino->size;
+    st->st_mode=(ino->type==VFS_NODE_DIR)?S_IFDIR:S_IFREG;
+    st->st_pad=0;
+    return 0;
+}
 
 uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4){
     switch(num){
@@ -289,6 +319,19 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return (uint64_t)(int64_t)ksys_munmap(a0, a1);
     case SYS_MPROTECT:
         return (uint64_t)(int64_t)ksys_mprotect(a0, a1, (int)a2);
+
+    case SYS_LSEEK:
+        return (uint64_t)(int64_t)ksys_lseek((int)a0, (long)a1, (int)a2);
+
+    case SYS_STAT: {
+        const char* path = (const char*)a0;
+        if (!user_range_valid(path, 1)) return (uint64_t)(int64_t)-EFAULT;
+        struct secos_stat st;
+        int r = ksys_stat(path, &st);
+        if (r != 0) return (uint64_t)(int64_t)r;
+        if (copy_to_user((void*)a1, &st, sizeof(st)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return 0;
+    }
 
     case SYS_DRIVER: {
         /*

@@ -704,8 +704,9 @@ static vfs_fs_ops_t ext2_ops = {
 };
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */
-int ext2_mount(const char* dev_name, const char* mount_point){
-    block_dev_t* dev=block_find(dev_name);
+/* Read + validate the ext2 superblock and populate the global FS state for dev.
+ * Returns 0 on a valid ext2 volume, -1 otherwise. Sets g_mounted=1 on success. */
+static int ext2_read_super(block_dev_t* dev){
     if(!dev) return -1;
     g_dev=dev;
     /* Superblock is at byte offset 1024. Read enough to cover it. */
@@ -734,5 +735,22 @@ int ext2_mount(const char* dev_name, const char* mount_point){
     g_bgdt_block  = g_first_data_block + 1;
     g_vused=0;
     g_mounted=1;
+    return 0;
+}
+
+int ext2_mount(const char* dev_name, const char* mount_point){
+    if(ext2_read_super(block_find(dev_name))!=0) return -1;
     return vfs_mount(mount_point, &ext2_ops, "ext2");
+}
+
+/* [M23] Mount an ext2 volume as the persistent VFS root, but only if it is a
+ * SecOS system disk — identified by the marker file "/.secosroot" at its root
+ * (so a plain ext2 *data* disk is never silently grabbed as the root). Returns 0
+ * if mounted as root, -1 otherwise (caller falls back to the ramfs root). */
+int ext2_mount_root(const char* dev_name){
+    if(ext2_read_super(block_find(dev_name))!=0) return -1;
+    g_vused=0;
+    if(!e2_lookup("/.secosroot")) return -1;     /* ext2 but not a SecOS root */
+    g_vused=0;
+    return vfs_mount_root(&ext2_ops, "ext2");
 }

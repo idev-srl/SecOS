@@ -14,6 +14,18 @@ ssize_t write(int fd, const void* buf, size_t len);
 ssize_t read(int fd, void* buf, size_t len);
 int     open(const char* path, int flags);
 int     close(int fd);
+/* [M23] file positioning + stat */
+struct stat { unsigned long st_size; unsigned st_mode; unsigned st_pad; };
+#define S_IFREG 0x8000
+#define S_IFDIR 0x4000
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#define O_RDONLY 0x0
+#define O_WRONLY 0x1
+#define O_RDWR   0x2
+long    lseek(int fd, long offset, int whence);
+int     stat(const char* path, struct stat* st);
 void    _exit(int code) __attribute__((noreturn));
 int     getpid(void);
 void    sched_yield(void);

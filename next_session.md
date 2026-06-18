@@ -293,7 +293,30 @@ Demo `M14_DEMAND_DEMO`: signed `hello` shows `mapped at load=0` for a `0x9000`
 reserved footprint, 2 pages fault in as it runs. Harness **61/61**. _(Historical
 recap — M14 is long merged into `main`.)_
 
-## Next milestone: M23 — POSIX FS personality (AGREED with the user)
+## M23 — POSIX FS personality: DONE
+
+Persistent ext2 root + `/dev` + `/proc` + `/sys` + `lseek`/`stat`. See
+`docs/devlog/M23.md`. Highlights:
+- **Trust = signature** (signed program → ambient `/dev` access; Driver Space
+  orthogonal). **Persistent ext2 root** via the `/.secosroot` marker (data disks
+  not grabbed; CI keeps RAMFS root). `make sysdisk-ext2` builds the root image.
+- `fs/devfs.c` (char + byte-addressed block nodes), `fs/procfs.c` (generated),
+  `fs/sysfs.c` (block tree). `VFS_FS_NOCACHE`; `VFS_MAX_MOUNTS`→12.
+  `SYS_LSEEK`/`SYS_STAT` + libc `lseek`/`stat`.
+- Verified: signed `user/m23_fs` uses `/dev`+`/proc`+`stat`+`lseek` from ring 3
+  (`M23_FS_DEMO`); **two-boot persistence** confirmed (`vcreate` → reboot →
+  `vcat` survives). Run a persistent-root VM: `make sysdisk-vmdk`, attach
+  `sysdisk.vmdk` as a SATA/NVMe data disk.
+- **Foundation, not full Linux source-compat**: `ioctl`, a fuller libc
+  (musl/newlib) + wider syscall surface (poll/select/fcntl/pipe/signals), per-pid
+  `/proc/<pid>` are the follow-ups.
+- **Shell cleanup (M23)**: added POSIX-style commands over the VFS with a real
+  working directory — `ls cd pwd cat touch mkdir rm df free uname` (`kernel/shell.c`,
+  `cwd_resolve` handles `.`/`..`). The prompt now shows the cwd (`secos:/home$`).
+  Legacy `v*`/`rf*` commands kept (init.rc + selftests use `vls`/`vcat`). Verified
+  interactively against the persistent ext2 root + /dev + /proc.
+
+## (historical) Next milestone: M23 — POSIX FS personality (AGREED with the user)
 
 The user wants a **Linux-style filesystem** so that open-source Linux projects can
 be **compiled-from-source (and signed) for SecOS**, including apps that access

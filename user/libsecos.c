@@ -37,6 +37,8 @@ ssize_t read(int fd, void* buf, size_t len) {
 }
 int open(const char* path, int flags) { return (int)secos_syscall(4 /*SYS_OPEN*/, (long)path, flags, 0, 0, 0); }
 int close(int fd) { return (int)secos_syscall(5 /*SYS_CLOSE*/, fd, 0, 0, 0, 0); }
+long lseek(int fd, long offset, int whence) { return secos_syscall(19 /*SYS_LSEEK*/, fd, offset, whence, 0, 0); }
+int stat(const char* path, struct stat* st) { return (int)secos_syscall(20 /*SYS_STAT*/, (long)path, (long)st, 0, 0, 0); }
 void _exit(int code) { secos_syscall(SYS_EXIT, code, 0, 0, 0, 0); for (;;) {} }
 int  getpid(void)    { return (int)secos_syscall(SYS_GETPID, 0, 0, 0, 0, 0); }
 void sched_yield(void){ secos_syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
