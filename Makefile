@@ -300,3 +300,20 @@ uefi_hello: $(UEFI_HELLO_OBJS)
 run-uefi: uefi
 	@chmod +x run_uefi.sh 2>/dev/null || true
 	./run_uefi.sh
+
+# Bootable UEFI GPT+ESP disk image (for VMware / physical PC / QEMU+OVMF).
+# Builds kernel + loader, then a raw disk with an ESP holding BOOTX64.EFI + kernel.elf.
+.PHONY: uefi-disk uefi-vmdk run-uefi-disk
+uefi-disk: all uefi
+	bash tools/mkuefidisk.sh secos-uefi.img
+
+# VMware-friendly virtual disk (convert the raw image to VMDK).
+uefi-vmdk: uefi-disk
+	qemu-img convert -f raw -O vmdk secos-uefi.img secos-uefi.vmdk
+	@echo "✅ secos-uefi.vmdk ready for VMware"
+
+# Boot the built image locally in QEMU+OVMF (sanity check before real hardware).
+run-uefi-disk: uefi-disk
+	qemu-system-x86_64 -machine q35 -m 256M -bios /usr/share/ovmf/OVMF.fd \
+		-drive file=secos-uefi.img,format=raw,if=ide \
+		-serial stdio -display none -no-reboot
