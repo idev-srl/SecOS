@@ -4,7 +4,14 @@ _Last updated: **M22 (NVMe + USB stack)**. NVMe storage + a polled xHCI USB stac
 with a HID boot keyboard and Bulk-Only Mass Storage. M21 (AHCI/SATA) is pushed +
 tagged `M21_STABLE`. Read this first._
 
-## ✅ Status: M22 + follow-ups pushed (HEAD `6f7e0c6`)
+## ✅ Status: M23 done + pushed (HEAD `04eb1f9`, self-test 122/122)
+M23 (POSIX FS personality: persistent ext2 root + /dev /proc /sys + POSIX shell)
+is implemented, **self-test 122/122**, and pushed. VMware images rebuilt
+(`GIT_HASH=04eb1f9`) and copied to `C:\Users\Luigi\SecOS\`: `secos-uefi.vmdk`
+(boot) + `sysdisk.vmdk` (persistent ext2 root — attach as a 2nd SATA disk). See
+the "M23 — POSIX FS personality: DONE" section below.
+
+## (earlier) Status: M22 + follow-ups pushed (HEAD `6f7e0c6`)
 M21 (`M21_STABLE`) and **M22 (tag `M22_STABLE` = `e970af2`)** are pushed to
 `origin/main`. Post-tag additions also pushed: `blk`/`mountdev` shell
 diagnostics, **USB MSC BOT STALL recovery + Get Max LUN**, plus the two M22
