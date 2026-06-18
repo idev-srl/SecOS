@@ -1,21 +1,23 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: M18 (mmap/brk/malloc) + M19 (copy-on-write fork). Phase G in progress. Read this first._
+_Last updated: M20 (unified page cache). **Phase G complete.** Read this first._
 
 ## Where we are
 
-- **Done through M19** — M0–M13 (A–E) + M14 (demand paging) + Phase F (M15
-  fault-kill, M16 exec, M17 blocking) + **Phase G: M18 (mmap/munmap/mprotect/brk +
-  user malloc), M19 (copy-on-write fork)**. Branch **`milestone/M7`**.
-  **HEAD ≈ M19 commit; M18 (`1666854`) is committed. Last pushed: M16+M17
-  (`558c121`) + tag `M17_STABLE`. M18 + M19 NOT yet pushed.**
+- **Done through M20** — M0–M13 (A–E) + M14 (demand paging) + Phase F (M15
+  fault-kill, M16 exec, M17 blocking) + **Phase G COMPLETE: M18 (mmap/brk/malloc),
+  M19 (COW fork), M20 (page cache + file-backed mmap)**. Branch **`milestone/M7`**.
+  **HEAD ≈ M20 commit. Pushed: M16+M17 (`558c121`) + tag `M17_STABLE`. M18
+  (`1666854`), M19 (`f613e1f`), M20 are committed but NOT yet pushed.**
 - **Long-term roadmap: `docs/ROADMAP_TO_COMPLETE_OS.md`** — Phases F–L (M15–M32).
-  **Next: M20** (unified page/buffer cache → file read/write shares pages with
-  file-backed mmap; lets the per-process pinned image become shared RO text).
-  Then Phase H (storage maturity) / I (APIC+SMP). **Pipes + TTY** (deferred from
-  M17) are now unblocked by fork (M19).
-- Build is green: `make` clean (0 warnings), `tools/selftest.sh` **91/91** (+9
-  M18, +7 M19), both boot paths higher-half (`smoke.sh --mb2`/`--uefi` PASS).
+  **Next: pipes + TTY** (now unblocked by fork), then **Phase H** (storage
+  maturity: VFS perms/ownership/mount syscalls, devfs/procfs, ext4 journaling) and
+  **Phase I** (ACPI + APIC/IOAPIC + SMP — the big one).
+- Build is green: `make` clean (0 warnings), `tools/selftest.sh` **96/96** (+9
+  M18, +7 M19, +5 M20), both boot paths higher-half (`smoke.sh --mb2`/`--uefi`).
+- **Self-test runner note:** the full suite takes ~12–15 min (≈14 variant builds).
+  Run it as a SINGLE background process and wait for its completion — running
+  several `selftest.sh` at once shares the build dir and corrupts/truncates logs.
 - **M19 gotcha (important):** intermediate page-table entries are now always
   `RW|PRESENT` (USER still propagated). x86-64 ANDs the RW bit across ALL paging
   levels (CR0.WP=1), so a non-writable intermediate makes every leaf below it RO —
@@ -63,7 +65,8 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | **M17** | **done (Phase F)** | **blocking primitives** on the M16 block/wake core: `SYS_SLEEP` (13); **blocking `SYS_MSG_RECV`** (pre-queued msg returns immediately so M13 poll stays green). libc `sleep_ticks`. **Pipes/TTY deferred**. See `docs/devlog/M17.md` |
 | **M18** | **done (Phase G)** | **dynamic memory**: `SYS_MMAP/MUNMAP/BRK/MPROTECT` (14–17) on the M14 VMA framework; `brk`/`sbrk` heap, anon `mmap` arena, `mprotect` (`vmm_protect_in_space`+invlpg); W^X-enforced + bounded by manifest `max_mem` at runtime; VMA tombstones + `VMA_MAX`→64. libc `malloc`/`free`/`mmap`. Demo `M18_MEM_DEMO`. See `docs/devlog/M18.md` |
 | **M19** | **done (Phase G)** | **copy-on-write fork**: PMM frame refcounts (`pmm_share`/`pmm_unref`); `vmm_fork_space` (COW bit 9), `vmm_cow_fault`; `SYS_FORK` (18) / `process_fork`; libc `fork()`. **Fix**: intermediate PT entries always `RW|PRESENT` (leaf is sole protection authority). Demo `M19_FORK_DEMO`. See `docs/devlog/M19.md` |
-| next | **Phase G→H** | **M20**: unified page/buffer cache — file `read`/`write` shares pages with file-backed `mmap`; the per-process pinned image becomes shared RO text. Then **pipes + TTY** (now unblocked by fork), Phase H (storage), Phase I (APIC+SMP). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
+| **M20** | **done (Phase G)** | **unified page cache** (`mm/pagecache.c`, 128 pages keyed by inode+offset) backs file `read()` AND **file-backed `mmap`** (MAP_PRIVATE via `vma_add_file`/`file_inode`; fault copies cached page into a private frame). `SYS_MMAP` +`fd` arg; `ksys_read`→cache, `ksys_write` invalidates. libc `open`/`read`/`close`/`mmap_file`. Demo `M20_MMAP_DEMO`: mmap+read of a VFS file return identical (coherent) bytes. See `docs/devlog/M20.md` |
+| next | **Pipes/TTY → H → I** | **pipes + TTY** (unblocked by fork): anon pipes on the fd table, a ring-3 TTY line discipline (Ctrl-C→signal needs a signal mechanism). Then **Phase H** (VFS perms/ownership/mount syscalls, devfs/procfs, ext4 journaling) and **Phase I** (ACPI + APIC/IOAPIC + SMP). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
 
 ## Build / test / run
 

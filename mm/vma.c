@@ -7,6 +7,7 @@
 #include "vma.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "pagecache.h"  // [M20] file-backed mmap via the page cache
 
 #define ADDRESS_MASK 0x000FFFFFFFFFF000ULL
 
@@ -39,6 +40,19 @@ int vma_add(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags,
     v->file_off = file_off;
     v->file_pad = file_pad;
     v->file_len = file_len;
+    v->file_inode = 0;          // [M20] not a page-cache mapping
+    v->file_voff = 0;
+    return 0;
+}
+
+int vma_add_file(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags,
+                 struct vfs_inode* inode, uint64_t voff) {
+    if (vma_add(s, start, end, flags, VMA_TYPE_FILE, 0, 0, 0, 0) != 0) return -1;
+    // The slot just added is the one vma_find returns for 'start'.
+    vma_t* v = vma_find_mut(s, start);
+    if (!v) return -1;
+    v->file_inode = inode;
+    v->file_voff = voff;
     return 0;
 }
 
@@ -97,7 +111,19 @@ int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr) {
     // be content-filled even though its USER mapping will be read-only (RX).
     uint8_t* dst = (uint8_t*)phys_to_virt(fphys);
 
-    if (v->type == VMA_TYPE_FILE && v->file_base) {
+    if (v->type == VMA_TYPE_FILE && v->file_inode) {
+        // [M20] Page-cache-backed mmap (MAP_PRIVATE): copy the file's cached page
+        // into this private frame. The cache provides shared, coherent bytes; the
+        // process gets its own writable copy.
+        uint64_t foff = v->file_voff + (pg - v->start);
+        uint64_t cphys = pagecache_get_phys(v->file_inode, foff & ~0xFFFULL);
+        if (cphys) {
+            const uint8_t* src = (const uint8_t*)phys_to_virt(cphys);
+            for (int b = 0; b < 0x1000; b++) dst[b] = src[b];
+        } else {
+            vma_memset(dst, 0, 0x1000);
+        }
+    } else if (v->type == VMA_TYPE_FILE && v->file_base) {
         // File content occupies region offsets [file_pad, file_pad+file_len).
         // Intersect it with this page [poff, poff+0x1000) and copy the overlap;
         // zero everything else (leading page padding + BSS tail).

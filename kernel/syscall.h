@@ -50,7 +50,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]); // [M
 int ksys_wait(int pid);             // returns 0 when pid has exited, -1 if unknown (poll)
 // [M18] dynamic memory
 uint64_t ksys_brk(uint64_t new_brk);
-uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags);
+uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd);
 int ksys_munmap(uint64_t addr, uint64_t len);
 int ksys_mprotect(uint64_t addr, uint64_t len, int prot);
 

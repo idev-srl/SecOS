@@ -11,6 +11,9 @@ long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4);
 
 /* POSIX-ish wrappers */
 ssize_t write(int fd, const void* buf, size_t len);
+ssize_t read(int fd, void* buf, size_t len);
+int     open(const char* path, int flags);
+int     close(int fd);
 void    _exit(int code) __attribute__((noreturn));
 int     getpid(void);
 void    sched_yield(void);
@@ -34,6 +37,7 @@ void    sleep_ticks(unsigned ticks);
 #define MAP_PRIVATE   0x02
 #define MAP_ANONYMOUS 0x20
 void*   mmap(void* addr, size_t len, int prot, int flags);
+void*   mmap_file(void* addr, size_t len, int prot, int flags, int fd); /* [M20] */
 int     munmap(void* addr, size_t len);
 int     mprotect(void* addr, size_t len, int prot);
 void*   sbrk(long incr);

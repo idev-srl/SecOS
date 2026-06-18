@@ -96,13 +96,14 @@ Ctrl-C interrupt deferred with `fork`/signals.
   `vmm_cow_fault`. Uncovered + fixed the intermediate-PT-permission rule
   (RW is ANDed across all levels). `shm`/`MAP_SHARED` still future work.
 
-- **M20 — Unified page/buffer cache.** _Next._
-  One cache backing file `read`/`write` **and** file-backed `mmap` coherently;
-  `fsync`/writeback. Removes the per-process pinned-image copy from M14 (shared
-  read-only text). _Security:_ cache respects file permissions/ownership.
+- **M20 — Unified page/buffer cache.** _DONE._
+  One cache (`mm/pagecache.c`) backs file `read()` **and** file-backed `mmap`
+  (MAP_PRIVATE) coherently. `MAP_SHARED` + shared read-only text (retiring M14's
+  per-process pinned image) and `fsync`/writeback are deferred.
 
 **Exit criteria G:** programs `mmap` and grow the heap (M18 ✓); `fork` works with
-COW isolation (M19 ✓); a page cache shares text/file pages (M20, next).
+COW isolation (M19 ✓); a page cache makes file read/mmap coherent (M20 ✓).
+**Phase G complete.**
 
 ---
 
@@ -229,13 +230,14 @@ security events are audited.
 3. ~~**M17** — blocking primitives (sleep + recv).~~ _DONE (pipes/TTY deferred)._
 4. ~~**M18** — mmap/mprotect/brk + user malloc.~~ _DONE._
 5. ~~**M19** — copy-on-write + fork.~~ _DONE._
-6. **M20** — unified page/buffer cache. _Next._
+6. ~~**M20** — unified page/buffer cache.~~ _DONE. **Phase G complete.**_
+7. **Pipes + TTY** (unblocked by fork), then Phase H (storage), Phase I (APIC+SMP).
 
-Phase F done + Phase G nearly done (M18 mmap/malloc, M19 COW fork). SECoS now runs
-a real multi-process userland (signed programs with argv, dynamic memory, fork
-with COW isolation, blocking wait/sleep/recv) that survives faults. M20 (page
-cache) closes Phase G; then pipes+TTY (unblocked by fork), Phase H (storage), and
-Phase I (APIC+SMP). Networking (Phase J) follows once the IO model is solid.
+Phases F and G are done. SECoS now runs a real multi-process userland (signed
+programs with argv, dynamic memory via malloc/mmap, fork with COW isolation,
+blocking wait/sleep/recv, file-backed mmap through a coherent page cache) that
+survives faults. Next: pipes + a TTY, then storage maturity (Phase H) and the big
+platform lift — ACPI + APIC + SMP (Phase I). Networking (Phase J) follows.
 
 ## How this maps to the existing roadmap
 

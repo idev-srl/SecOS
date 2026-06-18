@@ -886,6 +886,11 @@ vmm_space_t* vmm_fork_space(vmm_space_t* parent) {
 // protection violation the caller must treat as fatal).
 int vmm_cow_fault(vmm_space_t* space, uint64_t addr) {
     if (!space) return -1;
+    // [M19] COW pages live only in the 4 KB user VMA range. Excluding everything
+    // else is essential: a ring-3 write to the low-identity region (e.g. a NULL
+    // deref) faults present+write, and get_pt_space would otherwise misread the
+    // 2 MB huge-page PD entry as a leaf PT. Such faults must reach the kill path.
+    if (addr < USER_CODE_BASE || addr >= USER_STACK_TOP) return -1;
     uint64_t va = addr & ~0xFFFULL;
     uint64_t* pt = get_pt_space(space, va, 0, 0);
     if (!pt) return -1;

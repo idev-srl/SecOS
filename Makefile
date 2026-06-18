@@ -36,6 +36,7 @@ SRC_C   = \
 	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
 	$(MM_DIR)/vma.c \
+	$(MM_DIR)/pagecache.c \
 	$(MM_DIR)/elf.c \
 	$(MM_DIR)/elf_unload.c \
 	$(MM_DIR)/elf_manifest.c \
@@ -198,7 +199,12 @@ user-progs:
 	$(LD) -T user/user.ld -o user/m19_fork.elf user/crt0.o user/note.o user/libsecos.o user/m19_fork.o
 	python3 tools/secos-sign user/m19_fork.elf --dev
 	python3 tools/elf2h.py user/m19_fork.elf user_m19_fork_elf crypto/user_m19_fork_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork -> crypto/*.h"
+	# [M20] file-backed mmap via page cache
+	$(CC) $(USER_CFLAGS) -c user/m20_mmap.c    -o user/m20_mmap.o
+	$(LD) -T user/user.ld -o user/m20_mmap.elf user/crt0.o user/note.o user/libsecos.o user/m20_mmap.o
+	python3 tools/secos-sign user/m20_mmap.elf --dev
+	python3 tools/elf2h.py user/m20_mmap.elf user_m20_mmap_elf crypto/user_m20_mmap_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap -> crypto/*.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke

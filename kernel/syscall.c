@@ -14,6 +14,7 @@
 #include "ipc.h"
 #include "debugcon.h"
 #include "../mm/user_copy.h"
+#include "../mm/pagecache.h"  // [M20] unified file page cache
 
 extern uint64_t timer_get_ticks(void);
 
@@ -100,18 +101,26 @@ uint64_t ksys_brk(uint64_t new_brk){
     return new_brk;
 }
 
-uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags){
+uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd){
     (void)addr;                                     // hint ignored (bump allocator)
     process_t* c = sched_get_current();
     if (!c || len == 0) return (uint64_t)-1;
-    if (!(flags & MAP_ANONYMOUS)) return (uint64_t)-1;        // M18: anonymous only
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return (uint64_t)-1; // W^X
     len = pgup(len);
     uint64_t base = c->mmap_next;
     if (base + len > USER_MMAP_END) return (uint64_t)-1;      // arena exhausted
     if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) return (uint64_t)-1;
-    if (vma_add(&c->vmas, base, base + len, m18_prot_to_flags(prot), VMA_TYPE_ANON,0,0,0,0) != 0)
-        return (uint64_t)-1;
+    if (flags & MAP_ANONYMOUS) {
+        if (vma_add(&c->vmas, base, base + len, m18_prot_to_flags(prot), VMA_TYPE_ANON,0,0,0,0) != 0)
+            return (uint64_t)-1;
+    } else {
+        // [M20] File-backed mmap (MAP_PRIVATE) via the page cache, from offset 0.
+        if (fd < 0 || fd >= 32 || !c->fds[fd].used) return (uint64_t)-1;
+        vfs_inode_t* ino = (vfs_inode_t*)c->fds[fd].inode;
+        if (!ino) return (uint64_t)-1;
+        if (vma_add_file(&c->vmas, base, base + len, m18_prot_to_flags(prot), ino, 0) != 0)
+            return (uint64_t)-1;
+    }
     c->mmap_next = base + len;
     return base;
 }
@@ -158,16 +167,18 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
 void ksys_exit(int status){ (void)status; extern process_t* sched_get_current(void); extern int process_destroy(process_t*); process_t* c=sched_get_current(); if(c){ process_destroy(c); } }
 int ksys_open(const char* path, int flags){ (void)flags; extern vfs_inode_t* vfs_lookup(const char*); extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -1; int fd=fd_alloc(c); if(fd<0) return -1; c->fds[fd].inode=ino; c->fds[fd].flags=flags; return fd; }
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1; c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
-int ksys_read(int fd, void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32||!c->fds[fd].used) return -1; vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->read) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->read(ino, off, buf, (size_t)len); if(r>0) c->fds[fd].offset += (uint64_t)r; return r; }
+int ksys_read(int fd, void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32||!c->fds[fd].used) return -1; vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->read) return -1;
+    // [M20] Read through the unified page cache so file read() and file-backed
+    // mmap see the same pages (coherent).
+    size_t off=c->fds[fd].offset; int r=pagecache_read(ino, off, buf, (uint64_t)len); if(r>0) c->fds[fd].offset += (uint64_t)r; return r; }
 int ksys_write(int fd, const void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
     // [M9] fd 1 (stdout) / 2 (stderr) -> console. The buffer was already
     // user_range_valid()'d by the SYS_WRITE dispatcher; CR3 is the caller's
     // address space during the syscall, so reading it directly is safe.
     if(fd==1||fd==2){ const char* p=(const char*)buf; for(int i=0;i<len;i++){ terminal_putchar(p[i]); debugcon_putchar(p[i]); } return len; }
-    if(fd<0||fd>=32||!c->fds[fd].used) return -1; vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->write) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->write(ino, off, buf, (size_t)len); if(r>0) c->fds[fd].offset += (uint64_t)r; return r; }
+    if(fd<0||fd>=32||!c->fds[fd].used) return -1; vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->write) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->write(ino, off, buf, (size_t)len); if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); } return r; }
 
 uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4){
-    (void)a4;
     switch(num){
     case SYS_GETPID:
         return (uint64_t)ksys_getpid();
@@ -273,7 +284,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_BRK:
         return ksys_brk(a0);
     case SYS_MMAP:
-        return ksys_mmap(a0, a1, (int)a2, (int)a3);
+        return ksys_mmap(a0, a1, (int)a2, (int)a3, (int)a4);
     case SYS_MUNMAP:
         return (uint64_t)(int64_t)ksys_munmap(a0, a1);
     case SYS_MPROTECT:

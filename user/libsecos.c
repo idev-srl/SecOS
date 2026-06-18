@@ -32,6 +32,11 @@ long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4) {
 ssize_t write(int fd, const void* buf, size_t len) {
     return secos_syscall(SYS_WRITE, fd, (long)buf, (long)len, 0, 0);
 }
+ssize_t read(int fd, void* buf, size_t len) {
+    return secos_syscall(3 /*SYS_READ*/, fd, (long)buf, (long)len, 0, 0);
+}
+int open(const char* path, int flags) { return (int)secos_syscall(4 /*SYS_OPEN*/, (long)path, flags, 0, 0, 0); }
+int close(int fd) { return (int)secos_syscall(5 /*SYS_CLOSE*/, fd, 0, 0, 0, 0); }
 void _exit(int code) { secos_syscall(SYS_EXIT, code, 0, 0, 0, 0); for (;;) {} }
 int  getpid(void)    { return (int)secos_syscall(SYS_GETPID, 0, 0, 0, 0, 0); }
 void sched_yield(void){ secos_syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
@@ -53,7 +58,9 @@ size_t strlen(const char* s) { size_t n = 0; while (s[n]) n++; return n; }
 int puts(const char* s) { write(1, s, strlen(s)); write(1, "\n", 1); return 0; }
 
 /* [M18] dynamic memory */
-void* mmap(void* addr, size_t len, int prot, int flags){ return (void*)secos_syscall(SYS_MMAP,(long)addr,(long)len,prot,flags,0); }
+void* mmap(void* addr, size_t len, int prot, int flags){ return (void*)secos_syscall(SYS_MMAP,(long)addr,(long)len,prot,flags,-1); }
+/* [M20] file-backed mmap (MAP_PRIVATE via the page cache), from file offset 0. */
+void* mmap_file(void* addr, size_t len, int prot, int flags, int fd){ return (void*)secos_syscall(SYS_MMAP,(long)addr,(long)len,prot,flags,fd); }
 int   munmap(void* addr, size_t len){ return (int)secos_syscall(SYS_MUNMAP,(long)addr,(long)len,0,0,0); }
 int   mprotect(void* addr, size_t len, int prot){ return (int)secos_syscall(SYS_MPROTECT,(long)addr,(long)len,prot,0,0); }
 unsigned long brk_set(unsigned long addr){ return (unsigned long)secos_syscall(SYS_BRK,(long)addr,0,0,0,0); }
