@@ -4,13 +4,10 @@ _Last updated: **M22 (NVMe + USB stack)**. NVMe storage + a polled xHCI USB stac
 with a HID boot keyboard and Bulk-Only Mass Storage. M21 (AHCI/SATA) is pushed +
 tagged `M21_STABLE`. Read this first._
 
-## ⚠️ FIRST THING: commit + push M22
-M21 is pushed (`origin/main` at `d0f2212`) and tagged **`M21_STABLE`**. The **M22
-work is NOT committed yet** — new files `drivers/{nvme,xhci,usb,usb_hid,usb_msc}.{c,h}`
-plus edits to `pci.{c,h}`, `keyboard.{c,h}`, `kernel.c`, `Makefile`,
-`tools/selftest.sh`, `docs/devlog/M22.md`, `CLAUDE.md`, this file.
-**Commit M22 and `git push origin main`** (optionally tag `M22_STABLE`).
-Self-test is **112/112** (was 102/102; +4 NVMe, +6 USB).
+## ✅ Status: M22 pushed
+M21 (`M21_STABLE`) and **M22 (`M22_STABLE`, commit `e970af2`) are pushed** to
+`origin/main`. Nothing pending to push at session start. Self-test is **112/112**
+(was 102/102; +4 NVMe, +6 USB). `edk2/` stays untracked (vendored, not built).
 
 ## Where we are
 
