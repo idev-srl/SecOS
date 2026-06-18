@@ -63,7 +63,70 @@ void process_foreach(void (*cb)(process_t*, void*), void* user) {
     }
 }
 
+// [M16] Write 'n' bytes into user VA 'va' of a not-yet-running space, faulting
+// in the backing (demand-paged) stack pages as needed. Returns 0 / -1.
+static int uwrite(process_t* p, uint64_t va, const void* src, uint64_t n) {
+    const uint8_t* s = (const uint8_t*)src;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t a = va + i;
+        uint64_t phys = vmm_translate_in_space(p->space, a);
+        if (!phys) {
+            const vma_t* vv = vma_find(&p->vmas, a);
+            if (!vv) return -1;
+            if (vma_fault_in(p->space, vv, a) != 0) return -1;
+            phys = vmm_translate_in_space(p->space, a);
+            if (!phys) return -1;
+        }
+        *(uint8_t*)phys_to_virt(phys) = s[i];
+    }
+    return 0;
+}
+
+#define PROC_MAX_ARGS    16
+#define PROC_MAX_ARG_LEN 256
+
+// [M16] Build argc/argv/envp on the user stack (top-down): copy the strings,
+// then a NULL-terminated argv[] pointer array and an empty envp[]. Returns the
+// new (16-byte aligned) rsp plus the user VAs of argv[] and envp[]. Fails if the
+// data does not fit the reserved 8-page stack VMA.
+static int setup_user_args(process_t* p, int argc, const char* const argv[],
+                           uint64_t* rsp_out, uint64_t* argv_out, uint64_t* envp_out) {
+    if (argc < 0) argc = 0;
+    if (argc > PROC_MAX_ARGS) argc = PROC_MAX_ARGS;
+    const uint64_t st_lo = USER_STACK_TOP - 8ULL * 0x1000ULL;
+    uint64_t sp = USER_STACK_TOP;
+    uint64_t vptr[PROC_MAX_ARGS];
+    uint64_t z = 0;
+
+    for (int i = argc - 1; i >= 0; i--) {
+        const char* a = (argv && argv[i]) ? argv[i] : "";
+        uint64_t len = 0; while (a[len] && len < PROC_MAX_ARG_LEN - 1) len++;
+        len++; // include NUL
+        sp -= len;
+        if (sp < st_lo || uwrite(p, sp, a, len) != 0) return -1;
+        vptr[i] = sp;
+    }
+    sp &= ~7ULL;
+    // envp[] = { NULL }
+    sp -= 8; if (sp < st_lo || uwrite(p, sp, &z, 8) != 0) return -1;
+    uint64_t envp = sp;
+    // argv[] = { vptr[0..argc-1], NULL } — write the NULL terminator first.
+    sp -= 8; if (sp < st_lo || uwrite(p, sp, &z, 8) != 0) return -1;
+    for (int i = argc - 1; i >= 0; i--) {
+        sp -= 8; if (sp < st_lo || uwrite(p, sp, &vptr[i], 8) != 0) return -1;
+    }
+    uint64_t argvp = sp;
+    sp &= ~15ULL; // ABI: 16-byte aligned rsp
+    *rsp_out = sp; *argv_out = argvp; *envp_out = envp;
+    return 0;
+}
+
 process_t* process_create_from_elf(const void* elf_buf, size_t size) {
+    return process_create_from_elf_args(elf_buf, size, 0, NULL);
+}
+
+process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
+                                        int argc, const char* const argv[]) {
     if (!proc_inited) process_init_system();
 
     // [M9] Code-signing gate (root of trust). Every ELF must carry a valid
@@ -164,6 +227,8 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     // sizes), which is also what the manifest max_mem limit is checked against.
     p->cpu_ticks = 0;
     p->exit_code = 0;
+    p->wait_pid = -1; p->wait_result = 0; p->wait_ready = 0;
+    p->sleep_until = 0; p->recv_chan = -1;
     p->user_mem_bytes = footprint;
     p->mapped_page_count = (uint32_t)(footprint / 4096ULL);
     // Manifest stub
@@ -283,6 +348,21 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
         // Markers
         p->tf->int_no   = 0x80;
         p->tf->err_code = 0;
+    }
+    // [M16] Set up argc/argv/envp on the user stack and pass them to the entry
+    // per the System V convention (rdi=argc, rsi=argv, rdx=envp). main(void)
+    // programs simply ignore the extra registers. On failure (too many/large
+    // args) fall back to argc=0 rather than refusing to run.
+    {
+        uint64_t rsp = st_top, argvp = 0, envp = 0;
+        if (argc > 0 && setup_user_args(p, argc, argv, &rsp, &argvp, &envp) == 0) {
+            p->tf->rsp = rsp;
+            p->tf->rdi = (uint64_t)argc;
+            p->tf->rsi = argvp;
+            p->tf->rdx = envp;
+        } else if (argc > 0) {
+            terminal_writestring("[PROC] argv setup failed; running with argc=0\n");
+        }
     }
     // Hardening mapping condiviso
     vmm_harden_user_space(space);

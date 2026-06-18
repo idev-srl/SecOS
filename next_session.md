@@ -1,22 +1,21 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: M15 (fault-driven process kill, Phase F start). Read this first._
+_Last updated: M16 (exec/argv/blocking wait) + M17 (blocking sleep/recv). Phase F core done. Read this first._
 
 ## Where we are
 
-- **Done through M15** — M0–M13 (phases A–E) + **M14 (demand paging)** + **M15
-  (fault-kill, first of Phase F)**. Branch **`milestone/M7`** (historical name).
-  **HEAD ≈ M15 commit, committed but NOT yet pushed** to `origin/milestone/M7`
-  (the M14 commit `19e10f5` + tag `M14_STABLE` are already pushed). Tag
-  `M14_STABLE` is the last pushed tag.
-- **Long-term roadmap to a complete headless OS:
-  `docs/ROADMAP_TO_COMPLETE_OS.md`** — Phases F–L (M15–M32): robustness/process
-  model, VM completeness, storage maturity, APIC+SMP+real drivers, networking,
-  userland, security hardening. Next: **M16** (argv/env + exec + blocking wait),
-  **M17** (blocking primitives + pipes + TTY).
+- **Done through M17** — M0–M13 (phases A–E) + M14 (demand paging) + **M15
+  (fault-kill) + M16 (exec model) + M17 (blocking primitives)** = Phase F core.
+  Branch **`milestone/M7`**. **HEAD ≈ M16+M17 commit, committed but NOT yet
+  pushed** (M15 commit `7a2ae93` + tag `M15_STABLE` are pushed; that's the last
+  pushed tag).
+- **Long-term roadmap: `docs/ROADMAP_TO_COMPLETE_OS.md`** — Phases F–L (M15–M32).
+  **Next: Phase G** — M18 (mmap/mprotect/brk + user malloc), M19 (copy-on-write +
+  fork), M20 (page cache). NB: **pipes + TTY were deferred from M17** (they want
+  fork/signals first — Phase G/L).
 - Build is green: `make` clean (0 warnings), the full self-test harness
-  `tools/selftest.sh` is **66/66** (+5 M14, +5 M15), both boot paths run
-  higher-half at `0xFFFFFFFF80000000` (`smoke.sh --mb2` and `--uefi` PASS).
+  `tools/selftest.sh` is **75/75** (+5 M14, +5 M15, +4 M16, +5 M17), both boot
+  paths run higher-half at `0xFFFFFFFF80000000` (`smoke.sh --mb2` and `--uefi` PASS).
 - Only `edk2/` is untracked (a large vendored tree, not part of the build) — leave it.
   `.gitignore` shows a stale local modification from before this work — harmless,
   not committed. Build artifacts `secos-uefi.{img,vmdk}`, `disk.img`, `*.o`,
@@ -55,8 +54,10 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | M12 | done | Memory scalability + W^X hard gate + **higher-half kernel**: PMM manages all RAM (clamps gone; word-skip+cursor; `pmm_alloc_contiguous`); heap on physmap + multi-frame + NULL-on-fail; `vmm_map` rejects W+X (`-5`); `-m 2G` → ~2045 MB free. Kernel runs at `0xFFFFFFFF80000000` (both MB2 and UEFI). See `docs/devlog/M12.md` |
 | **M13** | **done** | usability & policy: **manifest `max_mem` enforced at load** (leak-free abort, signature-rooted); `SYS_GETTICKS` + **kernel IPC channels** (`SYS_MSG_SEND`/`RECV`, `kernel/ipc.c`); shell `run` = on-disk launcher; producer/consumer demo exchange a message over channel 0. See `docs/devlog/M13.md` |
 | **M14** | **done (stretch)** | **full demand paging**: per-process VMAs (`mm/vma.{c,h}`) replace eager mapping; `elf_load_image_lazy` reserves FILE/ANON regions; `vmm_handle_page_fault` materializes pages on first touch (`[PF] demand page`); pinned per-process ELF image; syscall buffers fault in via kernel-mode #PF (no `user_copy` change); stack guard = absence of a VMA; `max_mem` vs reserved footprint. See `docs/devlog/M14.md` |
-| **M15** | **done (Phase F)** | **fault-driven process kill**: a ring-3 CPU fault kills only the offending process and returns to the scheduler instead of halting. `vmm_handle_page_fault`→int (no halt); `exception_handler` decides from saved `cs` (ring3⇒`sched_kill_current`, ring0⇒panic); kill reuses the SYS_EXIT path (ZOMBIE+`pick_user`+`switch_to`, reaped later, no leak). `process_t.exit_code` (128+vec). Demo `M15_KILL_DEMO`: signed `crashtest` NULL-writes→killed→`hello` still runs. Harness **66/66**. See `docs/devlog/M15.md` |
-| next | **Phase F cont.** | **M16**: argv/env/auxv + `SYS_EXEC`/spawn + blocking `SYS_WAIT` carrying exit status. **M17**: wait queues + futex-like + blocking `SYS_SLEEP`/recv + anonymous pipes + TTY line discipline (Ctrl-C→SIGINT). Then Phase G (mmap/COW/page cache). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
+| **M15** | **done (Phase F)** | **fault-driven process kill**: a ring-3 CPU fault kills only the offending process and returns to the scheduler instead of halting. `exception_handler` decides from saved `cs` (ring3⇒`sched_kill_current`, ring0⇒panic). `process_t.exit_code` (128+vec). Demo `M15_KILL_DEMO`. See `docs/devlog/M15.md` |
+| **M16** | **done (Phase F)** | **exec model**: argv/env on the demand-paged user stack (`process_create_from_elf_args`, SysV `rdi/rsi/rdx`; crt0 unchanged); `SYS_SPAWN(path, char**)`; **blocking `SYS_WAIT`** returns exit status (rip-rewind re-run; status delivered into the waiter via `sched_wake_waitpid`); `SYS_EXIT` carries user status; shell `run <path> args`. libc `spawn`/`waitpid`. Demo `M16_EXEC_DEMO`. See `docs/devlog/M16.md` |
+| **M17** | **done (Phase F)** | **blocking primitives** on the M16 block/wake core: `SYS_SLEEP` (13, woken by `sched_wake_sleepers` from the timer tick); **blocking `SYS_MSG_RECV`** (woken by `sched_wake_chan` on send; pre-queued msg returns immediately so M13 poll stays green). libc `sleep_ticks`. Demo `M17_BLOCK_DEMO` proves `PROC_BLOCKED` before the producer runs. **Pipes/TTY deferred** (need fork/signals). See `docs/devlog/M17.md` |
+| next | **Phase G** | **M18**: `mmap`/`munmap`/`mprotect` (anon + file-backed on the M14 VMA path) + `brk`/`sbrk` + a real user `malloc`. **M19**: copy-on-write + `fork` (needs PMM frame refcounts) + shared memory. **M20**: unified page/buffer cache (drops the per-process pinned-image copy; shared read-only text). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
 
 ## Build / test / run
 
@@ -215,19 +216,24 @@ Demo `M14_DEMAND_DEMO`: signed `hello` shows `mapped at load=0` for a `0x9000`
 reserved footprint, 2 pages fault in as it runs. Harness **61/61**. **Still to
 do:** `git push origin milestone/M7`, maybe tag `M14_STABLE`.
 
-## Suggested first move next session (M0–M15 done → Phase F)
+## Suggested first move next session (Phase F core done → Phase G)
 
-Mandatory plan (A–E) complete; M14 (demand paging) + M15 (fault-kill) done.
-**Push first** if the M15 commit isn't on origin yet (`git push origin
-milestone/M7`). Then continue Phase F per `docs/ROADMAP_TO_COMPLETE_OS.md`:
-- **M16 — exec model**: pass `argv`/`env`/`auxv` to ring-3 programs (stack setup
-  at exec), `SYS_EXEC`/`posix_spawn`, blocking `SYS_WAIT` returning the
-  `exit_code` M15 already records (incl. the `128+vec` killed encoding).
-- **M17 — blocking + pipes + TTY**: wait queues + a futex-like primitive; make
-  `SYS_WAIT`/`SYS_MSG_RECV` blocking; `SYS_SLEEP`; anonymous pipes; a TTY line
-  discipline so the shell does line editing + Ctrl-C→SIGINT.
-- Later stretch still open: COW/page-out, shared-text page cache, W^X of the
-  0–512 MB identity map, dropping the low identity map.
+Phase F core (M15 fault-kill, M16 exec/argv/wait, M17 blocking sleep/recv) is
+done. **Push first** if the M16+M17 commit isn't on origin yet (`git push origin
+milestone/M7`; consider tag `M17_STABLE`). Then start **Phase G — VM
+completeness** per `docs/ROADMAP_TO_COMPLETE_OS.md`:
+- **M18 — mmap/mprotect/brk + user malloc**: `mmap`/`munmap`/`mprotect` (anon +
+  file-backed) on the M14 VMA path; `brk`/`sbrk`; a real `malloc`/`free` in libc.
+  The VMA framework already does demand paging, so this is mostly new syscalls +
+  VMA bookkeeping + mprotect honoring W^X.
+- **M19 — copy-on-write + fork**: needs a PMM frame refcount; `fork` shares pages
+  COW, `shm`. The M16 block/wake + M14 VMAs are the foundation.
+- **M20 — page cache**: unify file read/write with file-backed mmap; lets the
+  per-process pinned ELF image (M14) become a shared read-only text cache.
+- **Deferred from M17:** anonymous pipes + a ring-3 TTY (Ctrl-C→SIGINT) — revisit
+  once fork (M19) shares fds and a signal-delivery mechanism exists (Phase L).
+- Other open stretch: W^X of the 0–512 MB identity map, dropping the low identity
+  map, real `DRIVER_OP_MAP_MEM`/IRQ-to-driver, ext4 journaling.
 - **Driver space**: real `DRIVER_OP_MAP_MEM` (map device MMIO into the driver
   address space — still a validating stub); IRQ-to-driver (`IRQ_SUBSCRIBE` + IPC
   queue, building on M13's IPC channels); DMA sandbox; auto-restart of a crashed

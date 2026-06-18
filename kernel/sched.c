@@ -74,6 +74,8 @@ static inline void pic_eoi(void) { __asm__ volatile("outb %0,$0x20"::"a"((uint8_
 // ---- [M8] preemptive tick ----
 void sched_on_timer_tick(trapframe_t* tf) {
     if (current) current->cpu_ticks++;
+    // [M17] Wake any sleepers whose deadline elapsed (independent of preemption).
+    { extern uint64_t timer_get_ticks(void); sched_wake_sleepers(timer_get_ticks()); }
     if (!idle_task) return;            // preemption only active once a scheduler is armed
     if (!current) return;              // not yet running the scheduler
 
@@ -169,8 +171,9 @@ void sched_exit_current(trapframe_t* tf) {
     debugcon_writestring("[SCHED] exit ");
     debugcon_print_hex(current->pid);
     debugcon_writestring("\n");
-    current->exit_code = 0;            // [M15] normal exit (SYS_EXIT)
+    // [M16] exit_code was set by the SYS_EXIT handler from the user's status.
     current->state = PROC_ZOMBIE;
+    sched_wake_waitpid(current->pid, current->exit_code); // [M16] wake a waiter
 
     process_t* next = pick_user(current);
     if (!next) next = idle_task;       // last one out → idle reaps and reports
@@ -196,8 +199,61 @@ void sched_kill_current(int reason) {
     // Encode the fault as a signal-style status (128 + vector), à la POSIX.
     current->exit_code = 128 + (reason & 0x7F);
     current->state = PROC_ZOMBIE;
+    sched_wake_waitpid(current->pid, current->exit_code); // [M16] wake a waiter
 
     process_t* next = pick_user(current);
     if (!next) next = idle_task;       // idle reaps the zombie and carries on
     switch_to(next);                   // NORETURN
+}
+
+// [M16/M17] Block the current process: save its mid-syscall trapframe and switch
+// away. The caller must have armed a wait condition (wait_pid / sleep_until /
+// recv_chan) and rewound rip so the syscall re-runs on wake. Returns only in the
+// (impossible) case that there is no current/idle-only — defensive.
+void sched_block_current(trapframe_t* tf) {
+    if (!current || current == idle_task) return;
+    save_tf(current, tf);
+    current->state = PROC_BLOCKED;
+    process_t* next = pick_user(current);
+    if (!next) next = idle_task;
+    switch_to(next);                   // NORETURN in practice
+}
+
+// [M16] Wake any process blocked in SYS_WAIT on 'pid', delivering 'code'.
+struct wake_wp_ctx { uint32_t pid; int code; };
+static void wake_wp_cb(process_t* p, void* u) {
+    struct wake_wp_ctx* w = (struct wake_wp_ctx*)u;
+    if (p->state == PROC_BLOCKED && p->wait_pid >= 0 && (uint32_t)p->wait_pid == w->pid) {
+        p->wait_result = w->code;
+        p->wait_ready  = 1;
+        p->wait_pid    = -1;
+        p->state       = PROC_READY;
+    }
+}
+void sched_wake_waitpid(uint32_t pid, int code) {
+    struct wake_wp_ctx w = { pid, code };
+    process_foreach(wake_wp_cb, &w);
+}
+
+// [M17] Wake processes whose SYS_SLEEP deadline has elapsed.
+static void wake_sleep_cb(process_t* p, void* u) {
+    uint64_t now = *(uint64_t*)u;
+    if (p->state == PROC_BLOCKED && p->sleep_until != 0 && now >= p->sleep_until) {
+        p->state = PROC_READY; // sleep_until cleared when the syscall re-runs
+    }
+}
+void sched_wake_sleepers(uint64_t now) {
+    process_foreach(wake_sleep_cb, &now);
+}
+
+// [M17] Wake processes blocked receiving on IPC channel 'chan'.
+static void wake_chan_cb(process_t* p, void* u) {
+    int chan = *(int*)u;
+    if (p->state == PROC_BLOCKED && p->recv_chan == chan) {
+        p->recv_chan = -1;
+        p->state = PROC_READY;
+    }
+}
+void sched_wake_chan(int chan) {
+    process_foreach(wake_chan_cb, &chan);
 }

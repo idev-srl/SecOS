@@ -51,6 +51,14 @@ typedef struct process {
     uint8_t*  image;
     size_t    image_size;
     int      exit_code;      // [M15] 0=normal (SYS_EXIT); 128+vec=killed by fault
+    // [M16/M17] Blocking state. While PROC_BLOCKED, exactly one wait condition is
+    // armed; the matching wake (child exit / timer tick / channel send) flips the
+    // process back to PROC_READY and it re-runs the syscall (rip was rewound).
+    int      wait_pid;       // [M16] child pid being waited on (-1 = none/any)
+    int      wait_result;    // [M16] exit status delivered to a woken waiter
+    uint8_t  wait_ready;     // [M16] 1 = wait_result is valid (child already gone)
+    uint64_t sleep_until;    // [M17] wake when timer_get_ticks() >= this (0 = n/a)
+    int      recv_chan;      // [M17] IPC channel the caller is blocked receiving on (-1)
     // Runtime metrics
     uint64_t cpu_ticks;      // accumulated CPU ticks (scheduler)
     uint64_t user_mem_bytes; // virtual memory footprint (updated at creation / future extensions)
@@ -60,6 +68,8 @@ typedef struct process {
 
 int process_init_system(void); // initialize process table
 process_t* process_create_from_elf(const void* elf_buf, size_t size);
+process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
+                                        int argc, const char* const argv[]); // [M16]
 void process_print(const process_t* p);
 process_t* process_get_last(void);
 process_t* process_find_by_pid(uint32_t pid);

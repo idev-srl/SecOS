@@ -18,7 +18,13 @@ void    sched_yield(void);
 /* [M13] uptime + minimal IPC channels */
 unsigned long getticks(void);                            /* uptime in timer ticks */
 long    msg_send(int chan, const void* buf, long len);   /* bytes accepted, or <0 */
-long    msg_recv(int chan, void* buf, long len);         /* bytes read (0 empty), or <0 */
+long    msg_recv(int chan, void* buf, long len);         /* blocks if empty (M17); bytes read or <0 */
+
+/* [M16] process control */
+int     spawn(const char* path, char* const argv[]);     /* signed child + argv -> pid, or <0 */
+int     waitpid(int pid);                                /* block until child exits -> status */
+/* [M17] blocking sleep */
+void    sleep_ticks(unsigned ticks);
 
 /* tiny libc helpers */
 size_t  strlen(const char* s);

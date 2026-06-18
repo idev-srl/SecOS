@@ -174,7 +174,21 @@ user-progs:
 	$(LD) -T user/user.ld -o user/crashtest.elf user/crt0.o user/note.o user/libsecos.o user/crashtest.o
 	python3 tools/secos-sign user/crashtest.elf --dev
 	python3 tools/elf2h.py user/crashtest.elf user_crash_elf crypto/user_crash_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest -> crypto/*.h"
+	# [M16] exec model: parent spawns child with argv, blocks in waitpid for status
+	$(CC) $(USER_CFLAGS) -c user/m16_child.c   -o user/m16_child.o
+	$(LD) -T user/user.ld -o user/m16_child.elf user/crt0.o user/note.o user/libsecos.o user/m16_child.o
+	python3 tools/secos-sign user/m16_child.elf --dev
+	python3 tools/elf2h.py user/m16_child.elf user_m16_child_elf crypto/user_m16_child_elf.h
+	$(CC) $(USER_CFLAGS) -c user/m16_parent.c  -o user/m16_parent.o
+	$(LD) -T user/user.ld -o user/m16_parent.elf user/crt0.o user/note.o user/libsecos.o user/m16_parent.o
+	python3 tools/secos-sign user/m16_parent.elf --dev
+	python3 tools/elf2h.py user/m16_parent.elf user_m16_parent_elf crypto/user_m16_parent_elf.h
+	# [M17] blocking sleep
+	$(CC) $(USER_CFLAGS) -c user/m17_sleeper.c -o user/m17_sleeper.o
+	$(LD) -T user/user.ld -o user/m17_sleeper.elf user/crt0.o user/note.o user/libsecos.o user/m17_sleeper.o
+	python3 tools/secos-sign user/m17_sleeper.elf --dev
+	python3 tools/elf2h.py user/m17_sleeper.elf user_m17_sleeper_elf crypto/user_m17_sleeper_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper -> crypto/*.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke

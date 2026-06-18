@@ -15,6 +15,7 @@
 #define SYS_GETTICKS 10 // [M13] uptime in timer ticks
 #define SYS_MSG_SEND 11 // [M13] send bytes to a kernel IPC channel (chan,buf,len)
 #define SYS_MSG_RECV 12 // [M13] receive bytes from a kernel IPC channel (chan,buf,len)
+#define SYS_SLEEP    13 // [M17] block the caller for N timer ticks
 
 // Flags for open (simplified)
 #define O_RDONLY 0x0
@@ -31,8 +32,9 @@ int ksys_write(int fd, const void* buf, int len);
 int ksys_read(int fd, void* buf, int len);
 int ksys_getpid(void);
 void ksys_exit(int status);
-int ksys_spawn(const char* path);   // returns pid (>0) or -1
-int ksys_wait(int pid);             // returns 0 when pid has exited, -1 if unknown
+int ksys_spawn(const char* path);   // returns pid (>0) or -1 (no args)
+int ksys_spawn_argv(const char* path, int argc, const char* const argv[]); // [M16]
+int ksys_wait(int pid);             // returns 0 when pid has exited, -1 if unknown (poll)
 
 // Driver interface forward declaration (struct defined in driver_if.h)
 struct driver_call;

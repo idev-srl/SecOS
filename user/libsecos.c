@@ -7,9 +7,12 @@
 #define SYS_WRITE    2
 #define SYS_GETPID   6
 #define SYS_DRIVER   7
+#define SYS_SPAWN    8
+#define SYS_WAIT     9
 #define SYS_GETTICKS 10
 #define SYS_MSG_SEND 11
 #define SYS_MSG_RECV 12
+#define SYS_SLEEP    13
 
 long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4) {
     long ret;
@@ -32,6 +35,14 @@ long secos_driver(driver_call_t* call){ return secos_syscall(SYS_DRIVER, (long)c
 unsigned long getticks(void){ return (unsigned long)secos_syscall(SYS_GETTICKS, 0, 0, 0, 0, 0); }
 long msg_send(int chan, const void* buf, long len){ return secos_syscall(SYS_MSG_SEND, chan, (long)buf, len, 0, 0); }
 long msg_recv(int chan, void* buf, long len){ return secos_syscall(SYS_MSG_RECV, chan, (long)buf, len, 0, 0); }
+
+/* [M16] spawn a signed child program from a VFS path with argv (NULL-terminated,
+ * may be NULL). Returns the child pid (>0) or <0. */
+int spawn(const char* path, char* const argv[]){ return (int)secos_syscall(SYS_SPAWN, (long)path, (long)argv, 0, 0, 0); }
+/* [M16] block until child 'pid' exits; returns its status (0=normal, 128+vec=killed). */
+int waitpid(int pid){ return (int)secos_syscall(SYS_WAIT, pid, 0, 0, 0, 0); }
+/* [M17] block the caller for 'ticks' timer ticks. */
+void sleep_ticks(unsigned ticks){ secos_syscall(SYS_SLEEP, (long)ticks, 0, 0, 0, 0); }
 
 size_t strlen(const char* s) { size_t n = 0; while (s[n]) n++; return n; }
 int puts(const char* s) { write(1, s, strlen(s)); write(1, "\n", 1); return 0; }

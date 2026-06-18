@@ -17,6 +17,10 @@
 
 extern uint64_t timer_get_ticks(void);
 
+// [M16] Bounds for SYS_SPAWN argv copy-in (kept small; argstore is static).
+#define SPAWN_MAX_ARGS 8
+#define SPAWN_ARG_LEN  128
+
 static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; return i; } } return -1; }
 
 int ksys_getpid(void){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); return c? (int)c->pid : 0; }
@@ -25,23 +29,39 @@ int ksys_getpid(void){ extern process_t* sched_get_current(void); process_t* c=s
 // process for it (PROC_READY so the scheduler can pick it up). The signing
 // gate inside process_create_from_elf refuses unsigned/tampered images.
 static uint8_t g_spawn_buf[65536];
-int ksys_spawn(const char* path){
+// [M16] Spawn with argv. The single static load buffer is safe because kernel
+// code is non-preemptible (preemption fires only on a ring-3 timer tick) and
+// process_create_from_elf_args copies/pins the image before returning.
+int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     extern int vfs_read_all(const char*, void*, size_t);
-    extern process_t* process_create_from_elf(const void*, size_t);
     if(!path) return -1;
     int n = vfs_read_all(path, g_spawn_buf, sizeof(g_spawn_buf));
     if(n <= 0) return -1;
-    process_t* p = process_create_from_elf(g_spawn_buf, (size_t)n);
+    process_t* p = process_create_from_elf_args(g_spawn_buf, (size_t)n, argc, argv);
     if(!p) return -1;
     p->state = PROC_READY;
     return (int)p->pid;
 }
-// Returns 0 if the pid has exited (ZOMBIE) or is gone; 1 if still running.
+int ksys_spawn(const char* path){ return ksys_spawn_argv(path, 0, (const char* const*)0); }
+
+// Poll variant (used by the kernel shell): 0 if the pid has exited (ZOMBIE) or
+// is gone; 1 if still running. User processes use the blocking SYS_WAIT instead.
 int ksys_wait(int pid){
     extern process_t* process_find_by_pid(uint32_t);
     process_t* t = process_find_by_pid((uint32_t)pid);
     if(!t) return 0;
     return (t->state == PROC_ZOMBIE) ? 0 : 1;
+}
+
+// [M17] Non-blocking recv attempt used by the blocking SYS_MSG_RECV path in
+// syscall_trap.c. Validates + copies to user. Returns: n>0 (bytes delivered),
+// 0 (channel empty -> caller should block), or <0 (fault/error).
+int ksys_msg_recv_try(int chan, void* ubuf, int len){
+    if (len <= 0 || len > 256 || !user_range_valid(ubuf, (size_t)len)) return -EFAULT;
+    uint8_t kbuf[256];
+    int n = ipc_recv(chan, kbuf, len);
+    if (n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0) return -EFAULT;
+    return n;
 }
 void ksys_exit(int status){ (void)status; extern process_t* sched_get_current(void); extern int process_destroy(process_t*); process_t* c=sched_get_current(); if(c){ process_destroy(c); } }
 int ksys_open(const char* path, int flags){ (void)flags; extern vfs_inode_t* vfs_lookup(const char*); extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -1; int fd=fd_alloc(c); if(fd<0) return -1; c->fds[fd].inode=ino; c->fds[fd].flags=flags; return fd; }
@@ -110,11 +130,33 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
             if (ch == 0) break;
         }
         kpath[i] = 0;
-        return (uint64_t)(int64_t)ksys_spawn(kpath);
+        /* [M16] Optional argv: a1 = user char** (NULL-terminated array of user
+         * char*), or NULL for no args. Copy both the pointer array and each
+         * string into the kernel (all user accesses validated/bounce-buffered). */
+        const char* const* uargv = (const char* const*)a1;
+        static char argstore[SPAWN_MAX_ARGS][SPAWN_ARG_LEN];
+        const char* kargv[SPAWN_MAX_ARGS];
+        int argc = 0;
+        if (uargv) {
+            for (argc = 0; argc < SPAWN_MAX_ARGS; argc++) {
+                const char* ustr = 0;
+                if (copy_from_user(&ustr, uargv + argc, sizeof(ustr)) != 0)
+                    return (uint64_t)(int64_t)-EFAULT;
+                if (!ustr) break; /* NULL terminator */
+                int j = 0;
+                for (; j < SPAWN_ARG_LEN - 1; j++) {
+                    char ch;
+                    if (copy_from_user(&ch, ustr + j, 1) != 0)
+                        return (uint64_t)(int64_t)-EFAULT;
+                    argstore[argc][j] = ch;
+                    if (!ch) break;
+                }
+                argstore[argc][j] = 0;
+                kargv[argc] = argstore[argc];
+            }
+        }
+        return (uint64_t)(int64_t)ksys_spawn_argv(kpath, argc, kargv);
     }
-
-    case SYS_WAIT:
-        return (uint64_t)(int64_t)ksys_wait((int)a0);
 
     case SYS_GETTICKS:
         /* [M13] Uptime in timer ticks. No user pointers involved. */
@@ -128,20 +170,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         uint8_t kbuf[256];
         if (copy_from_user(kbuf, ubuf, (size_t)len) != 0)
             return (uint64_t)(int64_t)-EFAULT;
-        return (uint64_t)(int64_t)ipc_send(chan, kbuf, len);
+        int sent = ipc_send(chan, kbuf, len);
+        if (sent > 0) { extern void sched_wake_chan(int); sched_wake_chan(chan); } // [M17] wake blocked receivers
+        return (uint64_t)(int64_t)sent;
     }
 
-    case SYS_MSG_RECV: {
-        /* [M13] (a0=chan, a1=buf, a2=len) <- kernel IPC channel (non-blocking). */
-        int chan = (int)a0; void* ubuf = (void*)a1; int len = (int)a2;
-        if (len <= 0 || len > 256 || !user_range_valid(ubuf, (size_t)len))
-            return (uint64_t)(int64_t)-EFAULT;
-        uint8_t kbuf[256];
-        int n = ipc_recv(chan, kbuf, len);
-        if (n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0)
-            return (uint64_t)(int64_t)-EFAULT;
-        return (uint64_t)(int64_t)n;
-    }
+    /* [M16] SYS_WAIT and [M17] SYS_MSG_RECV / SYS_SLEEP are handled in
+     * syscall_trap.c (they may block the caller and need the trapframe). */
 
     case SYS_DRIVER: {
         /*

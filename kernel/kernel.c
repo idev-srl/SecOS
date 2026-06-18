@@ -537,6 +537,135 @@ static void m15_run_demo(void) {
 }
 #endif /* M15_KILL_DEMO */
 
+// ---- [M16] Exec model demo (gated; off by default) ----
+// Proves argv delivery + blocking wait + exit-status: a signed `parent` is
+// spawned; it writes nothing — the kernel first drops the signed `child` ELF into
+// the VFS, then `parent` SYS_SPAWNs "/m16_child.elf" with argv {alpha,beta},
+// blocks in SYS_WAIT, and prints the child's exit status (== argc == 3).
+#ifndef M16_EXEC_DEMO
+#define M16_EXEC_DEMO 0
+#endif
+#if M16_EXEC_DEMO
+#include "trapframe.h"
+#include "../crypto/user_m16_child_elf.h"
+#include "../crypto/user_m16_parent_elf.h"
+
+static uint8_t m16_idle_stack[16384] __attribute__((aligned(16)));
+static int m16_step = 0, m16_done = 0;
+
+__attribute__((noreturn)) static void m16_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m16_step == 0) {
+            m16_step = 1;
+            extern int vfs_create(const char*, const void*, size_t);
+            extern int vfs_remove(const char*);
+            debugcon_writestring("[M16] --- argv + blocking wait + exit status ---\n");
+            vfs_remove("/m16_child.elf");
+            if (vfs_create("/m16_child.elf", user_m16_child_elf, user_m16_child_elf_len) == 0)
+                debugcon_writestring("[M16] child ELF placed in VFS\n");
+            else
+                debugcon_writestring("[M16] FAIL: could not place child ELF\n");
+            process_t* p = process_create_from_elf(user_m16_parent_elf, user_m16_parent_elf_len);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M16] spawned parent\n"); }
+            else   debugcon_writestring("[M16] FAIL: parent not loaded\n");
+        } else if (m16_step == 1 && sched_count_alive_user() == 0 && !m16_done) {
+            m16_done = 1;
+            debugcon_writestring("[M16] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m16_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M16] exec model demo\n");
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m16_idle_stack + sizeof(m16_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m16_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M16] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf);
+}
+#endif /* M16_EXEC_DEMO */
+
+// ---- [M17] Blocking primitives demo (gated; off by default) ----
+// Proves blocking SYS_SLEEP and blocking SYS_MSG_RECV: a sleeper blocks 10 ticks
+// and verifies the uptime advanced; a consumer is spawned FIRST and blocks on the
+// empty channel 0, then a producer is spawned and its send WAKES the blocked
+// consumer (consumer-before-producer ordering can only deliver via a real block).
+#ifndef M17_BLOCK_DEMO
+#define M17_BLOCK_DEMO 0
+#endif
+#if M17_BLOCK_DEMO
+#include "trapframe.h"
+#include "../crypto/user_m17_sleeper_elf.h"
+#include "../crypto/user_ipc_send_elf.h"
+#include "../crypto/user_ipc_recv_elf.h"
+
+static uint8_t m17_idle_stack[16384] __attribute__((aligned(16)));
+static int m17_step = 0, m17_done = 0;
+static process_t* m17_consumer = 0;
+
+static process_t* m17_spawn(const uint8_t* img, size_t len, const char* what) {
+    process_t* p = process_create_from_elf(img, len);
+    if (p) { p->state = PROC_READY; debugcon_writestring("[M17] spawned "); debugcon_writestring(what); debugcon_writestring("\n"); }
+    else   { debugcon_writestring("[M17] FAIL: "); debugcon_writestring(what); debugcon_writestring("\n"); }
+    return p;
+}
+
+__attribute__((noreturn)) static void m17_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m17_step == 0) {
+            m17_step = 1;
+            debugcon_writestring("[M17] --- blocking sleep + blocking recv ---\n");
+            m17_spawn(user_m17_sleeper_elf, user_m17_sleeper_elf_len, "sleeper");
+            m17_consumer = m17_spawn(user_ipc_recv_elf, user_ipc_recv_elf_len, "consumer (will block on ch0)");
+        } else if (m17_step == 1) {
+            // Wait until the consumer has actually BLOCKED on the empty channel,
+            // then release the producer — proving the recv blocked, not polled.
+            if (m17_consumer && m17_consumer->state == PROC_BLOCKED) {
+                m17_step = 2;
+                debugcon_writestring("[M17] consumer is BLOCKED on recv -> spawning producer\n");
+                m17_spawn(user_ipc_send_elf, user_ipc_send_elf_len, "producer");
+            }
+        } else if (m17_step == 2 && sched_count_alive_user() == 0 && !m17_done) {
+            m17_done = 1;
+            debugcon_writestring("[M17] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m17_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M17] blocking primitives demo\n");
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m17_idle_stack + sizeof(m17_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m17_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M17] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf);
+}
+#endif /* M17_BLOCK_DEMO */
+
 // ---- [M10] Interactive shell as the scheduler idle task ----
 // Running the shell as the idle task lets `run <path>` spawn a ring-3 process:
 // the timer preempts idle (shell) into the user task; on SYS_EXIT the scheduler
@@ -837,6 +966,12 @@ static void kernel_main_phase2(void) {
 #endif
 #if M15_KILL_DEMO
     m15_run_demo(); // fault-kill demo — does not return
+#endif
+#if M16_EXEC_DEMO
+    m16_run_demo(); // exec model demo — does not return
+#endif
+#if M17_BLOCK_DEMO
+    m17_run_demo(); // blocking primitives demo — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);

@@ -824,12 +824,24 @@ static void sh_ext2mount(const char* a){ while(*a==' ') a++; const char* mp = (*
 // here. An unsigned/tampered/missing ELF is refused by the loader gate.
 static void sh_run(const char* a){
     while(*a==' ') a++;
-    if(!*a){ terminal_writestring("Usage: run <path>\n"); return; }
-    char path[256]; size_t i=0; while(a[i] && a[i]!=' ' && i<sizeof(path)-1){ path[i]=a[i]; i++; } path[i]=0;
-    extern int ksys_spawn(const char*);
+    if(!*a){ terminal_writestring("Usage: run <path> [args...]\n"); return; }
+    // [M16] Tokenize: first token is the path, the rest become argv[1..].
+    // argv[0] is the path itself (conventional). Bounded copy into a local store.
+    static char tok[8][128];
+    const char* av[8];
+    int argc=0;
+    while(*a && argc<8){
+        while(*a==' ') a++;
+        if(!*a) break;
+        int j=0; while(*a && *a!=' ' && j<127){ tok[argc][j++]=*a++; } tok[argc][j]=0;
+        av[argc]=tok[argc]; argc++;
+    }
+    if(argc==0){ terminal_writestring("Usage: run <path> [args...]\n"); return; }
+    const char* path = av[0];
+    extern int ksys_spawn_argv(const char*, int, const char* const*);
     extern int ksys_wait(int);
     extern void sched_reap_zombies(void);
-    int pid = ksys_spawn(path);
+    int pid = ksys_spawn_argv(path, argc, av);
     if(pid<0){ terminal_writestring("[run] load/verify failed (missing or unsigned?): "); terminal_writestring(path); terminal_writestring("\n"); return; }
     terminal_writestring("[run] pid="); print_dec(pid); terminal_writestring(" "); terminal_writestring(path); terminal_writestring("\n");
     // Let the scheduler run it; we (idle) get preempted in and resumed on exit.

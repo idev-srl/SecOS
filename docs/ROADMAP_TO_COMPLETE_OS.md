@@ -53,27 +53,31 @@ subsystem hangs permissions off.
 > programs get no argv. Nothing else is worth building on a kernel that a buggy
 > user program can take down. This phase is low-risk and high-leverage.
 
-- **M15 — Fault-driven process termination + exception delivery.**
-  An unhandled user fault (or fatal exception) **kills the offending process** and
-  returns to the scheduler instead of halting. Thread the trapframe into the
-  fault path; add a `sched_kill_current(reason)`. Skeleton for signal/exception
-  delivery (at least fatal-signal semantics + exit status carrying the signal).
-  _Security:_ a faulting process is contained; the kernel logs an audit line.
+- **M15 — Fault-driven process termination + exception delivery.** _DONE._
+  An unhandled ring-3 fault **kills the offending process** and returns to the
+  scheduler instead of halting (`sched_kill_current`, decided from the saved `cs`).
+  Exit status carries a `128+vector` signal-style encoding. _Security:_ a faulting
+  process is contained; the kernel logs `[KILL]`/`[EXC] ring3`.
 
-- **M16 — Exec model: argv/env/auxv + spawn.**
-  Pass `argv`/`env` to ring-3 programs (stack setup at exec); `SYS_EXEC` /
-  `posix_spawn`-style. Proper exit codes through `SYS_WAIT` (blocking). libc crt0
-  consumes argv/env. _Security:_ the spawn path still enforces signing + manifest
-  `max_mem`/caps; argv is bounce-buffered like all user data.
+- **M16 — Exec model: argv/env + spawn + blocking wait.** _DONE._
+  argv/env on the demand-paged user stack, passed SysV-style (rdi/rsi/rdx; crt0
+  unchanged); `SYS_SPAWN(path, char**)`; blocking `SYS_WAIT` returns the exit
+  status (rip-rewind re-run; status delivered into the waiter). _Security:_ the
+  spawn path still enforces signing + manifest `max_mem`/caps; argv is
+  bounce-buffered like all user data.
 
-- **M17 — Blocking primitives, pipes, TTY.**
-  Wait queues + a futex-like primitive; convert poll-style syscalls (`SYS_WAIT`,
-  `SYS_MSG_RECV`) to **blocking**; `SYS_SLEEP`. Anonymous pipes. A real TTY line
-  discipline so the shell does line editing / signals (Ctrl-C → SIGINT) — first
-  step toward job control. _Security:_ pipe/tty endpoints are capabilities.
+- **M17 — Blocking primitives** (pipes + TTY split out). _DONE._
+  Wait queues + the block/wake core (rip-rewind re-run); `SYS_SLEEP`; blocking
+  `SYS_MSG_RECV`. **Anonymous pipes + TTY line discipline (Ctrl-C → SIGINT) were
+  deferred**: pipes are most useful once `fork` (M19) shares fds, and a TTY needs
+  a signal-delivery mechanism (today only fatal termination exists). They return
+  as a small milestone after M19 / once signals land in Phase L.
 
-**Exit criteria F:** a buggy program can't crash the kernel; the shell runs
-programs with arguments, pipes them, and Ctrl-C interrupts them.
+**Exit criteria F:** a buggy program can't crash the kernel (M15 ✓); the shell
+runs programs with arguments (M16 ✓); blocking sleep/recv work (M17 ✓). Pipes +
+Ctrl-C interrupt deferred with `fork`/signals.
+
+**Status: M15, M16, M17 DONE** (selftest 75/75). Pipes/TTY tracked for post-M19.
 
 ---
 
@@ -218,13 +222,15 @@ security events are audited.
 
 ## Recommended near-term sequence (next few sessions)
 
-1. **M15** — fault → kill process (stop halting the kernel). _Starting now._
-2. **M16** — argv/env + exec + blocking wait.
-3. **M17** — blocking primitives + pipes + TTY.
+1. ~~**M15** — fault → kill process.~~ _DONE._
+2. ~~**M16** — argv/env + exec + blocking wait.~~ _DONE._
+3. ~~**M17** — blocking primitives (sleep + recv).~~ _DONE (pipes/TTY deferred)._
+4. **M18** — mmap/mprotect/brk + user malloc (Phase G). _Next._
 
-These three are low-risk, unblock everything, and turn SECoS from "runs signed
-demos" into "runs a real interactive multi-process userland". SMP and networking
-follow once the process/memory/IO model is solid.
+Phase F core is done — SECoS now runs a real multi-process userland (signed
+programs with argv, blocking wait, blocking sleep/recv) that survives faults.
+Phase G (VM completeness) is next; SMP and networking follow once the
+process/memory/IO model is solid.
 
 ## How this maps to the existing roadmap
 
