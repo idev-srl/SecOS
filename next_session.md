@@ -4,6 +4,21 @@ _Last updated: **M22 (NVMe + USB stack)**. NVMe storage + a polled xHCI USB stac
 with a HID boot keyboard and Bulk-Only Mass Storage. M21 (AHCI/SATA) is pushed +
 tagged `M21_STABLE`. Read this first._
 
+## ✅ Status: M24 networking L2/L3 done — `ping` WORKS
+Networking foundation landed and verified: NIC contract `net/net.h`, **4 NIC
+drivers** (e1000 + e1000e + vmxnet3 + igc/2.5GbE), L2/L3 stack (Ethernet/ARP/
+IPv4/ICMP), `ping`/`netinfo` shell. **`ping` works host↔VM** in QEMU
+(`-netdev user -device e1000`): `ping` → `[NET] ARP resolved` → `[ICMP] echo
+reply` → `[NET] PING OK`. Self-test **122/122** (net is inert without a NIC).
+- **Gotcha (resolved):** RX only works in the **shell/idle context** — the idle
+  task `hlt`s between ticks, yielding the vCPU so QEMU delivers RX DMA; `net_tick`
+  polls. An early-boot busy-spin self-test never yielded → looked like an RX bug
+  (`GPRC=0`) but wasn't. Auto-ping removed; use the `ping` shell command.
+- **e1000e/vmxnet3/igc**: compile-clean, **untested** (no QEMU model / need real
+  HW). **igc = 2.5GbE** (I225/I226).
+- **Next waves**: UDP+DHCP+DNS → TCP → sockets + `CAP_NET` → MSI-X/NAPI RX
+  (current RX is timer-tick polling). See `docs/devlog/M24.md`.
+
 ## ✅ Status: M23 done + pushed (HEAD `04eb1f9`, self-test 122/122)
 M23 (POSIX FS personality: persistent ext2 root + /dev /proc /sys + POSIX shell)
 is implemented, **self-test 122/122**, and pushed. VMware images rebuilt
