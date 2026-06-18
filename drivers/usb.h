@@ -11,6 +11,7 @@
 
 #define USB_CLASS_HID  0x03
 #define USB_CLASS_MSC  0x08
+#define USB_CLASS_HUB  0x09
 
 // Descriptor types.
 #define USB_DT_DEVICE     1
@@ -36,9 +37,12 @@ void usb_attach(usb_device_t* d);
 // controller was found.
 int usb_init(void);
 
-// Class driver entry points (implemented in usb_hid.c / usb_msc.c).
+// Class driver entry points (implemented in usb_hid.c / usb_msc.c / usb_hub.c).
 void usb_hid_attach(usb_device_t* d, const usb_endpoint_t* eps, int n, uint8_t iface);
 void usb_msc_attach(usb_device_t* d, const usb_endpoint_t* eps, int n, uint8_t iface);
+// USB hub support (M22) — NOT YET TESTED on real hardware (no hub in QEMU CI).
+// Power + reset downstream ports and enumerate any attached devices through xHCI.
+void usb_hub_attach(usb_device_t* d, const usb_endpoint_t* eps, int n, uint8_t iface);
 
 // Polled from the timer tick: drain pending HID keyboard reports.
 void usb_hid_poll(void);
