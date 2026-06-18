@@ -17,6 +17,8 @@
 #include "io.h"
 #include "debugcon.h"
 #include "vmm.h"
+#include "idt.h"
+#include "lapic.h"
 #include <stddef.h>
 
 // ---- Capability registers ----
@@ -54,6 +56,8 @@
 #define IR0_ERSTSZ  0x28
 #define IR0_ERSTBA  0x30   // 64-bit
 #define IR0_ERDP    0x38   // 64-bit
+#define IMAN_IP     (1u << 0)   // interrupt pending (RW1C)
+#define IMAN_IE     (1u << 1)   // interrupt enable
 
 // ---- TRB types ----
 #define TRB_NORMAL        1
@@ -102,6 +106,11 @@ static int g_last_cc;       // completion code of the most recent transfer
 
 int xhci_last_cc(void) { return g_last_cc; }
 
+// MSI-X plumbing (defined at end of file; NOT enabled by default).
+int  xhci_enable_irq(void);
+void xhci_irq_handler(void);
+
+static pci_device_t g_pci;          // located xHCI PCI function (for MSI-X)
 static volatile uint8_t* g_cap;     // capability base
 static volatile uint8_t* g_op;      // operational base
 static volatile uint8_t* g_rt;      // runtime base
@@ -409,6 +418,7 @@ int xhci_init(void) {
         debugcon_writestring("[XHCI] no controller on PCI\n");
         return -1;
     }
+    g_pci = dev;   // remembered for optional MSI-X (gated, NOT enabled by default)
     pci_enable_mem_and_busmaster(&dev);
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[XHCI] BAR0 not memory\n"); return -1; }
@@ -479,5 +489,63 @@ int xhci_init(void) {
     for (volatile uint64_t i = 0; i < 2000000ull; i++) { }
     debugcon_writestring("[XHCI] running\n");
     g_ndev = 0;
+
+#ifdef XHCI_USE_IRQ
+    // MSI-X interrupt mode — IMPLEMENTED BUT NOT YET TESTED. OFF by default; the
+    // completion path above (evt_poll / evt_wait) remains the working default.
+    // When this gate is built, we additionally arm MSI-X so the handler can
+    // drain the event ring; the two coexist on a single CPU because the handler
+    // only advances ERDP, which the poller tolerates.
+    xhci_enable_irq();
+#endif
+    return 0;
+}
+
+/* ============================================================================
+ * MSI-X interrupt support — IMPLEMENTED BUT NOT YET TESTED / not enabled by
+ * default (the kernel is polled). Needs the LAPIC + hardware validation. The
+ * polled completion path (evt_poll/evt_wait) stays the working default; this
+ * handler only drains the event ring and acknowledges, so an unexpected
+ * interrupt can never corrupt an in-flight polled transfer.
+ * ========================================================================== */
+
+// Volatile flag a future interrupt-driven waiter could spin on instead of the
+// event ring. Set by the ISR; unused by the default polled path.
+static volatile uint32_t g_xhci_irq_count;
+
+// C half of isr_xhci (vector 0x40). Acknowledge the interrupter, advance the
+// event ring dequeue (so the controller stops asserting), and EOI the LAPIC.
+void xhci_irq_handler(void) {
+    if (g_rt) {
+        // RW1C the interrupter's IP bit and re-arm IE.
+        uint32_t iman = rt_rd(IR0_IMAN);
+        rt_wr(IR0_IMAN, iman | IMAN_IP | IMAN_IE);
+        // Drain any pending events to clear EHB and advance ERDP.
+        xhci_trb_t ev;
+        while (evt_poll(&ev)) { /* consumed; ERDP advanced inside evt_poll */ }
+    }
+    g_xhci_irq_count++;
+    lapic_eoi();
+}
+
+// Bring up MSI-X delivery for the xHCI event interrupter. NOT YET TESTED.
+// Returns 0 on success, -1 if MSI-X/LAPIC could not be programmed. Safe to
+// leave unused: the default build never calls it.
+int xhci_enable_irq(void) {
+    if (lapic_enable() != 0) {
+        debugcon_writestring("[MSIX] xhci: LAPIC unavailable, staying polled\n");
+        return -1;
+    }
+    idt_install_msi_vector(IDT_VECTOR_XHCI, isr_xhci);
+    if (pci_enable_msix(&g_pci, IDT_VECTOR_XHCI) != 0) {
+        // Fall back to plain MSI if the controller exposes only that.
+        if (pci_enable_msi(&g_pci, IDT_VECTOR_XHCI) != 0) {
+            debugcon_writestring("[MSIX] xhci: no MSI-X/MSI capability\n");
+            return -1;
+        }
+    }
+    // Make sure interrupter 0 has IE set; IP is RW1C so writing it clears it.
+    if (g_rt) rt_wr(IR0_IMAN, rt_rd(IR0_IMAN) | IMAN_IE | IMAN_IP);
+    debugcon_writestring("[MSIX] xhci vector=0x40 armed (NOT TESTED)\n");
     return 0;
 }

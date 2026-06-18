@@ -65,3 +65,42 @@ uint32_t pci_bar_mem(const pci_device_t* d, int idx);
  * (1:2) mark it 64-bit, the high half is read from BAR[idx+1]. Low 4 bits are
  * masked. Returns 0 if BAR[idx] is an I/O BAR. NVMe/XHCI use 64-bit MMIO BARs. */
 uint64_t pci_bar_mem64(const pci_device_t* d, int idx);
+
+/* ----------------------------------------------------------------------------
+ * MSI / MSI-X interrupt support — IMPLEMENTED BUT NOT YET TESTED.
+ *
+ * This is additive plumbing only: the kernel is still 100% polled (PIC/PIT),
+ * and these routines are NOT called by the default build. Message-signalled
+ * interrupts deliver through the Local APIC, which this kernel does not enable
+ * by default; the helpers program the device-side cap correctly, but a fired
+ * interrupt also needs the LAPIC up (see arch/x86/lapic.c) plus hardware/QEMU
+ * validation. Used only when a driver is built with its *_USE_IRQ flag.
+ * ------------------------------------------------------------------------- */
+
+/* PCI status register bit 4 (0x10): capability list present at cfg 0x34. */
+#define PCI_STATUS_CAP_LIST 0x10
+#define PCI_CFG_CAP_PTR     0x34
+
+/* PCI capability IDs we care about. */
+#define PCI_CAP_ID_MSI      0x05
+#define PCI_CAP_ID_MSIX     0x11
+
+/* The LAPIC message-address window for MSI. Destination/redirection bits are
+ * 0 here => physical delivery to LAPIC id 0 (the BSP), fixed delivery mode. */
+#define MSI_ADDR_BASE       0xFEE00000u
+
+/* Walk the PCI capability list and return the config-space offset of the
+ * capability with the given id, or 0 if absent. */
+uint8_t pci_find_capability(const pci_device_t* d, uint8_t cap_id);
+
+/* Program one MSI-X table entry to deliver to LAPIC vector `vector`, unmask it,
+ * and set the MSI-X Enable bit (function masking off). The MSI-X table is
+ * reached through the physmap via its BIR + table-offset. Returns 0 on success,
+ * -1 if the device has no MSI-X capability or the BAR is unusable.
+ * NOT YET TESTED — needs the LAPIC and real interrupt delivery. */
+int pci_enable_msix(const pci_device_t* d, uint8_t vector);
+
+/* Simpler fallback: program the MSI capability (single message) to deliver
+ * `vector` to the LAPIC and set MSI Enable. Returns 0 on success, -1 if the
+ * device has no MSI capability. NOT YET TESTED. */
+int pci_enable_msi(const pci_device_t* d, uint8_t vector);

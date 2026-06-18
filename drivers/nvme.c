@@ -18,6 +18,8 @@
 #include "block.h"
 #include "debugcon.h"
 #include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_extend_physmap
+#include "idt.h"
+#include "lapic.h"
 #include <stddef.h>
 
 // ---- Controller registers (BAR0 MMIO) ----
@@ -65,6 +67,7 @@ struct nvme_queue {
     volatile uint32_t* cq_db;
 };
 
+static pci_device_t g_pci;           // located NVMe PCI function (for MSI-X)
 static volatile uint8_t* g_bar;
 static uint32_t g_dstrd_bytes;       // doorbell stride in bytes
 static struct nvme_queue g_admin, g_io;
@@ -167,6 +170,10 @@ static int nvme_rw(uint64_t lba, uint8_t* buf, uint32_t count, int write) {
     return (int)count;
 }
 
+// MSI-X plumbing (defined at end of file; NOT enabled by default).
+int  nvme_enable_irq(void);
+void nvme_irq_handler(void);
+
 static int nvme_read(block_dev_t* dev, uint64_t lba, void* buf, uint32_t count) {
     (void)dev; return nvme_rw(lba, (uint8_t*)buf, count, 0);
 }
@@ -180,6 +187,7 @@ int nvme_init(void) {
         debugcon_writestring("[NVME] no controller on PCI\n");
         return -1;
     }
+    g_pci = dev;   // remembered for optional MSI-X (gated, NOT enabled by default)
     pci_enable_mem_and_busmaster(&dev);
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[NVME] BAR0 not memory\n"); return -1; }
@@ -261,5 +269,51 @@ int nvme_init(void) {
 
     debugcon_writestring("[NVME] ready nvme0n1 sectsz=0x"); debugcon_print_hex(g_sector_size);
     debugcon_writestring(" sectors=0x"); debugcon_print_hex(g_sector_count); debugcon_writestring("\n");
+
+#ifdef NVME_USE_IRQ
+    // MSI-X interrupt mode — IMPLEMENTED BUT NOT YET TESTED. OFF by default; the
+    // polled completion path (nvme_submit) remains the working default. Note the
+    // I/O completion queue above is created with IEN=0, so even when MSI-X is
+    // armed the controller does not actually raise an interrupt on I/O
+    // completion — fully wiring that needs the CQ recreated with IEN=1 and a
+    // vector. This call therefore arms the device-side plumbing only.
+    nvme_enable_irq();
+#endif
+    return 0;
+}
+
+/* ============================================================================
+ * MSI-X interrupt support — IMPLEMENTED BUT NOT YET TESTED / not enabled by
+ * default (the kernel is polled). Needs the LAPIC, the I/O CQ recreated with
+ * IEN=1 + a vector, and hardware validation. The polled completion path
+ * (nvme_submit) stays the working default; this handler only acknowledges.
+ * ========================================================================== */
+
+static volatile uint32_t g_nvme_irq_count;   // set by the ISR; unused by polling
+
+// C half of isr_nvme (vector 0x41). The CQ phase bit is still consumed by the
+// polled nvme_submit; here we only acknowledge so the controller deasserts and
+// EOI the LAPIC. NOT YET TESTED.
+void nvme_irq_handler(void) {
+    g_nvme_irq_count++;
+    lapic_eoi();
+}
+
+// Arm MSI-X delivery for the NVMe controller. NOT YET TESTED. Returns 0 on
+// success, -1 if MSI-X/MSI/LAPIC could not be programmed. The default build
+// never calls this.
+int nvme_enable_irq(void) {
+    if (lapic_enable() != 0) {
+        debugcon_writestring("[MSIX] nvme: LAPIC unavailable, staying polled\n");
+        return -1;
+    }
+    idt_install_msi_vector(IDT_VECTOR_NVME, isr_nvme);
+    if (pci_enable_msix(&g_pci, IDT_VECTOR_NVME) != 0) {
+        if (pci_enable_msi(&g_pci, IDT_VECTOR_NVME) != 0) {
+            debugcon_writestring("[MSIX] nvme: no MSI-X/MSI capability\n");
+            return -1;
+        }
+    }
+    debugcon_writestring("[MSIX] nvme vector=0x41 armed (NOT TESTED)\n");
     return 0;
 }

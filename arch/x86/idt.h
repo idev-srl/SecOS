@@ -69,6 +69,21 @@ extern void isr_timer(void);
 extern void isr_keyboard(void);
 extern void isr_stub(void);
 
+// MSI/MSI-X interrupt stubs — IMPLEMENTED BUT NOT YET TESTED / not enabled by
+// default (the kernel is polled). Installed only by the gated *_USE_IRQ driver
+// paths via idt_install_msi_vector(); the default build never references them.
+extern void isr_xhci(void);    // vector 0x40 (xHCI MSI-X)
+extern void isr_nvme(void);    // vector 0x41 (NVMe MSI-X)
+
+// MSI/MSI-X vector assignments (LAPIC delivery; above the PIC range 0x20-0x2F).
+#define IDT_VECTOR_XHCI  0x40
+#define IDT_VECTOR_NVME  0x41
+
+// Install an interrupt gate for a runtime MSI/MSI-X vector. Thin wrapper over
+// idt_set_gate with the kernel code selector and a present 64-bit int gate.
+// NOT YET TESTED — only the gated interrupt paths call this.
+void idt_install_msi_vector(uint8_t vector, void (*handler)(void));
+
 // Syscall entry (INT 0x80)
 extern void syscall_entry(void);
 

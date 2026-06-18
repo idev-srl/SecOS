@@ -44,6 +44,14 @@ void idt_set_gate_ist(uint8_t num, uint64_t handler, uint16_t selector, uint8_t 
     idt[num].ist = ist;  // Apply IST selector
 }
 
+// Install an interrupt gate for a runtime MSI/MSI-X vector. NOT YET TESTED:
+// only invoked from the gated *_USE_IRQ driver paths; the default polled build
+// never calls this. Kernel code selector 0x08, present 64-bit interrupt gate
+// (0x8E), DPL=0 (the device, not user code, raises it).
+void idt_install_msi_vector(uint8_t vector, void (*handler)(void)) {
+    idt_set_gate(vector, (uint64_t)handler, 0x08, 0x8E);
+}
+
 // Remap the PIC (Programmable Interrupt Controller) to avoid conflicts with CPU exceptions
 static void pic_remap(void) {
     // Save current masks
