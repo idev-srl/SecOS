@@ -1,16 +1,37 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: M21 (AHCI/SATA storage — VMware/hardware disks). Read this first._
+_Last updated: M21 (AHCI/SATA) + serial fix. **SECoS now runs on VMware with
+working disks (confirmed by the user).** Read this first._
+
+## ⚠️ FIRST THING: unpushed commits
+Local `main` is **ahead of `origin/main`** — these are committed but NOT pushed:
+- `9738510` — [M21] AHCI (SATA) block driver
+- `8dd0b7a` — fix(serial): UART presence loopback test
+- (+ this handoff commit)
+
+**Run `git push origin main` at the start of the next session** (the user kept
+testing on VMware before pushing). Optionally tag `M21_STABLE`.
 
 ## Where we are
 
-- **Done through M21** — M0–M13 (A–E) + M14 (demand paging) + Phase F (M15–M17) +
-  Phase G (M18–M20) + **M21 (AHCI/SATA block driver — `/mnt` works on VMware &
-  physical PCs)**. Consolidated on **`main`** (old milestone/* + debug/* branches
-  removed; `origin/main` is the single source of truth).
+- **Done through M21 (+ serial fix)** — M0–M13 (A–E) + M14 (demand paging) +
+  Phase F (M15–M17) + Phase G (M18–M20) + **M21 (AHCI/SATA block driver)**.
+  Consolidated on **`main`** (old milestone/* + debug/* branches removed).
+- **🎉 RUNS ON VMWARE WITH WORKING DISKS** (user-confirmed this session): boot
+  from `secos-uefi.vmdk`, data on `data.vmdk` (both **SATA**) → `/mnt` mounts
+  FAT32 read-write. Interactive via the VM console (PS/2) AND a serial console
+  (com0com virtual COM pair → PuTTY @ 115200 8N1). Write a file from the shell:
+  `vcreate /mnt/note.txt <text>` (FAT32 upcases to 8.3 → `NOTE.TXT`).
 - **Run on real hardware / VMware:** `docs/RUN_ON_HARDWARE.md`
-  (`make uefi-vmdk` boot disk + `make data-vmdk` SATA data disk). Verified in
-  QEMU q35 (built-in AHCI): ISO+SATA and UEFI+2×SATA both mount FAT32/ext2 RW.
+  (`make uefi-vmdk` boot disk + `make data-vmdk` SATA data disk). Built images are
+  in `~/secos/*.vmdk` and copied to the Windows host `C:\Users\Luigi\SecOS\`.
+- **Serial fix (`8dd0b7a`) — important gotcha:** `serial_init()` used to set
+  `ready=1` unconditionally; on a host with **no COM port** (VMware default, many
+  PCs) every UART register reads `0xFF`, so the LSR Data-Ready bit looks stuck and
+  the shell's polled input (`keyboard_getchar`→`serial_poll_char`) **flooded the
+  console with `0xFF` chars**, drowning PS/2 keystrokes. Fixed with the standard
+  16550 **loopback presence test** (send `0xAE` in MCR loopback, require it back);
+  if absent, `ready=0`. The PS/2 keyboard path itself was fine.
 - **Long-term roadmap: `docs/ROADMAP_TO_COMPLETE_OS.md`** — Phases F–L (M15–M32).
   **Next: M22 (NVMe driver)** — NVMe-only laptops + VMware NVMe option (same
   `block_dev_t` shape; admin/IO queues instead of SATA ports). Then a **USB stack**
