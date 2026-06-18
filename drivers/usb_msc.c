@@ -35,8 +35,17 @@ static uint32_t get32be(const uint8_t* p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
+// Recover a halted bulk endpoint (xHC reset + ring re-point) and clear the
+// device's functional stall (CLEAR_FEATURE ENDPOINT_HALT). ep 0 = EP0 control.
+static void clear_halt(uint8_t ep) {
+    xhci_reset_endpoint(g_dev, ep);
+    usb_control_out(g_dev, 0x02, 1, 0, ep);   // CLEAR_FEATURE(ENDPOINT_HALT)
+}
+
 // One Bulk-Only command: CBW (out), optional data phase, CSW (in).
 // dir_in: 1 = data flows device->host. Returns 0 on a passing CSW, -1 otherwise.
+// Per the BOT spec, a STALL on a bulk endpoint is recoverable: clear the halt and
+// (for the status phase) retry reading the CSW once.
 static int msc_cmd(int dir_in, const uint8_t* cdb, int cdblen, void* data, uint32_t dlen) {
     for (int i = 0; i < 31; i++) g_cbw[i] = 0;
     put32le(g_cbw, CBW_SIG);
@@ -47,12 +56,27 @@ static int msc_cmd(int dir_in, const uint8_t* cdb, int cdblen, void* data, uint3
     g_cbw[14] = (uint8_t)cdblen;
     for (int i = 0; i < cdblen && i < 16; i++) g_cbw[15 + i] = cdb[i];
 
-    if (xhci_transfer(g_dev, g_ep_out, g_cbw, 31) != 31) return -1;
-    if (dlen > 0) {
-        int r = xhci_transfer(g_dev, dir_in ? g_ep_in : g_ep_out, data, (int)dlen);
-        if (r < 0) return -1;
+    if (xhci_transfer(g_dev, g_ep_out, g_cbw, 31) != 31) {
+        if (xhci_last_cc() == XHCI_CC_STALL) clear_halt(g_ep_out);
+        return -1;
     }
-    if (xhci_transfer(g_dev, g_ep_in, g_csw, 13) < 0) return -1;
+    if (dlen > 0) {
+        uint8_t ep = dir_in ? g_ep_in : g_ep_out;
+        int r = xhci_transfer(g_dev, ep, data, (int)dlen);
+        if (r < 0) {
+            // A stalled data phase is recoverable: clear it and still read the CSW.
+            if (xhci_last_cc() == XHCI_CC_STALL) clear_halt(ep);
+            else return -1;
+        }
+    }
+    int got = xhci_transfer(g_dev, g_ep_in, g_csw, 13);
+    if (got < 0) {
+        if (xhci_last_cc() == XHCI_CC_STALL) {
+            clear_halt(g_ep_in);
+            got = xhci_transfer(g_dev, g_ep_in, g_csw, 13);   // retry CSW once
+        }
+        if (got < 0) return -1;
+    }
     uint32_t sig = (uint32_t)g_csw[0] | ((uint32_t)g_csw[1] << 8) |
                    ((uint32_t)g_csw[2] << 16) | ((uint32_t)g_csw[3] << 24);
     if (sig != CSW_SIG) return -1;
@@ -116,6 +140,15 @@ void usb_msc_attach(usb_device_t* d, const usb_endpoint_t* eps, int n, uint8_t i
     }
     if (!g_ep_in || !g_ep_out) { debugcon_writestring("[MSC] missing bulk endpoints\n"); return; }
     g_dev = d; g_tag = 0;
+
+    // Get Max LUN (class request). Some devices stall it to mean "single LUN" —
+    // that halts EP0, so clear it before continuing. We only use LUN 0 anyway.
+    {
+        uint8_t s[8], maxlun = 0;
+        usb_setup(s, 0xA1, 0xFE, 0, iface, 1);
+        if (xhci_control(d, s, &maxlun, 1) < 0 && xhci_last_cc() == XHCI_CC_STALL)
+            clear_halt(0);
+    }
 
     scsi_inquiry();
     // Clear the power-on Unit Attention: try TEST UNIT READY a few times.

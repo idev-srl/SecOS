@@ -65,6 +65,8 @@
 #define TRB_ADDRESS_DEV   11
 #define TRB_CONFIG_EP     12
 #define TRB_EVAL_CTX      13
+#define TRB_RESET_EP      14
+#define TRB_SET_TR_DEQ    16
 #define TRB_XFER_EVENT    32
 #define TRB_CMD_COMPLETE  33
 #define TRB_PORT_CHANGE   34
@@ -96,6 +98,9 @@ static xhci_trb_t d_epr[MAX_DEV][XHCI_EPR_PER_DEV][XHCI_RING_SIZE] __attribute__
 
 static usb_device_t g_dev[MAX_DEV];
 static int g_ndev;
+static int g_last_cc;       // completion code of the most recent transfer
+
+int xhci_last_cc(void) { return g_last_cc; }
 
 static volatile uint8_t* g_cap;     // capability base
 static volatile uint8_t* g_op;      // operational base
@@ -210,8 +215,9 @@ int xhci_control(usb_device_t* d, const void* setup, void* data, int len) {
     ring_db(d->slot_id, 1);   // EP0 doorbell, DCI 1
 
     xhci_trb_t ev;
-    if (!evt_wait(TRB_XFER_EVENT, &ev)) return -1;
+    if (!evt_wait(TRB_XFER_EVENT, &ev)) { g_last_cc = -1; return -1; }
     int cc = (ev.d[2] >> 24) & 0xFF;
+    g_last_cc = cc;
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) return -1;
     return len;
 }
@@ -291,6 +297,7 @@ int xhci_poll_transfer(usb_device_t* d, uint8_t ep_addr, int len, int* bytes) {
     int eid  = (ev.d[3] >> 16) & 0x1F;
     if (slot != d->slot_id || eid != (int)dci) return 0;   // not ours — drop
     int cc = (ev.d[2] >> 24) & 0xFF;
+    g_last_cc = cc;
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) { *bytes = -1; return 1; }
     *bytes = len - (int)(ev.d[2] & 0xFFFFFF);
     return 1;
@@ -299,10 +306,35 @@ int xhci_poll_transfer(usb_device_t* d, uint8_t ep_addr, int len, int* bytes) {
 int xhci_transfer(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
     if (xhci_submit(d, ep_addr, data, len) < 0) return -1;
     xhci_trb_t ev;
-    if (!evt_wait(TRB_XFER_EVENT, &ev)) return -1;
+    if (!evt_wait(TRB_XFER_EVENT, &ev)) { g_last_cc = -1; return -1; }
     int cc = (ev.d[2] >> 24) & 0xFF;
+    g_last_cc = cc;
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) return -1;
     return len - (int)(ev.d[2] & 0xFFFFFF);
+}
+
+// Find the transfer ring serving a given DCI (1 = EP0).
+static xhci_ring_t* ring_for_dci(usb_device_t* d, uint8_t dci) {
+    if (dci == 1) return &d->ep0;
+    for (int i = 0; i < d->n_epr; i++) if (d->epr[i].dci == dci) return &d->epr[i];
+    return NULL;
+}
+
+int xhci_reset_endpoint(usb_device_t* d, uint8_t ep_addr) {
+    uint8_t dci = (ep_addr == 0) ? 1 : ep_dci(ep_addr);
+    xhci_ring_t* r = ring_for_dci(d, dci);
+    if (!r) return -1;
+    // Reset Endpoint: moves the halted endpoint back to Stopped.
+    int cc = cmd_run(0, 0, 0, TRB_TYPE(TRB_RESET_EP) |
+                     ((uint32_t)dci << 16) | ((uint32_t)d->slot_id << 24), NULL);
+    if (cc != CC_SUCCESS) return -1;
+    // Reset the software ring (enq=0, cycle=1, link rebuilt) and point the HW
+    // dequeue at its base with DCS=1 to match.
+    ring_init(r, r->trb, dci);
+    uint64_t dq = r->phys | 1u;
+    cc = cmd_run((uint32_t)dq, (uint32_t)(dq >> 32), 0, TRB_TYPE(TRB_SET_TR_DEQ) |
+                 ((uint32_t)dci << 16) | ((uint32_t)d->slot_id << 24), NULL);
+    return (cc == CC_SUCCESS) ? 0 : -1;
 }
 
 // Reset one root port and return its speed (0 if it failed to enable).

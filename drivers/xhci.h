@@ -82,4 +82,14 @@ int xhci_poll_transfer(usb_device_t* d, uint8_t ep_addr, int len, int* bytes);
 // Update EP0 max packet size (Evaluate Context) after reading the descriptor.
 int xhci_set_ep0_mps(usb_device_t* d, uint16_t mps);
 
+// Completion code of the most recent transfer (for error recovery decisions).
+#define XHCI_CC_STALL 6
+int xhci_last_cc(void);
+
+// Recover a halted endpoint after a STALL: Reset Endpoint + reset its transfer
+// ring + Set TR Dequeue Pointer. ep_addr 0 means the control endpoint (EP0).
+// Returns 0 on success. The caller still issues CLEAR_FEATURE(ENDPOINT_HALT) to
+// the device for a functional stall.
+int xhci_reset_endpoint(usb_device_t* d, uint8_t ep_addr);
+
 #endif // XHCI_H
