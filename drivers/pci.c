@@ -123,3 +123,15 @@ uint32_t pci_bar_mem(const pci_device_t* d, int idx) {
     if (bar & 0x1) return 0;             /* I/O BAR, not memory */
     return bar & 0xFFFFFFF0u;            /* mask type/prefetch bits */
 }
+
+uint64_t pci_bar_mem64(const pci_device_t* d, int idx) {
+    if (idx < 0 || idx > 5) return 0;
+    uint32_t lo = pci_config_read32(d->bus, d->slot, d->func, (uint8_t)(PCI_CFG_BAR0 + idx * 4));
+    if (lo & 0x1) return 0;                       /* I/O BAR, not memory */
+    uint64_t base = (uint64_t)(lo & 0xFFFFFFF0u); /* mask type/prefetch bits */
+    if (((lo >> 1) & 0x3) == 0x2 && idx < 5) {    /* type 10b => 64-bit BAR */
+        uint32_t hi = pci_config_read32(d->bus, d->slot, d->func, (uint8_t)(PCI_CFG_BAR0 + (idx + 1) * 4));
+        base |= (uint64_t)hi << 32;
+    }
+    return base;
+}

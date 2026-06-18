@@ -63,9 +63,20 @@ static char buffer_get(void) {
     return c;
 }
 
+// [M22] Poll the USB HID keyboard (if present). Safe no-op when no USB keyboard
+// is attached. Driven from the input-wait path below, never from an ISR, so it
+// never races the event ring against an in-flight MSC/control transfer.
+extern void usb_hid_poll(void);
+
 // Check if buffer has characters
 bool keyboard_has_char(void) {
+    usb_hid_poll();
     return (buffer_start != buffer_end) || serial_has_char();
+}
+
+// [M22] Inject a character from another input source (USB HID keyboard).
+void keyboard_inject_char(char c) {
+    if (c) buffer_put(c);
 }
 
 // Keyboard interrupt handler

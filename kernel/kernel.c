@@ -1043,11 +1043,19 @@ static void kernel_main_phase2(void) {
     {
         extern int virtio_blk_init(void);
         extern int ahci_init(void); // [M21] AHCI/SATA — for VMware / physical PCs
+        extern int nvme_init(void); // [M22] NVMe — NVMe-only laptops / VMware NVMe
         extern block_dev_t* block_find(const char* name);
         int have_virtio = (virtio_blk_init() == 0);
         // [M21] Probe AHCI too (registers block dev "sda"). On QEMU q35 a SATA
         // disk attaches to the built-in AHCI; on VMware/real PCs this is the path.
-        if (!have_virtio) ahci_init();
+        // [M22] Probe NVMe too (registers "nvme0n1"). Each probe is a no-op when
+        // its controller is absent, so all storage back-ends can coexist.
+        if (!have_virtio) { ahci_init(); nvme_init(); }
+        // [M22] Bring up USB (xHCI): enumerates a HID keyboard and a Mass Storage
+        // device (registers block dev "usb0"). Always probed — independent of the
+        // disk back-end above.
+        extern int usb_init(void);
+        usb_init();
         if (have_virtio) {
             block_dev_t* vda = block_find("vda");
             if (vda) {
@@ -1093,7 +1101,7 @@ static void kernel_main_phase2(void) {
         // (VMware / physical PC) — and mount the first that holds a FAT32 or extN
         // volume. On VMware the boot ESP and the data disk are both SATA, so the
         // ESP's own disk is simply skipped here (it's GPT, not a raw FS volume).
-        static const char* cand[] = { "vda", "sda", "sdb", "sdc", "sdd" };
+        static const char* cand[] = { "vda", "sda", "sdb", "sdc", "sdd", "nvme0n1", "usb0" };
         for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]) && !fsname; i++) {
             if (!block_find(cand[i])) continue;
             if      (fat32_mount(cand[i], "/mnt") == 0) fsname = "FAT32";

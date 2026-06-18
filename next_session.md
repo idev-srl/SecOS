@@ -1,22 +1,31 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: M21 (AHCI/SATA) + serial fix. **SECoS now runs on VMware with
-working disks (confirmed by the user).** Read this first._
+_Last updated: **M22 (NVMe + USB stack)**. NVMe storage + a polled xHCI USB stack
+with a HID boot keyboard and Bulk-Only Mass Storage. M21 (AHCI/SATA) is pushed +
+tagged `M21_STABLE`. Read this first._
 
-## ⚠️ FIRST THING: unpushed commits
-Local `main` is **ahead of `origin/main`** — these are committed but NOT pushed:
-- `9738510` — [M21] AHCI (SATA) block driver
-- `8dd0b7a` — fix(serial): UART presence loopback test
-- (+ this handoff commit)
-
-**Run `git push origin main` at the start of the next session** (the user kept
-testing on VMware before pushing). Optionally tag `M21_STABLE`.
+## ⚠️ FIRST THING: commit + push M22
+M21 is pushed (`origin/main` at `d0f2212`) and tagged **`M21_STABLE`**. The **M22
+work is NOT committed yet** — new files `drivers/{nvme,xhci,usb,usb_hid,usb_msc}.{c,h}`
+plus edits to `pci.{c,h}`, `keyboard.{c,h}`, `kernel.c`, `Makefile`,
+`tools/selftest.sh`, `docs/devlog/M22.md`, `CLAUDE.md`, this file.
+**Commit M22 and `git push origin main`** (optionally tag `M22_STABLE`).
+Self-test is **112/112** (was 102/102; +4 NVMe, +6 USB).
 
 ## Where we are
 
-- **Done through M21 (+ serial fix)** — M0–M13 (A–E) + M14 (demand paging) +
-  Phase F (M15–M17) + Phase G (M18–M20) + **M21 (AHCI/SATA block driver)**.
-  Consolidated on **`main`** (old milestone/* + debug/* branches removed).
+- **Done through M22** — M0–M13 (A–E) + M14 (demand paging) + Phase F (M15–M17) +
+  Phase G (M18–M20) + M21 (AHCI/SATA) + **M22 (NVMe + USB: xHCI / HID keyboard /
+  Mass Storage)**. Consolidated on **`main`**.
+- **M22 highlights** (`docs/devlog/M22.md`): `drivers/nvme.c` registers `nvme0n1`
+  (NVMe-only laptops / VMware NVMe). A polled `drivers/xhci.c` host controller +
+  `usb.c` core enumerate USB devices; `usb_hid.c` (HID **boot keyboard** → injects
+  into the shared keyboard buffer via `keyboard_inject_char`, polled from
+  `keyboard_has_char`, never an ISR) and `usb_msc.c` (Bulk-Only/SCSI → `usb0`).
+  `pci_bar_mem64` for 64-bit BARs. Boot mount tries `vda,sda..sdd,nvme0n1,usb0`.
+  Verified in QEMU: NVMe FAT32 RW; xHCI+usb-kbd+usb-storage (keystrokes reach the
+  shell, `usb0` FAT32 RW). **Gotcha:** SeaBIOS hangs trying to boot an NVMe/USB
+  *data* disk → ISO tests use `-boot d`.
 - **🎉 RUNS ON VMWARE WITH WORKING DISKS** (user-confirmed this session): boot
   from `secos-uefi.vmdk`, data on `data.vmdk` (both **SATA**) → `/mnt` mounts
   FAT32 read-write. Interactive via the VM console (PS/2) AND a serial console
@@ -33,13 +42,20 @@ testing on VMware before pushing). Optionally tag `M21_STABLE`.
   16550 **loopback presence test** (send `0xAE` in MCR loopback, require it back);
   if absent, `ready=0`. The PS/2 keyboard path itself was fine.
 - **Long-term roadmap: `docs/ROADMAP_TO_COMPLETE_OS.md`** — Phases F–L (M15–M32).
-  **Next: M22 (NVMe driver)** — NVMe-only laptops + VMware NVMe option (same
-  `block_dev_t` shape; admin/IO queues instead of SATA ports). Then a **USB stack**
-  (XHCI + USB core + HID keyboard + Mass Storage) — needed to *use* USB devices
-  after boot (booting from USB is the firmware's job). Then pipes/TTY, Phase H
-  (storage maturity), Phase I (ACPI+APIC+SMP).
-- Build is green: `make` clean (0 warnings), `tools/selftest.sh` **102/102**
-  (+9 M18, +7 M19, +5 M20, +6 M21), both boot paths higher-half.
+  **Next (post-M22):** USB **hubs** (only root-port devices enumerate today) +
+  NVMe/xHCI **interrupts** (MSI-X; everything is polled now). Then **pipes/TTY**,
+  Phase H (storage maturity), Phase I (ACPI+APIC+SMP).
+- Build is green: `make` clean (0 warnings), `tools/selftest.sh` **112/112**
+  (+4 M22 NVMe, +6 M22 USB), both boot paths higher-half.
+- **M22 notes:** everything USB/NVMe is **polled, one op at a time** (matches
+  AHCI/virtio-blk). The HID keyboard is polled from `keyboard_has_char()` (the
+  input-wait path), **never an ISR**, so the single shared xHCI event ring is
+  never drained underneath an in-flight MSC/control transfer. NVMe/xHCI are
+  testable in QEMU (`-device nvme`, `-device qemu-xhci -device usb-kbd -device
+  usb-storage`). **`-boot d` is required** on the ISO path: SeaBIOS otherwise
+  hangs trying to boot the NVMe/USB *data* disk (FS but no boot record). OVMF 6.2
+  + `-device nvme` + `fat:rw:dist/` won't launch our EFI app — use a real GPT/ESP
+  disk image or the ISO path for NVMe.
 - **M21 note:** AHCI is testable in QEMU because `q35` has a built-in AHCI
   controller (`-machine q35 -drive ...,if=ide` routes to it). The driver registers
   multiple disks (sda..sdd) and the boot mount tries each, so VMware's "boot ESP +
@@ -95,8 +111,9 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | **M18** | **done (Phase G)** | **dynamic memory**: `SYS_MMAP/MUNMAP/BRK/MPROTECT` (14–17) on the M14 VMA framework; `brk`/`sbrk` heap, anon `mmap` arena, `mprotect` (`vmm_protect_in_space`+invlpg); W^X-enforced + bounded by manifest `max_mem` at runtime; VMA tombstones + `VMA_MAX`→64. libc `malloc`/`free`/`mmap`. Demo `M18_MEM_DEMO`. See `docs/devlog/M18.md` |
 | **M19** | **done (Phase G)** | **copy-on-write fork**: PMM frame refcounts (`pmm_share`/`pmm_unref`); `vmm_fork_space` (COW bit 9), `vmm_cow_fault`; `SYS_FORK` (18) / `process_fork`; libc `fork()`. **Fix**: intermediate PT entries always `RW|PRESENT` (leaf is sole protection authority). Demo `M19_FORK_DEMO`. See `docs/devlog/M19.md` |
 | **M20** | **done (Phase G)** | **unified page cache** (`mm/pagecache.c`, 128 pages keyed by inode+offset) backs file `read()` AND **file-backed `mmap`** (MAP_PRIVATE via `vma_add_file`/`file_inode`; fault copies cached page into a private frame). `SYS_MMAP` +`fd` arg; `ksys_read`→cache, `ksys_write` invalidates. libc `open`/`read`/`close`/`mmap_file`. Demo `M20_MMAP_DEMO`: mmap+read of a VFS file return identical (coherent) bytes. See `docs/devlog/M20.md` |
-| **M21** | **done** | **AHCI/SATA block driver** (`drivers/ahci.c`) — disk path for **VMware + physical PCs**. PCI class probe (01/06/01, ABAR=BAR5), IDENTIFY, polled DMA read/write (READ/WRITE DMA EXT). Registers sda..sdd; boot mount tries vda,sda..sdd (skips GPT ESP). `make data-vmdk`; `docs/RUN_ON_HARDWARE.md`. Tested in QEMU q35. See `docs/devlog/M21.md` |
-| next | **M22 → USB → …** | **M22 NVMe driver** (NVMe-only laptops / VMware NVMe). Then a **USB stack** (XHCI+core+HID keyboard+Mass Storage) to *use* USB post-boot. Then pipes/TTY, Phase H (storage maturity), Phase I (ACPI+APIC+SMP). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
+| **M21** | **done (`M21_STABLE`)** | **AHCI/SATA block driver** (`drivers/ahci.c`) — disk path for **VMware + physical PCs**. PCI class probe (01/06/01, ABAR=BAR5), IDENTIFY, polled DMA read/write (READ/WRITE DMA EXT). Registers sda..sdd; boot mount tries vda,sda..sdd (skips GPT ESP). `make data-vmdk`; `docs/RUN_ON_HARDWARE.md`. Tested in QEMU q35. See `docs/devlog/M21.md` |
+| **M22** | **done** | **NVMe + USB stack**. `drivers/nvme.c` → `nvme0n1` (admin+I/O queues, IDENTIFY, polled DMA, PRP1+PRP-list). Polled **xHCI** (`drivers/xhci.c`) + USB core (`usb.c`) + **HID boot keyboard** (`usb_hid.c` → `keyboard_inject_char`) + **Bulk-Only Mass Storage** (`usb_msc.c` → `usb0`). `pci_bar_mem64`. Mount tries vda,sda..sdd,nvme0n1,usb0. Verified in QEMU (NVMe + usb-kbd + usb-storage). See `docs/devlog/M22.md` |
+| next | **USB hubs / IRQs → pipes/TTY → Phase H/I** | USB hubs (only root-port devices today) + NVMe/xHCI **interrupts** (MSI-X, retire polling). Then pipes/TTY, Phase H (storage maturity), Phase I (ACPI+APIC+SMP). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
 
 ## Build / test / run
 
@@ -255,11 +272,14 @@ Demo `M14_DEMAND_DEMO`: signed `hello` shows `mapped at load=0` for a `0x9000`
 reserved footprint, 2 pages fault in as it runs. Harness **61/61**. _(Historical
 recap — M14 is long merged into `main`.)_
 
-## Suggested first move next session (Phases F+G done → next)
+## Suggested first move next session (M22 done → next)
 
-Phases F and G are complete (M15–M20). Work on **`main`** (everything is
-consolidated there; old milestone/* and debug/* branches are gone). Per
-`docs/ROADMAP_TO_COMPLETE_OS.md`, the next steps:
+Phases F+G (M15–M20), M21 (AHCI) and **M22 (NVMe + USB)** are complete. First:
+**commit + push the M22 work** (see the top of this file). Then, per
+`docs/ROADMAP_TO_COMPLETE_OS.md`, options:
+- **USB maturity** (builds on M22): USB **hubs** (so non-root-port devices
+  enumerate), NVMe/xHCI **MSI-X interrupts** (retire the polling loops),
+  multi-LUN MSC, USB3 warm-reset edge cases.
 - **Pipes + TTY** (now unblocked by fork): anonymous pipes on the `fds[]` table; a
   ring-3 TTY line discipline. Ctrl-C→SIGINT needs a signal-delivery mechanism
   (only fatal termination exists today — see M15).

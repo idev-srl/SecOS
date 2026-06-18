@@ -15,5 +15,6 @@ void keyboard_handler(void);           // Interrupt handler (ISR)
 char keyboard_getchar(void);           // Blocking read char
 bool keyboard_has_char(void);          // Non-blocking availability check
 void keyboard_readline(char* buffer, int max_len); // Read line until Enter
+void keyboard_inject_char(char c);     // [M22] Inject a char (e.g. from a USB HID keyboard)
 
 #endif

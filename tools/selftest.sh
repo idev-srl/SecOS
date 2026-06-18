@@ -389,6 +389,42 @@ grep -q "\[M10\] read /mnt hello" "$M21LOG"; check "M21 reads a file from the AH
 grep -q "\[M10\] disk write+readback: OK" "$M21LOG"; check "M21 AHCI write+readback persists" $?
 ! grep -q "\[EXC\]" "$M21LOG"; check "no CPU exception ([EXC]) during M21 run" $?
 
+# ---- M22: NVMe storage + USB stack (xHCI + HID keyboard + Mass Storage) ----
+# Reuses the default myos.iso (NVMe/xHCI probes run at boot) + the FAT32 disk.img.
+M22NLOG=/tmp/secos_selftest_m22n.log
+M22ULOG=/tmp/secos_selftest_m22u.log
+echo "[selftest] Running M22 NVMe (q35 + NVMe data disk, ${TIMEOUT}s)..."
+: > "$M22NLOG"
+set +e
+# q35 ISO boot needs -boot d (else SeaBIOS hangs trying to boot the NVMe disk).
+timeout "$((TIMEOUT+4))" qemu-system-x86_64 -machine q35 -m 256M \
+    -cdrom myos.iso -boot d \
+    -drive file=disk.img,if=none,id=nvm,format=raw -device nvme,serial=secos1,drive=nvm \
+    -debugcon file:"$M22NLOG" -global isa-debugcon.iobase=0xe9 \
+    -no-reboot -no-shutdown -display none
+set -e
+grep -q "\[NVME\] ready nvme0n1" "$M22NLOG"; check "M22 NVMe namespace ready (nvme0n1)" $?
+grep -q "\[M10\] disk mounted at /mnt fs=FAT32" "$M22NLOG"; check "M22 FAT32 mounts on the NVMe disk" $?
+grep -q "\[M10\] disk write+readback: OK" "$M22NLOG"; check "M22 NVMe write+readback persists" $?
+! grep -q "\[EXC\]" "$M22NLOG"; check "no CPU exception ([EXC]) during M22 NVMe run" $?
+
+echo "[selftest] Running M22 USB (xHCI + usb-kbd + usb-storage, ${TIMEOUT}s)..."
+: > "$M22ULOG"
+set +e
+timeout "$((TIMEOUT+4))" qemu-system-x86_64 -m 256M \
+    -cdrom myos.iso -boot d \
+    -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
+    -drive file=disk.img,if=none,id=us,format=raw -device usb-storage,bus=xhci.0,drive=us \
+    -debugcon file:"$M22ULOG" -global isa-debugcon.iobase=0xe9 \
+    -no-reboot -no-shutdown -display none
+set -e
+grep -q "\[XHCI\] running" "$M22ULOG"; check "M22 xHCI controller running" $?
+grep -q "\[HID\] boot keyboard ready" "$M22ULOG"; check "M22 USB HID boot keyboard enumerated" $?
+grep -q "\[MSC\] usb0 ready" "$M22ULOG"; check "M22 USB Mass Storage ready (usb0)" $?
+grep -q "\[M10\] disk mounted at /mnt fs=FAT32" "$M22ULOG"; check "M22 FAT32 mounts on the USB disk" $?
+grep -q "\[M10\] disk write+readback: OK" "$M22ULOG"; check "M22 USB write+readback persists" $?
+! grep -q "\[EXC\]" "$M22ULOG"; check "no CPU exception ([EXC]) during M22 USB run" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

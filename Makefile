@@ -34,7 +34,9 @@ SRC_C   = \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \
 	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
-	$(DRIVERS_DIR)/ahci.c \
+	$(DRIVERS_DIR)/ahci.c $(DRIVERS_DIR)/nvme.c \
+	$(DRIVERS_DIR)/xhci.c $(DRIVERS_DIR)/usb.c \
+	$(DRIVERS_DIR)/usb_hid.c $(DRIVERS_DIR)/usb_msc.c \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
 	$(MM_DIR)/vma.c \
 	$(MM_DIR)/pagecache.c \

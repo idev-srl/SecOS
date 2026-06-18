@@ -60,3 +60,8 @@ uint16_t pci_bar0_io_base(const pci_device_t* d);
 /* [M21] Read BAR[idx] (idx 0..5) as a 32-bit memory BAR base (low 4 bits masked).
  * Returns 0 if it is an I/O BAR. */
 uint32_t pci_bar_mem(const pci_device_t* d, int idx);
+
+/* [M22] Read BAR[idx] as a full 64-bit memory BAR base. If the BAR type bits
+ * (1:2) mark it 64-bit, the high half is read from BAR[idx+1]. Low 4 bits are
+ * masked. Returns 0 if BAR[idx] is an I/O BAR. NVMe/XHCI use 64-bit MMIO BARs. */
+uint64_t pci_bar_mem64(const pci_device_t* d, int idx);
