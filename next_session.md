@@ -14,6 +14,13 @@ M21 (`M21_STABLE`) and **M22 (`M22_STABLE`, commit `e970af2`) are pushed** to
 - **Done through M22** — M0–M13 (A–E) + M14 (demand paging) + Phase F (M15–M17) +
   Phase G (M18–M20) + M21 (AHCI/SATA) + **M22 (NVMe + USB: xHCI / HID keyboard /
   Mass Storage)**. Consolidated on **`main`**.
+- **🎉 NVMe CONFIRMED ON REAL VMWARE** (user, 2026-06-18): boot disk on SATA
+  (`sda`, GPT skipped), data disk moved to a **VMware NVMe** controller → `blk`
+  shows `nvme0n1 sectsz=512 sectors=131072 (64 MB) fs=FAT` and `vls /mnt` lists
+  the files. So the full NVMe path (PCI probe → IDENTIFY → I/O queue → polled DMA
+  → FAT32 mount) works on real VMware, not just QEMU. USB stick (MSC) not yet
+  tried on VMware. Diagnose storage on VMware with the new **`blk`** / **`mountdev
+  <dev> [mp]`** shell commands (debugcon markers aren't visible there).
 - **M22 highlights** (`docs/devlog/M22.md`): `drivers/nvme.c` registers `nvme0n1`
   (NVMe-only laptops / VMware NVMe). A polled `drivers/xhci.c` host controller +
   `usb.c` core enumerate USB devices; `usb_hid.c` (HID **boot keyboard** → injects
