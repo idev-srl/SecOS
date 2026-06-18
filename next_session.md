@@ -4,14 +4,27 @@ _Last updated: **M22 (NVMe + USB stack)**. NVMe storage + a polled xHCI USB stac
 with a HID boot keyboard and Bulk-Only Mass Storage. M21 (AHCI/SATA) is pushed +
 tagged `M21_STABLE`. Read this first._
 
-## ✅ Status: M22 pushed (HEAD `d30db54`)
+## ✅ Status: M22 + follow-ups pushed (HEAD `6f7e0c6`)
 M21 (`M21_STABLE`) and **M22 (tag `M22_STABLE` = `e970af2`)** are pushed to
 `origin/main`. Post-tag additions also pushed: `blk`/`mountdev` shell
-diagnostics, and **USB MSC BOT STALL recovery + Get Max LUN** (`xhci_reset_endpoint`,
-`xhci_last_cc`). Nothing pending to push. Self-test **112/112**. NVMe **confirmed
-on real VMware**; USB stick (MSC) verified in QEMU, not yet on hardware. `edk2/`
-stays untracked (vendored, not built). Latest VMware image (`secos-uefi.vmdk`,
-banner `GIT_HASH=d30db54`) is in `C:\Users\Luigi\SecOS\`.
+diagnostics, **USB MSC BOT STALL recovery + Get Max LUN**, plus the two M22
+follow-ups merged into `main`:
+
+- **USB hub support** (`drivers/usb_hub.c` + xHCI routing): enumerate devices
+  behind a hub (route string, parent hub slot/port, TT for FS/LS). **⚠️ DA
+  TESTARE su hardware reale** — QEMU CI ha no hub, quindi dormiente lì (compile-
+  + logic-verified only). Emits `[HUB]` markers when a hub is found.
+- **MSI / MSI-X plumbing** (`drivers/pci.c`, `arch/x86/lapic.c`, IDT vectors
+  0x40/0x41, `xhci_enable_irq`/`nvme_enable_irq`): **⚠️ DA TESTARE** — additive,
+  **OFF by default** (kernel still 100% polled). Real interrupt path gated behind
+  `-DXHCI_USE_IRQ`/`-DNVME_USE_IRQ` and needs the LAPIC + hardware validation.
+  NVMe I/O CQ is still created with IEN=0 (recreate with IEN=1 + vector to truly
+  fire). Default build is byte-for-byte behaviourally identical (no `[MSIX]`).
+
+Self-test **112/112** on the merged tree. NVMe **confirmed on real VMware**; USB
+stick (MSC) verified in QEMU, not yet on hardware. `edk2/` stays untracked.
+Latest VMware image last built at `GIT_HASH=d30db54` (pre-merge) in
+`C:\Users\Luigi\SecOS\` — rebuild (`make uefi-vmdk`) for the hub/MSI-X code.
 
 ## Where we are
 
@@ -280,14 +293,37 @@ Demo `M14_DEMAND_DEMO`: signed `hello` shows `mapped at load=0` for a `0x9000`
 reserved footprint, 2 pages fault in as it runs. Harness **61/61**. _(Historical
 recap — M14 is long merged into `main`.)_
 
-## Suggested first move next session (M22 done → next)
+## Next milestone: M23 — POSIX FS personality (AGREED with the user)
 
-Phases F+G (M15–M20), M21 (AHCI) and **M22 (NVMe + USB)** are complete. First:
-**commit + push the M22 work** (see the top of this file). Then, per
-`docs/ROADMAP_TO_COMPLETE_OS.md`, options:
-- **USB maturity** (builds on M22): USB **hubs** (so non-root-port devices
-  enumerate), NVMe/xHCI **MSI-X interrupts** (retire the polling loops),
-  multi-LUN MSC, USB3 warm-reset edge cases.
+The user wants a **Linux-style filesystem** so that open-source Linux projects can
+be **compiled-from-source (and signed) for SecOS**, including apps that access
+`/dev`. Agreed design:
+- **Trust model**: the **signature IS the trust boundary**. Only signed code runs,
+  so a signed app gets ambient authority over `/dev` like a normal Linux process.
+  **Driver Space is orthogonal** (it governs how a *driver* gets privileged HW
+  access; a `/dev/sda` read still goes through the kernel block driver). Caveat to
+  keep in mind: with "signed = full trust" the signing key is the whole perimeter
+  (a signed binary can `dd` a raw disk) — a conscious trade the user accepts.
+- **Root `/` PERSISTENT on disk (ext2)** — not the volatile ramfs. (User confirmed.)
+- Scope reality: FHS + `/dev` is the *foundation*; "all Linux projects compile" is
+  a long road (libc completeness, full syscall surface incl. `ioctl`, `/proc`).
+  Treat M23 as the foundation that grows program-by-program.
+
+M23 build list:
+1. Persistent root: mount ext2 as `/` (boot ordering: root before init).
+2. FHS skeleton: `/bin /etc /dev /proc /sys /tmp /usr /opt /home /lib /mnt /root`.
+3. **devfs** (`/dev`): char (`null,zero,full,random,urandom,console,tty`) + block
+   (`sda,nvme0n1,usb0`) → `block_dev_t` byte-addressed. Signed apps open freely.
+4. **procfs** (`/proc`): `self`, `<pid>/{status,cmdline,maps}`, `meminfo`,
+   `uptime`, `mounts`, `cpuinfo`.
+5. minimal **sysfs** (`/sys/block`, `/sys/class`).
+6. syscalls/libc: wire `open/read/write/close/lseek` (partly from M20) through VFS
+   to these backends; add `ioctl`/`stat`/`fstat` + libc wrappers.
+
+## Other options later (per docs/ROADMAP_TO_COMPLETE_OS.md)
+- **USB/IRQ maturity** (M22 follow-ups already landed, DA TESTARE): validate hub +
+  MSI-X on hardware; wire NVMe CQ IEN=1 for real interrupt-driven completion;
+  multi-LUN MSC; USB3 warm-reset.
 - **Pipes + TTY** (now unblocked by fork): anonymous pipes on the `fds[]` table; a
   ring-3 TTY line discipline. Ctrl-C→SIGINT needs a signal-delivery mechanism
   (only fatal termination exists today — see M15).
