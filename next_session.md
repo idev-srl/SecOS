@@ -4,10 +4,14 @@ _Last updated: **M22 (NVMe + USB stack)**. NVMe storage + a polled xHCI USB stac
 with a HID boot keyboard and Bulk-Only Mass Storage. M21 (AHCI/SATA) is pushed +
 tagged `M21_STABLE`. Read this first._
 
-## ✅ Status: M22 pushed
-M21 (`M21_STABLE`) and **M22 (`M22_STABLE`, commit `e970af2`) are pushed** to
-`origin/main`. Nothing pending to push at session start. Self-test is **112/112**
-(was 102/102; +4 NVMe, +6 USB). `edk2/` stays untracked (vendored, not built).
+## ✅ Status: M22 pushed (HEAD `d30db54`)
+M21 (`M21_STABLE`) and **M22 (tag `M22_STABLE` = `e970af2`)** are pushed to
+`origin/main`. Post-tag additions also pushed: `blk`/`mountdev` shell
+diagnostics, and **USB MSC BOT STALL recovery + Get Max LUN** (`xhci_reset_endpoint`,
+`xhci_last_cc`). Nothing pending to push. Self-test **112/112**. NVMe **confirmed
+on real VMware**; USB stick (MSC) verified in QEMU, not yet on hardware. `edk2/`
+stays untracked (vendored, not built). Latest VMware image (`secos-uefi.vmdk`,
+banner `GIT_HASH=d30db54`) is in `C:\Users\Luigi\SecOS\`.
 
 ## Where we are
 
