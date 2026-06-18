@@ -319,6 +319,30 @@ grep -q "\[m18\] read-after-RO OK" "$M18LOG"; check "M18 read works after mprote
 grep -q "\[KILL\] pid=" "$M18LOG"; check "M18 RO write terminates the process ([KILL])" $?
 grep -q "\[M18\] DONE" "$M18LOG"; check "M18 demo completed ([M18] DONE)" $?
 
+# ---- M19: copy-on-write fork ----
+M19LOG=/tmp/secos_selftest_m19.log
+echo "[selftest] Building M19 image (M19_FORK_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make CFLAGS_EXTRA=-DM19_FORK_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M19 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M19 (mb2, ${TIMEOUT}s)..."
+tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$M19LOG" >/dev/null 2>&1 || true
+
+# fork() created a child...
+grep -q "\[FORK\] parent=" "$M19LOG"; check "M19 fork creates a child process" $?
+# ...the child inherited the parent's memory (COW read) ...
+grep -q "\[m19\] child inherited P OK" "$M19LOG"; check "M19 child inherits parent memory" $?
+# ...and a write triggered a private copy.
+grep -q "\[m19\] child wrote C OK" "$M19LOG"; check "M19 child write copies-on-write" $?
+# COW isolation: the parent's buffer is untouched by the child's write.
+grep -q "\[m19\] parent buf isolated OK" "$M19LOG"; check "M19 COW isolation (parent unchanged)" $?
+# Blocking wait returns the child's exit status (7).
+grep -q "\[m19\] parent: child status=7" "$M19LOG"; check "M19 parent reads child exit status (7)" $?
+grep -q "\[M19\] DONE" "$M19LOG"; check "M19 demo completed ([M19] DONE)" $?
+! grep -q "\[EXC\]" "$M19LOG"; check "no CPU exception ([EXC]) during M19 run" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

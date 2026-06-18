@@ -1,21 +1,25 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: M16 (exec/argv/blocking wait) + M17 (blocking sleep/recv). Phase F core done. Read this first._
+_Last updated: M18 (mmap/brk/malloc) + M19 (copy-on-write fork). Phase G in progress. Read this first._
 
 ## Where we are
 
-- **Done through M17** — M0–M13 (phases A–E) + M14 (demand paging) + **M15
-  (fault-kill) + M16 (exec model) + M17 (blocking primitives)** = Phase F core.
-  Branch **`milestone/M7`**. **HEAD ≈ M16+M17 commit, committed but NOT yet
-  pushed** (M15 commit `7a2ae93` + tag `M15_STABLE` are pushed; that's the last
-  pushed tag).
+- **Done through M19** — M0–M13 (A–E) + M14 (demand paging) + Phase F (M15
+  fault-kill, M16 exec, M17 blocking) + **Phase G: M18 (mmap/munmap/mprotect/brk +
+  user malloc), M19 (copy-on-write fork)**. Branch **`milestone/M7`**.
+  **HEAD ≈ M19 commit; M18 (`1666854`) is committed. Last pushed: M16+M17
+  (`558c121`) + tag `M17_STABLE`. M18 + M19 NOT yet pushed.**
 - **Long-term roadmap: `docs/ROADMAP_TO_COMPLETE_OS.md`** — Phases F–L (M15–M32).
-  **Next: Phase G** — M18 (mmap/mprotect/brk + user malloc), M19 (copy-on-write +
-  fork), M20 (page cache). NB: **pipes + TTY were deferred from M17** (they want
-  fork/signals first — Phase G/L).
-- Build is green: `make` clean (0 warnings), the full self-test harness
-  `tools/selftest.sh` is **75/75** (+5 M14, +5 M15, +4 M16, +5 M17), both boot
-  paths run higher-half at `0xFFFFFFFF80000000` (`smoke.sh --mb2` and `--uefi` PASS).
+  **Next: M20** (unified page/buffer cache → file read/write shares pages with
+  file-backed mmap; lets the per-process pinned image become shared RO text).
+  Then Phase H (storage maturity) / I (APIC+SMP). **Pipes + TTY** (deferred from
+  M17) are now unblocked by fork (M19).
+- Build is green: `make` clean (0 warnings), `tools/selftest.sh` **91/91** (+9
+  M18, +7 M19), both boot paths higher-half (`smoke.sh --mb2`/`--uefi` PASS).
+- **M19 gotcha (important):** intermediate page-table entries are now always
+  `RW|PRESENT` (USER still propagated). x86-64 ANDs the RW bit across ALL paging
+  levels (CR0.WP=1), so a non-writable intermediate makes every leaf below it RO —
+  which broke COW. The **leaf PTE is the sole write/exec authority** now.
 - Only `edk2/` is untracked (a large vendored tree, not part of the build) — leave it.
   `.gitignore` shows a stale local modification from before this work — harmless,
   not committed. Build artifacts `secos-uefi.{img,vmdk}`, `disk.img`, `*.o`,
@@ -56,8 +60,10 @@ Full mission + plan: `docs/DEVELOPMENT_PLAN.md`; high-level list: `ROADMAP_SECoS
 | **M14** | **done (stretch)** | **full demand paging**: per-process VMAs (`mm/vma.{c,h}`) replace eager mapping; `elf_load_image_lazy` reserves FILE/ANON regions; `vmm_handle_page_fault` materializes pages on first touch (`[PF] demand page`); pinned per-process ELF image; syscall buffers fault in via kernel-mode #PF (no `user_copy` change); stack guard = absence of a VMA; `max_mem` vs reserved footprint. See `docs/devlog/M14.md` |
 | **M15** | **done (Phase F)** | **fault-driven process kill**: a ring-3 CPU fault kills only the offending process and returns to the scheduler instead of halting. `exception_handler` decides from saved `cs` (ring3⇒`sched_kill_current`, ring0⇒panic). `process_t.exit_code` (128+vec). Demo `M15_KILL_DEMO`. See `docs/devlog/M15.md` |
 | **M16** | **done (Phase F)** | **exec model**: argv/env on the demand-paged user stack (`process_create_from_elf_args`, SysV `rdi/rsi/rdx`; crt0 unchanged); `SYS_SPAWN(path, char**)`; **blocking `SYS_WAIT`** returns exit status (rip-rewind re-run; status delivered into the waiter via `sched_wake_waitpid`); `SYS_EXIT` carries user status; shell `run <path> args`. libc `spawn`/`waitpid`. Demo `M16_EXEC_DEMO`. See `docs/devlog/M16.md` |
-| **M17** | **done (Phase F)** | **blocking primitives** on the M16 block/wake core: `SYS_SLEEP` (13, woken by `sched_wake_sleepers` from the timer tick); **blocking `SYS_MSG_RECV`** (woken by `sched_wake_chan` on send; pre-queued msg returns immediately so M13 poll stays green). libc `sleep_ticks`. Demo `M17_BLOCK_DEMO` proves `PROC_BLOCKED` before the producer runs. **Pipes/TTY deferred** (need fork/signals). See `docs/devlog/M17.md` |
-| next | **Phase G** | **M18**: `mmap`/`munmap`/`mprotect` (anon + file-backed on the M14 VMA path) + `brk`/`sbrk` + a real user `malloc`. **M19**: copy-on-write + `fork` (needs PMM frame refcounts) + shared memory. **M20**: unified page/buffer cache (drops the per-process pinned-image copy; shared read-only text). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
+| **M17** | **done (Phase F)** | **blocking primitives** on the M16 block/wake core: `SYS_SLEEP` (13); **blocking `SYS_MSG_RECV`** (pre-queued msg returns immediately so M13 poll stays green). libc `sleep_ticks`. **Pipes/TTY deferred**. See `docs/devlog/M17.md` |
+| **M18** | **done (Phase G)** | **dynamic memory**: `SYS_MMAP/MUNMAP/BRK/MPROTECT` (14–17) on the M14 VMA framework; `brk`/`sbrk` heap, anon `mmap` arena, `mprotect` (`vmm_protect_in_space`+invlpg); W^X-enforced + bounded by manifest `max_mem` at runtime; VMA tombstones + `VMA_MAX`→64. libc `malloc`/`free`/`mmap`. Demo `M18_MEM_DEMO`. See `docs/devlog/M18.md` |
+| **M19** | **done (Phase G)** | **copy-on-write fork**: PMM frame refcounts (`pmm_share`/`pmm_unref`); `vmm_fork_space` (COW bit 9), `vmm_cow_fault`; `SYS_FORK` (18) / `process_fork`; libc `fork()`. **Fix**: intermediate PT entries always `RW|PRESENT` (leaf is sole protection authority). Demo `M19_FORK_DEMO`. See `docs/devlog/M19.md` |
+| next | **Phase G→H** | **M20**: unified page/buffer cache — file `read`/`write` shares pages with file-backed `mmap`; the per-process pinned image becomes shared RO text. Then **pipes + TTY** (now unblocked by fork), Phase H (storage), Phase I (APIC+SMP). Full plan: `docs/ROADMAP_TO_COMPLETE_OS.md` |
 
 ## Build / test / run
 

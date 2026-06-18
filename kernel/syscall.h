@@ -20,6 +20,7 @@
 #define SYS_MUNMAP   15 // [M18] unmap a range (addr,len)
 #define SYS_BRK      16 // [M18] set/query the heap break (addr) -> new break
 #define SYS_MPROTECT 17 // [M18] change protection of a range (addr,len,prot)
+#define SYS_FORK     18 // [M19] copy-on-write fork; returns child pid (parent) / 0 (child)
 
 // [M18] mmap protection + flags (POSIX-ish subset)
 #define PROT_NONE   0x0

@@ -77,6 +77,7 @@ int process_init_system(void); // initialize process table
 process_t* process_create_from_elf(const void* elf_buf, size_t size);
 process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
                                         int argc, const char* const argv[]); // [M16]
+process_t* process_fork(process_t* parent, trapframe_t* tf); // [M19] COW fork
 void process_print(const process_t* p);
 process_t* process_get_last(void);
 process_t* process_find_by_pid(uint32_t pid);

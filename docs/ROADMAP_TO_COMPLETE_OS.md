@@ -86,21 +86,23 @@ Ctrl-C interrupt deferred with `fork`/signals.
 > _Why here:_ the M14 VMA framework is the foundation; fork/COW and mmap are what
 > "real" programs and a libc malloc expect.
 
-- **M18 — mmap / munmap / mprotect + brk/sbrk + user malloc.**
-  Anonymous and file-backed mappings on the M14 VMA path; `mprotect` honoring
-  W^X; `brk`/`sbrk`; a real `malloc`/`free` in libc on top of mmap/brk.
+- **M18 — mmap / munmap / mprotect + brk/sbrk + user malloc.** _DONE._
+  Anonymous mappings on the M14 VMA path; `mprotect` honoring W^X; `brk`/`sbrk`;
+  a real `malloc`/`free` in libc on top of `sbrk`. (File-backed `mmap` deferred to
+  M20's page cache.)
 
-- **M19 — Copy-on-write + fork + shared memory.**
-  COW page sharing (refcounted frames); `fork` (or a deliberate
-  spawn+COW-clone); `shm`. Needs a frame refcount in the PMM.
+- **M19 — Copy-on-write + fork.** _DONE._
+  COW page sharing (PMM frame refcounts); `fork` via `vmm_fork_space` +
+  `vmm_cow_fault`. Uncovered + fixed the intermediate-PT-permission rule
+  (RW is ANDed across all levels). `shm`/`MAP_SHARED` still future work.
 
-- **M20 — Unified page/buffer cache.**
+- **M20 — Unified page/buffer cache.** _Next._
   One cache backing file `read`/`write` **and** file-backed `mmap` coherently;
   `fsync`/writeback. Removes the per-process pinned-image copy from M14 (shared
   read-only text). _Security:_ cache respects file permissions/ownership.
 
-**Exit criteria G:** programs `mmap` files and grow the heap; `fork`/`exec`
-works; text pages are shared, not duplicated.
+**Exit criteria G:** programs `mmap` and grow the heap (M18 ✓); `fork` works with
+COW isolation (M19 ✓); a page cache shares text/file pages (M20, next).
 
 ---
 
@@ -225,12 +227,15 @@ security events are audited.
 1. ~~**M15** — fault → kill process.~~ _DONE._
 2. ~~**M16** — argv/env + exec + blocking wait.~~ _DONE._
 3. ~~**M17** — blocking primitives (sleep + recv).~~ _DONE (pipes/TTY deferred)._
-4. **M18** — mmap/mprotect/brk + user malloc (Phase G). _Next._
+4. ~~**M18** — mmap/mprotect/brk + user malloc.~~ _DONE._
+5. ~~**M19** — copy-on-write + fork.~~ _DONE._
+6. **M20** — unified page/buffer cache. _Next._
 
-Phase F core is done — SECoS now runs a real multi-process userland (signed
-programs with argv, blocking wait, blocking sleep/recv) that survives faults.
-Phase G (VM completeness) is next; SMP and networking follow once the
-process/memory/IO model is solid.
+Phase F done + Phase G nearly done (M18 mmap/malloc, M19 COW fork). SECoS now runs
+a real multi-process userland (signed programs with argv, dynamic memory, fork
+with COW isolation, blocking wait/sleep/recv) that survives faults. M20 (page
+cache) closes Phase G; then pipes+TTY (unblocked by fork), Phase H (storage), and
+Phase I (APIC+SMP). Networking (Phase J) follows once the IO model is solid.
 
 ## How this maps to the existing roadmap
 

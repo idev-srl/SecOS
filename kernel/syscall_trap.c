@@ -67,6 +67,14 @@ uint64_t syscall_handler(trapframe_t* tf) {
 
     uint64_t ret;
 
+    // [M19] SYS_FORK: copy-on-write child from the parent's live trapframe. The
+    // child resumes at the same point with rax=0; the parent gets the child pid.
+    if (num == SYS_FORK) {
+        extern process_t* process_fork(process_t*, trapframe_t*);
+        process_t* ch = cur ? process_fork(cur, tf) : 0;
+        ret = ch ? (uint64_t)(int64_t)ch->pid : (uint64_t)(int64_t)-1;
+    }
+    else
     // [M16] SYS_WAIT: blocking wait for a child, returning its exit status.
     // If the child is still running, block the caller (rewind rip so the syscall
     // re-runs on wake) instead of busy-polling. A woken waiter finds its result

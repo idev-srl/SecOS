@@ -41,6 +41,9 @@ unsigned long brk_set(unsigned long addr);
 void*   malloc(size_t size);
 void    free(void* p);
 
+/* [M19] copy-on-write fork */
+int     fork(void);
+
 /* tiny libc helpers */
 size_t  strlen(const char* s);
 int     puts(const char* s);   /* writes s + '\n' to stdout (fd 1) */

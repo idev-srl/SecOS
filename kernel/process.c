@@ -380,6 +380,67 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     return p;
 }
 
+// [M19] fork: create a copy-on-write child of 'parent'. 'tf' is the parent's
+// live syscall trapframe; the child resumes there with rax=0 (fork()==0). The
+// address space is COW-shared (vmm_fork_space); the pinned image + manifest are
+// copied (the child owns them); a fresh kernel stack + trapframe are allocated.
+// Driver privilege is NOT inherited (children are plain users). Returns the child
+// (PROC_READY) or NULL.
+process_t* process_fork(process_t* parent, trapframe_t* tf) {
+    if (!parent || !parent->space || !tf) return NULL;
+    process_t* c = (process_t*)kmalloc(sizeof(process_t));
+    if (!c) return NULL;
+    *c = *parent;                              // shallow-copy all fields (incl. VMAs, fds)
+    c->pid = next_pid++;
+    c->space = NULL; c->image = NULL; c->manifest = NULL; c->tf = NULL;
+    c->kstack_top = 0; c->kstack_slot = 0; c->mapped_pages = NULL;
+
+    c->space = vmm_fork_space(parent->space);
+    if (!c->space) { kfree(c); return NULL; }
+
+    if (parent->image && parent->image_size) {
+        c->image = (uint8_t*)kmalloc(parent->image_size);
+        if (!c->image) { vmm_space_destroy(c->space); kfree(c); return NULL; }
+        for (size_t i = 0; i < parent->image_size; i++) c->image[i] = parent->image[i];
+        c->image_size = parent->image_size;
+        // Re-point FILE VMA backing pointers into the child's own image copy.
+        for (uint32_t i = 0; i < c->vmas.count; i++) {
+            vma_t* v = &c->vmas.v[i];
+            if (v->type == VMA_TYPE_FILE && v->file_base)
+                v->file_base = c->image + ((uint64_t)v->file_base - (uint64_t)parent->image);
+        }
+    }
+    if (parent->manifest) {
+        c->manifest = kmalloc(sizeof(elf_manifest_t));
+        if (c->manifest) { uint8_t* d = (uint8_t*)c->manifest; uint8_t* s = (uint8_t*)parent->manifest;
+                           for (size_t i = 0; i < sizeof(elf_manifest_t); i++) d[i] = s[i]; }
+    }
+    c->tf = (trapframe_t*)kmalloc(sizeof(trapframe_t));
+    if (!c->tf) { if (c->manifest) kfree(c->manifest); if (c->image) kfree(c->image);
+                  vmm_space_destroy(c->space); kfree(c); return NULL; }
+    *c->tf = *tf;                              // child resumes at the fork syscall...
+    c->tf->rax = 0;                            // ...but fork() returns 0 in the child
+
+    c->wait_pid = -1; c->wait_result = 0; c->wait_ready = 0;
+    c->sleep_until = 0; c->recv_chan = -1; c->exit_code = 0; c->cpu_ticks = 0;
+    c->proc_type = PROC_TYPE_USER; c->drv_dev_id = -1; c->drv_caps = 0;
+    c->state = PROC_BLOCKED;                   // not runnable until fully built
+
+    if (proc_add(c) != 0) {
+        kfree(c->tf); if (c->manifest) kfree(c->manifest); if (c->image) kfree(c->image);
+        vmm_space_destroy(c->space); kfree(c); return NULL;
+    }
+    c->kstack_top = vmm_alloc_kernel_stack_for_slot(c->kstack_slot);
+    if (!c->kstack_top) {
+        proc_remove(c); kfree(c->tf); if (c->manifest) kfree(c->manifest);
+        if (c->image) kfree(c->image); vmm_space_destroy(c->space); kfree(c); return NULL;
+    }
+    debugcon_writestring("[FORK] parent="); debugcon_print_hex(parent->pid);
+    debugcon_writestring(" -> child="); debugcon_print_hex(c->pid); debugcon_writestring("\n");
+    c->state = PROC_READY;
+    return c;
+}
+
 void process_print(const process_t* p) {
     if (!p) return;
     terminal_writestring("[PROC] PID=");

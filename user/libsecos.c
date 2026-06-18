@@ -17,6 +17,7 @@
 #define SYS_MUNMAP   15
 #define SYS_BRK      16
 #define SYS_MPROTECT 17
+#define SYS_FORK     18
 
 long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4) {
     long ret;
@@ -84,3 +85,6 @@ void* malloc(size_t size){
     return (void*)(nb + 1);
 }
 void free(void* p){ if (!p) return; mblock_t* b = (mblock_t*)p - 1; b->is_free = 1; }
+
+/* [M19] copy-on-write fork: returns child pid in the parent, 0 in the child. */
+int fork(void){ return (int)secos_syscall(SYS_FORK, 0, 0, 0, 0, 0); }

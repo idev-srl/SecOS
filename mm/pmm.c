@@ -15,6 +15,10 @@ extern void print_hex(uint64_t value);
 
 // Bitmap tracking free/used physical frames
 static uint32_t* frame_bitmap = NULL;
+// [M19] Per-frame EXTRA reference count (refcount - 1), for copy-on-write page
+// sharing. 0 = the normal single owner; >0 = shared by N+1 mappings. Placed right
+// after the bitmap at _kernel_end. pmm_share/pmm_unref maintain it.
+static uint16_t* frame_refs = NULL;
 static uint64_t total_frames = 0;
 static uint64_t used_frames = 0;
 static uint64_t total_memory = 0;
@@ -151,6 +155,13 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
     for (uint64_t i = 0; i < dwords; i++) {
         frame_bitmap[i] = 0x00000000;
     }
+    // [M19] Place the COW refcount array (uint16 per frame) right after the
+    // bitmap, 8-byte aligned, and zero it. Both live in the low-identity window.
+    uint64_t refs_virt = (bitmap_virt + bitmap_size + 7) & ~7ULL;
+    uint64_t refs_size = total_frames * sizeof(uint16_t);
+    frame_refs = (uint16_t*)refs_virt;
+    for (uint64_t i = 0; i < total_frames; i++) frame_refs[i] = 0;
+    uint64_t refs_phys_end = kvirt_to_phys(refs_virt) + refs_size;
     used_frames = 0;
 
     // Mark regions as free
@@ -171,15 +182,16 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
             }
         }
     }
-    // Protect kernel+bitmap area (mark as used). Math in PHYSICAL space.
-    uint64_t kernel_end_frame = (bitmap_phys + bitmap_size) / PMM_FRAME_SIZE + 1;
+    // Protect kernel+bitmap+refcount area (mark as used). Math in PHYSICAL space.
+    (void)bitmap_phys;
+    uint64_t kernel_end_frame = refs_phys_end / PMM_FRAME_SIZE + 1;
     for (uint64_t f=0; f<kernel_end_frame; f++) {
         if (!bitmap_test(f)) { bitmap_set(f); used_frames++; }
     }
     // Fallback: if no free frames create synthetic region after kernel within mapped limit
     if (used_frames == 0 || used_frames == total_frames || pmm_get_free_memory() == 0) {
         terminal_writestring("[PMM][WARN] Nessun frame libero dalle regioni; applico fallback sintetico\n");
-        uint64_t fallback_start = (bitmap_phys + bitmap_size + PMM_FRAME_SIZE -1) & ~(PMM_FRAME_SIZE-1);
+        uint64_t fallback_start = (refs_phys_end + PMM_FRAME_SIZE -1) & ~(PMM_FRAME_SIZE-1);
         uint64_t fallback_end = total_frames * PMM_FRAME_SIZE;
         uint64_t start_f = fallback_start / PMM_FRAME_SIZE;
         uint64_t end_f = fallback_end / PMM_FRAME_SIZE;
@@ -371,6 +383,24 @@ void pmm_free_frame(void* addr) {
     bitmap_clear(frame);
     used_frames--;
     if (frame < next_free_hint) next_free_hint = frame; // [M12] reuse sooner
+}
+
+// [M19] Copy-on-write refcounting. pmm_share marks a frame as shared by one more
+// mapping; pmm_unref drops one mapping and returns 1 if the frame is still shared
+// (do NOT free it) or 0 if this was the last reference (the caller frees it).
+void pmm_share_frame(void* addr) {
+    uint64_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
+    if (frame < total_frames && frame_refs) {
+        if (frame_refs[frame] != 0xFFFF) frame_refs[frame]++; // saturate defensively
+    }
+}
+int pmm_unref_frame(void* addr) {
+    uint64_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
+    if (frame < total_frames && frame_refs && frame_refs[frame] > 0) {
+        frame_refs[frame]--;
+        return 1; // still referenced by someone else
+    }
+    return 0; // last reference -> caller frees
 }
 
 // Get total memory (sum of regions)

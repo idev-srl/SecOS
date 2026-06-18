@@ -100,7 +100,14 @@ static uint64_t* get_or_create_table(uint64_t* table, int index, uint64_t flags)
         if (!frame) return NULL;
         zero_frame((uint64_t)frame);
         uint64_t phys = (uint64_t)frame & ADDRESS_MASK;
-        table[index] = phys | (flags & (VMM_FLAG_RW|VMM_FLAG_USER|VMM_FLAG_PWT|VMM_FLAG_PCD)) | VMM_FLAG_PRESENT;
+        // [M19] Intermediate entries must be PERMISSIVE: on x86-64 the effective
+        // write permission is the AND of RW across all levels (CR0.WP=1), so an
+        // intermediate without RW makes every leaf below it read-only — which
+        // breaks COW (a leaf flipped to RW can't be written). Always set RW here;
+        // the LEAF PTE is the sole authority on write/exec protection. USER is
+        // still propagated from flags so kernel-range tables stay supervisor.
+        table[index] = phys | (flags & (VMM_FLAG_USER|VMM_FLAG_PWT|VMM_FLAG_PCD))
+                            | VMM_FLAG_RW | VMM_FLAG_PRESENT;
         if (physmap_initialized) {
             static int once = 0;
             if (!once) { once = 1; terminal_writestring("[M1.2] get_or_create_table: phys_to_virt path active\n"); }
@@ -755,7 +762,8 @@ int vmm_space_destroy(vmm_space_t* space) {
                 for (int ti = 0; ti < 512; ti++) {
                     uint64_t pte = pt[ti];
                     if (!(pte & VMM_FLAG_PRESENT)) continue;
-                    pmm_free_frame((void*)(pte & ADDRESS_MASK));
+                    void* lf = (void*)(pte & ADDRESS_MASK); // [M19] COW-aware free
+                    if (!pmm_unref_frame(lf)) pmm_free_frame(lf);
                     n_pages++;
                 }
                 pmm_free_frame((void*)pt_phys);
@@ -820,6 +828,82 @@ uint32_t vmm_count_user_pages(vmm_space_t* space) {
         }
     }
     return n;
+}
+
+// [M19] Duplicate an address space copy-on-write. Creates a fresh user space
+// (kernel mappings + private PML4[0] PDPT, empty user range), then walks the
+// parent's present user leaves: each frame is SHARED (refcount++), writable pages
+// are made read-only + COW in BOTH parent and child (so the first writer copies),
+// and read-only pages (code) are shared as-is. The parent TLB is flushed because
+// we mutated its PTEs and it is the current CR3.
+vmm_space_t* vmm_fork_space(vmm_space_t* parent) {
+    if (!parent) return 0;
+    vmm_space_t* child = vmm_space_create_user();
+    if (!child) return 0;
+    uint64_t ppml4_phys = parent->pml4_phys & ADDRESS_MASK;
+    uint64_t* ppml4 = physmap_initialized ? (uint64_t*)phys_to_virt(ppml4_phys) : (uint64_t*)ppml4_phys;
+    int pdpt_lo = (int)((USER_CODE_BASE >> 30) & 0x1FF);
+    int pdpt_hi = (int)((USER_STACK_TOP  >> 30) & 0x1FF);
+    uint64_t pml4e = ppml4[0];
+    if (pml4e & VMM_FLAG_PRESENT) {
+        uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4e & ADDRESS_MASK);
+        for (int pi = pdpt_lo; pi <= pdpt_hi; pi++) {
+            uint64_t pdpte = pdpt[pi];
+            if (!(pdpte & VMM_FLAG_PRESENT)) continue;
+            uint64_t* pdt = (uint64_t*)phys_to_virt(pdpte & ADDRESS_MASK);
+            for (int di = 0; di < 512; di++) {
+                uint64_t pdte = pdt[di];
+                if (!(pdte & VMM_FLAG_PRESENT) || (pdte & VMM_FLAG_PS)) continue;
+                uint64_t* pt = (uint64_t*)phys_to_virt(pdte & ADDRESS_MASK);
+                for (int ti = 0; ti < 512; ti++) {
+                    uint64_t pte = pt[ti];
+                    if (!(pte & VMM_FLAG_PRESENT)) continue;
+                    uint64_t va = ((uint64_t)pi << 30) | ((uint64_t)di << 21) | ((uint64_t)ti << 12);
+                    uint64_t phys  = pte & ADDRESS_MASK;
+                    uint64_t flags = pte & ~ADDRESS_MASK & ~VMM_FLAG_PRESENT;
+                    pmm_share_frame((void*)phys);
+                    uint64_t childflags = flags;
+                    if (pte & VMM_FLAG_RW) {                 // writable -> COW both sides
+                        uint64_t cow = (flags & ~VMM_FLAG_RW) | VMM_FLAG_COW;
+                        pt[ti] = phys | cow | VMM_FLAG_PRESENT; // parent now RO+COW
+                        childflags = cow;
+                    }
+                    if (vmm_map_in_space(child, va, phys, childflags) != 0) {
+                        // best-effort: drop the share we just added; leave child partial
+                        if (!pmm_unref_frame((void*)phys)) { /* leak rather than free shared */ }
+                    }
+                }
+            }
+        }
+    }
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory"); // flush parent TLB
+    return child;
+}
+
+// [M19] Resolve a write fault on a present read-only page. If the page is COW,
+// give the writer a private copy (or take ownership if it is the last reference)
+// and make it writable. Returns 0 if handled, -1 if it is not a COW page (a real
+// protection violation the caller must treat as fatal).
+int vmm_cow_fault(vmm_space_t* space, uint64_t addr) {
+    if (!space) return -1;
+    uint64_t va = addr & ~0xFFFULL;
+    uint64_t* pt = get_pt_space(space, va, 0, 0);
+    if (!pt) return -1;
+    int i = (va >> 12) & 0x1FF;
+    uint64_t pte = pt[i];
+    if (!(pte & VMM_FLAG_PRESENT) || !(pte & VMM_FLAG_COW)) return -1;
+    uint64_t oldphys = pte & ADDRESS_MASK;
+    void* nf = pmm_alloc_frame();
+    if (!nf) return -1;
+    uint64_t nphys = (uint64_t)nf & ADDRESS_MASK;
+    uint8_t* src = (uint8_t*)phys_to_virt(oldphys);
+    uint8_t* dst = (uint8_t*)phys_to_virt(nphys);
+    for (int b = 0; b < 4096; b++) dst[b] = src[b];
+    if (!pmm_unref_frame((void*)oldphys)) pmm_free_frame((void*)oldphys); // drop our old ref
+    uint64_t flags = (pte & ~ADDRESS_MASK & ~VMM_FLAG_COW) | VMM_FLAG_RW;  // writable, no COW
+    pt[i] = nphys | flags; // PRESENT preserved from pte
+    __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+    return 0;
 }
 
 // Map all available physical memory using 2MB huge pages to reduce table count.
@@ -952,9 +1036,9 @@ int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
     if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3; // not mapped
     uint64_t entry = pt[pt_i];
     pt[pt_i] = 0;
-    // Free physical frame
+    // Free physical frame — [M19] only when this was the last COW reference.
     void* frame = (void*)(entry & ADDRESS_MASK);
-    pmm_free_frame(frame);
+    if (!pmm_unref_frame(frame)) pmm_free_frame(frame);
     return 0;
 }
 
@@ -1075,6 +1159,16 @@ void vmm_dump_entry(uint64_t virt) {
 // is a genuine violation. [M15] On -1 the caller (exception_handler) decides
 // kill (ring-3) vs panic (ring-0) — this function no longer halts.
 int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+    // [M19] COW: a WRITE to a PRESENT page (protection fault) that is marked
+    // copy-on-write -> give the writer a private copy and continue.
+    if ((error_code & 1) && (error_code & 2)) {
+        process_t* cur = sched_get_current();
+        if (cur && cur->space && vmm_cow_fault(cur->space, fault_addr) == 0) {
+            debugcon_writestring("[COW] copy "); debugcon_print_hex(fault_addr & ~0xFFFULL);
+            debugcon_writestring("\n");
+            return 0; // retry the write
+        }
+    }
     // Fast path: demand-page a reserved VMA. Only not-present faults qualify (a
     // protection fault — present bit set — is a real access violation).
     if (!(error_code & 1)) {
