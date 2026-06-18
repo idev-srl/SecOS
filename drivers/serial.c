@@ -26,6 +26,21 @@ void serial_init(void) {
     outb(COM1 + 3, 0x03); // DLAB off, 8 bits, no parity, 1 stop
     outb(COM1 + 2, 0xC7); // FIFO enable + clear, 14-byte threshold
     outb(COM1 + 4, 0x0B); // DTR + RTS + OUT2
+
+    // Presence test: a non-existent UART (VMware / real PC with no COM port)
+    // reads 0xFF on every register, so the Line Status Register's Data-Ready bit
+    // looks permanently set and the polled input path floods the console with
+    // 0xFF "characters". Put the UART in loopback, send a byte, and require it to
+    // come back; if it doesn't, there is no UART — disable serial entirely.
+    outb(COM1 + 4, 0x1E);            // loopback mode (LOOP | OUT2 | OUT1 | RTS)
+    outb(COM1 + 0, 0xAE);            // transmit a test byte
+    if (inb(COM1 + 0) != 0xAE) {     // not looped back -> no real UART
+        outb(COM1 + 4, 0x0B);
+        ready = 0;
+        return;
+    }
+    outb(COM1 + 4, 0x0F);            // normal operation (DTR | RTS | OUT1 | OUT2)
+    outb(COM1 + 2, 0xC7);            // clear FIFOs (drop the loopback test byte)
     ready = 1;
 }
 
