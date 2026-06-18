@@ -23,6 +23,9 @@ typedef struct block_dev {
 int block_register(block_dev_t* dev);
 // Find device by name
 block_dev_t* block_find(const char* name);
+// Enumerate registered devices: count, and the i-th device (NULL if out of range).
+int block_count(void);
+block_dev_t* block_get(int i);
 // Convenience wrappers: returns sectors transferred or -1 (write -1 if read-only).
 int block_read(block_dev_t* dev, uint64_t lba, void* buf, uint32_t count);
 int block_write(block_dev_t* dev, uint64_t lba, const void* buf, uint32_t count);

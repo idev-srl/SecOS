@@ -19,6 +19,7 @@
 #include "fb.h" // per framebuffer_info_t in fbinfo
 #include "fs/ramfs.h" // RAMFS API
 #include "fs/vfs.h" // VFS API
+#include "fs/block.h" // [M22] block device introspection (blk/mountdev)
 #include "driver_if.h" // driver space API
 #include <stdint.h>
 #include <stddef.h>
@@ -132,6 +133,7 @@ static void sh_rftruncate(const char* a);
 static void sh_vls(const char* a); static void sh_vcat(const char* a); static void sh_vinfo(const char* a); static void sh_vpwd(const char* a); static void sh_vmount(const char* a);
 static void sh_vcreate(const char* a); static void sh_vwrite(const char* a); static void sh_vtruncate2(const char* a);
 static void sh_ext2mount(const char* a);
+static void sh_blk(const char* a); static void sh_mountdev(const char* a);
 static void sh_run(const char* a);
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
 static void sh_drvtest(const char* a);
@@ -209,6 +211,8 @@ static const struct shell_cmd shell_cmds[] = {
     {"vwrite",    sh_vwrite},
     {"vtruncate", sh_vtruncate2},
     {"ext2mount", sh_ext2mount},
+    {"blk",       sh_blk},
+    {"mountdev",  sh_mountdev},
     {"run",       sh_run},
     {"drvreg",    sh_drvreg},
     {"drvunreg",  sh_drvunreg},
@@ -818,6 +822,50 @@ static void sh_vcreate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_wri
 static void sh_vwrite(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vwrite <path> <offset> <data>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vwrite] missing offset\n"); return; } size_t off=0; while(*a>='0'&&*a<='9'){ off=off*10+(*a-'0'); a++; } while(*a==' ') a++; if(!*a){ terminal_writestring("[vwrite] missing data\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_write(const char*, size_t, const void*, size_t); int r=vfs_write(name,off,data,len); if(r>=0){ terminal_writestring("[vwrite] wrote "); print_dec(r); terminal_writestring(" bytes\n"); } else terminal_writestring("[vwrite] FAIL\n"); }
 static void sh_vtruncate2(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vtruncate <path> <size>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vtruncate] missing size\n"); return; } size_t sz=0; while(*a>='0'&&*a<='9'){ sz=sz*10+(*a-'0'); a++; } extern int vfs_truncate(const char*, size_t); if(vfs_truncate(name,sz)==0) terminal_writestring("[vtruncate] OK\n"); else terminal_writestring("[vtruncate] FAIL\n"); }
 static void sh_ext2mount(const char* a){ while(*a==' ') a++; const char* mp = (*a) ? a : "/mnt"; extern int ext2_mount(const char* dev_name, const char* mount_point); if(ext2_mount("vda", mp)==0){ terminal_writestring("[ext2mount] ext2/ext4 mounted at "); terminal_writestring(mp); terminal_writestring("\n"); } else terminal_writestring("[ext2mount] mount failed\n"); }
+// [M22] blk: list every detected block device (virtio/AHCI/NVMe/USB) and probe
+// sector 0 for a filesystem signature. Output goes to the shell (serial/FB), so
+// it works on VMware where the debugcon driver markers are not visible.
+static void sh_blk(const char* a){ (void)a;
+    extern int block_count(void); extern block_dev_t* block_get(int);
+    int n = block_count();
+    if(n==0){ terminal_writestring("[blk] NO block devices detected (no virtio/SATA/NVMe/USB disk found)\n"); return; }
+    static uint8_t s[4096];
+    for(int i=0;i<n;i++){
+        block_dev_t* d = block_get(i);
+        if(!d) continue;
+        terminal_writestring(d->name);
+        terminal_writestring("  sectsz="); print_dec(d->sector_size);
+        terminal_writestring(" sectors="); print_dec((uint64_t)d->sector_count);
+        terminal_writestring(" ("); print_dec((uint64_t)(d->sector_count * (uint64_t)d->sector_size / (1024*1024)));
+        terminal_writestring(" MB)  fs=");
+        uint32_t cnt = (1536 + d->sector_size - 1) / d->sector_size;
+        if(cnt * d->sector_size > sizeof(s)) cnt = sizeof(s) / d->sector_size;
+        if(cnt==0) cnt=1;
+        for(uint32_t k=0;k<sizeof(s);k++) s[k]=0;
+        int rr = d->read(d, 0, s, cnt);
+        if(rr<0){ terminal_writestring("[READ FAILED]\n"); continue; }
+        const char* fs;
+        if(s[450]==0xEE || (s[512]=='E'&&s[513]=='F'&&s[514]=='I'&&s[515]==' ')) fs="GPT (boot disk, skipped)";
+        else if(s[1080]==0x53 && s[1081]==0xEF) fs="ext2/3/4";
+        else if(s[510]==0x55 && s[511]==0xAA) fs="FAT";
+        else fs="unknown/raw";
+        terminal_writestring(fs); terminal_writestring("\n");
+    }
+}
+// [M22] mountdev <dev> [mp]: try to mount a named device (FAT32 then ext2/4) at a
+// mount point (default /mnt2 to avoid clashing with the boot /mnt). Diagnostic.
+static void sh_mountdev(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Usage: mountdev <dev> [mountpoint]\n  e.g. mountdev nvme0n1 /mnt2 ; then: vls /mnt2\n"); return; }
+    char dev[32]; size_t i=0; while(*a && *a!=' ' && i<sizeof(dev)-1) dev[i++]=*a++; dev[i]=0;
+    while(*a==' ') a++;
+    const char* mp = (*a) ? a : "/mnt2";
+    extern int fat32_mount(const char*, const char*); extern int ext2_mount(const char*, const char*);
+    if(!block_find(dev)){ terminal_writestring("[mountdev] no such device: "); terminal_writestring(dev); terminal_writestring(" (run blk to list)\n"); return; }
+    if(fat32_mount(dev, mp)==0){ terminal_writestring("[mountdev] FAT32 mounted "); terminal_writestring(dev); terminal_writestring(" -> "); terminal_writestring(mp); terminal_writestring("\n"); return; }
+    if(ext2_mount(dev, mp)==0){ terminal_writestring("[mountdev] ext2/4 mounted "); terminal_writestring(dev); terminal_writestring(" -> "); terminal_writestring(mp); terminal_writestring("\n"); return; }
+    terminal_writestring("[mountdev] mount FAILED (device not FAT32/extN, or already mounted there)\n");
+}
 // [M10] run <path>: load+signature-verify a signed ELF from the VFS, spawn it
 // ring-3 and wait for it to exit. Works because the shell runs as the scheduler
 // idle task: the timer preempts us into the spawned process; SYS_EXIT returns
