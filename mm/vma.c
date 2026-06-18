@@ -21,8 +21,16 @@ static void vma_memset(uint8_t* d, uint8_t val, uint64_t n) {
 int vma_add(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags,
             uint8_t type, const uint8_t* file_base, uint64_t file_off,
             uint64_t file_pad, uint64_t file_len) {
-    if (!s || s->count >= VMA_MAX) return -1;
-    vma_t* v = &s->v[s->count++];
+    if (!s) return -1;
+    vma_t* v = 0;
+    // [M18] Reuse a tombstone slot if one exists, else append.
+    for (uint32_t i = 0; i < s->count; i++) {
+        if (s->v[i].type == VMA_TYPE_NONE) { v = &s->v[i]; break; }
+    }
+    if (!v) {
+        if (s->count >= VMA_MAX) return -1;
+        v = &s->v[s->count++];
+    }
     v->start = start;
     v->end = end;
     v->flags = flags;
@@ -37,9 +45,44 @@ int vma_add(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags,
 const vma_t* vma_find(const vma_set_t* s, uint64_t addr) {
     if (!s) return 0;
     for (uint32_t i = 0; i < s->count; i++) {
+        if (s->v[i].type == VMA_TYPE_NONE) continue;
         if (addr >= s->v[i].start && addr < s->v[i].end) return &s->v[i];
     }
     return 0;
+}
+
+vma_t* vma_find_mut(vma_set_t* s, uint64_t addr) {
+    if (!s) return 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        if (s->v[i].type == VMA_TYPE_NONE) continue;
+        if (addr >= s->v[i].start && addr < s->v[i].end) return &s->v[i];
+    }
+    return 0;
+}
+
+void vma_remove(vma_set_t* s, vma_t* v) {
+    if (!s || !v) return;
+    v->type = VMA_TYPE_NONE;       // tombstone; indices stay stable
+    v->start = v->end = 0;
+}
+
+int vma_overlaps(const vma_set_t* s, uint64_t start, uint64_t end) {
+    if (!s) return 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        if (s->v[i].type == VMA_TYPE_NONE) continue;
+        if (start < s->v[i].end && s->v[i].start < end) return 1;
+    }
+    return 0;
+}
+
+uint64_t vma_total_bytes(const vma_set_t* s) {
+    if (!s) return 0;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        if (s->v[i].type == VMA_TYPE_NONE) continue;
+        total += (s->v[i].end - s->v[i].start);
+    }
+    return total;
 }
 
 int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr) {

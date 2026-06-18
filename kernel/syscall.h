@@ -16,6 +16,18 @@
 #define SYS_MSG_SEND 11 // [M13] send bytes to a kernel IPC channel (chan,buf,len)
 #define SYS_MSG_RECV 12 // [M13] receive bytes from a kernel IPC channel (chan,buf,len)
 #define SYS_SLEEP    13 // [M17] block the caller for N timer ticks
+#define SYS_MMAP     14 // [M18] map anonymous memory (addr,len,prot,flags) -> addr
+#define SYS_MUNMAP   15 // [M18] unmap a range (addr,len)
+#define SYS_BRK      16 // [M18] set/query the heap break (addr) -> new break
+#define SYS_MPROTECT 17 // [M18] change protection of a range (addr,len,prot)
+
+// [M18] mmap protection + flags (POSIX-ish subset)
+#define PROT_NONE   0x0
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define PROT_EXEC   0x4
+#define MAP_PRIVATE   0x02
+#define MAP_ANONYMOUS 0x20
 
 // Flags for open (simplified)
 #define O_RDONLY 0x0
@@ -35,6 +47,11 @@ void ksys_exit(int status);
 int ksys_spawn(const char* path);   // returns pid (>0) or -1 (no args)
 int ksys_spawn_argv(const char* path, int argc, const char* const argv[]); // [M16]
 int ksys_wait(int pid);             // returns 0 when pid has exited, -1 if unknown (poll)
+// [M18] dynamic memory
+uint64_t ksys_brk(uint64_t new_brk);
+uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags);
+int ksys_munmap(uint64_t addr, uint64_t len);
+int ksys_mprotect(uint64_t addr, uint64_t len, int prot);
 
 // Driver interface forward declaration (struct defined in driver_if.h)
 struct driver_call;

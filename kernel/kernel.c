@@ -666,6 +666,58 @@ static void m17_run_demo(void) {
 }
 #endif /* M17_BLOCK_DEMO */
 
+// ---- [M18] Dynamic memory demo (gated; off by default) ----
+// Runs the signed `m18_mem`: malloc/free/reuse over sbrk, anonymous mmap, W^X
+// rejection, mprotect read-only. It prints [m18] DONE-USER, then writes to a
+// read-only page — which terminates it ([KILL]), proving mprotect enforces. The
+// kernel survives (M15 mechanism).
+#ifndef M18_MEM_DEMO
+#define M18_MEM_DEMO 0
+#endif
+#if M18_MEM_DEMO
+#include "trapframe.h"
+#include "../crypto/user_m18_mem_elf.h"
+
+static uint8_t m18_idle_stack[16384] __attribute__((aligned(16)));
+static int m18_step = 0, m18_done = 0;
+
+__attribute__((noreturn)) static void m18_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m18_step == 0) {
+            m18_step = 1;
+            debugcon_writestring("[M18] --- malloc/mmap/mprotect ---\n");
+            process_t* p = process_create_from_elf(user_m18_mem_elf, user_m18_mem_elf_len);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M18] spawned m18_mem\n"); }
+            else   debugcon_writestring("[M18] FAIL: m18_mem not loaded\n");
+        } else if (m18_step == 1 && sched_count_alive_user() == 0 && !m18_done) {
+            m18_done = 1;
+            debugcon_writestring("[M18] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m18_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M18] dynamic memory demo\n");
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m18_idle_stack + sizeof(m18_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m18_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M18] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf);
+}
+#endif /* M18_MEM_DEMO */
+
 // ---- [M10] Interactive shell as the scheduler idle task ----
 // Running the shell as the idle task lets `run <path>` spawn a ring-3 process:
 // the timer preempts idle (shell) into the user task; on SYS_EXIT the scheduler
@@ -972,6 +1024,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M17_BLOCK_DEMO
     m17_run_demo(); // blocking primitives demo — does not return
+#endif
+#if M18_MEM_DEMO
+    m18_run_demo(); // dynamic memory demo — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);

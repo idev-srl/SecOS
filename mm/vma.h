@@ -18,9 +18,10 @@
 #include <stdint.h>
 #include "vmm.h"
 
-#define VMA_MAX        16
+#define VMA_MAX        64
 #define VMA_TYPE_ANON  0
 #define VMA_TYPE_FILE  1
+#define VMA_TYPE_NONE  255  // [M18] tombstone: a removed slot (kept so indices are stable)
 
 typedef struct vma {
     uint64_t start;        // page-aligned, inclusive
@@ -47,6 +48,15 @@ int vma_add(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags,
 
 // Locate the VMA containing 'addr', or NULL.
 const vma_t* vma_find(const vma_set_t* s, uint64_t addr);
+
+// [M18] Mutable lookup (for mprotect/munmap bookkeeping).
+vma_t* vma_find_mut(vma_set_t* s, uint64_t addr);
+// [M18] Mark a slot as a tombstone (removed). Indices of other slots are stable.
+void vma_remove(vma_set_t* s, vma_t* v);
+// [M18] Does any live VMA overlap [start,end)?
+int vma_overlaps(const vma_set_t* s, uint64_t start, uint64_t end);
+// [M18] Sum of live VMA sizes (reserved virtual footprint, for max_mem checks).
+uint64_t vma_total_bytes(const vma_set_t* s);
 
 // Materialize the page containing 'addr' in 'space' according to VMA 'v':
 // allocate a frame, fill it (file content + zero / pure zero), map it.

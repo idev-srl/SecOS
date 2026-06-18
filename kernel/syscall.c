@@ -63,6 +63,98 @@ int ksys_msg_recv_try(int chan, void* ubuf, int len){
     if (n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0) return -EFAULT;
     return n;
 }
+
+// ---- [M18] Dynamic memory: brk / mmap / munmap / mprotect ----
+// All operate on the current process's VMA set; pages are demand-faulted (the
+// M14 #PF path), so these calls only manipulate VMAs + already-present PTEs.
+static uint64_t m18_prot_to_flags(int prot){
+    uint64_t f = VMM_FLAG_USER;
+    if (prot & PROT_WRITE) f |= VMM_FLAG_RW;
+    if (!(prot & PROT_EXEC)) f |= VMM_FLAG_NOEXEC; // NX unless EXEC requested
+    return f;
+}
+static inline uint64_t pgup(uint64_t x){ return (x + 0xFFFULL) & ~0xFFFULL; }
+
+uint64_t ksys_brk(uint64_t new_brk){
+    process_t* c = sched_get_current();
+    if (!c) return 0;
+    if (new_brk == 0) return c->brk_cur;            // query current break
+    new_brk = pgup(new_brk);
+    if (new_brk < c->brk_start || new_brk >= USER_MMAP_BASE) return c->brk_cur;
+    uint64_t old = c->brk_cur;
+    if (new_brk == old) return old;
+    if (new_brk > old) {                            // grow
+        if (c->mem_limit && vma_total_bytes(&c->vmas) + (new_brk - old) > c->mem_limit)
+            return old;                             // would exceed signed mem limit
+        vma_t* h = vma_find_mut(&c->vmas, c->brk_start);
+        if (h) h->end = new_brk;
+        else if (vma_add(&c->vmas, c->brk_start, new_brk,
+                         VMM_FLAG_USER|VMM_FLAG_RW|VMM_FLAG_NOEXEC, VMA_TYPE_ANON,0,0,0,0) != 0)
+            return old;
+    } else {                                        // shrink
+        for (uint64_t va = new_brk; va < old; va += 0x1000) vmm_unmap_in_space(c->space, va);
+        vma_t* h = vma_find_mut(&c->vmas, c->brk_start);
+        if (h) { if (new_brk <= c->brk_start) vma_remove(&c->vmas, h); else h->end = new_brk; }
+    }
+    c->brk_cur = new_brk;
+    return new_brk;
+}
+
+uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags){
+    (void)addr;                                     // hint ignored (bump allocator)
+    process_t* c = sched_get_current();
+    if (!c || len == 0) return (uint64_t)-1;
+    if (!(flags & MAP_ANONYMOUS)) return (uint64_t)-1;        // M18: anonymous only
+    if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return (uint64_t)-1; // W^X
+    len = pgup(len);
+    uint64_t base = c->mmap_next;
+    if (base + len > USER_MMAP_END) return (uint64_t)-1;      // arena exhausted
+    if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) return (uint64_t)-1;
+    if (vma_add(&c->vmas, base, base + len, m18_prot_to_flags(prot), VMA_TYPE_ANON,0,0,0,0) != 0)
+        return (uint64_t)-1;
+    c->mmap_next = base + len;
+    return base;
+}
+
+int ksys_munmap(uint64_t addr, uint64_t len){
+    process_t* c = sched_get_current();
+    if (!c || (addr & 0xFFF) || len == 0) return -1;
+    len = pgup(len);
+    uint64_t end = addr + len;
+    for (uint64_t va = addr; va < end; va += 0x1000) vmm_unmap_in_space(c->space, va);
+    for (uint32_t i = 0; i < c->vmas.count; i++) {
+        vma_t* v = &c->vmas.v[i];
+        if (v->type == VMA_TYPE_NONE) continue;
+        if (!(addr < v->end && v->start < end)) continue;        // no overlap
+        if (addr <= v->start && end >= v->end)      vma_remove(&c->vmas, v);   // fully covered
+        else if (addr <= v->start)                  v->start = end;            // trim front
+        else if (end >= v->end)                     v->end = addr;             // trim back
+        else {                                                                 // hole: split (ANON)
+            uint64_t old_end = v->end; v->end = addr;
+            if (v->type == VMA_TYPE_ANON)
+                vma_add(&c->vmas, end, old_end, v->flags, VMA_TYPE_ANON,0,0,0,0);
+        }
+    }
+    return 0;
+}
+
+int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
+    process_t* c = sched_get_current();
+    if (!c || (addr & 0xFFF) || len == 0) return -1;
+    if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return -1;   // W^X
+    len = pgup(len);
+    uint64_t end = addr + len;
+    if (!vma_overlaps(&c->vmas, addr, end)) return -1;          // must be backed
+    uint64_t newf = m18_prot_to_flags(prot);
+    for (uint32_t i = 0; i < c->vmas.count; i++) {
+        vma_t* v = &c->vmas.v[i];
+        if (v->type == VMA_TYPE_NONE) continue;
+        if (addr <= v->start && end >= v->end && addr < v->end && v->start < end)
+            v->flags = newf;                                     // whole VMA in range
+    }
+    for (uint64_t va = addr; va < end; va += 0x1000) vmm_protect_in_space(c->space, va, newf);
+    return 0;
+}
 void ksys_exit(int status){ (void)status; extern process_t* sched_get_current(void); extern int process_destroy(process_t*); process_t* c=sched_get_current(); if(c){ process_destroy(c); } }
 int ksys_open(const char* path, int flags){ (void)flags; extern vfs_inode_t* vfs_lookup(const char*); extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -1; int fd=fd_alloc(c); if(fd<0) return -1; c->fds[fd].inode=ino; c->fds[fd].flags=flags; return fd; }
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1; c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
@@ -75,7 +167,7 @@ int ksys_write(int fd, const void* buf, int len){ extern process_t* sched_get_cu
     if(fd<0||fd>=32||!c->fds[fd].used) return -1; vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->write) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->write(ino, off, buf, (size_t)len); if(r>0) c->fds[fd].offset += (uint64_t)r; return r; }
 
 uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4){
-    (void)a3; (void)a4;
+    (void)a4;
     switch(num){
     case SYS_GETPID:
         return (uint64_t)ksys_getpid();
@@ -177,6 +269,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
 
     /* [M16] SYS_WAIT and [M17] SYS_MSG_RECV / SYS_SLEEP are handled in
      * syscall_trap.c (they may block the caller and need the trapframe). */
+
+    case SYS_BRK:
+        return ksys_brk(a0);
+    case SYS_MMAP:
+        return ksys_mmap(a0, a1, (int)a2, (int)a3);
+    case SYS_MUNMAP:
+        return (uint64_t)(int64_t)ksys_munmap(a0, a1);
+    case SYS_MPROTECT:
+        return (uint64_t)(int64_t)ksys_mprotect(a0, a1, (int)a2);
 
     case SYS_DRIVER: {
         /*

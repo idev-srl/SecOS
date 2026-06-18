@@ -294,6 +294,31 @@ grep -q "\[sleep\] OK slept >=10" "$M17LOG"; check "M17 SYS_SLEEP blocks for the
 grep -q "\[M17\] DONE" "$M17LOG"; check "M17 demo completed ([M17] DONE)" $?
 ! grep -q "\[EXC\]" "$M17LOG"; check "no CPU exception ([EXC]) during M17 run" $?
 
+# ---- M18: dynamic memory (malloc/free over sbrk, mmap, mprotect, W^X) ----
+M18LOG=/tmp/secos_selftest_m18.log
+echo "[selftest] Building M18 image (M18_MEM_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make CFLAGS_EXTRA=-DM18_MEM_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M18 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M18 (mb2, ${TIMEOUT}s)..."
+tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$M18LOG" >/dev/null 2>&1 || true
+
+# malloc/free over sbrk (multi-page, demand-faulted) + free-list reuse.
+grep -q "\[m18\] malloc rw OK" "$M18LOG"; check "M18 malloc/sbrk multi-page read-write" $?
+grep -q "\[m18\] free+reuse OK" "$M18LOG"; check "M18 free + malloc reuses the block" $?
+# anonymous mmap read-write.
+grep -q "\[m18\] mmap rw OK" "$M18LOG"; check "M18 anonymous mmap read-write" $?
+# W^X enforced on both mmap and mprotect.
+grep -q "\[m18\] mmap W+X refused OK" "$M18LOG"; check "M18 mmap W+X rejected (W^X)" $?
+grep -q "\[m18\] mprotect W+X refused OK" "$M18LOG"; check "M18 mprotect W+X rejected (W^X)" $?
+# mprotect to read-only is enforced: read still works, write is fatal.
+grep -q "\[m18\] read-after-RO OK" "$M18LOG"; check "M18 read works after mprotect read-only" $?
+! grep -q "STILL ALIVE after RO write" "$M18LOG"; check "M18 write to RO page is fatal (mprotect enforced)" $?
+grep -q "\[KILL\] pid=" "$M18LOG"; check "M18 RO write terminates the process ([KILL])" $?
+grep -q "\[M18\] DONE" "$M18LOG"; check "M18 demo completed ([M18] DONE)" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

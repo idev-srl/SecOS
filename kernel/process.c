@@ -229,6 +229,8 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->exit_code = 0;
     p->wait_pid = -1; p->wait_result = 0; p->wait_ready = 0;
     p->sleep_until = 0; p->recv_chan = -1;
+    p->brk_start = USER_HEAP_BASE; p->brk_cur = USER_HEAP_BASE;
+    p->mmap_next = USER_MMAP_BASE; p->mem_limit = 0;
     p->user_mem_bytes = footprint;
     p->mapped_page_count = (uint32_t)(footprint / 4096ULL);
     // Manifest stub
@@ -262,6 +264,8 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
                     kfree(p);
                     return NULL;
                 }
+                // [M18] Remember the limit so brk/mmap can enforce it at runtime.
+                p->mem_limit = mf->max_mem;
             }
             p->manifest = mf;
             // [M11] Driver Space: the signed manifest is the trust root for the

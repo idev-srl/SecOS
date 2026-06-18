@@ -66,6 +66,7 @@ void vmm_wx_selftest(void);
 // Unmap a 4K page
 int vmm_unmap(uint64_t virt);
 int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt);
+int vmm_protect_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags); // [M18] change page prot
 
 // Translate virtual -> physical (return 0 if not mapped)
 uint64_t vmm_translate(uint64_t virt);
@@ -157,9 +158,12 @@ uint64_t vmm_alloc_ist_stack(uint64_t guard_lo, uint64_t base, uint64_t top,
                               uint64_t guard_hi, int ist_num);
 
 // ---- User space (phase 1b) ----
-#define USER_CODE_BASE  0x0000000100000000ULL
-#define USER_DATA_BASE  0x0000000200000000ULL
-#define USER_STACK_TOP  0x00000003FFF00000ULL
+#define USER_CODE_BASE  0x0000000100000000ULL  //  4 GB: ELF code
+#define USER_DATA_BASE  0x0000000200000000ULL  //  8 GB: ELF data/bss
+#define USER_HEAP_BASE  0x0000000280000000ULL  // 10 GB: brk/sbrk heap (grows up)  [M18]
+#define USER_MMAP_BASE  0x0000000300000000ULL  // 12 GB: mmap arena (grows up)     [M18]
+#define USER_MMAP_END   0x00000003F0000000ULL  // below the stack guard band       [M18]
+#define USER_STACK_TOP  0x00000003FFF00000ULL  // 16 GB: stack top (grows down)
 
 int vmm_alloc_user_page(uint64_t virt);       // RW/NX
 int vmm_map_user_code(uint64_t virt);         // RX

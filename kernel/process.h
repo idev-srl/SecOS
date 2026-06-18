@@ -50,6 +50,13 @@ typedef struct process {
     vma_set_t vmas;
     uint8_t*  image;
     size_t    image_size;
+    // [M18] Dynamic memory: brk heap (single growable ANON region) + mmap arena
+    // (bump allocator). mem_limit mirrors the signed manifest max_mem (0 =
+    // unlimited) and bounds runtime growth so a process can't exceed its limit.
+    uint64_t  brk_start;
+    uint64_t  brk_cur;
+    uint64_t  mmap_next;
+    uint64_t  mem_limit;
     int      exit_code;      // [M15] 0=normal (SYS_EXIT); 128+vec=killed by fault
     // [M16/M17] Blocking state. While PROC_BLOCKED, exactly one wait condition is
     // armed; the matching wake (child exit / timer tick / channel send) flips the

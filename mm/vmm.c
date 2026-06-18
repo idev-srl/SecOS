@@ -958,6 +958,24 @@ int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
     return 0;
 }
 
+// [M18] Change the protection flags of an already-present page (keep its frame).
+// Returns 0 if the PTE was updated, -3 if not present (caller relies on the VMA
+// flags to apply on the next fault), or a W^X/error code. The TLB is flushed by
+// the caller's CR3 reload at the next context switch (or a manual invlpg).
+int vmm_protect_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
+    if (!space) return -10;
+    if (virt & 0xFFF) return -1;
+    if ((flags & VMM_FLAG_RW) && !(flags & VMM_FLAG_NOEXEC)) return -5; // W^X
+    uint64_t* pt = get_pt_space(space, virt, 0, 0);
+    if (!pt) return -3;
+    int pt_i = (virt >> 12) & 0x1FF;
+    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3;
+    uint64_t phys = pt[pt_i] & ADDRESS_MASK;
+    pt[pt_i] = phys | (flags & ~VMM_FLAG_PS) | VMM_FLAG_PRESENT | VMM_FLAG_USER;
+    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    return 0;
+}
+
 uint64_t vmm_translate(uint64_t virt) {
     uint64_t* pt = get_pt(virt, 0, 0);
     if (!pt) return 0;

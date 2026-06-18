@@ -188,7 +188,12 @@ user-progs:
 	$(LD) -T user/user.ld -o user/m17_sleeper.elf user/crt0.o user/note.o user/libsecos.o user/m17_sleeper.o
 	python3 tools/secos-sign user/m17_sleeper.elf --dev
 	python3 tools/elf2h.py user/m17_sleeper.elf user_m17_sleeper_elf crypto/user_m17_sleeper_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper -> crypto/*.h"
+	# [M18] dynamic memory: malloc/free + mmap/mprotect
+	$(CC) $(USER_CFLAGS) -c user/m18_mem.c     -o user/m18_mem.o
+	$(LD) -T user/user.ld -o user/m18_mem.elf user/crt0.o user/note.o user/libsecos.o user/m18_mem.o
+	python3 tools/secos-sign user/m18_mem.elf --dev
+	python3 tools/elf2h.py user/m18_mem.elf user_m18_mem_elf crypto/user_m18_mem_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem -> crypto/*.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke
