@@ -113,7 +113,12 @@ void usb_attach(usb_device_t* d) {
     debugcon_writestring(" proto=0x"); debugcon_print_hex(iface_proto);
     debugcon_writestring(" neps="); debugcon_print_hex((uint64_t)nep); debugcon_writestring("\n");
 
-    if (iface_class == USB_CLASS_HID && iface_proto == 1) {   // boot keyboard
+    if (d->dev_class == USB_CLASS_HUB || iface_class == USB_CLASS_HUB) {
+        // USB hub (M22 hub support — NOT YET TESTED on real hardware, no hub in
+        // QEMU CI). Power + reset downstream ports and enumerate behind it.
+        d->class_id = USB_CLASS_HUB;
+        usb_hub_attach(d, eps, nep, iface_num);
+    } else if (iface_class == USB_CLASS_HID && iface_proto == 1) {   // boot keyboard
         d->class_id = USB_CLASS_HID;
         usb_hid_attach(d, eps, nep, iface_num);
     } else if (iface_class == USB_CLASS_MSC && iface_sub == 0x06 /* SCSI */) {

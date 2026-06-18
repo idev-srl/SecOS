@@ -267,10 +267,18 @@ int xhci_configure_endpoints(usb_device_t* d, const usb_endpoint_t* eps, int n) 
         ec[4] = eps[i].max_packet;        // average TRB length ~ max packet
     }
     ctx_dw(in, 0)[1] = add;               // input control: add flags
-    // Slot context: keep speed/port, bump Context Entries to the highest DCI.
+    // Slot context: keep route/speed/root-port, bump Context Entries to the
+    // highest DCI. For a root device route_string=0 and root_port==port, so this
+    // is byte-for-byte identical to the original (M22 hub support adds the route
+    // string / TT info for routed devices — NOT YET TESTED on real hardware).
     uint32_t* slot = ctx_dw(in, 1);
-    slot[0] = ((uint32_t)d->speed << 20) | ((uint32_t)max_dci << 27);
-    slot[1] = ((uint32_t)d->port << 16);
+    slot[0] = (d->route_string & 0xFFFFFu) | ((uint32_t)d->speed << 20) |
+              ((uint32_t)max_dci << 27);
+    slot[1] = ((uint32_t)d->root_port << 16);
+    if (d->parent_slot != 0 && d->speed <= 2) {
+        slot[2] = ((uint32_t)d->parent_slot & 0xFF) |
+                  (((uint32_t)d->parent_port & 0xFF) << 8);
+    }
     int cc = cmd_run((uint32_t)phys_of(in), (uint32_t)(phys_of(in) >> 32), 0,
                      TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot_id << 24), NULL);
     return (cc == CC_SUCCESS) ? 0 : -1;
@@ -358,49 +366,99 @@ static int port_reset(int p) {
     return (int)((sc >> 10) & 0xF);
 }
 
-void xhci_enumerate(void) {
+// Enable Slot + Address Device, shared by the root-port path and the hub-routed
+// path. `port` is the device's own (downstream or root) port number used only for
+// display + d->port; `route_string`/`root_port`/`parent_slot`/`parent_port`/`tier`
+// describe the topology. For a root-port device (parent_slot==0, route==0, tier==0)
+// slot-context dword2 is left zero — byte-for-byte identical to the original code.
+// Returns the addressed device, or NULL on failure.
+static usb_device_t* xhci_address_common(int port, int speed, uint32_t route_string,
+                                         int root_port, int parent_slot,
+                                         int parent_port, int tier) {
     extern void usb_attach(usb_device_t* d);
+    if (g_ndev >= MAX_DEV) return NULL;
+    // Enable a device slot.
+    int slot = 0;
+    int cc = cmd_run(0, 0, 0, TRB_TYPE(TRB_ENABLE_SLOT), &slot);
+    if (cc != CC_SUCCESS || slot <= 0 || slot >= 256) {
+        debugcon_writestring("[XHCI] enable slot failed\n"); return NULL;
+    }
+    usb_device_t* d = &g_dev[g_ndev];
+    d->slot_id = slot; d->port = port; d->speed = speed; d->devidx = g_ndev;
+    d->route_string = route_string; d->root_port = root_port;
+    d->parent_slot = parent_slot; d->parent_port = parent_port; d->tier = tier;
+    d->input_ctx = d_input[g_ndev]; d->output_ctx = d_output[g_ndev];
+    d->n_epr = 0; d->class_id = 0; d->class_priv = NULL;
+    ring_init(&d->ep0, d_ep0[g_ndev], 1);
+    zero(d->output_ctx, sizeof(d_output[0]));
+    g_dcbaa[slot] = phys_of(d->output_ctx);
+
+    // Address Device: input ctx with A0 (slot) + A1 (EP0).
+    uint8_t* in = d->input_ctx;
+    zero(in, sizeof(d_input[0]));
+    ctx_dw(in, 0)[1] = (1u << 0) | (1u << 1);
+    uint32_t* sc = ctx_dw(in, 1);
+    // dword0: route string (bits 0:19) | speed (bits 20:23) | context entries (27:31).
+    sc[0] = (route_string & 0xFFFFFu) | ((uint32_t)speed << 20) | (1u << 27);
+    // dword1: root hub port number (bits 16:23).
+    sc[1] = ((uint32_t)root_port << 16);
+    // dword2 (routed devices only): for a FS/LS device behind a HS hub, the xHC
+    // needs the Transaction Translator's hub slot + port. Leave zero for a root
+    // device so the root path is unchanged.  Parent hub slot id (bits 0:7) is
+    // also informative for the controller's topology tracking.
+    if (parent_slot != 0) {
+        uint32_t dw2 = 0;
+        // TT hub slot id + TT port number for a LS/FS device behind a HS hub.
+        if (speed <= 2) {   // 1=FS, 2=LS, 3=HS, 4=SS
+            dw2 |= ((uint32_t)parent_slot & 0xFF);          // TT Hub Slot ID (0:7)
+            dw2 |= ((uint32_t)parent_port & 0xFF) << 8;     // TT Port Number (8:15)
+        }
+        sc[2] = dw2;
+    }
+    uint16_t mps0 = (speed == 4) ? 512 : (speed == 3) ? 64 : 8;
+    uint32_t* ep0 = ctx_dw(in, 2);
+    ep0[1] = (4u << 3) | (3u << 1) | ((uint32_t)mps0 << 16);
+    ep0[2] = (uint32_t)d->ep0.phys | 1u;
+    ep0[3] = (uint32_t)(d->ep0.phys >> 32);
+    ep0[4] = 8;
+    cc = cmd_run((uint32_t)phys_of(in), (uint32_t)(phys_of(in) >> 32), 0,
+                 TRB_TYPE(TRB_ADDRESS_DEV) | ((uint32_t)slot << 24), NULL);
+    if (cc != CC_SUCCESS) { debugcon_writestring("[XHCI] address device failed\n"); return NULL; }
+
+    debugcon_writestring("[XHCI] port "); debugcon_print_hex((uint64_t)port);
+    debugcon_writestring(" slot "); debugcon_print_hex((uint64_t)slot);
+    debugcon_writestring(" speed "); debugcon_print_hex((uint64_t)speed);
+    if (route_string) { debugcon_writestring(" route 0x"); debugcon_print_hex((uint64_t)route_string); }
+    debugcon_writestring(" addressed\n");
+    g_ndev++;
+    usb_attach(d);   // USB core: descriptors, set config, class bind
+    return d;
+}
+
+void xhci_enumerate(void) {
     for (uint32_t p = 1; p <= g_max_ports && g_ndev < MAX_DEV; p++) {
         int speed = port_reset((int)p);
         if (speed == 0) continue;
-        // Enable a device slot.
-        int slot = 0;
-        int cc = cmd_run(0, 0, 0, TRB_TYPE(TRB_ENABLE_SLOT), &slot);
-        if (cc != CC_SUCCESS || slot <= 0 || slot >= 256) {
-            debugcon_writestring("[XHCI] enable slot failed\n"); continue;
-        }
-        usb_device_t* d = &g_dev[g_ndev];
-        d->slot_id = slot; d->port = (int)p; d->speed = speed; d->devidx = g_ndev;
-        d->input_ctx = d_input[g_ndev]; d->output_ctx = d_output[g_ndev];
-        d->n_epr = 0; d->class_id = 0; d->class_priv = NULL;
-        ring_init(&d->ep0, d_ep0[g_ndev], 1);
-        zero(d->output_ctx, sizeof(d_output[0]));
-        g_dcbaa[slot] = phys_of(d->output_ctx);
-
-        // Address Device: input ctx with A0 (slot) + A1 (EP0).
-        uint8_t* in = d->input_ctx;
-        zero(in, sizeof(d_input[0]));
-        ctx_dw(in, 0)[1] = (1u << 0) | (1u << 1);
-        uint32_t* sc = ctx_dw(in, 1);
-        sc[0] = ((uint32_t)speed << 20) | (1u << 27);   // context entries = 1
-        sc[1] = ((uint32_t)p << 16);                    // root hub port number
-        uint16_t mps0 = (speed == 4) ? 512 : (speed == 3) ? 64 : 8;
-        uint32_t* ep0 = ctx_dw(in, 2);
-        ep0[1] = (4u << 3) | (3u << 1) | ((uint32_t)mps0 << 16);
-        ep0[2] = (uint32_t)d->ep0.phys | 1u;
-        ep0[3] = (uint32_t)(d->ep0.phys >> 32);
-        ep0[4] = 8;
-        cc = cmd_run((uint32_t)phys_of(in), (uint32_t)(phys_of(in) >> 32), 0,
-                     TRB_TYPE(TRB_ADDRESS_DEV) | ((uint32_t)slot << 24), NULL);
-        if (cc != CC_SUCCESS) { debugcon_writestring("[XHCI] address device failed\n"); continue; }
-
-        debugcon_writestring("[XHCI] port "); debugcon_print_hex(p);
-        debugcon_writestring(" slot "); debugcon_print_hex((uint64_t)slot);
-        debugcon_writestring(" speed "); debugcon_print_hex((uint64_t)speed);
-        debugcon_writestring(" addressed\n");
-        g_ndev++;
-        usb_attach(d);   // USB core: descriptors, set config, class bind
+        // Root-port device: route 0, no parent, tier 0, root port == this port.
+        xhci_address_common((int)p, speed, 0u, (int)p, 0, 0, 0);
     }
+}
+
+// USB hub support (M22) — NOT YET TESTED on real hardware (no hub in QEMU CI).
+// Append a downstream port number to a parent's route string (xHCI 8.9): each
+// hub tier occupies one 4-bit nibble; tier 0 (root hub) contributes nibble 0.
+uint32_t xhci_route_append(uint32_t parent_route, int parent_tier, int down_port) {
+    if (parent_tier >= 5) return parent_route;     // route string holds 5 tiers max
+    uint32_t pn = (uint32_t)(down_port & 0xF);
+    return parent_route | (pn << (4 * parent_tier));
+}
+
+// USB hub support (M22) — NOT YET TESTED on real hardware (no hub in QEMU CI).
+usb_device_t* xhci_attach_hub_device(int parent_slot, int parent_port,
+                                     int root_port, uint32_t route_string,
+                                     int tier, int speed) {
+    return xhci_address_common(parent_port, speed, route_string, root_port,
+                               parent_slot, parent_port, tier);
 }
 
 int xhci_init(void) {
