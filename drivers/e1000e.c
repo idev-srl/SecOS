@@ -84,8 +84,8 @@
 #define RXD_STAT_DD   (1u << 0)    // Descriptor Done
 #define RXD_STAT_EOP  (1u << 1)    // End Of Packet
 
-#define E1000_RX_DESCS 32
-#define E1000_TX_DESCS 32
+#define E1000_RX_DESCS 256  /* [M25] deeper RX ring (was 32) to absorb bursts between polls */
+#define E1000_TX_DESCS 64   /* [M25] deeper TX ring (was 32) for back-to-back sends */
 #define E1000_BUF_SIZE 2048
 
 /* Legacy receive descriptor (16 bytes). */

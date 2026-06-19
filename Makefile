@@ -54,6 +54,8 @@ SRC_C   = \
 	$(KERNEL_DIR)/syscall_trap.c \
 	$(KERNEL_DIR)/driver_if.c \
 	$(KERNEL_DIR)/ipc.c \
+	$(KERNEL_DIR)/pipe.c \
+	$(KERNEL_DIR)/tty.c \
 	$(KERNEL_DIR)/selftest.c \
 	user/testdriver.c \
 	$(LIB_DIR)/terminal.c \
@@ -244,7 +246,12 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/m24_nonet.elf user/crt0.o user/note.o user/libsecos.o user/m24_net.o
 	python3 tools/secos-sign user/m24_nonet.elf --dev
 	python3 tools/elf2h.py user/m24_nonet.elf user_m24nonet_elf crypto/user_m24nonet_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} -> crypto/*.h"
+	# [M25] anonymous pipes across fork
+	$(CC) $(USER_CFLAGS) -c user/m25_pipe.c    -o user/m25_pipe.o
+	$(LD) --gc-sections -T user/user.ld -o user/m25_pipe.elf user/crt0.o user/note.o user/libsecos.o user/m25_pipe.o
+	python3 tools/secos-sign user/m25_pipe.elf --dev
+	python3 tools/elf2h.py user/m25_pipe.elf user_m25_pipe_elf crypto/user_m25_pipe_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe -> crypto/*.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke

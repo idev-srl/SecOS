@@ -607,11 +607,15 @@ void shell_run(void) {
         if (c == '\n') {
             terminal_putchar('\n');
             command[pos] = '\0';
-            
+
             if (pos > 0) {
                 execute_command(command);
             }
-            
+
+            pos = 0;
+            show_prompt();
+        } else if (c == 0x03) {            // [M25] Ctrl-C: cancel the current line
+            terminal_writestring("^C\n");
             pos = 0;
             show_prompt();
         } else if (c == '\b') {
@@ -619,7 +623,7 @@ void shell_run(void) {
                 pos--;
                 terminal_putchar('\b');
             }
-        } else if (pos < MAX_COMMAND_LEN - 1) {
+        } else if (c >= 0x20 && c < 0x7f && pos < MAX_COMMAND_LEN - 1) {
             command[pos++] = c;
             terminal_putchar(c);
         }

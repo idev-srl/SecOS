@@ -18,6 +18,7 @@ void sched_block_current(trapframe_t* tf); // [M16/M17] block caller (re-runs sy
 void sched_wake_waitpid(uint32_t pid, int code); // [M16] wake a SYS_WAIT blocker
 void sched_wake_sleepers(uint64_t now);    // [M17] wake elapsed SYS_SLEEP blockers
 void sched_wake_chan(int chan);            // [M17] wake SYS_MSG_RECV blockers on chan
+void sched_wake_pipe(void* pp);            // [M25] wake pipe read/write blockers on pp
 void sched_reap_zombies(void);             // free ZOMBIE processes (not current)
 int  sched_count_alive_user(void);         // user processes not yet ZOMBIE
 

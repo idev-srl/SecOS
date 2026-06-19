@@ -67,11 +67,14 @@ typedef struct process {
     uint8_t  wait_ready;     // [M16] 1 = wait_result is valid (child already gone)
     uint64_t sleep_until;    // [M17] wake when timer_get_ticks() >= this (0 = n/a)
     int      recv_chan;      // [M17] IPC channel the caller is blocked receiving on (-1)
+    void*    wait_pipe;      // [M25] pipe object the caller is blocked on (NULL = none)
     // Runtime metrics
     uint64_t cpu_ticks;      // accumulated CPU ticks (scheduler)
     uint64_t user_mem_bytes; // virtual memory footprint (updated at creation / future extensions)
     // Simple file descriptor table
-    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; } fds[32];
+    // [M25] When is_pipe, `inode` holds a pipe_t* and pipe_w selects the end
+    // (1 = write end, 0 = read end). Otherwise `inode` is a vfs_inode_t*.
+    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; } fds[32];
 } process_t;
 
 int process_init_system(void); // initialize process table

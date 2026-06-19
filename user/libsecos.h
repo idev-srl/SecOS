@@ -60,6 +60,9 @@ void    free(void* p);
 /* [M19] copy-on-write fork */
 int     fork(void);
 
+/* [M25] anonymous pipe: fds[0]=read end, fds[1]=write end. 0 on success, -1 on error. */
+int     pipe(int fds[2]);
+
 /* [M24] BSD-style sockets (require CAP_NET in the signed manifest). ip is
  * network-order octets (octet0 in the low byte), port is host order. */
 #define SOCK_STREAM 1

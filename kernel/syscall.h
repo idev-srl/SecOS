@@ -34,6 +34,7 @@
 #define SYS_SENDTO   28 // sendto(fd, buf, len, sockaddr*)   UDP
 #define SYS_RECVFROM 29 // recvfrom(fd, buf, len, sockaddr*) UDP
 #define SYS_SOCKCLOSE 30// close a socket descriptor
+#define SYS_PIPE     31 // [M25] pipe(int fds[2]) -> fds[0]=read end, fds[1]=write end
 
 // [M24] socket types
 #define SOCK_STREAM 1   // TCP
@@ -97,6 +98,8 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot);
 // [M23] file positioning + stat
 long ksys_lseek(int fd, long offset, int whence);
 int  ksys_stat(const char* path, struct secos_stat* st);
+// [M25] anonymous pipe: allocate a pipe, return two fds (kfds[0]=read, kfds[1]=write)
+int  ksys_pipe(int kfds[2]);
 
 // Driver interface forward declaration (struct defined in driver_if.h)
 struct driver_call;

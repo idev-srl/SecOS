@@ -135,6 +135,22 @@ uint64_t syscall_handler(trapframe_t* tf) {
             ret = 0;
         }
     }
+    // [M25] SYS_READ / SYS_WRITE on a pipe may block. ksys_read/ksys_write return
+    // -2 ("would block") when the pipe is empty (read) or full (write) with the
+    // peer still open; arm wait_pipe and re-run the syscall on wake. EOF/EPIPE
+    // (0 / -1) and all non-pipe reads/writes fall straight through.
+    else if (num == SYS_READ || num == SYS_WRITE) {
+        ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
+        if (ret == (uint64_t)(int64_t)(-2) && cur) {
+            int fd = (int)tf->rdi;
+            if (fd >= 0 && fd < 32 && cur->fds[fd].used && cur->fds[fd].is_pipe) {
+                cur->wait_pipe = cur->fds[fd].inode;
+                tf->rip -= 2;                           // re-run `int 0x80` on wake
+                sched_block_current(tf);                // NORETURN (switches away)
+                ret = 0;                                 // not reached
+            }
+        }
+    }
     else {
         ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
     }

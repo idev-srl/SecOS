@@ -465,6 +465,23 @@ grep -q "\[M23\] persistent ext2 root on" "$M23RLOG"; check "M23 persistent ext2
 ! grep -q "\[VFS\] root RAMFS mounted" "$M23RLOG"; check "M23 RAMFS root skipped when ext2 root present" $?
 ! grep -q "\[EXC\]" "$M23RLOG"; check "no CPU exception ([EXC]) during M23 persistent-root boot" $?
 
+# ---- M25: anonymous pipes across fork (blocking read + EOF) ----
+M25LOG=/tmp/secos_selftest_m25.log
+echo "[selftest] Building M25 image (M25_PIPE_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make CFLAGS_EXTRA=-DM25_PIPE_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M25 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M25 (mb2, ${TIMEOUT}s)..."
+tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$M25LOG" >/dev/null 2>&1 || true
+grep -q "\[m25\] child read: " "$M25LOG"; check "M25 child reads parent's pipe data (blocking)" $?
+grep -q "M25-PIPE-OK" "$M25LOG"; check "M25 pipe payload delivered intact" $?
+grep -q "\[m25\] child got EOF OK" "$M25LOG"; check "M25 pipe EOF after write end closed" $?
+grep -q "\[m25\] DONE-USER" "$M25LOG"; check "M25 pipe demo program completed" $?
+grep -q "\[M25\] DONE" "$M25LOG"; check "M25 demo completed ([M25] DONE)" $?
+! grep -q "\[EXC\]" "$M25LOG"; check "no CPU exception ([EXC]) during M25 run" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

@@ -309,7 +309,13 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->regs.rax = p->regs.rbx = p->regs.rcx = p->regs.rdx = 0;
     p->regs.rsi = p->regs.rdi = p->regs.rbp = 0;
     // Init fd table
-    for(int i=0;i<32;i++){ p->fds[i].inode=NULL; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].used=0; }
+    for(int i=0;i<32;i++){ p->fds[i].inode=NULL; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].used=0; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; }
+    // [M25] Reserve fds 0/1/2 as stdin/stdout/stderr so open()/pipe() allocate
+    // from fd 3 up (otherwise a pipe end would land on fd 0/1/2 and collide with
+    // the console special-cases in ksys_read/ksys_write). They carry no inode —
+    // the std-stream paths are keyed on the fd number.
+    p->fds[0].used=1; p->fds[1].used=1; p->fds[2].used=1;
+    p->wait_pipe=NULL; // [M25]
     if (proc_add(p)!=0) {
         terminal_writestring("[PROC] table full\n");
         if (p->manifest) kfree(p->manifest);
@@ -426,8 +432,17 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
 
     c->wait_pid = -1; c->wait_result = 0; c->wait_ready = 0;
     c->sleep_until = 0; c->recv_chan = -1; c->exit_code = 0; c->cpu_ticks = 0;
+    c->wait_pipe = NULL;                       // [M25] not blocked on a pipe
     c->proc_type = PROC_TYPE_USER; c->drv_dev_id = -1; c->drv_caps = 0;
     c->state = PROC_BLOCKED;                   // not runnable until fully built
+
+    // [M25] The child inherits the parent's open pipe ends (fds were shallow
+    // copied) — bump each inherited end's refcount so EOF/EPIPE accounting stays
+    // correct across fork. The pipe object itself is shared (kernel-owned).
+    { extern void pipe_ref(void*, int);
+      for (int i = 0; i < 32; i++)
+          if (c->fds[i].used && c->fds[i].is_pipe)
+              pipe_ref(c->fds[i].inode, c->fds[i].pipe_w); }
 
     if (proc_add(c) != 0) {
         kfree(c->tf); if (c->manifest) kfree(c->manifest); if (c->image) kfree(c->image);
@@ -463,6 +478,14 @@ int process_destroy(process_t* p) {
     // [M24] Close any sockets this process still owns (frees TCP conns + UDP binds).
     extern void socket_owner_cleanup(uint32_t pid);
     socket_owner_cleanup(p->pid);
+    // [M25] Drop any still-open pipe ends so the peer observes EOF/EPIPE and the
+    // pipe object is freed once both ends are gone.
+    { extern void pipe_unref(void*, int);
+      for (int i = 0; i < 32; i++)
+          if (p->fds[i].used && p->fds[i].is_pipe) {
+              pipe_unref(p->fds[i].inode, p->fds[i].pipe_w);
+              p->fds[i].is_pipe = 0; p->fds[i].used = 0;
+          } }
     extern int elf_unload_process(process_t* p);
     elf_unload_process(p);                       // unmap + free user page frames, zero PTEs
     if (p->manifest) { kfree(p->manifest); p->manifest = NULL; }

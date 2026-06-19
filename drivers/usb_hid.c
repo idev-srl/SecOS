@@ -58,6 +58,7 @@ static int key_in_report(const uint8_t* rep, uint8_t code) {
 static void process_report(void) {
     uint8_t mods = g_report[0];
     int shift = (mods & 0x22) != 0;   // L/R shift
+    int ctrl  = (mods & 0x11) != 0;   // [M25] L/R ctrl -> control codes
     for (int i = 2; i < 8; i++) {
         uint8_t code = g_report[i];
         if (code == 0 || code == 1) continue;             // none / rollover
@@ -66,6 +67,7 @@ static void process_report(void) {
         if (code >= 0x68) continue;
         char c = shift ? hid_shift[code] : hid_unshift[code];
         if (!shift && g_caps && c >= 'a' && c <= 'z') c -= 32;
+        if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) c = (char)(c & 0x1F);  // [M25]
         if (c) {
 #ifdef HID_DEBUG_INJECT
             debugcon_writestring("[HID] key 0x"); debugcon_print_hex((uint64_t)(uint8_t)c); debugcon_writestring("\n");

@@ -58,8 +58,8 @@
 #define TCTL_CT    (0x0F << 4)
 #define TCTL_COLD  (0x40 << 12)
 
-#define RX_DESC 64
-#define TX_DESC 16
+#define RX_DESC 256   /* [M25] deeper RX ring (was 64) to absorb bursts between polls */
+#define TX_DESC 64    /* [M25] deeper TX ring (was 16) for back-to-back sends */
 #define BUF_SZ  2048
 
 struct rx_desc { uint64_t addr; uint16_t len; uint16_t csum; uint8_t status; uint8_t errors; uint16_t special; } __attribute__((packed));

@@ -18,8 +18,12 @@ extern uint64_t timer_get_ticks(void);
 
 #define IP_PROTO_TCP 6
 #define TCP_MAX_CONN 16
-#define TCP_RXBUF    8192
-#define TCP_TXBUF    8192
+/* [M25] 64 KiB send/receive buffers. The advertised receive window is
+ * min(TCP_RXBUF - rx_len, 65535) — 64 KiB is the largest window expressible
+ * without the window-scaling option, so this raises the window/RTT throughput
+ * ceiling ~8x over the old 8 KiB. (16 conns * 128 KiB ~= 2 MiB static BSS.) */
+#define TCP_RXBUF    65536
+#define TCP_TXBUF    65536
 #define TCP_MSS      1460
 #define TCP_RTO      600           /* ~600 ms at 1 kHz */
 #define TCP_MAX_RETX 6

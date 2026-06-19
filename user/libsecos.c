@@ -108,6 +108,9 @@ void free(void* p){ if (!p) return; mblock_t* b = (mblock_t*)p - 1; b->is_free =
 /* [M19] copy-on-write fork: returns child pid in the parent, 0 in the child. */
 int fork(void){ return (int)secos_syscall(SYS_FORK, 0, 0, 0, 0, 0); }
 
+/* [M25] anonymous pipe: fds[0]=read end, fds[1]=write end. Returns 0 or -1. */
+int pipe(int fds[2]){ return (int)secos_syscall(31 /*SYS_PIPE*/, (long)fds, 0, 0, 0, 0); }
+
 /* [M24] BSD-style sockets. Require CAP_NET in the signed manifest, else -1.
  * ip is network-order octets (octet0 in the low byte); port is host order. */
 int socket(int type){ return (int)secos_syscall(SYS_SOCKET, type, 0, 0, 0, 0); }

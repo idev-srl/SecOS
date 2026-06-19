@@ -16,6 +16,7 @@
 #include "../mm/user_copy.h"
 #include "../mm/pagecache.h"  // [M20] unified file page cache
 #include "socket.h"           // [M24] kernel-side socket layer (-Inet)
+#include "pipe.h"             // [M25] anonymous pipes
 
 extern uint64_t timer_get_ticks(void);
 
@@ -23,7 +24,19 @@ extern uint64_t timer_get_ticks(void);
 #define SPAWN_MAX_ARGS 8
 #define SPAWN_ARG_LEN  128
 
-static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; return i; } } return -1; }
+static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; return i; } } return -1; }
+
+// [M25] pipe(): allocate a pipe object and two fds (read end + write end).
+int ksys_pipe(int kfds[2]){
+    extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
+    pipe_t* p = pipe_alloc(); if(!p) return -1;
+    int rfd=fd_alloc(c); if(rfd<0){ pipe_unref(p,0); pipe_unref(p,1); return -1; }
+    int wfd=fd_alloc(c); if(wfd<0){ c->fds[rfd].used=0; pipe_unref(p,0); pipe_unref(p,1); return -1; }
+    c->fds[rfd].inode=p; c->fds[rfd].is_pipe=1; c->fds[rfd].pipe_w=0;  // read end
+    c->fds[wfd].inode=p; c->fds[wfd].is_pipe=1; c->fds[wfd].pipe_w=1;  // write end
+    kfds[0]=rfd; kfds[1]=wfd;
+    return 0;
+}
 
 int ksys_getpid(void){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); return c? (int)c->pid : 0; }
 
@@ -167,8 +180,15 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
 }
 void ksys_exit(int status){ (void)status; extern process_t* sched_get_current(void); extern int process_destroy(process_t*); process_t* c=sched_get_current(); if(c){ process_destroy(c); } }
 int ksys_open(const char* path, int flags){ (void)flags; extern vfs_inode_t* vfs_lookup(const char*); extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -1; int fd=fd_alloc(c); if(fd<0) return -1; c->fds[fd].inode=ino; c->fds[fd].flags=flags; return fd; }
-int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1; c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
-int ksys_read(int fd, void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32||!c->fds[fd].used) return -1; vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->read) return -1;
+int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
+    if(c->fds[fd].is_pipe){ pipe_unref((pipe_t*)c->fds[fd].inode, c->fds[fd].pipe_w); c->fds[fd].is_pipe=0; }  // [M25] drop end, may signal EOF/EPIPE
+    c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
+int ksys_read(int fd, void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
+    // [M25] fd 0 (stdin) -> the console TTY cooked line discipline (ring-3 input).
+    if(fd==0){ extern int tty_read(void* buf, int len); return tty_read(buf, len); }
+    if(fd<0||fd>=32||!c->fds[fd].used) return -1;
+    if(c->fds[fd].is_pipe){ if(c->fds[fd].pipe_w) return -1; return pipe_read((pipe_t*)c->fds[fd].inode, buf, len); } // [M25] read end only
+    vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->read) return -1;
     // [M20] Read through the unified page cache so file read() and file-backed
     // mmap see the same pages (coherent). [M23] Virtual FSes (devfs/procfs/sysfs)
     // are dynamic — bypass the cache and read live via ->read().
@@ -181,7 +201,9 @@ int ksys_write(int fd, const void* buf, int len){ extern process_t* sched_get_cu
     // user_range_valid()'d by the SYS_WRITE dispatcher; CR3 is the caller's
     // address space during the syscall, so reading it directly is safe.
     if(fd==1||fd==2){ const char* p=(const char*)buf; for(int i=0;i<len;i++){ terminal_putchar(p[i]); debugcon_putchar(p[i]); } return len; }
-    if(fd<0||fd>=32||!c->fds[fd].used) return -1; vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->write) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->write(ino, off, buf, (size_t)len); if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); } return r; }
+    if(fd<0||fd>=32||!c->fds[fd].used) return -1;
+    if(c->fds[fd].is_pipe){ if(!c->fds[fd].pipe_w) return -1; return pipe_write((pipe_t*)c->fds[fd].inode, buf, len); } // [M25] write end only
+    vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->write) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->write(ino, off, buf, (size_t)len); if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); } return r; }
 
 long ksys_lseek(int fd, long offset, int whence){
     extern process_t* sched_get_current(void);
@@ -331,6 +353,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         int r = ksys_stat(path, &st);
         if (r != 0) return (uint64_t)(int64_t)r;
         if (copy_to_user((void*)a1, &st, sizeof(st)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return 0;
+    }
+
+    case SYS_PIPE: {
+        /* [M25] pipe(int fds[2]): kernel-side alloc, then copy the two fds out. */
+        int kfds[2];
+        int r = ksys_pipe(kfds);
+        if (r != 0) return (uint64_t)(int64_t)r;
+        if (copy_to_user((void*)a0, kfds, sizeof(kfds)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return 0;
     }
 

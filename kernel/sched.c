@@ -257,3 +257,16 @@ static void wake_chan_cb(process_t* p, void* u) {
 void sched_wake_chan(int chan) {
     process_foreach(wake_chan_cb, &chan);
 }
+
+// [M25] Wake processes blocked on pipe 'pp' (either a reader waiting for data or
+// a writer waiting for space). The woken task re-runs its read/write syscall and
+// re-checks the condition, so a spurious wake just re-blocks.
+static void wake_pipe_cb(process_t* p, void* u) {
+    if (p->state == PROC_BLOCKED && p->wait_pipe == u) {
+        p->wait_pipe = 0;
+        p->state = PROC_READY;
+    }
+}
+void sched_wake_pipe(void* pp) {
+    process_foreach(wake_pipe_cb, pp);
+}

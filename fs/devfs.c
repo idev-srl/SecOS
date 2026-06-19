@@ -133,9 +133,9 @@ static int devfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
             for (size_t i=0;i<len;i++) out[i] = (uint8_t)rng_next();
             return (int)len;
         }
-        case DEV_CONSOLE: {                                        // read keyboard
-            size_t i=0; while (i<len && keyboard_has_char()) out[i++]=(uint8_t)keyboard_getchar();
-            return (int)i;
+        case DEV_CONSOLE: {                                        // [M25] cooked TTY line read
+            extern int tty_read(void* buf, int len);
+            return tty_read(buf, (int)len);
         }
         case DEV_BLOCK: return blk_byte_io(d->blk, off, buf, len, 0);
     }

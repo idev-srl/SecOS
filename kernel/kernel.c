@@ -771,6 +771,54 @@ static void m19_run_demo(void) {
 }
 #endif /* M19_FORK_DEMO */
 
+// ---- [M25] Anonymous pipes demo (gated; off by default) ----
+#ifndef M25_PIPE_DEMO
+#define M25_PIPE_DEMO 0
+#endif
+#if M25_PIPE_DEMO
+#include "trapframe.h"
+#include "../crypto/user_m25_pipe_elf.h"
+
+static uint8_t m25_idle_stack[16384] __attribute__((aligned(16)));
+static int m25_step = 0, m25_done = 0;
+
+__attribute__((noreturn)) static void m25_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m25_step == 0) {
+            m25_step = 1;
+            debugcon_writestring("[M25] --- anonymous pipes ---\n");
+            process_t* p = process_create_from_elf(user_m25_pipe_elf, user_m25_pipe_elf_len);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M25] spawned m25_pipe\n"); }
+            else   debugcon_writestring("[M25] FAIL: m25_pipe not loaded\n");
+        } else if (m25_step == 1 && sched_count_alive_user() == 0 && !m25_done) {
+            m25_done = 1;
+            debugcon_writestring("[M25] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m25_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M25] pipes demo\n");
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m25_idle_stack + sizeof(m25_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m25_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M25] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf);
+}
+#endif /* M25_PIPE_DEMO */
+
 // ---- [M20] Page cache / file-backed mmap demo (gated; off by default) ----
 // Writes a known file into the VFS, then runs the signed `m20_mmap`: it maps the
 // file read-only (MAP_PRIVATE via the page cache), checks the mapped bytes, then
@@ -1329,6 +1377,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M24_NET_DEMO
     m24_run_demo(); // networking CAP_NET demo — does not return
+#endif
+#if M25_PIPE_DEMO
+    m25_run_demo(); // anonymous pipes demo — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);

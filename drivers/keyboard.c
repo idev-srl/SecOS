@@ -18,6 +18,7 @@ static int buffer_end = 0;
 // Modifier key states
 static bool shift_pressed = false;
 static bool caps_lock = false;
+static bool ctrl_pressed = false;   // [M25] Left Ctrl (scancode 0x1D) for control codes
 
 // Inline port I/O
 static inline uint8_t inb(uint16_t port) {
@@ -90,12 +91,19 @@ void keyboard_handler(void) {
         if (scancode == 0x2A || scancode == 0x36) {
             shift_pressed = false;
         }
+        if (scancode == 0x1D) {                  // [M25] Ctrl release
+            ctrl_pressed = false;
+        }
         return;
     }
-    
+
     // Handle special keys
     if (scancode == 0x2A || scancode == 0x36) {  // Left/Right Shift
         shift_pressed = true;
+        return;
+    }
+    if (scancode == 0x1D) {                       // [M25] Left Ctrl
+        ctrl_pressed = true;
         return;
     }
     
@@ -117,7 +125,14 @@ void keyboard_handler(void) {
             }
         }
     }
-    
+
+    // [M25] Ctrl+letter -> control code (Ctrl+C=0x03, Ctrl+D=0x04, ...). This is
+    // what the TTY line discipline expects (EOF/interrupt). Without this the PS/2
+    // path produced the bare letter.
+    if (ctrl_pressed && ((ascii >= 'a' && ascii <= 'z') || (ascii >= 'A' && ascii <= 'Z'))) {
+        ascii = (char)(ascii & 0x1F);
+    }
+
     if (ascii) {
         buffer_put(ascii);
     }
@@ -129,6 +144,7 @@ void keyboard_init(void) {
     buffer_end = 0;
     shift_pressed = false;
     caps_lock = false;
+    ctrl_pressed = false;
 }
 
 // Read a character (blocking)
