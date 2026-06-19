@@ -21,6 +21,8 @@
 #include "fs/vfs.h" // VFS API
 #include "fs/block.h" // [M22] block device introspection (blk/mountdev)
 #include "net.h"       // [M24] networking (netinfo/ping)
+#include "udp.h"       // [M24] UDP / DHCP / DNS
+#include "tcp.h"       // [M24] TCP client
 #include "driver_if.h" // driver space API
 #include <stdint.h>
 #include <stddef.h>
@@ -141,6 +143,8 @@ static void sh_cat(const char* a); static void sh_touch(const char* a); static v
 static void sh_rm(const char* a); static void sh_df(const char* a); static void sh_free(const char* a);
 static void sh_uname(const char* a);
 static void sh_netinfo(const char* a); static void sh_ping(const char* a);   // [M24]
+static void sh_dhcp(const char* a); static void sh_nslookup(const char* a);  // [M24]
+static void sh_udpsend(const char* a); static void sh_tcptest(const char* a);// [M24]
 const char* shell_get_cwd(void);   // [M23] current VFS working directory (for the prompt)
 static void sh_run(const char* a);
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
@@ -234,6 +238,10 @@ static const struct shell_cmd shell_cmds[] = {
     {"uname",     sh_uname},
     {"netinfo",   sh_netinfo},
     {"ping",      sh_ping},
+    {"dhcp",      sh_dhcp},
+    {"nslookup",  sh_nslookup},
+    {"udpsend",   sh_udpsend},
+    {"tcptest",   sh_tcptest},
     {"run",       sh_run},
     {"drvreg",    sh_drvreg},
     {"drvunreg",  sh_drvunreg},
@@ -1052,6 +1060,84 @@ static void sh_ping(const char* a){
     terminal_writestring("PING "); print_ip(ip); terminal_writestring(" ...\n");
     net_ping_test(ip);
     terminal_writestring("(see serial/debug for result)\n");
+}
+// Parse "a.b.c.d" -> network-order uint32 (octet0 at LSB). Returns 0 on parse.
+static int parse_ip(const char* a, uint32_t* out){
+    uint32_t parts[4]={0,0,0,0}; int pi=0;
+    while(*a==' ') a++;
+    while(*a && pi<4){ if(*a<'0'||*a>'9') break; uint32_t v=0; while(*a>='0'&&*a<='9'){ v=v*10+(*a-'0'); a++; } parts[pi++]=v&0xFF; if(*a=='.') a++; }
+    if(pi!=4) return -1;
+    *out = parts[0] | (parts[1]<<8) | (parts[2]<<16) | (parts[3]<<24);
+    return 0;
+}
+static void sh_dhcp(const char* a){ (void)a;
+    net_dev_t* d = net_primary();
+    if(!d){ terminal_writestring("dhcp: no NIC\n"); return; }
+    terminal_writestring("dhcp: requesting lease...\n");
+    if(dhcp_configure(d)==0){
+        terminal_writestring("dhcp: OK  IP "); print_ip(d->ip);
+        terminal_writestring("  GW "); print_ip(d->gateway);
+        terminal_writestring("  DNS "); print_ip(d->dns); terminal_writestring("\n");
+    } else terminal_writestring("dhcp: no lease (timeout)\n");
+}
+static void sh_nslookup(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Usage: nslookup <hostname>\n"); return; }
+    net_dev_t* d = net_primary();
+    if(!d){ terminal_writestring("nslookup: no NIC\n"); return; }
+    if(!d->dns){ terminal_writestring("nslookup: no DNS server (run dhcp)\n"); return; }
+    uint32_t ip=0;
+    if(dns_resolve(d, a, &ip)==0){
+        terminal_writestring(a); terminal_writestring(" -> "); print_ip(ip); terminal_writestring("\n");
+    } else { terminal_writestring("nslookup: not resolved\n"); }
+}
+static void sh_udpsend(const char* a){
+    // Usage: udpsend <ip> <port> <text>
+    while(*a==' ') a++;
+    uint32_t ip; if(parse_ip(a,&ip)!=0){ terminal_writestring("Usage: udpsend <ip> <port> <text>\n"); return; }
+    while(*a && *a!=' ') a++; while(*a==' ') a++;          // skip ip
+    uint32_t port=0; while(*a>='0'&&*a<='9'){ port=port*10+(*a-'0'); a++; }
+    while(*a==' ') a++;                                     // text starts here
+    net_dev_t* d = net_primary();
+    if(!d){ terminal_writestring("udpsend: no NIC\n"); return; }
+    uint16_t sport = udp_ephemeral_port();
+    int n=0; const char* t=a; while(t[n]) n++;
+    if(udp_send(d, ip, sport, (uint16_t)port, a, (uint32_t)n)==0)
+        terminal_writestring("udpsend: sent\n");
+    else terminal_writestring("udpsend: failed (ARP pending? retry)\n");
+}
+// tcptest <ip> <port> [host] — open a TCP connection, send an HTTP GET, print
+// the first chunk of the reply. With no host, uses the dotted IP as Host:.
+static void sh_tcptest(const char* a){
+    while(*a==' ') a++;
+    uint32_t ip; if(parse_ip(a,&ip)!=0){ terminal_writestring("Usage: tcptest <ip> <port> [host]\n"); return; }
+    while(*a && *a!=' ') a++; while(*a==' ') a++;
+    uint32_t port=0; while(*a>='0'&&*a<='9'){ port=port*10+(*a-'0'); a++; }
+    if(port==0) port=80;
+    while(*a==' ') a++;
+    const char* host = *a ? a : "secos";
+    net_dev_t* d = net_primary();
+    if(!d){ terminal_writestring("tcptest: no NIC\n"); return; }
+    terminal_writestring("tcptest: connecting to "); print_ip(ip); terminal_writestring("...\n");
+    tcp_conn_t* c = tcp_connect(d, ip, (uint16_t)port);
+    if(!c){ terminal_writestring("tcptest: connect failed\n"); return; }
+    terminal_writestring("tcptest: connected, sending GET\n");
+    static char req[256]; int rl=0;
+    const char* g="GET / HTTP/1.0\r\nHost: ";
+    for(const char* p=g; *p; p++) req[rl++]=*p;
+    for(const char* p=host; *p && rl<200; p++) req[rl++]=*p;
+    const char* e="\r\nConnection: close\r\n\r\n";
+    for(const char* p=e; *p; p++) req[rl++]=*p;
+    tcp_send_all(c, req, (uint32_t)rl);
+    static char buf[1024]; int total=0;
+    for(;;){
+        int n = tcp_recv_block(c, buf, sizeof(buf)-1, 3000);
+        if(n<=0) break;
+        buf[n]=0; terminal_writestring(buf); total+=n;
+        if(total>8000) break;
+    }
+    terminal_writestring("\ntcptest: received "); print_dec((uint32_t)total); terminal_writestring(" bytes\n");
+    tcp_close(c);
 }
 // =========================================================================
 

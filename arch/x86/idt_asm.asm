@@ -322,6 +322,45 @@ isr_nvme:
     pop rax
     iretq
 
+; [M24] NIC MSI-X (vector 0x42). NAPI-style: the C handler acks the NIC, drains
+; the RX ring via dev->poll, runs protocol timers, and EOIs the LAPIC. Only wired
+; when net_request_irq() picks MSI-X (gated by NET_USE_MSIX); polled by default.
+global isr_net
+extern net_irq_handler
+isr_net:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    call net_irq_handler         ; acks NIC, drains ring; LAPIC EOI done in C
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
 ; ---- M2: Stack-switch trampoline ----
 ; void trampoline_switch_stack(uint64_t new_rsp, void (*fn)(void));
 ; rdi = new_rsp  (System V AMD64: first integer arg)

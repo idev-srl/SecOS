@@ -39,10 +39,18 @@ void ipv4_input(net_dev_t* dev, const uint8_t* frame, uint32_t len, const uint8_
 
 int ipv4_send(net_dev_t* dev, uint32_t dst_ip, uint8_t proto, const void* payload, uint32_t len) {
     if (!dev || len > NET_MTU - 20) return -1;
-    // Route: on-subnet -> direct, else via gateway.
-    uint32_t nexthop = ((dst_ip & dev->netmask) == (dev->ip & dev->netmask)) ? dst_ip : dev->gateway;
     uint8_t dmac[6];
-    if (arp_resolve(dev, nexthop, dmac) != 0) return -1;   // ARP pending: caller retries
+    // Limited broadcast (255.255.255.255) and the subnet directed broadcast go to
+    // the Ethernet broadcast address with no ARP — needed for DHCP, which runs
+    // before dev->ip is configured.
+    uint32_t bcast = dev->netmask ? (dev->ip | ~dev->netmask) : 0xFFFFFFFFu;
+    if (dst_ip == 0xFFFFFFFFu || (dev->netmask && dst_ip == bcast)) {
+        for (int i = 0; i < 6; i++) dmac[i] = 0xFF;
+    } else {
+        // Route: on-subnet -> direct, else via gateway.
+        uint32_t nexthop = ((dst_ip & dev->netmask) == (dev->ip & dev->netmask)) ? dst_ip : dev->gateway;
+        if (arp_resolve(dev, nexthop, dmac) != 0) return -1;   // ARP pending: caller retries
+    }
 
     uint8_t* ip = g_ipbuf;
     uint16_t tot = (uint16_t)(20 + len);

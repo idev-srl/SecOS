@@ -40,6 +40,7 @@ typedef struct process {
     int      proc_type;     // PROC_TYPE_USER / PROC_TYPE_DRIVER
     int      drv_dev_id;    // device id bound to this driver, -1 if none
     uint32_t drv_caps;      // granted capability mask (DEV_CAP_*), 0 if none
+    int      cap_net;       // [M24] CAP_NET: 1 if the signed manifest grants sockets
     uint64_t* mapped_pages; // array of virtual page addresses (code+data+stack)
     uint32_t mapped_page_count; // page count
     // [M14] Demand paging: pages are not eagerly mapped. 'vmas' describes the

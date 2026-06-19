@@ -1,40 +1,50 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **M24 networking** — L2/L3 done, `ping` works. M21/M22/M23 done
-and pushed. HEAD `e651927` on `origin/main`. Read this first._
+_Last updated: **M24 networking COMPLETE** — all four waves done (UDP/DHCP/DNS,
+TCP, sockets+CAP_NET, MSI-X/NAPI). Self-test 122/122. Committed on `main`
+(not yet pushed). Read this first._
 
-## ▶▶ NEXT SESSION TASK: complete the network stack
-The user wants the rest of networking done, in this order:
-**1) UDP + DHCP + DNS → 2) TCP (the big one) → 3) sockets + `CAP_NET` → 4) MSI-X/NAPI RX (2.5 Gbps perf).**
+## ▶▶ NEXT SESSION TASK: (networking done) — push + hardware validation, then pick next
+The full network stack is **implemented and verified in QEMU**. Suggested next:
+1. **Push** `main` to `origin` (this session committed locally only).
+2. **Hardware/VMware validation** of the NICs that QEMU can't model — e1000e
+   (laptops), vmxnet3 (VMware), igc (2.5 GbE). Rebuild VMware images
+   (`make uefi-vmdk`). Tune the 82574 MSI-X re-arm (IVAR/EIAC) so the poll
+   backstop can be dropped on validated hardware.
+3. Then a new milestone: **pipes/TTY** (now unblocked by fork/signals groundwork),
+   Phase H (storage maturity), or Phase I (ACPI+APIC+SMP). See
+   `docs/ROADMAP_TO_COMPLETE_OS.md`.
 
-The L2/L3 foundation is in and **`ping` works** (see status below). Build on it:
+### What landed this session (M24 waves 1–4, all live-verified vs QEMU SLIRP)
+- **Wave 1 — UDP/DHCP/DNS** (`net/udp.c`,`net/dhcp.c`,`net/dns.c`). Shell `dhcp`,
+  `nslookup`, `udpsend`. `dhcp` → lease 10.0.2.15; `nslookup example.com` resolves.
+  Fixed a DHCP `xid` endianness bug (written BE, read LE → every OFFER rejected).
+  `ipv4_send` gained a broadcast (no-ARP) path for DHCP.
+- **Wave 2 — TCP** (`net/tcp.c`,`tcp.h`). Full state machine, sliding window,
+  retransmit via `net_tick`, in-order RX rings, active+passive open. Shell
+  `tcptest <ip> <port>` did a real HTTP GET (2435 bytes) vs a host `http.server`.
+- **Wave 3 — sockets + CAP_NET** (`net/socket.c`,`socket.h`). Syscalls 21–30 +
+  libc wrappers. `CAP_NET` = bit 4 of the signed manifest `flags`
+  (`MANIFEST_FLAG_CAP_NET`); `process_t.cap_net`; dispatcher refuses all socket
+  calls without it. Demo gate `M24_NET_DEMO` proves OK-with-cap / DENIED-without.
+- **Wave 4 — MSI-X/NAPI** (gated `-DNET_USE_MSIX`, OFF by default). IDT vector
+  0x42 `isr_net`→`net_irq_handler` (NAPI). e1000/e1000e `irq_enable`/`irq_ack`
+  hooks; e1000e programs the 82574 IVAR. **Validated in QEMU** with `-device
+  e1000e`: ISR fires, DHCP+ping+DNS work in `mode=msix`. Hybrid: keeps a
+  timer-tick poll backstop for completeness.
 
-- **Wave 1 — UDP + DHCP + DNS.** Add `net/udp.c` (`udp_input`/`udp_send`, 16
-  ports max, pseudo-header checksum). `ipv4.c` already calls a weak `udp_input`.
-  Then `net/dhcp.c` (DISCOVER/OFFER/REQUEST/ACK over UDP 68→67, broadcast; set
-  `dev->ip/netmask/gateway/dns` from the lease — replaces the static config in
-  `net_init`). Then `net/dns.c` (A-record query over UDP 53 to `dev->dns`).
-  Shell: `dhcp`, `nslookup <name>`, `udpsend`. Test: QEMU SLIRP runs a DHCP
-  server (10.0.2.2) + DNS (10.0.2.3) — `dhcp` should get 10.0.2.15, `nslookup
-  example.com` should resolve. **Remember the RX gotcha** (run from shell/idle).
-- **Wave 2 — TCP.** `net/tcp.c`: the state machine (LISTEN/SYN-SENT/SYN-RCVD/
-  ESTABLISHED/FIN-WAIT/…), seq/ack, retransmit timer (use `net_tick`), a small
-  window, MSS. Start with active open (connect) + a tiny client; add passive
-  (listen/accept) after. Test: `nc -l` on the host vs a guest TCP connect, or an
-  HTTP GET to 10.0.2.2's hostfwd. This is the largest piece — do it incrementally
-  (3-way handshake first, then data, then teardown).
-- **Wave 3 — sockets + CAP_NET.** Syscalls `socket/bind/connect/listen/accept/
-  send/recv/sendto/recvfrom/close` (next free SYS numbers: lseek=19, stat=20 used
-  → start at **21**). libc wrappers in `user/libsecos.c`. Add a **`CAP_NET`** flag
-  to the `.note.secos` manifest (`mm/elf_manifest.*`) — a single general network
-  capability (NOT per-port/protocol); `process_create_from_elf` records it and
-  the socket syscalls refuse if absent. A signed demo program (gate `M24_NET_DEMO`)
-  doing a UDP echo or TCP GET proves it.
-- **Wave 4 — MSI-X/NAPI RX.** Replace timer-tick polling with real interrupts:
-  finish the M22 MSI-X plumbing (`pci_enable_msix`, `lapic`, IDT vectors), wire a
-  per-NIC ISR that does NAPI (ack → drain ring → re-arm). Needed for 2.5GbE
-  (igc). The `net_request_irq` contract already abstracts this — drivers only
-  provide `poll()`.
+### Build/run the networking (interactive — needs a NIC + the shell context)
+```bash
+make iso && qemu-system-x86_64 -cdrom myos.iso -boot d \
+  -netdev user,id=n0 -device e1000,netdev=n0 \
+  -serial stdio -display none -no-reboot -m 256M
+# then in the shell: dhcp / netinfo / ping / nslookup example.com / tcptest 10.0.2.2 80
+# CAP_NET demo (non-interactive): make iso CFLAGS_EXTRA=-DM24_NET_DEMO=1
+# MSI-X NAPI (validated w/ e1000e): make iso CFLAGS_EXTRA=-DNET_USE_MSIX  + -device e1000e
+```
+**RX gotcha still applies:** test from the shell/idle context (the idle `hlt`s,
+yielding the vCPU so QEMU delivers RX DMA). **`make clean` after any `-D`/header
+change** (Makefile has no header-dep tracking).
 
 ### Key facts for the next session (don't relearn the hard way)
 - **NIC RX needs the shell/idle context**: the idle task `hlt`s between timer

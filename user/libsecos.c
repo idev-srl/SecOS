@@ -18,6 +18,16 @@
 #define SYS_BRK      16
 #define SYS_MPROTECT 17
 #define SYS_FORK     18
+#define SYS_SOCKET   21
+#define SYS_CONNECT  22
+#define SYS_BIND     23
+#define SYS_LISTEN   24
+#define SYS_ACCEPT   25
+#define SYS_SEND     26
+#define SYS_RECV     27
+#define SYS_SENDTO   28
+#define SYS_RECVFROM 29
+#define SYS_SOCKCLOSE 30
 
 long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4) {
     long ret;
@@ -97,3 +107,21 @@ void free(void* p){ if (!p) return; mblock_t* b = (mblock_t*)p - 1; b->is_free =
 
 /* [M19] copy-on-write fork: returns child pid in the parent, 0 in the child. */
 int fork(void){ return (int)secos_syscall(SYS_FORK, 0, 0, 0, 0, 0); }
+
+/* [M24] BSD-style sockets. Require CAP_NET in the signed manifest, else -1.
+ * ip is network-order octets (octet0 in the low byte); port is host order. */
+int socket(int type){ return (int)secos_syscall(SYS_SOCKET, type, 0, 0, 0, 0); }
+int connect(int fd, unsigned int ip, unsigned short port){ return (int)secos_syscall(SYS_CONNECT, fd, (long)ip, port, 0, 0); }
+int bind(int fd, unsigned short port){ return (int)secos_syscall(SYS_BIND, fd, port, 0, 0, 0); }
+int listen(int fd, int backlog){ return (int)secos_syscall(SYS_LISTEN, fd, backlog, 0, 0, 0); }
+int accept(int fd){ return (int)secos_syscall(SYS_ACCEPT, fd, 0, 0, 0, 0); }
+long send(int fd, const void* buf, long len){ return secos_syscall(SYS_SEND, fd, (long)buf, len, 0, 0); }
+long recv(int fd, void* buf, long len){ return secos_syscall(SYS_RECV, fd, (long)buf, len, 0, 0); }
+long sendto(int fd, const void* buf, long len, const struct secos_sockaddr* sa){ return secos_syscall(SYS_SENDTO, fd, (long)buf, len, (long)sa, 0); }
+long recvfrom(int fd, void* buf, long len, struct secos_sockaddr* sa){ return secos_syscall(SYS_RECVFROM, fd, (long)buf, len, (long)sa, 0); }
+int sockclose(int fd){ return (int)secos_syscall(SYS_SOCKCLOSE, fd, 0, 0, 0, 0); }
+
+/* host-order port <-> network helpers and a dotted-quad parser for demos. */
+unsigned int ip4(unsigned a, unsigned b, unsigned c, unsigned d){
+    return (a & 0xFF) | ((b & 0xFF) << 8) | ((c & 0xFF) << 16) | ((d & 0xFF) << 24);
+}

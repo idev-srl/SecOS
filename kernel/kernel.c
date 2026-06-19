@@ -876,6 +876,62 @@ static void m23_run_demo(void) {
 }
 #endif /* M23_FS_DEMO */
 
+// ---- [M24] Networking CAP_NET demo (gated; off by default) ----
+// Proves, non-interactively, that the socket syscalls are gated by CAP_NET in
+// the signed manifest: a program signed WITH the CAP_NET manifest gets a socket
+// (prints "[m24net] socket OK"); the same program signed WITHOUT it is refused
+// the very first socket() call ("[m24net] socket DENIED"). No NIC required — the
+// gate is enforced in the syscall dispatcher before any device I/O. The live
+// data path (DHCP/DNS/TCP/UDP) is exercised interactively from the shell.
+#ifndef M24_NET_DEMO
+#define M24_NET_DEMO 0
+#endif
+#if M24_NET_DEMO
+#include "trapframe.h"
+#include "../crypto/user_m24net_elf.h"
+#include "../crypto/user_m24nonet_elf.h"
+static uint8_t m24_idle_stack[16384] __attribute__((aligned(16)));
+static int m24_step = 0, m24_done = 0;
+__attribute__((noreturn)) static void m24_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m24_step == 0) {
+            m24_step = 1;
+            debugcon_writestring("[M24] --- CAP_NET granted (socket allowed) ---\n");
+            process_t* p = process_create_from_elf(user_m24net_elf, user_m24net_elf_len);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M24] spawned m24_net (CAP_NET)\n"); }
+            else   debugcon_writestring("[M24] FAIL: m24_net not loaded\n");
+        } else if (m24_step == 1 && sched_count_alive_user() == 0) {
+            m24_step = 2;
+            debugcon_writestring("[M24] --- no CAP_NET (socket denied) ---\n");
+            process_t* p = process_create_from_elf(user_m24nonet_elf, user_m24nonet_elf_len);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M24] spawned m24_nonet (no cap)\n"); }
+            else   debugcon_writestring("[M24] FAIL: m24_nonet not loaded\n");
+        } else if (m24_step == 2 && sched_count_alive_user() == 0 && !m24_done) {
+            m24_done = 1;
+            debugcon_writestring("[M24] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+static void m24_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    static process_t idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m24_idle_stack + sizeof(m24_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m24_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    arch_iret_to_tf(&idle_tf);
+}
+#endif /* M24_NET_DEMO */
+
 // ---- [M10] Interactive shell as the scheduler idle task ----
 // Running the shell as the idle task lets `run <path>` spawn a ring-3 process:
 // the timer preempts idle (shell) into the user task; on SYS_EXIT the scheduler
@@ -1270,6 +1326,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M23_FS_DEMO
     m23_run_demo(); // POSIX FS personality demo — does not return
+#endif
+#if M24_NET_DEMO
+    m24_run_demo(); // networking CAP_NET demo — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);

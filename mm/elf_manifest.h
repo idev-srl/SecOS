@@ -22,6 +22,10 @@
 #define MANIFEST_FLAG_REQUIRE_STACK_GUARD   (1u<<1) // stack utente con guard page
 #define MANIFEST_FLAG_REQUIRE_NX_DATA       (1u<<2) // data RW NX
 #define MANIFEST_FLAG_REQUIRE_RX_CODE       (1u<<3) // code RX
+// [M24] CAP_NET: a single, general network capability. The signed manifest is
+// the trust root — a process may use the socket syscalls only if this flag is
+// set (covered by the Ed25519 signature, so it can't grant itself the cap).
+#define MANIFEST_FLAG_CAP_NET               (1u<<4) // socket syscalls allowed
 
 // Manifest versions
 #define MANIFEST_VERSION_BASE    1u   // version/flags/max_mem/entry_hint (24-byte desc)

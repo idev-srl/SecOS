@@ -120,6 +120,21 @@ static void e1000_poll(net_dev_t* dev) {
     wr(REG_RDT, (g_rx_cur + RX_DESC - 1) % RX_DESC);
 }
 
+// [M24] MSI-X/NAPI hooks (used only when net_request_irq picks MSI-X). Enable
+// arms the receive interrupts; ack reads ICR (read-to-clear) inside the ISR.
+#define IMS_RXT0   (1u << 7)         // receiver timer (per-packet with RDTR=0)
+#define IMS_RXDMT0 (1u << 4)         // RX descriptor minimum threshold
+#define IMS_RXO    (1u << 6)         // RX overrun
+static void e1000_irq_enable(net_dev_t* dev) {
+    (void)dev;
+    wr(0x2820 /*RDTR*/, 0);                  // no RX delay: interrupt per packet
+    wr(REG_IMS, IMS_RXT0 | IMS_RXDMT0 | IMS_RXO);
+}
+static void e1000_irq_ack(net_dev_t* dev) {
+    (void)dev;
+    (void)rd(REG_ICR);                        // read-to-clear the interrupt cause
+}
+
 int e1000_init(void) {
     pci_device_t pci;
     if (pci_find(E1000_VENDOR, E1000_DEV_82540EM, &pci) != 0) {
@@ -174,6 +189,8 @@ int e1000_init(void) {
 
     g_dev.transmit = e1000_transmit;
     g_dev.poll = e1000_poll;
+    g_dev.irq_enable = e1000_irq_enable;     // [M24] used only under NET_USE_MSIX
+    g_dev.irq_ack = e1000_irq_ack;
     g_dev.pci = pci;
     g_dev.link_up = (rd(REG_STATUS) & STATUS_LU) ? 1 : 0;
     if (net_register_dev(&g_dev) != 0) { debugcon_writestring("[E1000] register failed\n"); return -1; }

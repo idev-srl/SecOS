@@ -38,12 +38,44 @@ void net_rx(net_dev_t* dev, const void* frame, uint32_t len) {
     eth_input(dev, (const uint8_t*)frame, len);
 }
 
+// [M24] The MSI-X-wired NIC (NAPI). At most one is driven by interrupts; any
+// others fall back to timer-tick polling. NULL when no NIC uses MSI-X.
+static net_dev_t* g_irq_dev;
+
+#ifdef NET_USE_MSIX
+#include "idt.h"
+#include "lapic.h"
+#include "pci.h"
+#endif
+
 net_irq_mode_t net_request_irq(net_dev_t* dev) {
-    // [M24] First cut: timer-tick polling of dev->poll (guaranteed to work on
-    // every NIC/firmware). MSI-X (NAPI-style, for 2.5GbE+) and legacy INTx are
-    // the performance upgrade tracked for the follow-up — the contract stays the
-    // same (the driver only ever provides dev->poll).
-    if (dev && dev->poll && g_npoll < NET_MAX_DEV) {
+    if (!dev || !dev->poll) { if (dev) dev->irq_mode = NET_IRQ_NONE; return NET_IRQ_NONE; }
+#ifdef NET_USE_MSIX
+    // [M24] NAPI via MSI-X (perf path for 2.5 GbE+). Gated + additive: only the
+    // first NIC is wired; if MSI-X/MSI or the LAPIC are unavailable (e.g. QEMU's
+    // legacy e1000), fall through to polling — behaviour-identical to the default
+    // build. NOT validated on hardware yet (NICs that have MSI-X lack a QEMU model).
+    if (!g_irq_dev && lapic_enable() == 0) {
+        idt_install_msi_vector(IDT_VECTOR_NET, isr_net);
+        extern void isr_net(void);
+        if (pci_enable_msix(&dev->pci, IDT_VECTOR_NET) == 0 ||
+            pci_enable_msi(&dev->pci, IDT_VECTOR_NET) == 0) {
+            g_irq_dev = dev;
+            if (dev->irq_enable) dev->irq_enable(dev);   // NIC unmasks its RX cause
+            dev->irq_mode = NET_IRQ_MSIX;
+            // Hybrid NAPI: the MSI-X interrupt gives low-latency RX wakeups, but we
+            // also keep a timer-tick poll backstop (g_poll) so RX is complete even
+            // if a NIC's interrupt re-arm semantics drop an edge — a watchdog poll
+            // is standard practice in production NIC drivers. Belt and suspenders.
+            if (g_npoll < NET_MAX_DEV) g_poll[g_npoll++] = dev;
+            debugcon_writestring("[NET] MSI-X NAPI armed vector=0x42 (+poll backstop)\n");
+            return NET_IRQ_MSIX;                         // timers still run via net_tick
+        }
+        debugcon_writestring("[NET] no MSI-X/MSI; staying polled\n");
+    }
+#endif
+    // Default: timer-tick polling of dev->poll (works on every NIC/firmware).
+    if (g_npoll < NET_MAX_DEV) {
         g_poll[g_npoll++] = dev;
         dev->irq_mode = NET_IRQ_POLL;
         return NET_IRQ_POLL;
@@ -52,10 +84,29 @@ net_irq_mode_t net_request_irq(net_dev_t* dev) {
     return NET_IRQ_NONE;
 }
 
+// [M24] C half of isr_net (vector 0x42). NAPI: ack the NIC, drain the RX ring via
+// dev->poll, EOI the LAPIC. Protocol timers (ARP/TCP) stay on the timer tick via
+// net_tick(), so they don't run per-packet here. Only fires under NET_USE_MSIX.
+volatile uint32_t g_net_irq_count;
+void net_irq_handler(void) {
+    g_net_irq_count++;
+    if (g_net_irq_count <= 3) debugcon_writestring("[NET] IRQ fired\n");
+    net_dev_t* d = g_irq_dev;
+    if (d) {
+        if (d->irq_ack) d->irq_ack(d);
+        if (d->poll) d->poll(d);
+    }
+    extern void lapic_eoi(void);
+    lapic_eoi();
+}
+
+extern void tcp_tick(void) __attribute__((weak));
+
 void net_tick(void) {
     for (int i = 0; i < g_npoll; i++)
         if (g_poll[i] && g_poll[i]->poll) g_poll[i]->poll(g_poll[i]);
     arp_tick();
+    if (tcp_tick) tcp_tick();
 }
 
 // One's-complement Internet checksum (RFC 1071).

@@ -79,7 +79,12 @@ SRC_C   = \
 	$(NET_DIR)/eth.c \
 	$(NET_DIR)/arp.c \
 	$(NET_DIR)/ipv4.c \
-	$(NET_DIR)/icmp.c
+	$(NET_DIR)/icmp.c \
+	$(NET_DIR)/udp.c \
+	$(NET_DIR)/dhcp.c \
+	$(NET_DIR)/dns.c \
+	$(NET_DIR)/tcp.c \
+	$(NET_DIR)/socket.c
 
 OBJS_ASM = $(SRC_ASM:%.asm=%.o)
 OBJS_C   = $(SRC_C:%.c=%.o)
@@ -154,7 +159,7 @@ iso: $(KERNEL)
 # Build + sign the user programs and regenerate the embedded C headers. The
 # kernel includes the committed crypto/user_*_elf.h, so this only needs to run
 # when a user program changes (keeps the kernel build python-free).
-USER_CFLAGS = -ffreestanding -nostdlib -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 -Wall -Iuser
+USER_CFLAGS = -ffreestanding -nostdlib -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 -Wall -Iuser -ffunction-sections -fdata-sections
 .PHONY: user-progs
 user-progs:
 	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
@@ -168,68 +173,78 @@ user-progs:
 	$(CC) $(USER_CFLAGS) -c user/note_maxmem.S -o user/note_maxmem.o
 	$(CC) $(USER_CFLAGS) -c user/ipc_send.c   -o user/ipc_send.o
 	$(CC) $(USER_CFLAGS) -c user/ipc_recv.c   -o user/ipc_recv.o
-	$(LD) -T user/user.ld -o user/hello.elf user/crt0.o user/note.o user/libsecos.o user/hello.o
+	$(LD) --gc-sections -T user/user.ld -o user/hello.elf user/crt0.o user/note.o user/libsecos.o user/hello.o
 	python3 tools/secos-sign user/hello.elf --dev
 	python3 tools/elf2h.py user/hello.elf user_hello_elf crypto/user_hello_elf.h
 	# [M11] Signed user-space driver (PROC_TYPE_DRIVER manifest)
-	$(LD) -T user/user.ld -o user/driver_demo.elf user/crt0.o user/note_driver.o user/libsecos.o user/drvprobe.o user/driver_demo.o
+	$(LD) --gc-sections -T user/user.ld -o user/driver_demo.elf user/crt0.o user/note_driver.o user/libsecos.o user/drvprobe.o user/driver_demo.o
 	python3 tools/secos-sign user/driver_demo.elf --dev
 	python3 tools/elf2h.py user/driver_demo.elf user_driver_elf crypto/user_driver_elf.h
 	# [M11] Signed plain-user probe (PROC_TYPE_USER manifest) — driver calls denied
-	$(LD) -T user/user.ld -o user/userprobe.elf user/crt0.o user/note.o user/libsecos.o user/drvprobe.o user/userprobe.o
+	$(LD) --gc-sections -T user/user.ld -o user/userprobe.elf user/crt0.o user/note.o user/libsecos.o user/drvprobe.o user/userprobe.o
 	python3 tools/secos-sign user/userprobe.elf --dev
 	python3 tools/elf2h.py user/userprobe.elf user_userprobe_elf crypto/user_userprobe_elf.h
 	# [M13] IPC producer/consumer (signed, normal manifest)
-	$(LD) -T user/user.ld -o user/ipc_send.elf user/crt0.o user/note.o user/libsecos.o user/ipc_send.o
+	$(LD) --gc-sections -T user/user.ld -o user/ipc_send.elf user/crt0.o user/note.o user/libsecos.o user/ipc_send.o
 	python3 tools/secos-sign user/ipc_send.elf --dev
 	python3 tools/elf2h.py user/ipc_send.elf user_ipc_send_elf crypto/user_ipc_send_elf.h
-	$(LD) -T user/user.ld -o user/ipc_recv.elf user/crt0.o user/note.o user/libsecos.o user/ipc_recv.o
+	$(LD) --gc-sections -T user/user.ld -o user/ipc_recv.elf user/crt0.o user/note.o user/libsecos.o user/ipc_recv.o
 	python3 tools/secos-sign user/ipc_recv.elf --dev
 	python3 tools/elf2h.py user/ipc_recv.elf user_ipc_recv_elf crypto/user_ipc_recv_elf.h
 	# [M13] max_mem-limited build of hello (manifest limit too small -> refused at load)
-	$(LD) -T user/user.ld -o user/maxmem.elf user/crt0.o user/note_maxmem.o user/libsecos.o user/hello.o
+	$(LD) --gc-sections -T user/user.ld -o user/maxmem.elf user/crt0.o user/note_maxmem.o user/libsecos.o user/hello.o
 	python3 tools/secos-sign user/maxmem.elf --dev
 	python3 tools/elf2h.py user/maxmem.elf user_maxmem_elf crypto/user_maxmem_elf.h
 	# [M15] crashtest: deliberately faults in ring-3 -> kernel kills it (no halt)
 	$(CC) $(USER_CFLAGS) -c user/crashtest.c   -o user/crashtest.o
-	$(LD) -T user/user.ld -o user/crashtest.elf user/crt0.o user/note.o user/libsecos.o user/crashtest.o
+	$(LD) --gc-sections -T user/user.ld -o user/crashtest.elf user/crt0.o user/note.o user/libsecos.o user/crashtest.o
 	python3 tools/secos-sign user/crashtest.elf --dev
 	python3 tools/elf2h.py user/crashtest.elf user_crash_elf crypto/user_crash_elf.h
 	# [M16] exec model: parent spawns child with argv, blocks in waitpid for status
 	$(CC) $(USER_CFLAGS) -c user/m16_child.c   -o user/m16_child.o
-	$(LD) -T user/user.ld -o user/m16_child.elf user/crt0.o user/note.o user/libsecos.o user/m16_child.o
+	$(LD) --gc-sections -T user/user.ld -o user/m16_child.elf user/crt0.o user/note.o user/libsecos.o user/m16_child.o
 	python3 tools/secos-sign user/m16_child.elf --dev
 	python3 tools/elf2h.py user/m16_child.elf user_m16_child_elf crypto/user_m16_child_elf.h
 	$(CC) $(USER_CFLAGS) -c user/m16_parent.c  -o user/m16_parent.o
-	$(LD) -T user/user.ld -o user/m16_parent.elf user/crt0.o user/note.o user/libsecos.o user/m16_parent.o
+	$(LD) --gc-sections -T user/user.ld -o user/m16_parent.elf user/crt0.o user/note.o user/libsecos.o user/m16_parent.o
 	python3 tools/secos-sign user/m16_parent.elf --dev
 	python3 tools/elf2h.py user/m16_parent.elf user_m16_parent_elf crypto/user_m16_parent_elf.h
 	# [M17] blocking sleep
 	$(CC) $(USER_CFLAGS) -c user/m17_sleeper.c -o user/m17_sleeper.o
-	$(LD) -T user/user.ld -o user/m17_sleeper.elf user/crt0.o user/note.o user/libsecos.o user/m17_sleeper.o
+	$(LD) --gc-sections -T user/user.ld -o user/m17_sleeper.elf user/crt0.o user/note.o user/libsecos.o user/m17_sleeper.o
 	python3 tools/secos-sign user/m17_sleeper.elf --dev
 	python3 tools/elf2h.py user/m17_sleeper.elf user_m17_sleeper_elf crypto/user_m17_sleeper_elf.h
 	# [M18] dynamic memory: malloc/free + mmap/mprotect
 	$(CC) $(USER_CFLAGS) -c user/m18_mem.c     -o user/m18_mem.o
-	$(LD) -T user/user.ld -o user/m18_mem.elf user/crt0.o user/note.o user/libsecos.o user/m18_mem.o
+	$(LD) --gc-sections -T user/user.ld -o user/m18_mem.elf user/crt0.o user/note.o user/libsecos.o user/m18_mem.o
 	python3 tools/secos-sign user/m18_mem.elf --dev
 	python3 tools/elf2h.py user/m18_mem.elf user_m18_mem_elf crypto/user_m18_mem_elf.h
 	# [M19] copy-on-write fork
 	$(CC) $(USER_CFLAGS) -c user/m19_fork.c    -o user/m19_fork.o
-	$(LD) -T user/user.ld -o user/m19_fork.elf user/crt0.o user/note.o user/libsecos.o user/m19_fork.o
+	$(LD) --gc-sections -T user/user.ld -o user/m19_fork.elf user/crt0.o user/note.o user/libsecos.o user/m19_fork.o
 	python3 tools/secos-sign user/m19_fork.elf --dev
 	python3 tools/elf2h.py user/m19_fork.elf user_m19_fork_elf crypto/user_m19_fork_elf.h
 	# [M20] file-backed mmap via page cache
 	$(CC) $(USER_CFLAGS) -c user/m20_mmap.c    -o user/m20_mmap.o
-	$(LD) -T user/user.ld -o user/m20_mmap.elf user/crt0.o user/note.o user/libsecos.o user/m20_mmap.o
+	$(LD) --gc-sections -T user/user.ld -o user/m20_mmap.elf user/crt0.o user/note.o user/libsecos.o user/m20_mmap.o
 	python3 tools/secos-sign user/m20_mmap.elf --dev
 	python3 tools/elf2h.py user/m20_mmap.elf user_m20_mmap_elf crypto/user_m20_mmap_elf.h
 	# [M23] POSIX FS personality: a signed program using /dev + /proc + stat + lseek
 	$(CC) $(USER_CFLAGS) -c user/m23_fs.c      -o user/m23_fs.o
-	$(LD) -T user/user.ld -o user/m23_fs.elf user/crt0.o user/note.o user/libsecos.o user/m23_fs.o
+	$(LD) --gc-sections -T user/user.ld -o user/m23_fs.elf user/crt0.o user/note.o user/libsecos.o user/m23_fs.o
 	python3 tools/secos-sign user/m23_fs.elf --dev
 	python3 tools/elf2h.py user/m23_fs.elf user_m23_fs_elf crypto/user_m23_fs_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs -> crypto/*.h"
+	# [M24] networking CAP_NET: same program signed with vs without the CAP_NET
+	# manifest. The CAP_NET build gets a socket; the plain build is refused.
+	$(CC) $(USER_CFLAGS) -c user/note_net.S    -o user/note_net.o
+	$(CC) $(USER_CFLAGS) -c user/m24_net.c     -o user/m24_net.o
+	$(LD) --gc-sections -T user/user.ld -o user/m24_net.elf user/crt0.o user/note_net.o user/libsecos.o user/m24_net.o
+	python3 tools/secos-sign user/m24_net.elf --dev
+	python3 tools/elf2h.py user/m24_net.elf user_m24net_elf crypto/user_m24net_elf.h
+	$(LD) --gc-sections -T user/user.ld -o user/m24_nonet.elf user/crt0.o user/note.o user/libsecos.o user/m24_net.o
+	python3 tools/secos-sign user/m24_nonet.elf --dev
+	python3 tools/elf2h.py user/m24_nonet.elf user_m24nonet_elf crypto/user_m24nonet_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} -> crypto/*.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke

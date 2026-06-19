@@ -15,6 +15,7 @@
 #include "debugcon.h"
 #include "../mm/user_copy.h"
 #include "../mm/pagecache.h"  // [M20] unified file page cache
+#include "socket.h"           // [M24] kernel-side socket layer (-Inet)
 
 extern uint64_t timer_get_ticks(void);
 
@@ -331,6 +332,73 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         if (r != 0) return (uint64_t)(int64_t)r;
         if (copy_to_user((void*)a1, &st, sizeof(st)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return 0;
+    }
+
+    /* [M24] Sockets — gated by CAP_NET in the signed manifest. A staging buffer
+     * bounces user payloads; blocking calls (connect/accept/recv) spin in the
+     * socket layer with RX driven by the timer tick. */
+    case SYS_SOCKET: case SYS_CONNECT: case SYS_BIND: case SYS_LISTEN:
+    case SYS_ACCEPT: case SYS_SEND: case SYS_RECV: case SYS_SENDTO:
+    case SYS_RECVFROM: case SYS_SOCKCLOSE: {
+        process_t* c = sched_get_current();
+        if (!c || !c->cap_net) {
+            debugcon_writestring("[NET] socket syscall denied: no CAP_NET\n");
+            return (uint64_t)(int64_t)-1;            /* EPERM-ish */
+        }
+        uint32_t pid = c->pid;
+        static uint8_t netbuf[2048];
+        switch (num) {
+        case SYS_SOCKET:
+            return (uint64_t)(int64_t)socket_create(pid, (int)a0);
+        case SYS_SOCKCLOSE:
+            return (uint64_t)(int64_t)socket_close(pid, (int)a0);
+        case SYS_CONNECT:
+            return (uint64_t)(int64_t)socket_connect(pid, (int)a0, (uint32_t)a1, (uint16_t)a2);
+        case SYS_BIND:
+            return (uint64_t)(int64_t)socket_bind(pid, (int)a0, (uint16_t)a1);
+        case SYS_LISTEN:
+            return (uint64_t)(int64_t)socket_listen(pid, (int)a0, (int)a1);
+        case SYS_ACCEPT:
+            return (uint64_t)(int64_t)socket_accept(pid, (int)a0);
+        case SYS_SEND: {
+            int len = (int)a2;
+            if (len < 0 || len > (int)sizeof(netbuf) || !user_range_valid((void*)a1, (size_t)len))
+                return (uint64_t)(int64_t)-EFAULT;
+            if (copy_from_user(netbuf, (void*)a1, (size_t)len) != 0) return (uint64_t)(int64_t)-EFAULT;
+            return (uint64_t)(int64_t)socket_send(pid, (int)a0, netbuf, len);
+        }
+        case SYS_SENDTO: {
+            int len = (int)a2;
+            if (len < 0 || len > (int)sizeof(netbuf) || !user_range_valid((void*)a1, (size_t)len))
+                return (uint64_t)(int64_t)-EFAULT;
+            struct secos_sockaddr sa;
+            if (copy_from_user(&sa, (void*)a3, sizeof(sa)) != 0) return (uint64_t)(int64_t)-EFAULT;
+            if (copy_from_user(netbuf, (void*)a1, (size_t)len) != 0) return (uint64_t)(int64_t)-EFAULT;
+            return (uint64_t)(int64_t)socket_sendto(pid, (int)a0, netbuf, len, sa.ip, sa.port);
+        }
+        case SYS_RECV: {
+            int len = (int)a2;
+            if (len <= 0 || len > (int)sizeof(netbuf) || !user_range_valid((void*)a1, (size_t)len))
+                return (uint64_t)(int64_t)-EFAULT;
+            int n = socket_recv(pid, (int)a0, netbuf, len, 0, 0);
+            if (n > 0 && copy_to_user((void*)a1, netbuf, (size_t)n) != 0) return (uint64_t)(int64_t)-EFAULT;
+            return (uint64_t)(int64_t)n;
+        }
+        case SYS_RECVFROM: {
+            int len = (int)a2;
+            if (len <= 0 || len > (int)sizeof(netbuf) || !user_range_valid((void*)a1, (size_t)len))
+                return (uint64_t)(int64_t)-EFAULT;
+            uint32_t sip = 0; uint16_t sport = 0;
+            int n = socket_recv(pid, (int)a0, netbuf, len, &sip, &sport);
+            if (n > 0 && copy_to_user((void*)a1, netbuf, (size_t)n) != 0) return (uint64_t)(int64_t)-EFAULT;
+            if (a3) {
+                struct secos_sockaddr sa; sa.ip = sip; sa.port = sport; sa._pad = 0;
+                copy_to_user((void*)a3, &sa, sizeof(sa));
+            }
+            return (uint64_t)(int64_t)n;
+        }
+        }
+        return (uint64_t)(int64_t)-1;
     }
 
     case SYS_DRIVER: {

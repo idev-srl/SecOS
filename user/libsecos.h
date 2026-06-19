@@ -60,6 +60,23 @@ void    free(void* p);
 /* [M19] copy-on-write fork */
 int     fork(void);
 
+/* [M24] BSD-style sockets (require CAP_NET in the signed manifest). ip is
+ * network-order octets (octet0 in the low byte), port is host order. */
+#define SOCK_STREAM 1
+#define SOCK_DGRAM  2
+struct secos_sockaddr { unsigned int ip; unsigned short port; unsigned short _pad; };
+int   socket(int type);
+int   connect(int fd, unsigned int ip, unsigned short port);
+int   bind(int fd, unsigned short port);
+int   listen(int fd, int backlog);
+int   accept(int fd);
+long  send(int fd, const void* buf, long len);
+long  recv(int fd, void* buf, long len);
+long  sendto(int fd, const void* buf, long len, const struct secos_sockaddr* sa);
+long  recvfrom(int fd, void* buf, long len, struct secos_sockaddr* sa);
+int   sockclose(int fd);
+unsigned int ip4(unsigned a, unsigned b, unsigned c, unsigned d);
+
 /* tiny libc helpers */
 size_t  strlen(const char* s);
 int     puts(const char* s);   /* writes s + '\n' to stdout (fd 1) */

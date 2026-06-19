@@ -74,10 +74,12 @@ extern void isr_stub(void);
 // paths via idt_install_msi_vector(); the default build never references them.
 extern void isr_xhci(void);    // vector 0x40 (xHCI MSI-X)
 extern void isr_nvme(void);    // vector 0x41 (NVMe MSI-X)
+extern void isr_net(void);     // vector 0x42 (NIC MSI-X, [M24] NAPI RX)
 
 // MSI/MSI-X vector assignments (LAPIC delivery; above the PIC range 0x20-0x2F).
 #define IDT_VECTOR_XHCI  0x40
 #define IDT_VECTOR_NVME  0x41
+#define IDT_VECTOR_NET   0x42
 
 // Install an interrupt gate for a runtime MSI/MSI-X vector. Thin wrapper over
 // idt_set_gate with the kernel code selector and a present 64-bit int gate.

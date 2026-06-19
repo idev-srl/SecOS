@@ -23,6 +23,29 @@
 #define SYS_FORK     18 // [M19] copy-on-write fork; returns child pid (parent) / 0 (child)
 #define SYS_LSEEK    19 // [M23] reposition a file offset (fd, offset, whence) -> new offset
 #define SYS_STAT     20 // [M23] stat a path into a struct secos_stat (path, statbuf)
+// [M24] BSD-style sockets (gated by CAP_NET in the signed manifest)
+#define SYS_SOCKET   21 // socket(type) -> sockfd
+#define SYS_CONNECT  22 // connect(fd, ip, port)  TCP active open / UDP default peer
+#define SYS_BIND     23 // bind(fd, port)         local UDP/TCP port
+#define SYS_LISTEN   24 // listen(fd, backlog)    TCP passive open
+#define SYS_ACCEPT   25 // accept(fd) -> newfd    (blocking)
+#define SYS_SEND     26 // send(fd, buf, len)
+#define SYS_RECV     27 // recv(fd, buf, len)     (blocking, bounded)
+#define SYS_SENDTO   28 // sendto(fd, buf, len, sockaddr*)   UDP
+#define SYS_RECVFROM 29 // recvfrom(fd, buf, len, sockaddr*) UDP
+#define SYS_SOCKCLOSE 30// close a socket descriptor
+
+// [M24] socket types
+#define SOCK_STREAM 1   // TCP
+#define SOCK_DGRAM  2   // UDP
+
+// [M24] address handed to sendto/recvfrom. ip = network-order octets (octet0 in
+// the low byte, like the kernel's net_dev_t); port = host order.
+struct secos_sockaddr {
+    uint32_t ip;
+    uint16_t port;
+    uint16_t _pad;
+};
 
 // [M23] lseek whence
 #define SEEK_SET 0

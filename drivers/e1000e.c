@@ -254,6 +254,28 @@ static void e1000e_poll(net_dev_t* dev) {
     }
 }
 
+// [M24] MSI-X/NAPI hooks (used only when net_request_irq picks MSI-X). The
+// register layout matches e1000: read ICR to clear the cause, IMS to arm RX.
+static void e1000e_irq_enable(net_dev_t* dev) {
+    (void)dev;
+    // 82574L MSI-X: route the RxQ0 cause (and "Other") to MSI-X table entry 0 —
+    // the only entry pci_enable_msix() programmed (it carries IDT vector 0x42).
+    // IVAR (0xE4): low nibble = RxQ0 (entry|VALID=bit3); bit31 = Other valid.
+    // EIAC (0xDC): auto-clear the MSI-X causes so they don't stay asserted.
+    reg_wr(0x000E4 /*IVAR*/, 0x00000008u | (1u << 31));
+    reg_wr(0x02820 /*RDTR*/, 0);                        // interrupt per packet
+    // Arm RxQ0 (MSI-X RX cause, bit 20) plus the legacy RX causes as a backstop.
+    reg_wr(E1000_IMS, (1u<<20) | (1u<<7) | (1u<<4) | (1u<<6));
+}
+static void e1000e_irq_ack(net_dev_t* dev) {
+    (void)dev;
+    // 82574 MSI-X cause is in EICR (0x1580), separate from the legacy ICR. Clear
+    // both so the next RX re-asserts a fresh edge-triggered MSI-X message; without
+    // this only the first interrupt ever fires.
+    reg_wr(0x01580 /*EICR*/, 0xFFFFFFFFu);
+    (void)reg_rd(E1000_ICR);
+}
+
 int e1000e_init(void) {
     pci_device_t dev;
     if (e1000e_find(&dev) != 0) {
@@ -300,6 +322,8 @@ int e1000e_init(void) {
     g_dev.name[3] = '0'; g_dev.name[4] = '\0';
     g_dev.transmit = e1000e_transmit;
     g_dev.poll     = e1000e_poll;
+    g_dev.irq_enable = e1000e_irq_enable;   // [M24] used only under NET_USE_MSIX
+    g_dev.irq_ack    = e1000e_irq_ack;
     g_dev.priv     = NULL;
     g_dev.pci      = dev;
     g_dev.link_up  = link;

@@ -221,6 +221,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->proc_type = PROC_TYPE_USER;
     p->drv_dev_id = -1;
     p->drv_caps = 0;
+    p->cap_net = 0;          // [M24] granted below from the signed manifest flags
     // [M14] No eager page tracking: pages are demand-paged and freed at teardown
     // by vmm_space_destroy() (which frees every present leaf in the user range).
     // mapped_page_count/user_mem_bytes report the RESERVED footprint (sum of VMA
@@ -268,6 +269,8 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
                 p->mem_limit = mf->max_mem;
             }
             p->manifest = mf;
+            // [M24] CAP_NET from the signed manifest flags (socket syscalls gate on it).
+            p->cap_net = (mf->flags & MANIFEST_FLAG_CAP_NET) ? 1 : 0;
             // [M11] Driver Space: the signed manifest is the trust root for the
             // driver claim. If it declares PROC_TYPE_DRIVER, validate the device
             // and grant only capabilities the device actually supports (subset),
@@ -457,6 +460,9 @@ int process_destroy(process_t* p) {
     // stale pointer surviving kfree(p) could later alias a reused process and
     // grant it the dead driver's device — clear it unconditionally.
     driver_remove_all_bindings(p);
+    // [M24] Close any sockets this process still owns (frees TCP conns + UDP binds).
+    extern void socket_owner_cleanup(uint32_t pid);
+    socket_owner_cleanup(p->pid);
     extern int elf_unload_process(process_t* p);
     elf_unload_process(p);                       // unmap + free user page frames, zero PTEs
     if (p->manifest) { kfree(p->manifest); p->manifest = NULL; }

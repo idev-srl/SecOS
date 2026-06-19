@@ -33,6 +33,11 @@ typedef struct net_dev {
     /* Drain the RX ring, calling net_rx() for each frame. Invoked from the NIC
      * IRQ (NAPI-style: ack, then drain to empty) and/or the timer-tick poll. */
     void     (*poll)(struct net_dev* dev);
+    /* [M24] MSI-X/NAPI (optional). irq_enable arms the NIC's RX interrupt;
+     * irq_ack clears the device interrupt cause inside the ISR (before draining).
+     * NULL on drivers that only support polling. */
+    void     (*irq_enable)(struct net_dev* dev);
+    void     (*irq_ack)(struct net_dev* dev);
     void*    priv;                /* driver state */
     pci_device_t pci;            /* the NIC's PCI function (for IRQ setup) */
     net_irq_mode_t irq_mode;
