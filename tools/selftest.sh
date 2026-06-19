@@ -465,6 +465,40 @@ grep -q "\[M23\] persistent ext2 root on" "$M23RLOG"; check "M23 persistent ext2
 ! grep -q "\[VFS\] root RAMFS mounted" "$M23RLOG"; check "M23 RAMFS root skipped when ext2 root present" $?
 ! grep -q "\[EXC\]" "$M23RLOG"; check "no CPU exception ([EXC]) during M23 persistent-root boot" $?
 
+# ---- M27a: JBD2 journal replay (crash recovery) ----
+M27LOG=/tmp/secos_selftest_m27.log
+echo "[selftest] Building M27 image (M27_RECOVER_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA=-DM27_RECOVER_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M27 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+# ext4 image with a dirty JBD2 journal (e2fsck-validated synthetic transaction).
+if make disk-journal >/tmp/secos_selftest_build.log 2>&1; then
+    # Cross-check: e2fsck on a COPY must itself recover the journal to "NEW"
+    # (proves the synthetic journal is a genuine JBD2 journal, not self-consistency).
+    cp disk.img /tmp/secos_m27_e2fsck.img
+    e2fsck -fy /tmp/secos_m27_e2fsck.img >/dev/null 2>&1
+    if debugfs -R "cat /target.bin" /tmp/secos_m27_e2fsck.img 2>/dev/null | grep -q NEW; then
+        check "M27 synthetic journal is e2fsck-recoverable (ground truth)" 0
+    else
+        check "M27 synthetic journal is e2fsck-recoverable (ground truth)" 1
+    fi
+    echo "[selftest] Running M27 journal replay (ext4 dirty journal, ${TIMEOUT}s)..."
+    : > "$M27LOG"; set +e
+    timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -drive file=disk.img,if=virtio,format=raw -boot d \
+        -debugcon file:"$M27LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
+    set -e
+    grep -q "\[M27\] journal recover: txns=0x0000000000000001" "$M27LOG"; check "M27 detects + counts the committed transaction" $?
+    grep -q '\[M27\] target.bin n=.* data="NEW"' "$M27LOG"; check "M27 replay rewrites the in-place block (OLD->NEW)" $?
+    grep -q "\[M27\] REPLAY OK" "$M27LOG"; check "M27 journal replay OK (matches e2fsck)" $?
+    ! grep -q "\[EXC\]" "$M27LOG"; check "no CPU exception ([EXC]) during M27 run" $?
+    # After SecOS replayed, the image must be e2fsck-clean (journal consumed).
+    e2fsck -fn disk.img >/dev/null 2>&1; check "M27 post-replay image is e2fsck-clean" $?
+else
+    echo "  [SKIP] M27 disk-journal build failed (mke2fs/debugfs/python missing?)"
+fi
+
 # ---- M26: VFS maturity (metadata, symlinks, mount control) on ext2 /mnt ----
 M26LOG=/tmp/secos_selftest_m26.log
 echo "[selftest] Building M26 image (M26_FS_DEMO=1, signing enforced)..."

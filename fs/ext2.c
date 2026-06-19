@@ -19,6 +19,7 @@
 #include "ext2.h"
 #include "vfs.h"
 #include "block.h"
+#include "debugcon.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -807,8 +808,157 @@ static int ext2_read_super(block_dev_t* dev){
     return 0;
 }
 
+/* ── [M27a] JBD2 journal recovery (replay) ──────────────────────────────────
+ * Read-side crash recovery: if an ext3/ext4 volume carries a non-empty journal
+ * (left dirty by a crash on another OS), replay the committed-but-not-checkpointed
+ * transactions before mounting, so we never read stale in-place metadata. JBD2 is
+ * BIG-ENDIAN on disk. We implement the standard 3-pass recovery (SCAN to find the
+ * last committed transaction, REVOKE to build the revoke table, REPLAY to write
+ * the journalled blocks honouring revokes), then mark the journal/superblock clean
+ * so we don't recover twice. Checksums are not verified (we replay regardless),
+ * which is safe for recovery and keeps us compatible with csum-enabled journals. */
+#define JBD2_MAGIC            0xc03b3998u
+#define JBD2_DESCRIPTOR_BLOCK 1
+#define JBD2_COMMIT_BLOCK     2
+#define JBD2_REVOKE_BLOCK     5
+#define JBD2_FLAG_ESCAPE      0x1
+#define JBD2_FLAG_SAME_UUID   0x2
+#define JBD2_FLAG_LAST_TAG    0x8
+#define JBD2_INCOMPAT_64BIT   0x2
+#define JBD2_INCOMPAT_CSUM_V3 0x10
+
+static uint8_t g_jdesc[MAX_BLK];     /* current descriptor/revoke block        */
+static uint8_t g_jdata[MAX_BLK];     /* current journalled data block          */
+static uint8_t g_jin[256];           /* journal inode                          */
+static struct { uint64_t blk; uint32_t seq; } g_jrev[2048];
+static int     g_njrev;
+
+static uint32_t be32(const uint8_t* p){ return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
+static uint16_t be16(const uint8_t* p){ return (uint16_t)((p[0]<<8)|p[1]); }
+
+/* Read journal logical block `lb` (via the journal inode's block map) into buf. */
+static int jread(uint32_t lb, uint8_t* buf){
+    uint32_t pb = bmap_read(g_jin, lb);   /* note: clobbers g_xb */
+    if(!pb) return -1;
+    return blk_read(pb, buf);
+}
+
+static int jrev_test(uint64_t blk, uint32_t seq){          /* revoked at >= seq? */
+    for(int i=0;i<g_njrev;i++) if(g_jrev[i].blk==blk && g_jrev[i].seq>=seq) return 1;
+    return 0;
+}
+
+/* One recovery pass. phase: 0=SCAN, 1=REVOKE, 2=REPLAY. Returns the number of
+ * committed transactions seen (the SCAN result is used to bound REVOKE/REPLAY). */
+enum { JP_SCAN, JP_REVOKE, JP_REPLAY };
+static uint32_t jbd2_pass(int phase, uint32_t first, uint32_t maxlen,
+                          uint32_t incompat, uint32_t start, uint32_t start_seq,
+                          uint32_t end_seq){
+    uint32_t next = start, seq = start_seq, committed = 0;
+    int tag3 = (incompat & JBD2_INCOMPAT_CSUM_V3) ? 1 : 0;
+    int b64  = (incompat & JBD2_INCOMPAT_64BIT) ? 1 : 0;
+    int tagsz = tag3 ? 16 : (b64 ? 12 : 8);
+    for(;;){
+        if(phase!=JP_SCAN && seq>=end_seq) break;          /* stop at uncommitted tail */
+        if(jread(next, g_jdesc)!=0) break;
+        if(be32(g_jdesc+0)!=JBD2_MAGIC) break;
+        uint32_t btype=be32(g_jdesc+4), bseq=be32(g_jdesc+8);
+        if(bseq!=seq) break;
+        if(btype==JBD2_DESCRIPTOR_BLOCK){
+            uint32_t next_data = (next+1>=maxlen)? first : next+1;
+            uint32_t off=12;
+            for(;;){
+                if(off+tagsz > g_blk_size) break;
+                const uint8_t* t=g_jdesc+off;
+                uint32_t flags = tag3 ? be32(t+4) : be16(t+6);
+                uint64_t lo = be32(t+0);
+                uint64_t tgt = (b64 ? ((uint64_t)be32(t+ (tag3?8:8))<<32) : 0) | lo;
+                off += tagsz;
+                if(!(flags & JBD2_FLAG_SAME_UUID)) off += 16;   /* skip UUID */
+                if(phase==JP_REPLAY){
+                    if(jread(next_data, g_jdata)==0 && !jrev_test(tgt, seq)){
+                        if(flags & JBD2_FLAG_ESCAPE){           /* first word was un-escaped */
+                            g_jdata[0]=0xc0; g_jdata[1]=0x3b; g_jdata[2]=0x39; g_jdata[3]=0x98;
+                        }
+                        blk_write((uint32_t)tgt, g_jdata);
+                    }
+                }
+                next_data = (next_data+1>=maxlen)? first : next_data+1;
+                if(flags & JBD2_FLAG_LAST_TAG) break;
+            }
+            next = next_data;                                /* descriptor + its data blocks */
+            continue;
+        } else if(btype==JBD2_COMMIT_BLOCK){
+            seq++; committed++;
+            next = (next+1>=maxlen)? first : next+1;
+            continue;
+        } else if(btype==JBD2_REVOKE_BLOCK){
+            if(phase==JP_REVOKE){
+                uint32_t cnt=be32(g_jdesc+12);               /* bytes used incl 12-byte header? r_count */
+                uint32_t roff=16, rsz=b64?8:4;               /* header is 16 bytes for v? actually 12 + r_count@12 */
+                /* jbd2 revoke header: h(12) + r_count(be32)@12 -> records start @16 */
+                while(roff+rsz<=cnt && roff+rsz<=g_blk_size && g_njrev<2048){
+                    uint64_t rb = b64 ? (((uint64_t)be32(g_jdesc+roff)<<32)|be32(g_jdesc+roff+4))
+                                      : be32(g_jdesc+roff);
+                    g_jrev[g_njrev].blk=rb; g_jrev[g_njrev].seq=seq; g_njrev++;
+                    roff += rsz;
+                }
+            }
+            next = (next+1>=maxlen)? first : next+1;
+            continue;
+        } else break;
+    }
+    return committed;
+}
+
+/* Recover the journal of the currently-mounted volume (globals from read_super).
+ * Returns 1 if a replay happened, 0 if nothing to do, -1 on error. */
+static int jbd2_recover(void){
+    uint8_t sbsec[1024];
+    if(block_read(g_dev, 2, sbsec, 2)!=2) return -1;
+    uint8_t* sb=sbsec;
+    uint32_t feat_compat   = rd32(sb+92);
+    uint32_t feat_incompat = rd32(sb+96);
+    if(!(feat_compat & 0x4)) return 0;                       /* no HAS_JOURNAL */
+    uint32_t jinum = rd32(sb+224);                           /* s_journal_inum */
+    if(!jinum) return 0;
+    if(inode_read(jinum, g_jin)!=0) return -1;
+    if(jread(0, g_jdesc)!=0) return -1;                      /* journal superblock @ jblk 0 */
+    if(be32(g_jdesc+0)!=JBD2_MAGIC) return -1;
+    uint32_t jmaxlen  = be32(g_jdesc+16);
+    uint32_t jfirst   = be32(g_jdesc+20);
+    uint32_t jseq     = be32(g_jdesc+24);
+    uint32_t jstart   = be32(g_jdesc+28);
+    uint32_t jincompat= be32(g_jdesc+40);
+    int needs = (feat_incompat & 0x4) ? 1 : 0;               /* EXT4 NEEDS_RECOVERY */
+    if(jstart==0){                                           /* journal clean */
+        if(needs){                                           /* clear stale flag */
+            wr32(sb+96, feat_incompat & ~0x4u); block_write(g_dev, 2, sbsec, 2);
+        }
+        return 0;
+    }
+    g_njrev=0;
+    uint32_t committed = jbd2_pass(JP_SCAN,   jfirst, jmaxlen, jincompat, jstart, jseq, 0);
+    uint32_t end_seq   = jseq + committed;
+    debugcon_writestring("[M27] journal recover: txns="); debugcon_print_hex(committed); debugcon_writestring("\n");
+    jbd2_pass(JP_REVOKE, jfirst, jmaxlen, jincompat, jstart, jseq, end_seq);
+    jbd2_pass(JP_REPLAY, jfirst, jmaxlen, jincompat, jstart, jseq, end_seq);
+    /* Mark the journal empty (s_start=0, s_sequence=end_seq) and clear the fs
+     * NEEDS_RECOVERY flag so we don't replay again and e2fsck sees it clean. */
+    if(jread(0, g_jdesc)==0){
+        g_jdesc[28]=0;g_jdesc[29]=0;g_jdesc[30]=0;g_jdesc[31]=0;            /* s_start = 0 (BE) */
+        g_jdesc[24]=(uint8_t)(end_seq>>24);g_jdesc[25]=(uint8_t)(end_seq>>16);
+        g_jdesc[26]=(uint8_t)(end_seq>>8);g_jdesc[27]=(uint8_t)end_seq;     /* s_sequence (BE) */
+        uint32_t jpb=bmap_read(g_jin,0); if(jpb) blk_write(jpb, g_jdesc);
+    }
+    if(needs){ wr32(sb+96, feat_incompat & ~0x4u); block_write(g_dev, 2, sbsec, 2); }
+    return committed ? 1 : 0;
+}
+
 int ext2_mount(const char* dev_name, const char* mount_point){
     if(ext2_read_super(block_find(dev_name))!=0) return -1;
+    jbd2_recover();                                          /* [M27a] replay a dirty journal */
+    if(ext2_read_super(block_find(dev_name))!=0) return -1;  /* re-read SB (recovery cleared flags) */
     return vfs_mount(mount_point, &ext2_ops, "ext2");
 }
 
@@ -817,6 +967,8 @@ int ext2_mount(const char* dev_name, const char* mount_point){
  * (so a plain ext2 *data* disk is never silently grabbed as the root). Returns 0
  * if mounted as root, -1 otherwise (caller falls back to the ramfs root). */
 int ext2_mount_root(const char* dev_name){
+    if(ext2_read_super(block_find(dev_name))!=0) return -1;
+    jbd2_recover();                              /* [M27a] replay a dirty journal first */
     if(ext2_read_super(block_find(dev_name))!=0) return -1;
     g_vused=0;
     if(!e2_lookup("/.secosroot")) return -1;     /* ext2 but not a SecOS root */

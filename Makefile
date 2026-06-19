@@ -257,7 +257,7 @@ user-progs:
 # A small FAT32 data disk with a known test file. Used by the storage smoke
 # tests; attach with -drive file=$(DISK_IMG),if=virtio,format=raw.
 DISK_IMG = disk.img
-.PHONY: disk disk-fat32 disk-ext2 disk-ext4
+.PHONY: disk disk-fat32 disk-ext2 disk-ext4 disk-journal
 disk: disk-fat32
 disk-fat32:
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
@@ -277,6 +277,16 @@ disk-ext4:
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
 	mkfs.ext4 -q -O ^has_journal,^metadata_csum -L SECOSDATA -d /tmp/secos_diskstage $(DISK_IMG)
 	@echo "disk-ext4: $(DISK_IMG) (ext4 no-journal/no-csum, extents+64bit, 64MB, hello.txt)"
+
+# [M27a] ext4 image with a DIRTY JBD2 journal: a committed transaction rewrites
+# /target.bin from OLD to NEW, pending replay. e2fsck-validated synthetic journal
+# (tools/mk_dirty_journal.py). A correct journal-recovery driver replays it on mount.
+disk-journal:
+	rm -rf /tmp/secos_jstage && mkdir -p /tmp/secos_jstage
+	printf 'OLDOLDOLDOLD\n' > /tmp/secos_jstage/target.bin
+	mke2fs -F -q -t ext4 -O has_journal,^metadata_csum,^64bit -b 1024 -d /tmp/secos_jstage $(DISK_IMG) 16384
+	python3 tools/mk_dirty_journal.py $(DISK_IMG) /target.bin NEW
+	@echo "disk-journal: $(DISK_IMG) (ext4 + dirty JBD2 journal, /target.bin OLD->NEW pending replay)"
 
 # [M23] Persistent ext2 SYSTEM root disk: FHS skeleton + the /.secosroot marker
 # that makes the kernel adopt it as the VFS root "/". Attach as a SATA/NVMe/USB

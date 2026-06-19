@@ -84,8 +84,11 @@ session. The narrative handoff lives in `next_session.md`; the long-term plan in
 - [x] `mount` / `umount` syscalls — **M26**.
 - [x] Symlinks — **M26** (ext2 fast symlinks; `stat` follows final component).
       _Limitation: mid-path symlink components not followed yet._
-- [ ] **ext4 JBD2 journaling + `metadata_csum`** — **M27** (crash consistency,
-      flagged big rock; needs fault-injection testing). Completes Phase H.
+- [x] **JBD2 journal replay (read-side)** — **M27a**: safely mount a dirty
+      ext3/ext4 left by a crash on another OS. 3-pass recovery, e2fsck-validated.
+- [ ] **Write-side journaling + `metadata_csum`** — **M27b** (SecOS's own writes
+      crash-safe; needs a transaction/checkpoint layer + fault-injection harness).
+      The larger remaining half of Phase H crash-consistency.
 
 ### Option 5 — Phase I: modern platform → **MULTICORE / SMP** _(biggest effort)_
 

@@ -1308,6 +1308,20 @@ static void kernel_main_phase2(void) {
             for (size_t i = 0; match && i < mlen; i++) if (back[i] != msg[i]) match = 0;
             debugcon_writestring(match ? "[M10] disk write+readback: OK\n"
                                        : "[M10] disk write+readback: FAIL\n");
+#if M27_RECOVER_DEMO
+            // [M27a] Journal replay: the disk carries a dirty JBD2 journal whose
+            // committed transaction rewrites /mnt/target.bin from "OLD" to "NEW".
+            // jbd2_recover() runs in ext2_mount; if it replayed, the file is "NEW".
+            {
+                static char tb[2048]; for(int i=0;i<2048;i++) tb[i]=0;
+                int tn = vfs_read_all("/mnt/target.bin", tb, sizeof(tb));
+                debugcon_writestring("[M27] target.bin n="); debugcon_print_hex((uint64_t)tn);
+                debugcon_writestring(" data=\""); for(int i=0;i<3&&i<tn;i++) debugcon_putchar(tb[i]);
+                debugcon_writestring("\" (expect NEW after replay)\n");
+                debugcon_writestring((tn>=3 && tb[0]=='N'&&tb[1]=='E'&&tb[2]=='W')
+                    ? "[M27] REPLAY OK\n" : "[M27] REPLAY FAIL\n");
+            }
+#endif
 #if M26_FS_DEMO
             // [M26] VFS maturity: metadata (chmod/chown), symlinks, mount control.
             // Needs an ext2 /mnt (FAT32 has no setattr/symlink). Run on extN only.
