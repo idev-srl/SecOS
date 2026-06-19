@@ -32,6 +32,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/kernel.c \
 	$(ARCH_DIR)/idt.c $(ARCH_DIR)/tss.c $(ARCH_DIR)/context_switch.c \
 	$(ARCH_DIR)/lapic.c \
+	$(ARCH_DIR)/acpi.c \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \

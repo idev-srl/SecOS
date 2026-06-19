@@ -579,6 +579,24 @@ else
   echo "  [SKIP] M27b (mke2fs unavailable)"
 fi
 
+# ---- M28-1: ACPI topology discovery (read-only; scales with -smp) ----
+M28LOG=/tmp/secos_selftest_m28.log
+echo "[selftest] Building M28 image (default; ACPI discovery at boot)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M28 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M28 (mb2, -smp 2, ${TIMEOUT}s)..."
+: > "$M28LOG"; set +e
+timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -smp 2 -boot d \
+    -debugcon file:"$M28LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
+set -e
+grep -q "\[ACPI\] CPUs=0x0000000000000002" "$M28LOG"; check "M28 ACPI discovers all CPUs (-smp 2)" $?
+grep -q "lapic=0x00000000FEE00000" "$M28LOG"; check "M28 ACPI reports the LAPIC base" $?
+grep -q "ioapic0=0x00000000FEC00000" "$M28LOG"; check "M28 ACPI reports the IOAPIC base" $?
+! grep -q "\[EXC\]" "$M28LOG"; check "no CPU exception ([EXC]) during M28 run" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

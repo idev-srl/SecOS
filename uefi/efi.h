@@ -189,7 +189,19 @@ typedef struct EFI_SYSTEM_TABLE {
     void*                            StdErr;          /* offset  80 */
     void*                            RuntimeServices; /* offset  88 */
     EFI_BOOT_SERVICES*               BootServices;    /* offset  96 */
+    uint64_t                         NumberOfTableEntries; /* offset 104 */
+    struct EFI_CONFIGURATION_TABLE*  ConfigurationTable;   /* offset 112 */
 } EFI_SYSTEM_TABLE;
+
+/* [M28] EFI configuration table entry — carries the ACPI RSDP among others. */
+typedef struct EFI_CONFIGURATION_TABLE {
+    EFI_GUID VendorGuid;
+    void*    VendorTable;
+} EFI_CONFIGURATION_TABLE;
+
+/* ACPI 2.0+ and legacy ACPI 1.0 RSDP configuration-table GUIDs. */
+static const EFI_GUID EFI_ACPI_20_TABLE_GUID = {0x8868e871,0xe4f1,0x11d3,{0xbc,0x22,0x00,0x80,0xc7,0x3c,0x88,0x81}};
+static const EFI_GUID EFI_ACPI_10_TABLE_GUID = {0xeb9d2d30,0x2d88,0x11d3,{0x9a,0x16,0x00,0x90,0x27,0x3f,0xc1,0x4d}};
 
 // Status codes (subset)
 // Status codes: high bit set for error conditions per UEFI spec.

@@ -1076,6 +1076,17 @@ static void kernel_main_phase2(void) {
     sched_init();
     driver_registry_init();
     { extern void ipc_init(void); ipc_init(); }  // [M13] kernel IPC channels
+    { // [M28-1] discover CPUs/LAPIC/IOAPIC (read-only). UEFI hands the RSDP over;
+      // MB2 falls back to a BIOS-area scan.
+      extern int acpi_init(uint64_t);
+      extern uint32_t g_multiboot_magic; extern uint64_t g_multiboot_info;
+      uint64_t rsdp_hint = 0;
+      if (g_multiboot_magic == 0 && g_multiboot_info) {
+          struct secos_boot_info* bi = (struct secos_boot_info*)g_multiboot_info;
+          rsdp_hint = bi->acpi_rsdp;
+      }
+      acpi_init(rsdp_hint);
+    }
     timer_init(1000);
     keyboard_init();
 

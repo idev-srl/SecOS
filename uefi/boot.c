@@ -185,6 +185,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         saved_fb_pitch = gop->Mode->Info->PixelsPerScanLine * 4;
     }
 
+    // [M28] Find the ACPI RSDP in the EFI configuration table (prefer ACPI 2.0).
+    // Plain memory reads — valid before ExitBootServices; the RSDP itself persists.
+    uint64_t saved_rsdp = 0;
+    {
+        EFI_CONFIGURATION_TABLE* ct = SystemTable->ConfigurationTable;
+        uint64_t n = SystemTable->NumberOfTableEntries;
+        for (uint64_t i = 0; i < n; i++) {
+            EFI_GUID* g = &ct[i].VendorGuid;
+            int is20 = g->Data1==EFI_ACPI_20_TABLE_GUID.Data1 && g->Data2==EFI_ACPI_20_TABLE_GUID.Data2 && g->Data3==EFI_ACPI_20_TABLE_GUID.Data3;
+            int is10 = g->Data1==EFI_ACPI_10_TABLE_GUID.Data1 && g->Data2==EFI_ACPI_10_TABLE_GUID.Data2 && g->Data3==EFI_ACPI_10_TABLE_GUID.Data3;
+            if (is20) { saved_rsdp = (uint64_t)ct[i].VendorTable; break; }      // 2.0 wins
+            if (is10 && !saved_rsdp) saved_rsdp = (uint64_t)ct[i].VendorTable;  // 1.0 fallback
+        }
+    }
+
     // Fase 4: ExitBootServices — retry loop (UEFI spec §7.4.6)
     // Any puts16 after GetMemoryMap allocates console buffers and stales the map_key.
     // Solution: print BEFORE the loop, then only GetMemoryMap + EBS inside it, no console.
@@ -216,6 +231,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     } else {
         bootinfo.fb_addr=bootinfo.fb_width=bootinfo.fb_height=bootinfo.fb_pitch=bootinfo.fb_bpp=0;
     }
+    bootinfo.acpi_rsdp        = saved_rsdp;   // [M28] ACPI RSDP for the kernel
     bootinfo.mem_descs        = mem_map;
     bootinfo.mem_desc_count   = final_map_size / desc_size;
     bootinfo.mem_desc_size    = desc_size;

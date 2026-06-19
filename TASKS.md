@@ -100,9 +100,9 @@ kernel today is written assuming a single core (PMM, scheduler, heap, VFS, page
 cache are all SMP-unsafe), and there is no way to even discover the other cores
 yet. The chain below must be done roughly in order; SMP is the last and riskiest step.
 
-- [ ] **1. ACPI table parsing** — find the RSDP, parse RSDT/XSDT, then the **MADT**
-      to enumerate CPUs / LAPIC IDs and the IOAPIC(s). Without this we can't know
-      how many cores exist.
+- [x] **1. ACPI table parsing** — **M28-1 done**: RSDP (UEFI loader / MB2 scan) →
+      XSDT/RSDT → MADT → CPU LAPIC IDs+count, LAPIC base, IOAPIC(s), overrides.
+      `arch/x86/acpi.{c,h}`; verified both boot paths, scales with `-smp`.
 - [ ] **2. APIC / IOAPIC** — retire the legacy 8259 PIC; route IRQs through the
       IOAPIC; per-core LAPIC (EOI, IPIs). Prerequisite for per-core interrupts.
 - [ ] **3. TSC / HPET timekeeping** — reliable time source + per-core LAPIC timer

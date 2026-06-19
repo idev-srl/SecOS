@@ -24,7 +24,8 @@ struct secos_boot_info {
     uint64_t mem_desc_size;           // Size of each descriptor
     uint64_t mem_desc_version;        // Descriptor version
     uint64_t mem_map_key;             // Key for ExitBootServices (informativo per kernel)
-    // Future extensions: ACPI RSDP, SMBIOS, RNG seed, etc.
+    uint64_t acpi_rsdp;               // [M28] ACPI RSDP physical address (0 if not found)
+    // Future extensions: SMBIOS, RNG seed, etc.
     uint64_t flags;                   // Misc flags (bit0: GOP valid, bit1: memory map valid)
 };
 
