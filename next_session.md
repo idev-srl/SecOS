@@ -1,24 +1,48 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **M25 + M26 + M27 (a+b) COMPLETE & pushed — Phase H DONE**. M25
-(pipes + console TTY + TCP throughput), M26 (VFS maturity: metadata/chmod/chown/
-symlinks/mount), M27a (JBD2 journal replay), M27b (write-side crash-atomic
-journaling). Self-test **150/150**. HEAD `eaf2f6d` on `main`, pushed to
-`origin/main`. Read this first._
-_The actionable checklist is `TASKS.md`; per-milestone detail in `docs/devlog/M25..M27.md`._
+_Last updated: **Phase H DONE + Phase I STARTED (M28-1 ACPI done)**. This session
+shipped M25 (pipes+TTY+TCP throughput), M26 (VFS maturity), M27a (journal replay),
+M27b (write-side crash-atomic journaling → **Phase H complete**), and M28-1 (ACPI
+table discovery → **Phase I part 1**). Self-test **154/154**. HEAD `35e3782` on
+`main`, pushed to `origin/main`. Read this first._
+_Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M25..M28.md`._
 
-## ▶▶ NEXT SESSION TASK: pick the next milestone (Phase H is complete)
-With Phase H done (storage & filesystem maturity), the open fronts:
-1. **Signals** — async **Ctrl-C→SIGINT** to kill a compute-bound foreground
-   process + **SIGPIPE**. Today Ctrl-C only interrupts an in-progress read (M25);
-   the kill path (M15 `sched_kill_current`) exists but there's no async delivery.
-   Unblocks **shell job control + pipelines** (`cmd1 | cmd2`, pipes already exist).
-2. **Phase I** — ACPI + APIC/IOAPIC (retire the PIC) → TSC/HPET → **SMP**
-   (the biggest effort; locking audit first). See `TASKS.md` for the SMP chain.
-3. **NIC hardware validation** — vmxnet3 / igc (2.5 GbE) need the real adapter.
-4. **FS follow-ups** (optional polish): mid-path symlink following; `metadata_csum`;
-   ctime auto-bump; M27b is ordered-mode (data=journal would also crash-protect
-   recent data). Detail in `docs/devlog/M26.md` / `M27.md`.
+## ▶▶ NEXT SESSION TASK: **M28-2 — APIC switchover** (Phase I, part 2)
+M28-1 (ACPI discovery) is done; `arch/x86/acpi.{c,h}` exposes the topology via
+`acpi_get()` / `acpi_irq_to_gsi()`. Next, retire the legacy 8259 PIC + PIT for the
+APIC. **This is risky live-interrupt surgery — keep BOTH boot paths green and
+commit only on a clean selftest.** Plan:
+1. **Enable the LAPIC fully** — build on `lapic_enable()` (`arch/x86/lapic.c`):
+   spurious-interrupt vector + APIC software-enable (already there for MSI).
+2. **LAPIC timer as the scheduler tick** — calibrate against the PIT once, then
+   program the LAPIC timer (periodic, vector e.g. 0x20 or a fresh one) to fire at
+   1 kHz and call `sched_on_timer_tick()` (today driven by PIT IRQ0 →
+   `drivers/timer.c timer_handler`). `lapic_eoi()` instead of PIC EOI.
+3. **IOAPIC** — map `acpi_get()->ioapics[0].base` (physmap), program the
+   redirection entry for the keyboard (ISA IRQ1 → `acpi_irq_to_gsi(1)` → a vector),
+   honoring override polarity/trigger flags. **Mask the 8259 PIC** (OCW1 0xFF to
+   0x21/0xA1) once the IOAPIC owns the IRQs.
+4. Keep a fallback: if `acpi_get()->found` is 0 (no MADT), stay on PIC/PIT.
+5. **Gotchas**: `idt.c` currently installs IRQ gates at 0x20/0x21 (PIC-remapped);
+   the LAPIC-timer + IOAPIC vectors must line up with the IDT. EOI source changes
+   (LAPIC vs PIC). Test mb2 AND uefi; the scheduler tick + keyboard must still work.
+   Add an `[APIC]` debugcon marker + a selftest case (tick still preempts, ACPI
+   topology unchanged, no `[EXC]`).
+Then **M28-3** (TSC timekeeping) and **M29 (SMP)** — the big one (AP bring-up +
+kernel-wide locking audit; do the audit BEFORE enabling APs).
+
+### Other open fronts (lower priority than finishing Phase I)
+- **Signals** — async Ctrl-C→SIGINT + SIGPIPE → shell job control & pipelines
+  (`cmd1 | cmd2`; pipes already exist). M15 `sched_kill_current` exists; no async delivery.
+- **NIC hardware validation** — vmxnet3 / igc (2.5 GbE) need the real adapter.
+- **FS follow-ups**: mid-path symlink following; `metadata_csum`; ctime auto-bump.
+
+### M28-1 facts (don't relearn)
+- ACPI tables are read via the **low identity map (0–512 MiB)** (`pv()` in acpi.c),
+  NOT the physmap — the physmap may not cover the ACPI region on UEFI (#PF otherwise).
+- RSDP: UEFI loader passes it (`secos_boot_info.acpi_rsdp`, via the EFI config
+  table for the ACPI 2.0/1.0 GUID); MB2 scans the BIOS area. `acpi_init(rsdp_hint)`.
+- `efi.h` `EFI_SYSTEM_TABLE` now includes `ConfigurationTable` (was truncated).
 
 ### M27 (a+b) facts (don't relearn)
 - M27b is **ordered mode**: metadata journalled, file **data** written direct
