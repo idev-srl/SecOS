@@ -1058,8 +1058,9 @@ static void sh_ping(const char* a){
         ip = parts[0] | (parts[1]<<8) | (parts[2]<<16) | (parts[3]<<24);
     }
     terminal_writestring("PING "); print_ip(ip); terminal_writestring(" ...\n");
-    net_ping_test(ip);
-    terminal_writestring("(see serial/debug for result)\n");
+    int r = net_ping_test(ip);
+    if(r==0){ terminal_writestring("reply from "); print_ip(ip); terminal_writestring(": ok\n"); }
+    else     terminal_writestring("no reply (timeout / ARP failed)\n");
 }
 // Parse "a.b.c.d" -> network-order uint32 (octet0 at LSB). Returns 0 on parse.
 static int parse_ip(const char* a, uint32_t* out){

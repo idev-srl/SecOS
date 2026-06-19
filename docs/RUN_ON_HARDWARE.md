@@ -110,6 +110,37 @@ for *using* a stick after boot.)
   NVRAM). For QEMU testing, the single-disk `make run-uefi-disk` is the reliable
   path; split `OVMF_CODE`/`OVMF_VARS` if you need persistence.
 
+## Networking (M24) on VMware
+
+SecOS speaks Ethernet/ARP/IPv4/ICMP + UDP/DHCP/DNS + TCP, with BSD sockets gated
+by the signed-manifest `CAP_NET`. To get the network up on VMware:
+
+1. **Use a supported NIC.** In the VM settings, set the network adapter so it
+   presents one of:
+   - **e1000e** (Intel 82574L, dev `8086:10D3`) — **recommended**, this is the
+     driver validated in QEMU. In the `.vmx`: `ethernet0.virtualDev = "e1000e"`.
+   - **e1000** (Intel 82545EM, dev `8086:100F`) — also supported (M24 widened the
+     e1000 driver to accept it). `ethernet0.virtualDev = "e1000"`.
+   - **vmxnet3** (`15AD:07B0`) — driver present but **not yet validated** on a real
+     VMware host; prefer e1000e for now.
+   Set the adapter to **NAT** (gives a DHCP server + DNS, like QEMU SLIRP) or
+   Bridged. The GUI may not expose the adapter type — edit the `.vmx` line above.
+
+2. **Drive it from the shell** (the RX path needs the idle/shell context):
+   ```
+   netinfo              # MAC, IP, link state
+   dhcp                 # request a lease -> sets IP/netmask/gateway/DNS
+   ping 8.8.8.8         # or `ping` for the gateway -> prints "reply ...: ok"
+   nslookup example.com # resolve via the DHCP-provided DNS
+   tcptest <ip> 80      # open a TCP connection + HTTP GET
+   ```
+   All of these print their result to the **console/serial** (not just debugcon),
+   so they're visible on the VMware VM console and over the COM1 serial capture.
+
+3. **Troubleshooting.** `netinfo` saying "no NIC" means the driver didn't bind —
+   check the adapter type in the `.vmx` (must be e1000/e1000e). `dhcp` timing out
+   on Bridged usually means no DHCP server on that LAN; use NAT. Link must be `up`.
+
 ## How it's built (reproducible)
 
 `tools/mkuefidisk.sh` (invoked by `make uefi-disk`) creates the image with no root:

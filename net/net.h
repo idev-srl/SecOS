@@ -62,8 +62,9 @@ net_irq_mode_t net_request_irq(net_dev_t* dev);
  * stack, configure (static IP for now), and start. Returns the number of NICs. */
 int net_init(void);
 
-/* [M24] Boot ping self-test against an IPv4 (network byte order). */
-void net_ping_test(uint32_t dst_ip);
+/* [M24] Ping an IPv4 (network byte order). Returns 0 if an echo reply arrived,
+ * -1 on ARP/echo timeout. (Result also mirrored to debugcon.) */
+int net_ping_test(uint32_t dst_ip);
 
 /* Called from the timer tick (drives polled NICs + protocol timers like ARP/TCP
  * retransmit). Cheap no-op when networking is absent. */

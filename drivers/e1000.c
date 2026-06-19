@@ -135,10 +135,15 @@ static void e1000_irq_ack(net_dev_t* dev) {
     (void)rd(REG_ICR);                        // read-to-clear the interrupt cause
 }
 
+// The 82540EM (QEMU `-device e1000`) and 82545EM (VMware's "e1000" adapter) share
+// the same register layout, so one driver covers both.
+#define E1000_DEV_82545EM 0x100F
+
 int e1000_init(void) {
     pci_device_t pci;
-    if (pci_find(E1000_VENDOR, E1000_DEV_82540EM, &pci) != 0) {
-        debugcon_writestring("[E1000] no 8086:100E on PCI\n");
+    if (pci_find(E1000_VENDOR, E1000_DEV_82540EM, &pci) != 0 &&
+        pci_find(E1000_VENDOR, E1000_DEV_82545EM, &pci) != 0) {
+        debugcon_writestring("[E1000] no 8086:100E/100F on PCI\n");
         return -1;
     }
     pci_enable_mem_and_busmaster(&pci);

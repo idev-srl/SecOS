@@ -152,28 +152,29 @@ int net_init(void) {
     return g_ndev;
 }
 
-// [M24] Boot self-test: ARP + ping the given IPv4 (network byte order). Drives the
-// NIC poll loop directly (the scheduler/timer may not be running yet). Logs result.
-void net_ping_test(uint32_t dst_ip) {
+// [M24] ARP + ping the given IPv4 (network byte order). Drives the NIC poll loop
+// directly via hlt (yields the vCPU so received DMA lands). Returns 0 on an echo
+// reply, -1 on timeout; mirrors the outcome to debugcon.
+int net_ping_test(uint32_t dst_ip) {
     net_dev_t* d = net_primary();
-    if (!d) return;
+    if (!d) return -1;
     extern uint64_t timer_get_ticks(void);
     uint8_t mac[6];
-    // The timer tick drives net_tick()->poll and, crucially, halting the CPU
-    // (hlt) yields to the host so received DMA actually lands. Bounded by ticks.
     __asm__ volatile ("sti");
 
     arp_request(d, dst_ip);
-    uint64_t deadline = timer_get_ticks() + 300;        // ~300 ms at 1 kHz
+    uint64_t deadline = timer_get_ticks() + 1000;       // ~1 s at 1 kHz
     while (timer_get_ticks() < deadline && arp_lookup(dst_ip, mac) != 0)
         __asm__ volatile ("hlt");
-    if (arp_lookup(dst_ip, mac) != 0) { debugcon_writestring("[NET] ARP timeout (no peer)\n"); return; }
-    debugcon_writestring("[NET] ARP resolved gateway\n");
+    if (arp_lookup(dst_ip, mac) != 0) { debugcon_writestring("[NET] ARP timeout (no peer)\n"); return -1; }
+    debugcon_writestring("[NET] ARP resolved\n");
 
     uint32_t before = icmp_echo_replies();
     icmp_send_echo(d, dst_ip, 1, 1);
-    deadline = timer_get_ticks() + 300;
+    deadline = timer_get_ticks() + 1000;
     while (timer_get_ticks() < deadline && icmp_echo_replies() == before)
         __asm__ volatile ("hlt");
-    debugcon_writestring(icmp_echo_replies() > before ? "[NET] PING OK\n" : "[NET] PING timeout\n");
+    int ok = icmp_echo_replies() > before;
+    debugcon_writestring(ok ? "[NET] PING OK\n" : "[NET] PING timeout\n");
+    return ok ? 0 : -1;
 }
