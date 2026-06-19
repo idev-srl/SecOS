@@ -1047,6 +1047,8 @@ static void sh_netinfo(const char* a){ (void)a;
     terminal_writestring("\n  IP ");   print_ip(d->ip);
     terminal_writestring("  GW ");      print_ip(d->gateway);
     terminal_writestring("  link ");    terminal_writestring(d->link_up?"up":"down");
+    terminal_writestring("  rx ");
+    terminal_writestring(d->irq_mode==NET_IRQ_MSIX?"msix(irq)":d->irq_mode==NET_IRQ_INTX?"intx(irq)":d->irq_mode==NET_IRQ_POLL?"poll":"none");
     terminal_writestring("\n");
 }
 static void sh_ping(const char* a){
