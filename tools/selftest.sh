@@ -600,6 +600,9 @@ grep -q "\[APIC\] IOAPIC route irq=0x0000000000000001 .* vec=0x0000000000000021"
 grep -q "\[APIC\] LAPIC timer hz=0x00000000000003E8" "$M28LOG"; check "M28-2 LAPIC timer programmed at 1 kHz" $?
 grep -q "\[APIC\] mode active" "$M28LOG"; check "M28-2 APIC mode active (PIC masked)" $?
 grep -q "\[APIC\] timer tick verified" "$M28LOG"; check "M28-2 LAPIC timer actually ticks (IRQ delivery OK)" $?
+# M28-3: TSC monotonic timekeeping.
+grep -q "\[TSC\] calibrated hz=" "$M28LOG"; check "M28-3 TSC calibrated against PIT ch2" $?
+grep -q "\[TSC\] monotonic OK" "$M28LOG"; check "M28-3 ktime_ns() monotonic + sane frequency" $?
 ! grep -q "\[EXC\]" "$M28LOG"; check "no CPU exception ([EXC]) during M28 run" $?
 
 echo "[selftest] ---"

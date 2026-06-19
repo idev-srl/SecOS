@@ -19,6 +19,8 @@ extern uint64_t timer_get_ticks(void);
 extern uint64_t timer_get_uptime_seconds(void);
 extern uint32_t timer_get_frequency(void);
 extern process_t* sched_get_current(void);
+extern uint64_t ktime_ns(void);   /* [M28-3] TSC monotonic clock */
+extern uint64_t tsc_hz(void);
 
 // ---- tiny text builder ----
 struct sb { char* p; int cap; int len; };
@@ -41,7 +43,18 @@ static int gen_meminfo(struct sb* s){
     return s->len;
 }
 static int gen_uptime(struct sb* s){
-    sb_u64(s, timer_get_uptime_seconds()); sb_str(s," s ("); sb_u64(s, timer_get_ticks()); sb_str(s," ticks)\n");
+    // [M28-3] Sub-second precision from the TSC monotonic clock when calibrated;
+    // fall back to whole-second tick uptime otherwise.
+    uint64_t ns = ktime_ns();
+    if(ns){
+        uint64_t sec = ns / 1000000000ull;
+        uint64_t cs  = (ns % 1000000000ull) / 10000000ull;   // centiseconds
+        sb_u64(s, sec); sb_putc(s,'.');
+        if(cs < 10) sb_putc(s,'0');
+        sb_u64(s, cs); sb_str(s," s\n");
+    } else {
+        sb_u64(s, timer_get_uptime_seconds()); sb_str(s," s ("); sb_u64(s, timer_get_ticks()); sb_str(s," ticks)\n");
+    }
     return s->len;
 }
 static int gen_version(struct sb* s){
@@ -53,6 +66,7 @@ static int gen_cpuinfo(struct sb* s){
     sb_str(s,"arch        : x86_64\n");
     sb_str(s,"mode        : long (64-bit)\n");
     sb_str(s,"timer_hz    : "); sb_u64(s, timer_get_frequency()); sb_putc(s,'\n');
+    sb_str(s,"tsc_mhz     : "); sb_u64(s, tsc_hz()/1000000ull); sb_putc(s,'\n');
     return s->len;
 }
 static int gen_mounts(struct sb* s){

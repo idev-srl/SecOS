@@ -1112,6 +1112,21 @@ static void kernel_main_phase2(void) {
         }
     }
 
+    // [M28-3] TSC timekeeping: calibrate rdtsc against PIT channel 2 (independent
+    // of the 8259/APIC) for a monotonic nanosecond clock. The 1 kHz scheduler tick
+    // is unchanged. Self-check: ktime_ns() must be non-zero and strictly advance.
+    {
+        extern void tsc_init(void);
+        extern uint64_t ktime_ns(void); extern uint64_t tsc_hz(void);
+        tsc_init();
+        uint64_t a = ktime_ns();
+        for (volatile int i = 0; i < 100000; i++) { __asm__ volatile(""); }
+        uint64_t b = ktime_ns();
+        int ok = (tsc_hz() > 100000000ull) && (b > a);  // >100 MHz and monotonic
+        debugcon_writestring(ok ? "[TSC] monotonic OK\n"
+                                : "[TSC] FAIL: clock not advancing\n");
+    }
+
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();
 #endif

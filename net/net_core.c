@@ -123,10 +123,14 @@ static inline uint64_t rdtsc(void){
     return ((uint64_t)hi << 32) | lo;
 }
 
-// Calibrate the TSC against the 1 kHz PIT once: count cycles over 100 ms.
+// Cycles per microsecond. Prefer the kernel's calibrated TSC clock (M28-3); fall
+// back to a local calibration against the 1 kHz PIT if it isn't up yet.
 uint64_t net_tsc_per_us(void) {
     static uint64_t cached;
     if (cached) return cached;
+    { extern uint64_t tsc_hz(void);
+      uint64_t hz = tsc_hz();
+      if (hz) { cached = hz / 1000000u; if (!cached) cached = 1; return cached; } }
     extern uint64_t timer_get_ticks(void);
     uint64_t t = timer_get_ticks();
     while (timer_get_ticks() == t) __asm__ volatile("sti; hlt");  // align to a tick edge
