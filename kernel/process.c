@@ -14,11 +14,23 @@
 #include "driver_if.h"
 #include "pmm.h"
 #include "debugcon.h"
+#include "spinlock.h"   // [M29] SMP: serialize the process table
+#include "percpu.h"     // [M29] smp_online_count for CPU affinity
 
 #define MAX_PROCESSES 32
 static process_t* proc_table[MAX_PROCESSES];
 static uint32_t next_pid = 1;
 static int proc_inited = 0;
+
+// [M29] One lock guards the process table, next_pid and the affinity rotor. It
+// is taken around the whole process_foreach() iteration (so the table cannot be
+// mutated mid-scan); the scheduler's foreach callbacks therefore must NOT call
+// any proc_lock-taking function (they don't — only read/write process fields).
+// Process teardown frees a process_t only after detaching it from the table
+// under this lock (process_reap_one), and only its affinity CPU reaps it, so no
+// other CPU ever dereferences a freed entry.
+static spinlock_t proc_lock = SPINLOCK_INIT;
+static uint32_t affinity_rotor = 0;
 
 int process_init_system(void) {
     for (int i=0;i<MAX_PROCESSES;i++) proc_table[i]=0;
@@ -27,40 +39,86 @@ int process_init_system(void) {
     return 0;
 }
 
+// [M29] Allocate a unique pid (locked).
+static uint32_t alloc_pid(void) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    uint32_t pid = next_pid++;
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return pid;
+}
+
+// [M29] Round-robin a new process onto an online CPU (1 CPU -> always 0).
+static uint32_t pick_affinity(void) {
+    uint32_t n = smp_online_count(); if (n == 0) n = 1;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    uint32_t a = affinity_rotor++ % n;
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return a;
+}
+
 static int proc_add(process_t* p) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (int i=0;i<MAX_PROCESSES;i++) {
-        if (!proc_table[i]) { proc_table[i]=p; p->kstack_slot = (uint8_t)i; return 0; }
+        if (!proc_table[i]) { proc_table[i]=p; p->kstack_slot = (uint8_t)i;
+            spin_unlock_irqrestore(&proc_lock, fl); return 0; }
     }
+    spin_unlock_irqrestore(&proc_lock, fl);
     return -1;
 }
 
 static void proc_remove(process_t* p) {
     if (!p) return;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (int i=0;i<MAX_PROCESSES;i++) {
-        if (proc_table[i] == p) { proc_table[i] = NULL; return; }
+        if (proc_table[i] == p) { proc_table[i] = NULL; break; }
     }
+    spin_unlock_irqrestore(&proc_lock, fl);
 }
 
 process_t* process_get_last(void) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
     process_t* best = NULL; uint32_t best_pid = 0;
     for (int i=0;i<MAX_PROCESSES;i++) {
         if (proc_table[i] && proc_table[i]->pid > best_pid) { best = proc_table[i]; best_pid = proc_table[i]->pid; }
     }
+    spin_unlock_irqrestore(&proc_lock, fl);
     return best;
 }
 
 process_t* process_find_by_pid(uint32_t pid) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    process_t* r = NULL;
     for (int i=0;i<MAX_PROCESSES;i++) {
-        if (proc_table[i] && proc_table[i]->pid == pid) return proc_table[i];
+        if (proc_table[i] && proc_table[i]->pid == pid) { r = proc_table[i]; break; }
     }
-    return NULL;
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return r;
 }
 
 void process_foreach(void (*cb)(process_t*, void*), void* user) {
     if (!cb) return;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (int i=0;i<MAX_PROCESSES;i++) {
         if (proc_table[i]) cb(proc_table[i], user);
     }
+    spin_unlock_irqrestore(&proc_lock, fl);
+}
+
+// [M29] Atomically detach one reapable ZOMBIE pinned to `affinity` from the table
+// and return it (the caller frees it via process_destroy outside the lock). Only
+// the zombie's own affinity CPU reaps, and only once it has switched off the
+// zombie's kernel stack (idle context), so the freed stack is never in use.
+process_t* process_reap_one(uint32_t affinity) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    process_t* z = NULL;
+    for (int i=0;i<MAX_PROCESSES;i++) {
+        process_t* p = proc_table[i];
+        if (p && p->state == PROC_ZOMBIE && p->cpu_affinity == affinity) {
+            proc_table[i] = NULL; z = p; break;
+        }
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return z;
 }
 
 // [M16] Write 'n' bytes into user VA 'va' of a not-yet-running space, faulting
@@ -204,7 +262,8 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     }
     footprint += (uint64_t)STACK_PAGES * 0x1000ULL;
 
-    p->pid = next_pid++;
+    p->pid = alloc_pid();
+    p->cpu_affinity = pick_affinity();   // [M29] pin to an online CPU
     p->space = space;
     p->entry = entry;
     p->stack_top = st_top;
@@ -400,7 +459,8 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     process_t* c = (process_t*)kmalloc(sizeof(process_t));
     if (!c) return NULL;
     *c = *parent;                              // shallow-copy all fields (incl. VMAs, fds)
-    c->pid = next_pid++;
+    c->pid = alloc_pid();
+    c->cpu_affinity = pick_affinity();         // [M29] spread the child across CPUs
     c->space = NULL; c->image = NULL; c->manifest = NULL; c->tf = NULL;
     c->kstack_top = 0; c->kstack_slot = 0; c->mapped_pages = NULL;
 

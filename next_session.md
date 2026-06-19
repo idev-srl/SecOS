@@ -1,28 +1,50 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **Phase H DONE + Phase I parts 1–3 done (M28-1 ACPI + M28-2 APIC
-switchover + M28-3 TSC timekeeping)**. Earlier sessions shipped M25–M27b (Phase H)
-+ M28-1. This session shipped **M28-2** (LAPIC timer + IOAPIC retire the 8259
-PIC/PIT — VMware-verified, keyboard+Ctrl+C work) and **M28-3** (TSC monotonic ns
-clock). Self-test **160/160**. HEAD `377db8a` on `main`, pushed. Read this first._
-_Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M25..M28.md`._
+_Last updated: **Phase I COMPLETE — multicore works.** This session shipped M28-2
+(APIC switchover, VMware-verified), M28-3 (TSC clock), and **M29 (SMP)**: M29-1
+primitives + locks, M29-2 AP bring-up, M29-3 multicore scheduling — **ring-3 user
+tasks run on application processors in parallel** (`[SMP] cpu=1 run pid=…`). HEAD
+on `main`, pushed. Read this first._
+_Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M29.md`._
 
-## ▶▶ NEXT SESSION TASK: **M29 — SMP** (Phase I, final part — the big one)
-Phase I platform pieces are done (ACPI discovery, APIC switchover, TSC clock).
-SMP is the single biggest correctness effort in the roadmap — **do the locking
-audit BEFORE enabling APs** (working-style: big rocks in a fresh session). Plan:
-1. **Locking audit first** — the kernel is currently single-CPU and lock-free in
-   many places (PMM bitmap/refcounts, heap free-list, scheduler run state, VFS/
-   page cache, IPC/pipe rings, driver event rings). Enumerate shared mutable state
-   and add spinlocks (or per-CPU data) before any AP runs. This is the bulk of M29.
-2. **Per-CPU data** — GS-based per-CPU blocks (current task, kstack, LAPIC id).
-3. **AP bring-up** — INIT-SIPI-SIPI via LAPIC IPIs using the M28-1 CPU list
-   (`acpi_get()->lapic_ids`); trampoline in low memory (real→long mode), per-AP
-   stack + GDT/IDT load, each AP calls `lapic_enable()` + starts its LAPIC timer.
-4. **N-CPU scheduler** — per-CPU run state or a locked global runqueue; IPI-based
-   reschedule/TLB-shootdown.
-Building blocks already in place: `acpi_get()` (CPU list + LAPIC base), the LAPIC
-(`lapic_enable`/`lapic_eoi`/timer), `ktime_ns()` for cross-CPU time.
+## ⚠️ PENDING USER VERIFICATION (M29 multicore)
+The user tests on **VMware** (not QEMU). Build `make uefi-vmdk`, give the VM
+**2+ vCPUs**, boot, and run a workload (e.g. spawn programs from the shell) — it
+should stay stable. SMP is QEMU-verified (`-smp 2/4`, no `[EXC]`, no PMM leak) but
+not yet on VMware hardware.
+
+## ▶▶ NEXT SESSION TASK: pick one (Phase I is done)
+Phase I (ACPI → APIC → TSC → SMP) is complete. Open fronts, roughly by value:
+1. **Signals** — async Ctrl-C→SIGINT + SIGPIPE → shell job control & pipelines
+   (`cmd1 | cmd2`; pipes already exist). `sched_kill_current` exists (M15); no
+   async delivery yet. Long-requested; unblocks a real interactive shell.
+2. **SMP hardening / polish** — IPI-based reschedule (a wake on another core
+   preempts immediately, not at the next tick); per-CPU run queues (today: one
+   shared proc table under `proc_lock` — fine at 2–8 cores); load balancing /
+   task migration (affinity is static round-robin now). See `docs/devlog/M29.md`
+   "Known follow-ups".
+3. **NIC hardware validation** — vmxnet3 / igc (2.5 GbE) need the real adapter.
+4. **FS follow-ups** — mid-path symlink following; `metadata_csum`; ctime bump.
+
+### M29 facts (don't relearn)
+- **Architecture**: per-CPU run state (`arch/x86/percpu.{c,h}`, `this_cpu()` by
+  LAPIC id) + **CPU-pinned processes** (`process_t.cpu_affinity`, round-robin) +
+  fine-grained spinlocks (`arch/x86/spinlock.h`, irqsave) on shared subsystems.
+  NO Big Kernel Lock across the context switch (deliberate — that's the fragile
+  point). Each core schedules only its own affinity set → switch is lock-free.
+- **AP bring-up**: `boot/ap_trampoline.asm` (flat `org 0x8000`, objcopy-wrapped),
+  `kernel/smp.c smp_init()` INIT-SIPI-SIPI (one AP at a time; ktime_us delays),
+  `ap_entry()` → per-CPU GDT/TSS (`tss_setup_ap`), idle task, LAPIC timer, scheduler.
+- **TLB shootdown is intentionally absent**: a user space runs on one core, so its
+  page-table edits (fault/COW/mmap/fork) are core-local; the only growing shared
+  kernel map (`vmm_extend_physmap`) is boot/driver-bind only on the BSP. If you add
+  cross-core page-table sharing (e.g. MAP_SHARED across cores, task migration), you
+  MUST add an IPI shootdown first.
+- **Reaping**: `process_reap_one(affinity)` detaches a ZOMBIE under `proc_lock`;
+  only its affinity core reaps it, from idle (off its stack). Don't reap across cores.
+- Locks added M29-1: PMM, heap, pagecache, ipc, pipe, block I/O, vfs mounts,
+  keyboard, proc table. All irqsave (safe vs this core's own ISRs).
+- Observability: `[SMP] cpu=<idx> run pid=<pid>` in `switch_to` (user task on a core).
 
 ### M28-3 facts (don't relearn)
 - `arch/x86/tsc.{c,h}`: `tsc_init` calibrates rdtsc vs **PIT channel 2** (50 ms,

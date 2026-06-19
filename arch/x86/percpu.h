@@ -36,6 +36,7 @@ extern volatile uint32_t g_cpu_count;
 cpu_t* this_cpu(void);
 cpu_t* cpu_by_index(uint32_t i);
 uint32_t smp_cpu_count(void);
+uint32_t smp_online_count(void);   /* CPUs marked online (incl. BSP); defined in smp.c */
 
 /* Register a CPU by its LAPIC ID (idempotent). Returns its dense index, -1 if
  * the table is full. */

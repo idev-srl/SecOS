@@ -68,6 +68,10 @@ typedef struct process {
     uint64_t sleep_until;    // [M17] wake when timer_get_ticks() >= this (0 = n/a)
     int      recv_chan;      // [M17] IPC channel the caller is blocked receiving on (-1)
     void*    wait_pipe;      // [M25] pipe object the caller is blocked on (NULL = none)
+    // [M29] SMP: the CPU this process is pinned to. Assigned round-robin at
+    // creation; only this CPU schedules, preempts, and reaps it, so the context
+    // switch needs no lock and a freed PCB is never touched by another core.
+    uint32_t cpu_affinity;
     // Runtime metrics
     uint64_t cpu_ticks;      // accumulated CPU ticks (scheduler)
     uint64_t user_mem_bytes; // virtual memory footprint (updated at creation / future extensions)
@@ -86,6 +90,7 @@ void process_print(const process_t* p);
 process_t* process_get_last(void);
 process_t* process_find_by_pid(uint32_t pid);
 void process_foreach(void (*cb)(process_t*, void*), void* user);
+process_t* process_reap_one(uint32_t affinity); // [M29] detach+return one ZOMBIE
 int process_destroy(process_t* p);
 
 #endif // PROCESS_H

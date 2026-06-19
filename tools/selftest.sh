@@ -604,6 +604,27 @@ grep -q "\[APIC\] timer tick verified" "$M28LOG"; check "M28-2 LAPIC timer actua
 grep -q "\[TSC\] calibrated hz=" "$M28LOG"; check "M28-3 TSC calibrated against PIT ch2" $?
 grep -q "\[TSC\] monotonic OK" "$M28LOG"; check "M28-3 ktime_ns() monotonic + sane frequency" $?
 ! grep -q "\[EXC\]" "$M28LOG"; check "no CPU exception ([EXC]) during M28 run" $?
+# M28-2 also brings up the AP (M29-1/2): it must come online with no fault.
+grep -q "\[SMP\] online cpus=0x0000000000000002" "$M28LOG"; check "M29-2 AP comes online (-smp 2)" $?
+
+# ---- M29-3: multicore scheduling (user tasks run on an application processor) ----
+M29LOG=/tmp/secos_selftest_m29.log
+echo "[selftest] Building M29 image (M8 workload, multicore)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA="-DM8_SCHED_DEMO=1 -DDEV_ALLOW_UNSIGNED" >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M29 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M29 (mb2, -smp 2, ${TIMEOUT}s)..."
+: > "$M29LOG"; set +e
+timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -smp 2 -boot d \
+    -debugcon file:"$M29LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
+set -e
+# A ring-3 user task (pid != 0) scheduled on CPU index 1 = it ran on the AP.
+grep -q "\[SMP\] cpu=0x0000000000000001 run pid=" "$M29LOG"; check "M29-3 user task runs on an application processor" $?
+grep -q "\[M8\] PMM stable across rounds: NO LEAK" "$M29LOG"; check "M29-3 no PMM leak under multicore scheduling" $?
+grep -q "\[M8\] DONE" "$M29LOG"; check "M29-3 multicore workload completes" $?
+! grep -q "\[EXC\]" "$M29LOG"; check "no CPU exception ([EXC]) during M29 multicore run" $?
 
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"

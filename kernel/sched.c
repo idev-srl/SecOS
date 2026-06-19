@@ -31,19 +31,22 @@ extern void arch_iret_to_tf(trapframe_t* tf) __attribute__((noreturn));
 extern int  process_destroy(process_t* p);
 
 // ---- process selection (round-robin over runnable user processes) ----
-struct pick_ctx { process_t* after; int passed; process_t* cand; };
+// [M29] Only consider processes pinned to THIS CPU (cpu_affinity), so each core
+// schedules its own task set and no two cores ever run the same process.
+struct pick_ctx { process_t* after; int passed; process_t* cand; uint32_t affinity; };
 static void pick_scan_cb(process_t* p, void* user) {
     struct pick_ctx* c = (struct pick_ctx*)user;
-    if (p == idle_task) return;                       // idle is never picked here
+    if (p->cpu_affinity != c->affinity) return;       // not ours
     if (p == c->after) { c->passed = 1; return; }
     if (!c->passed && c->after != NULL) return;       // not yet past 'after'
     if (p->state == PROC_NEW || p->state == PROC_READY) { if (!c->cand) c->cand = p; }
 }
 static process_t* pick_user(process_t* after) {
-    struct pick_ctx c = { after, after == NULL ? 1 : 0, NULL };
+    uint32_t aff = this_cpu()->index;
+    struct pick_ctx c = { after, after == NULL ? 1 : 0, NULL, aff };
     process_foreach(pick_scan_cb, &c);
     if (!c.cand) { // wrap around from the beginning
-        struct pick_ctx c2 = { NULL, 1, NULL };
+        struct pick_ctx c2 = { NULL, 1, NULL, aff };
         process_foreach(pick_scan_cb, &c2);
         return c2.cand;
     }
@@ -66,6 +69,14 @@ static void switch_to(process_t* next) __attribute__((noreturn));
 static void switch_to(process_t* next) {
     current = next;
     next->state = PROC_RUNNING;
+    // [M29] Observability: a user task running on an application processor proves
+    // multicore scheduling. (idle tasks have pid 0 and never log here.)
+    { cpu_t* cpu = this_cpu();
+      if (cpu->index != 0 && next->pid != 0) {
+        debugcon_writestring("[SMP] cpu="); debugcon_print_hex(cpu->index);
+        debugcon_writestring(" run pid="); debugcon_print_hex(next->pid);
+        debugcon_writestring("\n");
+      } }
     vmm_switch_space(next->space);
     tss_set_kernel_stack(next->kstack_top);
     slice_left = SCHED_QUANTUM_TICKS;
@@ -166,16 +177,17 @@ int sched_count_alive_user(void) {
     return c.n;
 }
 
-struct reap_ctx { process_t* skip; };
-static void reap_cb(process_t* p, void* u) {
-    struct reap_ctx* c = (struct reap_ctx*)u;
-    if (p == c->skip || p == idle_task) return;
-    if (p->state == PROC_ZOMBIE) process_destroy(p); // frees space/tables/kstack/tf
-}
 void sched_reap_zombies(void) {
-    // Destroy zombies that are not the running task (their kernel stack is idle).
-    struct reap_ctx c = { current };
-    process_foreach(reap_cb, &c);
+    // [M29] Reap only zombies pinned to THIS CPU, and only from a context that has
+    // already switched off the zombie's kernel stack (the idle loop / a later
+    // task). process_reap_one() detaches each zombie from the table under the
+    // proc lock before we free it, so no other core can race on it.
+    extern process_t* process_reap_one(uint32_t affinity);
+    uint32_t aff = this_cpu()->index;
+    process_t* z;
+    while ((z = process_reap_one(aff)) != NULL) {
+        process_destroy(z);             // frees space/tables/kstack/tf (zombie != current)
+    }
 }
 
 void sched_exit_current(trapframe_t* tf) {

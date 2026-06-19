@@ -66,6 +66,10 @@ void tss_init(uint64_t kernel_rsp0);
 // Update TSS.rsp0 (used when entering ring 0 from ring 3).
 void tss_set_kernel_stack(uint64_t stack);
 
+// [M29] Build + load an application processor's own GDT/TSS/IST (idx = CPU index,
+// kstack_top = that CPU's kernel stack). Called from ap_entry on the AP.
+void tss_setup_ap(uint32_t idx, uint64_t kstack_top);
+
 // Return the virtual tops of the IST stacks (M2: virtual, not physical).
 void tss_get_ist_bases(uint64_t* out_ist1, uint64_t* out_ist2, uint64_t* out_ist3);
 

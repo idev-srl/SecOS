@@ -16,8 +16,11 @@
 #include "acpi.h"
 #include "lapic.h"
 #include "debugcon.h"
-#include "vmm.h"   /* phys_to_virt */
+#include "vmm.h"   /* phys_to_virt, vmm_get_kernel_space */
 #include "pmm.h"
+#include "process.h"
+#include "trapframe.h"
+#include "tss.h"
 #include <stddef.h>
 
 /* Trampoline blob (objcopy of the flat binary) + its load/parameter addresses. */
@@ -49,14 +52,45 @@ static void ap_udelay(uint64_t us) {
  * valid pointer. */
 static volatile uint8_t* lowp(uint64_t phys) { return (volatile uint8_t*)phys; }
 
-/* AP 64-bit entry: enable our Local APIC, load the shared IDT, mark online, park.
- * M29-3 will start this CPU's LAPIC timer and enter the scheduler from here. */
+/* Per-AP idle task (a ring-0 kernel context). When a core has no runnable user
+ * task pinned to it, it runs its idle loop; the LAPIC timer preempts idle to a
+ * user task and returns here when that task blocks/exits. */
+static process_t ap_idle[SMP_MAX_CPUS];
+static trapframe_t ap_idle_tf[SMP_MAX_CPUS];
+
+extern void lapic_timer_start_this_cpu(uint32_t);
+extern void sched_reap_zombies(void);
+
+/* AP 64-bit entry: bring this core fully online and enter the scheduler.
+ *  1. enable its Local APIC + load the shared IDT
+ *  2. build its own GDT/TSS/IST (ring-3 entry lands on this core's kernel stack)
+ *  3. install a per-core idle task as `current`/`idle_task`
+ *  4. start its LAPIC timer and run the idle loop — the timer tick schedules any
+ *     user task pinned (cpu_affinity) to this core. */
 void ap_entry(void) {
     cpu_t* c = this_cpu();
     lapic_enable_this_cpu();
     idt_ap_load();
+    tss_setup_ap(c->index, c->kstack_top);
+
+    process_t* idle = &ap_idle[c->index];
+    trapframe_t* tf = &ap_idle_tf[c->index];
+    for (int i = 0; i < (int)sizeof(*idle); i++) ((uint8_t*)idle)[i] = 0;
+    for (int i = 0; i < (int)sizeof(*tf); i++) ((uint8_t*)tf)[i] = 0;
+    idle->pid = 0;                       /* idle tasks are not in the proc table */
+    idle->space = vmm_get_kernel_space();
+    idle->kstack_top = c->kstack_top;
+    idle->tf = tf;
+    idle->state = PROC_RUNNING;
+    idle->cpu_affinity = c->index;
+    c->idle_task = idle;
+    c->current = idle;
+    c->slice_left = 0;
+
     c->online = 1;
-    for (;;) __asm__ volatile ("hlt");
+    lapic_timer_start_this_cpu(1000);
+    __asm__ volatile ("sti");
+    for (;;) { sched_reap_zombies(); __asm__ volatile ("hlt"); }
 }
 
 uint32_t smp_online_count(void) {
