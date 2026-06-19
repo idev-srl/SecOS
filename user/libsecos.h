@@ -14,10 +14,20 @@ ssize_t write(int fd, const void* buf, size_t len);
 ssize_t read(int fd, void* buf, size_t len);
 int     open(const char* path, int flags);
 int     close(int fd);
-/* [M23] file positioning + stat */
-struct stat { unsigned long st_size; unsigned st_mode; unsigned st_pad; };
+/* [M23/M26] file positioning + stat. Layout mirrors struct secos_stat. */
+struct stat {
+    unsigned long st_size;
+    unsigned st_mode;          /* full POSIX mode (S_IFMT | perms) */
+    unsigned st_nlink;
+    unsigned st_uid, st_gid;
+    unsigned long st_atime, st_mtime, st_ctime;
+};
+#define S_IFMT  0xF000
 #define S_IFREG 0x8000
 #define S_IFDIR 0x4000
+#define S_IFLNK 0xA000
+#define S_IFCHR 0x2000
+#define S_IFBLK 0x6000
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2
@@ -26,6 +36,15 @@ struct stat { unsigned long st_size; unsigned st_mode; unsigned st_pad; };
 #define O_RDWR   0x2
 long    lseek(int fd, long offset, int whence);
 int     stat(const char* path, struct stat* st);
+/* [M26] VFS maturity: metadata + symlinks */
+int     lstat(const char* path, struct stat* st);
+int     chmod(const char* path, unsigned mode);
+int     chown(const char* path, unsigned uid, unsigned gid);
+int     utimes(const char* path, unsigned long atime, unsigned long mtime);
+long    readlink(const char* path, char* buf, long len);
+int     symlink(const char* target, const char* linkpath);
+int     mount(const char* dev, const char* target, const char* fstype);
+int     umount(const char* target);
 void    _exit(int code) __attribute__((noreturn));
 int     getpid(void);
 void    sched_yield(void);

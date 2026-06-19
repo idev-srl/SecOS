@@ -111,6 +111,16 @@ int fork(void){ return (int)secos_syscall(SYS_FORK, 0, 0, 0, 0, 0); }
 /* [M25] anonymous pipe: fds[0]=read end, fds[1]=write end. Returns 0 or -1. */
 int pipe(int fds[2]){ return (int)secos_syscall(31 /*SYS_PIPE*/, (long)fds, 0, 0, 0, 0); }
 
+/* [M26] VFS maturity: metadata + symlinks. */
+int lstat(const char* path, struct stat* st){ return (int)secos_syscall(37 /*SYS_LSTAT*/, (long)path, (long)st, 0, 0, 0); }
+int chmod(const char* path, unsigned mode){ return (int)secos_syscall(32 /*SYS_CHMOD*/, (long)path, (long)mode, 0, 0, 0); }
+int chown(const char* path, unsigned uid, unsigned gid){ return (int)secos_syscall(33 /*SYS_CHOWN*/, (long)path, (long)uid, (long)gid, 0, 0); }
+int utimes(const char* path, unsigned long atime, unsigned long mtime){ return (int)secos_syscall(34 /*SYS_UTIMES*/, (long)path, (long)atime, (long)mtime, 0, 0); }
+long readlink(const char* path, char* buf, long len){ return secos_syscall(35 /*SYS_READLINK*/, (long)path, (long)buf, len, 0, 0); }
+int symlink(const char* target, const char* linkpath){ return (int)secos_syscall(36 /*SYS_SYMLINK*/, (long)target, (long)linkpath, 0, 0, 0); }
+int mount(const char* dev, const char* target, const char* fstype){ return (int)secos_syscall(38 /*SYS_MOUNT*/, (long)dev, (long)target, (long)fstype, 0, 0); }
+int umount(const char* target){ return (int)secos_syscall(39 /*SYS_UMOUNT*/, (long)target, 0, 0, 0, 0); }
+
 /* [M24] BSD-style sockets. Require CAP_NET in the signed manifest, else -1.
  * ip is network-order octets (octet0 in the low byte); port is host order. */
 int socket(int type){ return (int)secos_syscall(SYS_SOCKET, type, 0, 0, 0, 0); }

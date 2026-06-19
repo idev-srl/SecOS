@@ -78,12 +78,14 @@ session. The narrative handoff lives in `next_session.md`; the long-term plan in
       _shell job control._
 - [ ] **Shell pipelines** (`cmd1 | cmd2`) — now unblocked (pipes + fork + exec).
 
-### Option 4 — Phase H: storage maturity
-- [ ] VFS permissions / ownership / timestamps.
-- [ ] `mount` / `umount` syscalls.
-- [ ] Symlinks.
-- [ ] ext4 JBD2 journaling + `metadata_csum` (currently no-journal v0).
-- _Scope: large; several independent sub-tasks, can be sequenced._
+### Option 4 — Phase H: storage maturity  (part 1 ✅ M26, part 2 = M27)
+- [x] VFS permissions / ownership / timestamps — **M26** (stored & exposed, not
+      enforced; signature = trust boundary). chmod/chown/utimes + extended stat.
+- [x] `mount` / `umount` syscalls — **M26**.
+- [x] Symlinks — **M26** (ext2 fast symlinks; `stat` follows final component).
+      _Limitation: mid-path symlink components not followed yet._
+- [ ] **ext4 JBD2 journaling + `metadata_csum`** — **M27** (crash consistency,
+      flagged big rock; needs fault-injection testing). Completes Phase H.
 
 ### Option 5 — Phase I: modern platform → **MULTICORE / SMP** _(biggest effort)_
 

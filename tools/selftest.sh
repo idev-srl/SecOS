@@ -465,6 +465,28 @@ grep -q "\[M23\] persistent ext2 root on" "$M23RLOG"; check "M23 persistent ext2
 ! grep -q "\[VFS\] root RAMFS mounted" "$M23RLOG"; check "M23 RAMFS root skipped when ext2 root present" $?
 ! grep -q "\[EXC\]" "$M23RLOG"; check "no CPU exception ([EXC]) during M23 persistent-root boot" $?
 
+# ---- M26: VFS maturity (metadata, symlinks, mount control) on ext2 /mnt ----
+M26LOG=/tmp/secos_selftest_m26.log
+echo "[selftest] Building M26 image (M26_FS_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA=-DM26_FS_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M26 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+make disk-ext2 >/dev/null 2>&1 || { echo "  [FAIL] M26 ext2 disk build"; FAIL=$((FAIL+1)); }
+echo "[selftest] Running M26 (ext2 /mnt, ${TIMEOUT}s)..."
+: > "$M26LOG"; set +e
+timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -drive file=disk.img,if=virtio,format=raw -boot d \
+    -debugcon file:"$M26LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
+set -e
+grep -q "\[M26\] chmod 0640 -> mode=0x00000000000001A0" "$M26LOG"; check "M26 chmod persists + stat reads mode (0640)" $?
+grep -q "\[M26\] chown 1000:1000 -> uid=0x00000000000003E8 gid=0x00000000000003E8" "$M26LOG"; check "M26 chown persists uid/gid" $?
+grep -q 'target="m26.txt"' "$M26LOG"; check "M26 symlink create + readlink target" $?
+grep -q "lstat type=0x0000000000000003 stat-follow type=0x0000000000000001" "$M26LOG"; check "M26 lstat=symlink, stat follows to file" $?
+grep -q "\[M26\] umount rc=0x0000000000000000 remount rc=0x0000000000000000" "$M26LOG"; check "M26 umount + remount succeed" $?
+grep -q "\[M26\] DONE" "$M26LOG"; check "M26 demo completed ([M26] DONE)" $?
+! grep -q "\[EXC\]" "$M26LOG"; check "no CPU exception ([EXC]) during M26 run" $?
+
 # ---- M25: anonymous pipes across fork (blocking read + EOF) ----
 M25LOG=/tmp/secos_selftest_m25.log
 echo "[selftest] Building M25 image (M25_PIPE_DEMO=1, signing enforced)..."

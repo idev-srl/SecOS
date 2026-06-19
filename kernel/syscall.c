@@ -222,13 +222,93 @@ long ksys_lseek(int fd, long offset, int whence){
     return np;
 }
 
+// [M26] Fill a stat buffer from an inode, synthesizing POSIX metadata when the
+// underlying FS did not populate it (mode==0). Shared by stat and lstat.
+static void stat_fill(const vfs_inode_t* ino, struct secos_stat* st){
+    st->st_size = ino->size;
+    if(ino->mode){
+        st->st_mode = ino->mode;                 // FS provided the real mode
+    } else {                                     // synthesize from the node type
+        uint32_t type = (ino->type==VFS_NODE_DIR) ? S_IFDIR :
+                        (ino->type==VFS_NODE_SYMLINK) ? S_IFLNK : S_IFREG;
+        st->st_mode = type | (ino->type==VFS_NODE_DIR ? 0755 : 0644);
+    }
+    st->st_nlink = ino->nlink ? ino->nlink : 1;
+    st->st_uid = ino->uid; st->st_gid = ino->gid;
+    st->st_atime = ino->atime; st->st_mtime = ino->mtime; st->st_ctime = ino->ctime;
+}
+
 int ksys_stat(const char* path, struct secos_stat* st){
+    extern vfs_inode_t* vfs_lookup_follow(const char*);   // [M26] follows final symlink
+    vfs_inode_t* ino=vfs_lookup_follow(path); if(!ino) return -1;
+    stat_fill(ino, st);
+    return 0;
+}
+
+// [M26] lstat: like stat but does not follow a final symlink. vfs_lookup() does
+// not auto-follow symlinks (the inode keeps type VFS_NODE_SYMLINK), so lstat is
+// the plain lookup; stat() resolution of symlinks is layered in vfs (M26-3).
+int ksys_lstat(const char* path, struct secos_stat* st){
     extern vfs_inode_t* vfs_lookup(const char*);
     vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -1;
-    st->st_size=ino->size;
-    st->st_mode=(ino->type==VFS_NODE_DIR)?S_IFDIR:S_IFREG;
-    st->st_pad=0;
+    stat_fill(ino, st);
     return 0;
+}
+
+// [M26] chmod/chown/utimes — store-and-expose metadata (no multi-user enforce).
+int ksys_chmod(const char* path, uint32_t mode){
+    extern int vfs_setattr(const char*, const vfs_attr_t*, unsigned);
+    vfs_attr_t a; a.mode=mode; return vfs_setattr(path, &a, VFS_ATTR_MODE);
+}
+int ksys_chown(const char* path, uint32_t uid, uint32_t gid){
+    extern int vfs_setattr(const char*, const vfs_attr_t*, unsigned);
+    vfs_attr_t a; a.uid=uid; a.gid=gid; return vfs_setattr(path, &a, VFS_ATTR_UID|VFS_ATTR_GID);
+}
+int ksys_utimes(const char* path, uint64_t atime, uint64_t mtime){
+    extern int vfs_setattr(const char*, const vfs_attr_t*, unsigned);
+    vfs_attr_t a; a.atime=atime; a.mtime=mtime; return vfs_setattr(path, &a, VFS_ATTR_ATIME|VFS_ATTR_MTIME);
+}
+int ksys_readlink(const char* path, char* buf, int len){
+    extern int vfs_readlink(const char*, char*, size_t);
+    if(len<=0) return -1; return vfs_readlink(path, buf, (size_t)len);
+}
+int ksys_symlink(const char* target, const char* linkpath){
+    extern int vfs_symlink(const char*, const char*);
+    return vfs_symlink(target, linkpath);
+}
+
+// [M26] mount/umount: map a block-device name + fstype to the existing FS mount
+// helpers (the same path the boot mount and shell `mountdev` use). fstype:
+// "fat32"/"vfat" -> FAT32; "ext2"/"ext4"/"extN" -> ext driver; "auto"/"" -> try
+// both. The signature is the trust boundary, so any signed caller may mount.
+static int str_eq2(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
+int ksys_mount(const char* dev, const char* target, const char* fstype){
+    extern void* block_find(const char* name);
+    extern int fat32_mount(const char*, const char*);
+    extern int ext2_mount(const char*, const char*);
+    if(!dev||!target||!fstype) return -1;
+    if(!block_find(dev)) return -1;                       // no such device
+    int isfat = str_eq2(fstype,"fat32")||str_eq2(fstype,"vfat");
+    int isext = str_eq2(fstype,"ext2")||str_eq2(fstype,"ext4")||str_eq2(fstype,"extN");
+    int isauto= str_eq2(fstype,"auto")||fstype[0]==0;
+    if(isfat) return fat32_mount(dev,target);
+    if(isext) return ext2_mount(dev,target);
+    if(isauto){ if(fat32_mount(dev,target)==0) return 0; return ext2_mount(dev,target); }
+    return -1;                                            // unknown fstype
+}
+int ksys_umount(const char* target){
+    extern int vfs_unmount(const char*);
+    return vfs_unmount(target);
+}
+
+// [M26] Copy a NUL-terminated user string into a kernel buffer (per-byte
+// validated, bounded). Returns 0 on success, -1 on fault or overflow.
+static int copy_user_str(const char* u, char* k, int ksz){
+    for(int i=0;i<ksz;i++){
+        if(!user_range_valid(u+i,1)) return -1;
+        char c=u[i]; k[i]=c; if(!c) return 0;
+    }
+    return -1;
 }
 
 uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4){
@@ -363,6 +443,52 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         if (r != 0) return (uint64_t)(int64_t)r;
         if (copy_to_user((void*)a0, kfds, sizeof(kfds)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return 0;
+    }
+
+    case SYS_LSTAT: {
+        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        struct secos_stat st; int r = ksys_lstat(kp, &st);
+        if (r != 0) return (uint64_t)(int64_t)r;
+        if (copy_to_user((void*)a1, &st, sizeof(st)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return 0;
+    }
+    case SYS_CHMOD: {
+        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_chmod(kp, (uint32_t)a1);
+    }
+    case SYS_CHOWN: {
+        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_chown(kp, (uint32_t)a1, (uint32_t)a2);
+    }
+    case SYS_UTIMES: {
+        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_utimes(kp, (uint64_t)a1, (uint64_t)a2);
+    }
+    case SYS_READLINK: {
+        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        int len = (int)a2; if (len <= 0 || len > 4096 || !user_range_valid((void*)a1, (size_t)len)) return (uint64_t)(int64_t)-EFAULT;
+        char kbuf[256]; int klen = len < (int)sizeof(kbuf) ? len : (int)sizeof(kbuf);
+        int n = ksys_readlink(kp, kbuf, klen);
+        if (n < 0) return (uint64_t)(int64_t)n;
+        if (copy_to_user((void*)a1, kbuf, (size_t)n) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)n;
+    }
+    case SYS_SYMLINK: {
+        char ktarget[256], klink[256];
+        if (copy_user_str((const char*)a0, ktarget, sizeof(ktarget)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        if (copy_user_str((const char*)a1, klink, sizeof(klink)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_symlink(ktarget, klink);
+    }
+    case SYS_MOUNT: {
+        char kdev[64], ktgt[256], kfs[32];
+        if (copy_user_str((const char*)a0, kdev, sizeof(kdev)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        if (copy_user_str((const char*)a1, ktgt, sizeof(ktgt)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        if (copy_user_str((const char*)a2, kfs,  sizeof(kfs))  != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_mount(kdev, ktgt, kfs);
+    }
+    case SYS_UMOUNT: {
+        char ktgt[256]; if (copy_user_str((const char*)a0, ktgt, sizeof(ktgt)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_umount(ktgt);
     }
 
     /* [M24] Sockets — gated by CAP_NET in the signed manifest. A staging buffer

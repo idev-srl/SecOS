@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 // Basic inode type enumeration
-typedef enum { VFS_NODE_FILE=1, VFS_NODE_DIR=2 } vfs_node_type_t;
+typedef enum { VFS_NODE_FILE=1, VFS_NODE_DIR=2, VFS_NODE_SYMLINK=3 } vfs_node_type_t; // [M26] symlink
 
 // Forward decl filesystem ops
 struct vfs_fs_ops;
@@ -19,11 +19,31 @@ struct vfs_fs_ops;
 // Generic VFS inode representation
 typedef struct vfs_inode {
     char path[256];            // absolute canonical path (no trailing '/') except root
-    vfs_node_type_t type;      // file or directory
+    vfs_node_type_t type;      // file, directory or symlink
     size_t size;               // file size (0 for dir)
     void* fs_data;             // pointer to underlying FS specific entry/object
     const struct vfs_fs_ops* ops; // back-pointer to filesystem operations
+    // [M26] POSIX metadata. Stored & exposed (stat/chmod/chown/utimes) but NOT
+    // used for multi-user access enforcement — the signature is the trust
+    // boundary in SecOS, so a signed process has ambient access regardless.
+    uint32_t mode;             // full POSIX mode: S_IFMT type bits | permission bits
+    uint32_t uid, gid;         // owner / group
+    uint64_t atime, mtime, ctime; // unix seconds
+    uint32_t nlink;            // hard-link count
 } vfs_inode_t;
+
+// [M26] Attribute-change request for setattr (chmod/chown/utimes). Only the
+// fields whose VFS_ATTR_* bit is set in `valid` are applied.
+#define VFS_ATTR_MODE  0x01
+#define VFS_ATTR_UID   0x02
+#define VFS_ATTR_GID   0x04
+#define VFS_ATTR_ATIME 0x08
+#define VFS_ATTR_MTIME 0x10
+typedef struct vfs_attr {
+    uint32_t mode;
+    uint32_t uid, gid;
+    uint64_t atime, mtime;
+} vfs_attr_t;
 
 // Directory iteration callback
 typedef void (*vfs_iter_cb)(const vfs_inode_t* child, void* user);
@@ -55,6 +75,13 @@ typedef struct vfs_fs_ops {
     int (*rename)(const char* old_path, const char* new_path);
     // Truncate file
     int (*truncate)(const char* path, size_t new_size);
+    // [M26] Change attributes (mode/uid/gid/times); `valid` = VFS_ATTR_* bitmask.
+    // NULL = unsupported (chmod/chown silently no-op on that FS). Returns 0/-1.
+    int (*setattr)(const char* path, const vfs_attr_t* a, unsigned valid);
+    // [M26] Read a symlink's target into buf (NUL-terminated). Returns length or -1.
+    int (*readlink)(const char* path, char* buf, size_t len);
+    // [M26] Create a symlink at linkpath pointing to target. Returns 0/-1.
+    int (*symlink)(const char* target, const char* linkpath);
 } vfs_fs_ops_t;
 
 // Mount record (single root for now)
@@ -76,6 +103,8 @@ int vfs_mount(const char* mount_point, const vfs_fs_ops_t* ops, const char* fs_n
 int vfs_unmount(const char* mount_point);
 // Lookup inode by absolute path
 vfs_inode_t* vfs_lookup(const char* path);
+// [M26] Lookup following a final-component symlink (bounded). Used by stat/open.
+vfs_inode_t* vfs_lookup_follow(const char* path);
 // Iterate directory children
 int vfs_readdir(const char* path, vfs_iter_cb cb, void* user);
 // Read whole file convenience (returns size or -1 if too small)
@@ -92,6 +121,12 @@ int vfs_remove(const char* path);
 int vfs_rename(const char* oldp, const char* newp);
 // Truncate
 int vfs_truncate(const char* path, size_t new_size);
+// [M26] Change attributes (chmod/chown/utimes); valid = VFS_ATTR_* bitmask.
+int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid);
+// [M26] Read a symlink target (NUL-terminated). Returns length or -1.
+int vfs_readlink(const char* path, char* buf, size_t len);
+// [M26] Create a symlink at linkpath pointing to target. Returns 0/-1.
+int vfs_symlink(const char* target, const char* linkpath);
 // [M23] Mount-table introspection (for /proc/mounts, df, etc.).
 int vfs_mount_count(void);
 int vfs_mount_info(int i, const char** mount_point, const char** fs_name);

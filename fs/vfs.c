@@ -148,6 +148,38 @@ int vfs_rename(const char* oldp, const char* newp){
 }
 int vfs_truncate(const char* path, size_t new_size){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops) return -1; return m->ops->truncate(rel, new_size); }
 
+// [M26] Look up a path following a final-component symlink (bounded to 8 hops to
+// catch loops). Absolute targets replace the path; relative targets join to the
+// link's own directory. Mid-path symlink components are NOT followed yet (the
+// underlying FS walks components as directories) — a documented limitation.
+vfs_inode_t* vfs_lookup_follow(const char* path){
+    char cur[256]; size_t k=0; for(; path[k] && k<sizeof(cur)-1; k++) cur[k]=path[k]; cur[k]=0;
+    for(int hop=0; hop<8; hop++){
+        vfs_inode_t* ino = vfs_lookup(cur);
+        if(!ino || ino->type != VFS_NODE_SYMLINK) return ino;
+        char tgt[256]; int n = vfs_readlink(cur, tgt, sizeof(tgt));
+        if(n<=0) return ino;                              // unreadable -> return the link
+        if(tgt[0]=='/'){                                  // absolute target
+            size_t j=0; for(; tgt[j] && j<sizeof(cur)-1; j++) cur[j]=tgt[j]; cur[j]=0;
+        } else {                                          // relative to the link's dir
+            int slash=-1; for(size_t i=0;cur[i];i++) if(cur[i]=='/') slash=(int)i;
+            char joined[256]; size_t j=0;
+            if(slash>0) for(int i=0;i<slash && j<(int)sizeof(joined)-1;i++) joined[j++]=cur[i];
+            if(j==0 || joined[j-1]!='/') { if(j<sizeof(joined)-1) joined[j++]='/'; }
+            for(size_t i=0;tgt[i] && j<sizeof(joined)-1;i++) joined[j++]=tgt[i];
+            joined[j]=0;
+            for(j=0; joined[j] && j<sizeof(cur)-1; j++) cur[j]=joined[j]; cur[j]=0;
+        }
+    }
+    return NULL;                                          // too many hops -> loop
+}
+
+// [M26] Attribute / symlink routing (NULL-checked: FSes that don't implement the
+// op return -1 instead of crashing — chmod on a read-only virtual FS is a no-op).
+int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->setattr) return -1; return m->ops->setattr(rel, a, valid); }
+int vfs_readlink(const char* path, char* buf, size_t len){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->readlink) return -1; return m->ops->readlink(rel, buf, len); }
+int vfs_symlink(const char* target, const char* linkpath){ char rel[256]; vfs_mount_t* m=vfs_resolve(linkpath,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->symlink) return -1; return m->ops->symlink(target, rel); }
+
 int vfs_mount_count(void){ return g_mount_count; }
 int vfs_mount_info(int i, const char** mp, const char** fsname){
     if(i<0 || i>=g_mount_count) return -1;

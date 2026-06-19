@@ -1277,11 +1277,13 @@ static void kernel_main_phase2(void) {
         // volume. On VMware the boot ESP and the data disk are both SATA, so the
         // ESP's own disk is simply skipped here (it's GPT, not a raw FS volume).
         static const char* cand[] = { "vda", "sda", "sdb", "sdc", "sdd", "nvme0n1", "usb0" };
+        const char* mounted_dev = 0;        // [M26] remember which device backs /mnt
         for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]) && !fsname; i++) {
             if (!block_find(cand[i])) continue;
-            if      (fat32_mount(cand[i], "/mnt") == 0) fsname = "FAT32";
-            else if (ext2_mount (cand[i], "/mnt") == 0) fsname = "extN";
+            if      (fat32_mount(cand[i], "/mnt") == 0) { fsname = "FAT32"; mounted_dev = cand[i]; }
+            else if (ext2_mount (cand[i], "/mnt") == 0) { fsname = "extN";  mounted_dev = cand[i]; }
         }
+        (void)mounted_dev;
         if (fsname) {
             debugcon_writestring("[M10] disk mounted at /mnt fs=");
             debugcon_writestring(fsname); debugcon_writestring("\n");
@@ -1306,6 +1308,44 @@ static void kernel_main_phase2(void) {
             for (size_t i = 0; match && i < mlen; i++) if (back[i] != msg[i]) match = 0;
             debugcon_writestring(match ? "[M10] disk write+readback: OK\n"
                                        : "[M10] disk write+readback: FAIL\n");
+#if M26_FS_DEMO
+            // [M26] VFS maturity: metadata (chmod/chown), symlinks, mount control.
+            // Needs an ext2 /mnt (FAT32 has no setattr/symlink). Run on extN only.
+            if (fsname[0]=='e') {
+                debugcon_writestring("[M26] --- VFS maturity (metadata + symlinks) ---\n");
+                vfs_remove("/mnt/m26.txt");
+                vfs_create("/mnt/m26.txt", "hi\n", 3);
+                vfs_attr_t a; a.mode=0640; a.uid=0; a.gid=0; a.atime=0; a.mtime=0;
+                vfs_setattr("/mnt/m26.txt", &a, VFS_ATTR_MODE);
+                vfs_inode_t* v = vfs_lookup("/mnt/m26.txt");
+                debugcon_writestring("[M26] chmod 0640 -> mode=");
+                debugcon_print_hex(v ? (v->mode & 0xFFF) : 0); debugcon_writestring("\n");
+                a.uid=1000; a.gid=1000;
+                vfs_setattr("/mnt/m26.txt", &a, VFS_ATTR_UID|VFS_ATTR_GID);
+                v = vfs_lookup("/mnt/m26.txt");
+                debugcon_writestring("[M26] chown 1000:1000 -> uid=");
+                debugcon_print_hex(v?v->uid:0); debugcon_writestring(" gid=");
+                debugcon_print_hex(v?v->gid:0); debugcon_writestring("\n");
+                vfs_remove("/mnt/m26.lnk");
+                int sl = vfs_symlink("m26.txt", "/mnt/m26.lnk");
+                char tgt[64]; for(int i=0;i<64;i++) tgt[i]=0;
+                int rl = vfs_readlink("/mnt/m26.lnk", tgt, sizeof(tgt));
+                debugcon_writestring("[M26] symlink rc="); debugcon_print_hex((uint64_t)(int64_t)sl);
+                debugcon_writestring(" readlink="); debugcon_print_hex((uint64_t)rl);
+                debugcon_writestring(" target=\""); debugcon_writestring(tgt); debugcon_writestring("\"\n");
+                vfs_inode_t* lk = vfs_lookup("/mnt/m26.lnk");           // lstat: the link itself
+                vfs_inode_t* tg = vfs_lookup_follow("/mnt/m26.lnk");    // stat: follows to file
+                debugcon_writestring("[M26] lstat type="); debugcon_print_hex(lk?lk->type:0);
+                debugcon_writestring(" stat-follow type="); debugcon_print_hex(tg?tg->type:0);
+                debugcon_writestring(" (3=symlink,1=file)\n");
+                // mount control: unmount /mnt then re-mount the same device.
+                int um = vfs_unmount("/mnt");
+                int rm = mounted_dev ? ext2_mount(mounted_dev, "/mnt") : -1;
+                debugcon_writestring("[M26] umount rc="); debugcon_print_hex((uint64_t)(int64_t)um);
+                debugcon_writestring(" remount rc="); debugcon_print_hex((uint64_t)(int64_t)rm); debugcon_writestring("\n");
+                debugcon_writestring("[M26] DONE\n");
+            }
+#endif
         } else {
             debugcon_writestring("[M10] no disk mounted at /mnt (no vda/sda)\n");
         }

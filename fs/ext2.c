@@ -34,6 +34,8 @@
 
 #define DT_REG 1
 #define DT_DIR 2
+#define DT_LNK 7          /* [M26] symlink dir-entry file type */
+#define S_IFLNK 0xA000    /* [M26] symlink mode bits */
 
 #define MAX_BLK 4096
 
@@ -523,6 +525,45 @@ static vfs_inode_t* vino_alloc(const char* path){
     return ino;
 }
 
+/* [M26] Read a symlink target. Fast symlinks (target <= 60 bytes) store the
+ * target inline in the i_block area (offset 40); larger ones use data block 0. */
+static int e2_readlink(const char* path, char* buf, size_t len){
+    if(!g_mounted||!path||!buf||len==0) return -1;
+    int isd; uint32_t ino=path_to_ino(path,&isd,NULL);
+    if(!ino) return -1;
+    uint8_t in[256]; if(inode_read(ino,in)!=0) return -1;
+    if((rd16(in+0)&S_IFMT)!=S_IFLNK) return -1;          /* not a symlink */
+    uint32_t sz=inode_size_lo(in); if(sz==0) return -1;
+    uint32_t n = (sz < len-1) ? sz : (uint32_t)(len-1);
+    if(sz<=60){ for(uint32_t i=0;i<n;i++) buf[i]=(char)in[40+i]; }
+    else {
+        uint32_t pb=bmap_read(in,0); if(!pb) return -1;
+        if(blk_read(pb,g_b)!=0) return -1;
+        for(uint32_t i=0;i<n;i++) buf[i]=(char)g_b[i];
+    }
+    buf[n]=0; return (int)n;
+}
+
+/* [M26] Create a fast symlink (target inline in i_block; supports up to 60-byte
+ * targets, which covers virtually all real symlinks). */
+static int e2_symlink(const char* target, const char* linkpath){
+    if(!g_mounted||!target||!linkpath) return -1;
+    if(path_to_ino(linkpath,NULL,NULL)) return -1;       /* exists */
+    size_t tlen=0; while(target[tlen]) tlen++;
+    if(tlen==0 || tlen>60) return -1;                    /* fast symlink only */
+    uint32_t parent; char comp[128];
+    if(split_parent(linkpath,&parent,comp,sizeof(comp))!=0) return -1;
+    uint32_t nino=alloc_inode(0); if(!nino) return -1;
+    uint8_t inode[256]; mem_zero(inode, g_inode_size);
+    wr16(inode+0, (uint16_t)(S_IFLNK | 0777));           /* mode */
+    wr32(inode+4, (uint32_t)tlen);                        /* i_size = target length */
+    wr16(inode+26, 1);                                    /* links_count */
+    for(size_t i=0;i<tlen;i++) inode[40+i]=(uint8_t)target[i];  /* inline target */
+    if(inode_write(nino, inode)!=0) return -1;
+    if(dir_add(parent, comp, e2_strlen(comp), nino, DT_LNK)!=0) return -1;
+    return 0;
+}
+
 /* ── VFS ops ─────────────────────────────────────────────────────────────── */
 static vfs_inode_t* e2_lookup(const char* path){
     if(!g_mounted) return NULL;
@@ -531,6 +572,17 @@ static vfs_inode_t* e2_lookup(const char* path){
     if(!ino) return NULL;
     vfs_inode_t* v=vino_alloc(path&&path[0]?path:"/"); if(!v) return NULL;
     v->type=isd?VFS_NODE_DIR:VFS_NODE_FILE; v->size=sz;
+    // [M26] Populate POSIX metadata from the on-disk inode (standard ext2 layout:
+    // i_mode@0, i_uid@2, i_atime@8, i_ctime@12, i_mtime@16, i_gid@24, i_links@26).
+    uint8_t in[256];
+    if(inode_read(ino, in)==0){
+        uint16_t m=rd16(in+0);
+        v->mode=m;
+        if((m&S_IFMT)==0xA000) v->type=VFS_NODE_SYMLINK;   // S_IFLNK
+        v->uid=rd16(in+2); v->gid=rd16(in+24);
+        v->atime=rd32(in+8); v->ctime=rd32(in+12); v->mtime=rd32(in+16);
+        v->nlink=rd16(in+26);
+    }
     e2_node_t* nd=(e2_node_t*)v->fs_data; nd->ino=ino; nd->size=sz; nd->is_dir=isd;
     return v;
 }
@@ -574,6 +626,22 @@ static int e2_readdir(const char* dir_path, vfs_iter_cb cb, void* user){
 static int e2_read(vfs_inode_t* v, size_t off, void* buf, size_t len){
     if(!g_mounted||!v||v->type!=VFS_NODE_FILE) return -1;
     return file_read(((e2_node_t*)v->fs_data)->ino, off, buf, len);
+}
+
+/* [M26] chmod/chown/utimes: patch the on-disk inode metadata in place. The mode
+ * change preserves the S_IFMT type bits (chmod sets only the low 12 perm bits).
+ * e2fsck-clean: we only touch fields, never the block map. */
+static int e2_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
+    if(!g_mounted || !path || !a) return -1;
+    int isd; uint32_t ino=path_to_ino(path,&isd,NULL);
+    if(!ino) return -1;
+    uint8_t in[256]; if(inode_read(ino,in)!=0) return -1;
+    if(valid&VFS_ATTR_MODE){ uint16_t old=rd16(in+0); wr16(in+0,(uint16_t)((old&S_IFMT)|(a->mode&0x0FFF))); }
+    if(valid&VFS_ATTR_UID)   wr16(in+2,  (uint16_t)a->uid);
+    if(valid&VFS_ATTR_GID)   wr16(in+24, (uint16_t)a->gid);
+    if(valid&VFS_ATTR_ATIME) wr32(in+8,  (uint32_t)a->atime);
+    if(valid&VFS_ATTR_MTIME) wr32(in+16, (uint32_t)a->mtime);
+    return inode_write(ino,in);
 }
 static int e2_write(vfs_inode_t* v, size_t off, const void* data, size_t len){
     if(!g_mounted||!v||v->type!=VFS_NODE_FILE) return -1;
@@ -700,7 +768,8 @@ static int e2_rename(const char* oldp, const char* newp){
 static vfs_fs_ops_t ext2_ops = {
     .lookup=e2_lookup, .readdir=e2_readdir, .read=e2_read, .write=e2_write,
     .create=e2_create, .mkdir=e2_mkdir, .remove=e2_remove, .rename=e2_rename,
-    .truncate=e2_truncate
+    .truncate=e2_truncate, .setattr=e2_setattr,
+    .readlink=e2_readlink, .symlink=e2_symlink
 };
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */

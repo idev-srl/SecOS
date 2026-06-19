@@ -35,6 +35,15 @@
 #define SYS_RECVFROM 29 // recvfrom(fd, buf, len, sockaddr*) UDP
 #define SYS_SOCKCLOSE 30// close a socket descriptor
 #define SYS_PIPE     31 // [M25] pipe(int fds[2]) -> fds[0]=read end, fds[1]=write end
+// [M26] VFS maturity: metadata, symlinks, mount control
+#define SYS_CHMOD    32 // chmod(path, mode)
+#define SYS_CHOWN    33 // chown(path, uid, gid)
+#define SYS_UTIMES   34 // utimes(path, atime, mtime)  (unix seconds)
+#define SYS_READLINK 35 // readlink(path, buf, len) -> length
+#define SYS_SYMLINK  36 // symlink(target, linkpath)
+#define SYS_LSTAT    37 // lstat(path, statbuf)  (does not follow a final symlink)
+#define SYS_MOUNT    38 // mount(dev, target, fstype)
+#define SYS_UMOUNT   39 // umount(target)
 
 // [M24] socket types
 #define SOCK_STREAM 1   // TCP
@@ -70,12 +79,27 @@ struct secos_sockaddr {
 #define O_WRONLY 0x1
 #define O_RDWR   0x2
 
-// [M23] stat result handed to user space (ABI struct; libc mirrors this layout).
+// [M23/M26] stat result handed to user space (ABI struct; libc mirrors this).
+// st_size@0 and st_mode@8 kept stable; M26 appended owner/timestamps. st_mode is
+// now the full POSIX mode (S_IFMT type bits | permission bits).
 struct secos_stat {
-    uint64_t st_size;   // size in bytes
-    uint32_t st_mode;   // S_IFREG | S_IFDIR
-    uint32_t st_pad;
+    uint64_t st_size;   // size in bytes              (offset 0)
+    uint32_t st_mode;   // S_IFMT | perms             (offset 8)
+    uint32_t st_nlink;  // hard-link count            (offset 12, was st_pad)
+    uint32_t st_uid;    // owner uid                  (offset 16)
+    uint32_t st_gid;    // owner gid                  (offset 20)
+    uint64_t st_atime;  // access time (unix seconds) (offset 24)
+    uint64_t st_mtime;  // modify time                (offset 32)
+    uint64_t st_ctime;  // change time                (offset 40)
 };
+
+// [M26] POSIX mode helpers (S_IFMT mask + type bits; perms in the low 12 bits).
+#define S_IFMT   0xF000
+#define S_IFLNK  0xA000
+#define S_IFSOCK 0xC000
+#define S_IFCHR  0x2000
+#define S_IFBLK  0x6000
+#define S_IFIFO  0x1000
 
 // Kernel-side dispatcher invoked by asm stub
 uint64_t syscall_dispatch(uint64_t num, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4);
@@ -98,8 +122,17 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot);
 // [M23] file positioning + stat
 long ksys_lseek(int fd, long offset, int whence);
 int  ksys_stat(const char* path, struct secos_stat* st);
+int  ksys_lstat(const char* path, struct secos_stat* st);   // [M26] no symlink follow
 // [M25] anonymous pipe: allocate a pipe, return two fds (kfds[0]=read, kfds[1]=write)
 int  ksys_pipe(int kfds[2]);
+// [M26] metadata + symlinks + mount control (kernel-side, args already copied in)
+int  ksys_chmod(const char* path, uint32_t mode);
+int  ksys_chown(const char* path, uint32_t uid, uint32_t gid);
+int  ksys_utimes(const char* path, uint64_t atime, uint64_t mtime);
+int  ksys_readlink(const char* path, char* buf, int len);
+int  ksys_symlink(const char* target, const char* linkpath);
+int  ksys_mount(const char* dev, const char* target, const char* fstype);
+int  ksys_umount(const char* target);
 
 // Driver interface forward declaration (struct defined in driver_if.h)
 struct driver_call;
