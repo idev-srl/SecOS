@@ -1,31 +1,49 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **Phase H DONE + Phase I parts 1&2 done (M28-1 ACPI + M28-2 APIC
-switchover)**. Earlier sessions shipped M25–M27b (Phase H) + M28-1. This session
-shipped **M28-2** (LAPIC timer + IOAPIC retire the 8259 PIC/PIT). Self-test
-**158/158**. HEAD `eb29d94` on `main` (commit done; PUSH PENDING — confirm).
-Read this first._
+_Last updated: **Phase H DONE + Phase I parts 1–3 done (M28-1 ACPI + M28-2 APIC
+switchover + M28-3 TSC timekeeping)**. Earlier sessions shipped M25–M27b (Phase H)
++ M28-1. This session shipped **M28-2** (LAPIC timer + IOAPIC retire the 8259
+PIC/PIT — VMware-verified, keyboard+Ctrl+C work) and **M28-3** (TSC monotonic ns
+clock). Self-test **160/160**. HEAD `377db8a` on `main`, pushed. Read this first._
 _Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M25..M28.md`._
 
-## ⚠️ PENDING USER VERIFICATION (M28-2)
-Keyboard now routes via the **IOAPIC** (ISA IRQ1 → vec 0x21), not the PIC — the
-selftest can't press keys, so this needs a **real VMware** boot (user tests on
-VMware, not QEMU; IMCR + IOAPIC actually matter there). Build `make uefi-vmdk`,
-copy to `C:\Users\Luigi\SecOS\`, boot, type in the shell. If keys are dead,
-suspect the IOAPIC redirection (polarity/trigger flags) or IMCR.
+## ▶▶ NEXT SESSION TASK: **M29 — SMP** (Phase I, final part — the big one)
+Phase I platform pieces are done (ACPI discovery, APIC switchover, TSC clock).
+SMP is the single biggest correctness effort in the roadmap — **do the locking
+audit BEFORE enabling APs** (working-style: big rocks in a fresh session). Plan:
+1. **Locking audit first** — the kernel is currently single-CPU and lock-free in
+   many places (PMM bitmap/refcounts, heap free-list, scheduler run state, VFS/
+   page cache, IPC/pipe rings, driver event rings). Enumerate shared mutable state
+   and add spinlocks (or per-CPU data) before any AP runs. This is the bulk of M29.
+2. **Per-CPU data** — GS-based per-CPU blocks (current task, kstack, LAPIC id).
+3. **AP bring-up** — INIT-SIPI-SIPI via LAPIC IPIs using the M28-1 CPU list
+   (`acpi_get()->lapic_ids`); trampoline in low memory (real→long mode), per-AP
+   stack + GDT/IDT load, each AP calls `lapic_enable()` + starts its LAPIC timer.
+4. **N-CPU scheduler** — per-CPU run state or a locked global runqueue; IPI-based
+   reschedule/TLB-shootdown.
+Building blocks already in place: `acpi_get()` (CPU list + LAPIC base), the LAPIC
+(`lapic_enable`/`lapic_eoi`/timer), `ktime_ns()` for cross-CPU time.
 
-## ▶▶ NEXT SESSION TASK: **M28-3 — TSC timekeeping** (Phase I, part 3)
-M28-2 is done: `apic_switchover()` (`arch/x86/lapic.c`) drives the scheduler tick
-from the LAPIC timer (1 kHz, vector 0x20) and the keyboard from the IOAPIC, PIC
-masked, with a PIC/PIT fallback. Next, monotonic timekeeping:
-1. **Calibrate the TSC** (rdtsc) against a known reference — reuse the PIT-ch2
-   gate trick already in `lapic_timer_start()` (poll port 0x61 bit5 over 10 ms),
-   or against the now-calibrated LAPIC timer. Store cycles-per-ns.
-2. Expose a **monotonic nanosecond clock** (`ktime_ns()`), back `SYS_GETTICKS` /
-   uptime with it for sub-ms precision; keep `timer_ticks` for the scheduler.
-3. Optional: parse **HPET** from ACPI as a fallback/cross-check timesource.
-Then **M29 (SMP)** — the big one (AP bring-up via the LAPIC IPIs + the M28-1
-CPU list; kernel-wide locking audit FIRST, before enabling APs).
+### M28-3 facts (don't relearn)
+- `arch/x86/tsc.{c,h}`: `tsc_init` calibrates rdtsc vs **PIT channel 2** (50 ms,
+  port 0x61 gate + OUT2 bit5) — independent of 8259/APIC, works in either mode.
+  `ktime_ns/us/ms()` + `tsc_hz()`. Calibrated ~2.5 GHz on QEMU/VMware.
+- **No 128-bit divide**: libgcc isn't linked (`-nostdlib`), so `(__uint128_t)/hz`
+  → `__udivti3` link error. Hot path is `ns=(cycles*mult)>>32` with `mult`
+  precomputed via one 64-bit divide; the 64x64→128 multiply is a native `mulq`.
+- `SYS_GETTICKS` ABI unchanged (still the 1 kHz tick). The ns clock is
+  kernel-internal + exposed via `/proc/uptime` (sub-second) and `/proc/cpuinfo`
+  (`tsc_mhz`). `net_tsc_per_us()` now prefers `tsc_hz()`.
+
+### M28-2 facts (don't relearn)
+- Everything is in `arch/x86/lapic.c` (it already owned the LAPIC MMIO for MSI).
+  `apic_switchover(hz)` orchestrates; `apic_mode_active()` + `irq_eoi()` are the
+  public surface. `g_apic_mode` flips the EOI source atomically.
+- The **vector stays 0x20** for the timer (reuses isr_timer + the IDT gate) — only
+  the EOI moves from `out 0x20,0x20` to `irq_eoi()` (LAPIC). Same for kbd 0x21.
+- LAPIC timer **calibrated against PIT channel 2** (same trick M28-3 reuses).
+- Fallback: no MADT/IOAPIC or calibration==0 → revert the PIC mask, stay on 8259.
+- **VMware-verified** (user, this session): keyboard via IOAPIC + Ctrl+C work.
 
 ### M28-2 facts (don't relearn)
 - Everything is in `arch/x86/lapic.c` (it already owned the LAPIC MMIO for MSI).
