@@ -538,6 +538,47 @@ grep -q "\[m25\] DONE-USER" "$M25LOG"; check "M25 pipe demo program completed" $
 grep -q "\[M25\] DONE" "$M25LOG"; check "M25 demo completed ([M25] DONE)" $?
 ! grep -q "\[EXC\]" "$M25LOG"; check "no CPU exception ([EXC]) during M25 run" $?
 
+# ---- M27b: write-side journaling (crash atomicity) ----
+# Build a verify image + two crash images, then for each crash point: run1 cuts
+# power mid-commit, run2 recovers and reports. A write-journalled op must be
+# ATOMIC across the crash (absent if cut before commit, present if cut after the
+# journal is published) and the volume must stay e2fsck-clean.
+if command -v mke2fs >/dev/null 2>&1; then
+  mkj(){ rm -rf /tmp/secos_jc && mkdir -p /tmp/secos_jc; printf 'hi\n' > /tmp/secos_jc/hello.txt;
+         mke2fs -F -q -t ext4 -O has_journal,^metadata_csum,^64bit -b 1024 -d /tmp/secos_jc "$1" 16384 2>/dev/null; }
+  runimg(){ : > "$2"; timeout "$TIMEOUT" qemu-system-x86_64 -cdrom "$1" -drive file="$3",if=virtio,format=raw -boot d \
+            -debugcon file:"$2" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M >/dev/null 2>&1 || true; }
+  echo "[selftest] Building M27b images (verify + crash1 + crash2)..."
+  make clean >/dev/null 2>&1 || true
+  make iso CFLAGS_EXTRA=-DM27B_VERIFY=1 >/tmp/secos_selftest_build.log 2>&1 && cp myos.iso /tmp/secos_iso_verify.iso
+  make clean >/dev/null 2>&1 || true
+  make iso CFLAGS_EXTRA=-DM27B_CRASH=1 >/tmp/secos_selftest_build.log 2>&1 && cp myos.iso /tmp/secos_iso_c1.iso
+  make clean >/dev/null 2>&1 || true
+  make iso CFLAGS_EXTRA=-DM27B_CRASH=2 >/tmp/secos_selftest_build.log 2>&1 && cp myos.iso /tmp/secos_iso_c2.iso
+  # baseline: journalled writes (default M10 test) leave the volume e2fsck-clean
+  mkj /tmp/secos_jbase.img
+  runimg /tmp/secos_iso_verify.iso /tmp/secos_m27b_base.log /tmp/secos_jbase.img
+  grep -q "\[M10\] disk write+readback: OK" /tmp/secos_m27b_base.log; check "M27b journalled write+readback OK" $?
+  e2fsck -fn /tmp/secos_jbase.img >/dev/null 2>&1; check "M27b journalled write leaves volume e2fsck-clean" $?
+  # scenario 1: crash BEFORE commit -> op atomically absent
+  mkj /tmp/secos_jc1.img
+  runimg /tmp/secos_iso_c1.iso     /tmp/secos_m27b_c1r1.log /tmp/secos_jc1.img
+  grep -q "\[M27B\] CRASH before commit" /tmp/secos_m27b_c1r1.log; check "M27b run1 cut power before commit" $?
+  runimg /tmp/secos_iso_verify.iso /tmp/secos_m27b_c1r2.log /tmp/secos_jc1.img
+  grep -q "\[M27B\] verify: newf ABSENT" /tmp/secos_m27b_c1r2.log; check "M27b crash-before-commit: op atomically absent" $?
+  e2fsck -fn /tmp/secos_jc1.img >/dev/null 2>&1; check "M27b crash-before-commit: e2fsck-clean" $?
+  # scenario 2: crash AFTER publish -> recovery replays -> op present
+  mkj /tmp/secos_jc2.img
+  runimg /tmp/secos_iso_c2.iso     /tmp/secos_m27b_c2r1.log /tmp/secos_jc2.img
+  grep -q "\[M27B\] CRASH after publish" /tmp/secos_m27b_c2r1.log; check "M27b run1 cut power after publish" $?
+  runimg /tmp/secos_iso_verify.iso /tmp/secos_m27b_c2r2.log /tmp/secos_jc2.img
+  grep -q "\[M27\] journal recover: txns=0x0000000000000001" /tmp/secos_m27b_c2r2.log; check "M27b crash-after-publish: recovery replays the txn" $?
+  grep -q "\[M27B\] verify: newf PRESENT" /tmp/secos_m27b_c2r2.log; check "M27b crash-after-publish: op atomically present" $?
+  e2fsck -fn /tmp/secos_jc2.img >/dev/null 2>&1; check "M27b crash-after-publish: e2fsck-clean" $?
+else
+  echo "  [SKIP] M27b (mke2fs unavailable)"
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

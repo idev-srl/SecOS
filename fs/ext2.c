@@ -64,8 +64,44 @@ static uint32_t rd32(const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1]<
 static void wr16(uint8_t* p, uint16_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }
 static void wr32(uint8_t* p, uint32_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
 
-static int blk_read(uint32_t b, uint8_t* buf){ return block_read(g_dev, (uint64_t)b*g_sec_per_blk, buf, g_sec_per_blk)==(int)g_sec_per_blk ? 0 : -1; }
-static int blk_write(uint32_t b, const uint8_t* buf){ return block_write(g_dev, (uint64_t)b*g_sec_per_blk, buf, g_sec_per_blk)==(int)g_sec_per_blk ? 0 : -1; }
+static int g_jt_active;                                  /* [M27b] a metadata txn is open */
+static int jt_read_cached(uint32_t b, uint8_t* buf);     /* fwd: 1 if served from txn buffer */
+static int blk_read(uint32_t b, uint8_t* buf){
+    /* [M27b] Read-your-writes: inside a transaction, a block modified earlier in
+     * the same txn lives only in the buffer (not yet on disk). Serve it from there
+     * so read-modify-write of shared metadata (group desc, superblock, bitmaps)
+     * accumulates instead of clobbering. */
+    if(g_jt_active && jt_read_cached(b, buf)) return 0;
+    return block_read(g_dev, (uint64_t)b*g_sec_per_blk, buf, g_sec_per_blk)==(int)g_sec_per_blk ? 0 : -1;
+}
+
+/* [M27b] Write-side journaling. A metadata transaction buffers metadata block
+ * writes and commits them atomically through the JBD2 journal (commit -> in-place
+ * checkpoint, done synchronously), so a crash mid-operation leaves the fs either
+ * fully-old or fully-new (M27a recovery replays a committed-but-uncheckpointed
+ * txn on the next mount). When a txn is active, blk_write() buffers; file DATA
+ * blocks and freshly-allocated-block zeroing use blk_write_direct() (ordered
+ * mode: data hits disk before the metadata commit). With no journal on the
+ * volume, transactions degrade to plain in-place writes (legacy behaviour). */
+static int jt_buffer(uint32_t b, const uint8_t* buf);    /* fwd */
+static void jt_begin(void);                              /* fwd */
+static void jt_commit(void);                             /* fwd */
+static int  jt_finish(int r, int ok);                    /* fwd */
+
+/* [M27b] Fault injection: when "power is cut" (g_blk_dead) all further writes are
+ * dropped, simulating a crash. Used by the crash-consistency test to verify that
+ * the journal commit ordering makes every operation atomic across a power loss. */
+static int g_blk_dead;
+static int g_crash_mode;             /* 0=none, 1=before commit block, 2=after publish */
+void ext2_test_set_crash(int mode){ g_crash_mode=mode; g_blk_dead=0; }
+static int blk_write_direct(uint32_t b, const uint8_t* buf){
+    if(g_blk_dead) return 0;         /* write lost to the (simulated) crash */
+    return block_write(g_dev, (uint64_t)b*g_sec_per_blk, buf, g_sec_per_blk)==(int)g_sec_per_blk ? 0 : -1;
+}
+static int blk_write(uint32_t b, const uint8_t* buf){
+    if(g_jt_active) return jt_buffer(b, buf);            /* metadata -> transaction */
+    return blk_write_direct(b, buf);
+}
 
 static void mem_zero(uint8_t* p, size_t n){ while(n--) *p++=0; }
 static void mem_copy(uint8_t* d, const uint8_t* s, size_t n){ while(n--) *d++=*s++; }
@@ -149,8 +185,10 @@ static uint32_t alloc_block(void){
                 { uint8_t gd[64]; if(gd_read(g,gd)==0){ uint16_t fc=rd16(gd+12); if(fc) wr16(gd+12,fc-1); gd_write(g,gd); } }
                 sb_adjust_free_blocks(-1);
                 uint32_t bno = g*g_blocks_per_group + i + g_first_data_block;
-                /* zero the new block */
-                mem_zero(g_b, g_blk_size); blk_write(bno, g_b);
+                /* zero the new block (direct: a freshly-allocated block's prior
+                 * content is irrelevant, and journalling a data block's zero would
+                 * clobber the direct data write on checkpoint) */
+                mem_zero(g_b, g_blk_size); blk_write_direct(bno, g_b);
                 return bno;
             }
         }
@@ -360,7 +398,7 @@ static int file_write(uint32_t ino, size_t offset, const void* buf, size_t len){
         uint32_t chunk=g_blk_size-bo; if(chunk>len-done) chunk=(uint32_t)(len-done);
         if(bo!=0 || chunk!=g_blk_size){ if(blk_read(pb,g_b)!=0) return -1; }
         for(uint32_t i=0;i<chunk;i++) g_b[bo+i]=in[done+i];
-        if(blk_write(pb,g_b)!=0) return -1;
+        if(blk_write_direct(pb,g_b)!=0) return -1;   /* [M27b] data: ordered (direct, pre-commit) */
         done+=chunk;
     }
     uint32_t newsize = (uint32_t)(offset+len); if(newsize<fsize) newsize=fsize;
@@ -766,11 +804,23 @@ static int e2_rename(const char* oldp, const char* newp){
     return dir_remove_entry(op, oc, e2_strlen(oc));
 }
 
+/* [M27b] Transaction wrappers: each mutating op runs as one journalled metadata
+ * transaction (commit-then-checkpoint on success, atomic rollback on failure).
+ * Read-only ops (lookup/readdir/read/readlink) are not wrapped. */
+static int e2j_create(const char* p, const void* d, size_t s){ jt_begin(); int r=e2_create(p,d,s); return jt_finish(r, r==0); }
+static int e2j_mkdir(const char* p){ jt_begin(); int r=e2_mkdir(p); return jt_finish(r, r==0); }
+static int e2j_remove(const char* p){ jt_begin(); int r=e2_remove(p); return jt_finish(r, r==0); }
+static int e2j_rename(const char* o,const char* n){ jt_begin(); int r=e2_rename(o,n); return jt_finish(r, r==0); }
+static int e2j_truncate(const char* p, size_t s){ jt_begin(); int r=e2_truncate(p,s); return jt_finish(r, r==0); }
+static int e2j_setattr(const char* p, const vfs_attr_t* a, unsigned v){ jt_begin(); int r=e2_setattr(p,a,v); return jt_finish(r, r==0); }
+static int e2j_symlink(const char* t, const char* l){ jt_begin(); int r=e2_symlink(t,l); return jt_finish(r, r==0); }
+static int e2j_write(vfs_inode_t* v, size_t off, const void* d, size_t l){ jt_begin(); int r=e2_write(v,off,d,l); return jt_finish(r, r>=0); }
+
 static vfs_fs_ops_t ext2_ops = {
-    .lookup=e2_lookup, .readdir=e2_readdir, .read=e2_read, .write=e2_write,
-    .create=e2_create, .mkdir=e2_mkdir, .remove=e2_remove, .rename=e2_rename,
-    .truncate=e2_truncate, .setattr=e2_setattr,
-    .readlink=e2_readlink, .symlink=e2_symlink
+    .lookup=e2_lookup, .readdir=e2_readdir, .read=e2_read, .write=e2j_write,
+    .create=e2j_create, .mkdir=e2j_mkdir, .remove=e2j_remove, .rename=e2j_rename,
+    .truncate=e2j_truncate, .setattr=e2j_setattr,
+    .readlink=e2_readlink, .symlink=e2j_symlink
 };
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */
@@ -955,10 +1005,105 @@ static int jbd2_recover(void){
     return committed ? 1 : 0;
 }
 
+/* ── [M27b] Write-side transaction layer ────────────────────────────────────*/
+#define JT_MAX 64
+static struct { uint32_t blk; uint8_t data[MAX_BLK]; } g_jt[JT_MAX];
+static int      g_jt_n;
+static int      g_jhas;              /* volume carries a usable journal          */
+static uint32_t g_jfirst, g_jmaxlen, g_jseq;   /* journal geometry / next sequence */
+
+static void wbe32(uint8_t* p, uint32_t v){ p[0]=(uint8_t)(v>>24);p[1]=(uint8_t)(v>>16);p[2]=(uint8_t)(v>>8);p[3]=(uint8_t)v; }
+static void wbe16(uint8_t* p, uint16_t v){ p[0]=(uint8_t)(v>>8);p[1]=(uint8_t)v; }
+
+/* Capture journal geometry at mount (after any recovery). Call with g_mounted. */
+static void jt_init(void){
+    g_jhas=0; g_jt_active=0; g_jt_n=0;
+    uint8_t sbsec[1024];
+    if(block_read(g_dev,2,sbsec,2)!=2) return;
+    if(!(rd32(sbsec+92)&0x4)) return;                 /* no HAS_JOURNAL */
+    uint32_t jinum=rd32(sbsec+224); if(!jinum) return;
+    if(inode_read(jinum,g_jin)!=0) return;
+    if(jread(0,g_jdesc)!=0 || be32(g_jdesc+0)!=JBD2_MAGIC) return;
+    /* Only journal to a checksum-free, non-async journal we can format simply. */
+    uint32_t jincompat=be32(g_jdesc+40);
+    if(jincompat & ~JBD2_INCOMPAT_64BIT) return;      /* csum/async journal -> stay legacy */
+    g_jmaxlen=be32(g_jdesc+16); g_jfirst=be32(g_jdesc+20); g_jseq=be32(g_jdesc+24);
+    if(g_jfirst==0) g_jfirst=1;
+    g_jhas=1;
+}
+
+static int jt_read_cached(uint32_t b, uint8_t* buf){
+    for(int i=0;i<g_jt_n;i++) if(g_jt[i].blk==b){ mem_copy(buf,g_jt[i].data,g_blk_size); return 1; }
+    return 0;
+}
+
+static int jt_buffer(uint32_t b, const uint8_t* buf){
+    for(int i=0;i<g_jt_n;i++) if(g_jt[i].blk==b){ mem_copy(g_jt[i].data,buf,g_blk_size); return 0; }
+    if(g_jt_n>=JT_MAX) return blk_write_direct(b,buf);     /* overflow: degrade (rare) */
+    g_jt[g_jt_n].blk=b; mem_copy(g_jt[g_jt_n].data,buf,g_blk_size); g_jt_n++;
+    return 0;
+}
+
+static void jt_begin(void){ if(g_jhas){ g_jt_n=0; g_jt_active=1; } }
+
+/* Discard a transaction without writing anything: the buffered metadata never
+ * reaches disk, so a failed operation leaves the fs exactly as before (atomic
+ * rollback). Any direct data/zeroing writes landed on not-yet-referenced blocks
+ * and are harmless. */
+static void jt_abort(void){ g_jt_active=0; g_jt_n=0; }
+
+/* Finish a transaction: commit on success (r ok), roll back otherwise. */
+static int jt_finish(int r, int ok){ if(ok) jt_commit(); else jt_abort(); return r; }
+
+/* Commit the buffered metadata atomically: write the journal transaction
+ * (descriptor + data blocks + commit), publish it (s_start), checkpoint in place,
+ * then retire it (s_start=0). A crash between publish and retire is replayed by
+ * M27a on the next mount; a crash before publish leaves the fs untouched. */
+static void jt_commit(void){
+    if(!g_jt_active) return;
+    g_jt_active=0;
+    int n=g_jt_n; if(n<=0) return;
+    if(!g_jhas){ for(int i=0;i<n;i++) blk_write_direct(g_jt[i].blk,g_jt[i].data); return; }
+    uint32_t jp_desc=bmap_read(g_jin,g_jfirst);
+    /* descriptor block: header + one tag per buffered block (first tag carries a
+     * UUID, the rest set SAME_UUID; last sets LAST_TAG) */
+    mem_zero(g_jdesc,g_blk_size);
+    wbe32(g_jdesc+0,JBD2_MAGIC); wbe32(g_jdesc+4,JBD2_DESCRIPTOR_BLOCK); wbe32(g_jdesc+8,g_jseq);
+    uint32_t off=12;
+    for(int i=0;i<n;i++){
+        uint16_t flags=0; if(i>0) flags|=JBD2_FLAG_SAME_UUID; if(i==n-1) flags|=JBD2_FLAG_LAST_TAG;
+        wbe32(g_jdesc+off,g_jt[i].blk); wbe16(g_jdesc+off+4,0); wbe16(g_jdesc+off+6,flags); off+=8;
+        if(i==0){ for(int u=0;u<16;u++) g_jdesc[off+u]=0; off+=16; }   /* UUID (zeros ok, no csum) */
+    }
+    if(jp_desc) blk_write_direct(jp_desc,g_jdesc);
+    /* data blocks follow the descriptor */
+    for(int i=0;i<n;i++){ uint32_t jp=bmap_read(g_jin,g_jfirst+1+i); if(jp) blk_write_direct(jp,g_jt[i].data); }
+    /* [M27b test] crash BEFORE the commit block: txn never becomes valid -> the
+     * next mount sees no committed transaction -> filesystem stays in the OLD state. */
+    if(g_crash_mode==1){ g_blk_dead=1; debugcon_writestring("[M27B] CRASH before commit\n"); }
+    /* commit block */
+    mem_zero(g_jdesc,g_blk_size);
+    wbe32(g_jdesc+0,JBD2_MAGIC); wbe32(g_jdesc+4,JBD2_COMMIT_BLOCK); wbe32(g_jdesc+8,g_jseq);
+    uint32_t jp_commit=bmap_read(g_jin,g_jfirst+1+n); if(jp_commit) blk_write_direct(jp_commit,g_jdesc);
+    /* PUBLISH: journal sb s_start = descriptor block, s_sequence = this txn */
+    uint32_t jp_sb=bmap_read(g_jin,0);
+    if(jread(0,g_jdesc)==0){ wbe32(g_jdesc+28,g_jfirst); wbe32(g_jdesc+24,g_jseq); if(jp_sb) blk_write_direct(jp_sb,g_jdesc); }
+    /* [M27b test] crash AFTER publish, before checkpoint completes: the committed
+     * txn is durable in the journal -> the next mount REPLAYS it -> NEW state. */
+    if(g_crash_mode==2){ g_blk_dead=1; debugcon_writestring("[M27B] CRASH after publish\n"); }
+    /* CHECKPOINT: write the buffered metadata to its final in-place locations */
+    for(int i=0;i<n;i++) blk_write_direct(g_jt[i].blk,g_jt[i].data);
+    /* RETIRE: journal sb s_start = 0, s_sequence = next */
+    g_jseq++;
+    if(jread(0,g_jdesc)==0){ wbe32(g_jdesc+28,0); wbe32(g_jdesc+24,g_jseq); if(jp_sb) blk_write_direct(jp_sb,g_jdesc); }
+    g_jt_n=0;
+}
+
 int ext2_mount(const char* dev_name, const char* mount_point){
     if(ext2_read_super(block_find(dev_name))!=0) return -1;
     jbd2_recover();                                          /* [M27a] replay a dirty journal */
     if(ext2_read_super(block_find(dev_name))!=0) return -1;  /* re-read SB (recovery cleared flags) */
+    jt_init();                                               /* [M27b] capture journal geometry */
     return vfs_mount(mount_point, &ext2_ops, "ext2");
 }
 
@@ -970,6 +1115,7 @@ int ext2_mount_root(const char* dev_name){
     if(ext2_read_super(block_find(dev_name))!=0) return -1;
     jbd2_recover();                              /* [M27a] replay a dirty journal first */
     if(ext2_read_super(block_find(dev_name))!=0) return -1;
+    jt_init();                                   /* [M27b] capture journal geometry */
     g_vused=0;
     if(!e2_lookup("/.secosroot")) return -1;     /* ext2 but not a SecOS root */
     g_vused=0;

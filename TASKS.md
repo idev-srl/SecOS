@@ -78,7 +78,7 @@ session. The narrative handoff lives in `next_session.md`; the long-term plan in
       _shell job control._
 - [ ] **Shell pipelines** (`cmd1 | cmd2`) — now unblocked (pipes + fork + exec).
 
-### Option 4 — Phase H: storage maturity  (part 1 ✅ M26, part 2 = M27)
+### Option 4 — Phase H: storage maturity  ✅ COMPLETE (M26 + M27a + M27b)
 - [x] VFS permissions / ownership / timestamps — **M26** (stored & exposed, not
       enforced; signature = trust boundary). chmod/chown/utimes + extended stat.
 - [x] `mount` / `umount` syscalls — **M26**.
@@ -86,9 +86,12 @@ session. The narrative handoff lives in `next_session.md`; the long-term plan in
       _Limitation: mid-path symlink components not followed yet._
 - [x] **JBD2 journal replay (read-side)** — **M27a**: safely mount a dirty
       ext3/ext4 left by a crash on another OS. 3-pass recovery, e2fsck-validated.
-- [ ] **Write-side journaling + `metadata_csum`** — **M27b** (SecOS's own writes
-      crash-safe; needs a transaction/checkpoint layer + fault-injection harness).
-      The larger remaining half of Phase H crash-consistency.
+- [x] **Write-side journaling** — **M27b**: SecOS's own metadata writes are
+      crash-atomic (transaction → commit → checkpoint; read-your-writes; atomic
+      rollback). Proven with a fault-injection harness (crash before commit → op
+      absent; after publish → replayed; always e2fsck-clean). `metadata_csum`
+      intentionally not implemented (journals to `^metadata_csum` volumes).
+      **➡ Phase H COMPLETE.**
 
 ### Option 5 — Phase I: modern platform → **MULTICORE / SMP** _(biggest effort)_
 

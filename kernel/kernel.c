@@ -1322,6 +1322,32 @@ static void kernel_main_phase2(void) {
                     ? "[M27] REPLAY OK\n" : "[M27] REPLAY FAIL\n");
             }
 #endif
+#if defined(M27B_CRASH)
+            // [M27b] Write-side journaling crash test, RUN 1: create a file in a
+            // single journalled transaction, but cut power at a precise point in
+            // the commit (M27B_CRASH=1 before the commit block, =2 after s_start is
+            // published). Then halt — the next boot's recovery must leave the fs
+            // ATOMIC (file absent for =1, present for =2), e2fsck-clean.
+            if (fsname[0]=='e') {
+                extern void ext2_test_set_crash(int);
+                debugcon_writestring("[M27B] run1: create /mnt/newf with crash mode\n");
+                ext2_test_set_crash(M27B_CRASH);
+                vfs_create("/mnt/newf", "x", 1);
+                debugcon_writestring("[M27B] run1 done, halting (simulated crash)\n");
+                for(;;) __asm__ volatile("cli; hlt");
+            }
+#endif
+#if defined(M27B_VERIFY)
+            // [M27b] RUN 2: the mount already ran recovery (jbd2_recover). Report
+            // whether /mnt/newf survived — must be atomic (present XOR absent).
+            {
+                extern vfs_inode_t* vfs_lookup(const char*);
+                vfs_inode_t* nf = vfs_lookup("/mnt/newf");
+                debugcon_writestring(nf ? "[M27B] verify: newf PRESENT\n"
+                                        : "[M27B] verify: newf ABSENT\n");
+                debugcon_writestring("[M27B] verify done\n");
+            }
+#endif
 #if M26_FS_DEMO
             // [M26] VFS maturity: metadata (chmod/chown), symlinks, mount control.
             // Needs an ext2 /mnt (FAT32 has no setattr/symlink). Run on extN only.
