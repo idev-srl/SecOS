@@ -1147,23 +1147,23 @@ static void sh_udpsend(const char* a){
 // the first chunk of the reply. With no host, uses the dotted IP as Host:.
 static void sh_tcptest(const char* a){
     while(*a==' ') a++;
-    uint32_t ip; if(parse_ip(a,&ip)!=0){ terminal_writestring("Usage: tcptest <ip> <port> [host]\n"); return; }
+    uint32_t ip; if(parse_ip(a,&ip)!=0){ terminal_writestring("Usage: tcptest <ip> <port> [path]\n"); return; }
     while(*a && *a!=' ') a++; while(*a==' ') a++;
     uint32_t port=0; while(*a>='0'&&*a<='9'){ port=port*10+(*a-'0'); a++; }
     if(port==0) port=80;
     while(*a==' ') a++;
-    const char* host = *a ? a : "secos";
+    const char* path = *a ? a : "/";          // 3rd arg = path (consistent with nettest)
     net_dev_t* d = net_primary();
     if(!d){ terminal_writestring("tcptest: no NIC\n"); return; }
     terminal_writestring("tcptest: connecting to "); print_ip(ip); terminal_writestring("...\n");
     tcp_conn_t* c = tcp_connect(d, ip, (uint16_t)port);
     if(!c){ terminal_writestring("tcptest: connect failed\n"); return; }
-    terminal_writestring("tcptest: connected, sending GET\n");
+    terminal_writestring("tcptest: GET "); terminal_writestring(path); terminal_writestring("\n");
     static char req[256]; int rl=0;
-    const char* g="GET / HTTP/1.0\r\nHost: ";
+    const char* g="GET ";
     for(const char* p=g; *p; p++) req[rl++]=*p;
-    for(const char* p=host; *p && rl<200; p++) req[rl++]=*p;
-    const char* e="\r\nConnection: close\r\n\r\n";
+    for(const char* p=path; *p && rl<180; p++) req[rl++]=*p;
+    const char* e=" HTTP/1.0\r\nHost: secos\r\nConnection: close\r\n\r\n";
     for(const char* p=e; *p; p++) req[rl++]=*p;
     tcp_send_all(c, req, (uint32_t)rl);
     static char buf[1024]; int total=0;

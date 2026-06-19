@@ -381,6 +381,17 @@ void tcp_tick(void){
 
 // ---- blocking convenience ----
 tcp_conn_t* tcp_connect(net_dev_t* dev, uint32_t dip, uint16_t dport){
+    // Warm the next-hop ARP first (gateway for off-subnet) so the very first SYN
+    // goes out instead of being dropped on a pending ARP — otherwise a fresh
+    // destination could report "connect failed" until a retransmit happened.
+    if(dev){
+        uint32_t nh = (dev->netmask && (dip & dev->netmask)==(dev->ip & dev->netmask)) ? dip : dev->gateway;
+        uint8_t mac[6];
+        if(arp_resolve(dev, nh, mac)!=0){
+            uint64_t adl=timer_get_ticks()+1000;
+            while(timer_get_ticks()<adl && arp_lookup(nh, mac)!=0) __asm__ volatile("sti; hlt");
+        }
+    }
     tcp_conn_t* c=tcp_alloc();
     if(!c) return NULL;
     if(tcp_start_connect(c, dev, dip, dport)!=0){ tcp_free(c); return NULL; }
