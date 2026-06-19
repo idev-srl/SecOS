@@ -1,22 +1,47 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **M24 networking COMPLETE + validated on REAL VMware** (DHCP, DNS,
-ICMP LAN **and internet**, TCP to internet + LAN, UDP, sockets+CAP_NET), RX is
-**interrupt-driven (MSI-X) by default**, plus perf tools. Self-test 122/122.
-HEAD `5e471ac` on `main`, **pushed to `origin/main`**. Read this first._
+_Last updated: **M25 + M26 + M27a COMPLETE & pushed**. M25 (pipes + console TTY +
+TCP throughput), M26 (VFS maturity: metadata/chmod/chown/symlinks/mount — Phase H
+part 1), M27a (JBD2 journal replay — Phase H part 2 read-side). Self-test
+**141/141**. HEAD `6eaa3b6` on `main`, pushed to `origin/main`. Read this first._
+_The actionable checklist is `TASKS.md`; per-milestone detail in `docs/devlog/M25..M27.md`._
 
-## ▶▶ NEXT SESSION TASK: pick the next milestone (networking is done)
-M24 is finished and proven on hardware. Options, roughly in order:
-1. **Throughput optimization** (if wanted): TCP window/buffer is 8 KB → bumping to
-   32/64 KB and/or larger RX rings would raise throughput (currently ~270–460
-   Mbit/s on real VMware; the ceiling is `window / RTT`). Low-risk, localized to
-   `net/tcp.c`.
-2. **vmxnet3 / igc hardware validation** — QEMU models neither (igc = 2.5 GbE);
-   needs the real adapter. Tune the 82574 MSI-X re-arm (IVAR/EIAC) so the poll
-   backstop can eventually be dropped.
-3. **New milestone**: **pipes/TTY** (unblocked by fork), Phase H (storage
-   maturity: permissions/timestamps, mount/umount syscalls, ext4 journaling), or
-   Phase I (ACPI + APIC/IOAPIC → SMP). See `docs/ROADMAP_TO_COMPLETE_OS.md`.
+## ▶▶ NEXT SESSION TASK: pick the next milestone
+Phase H is half-done (M26 VFS maturity + M27a journal replay). Options:
+1. **M27b — write-side journaling** (finishes Phase H crash-consistency): route
+   SecOS's own metadata writes through the journal (descriptor+data+commit then
+   checkpoint) + `metadata_csum` + a **fault-injection harness** (interrupt a
+   write at precise points, remount, assert consistency). The larger, riskier
+   half — flagged "big rock". Builds on M27a (`fs/ext2.c jbd2_recover`).
+2. **Signals** — async **Ctrl-C→SIGINT** to kill a compute-bound foreground
+   process + **SIGPIPE**. Today Ctrl-C only interrupts an in-progress read (M25);
+   the kill path (M15 `sched_kill_current`) exists but there's no async delivery.
+   Unblocks **shell job control + pipelines** (`cmd1 | cmd2`, pipes already exist).
+3. **Phase I** — ACPI + APIC/IOAPIC (retire the PIC) → TSC/HPET → **SMP**
+   (the biggest effort; locking audit first). See `TASKS.md` for the SMP chain.
+4. **NIC hardware validation** — vmxnet3 / igc (2.5 GbE) need the real adapter
+   (QEMU models neither). Tune the 82574 MSI-X re-arm.
+
+### This session's deltas (don't relearn)
+- **M25**: pipes (`kernel/pipe.{c,h}`, `SYS_PIPE` 31, blocking/EOF/EPIPE,
+  fork-inherited) + console **TTY cooked mode** (`kernel/tty.c`: echo/backspace/
+  Ctrl-D/Ctrl-C) + **PS/2+USB-HID Ctrl-key support** (was missing entirely — that's
+  why Ctrl-C/D did nothing on the console) + shell-prompt Ctrl-C. **fds 0/1/2 are
+  now reserved as stdin/stdout/stderr at process creation** (else a pipe end
+  collided with the console fd specials). TCP buffer 8K→64K (helps WAN, not the
+  sub-ms-RTT LAN — that's processing-bound; see `memory/m25-tcp-throughput-findings`).
+- **M26**: POSIX metadata **stored & exposed, NOT enforced** (signature = trust;
+  user decision). `struct secos_stat` grew (st_size@0/st_mode@8 stable). chmod/
+  chown/utimes/lstat/readlink/symlink/mount/umount syscalls + libc. **Mid-path
+  symlink components not followed yet** (final component only).
+- **M27a**: JBD2 **replay only** (read-side). `tools/mk_dirty_journal.py` +
+  `make disk-journal` build an e2fsck-validated dirty-journal test image.
+- **selftest gotcha hit this session**: it's `set -euo pipefail`, so a single
+  failing `grep -q` **aborts the whole suite** (and can look like a premature
+  "exit 0"). Keep selftest grep patterns exact. Don't hardcode file sizes.
+- **Process gotcha (bit me again)**: never `pkill -f "...selftest..."`/`qemu` in a
+  command whose own line matches the pattern → kills the shell (exit 144). Same
+  for a `pgrep` wait-loop that matches itself.
 
 ### M24 final state (all live-verified on real VMware against a bridged LAN)
 - **Waves 1–4 done**: UDP/DHCP/DNS (`net/udp.c,dhcp.c,dns.c`), TCP
