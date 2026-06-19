@@ -69,7 +69,10 @@ static inline void save_tf(process_t* p, trapframe_t* tf) {
     for (int i = 0; i < (int)sizeof(trapframe_t); i++) d[i] = s[i];
 }
 
-static inline void pic_eoi(void) { __asm__ volatile("outb %0,$0x20"::"a"((uint8_t)0x20)); }
+/* [M28-2] EOI the scheduler tick to whichever controller owns it (LAPIC in APIC
+ * mode, else the 8259). The preempt path EOIs here because switch_to() does not
+ * return, so the ISR stub's trailing irq_eoi never runs. */
+extern void irq_eoi(void);
 
 // ---- [M8] preemptive tick ----
 void sched_on_timer_tick(trapframe_t* tf) {
@@ -87,7 +90,7 @@ void sched_on_timer_tick(trapframe_t* tf) {
         // user task exits) resumes where it was — this lets the interactive
         // shell run as the idle task and get control back after `run`.
         process_t* next = pick_user(NULL);
-        if (next) { if (idle_task->tf) save_tf(idle_task, tf); pic_eoi(); switch_to(next); }
+        if (next) { if (idle_task->tf) save_tf(idle_task, tf); irq_eoi(); switch_to(next); }
         return;
     }
 
@@ -107,7 +110,7 @@ void sched_on_timer_tick(trapframe_t* tf) {
     debugcon_writestring(" -> ");
     debugcon_print_hex(next->pid);
     debugcon_writestring("\n");
-    pic_eoi();
+    irq_eoi();
     switch_to(next);
 }
 

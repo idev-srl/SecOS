@@ -595,6 +595,11 @@ set -e
 grep -q "\[ACPI\] CPUs=0x0000000000000002" "$M28LOG"; check "M28 ACPI discovers all CPUs (-smp 2)" $?
 grep -q "lapic=0x00000000FEE00000" "$M28LOG"; check "M28 ACPI reports the LAPIC base" $?
 grep -q "ioapic0=0x00000000FEC00000" "$M28LOG"; check "M28 ACPI reports the IOAPIC base" $?
+# M28-2: APIC switchover (LAPIC timer + IOAPIC replace the PIC/PIT).
+grep -q "\[APIC\] IOAPIC route irq=0x0000000000000001 .* vec=0x0000000000000021" "$M28LOG"; check "M28-2 IOAPIC routes keyboard IRQ1 -> vec 0x21" $?
+grep -q "\[APIC\] LAPIC timer hz=0x00000000000003E8" "$M28LOG"; check "M28-2 LAPIC timer programmed at 1 kHz" $?
+grep -q "\[APIC\] mode active" "$M28LOG"; check "M28-2 APIC mode active (PIC masked)" $?
+grep -q "\[APIC\] timer tick verified" "$M28LOG"; check "M28-2 LAPIC timer actually ticks (IRQ delivery OK)" $?
 ! grep -q "\[EXC\]" "$M28LOG"; check "no CPU exception ([EXC]) during M28 run" $?
 
 echo "[selftest] ---"

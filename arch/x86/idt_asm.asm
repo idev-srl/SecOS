@@ -147,6 +147,7 @@ isr_stub:
 ; Handler per il timer (IRQ0 = interrupt 0x20)
 global isr_timer
 extern timer_handler
+extern irq_eoi          ; M28-2: mode-aware EOI (LAPIC vs 8259)
 
 isr_timer:
     ; Build a canonical trapframe_t so the handler can preempt (M8).
@@ -174,9 +175,9 @@ isr_timer:
     mov rdi, rsp
     call timer_handler
 
-    ; Send EOI (End Of Interrupt) to the PIC
-    mov al, 0x20
-    out 0x20, al
+    ; Send EOI to whichever controller owns the line (LAPIC in APIC mode, else
+    ; the 8259). Caller-saved clobbers are fine — all GPRs are restored below.
+    call irq_eoi
 
     pop r15
     pop r14
@@ -220,11 +221,10 @@ isr_keyboard:
     
     ; Chiama il gestore C
     call keyboard_handler
-    
-    ; Invia EOI (End Of Interrupt) al PIC
-    mov al, 0x20
-    out 0x20, al
-    
+
+    ; EOI to the active controller (LAPIC in APIC mode, else the 8259 master).
+    call irq_eoi
+
     pop r15
     pop r14
     pop r13

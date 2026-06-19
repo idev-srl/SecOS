@@ -1090,6 +1090,28 @@ static void kernel_main_phase2(void) {
     timer_init(1000);
     keyboard_init();
 
+    // [M28-2] Retire the 8259 PIC + PIT IRQ0 onto the LAPIC timer + IOAPIC when
+    // ACPI gave us a MADT/IOAPIC. timer_init() above already programmed the PIT
+    // and timer_frequency=1000 (still used for uptime math); the switchover masks
+    // the PIC and drives the same vector 0x20 (isr_timer) from the LAPIC timer at
+    // 1 kHz, so timer_ticks keeps advancing. Falls back to PIC/PIT on no MADT.
+    {
+        extern int apic_switchover(uint32_t);
+        if (apic_switchover(1000) == 0) {
+            // Prove the LAPIC timer actually fires (and IRQ delivery works) by
+            // confirming timer_ticks advances. Bounded spin so a dead timer can't
+            // hang boot — on failure we log and continue (PIC was already masked,
+            // but a non-ticking system is a loud, visible failure in the log).
+            uint64_t t0 = timer_get_ticks();
+            int ticking = 0;
+            for (volatile uint64_t i = 0; i < 300000000ull; i++) {
+                if (timer_get_ticks() != t0) { ticking = 1; break; }
+            }
+            debugcon_writestring(ticking ? "[APIC] timer tick verified\n"
+                                         : "[APIC] FAIL: LAPIC timer not ticking\n");
+        }
+    }
+
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();
 #endif
