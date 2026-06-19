@@ -1,35 +1,45 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **Phase H DONE + Phase I STARTED (M28-1 ACPI done)**. This session
-shipped M25 (pipes+TTY+TCP throughput), M26 (VFS maturity), M27a (journal replay),
-M27b (write-side crash-atomic journaling → **Phase H complete**), and M28-1 (ACPI
-table discovery → **Phase I part 1**). Self-test **154/154**. HEAD `35e3782` on
-`main`, pushed to `origin/main`. Read this first._
+_Last updated: **Phase H DONE + Phase I parts 1&2 done (M28-1 ACPI + M28-2 APIC
+switchover)**. Earlier sessions shipped M25–M27b (Phase H) + M28-1. This session
+shipped **M28-2** (LAPIC timer + IOAPIC retire the 8259 PIC/PIT). Self-test
+**158/158**. HEAD `eb29d94` on `main` (commit done; PUSH PENDING — confirm).
+Read this first._
 _Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M25..M28.md`._
 
-## ▶▶ NEXT SESSION TASK: **M28-2 — APIC switchover** (Phase I, part 2)
-M28-1 (ACPI discovery) is done; `arch/x86/acpi.{c,h}` exposes the topology via
-`acpi_get()` / `acpi_irq_to_gsi()`. Next, retire the legacy 8259 PIC + PIT for the
-APIC. **This is risky live-interrupt surgery — keep BOTH boot paths green and
-commit only on a clean selftest.** Plan:
-1. **Enable the LAPIC fully** — build on `lapic_enable()` (`arch/x86/lapic.c`):
-   spurious-interrupt vector + APIC software-enable (already there for MSI).
-2. **LAPIC timer as the scheduler tick** — calibrate against the PIT once, then
-   program the LAPIC timer (periodic, vector e.g. 0x20 or a fresh one) to fire at
-   1 kHz and call `sched_on_timer_tick()` (today driven by PIT IRQ0 →
-   `drivers/timer.c timer_handler`). `lapic_eoi()` instead of PIC EOI.
-3. **IOAPIC** — map `acpi_get()->ioapics[0].base` (physmap), program the
-   redirection entry for the keyboard (ISA IRQ1 → `acpi_irq_to_gsi(1)` → a vector),
-   honoring override polarity/trigger flags. **Mask the 8259 PIC** (OCW1 0xFF to
-   0x21/0xA1) once the IOAPIC owns the IRQs.
-4. Keep a fallback: if `acpi_get()->found` is 0 (no MADT), stay on PIC/PIT.
-5. **Gotchas**: `idt.c` currently installs IRQ gates at 0x20/0x21 (PIC-remapped);
-   the LAPIC-timer + IOAPIC vectors must line up with the IDT. EOI source changes
-   (LAPIC vs PIC). Test mb2 AND uefi; the scheduler tick + keyboard must still work.
-   Add an `[APIC]` debugcon marker + a selftest case (tick still preempts, ACPI
-   topology unchanged, no `[EXC]`).
-Then **M28-3** (TSC timekeeping) and **M29 (SMP)** — the big one (AP bring-up +
-kernel-wide locking audit; do the audit BEFORE enabling APs).
+## ⚠️ PENDING USER VERIFICATION (M28-2)
+Keyboard now routes via the **IOAPIC** (ISA IRQ1 → vec 0x21), not the PIC — the
+selftest can't press keys, so this needs a **real VMware** boot (user tests on
+VMware, not QEMU; IMCR + IOAPIC actually matter there). Build `make uefi-vmdk`,
+copy to `C:\Users\Luigi\SecOS\`, boot, type in the shell. If keys are dead,
+suspect the IOAPIC redirection (polarity/trigger flags) or IMCR.
+
+## ▶▶ NEXT SESSION TASK: **M28-3 — TSC timekeeping** (Phase I, part 3)
+M28-2 is done: `apic_switchover()` (`arch/x86/lapic.c`) drives the scheduler tick
+from the LAPIC timer (1 kHz, vector 0x20) and the keyboard from the IOAPIC, PIC
+masked, with a PIC/PIT fallback. Next, monotonic timekeeping:
+1. **Calibrate the TSC** (rdtsc) against a known reference — reuse the PIT-ch2
+   gate trick already in `lapic_timer_start()` (poll port 0x61 bit5 over 10 ms),
+   or against the now-calibrated LAPIC timer. Store cycles-per-ns.
+2. Expose a **monotonic nanosecond clock** (`ktime_ns()`), back `SYS_GETTICKS` /
+   uptime with it for sub-ms precision; keep `timer_ticks` for the scheduler.
+3. Optional: parse **HPET** from ACPI as a fallback/cross-check timesource.
+Then **M29 (SMP)** — the big one (AP bring-up via the LAPIC IPIs + the M28-1
+CPU list; kernel-wide locking audit FIRST, before enabling APs).
+
+### M28-2 facts (don't relearn)
+- Everything is in `arch/x86/lapic.c` (it already owned the LAPIC MMIO for MSI).
+  `apic_switchover(hz)` orchestrates; `apic_mode_active()` + `irq_eoi()` are the
+  public surface. `g_apic_mode` flips the EOI source atomically.
+- The **vector stays 0x20** for the timer (reuses isr_timer + the IDT gate) — only
+  the EOI moves from `out 0x20,0x20` to `irq_eoi()` (LAPIC). Same for kbd 0x21.
+- LAPIC timer is **calibrated against PIT channel 2** (port 0x61 gate, poll OUT2
+  bit5; ch2 is independent of the 8259 so it counts with the PIC masked). QEMU
+  LAPIC ≈ 1 GHz, /16 → ~62.5 M ticks/s → init ≈ 62.5 k for 1 kHz.
+- The asm `call irq_eoi` sits exactly where the old inline EOI was (same RSP as
+  the working `call timer_handler`) so stack alignment is unchanged.
+- Fallback path is real: no MADT/IOAPIC or calibration==0 → revert the PIC mask,
+  `irq_eoi` stays in 8259 mode, kernel runs as before.
 
 ### Other open fronts (lower priority than finishing Phase I)
 - **Signals** — async Ctrl-C→SIGINT + SIGPIPE → shell job control & pipelines
