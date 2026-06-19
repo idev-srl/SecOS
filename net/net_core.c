@@ -145,13 +145,17 @@ int net_ping_rtt(uint32_t dst_ip, uint16_t seq, uint64_t* rtt_tsc) {
     extern uint64_t timer_get_ticks(void);
     uint8_t mac[6];
     __asm__ volatile("sti");
-    // Resolve ARP first (not part of the timed window).
-    if (arp_lookup(dst_ip, mac) != 0) {
-        arp_request(d, dst_ip);
+    // Resolve the NEXT HOP, not the destination (you can't ARP a host that isn't
+    // on the local subnet): off-subnet -> gateway, on-subnet -> the dst itself.
+    // This mirrors ipv4_send()'s routing — without it, pinging any external IP
+    // ARPed the unreachable destination and timed out before sending the echo.
+    uint32_t nexthop = (d->netmask && (dst_ip & d->netmask) == (d->ip & d->netmask)) ? dst_ip : d->gateway;
+    if (arp_lookup(nexthop, mac) != 0) {
+        arp_request(d, nexthop);
         uint64_t adl = timer_get_ticks() + 1000;
-        while (timer_get_ticks() < adl && arp_lookup(dst_ip, mac) != 0)
+        while (timer_get_ticks() < adl && arp_lookup(nexthop, mac) != 0)
             __asm__ volatile("sti; hlt");
-        if (arp_lookup(dst_ip, mac) != 0) return -1;
+        if (arp_lookup(nexthop, mac) != 0) return -1;
     }
     uint32_t before = icmp_echo_replies();
     uint64_t deadline = timer_get_ticks() + 2000;        // 2 s safety timeout
@@ -212,11 +216,13 @@ int net_ping_test(uint32_t dst_ip) {
     uint8_t mac[6];
     __asm__ volatile ("sti");
 
-    arp_request(d, dst_ip);
+    // Next hop (gateway for off-subnet), not the destination — see net_ping_rtt().
+    uint32_t nexthop = (d->netmask && (dst_ip & d->netmask) == (d->ip & d->netmask)) ? dst_ip : d->gateway;
+    arp_request(d, nexthop);
     uint64_t deadline = timer_get_ticks() + 1000;       // ~1 s at 1 kHz
-    while (timer_get_ticks() < deadline && arp_lookup(dst_ip, mac) != 0)
+    while (timer_get_ticks() < deadline && arp_lookup(nexthop, mac) != 0)
         __asm__ volatile ("hlt");
-    if (arp_lookup(dst_ip, mac) != 0) { debugcon_writestring("[NET] ARP timeout (no peer)\n"); return -1; }
+    if (arp_lookup(nexthop, mac) != 0) { debugcon_writestring("[NET] ARP timeout (no peer)\n"); return -1; }
     debugcon_writestring("[NET] ARP resolved\n");
 
     uint32_t before = icmp_echo_replies();
