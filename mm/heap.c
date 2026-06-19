@@ -8,6 +8,12 @@
 #include "pmm.h"
 #include "vmm.h"   // [M12] phys_to_virt for physmap-addressed heap
 #include "terminal.h"
+#include "spinlock.h"  // [M29] SMP: serialize the free-list across CPUs
+
+// [M29] One lock guards the whole free list (kmalloc/kfree/expand). Uncontended
+// on the single-core path. expand_heap() calls the PMM under this lock, but the
+// PMM has its own separate lock, so there is no nesting on the same lock.
+static spinlock_t heap_lock = SPINLOCK_INIT;
 
 // Header for each heap block
 typedef struct heap_block {
@@ -127,6 +133,7 @@ void* kmalloc(size_t size) {
     // Align size to 8 bytes
     size = align_up(size, 8);
 
+    uint64_t fl = spin_lock_irqsave(&heap_lock);
     heap_block_t* current = heap_start;
 
     // Search free block large enough (with potential splitting)
@@ -146,13 +153,16 @@ void* kmalloc(size_t size) {
             }
             current->is_free = false;
             total_allocated += current->size;
-            return (void*)((uint8_t*)current + HEAP_BLOCK_HEADER_SIZE);
+            void* r = (void*)((uint8_t*)current + HEAP_BLOCK_HEADER_SIZE);
+            spin_unlock_irqrestore(&heap_lock, fl);
+            return r;
         }
         current = current->next;
     }
     // Try to expand the heap
     heap_block_t* new_block = expand_heap(size);
     if (!new_block) {
+        spin_unlock_irqrestore(&heap_lock, fl);
         terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
         terminal_writestring("[FAIL] Allocation failed (expand_heap NULL)\n");
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
@@ -170,7 +180,9 @@ void* kmalloc(size_t size) {
     }
     new_block->is_free = false;
     total_allocated += new_block->size;
-    return (void*)((uint8_t*)new_block + HEAP_BLOCK_HEADER_SIZE);
+    void* r = (void*)((uint8_t*)new_block + HEAP_BLOCK_HEADER_SIZE);
+    spin_unlock_irqrestore(&heap_lock, fl);
+    return r;
 }
 
 // Allocate memory with alignment guarantee
@@ -194,14 +206,16 @@ void kfree(void* ptr) {
     
     // Get block header
     heap_block_t* block = (heap_block_t*)((uint8_t*)ptr - HEAP_BLOCK_HEADER_SIZE);
-    
+
+    uint64_t fl = spin_lock_irqsave(&heap_lock);
     if (block->is_free) {
+        spin_unlock_irqrestore(&heap_lock, fl);
         return;  // Already free
     }
-    
+
     block->is_free = true;
     total_freed += block->size;
-    
+
     // Coalesce adjacent free blocks.
     // CRITICAL: only merge blocks that are PHYSICALLY contiguous. Heap frames
     // come from separate pmm_alloc_frame() calls and are not necessarily
@@ -221,6 +235,7 @@ void kfree(void* ptr) {
             current = current->next;
         }
     }
+    spin_unlock_irqrestore(&heap_lock, fl);
 }
 
 // Print heap allocator statistics

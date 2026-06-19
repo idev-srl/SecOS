@@ -43,6 +43,23 @@ int apic_switchover(uint32_t hz);
 /* True once apic_switchover() has put the system in symmetric-I/O (APIC) mode. */
 int apic_mode_active(void);
 
+/* This CPU's Local APIC ID (bits 31:24 of the ID register). 0 if the LAPIC is
+ * not yet mapped (pre-switchover) — safe default for the single-core path. */
+uint32_t lapic_get_id(void);
+
+/* ---- M29 SMP: inter-processor interrupts via the LAPIC ICR ----
+ * Send an INIT IPI then two STARTUP (SIPI) IPIs to bring an AP out of reset; the
+ * AP begins executing at physical (vector << 12). lapic_send_init / lapic_send_sipi
+ * target a destination LAPIC ID. lapic_ipi(dest, vector) sends a plain fixed IPI
+ * (used for TLB shootdown / reschedule). All no-op if the LAPIC is not mapped. */
+void lapic_send_init(uint32_t dest_apic_id);
+void lapic_send_sipi(uint32_t dest_apic_id, uint8_t vector);
+void lapic_ipi(uint32_t dest_apic_id, uint8_t vector);
+
+/* Start this CPU's LAPIC timer at `hz` on the scheduler-tick vector (used by APs,
+ * which calibrate off the BSP's already-computed period). Requires lapic_enable(). */
+void lapic_timer_start_this_cpu(uint32_t hz);
+
 /* End-of-interrupt for a level-0 hardware IRQ (timer/keyboard). Dispatches to the
  * LAPIC in APIC mode, or the 8259 master otherwise. Called from the ISR stubs and
  * the scheduler's preempt path so the EOI source tracks the active mode. */

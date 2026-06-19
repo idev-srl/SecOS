@@ -12,13 +12,18 @@
 #include "terminal.h"
 #include "debugcon.h"
 #include "vmm.h"
+#include "percpu.h"
 
-static process_t* current = NULL;
-static process_t* idle_task = NULL;
+// [M29] Scheduler state is per-CPU: `current`, `idle_task` and the preemption
+// quantum live in this CPU's cpu_t. The macros keep the single-core code below
+// unchanged while making each core operate on its own task set. `this_cpu()`
+// returns CPU 0 before SMP is up, so the pre-SMP path is identical.
+#define current     (this_cpu()->current)
+#define idle_task   (this_cpu()->idle_task)
+#define slice_left  (this_cpu()->slice_left)
 
 // [M8] Preemption quantum: switch the running user task every N timer ticks.
 #define SCHED_QUANTUM_TICKS 3
-static uint32_t slice_left = SCHED_QUANTUM_TICKS;
 
 extern void process_foreach(void (*cb)(process_t*, void*), void* user);
 extern void tss_set_kernel_stack(uint64_t stack);
@@ -45,7 +50,12 @@ static process_t* pick_user(process_t* after) {
     return c.cand;
 }
 
-void sched_init(void) { current = NULL; idle_task = NULL; }
+void sched_init(void) {
+    // [M29] Ensure the BSP (CPU 0) exists before any per-CPU access. Its real
+    // LAPIC ID is fixed up after ACPI/LAPIC bring-up via smp_set_bsp_lapic_id().
+    if (smp_cpu_count() == 0) smp_register_cpu(0);
+    current = NULL; idle_task = NULL;
+}
 process_t* sched_get_current(void) { return current; }
 void sched_set_current(process_t* p) { current = p; }
 void sched_set_idle(process_t* idle) { idle_task = idle; }

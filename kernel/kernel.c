@@ -1098,6 +1098,10 @@ static void kernel_main_phase2(void) {
     {
         extern int apic_switchover(uint32_t);
         if (apic_switchover(1000) == 0) {
+            // [M29] LAPIC is up: record the BSP's real LAPIC ID so this_cpu()
+            // resolves CPU 0 correctly and APs later get distinct slots.
+            { extern void smp_set_bsp_lapic_id(uint32_t); extern uint32_t lapic_get_id(void);
+              smp_set_bsp_lapic_id(lapic_get_id()); }
             // Prove the LAPIC timer actually fires (and IRQ delivery works) by
             // confirming timer_ticks advances. Bounded spin so a dead timer can't
             // hang boot — on failure we log and continue (PIC was already masked,
@@ -1126,6 +1130,11 @@ static void kernel_main_phase2(void) {
         debugcon_writestring(ok ? "[TSC] monotonic OK\n"
                                 : "[TSC] FAIL: clock not advancing\n");
     }
+
+    // [M29-2] Bring up the application processors (INIT-SIPI-SIPI). Each AP
+    // enables its LAPIC, registers online, and parks (M29-3 enters the scheduler).
+    // No-op on a single-CPU system or without ACPI/APIC.
+    { extern void smp_init(void); smp_init(); }
 
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();

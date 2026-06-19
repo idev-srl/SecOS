@@ -76,6 +76,12 @@ static void pic_remap(void) {
     outb(0xA1, a2);
 }
 
+// [M29] Load the shared IDT on an application processor (the IDT itself is global;
+// only the lidt must be re-run per CPU). Called from ap_entry().
+void idt_ap_load(void) {
+    idt_load((uint64_t)&idtp);
+}
+
 // Initialize the IDT
 void idt_init(void) {
     // Set IDT pointer (limit and base)

@@ -10,8 +10,13 @@
 #include "terminal.h"
 #include "debugcon.h"
 #include "vmm.h"   // [M12] KERNEL_VMA_BASE / kvirt_to_phys for the higher-half bitmap
+#include "spinlock.h"  // [M29] SMP: serialize the bitmap / refcounts across CPUs
 // print_hex definita in kernel, forward decl per debug
 extern void print_hex(uint64_t value);
+
+// [M29] One lock guards the whole allocator: bitmap, rolling hint, refcounts and
+// the used_frames counter. Uncontended (a single xchg) on the single-core path.
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 // Bitmap tracking free/used physical frames
 static uint32_t* frame_bitmap = NULL;
@@ -337,52 +342,69 @@ void pmm_init_uefi(void* mem_descs, uint64_t desc_count, uint64_t desc_size, uin
     terminal_writestring("[UEFI][PMM] Inizializzazione da descriptors completata\n");
 }
 
-// Allocate one physical frame
-void* pmm_alloc_frame(void) {
+// Allocate one physical frame (caller holds pmm_lock).
+static void* alloc_frame_nolock(void) {
     uint32_t frame = find_free_frame();
-
-    if (frame == (uint32_t)-1) {
-    return NULL;  // Out of memory
-    }
-
+    if (frame == (uint32_t)-1) return NULL;  // Out of memory
     bitmap_set(frame);
     used_frames++;
     next_free_hint = (uint64_t)frame + 1; // [M12] advance rolling hint
-
     return (void*)((uint64_t)frame * PMM_FRAME_SIZE);
+}
+
+// Free a physical frame (caller holds pmm_lock).
+static void free_frame_nolock(void* addr) {
+    uint32_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
+    if (!bitmap_test(frame)) return;  // Already free
+    bitmap_clear(frame);
+    used_frames--;
+    if (frame < next_free_hint) next_free_hint = frame; // [M12] reuse sooner
+}
+
+// Allocate one physical frame
+void* pmm_alloc_frame(void) {
+    uint64_t fl = spin_lock_irqsave(&pmm_lock);
+    void* r = alloc_frame_nolock();
+    spin_unlock_irqrestore(&pmm_lock, fl);
+    return r;
 }
 
 // [M12] Allocate `count` physically-contiguous frames.
 void* pmm_alloc_contiguous(size_t count) {
     if (count == 0) return NULL;
-    if (count == 1) return pmm_alloc_frame();
-    uint64_t base = find_free_run(count);
-    if (base == (uint64_t)-1) return NULL; // no contiguous run
-    for (uint64_t f = base; f < base + count; f++) { bitmap_set((uint32_t)f); used_frames++; }
-    next_free_hint = base + count;
-    return (void*)(base * PMM_FRAME_SIZE);
+    uint64_t fl = spin_lock_irqsave(&pmm_lock);
+    void* r;
+    if (count == 1) {
+        r = alloc_frame_nolock();
+    } else {
+        uint64_t base = find_free_run(count);
+        if (base == (uint64_t)-1) { r = NULL; }
+        else {
+            for (uint64_t f = base; f < base + count; f++) { bitmap_set((uint32_t)f); used_frames++; }
+            next_free_hint = base + count;
+            r = (void*)(base * PMM_FRAME_SIZE);
+        }
+    }
+    spin_unlock_irqrestore(&pmm_lock, fl);
+    return r;
 }
 
 // [M12] Free `count` contiguous frames.
 void pmm_free_contiguous(void* addr, size_t count) {
+    uint64_t fl = spin_lock_irqsave(&pmm_lock);
     uint64_t base = (uint64_t)addr / PMM_FRAME_SIZE;
     for (uint64_t f = base; f < base + count; f++) {
         if (bitmap_test((uint32_t)f)) { bitmap_clear((uint32_t)f); used_frames--; }
     }
     if (base < next_free_hint) next_free_hint = base; // reuse freed space sooner
+    spin_unlock_irqrestore(&pmm_lock, fl);
 }
 
 // Free a physical frame
 void pmm_free_frame(void* addr) {
-    uint32_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
-
-    if (!bitmap_test(frame)) {
-    return;  // Already free
-    }
-
-    bitmap_clear(frame);
-    used_frames--;
-    if (frame < next_free_hint) next_free_hint = frame; // [M12] reuse sooner
+    uint64_t fl = spin_lock_irqsave(&pmm_lock);
+    free_frame_nolock(addr);
+    spin_unlock_irqrestore(&pmm_lock, fl);
 }
 
 // [M19] Copy-on-write refcounting. pmm_share marks a frame as shared by one more
@@ -390,17 +412,22 @@ void pmm_free_frame(void* addr) {
 // (do NOT free it) or 0 if this was the last reference (the caller frees it).
 void pmm_share_frame(void* addr) {
     uint64_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
+    uint64_t fl = spin_lock_irqsave(&pmm_lock);
     if (frame < total_frames && frame_refs) {
         if (frame_refs[frame] != 0xFFFF) frame_refs[frame]++; // saturate defensively
     }
+    spin_unlock_irqrestore(&pmm_lock, fl);
 }
 int pmm_unref_frame(void* addr) {
     uint64_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
+    uint64_t fl = spin_lock_irqsave(&pmm_lock);
+    int r = 0;
     if (frame < total_frames && frame_refs && frame_refs[frame] > 0) {
         frame_refs[frame]--;
-        return 1; // still referenced by someone else
+        r = 1; // still referenced by someone else
     }
-    return 0; // last reference -> caller frees
+    spin_unlock_irqrestore(&pmm_lock, fl);
+    return r;
 }
 
 // Get total memory (sum of regions)

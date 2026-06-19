@@ -9,37 +9,51 @@
  * SPDX-License-Identifier: MIT
  */
 #include "vfs.h"
+#include "spinlock.h"
 #include <stddef.h>
 
 #define VFS_MAX_MOUNTS 12   // [M23] root + /mnt + /dev + /proc + /sys + headroom
 static vfs_mount_t g_mounts[VFS_MAX_MOUNTS];
 static int         g_mount_count = 0;
 
+// [M29] Guards the mount-table array (g_mounts[]/g_mount_count) only — NOT path
+// resolution, which calls into filesystems that block on I/O. The lookup helper
+// has a _nolock leaf so mount/unmount can hold the lock while using it (the lock
+// is not recursive).
+static spinlock_t g_mount_lock = SPINLOCK_INIT;
+
 static size_t str_len(const char* s){ size_t n=0; while(s[n]) n++; return n; }
 
 void vfs_init(void){ g_mount_count = 0; for(int i=0;i<VFS_MAX_MOUNTS;i++){ g_mounts[i].mount_point=NULL; g_mounts[i].ops=NULL; g_mounts[i].fs_name=NULL; } }
 
-// Locate/replace the root ("/") mount slot.
-static vfs_mount_t* find_mount_by_point(const char* mp){
+// Locate/replace the root ("/") mount slot (lock-free leaf — caller holds
+// g_mount_lock).
+static vfs_mount_t* find_mount_by_point_nolock(const char* mp){
     for(int i=0;i<g_mount_count;i++){ const char* a=g_mounts[i].mount_point; const char* b=mp; size_t k=0; int eq=1; while(a[k]||b[k]){ if(a[k]!=b[k]){ eq=0; break; } k++; } if(eq) return &g_mounts[i]; }
     return NULL;
 }
 
 int vfs_mount_root(const vfs_fs_ops_t* ops, const char* fs_name){
     if(!ops || !fs_name) return -1;
-    if(find_mount_by_point("/")) return -1; // already mounted
-    if(g_mount_count >= VFS_MAX_MOUNTS) return -1;
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
+    if(find_mount_by_point_nolock("/")){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; } // already mounted
+    if(g_mount_count >= VFS_MAX_MOUNTS){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
     g_mounts[g_mount_count].mount_point = "/";
     g_mounts[g_mount_count].ops = ops;
     g_mounts[g_mount_count].fs_name = fs_name;
     g_mount_count++;
+    spin_unlock_irqrestore(&g_mount_lock, fl);
     return 0;
 }
 
 int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name){
     if(!ops || !fs_name) return -1;
-    vfs_mount_t* r = find_mount_by_point("/");
-    if(r){ r->ops = ops; r->fs_name = fs_name; return 0; }
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
+    vfs_mount_t* r = find_mount_by_point_nolock("/");
+    if(r){ r->ops = ops; r->fs_name = fs_name; spin_unlock_irqrestore(&g_mount_lock, fl); return 0; }
+    spin_unlock_irqrestore(&g_mount_lock, fl);
+    // vfs_mount_root takes g_mount_lock itself — call it OUTSIDE the lock (not
+    // recursive). It re-checks for an existing root, so the drop/re-take is safe.
     return vfs_mount_root(ops, fs_name);
 }
 
@@ -47,22 +61,26 @@ int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name){
 int vfs_mount(const char* mount_point, const vfs_fs_ops_t* ops, const char* fs_name){
     if(!mount_point || !ops || !fs_name) return -1;
     if(mount_point[0] != '/') return -1;
-    if(find_mount_by_point(mount_point)) return -1;
-    if(g_mount_count >= VFS_MAX_MOUNTS) return -1;
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
+    if(find_mount_by_point_nolock(mount_point)){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
+    if(g_mount_count >= VFS_MAX_MOUNTS){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
     g_mounts[g_mount_count].mount_point = mount_point;
     g_mounts[g_mount_count].ops = ops;
     g_mounts[g_mount_count].fs_name = fs_name;
     g_mount_count++;
+    spin_unlock_irqrestore(&g_mount_lock, fl);
     return 0;
 }
 
 int vfs_unmount(const char* mount_point){
     if(!mount_point) return -1;
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
     for(int i=0;i<g_mount_count;i++){
         const char* a=g_mounts[i].mount_point; const char* b=mount_point; size_t k=0; int eq=1;
         while(a[k]||b[k]){ if(a[k]!=b[k]){ eq=0; break; } k++; }
-        if(eq){ for(int j=i;j<g_mount_count-1;j++) g_mounts[j]=g_mounts[j+1]; g_mount_count--; return 0; }
+        if(eq){ for(int j=i;j<g_mount_count-1;j++) g_mounts[j]=g_mounts[j+1]; g_mount_count--; spin_unlock_irqrestore(&g_mount_lock, fl); return 0; }
     }
+    spin_unlock_irqrestore(&g_mount_lock, fl);
     return -1;
 }
 
@@ -180,10 +198,17 @@ int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid){ char rel
 int vfs_readlink(const char* path, char* buf, size_t len){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->readlink) return -1; return m->ops->readlink(rel, buf, len); }
 int vfs_symlink(const char* target, const char* linkpath){ char rel[256]; vfs_mount_t* m=vfs_resolve(linkpath,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->symlink) return -1; return m->ops->symlink(target, rel); }
 
-int vfs_mount_count(void){ return g_mount_count; }
+int vfs_mount_count(void){
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
+    int n = g_mount_count;
+    spin_unlock_irqrestore(&g_mount_lock, fl);
+    return n;
+}
 int vfs_mount_info(int i, const char** mp, const char** fsname){
-    if(i<0 || i>=g_mount_count) return -1;
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
+    if(i<0 || i>=g_mount_count){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
     if(mp) *mp = g_mounts[i].mount_point;
     if(fsname) *fsname = g_mounts[i].fs_name;
+    spin_unlock_irqrestore(&g_mount_lock, fl);
     return 0;
 }

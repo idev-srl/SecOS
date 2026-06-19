@@ -7,6 +7,7 @@
 #include "pmm.h"
 #include "vmm.h"        // phys_to_virt
 #include "vfs.h"        // vfs_inode_t + ops->read
+#include "spinlock.h"   // SMP serialization of the cache state
 
 #define ADDRESS_MASK 0x000FFFFFFFFFF000ULL
 #define PC_ENTRIES   128
@@ -20,6 +21,7 @@ typedef struct {
 
 static pc_entry_t pc[PC_ENTRIES];
 static uint32_t   pc_clock = 0;   // FIFO eviction hand
+static spinlock_t pc_lock = SPINLOCK_INIT;   // guards pc[] + pc_clock
 
 // Fill frame 'phys' with file bytes [off, off+4096), zero-padded past EOF.
 static void pc_fill(vfs_inode_t* ino, uint64_t off, uint64_t phys) {
@@ -32,7 +34,8 @@ static void pc_fill(vfs_inode_t* ino, uint64_t off, uint64_t phys) {
     }
 }
 
-uint64_t pagecache_get_phys(vfs_inode_t* inode, uint64_t off) {
+// Core lookup/fill; caller must hold pc_lock.
+static uint64_t pagecache_get_phys_nolock(vfs_inode_t* inode, uint64_t off) {
     if (!inode) return 0;
     off &= ~0xFFFULL;
     for (int i = 0; i < PC_ENTRIES; i++)
@@ -54,17 +57,25 @@ uint64_t pagecache_get_phys(vfs_inode_t* inode, uint64_t off) {
     return phys;
 }
 
+uint64_t pagecache_get_phys(vfs_inode_t* inode, uint64_t off) {
+    uint64_t fl = spin_lock_irqsave(&pc_lock);
+    uint64_t phys = pagecache_get_phys_nolock(inode, off);
+    spin_unlock_irqrestore(&pc_lock, fl);
+    return phys;
+}
+
 int pagecache_read(vfs_inode_t* inode, uint64_t offset, void* kbuf, uint64_t len) {
     if (!inode) return -1;
     if (offset >= inode->size) return 0;
     if (offset + len > inode->size) len = inode->size - offset;
     uint8_t* dst = (uint8_t*)kbuf;
     uint64_t done = 0;
+    uint64_t fl = spin_lock_irqsave(&pc_lock);
     while (done < len) {
         uint64_t off    = offset + done;
         uint64_t pgoff  = off & ~0xFFFULL;
         uint64_t in_pg  = off - pgoff;
-        uint64_t phys   = pagecache_get_phys(inode, pgoff);
+        uint64_t phys   = pagecache_get_phys_nolock(inode, pgoff);
         if (!phys) break;
         const uint8_t* src = (const uint8_t*)phys_to_virt(phys);
         uint64_t chunk = 4096 - in_pg;
@@ -72,12 +83,14 @@ int pagecache_read(vfs_inode_t* inode, uint64_t offset, void* kbuf, uint64_t len
         for (uint64_t i = 0; i < chunk; i++) dst[done + i] = src[in_pg + i];
         done += chunk;
     }
+    spin_unlock_irqrestore(&pc_lock, fl);
     return (int)done;
 }
 
 void pagecache_invalidate(vfs_inode_t* inode, uint64_t offset, uint64_t len) {
     if (!inode) return;
     uint64_t end = offset + len;
+    uint64_t fl = spin_lock_irqsave(&pc_lock);
     for (int i = 0; i < PC_ENTRIES; i++) {
         if (pc[i].valid && pc[i].inode == inode &&
             pc[i].off < end && pc[i].off + 4096 > offset) {
@@ -85,4 +98,5 @@ void pagecache_invalidate(vfs_inode_t* inode, uint64_t offset, uint64_t len) {
             pc[i].valid = 0; pc[i].phys = 0;
         }
     }
+    spin_unlock_irqrestore(&pc_lock, fl);
 }

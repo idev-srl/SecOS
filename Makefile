@@ -34,6 +34,7 @@ SRC_C   = \
 	$(ARCH_DIR)/lapic.c \
 	$(ARCH_DIR)/acpi.c \
 	$(ARCH_DIR)/tsc.c \
+	$(ARCH_DIR)/percpu.c \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \
@@ -58,6 +59,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/ipc.c \
 	$(KERNEL_DIR)/pipe.c \
 	$(KERNEL_DIR)/tty.c \
+	$(KERNEL_DIR)/smp.c \
 	$(KERNEL_DIR)/selftest.c \
 	user/testdriver.c \
 	$(LIB_DIR)/terminal.c \
@@ -92,7 +94,10 @@ SRC_C   = \
 
 OBJS_ASM = $(SRC_ASM:%.asm=%.o)
 OBJS_C   = $(SRC_C:%.c=%.o)
-OBJS     = $(OBJS_ASM) $(OBJS_C)
+# [M29] AP startup trampoline: a flat binary (org 0x8000) wrapped into an object
+# so the kernel can copy it to low memory at runtime.
+AP_TRAMPOLINE = $(BOOT_DIR)/ap_trampoline.o
+OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE)
 KERNEL  = kernel.bin
 ISO     = myos.iso
 ISODIR  = isodir
@@ -113,6 +118,13 @@ all: $(KERNEL)
 ifneq (,$(wildcard kernel.c))
 $(warning WARNING: Found unused kernel.c in root; remove to avoid confusion.)
 endif
+
+# [M29] AP trampoline: assemble flat (org 0x8000), wrap into an ELF object whose
+# _binary_ap_trampoline_bin_{start,end} symbols the kernel copies to 0x8000.
+# Explicit rule wins over the generic boot/%.o:%.asm pattern below.
+$(BOOT_DIR)/ap_trampoline.o: $(BOOT_DIR)/ap_trampoline.asm
+	$(AS) -f bin $< -o $(BOOT_DIR)/ap_trampoline.bin
+	cd $(BOOT_DIR) && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 ap_trampoline.bin ap_trampoline.o
 
 $(BOOT_DIR)/%.o: $(BOOT_DIR)/%.asm
 	$(AS) $(ASFLAGS) $< -o $@
@@ -336,6 +348,7 @@ run-vnc: iso
 # Clean generated files
 clean:
 	rm -f $(OBJS) $(KERNEL)
+	rm -f $(BOOT_DIR)/ap_trampoline.bin
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)
 

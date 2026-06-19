@@ -47,9 +47,18 @@
 /* Spurious vector to install when we enable the LAPIC. 0xFF is conventional. */
 #define LAPIC_SPURIOUS_VECTOR 0xFF
 
+/* Interrupt Command Register (low/high) for sending IPIs (M29 SMP). */
+#define LAPIC_REG_ICR_LO 0x300
+#define LAPIC_REG_ICR_HI 0x310
+#define ICR_DELIV_INIT   (5u << 8)
+#define ICR_DELIV_STARTUP (6u << 8)
+#define ICR_LEVEL_ASSERT (1u << 14)
+#define ICR_DELIVERY_PENDING (1u << 12)
+
 static volatile uint32_t* g_lapic;   /* mapped LAPIC base, NULL until enabled */
 static volatile uint32_t* g_ioapic;  /* mapped IOAPIC base, NULL until routed  */
 static int g_apic_mode;              /* 1 once the APIC owns hardware IRQs      */
+static uint32_t g_timer_init;        /* periodic LAPIC-timer count (BSP-calibrated) */
 
 static inline void outb(uint16_t port, uint8_t v) {
     __asm__ volatile ("outb %0, %1" : : "a"(v), "Nd"(port));
@@ -194,7 +203,9 @@ static uint64_t lapic_timer_start(uint32_t hz) {
     uint32_t init = (uint32_t)(ticks_per_sec / hz);
     if (init == 0) init = 1;
 
-    /* Program periodic at `hz`, unmasked, on VEC_TIMER. */
+    /* Program periodic at `hz`, unmasked, on VEC_TIMER. Remember the count so APs
+     * can start their own LAPIC timer at the same rate without recalibrating. */
+    g_timer_init = init;
     g_lapic[LAPIC_REG_TIMER_DIV / 4]  = LAPIC_TIMER_DIV_16;
     g_lapic[LAPIC_REG_LVT_TIMER / 4]  = LAPIC_TIMER_PERIODIC | VEC_TIMER;
     g_lapic[LAPIC_REG_TIMER_INIT / 4] = init;
@@ -247,4 +258,55 @@ int apic_switchover(uint32_t hz) {
     __asm__ volatile ("sti");
     debugcon_writestring("[APIC] mode active (PIC masked, LAPIC timer + IOAPIC)\n");
     return 0;
+}
+
+/* ============================ M29: SMP IPIs / per-CPU ===================== */
+
+uint32_t lapic_get_id(void) {
+    if (!g_lapic) return 0;
+    return g_lapic[LAPIC_REG_ID / 4] >> 24;
+}
+
+/* Software-enable THIS CPU's Local APIC (per-CPU MSR + SVR). Unlike lapic_enable()
+ * — which also maps the shared MMIO and is idempotent for the BSP — this is run by
+ * each AP, which must set its own APIC-base-enable bit and spurious vector. The
+ * MMIO is already mapped (BSP did it); the LAPIC registers are per-CPU. */
+void lapic_enable_this_cpu(void) {
+    uint64_t base = rdmsr(IA32_APIC_BASE_MSR);
+    wrmsr(IA32_APIC_BASE_MSR, base | APIC_BASE_ENABLE);
+    if (g_lapic) g_lapic[LAPIC_REG_SVR / 4] = LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR;
+}
+
+static void icr_wait_idle(void) {
+    while (g_lapic[LAPIC_REG_ICR_LO / 4] & ICR_DELIVERY_PENDING) __asm__ volatile ("pause");
+}
+
+static void icr_send(uint32_t dest_apic_id, uint32_t low) {
+    g_lapic[LAPIC_REG_ICR_HI / 4] = dest_apic_id << 24;   /* destination field */
+    g_lapic[LAPIC_REG_ICR_LO / 4] = low;                  /* writing LOW fires it */
+    icr_wait_idle();
+}
+
+void lapic_send_init(uint32_t dest_apic_id) {
+    if (!g_lapic) return;
+    icr_send(dest_apic_id, ICR_DELIV_INIT | ICR_LEVEL_ASSERT);
+}
+
+void lapic_send_sipi(uint32_t dest_apic_id, uint8_t vector) {
+    if (!g_lapic) return;
+    icr_send(dest_apic_id, ICR_DELIV_STARTUP | ICR_LEVEL_ASSERT | vector);
+}
+
+void lapic_ipi(uint32_t dest_apic_id, uint8_t vector) {
+    if (!g_lapic) return;
+    icr_send(dest_apic_id, ICR_LEVEL_ASSERT | vector);
+}
+
+void lapic_timer_start_this_cpu(uint32_t hz) {
+    (void)hz;
+    if (!g_lapic || !g_timer_init) return;
+    g_lapic[LAPIC_REG_TPR / 4]        = 0;
+    g_lapic[LAPIC_REG_TIMER_DIV / 4]  = LAPIC_TIMER_DIV_16;
+    g_lapic[LAPIC_REG_LVT_TIMER / 4]  = LAPIC_TIMER_PERIODIC | VEC_TIMER;
+    g_lapic[LAPIC_REG_TIMER_INIT / 4] = g_timer_init;
 }

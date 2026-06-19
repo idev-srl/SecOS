@@ -6,9 +6,15 @@
  */
 #include "keyboard.h"
 #include "serial.h"
+#include "spinlock.h"
 
 #define KEYBOARD_DATA_PORT 0x60
 #define BUFFER_SIZE 256
+
+// [M29] One spinlock guards both the input ring buffer and the modifier state.
+// keyboard_handler runs in interrupt context, so the irqsave variants are used
+// everywhere to stay atomic against this CPU's own ISR as well as other CPUs.
+static spinlock_t kbd_lock = SPINLOCK_INIT;
 
 // Circular input buffer
 static char input_buffer[BUFFER_SIZE];
@@ -45,8 +51,8 @@ static const char scancode_to_ascii_shift[] = {
     '*', 0, ' '
 };
 
-// Push char into buffer
-static void buffer_put(char c) {
+// Push char into buffer (lock-free leaf — caller holds kbd_lock).
+static void buffer_put_nolock(char c) {
     int next = (buffer_end + 1) % BUFFER_SIZE;
     if (next != buffer_start) {
         input_buffer[buffer_end] = c;
@@ -54,13 +60,28 @@ static void buffer_put(char c) {
     }
 }
 
-// Pop char from buffer
-static char buffer_get(void) {
+// Pop char from buffer (lock-free leaf — caller holds kbd_lock).
+static char buffer_get_nolock(void) {
     if (buffer_start == buffer_end) {
         return 0;
     }
     char c = input_buffer[buffer_start];
     buffer_start = (buffer_start + 1) % BUFFER_SIZE;
+    return c;
+}
+
+// Push char into buffer.
+static void buffer_put(char c) {
+    uint64_t fl = spin_lock_irqsave(&kbd_lock);
+    buffer_put_nolock(c);
+    spin_unlock_irqrestore(&kbd_lock, fl);
+}
+
+// Pop char from buffer.
+static char buffer_get(void) {
+    uint64_t fl = spin_lock_irqsave(&kbd_lock);
+    char c = buffer_get_nolock();
+    spin_unlock_irqrestore(&kbd_lock, fl);
     return c;
 }
 
@@ -71,8 +92,13 @@ extern void usb_hid_poll(void);
 
 // Check if buffer has characters
 bool keyboard_has_char(void) {
+    // usb_hid_poll() can call keyboard_inject_char()->buffer_put(), which takes
+    // kbd_lock — so it must run OUTSIDE the lock (kbd_lock is not recursive).
     usb_hid_poll();
-    return (buffer_start != buffer_end) || serial_has_char();
+    uint64_t fl = spin_lock_irqsave(&kbd_lock);
+    bool has = (buffer_start != buffer_end);
+    spin_unlock_irqrestore(&kbd_lock, fl);
+    return has || serial_has_char();
 }
 
 // [M22] Inject a character from another input source (USB HID keyboard).
@@ -83,7 +109,11 @@ void keyboard_inject_char(char c) {
 // Keyboard interrupt handler
 void keyboard_handler(void) {
     uint8_t scancode = inb(KEYBOARD_DATA_PORT);
-    
+
+    // [M29] Guard modifier state + ring buffer. Use buffer_put_nolock below since
+    // we already hold kbd_lock (it is not recursive). Every return path unlocks.
+    uint64_t fl = spin_lock_irqsave(&kbd_lock);
+
     // Handle key release (bit7 = 1)
     if (scancode & 0x80) {
         scancode &= 0x7F;
@@ -94,24 +124,28 @@ void keyboard_handler(void) {
         if (scancode == 0x1D) {                  // [M25] Ctrl release
             ctrl_pressed = false;
         }
+        spin_unlock_irqrestore(&kbd_lock, fl);
         return;
     }
 
     // Handle special keys
     if (scancode == 0x2A || scancode == 0x36) {  // Left/Right Shift
         shift_pressed = true;
+        spin_unlock_irqrestore(&kbd_lock, fl);
         return;
     }
     if (scancode == 0x1D) {                       // [M25] Left Ctrl
         ctrl_pressed = true;
+        spin_unlock_irqrestore(&kbd_lock, fl);
         return;
     }
-    
+
     if (scancode == 0x3A) {  // Caps Lock
         caps_lock = !caps_lock;
+        spin_unlock_irqrestore(&kbd_lock, fl);
         return;
     }
-    
+
     // Convert scancode to ASCII
     char ascii = 0;
     if (scancode < sizeof(scancode_to_ascii)) {
@@ -134,8 +168,9 @@ void keyboard_handler(void) {
     }
 
     if (ascii) {
-        buffer_put(ascii);
+        buffer_put_nolock(ascii);
     }
+    spin_unlock_irqrestore(&kbd_lock, fl);
 }
 
 // Initialize keyboard state
