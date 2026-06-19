@@ -1,50 +1,62 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **M24 networking COMPLETE** — all four waves done (UDP/DHCP/DNS,
-TCP, sockets+CAP_NET, MSI-X/NAPI). Self-test 122/122. Committed on `main`
-(not yet pushed). Read this first._
+_Last updated: **M24 networking COMPLETE + validated on REAL VMware** (DHCP, DNS,
+ICMP LAN **and internet**, TCP to internet + LAN, UDP, sockets+CAP_NET), RX is
+**interrupt-driven (MSI-X) by default**, plus perf tools. Self-test 122/122.
+HEAD `5e471ac` on `main`, **pushed to `origin/main`**. Read this first._
 
-## ▶▶ NEXT SESSION TASK: (networking done) — push + hardware validation, then pick next
-The full network stack is **implemented and verified in QEMU**. Suggested next:
-1. **Push** `main` to `origin` (this session committed locally only).
-2. **Hardware/VMware validation** of the NICs that QEMU can't model — e1000e
-   (laptops), vmxnet3 (VMware), igc (2.5 GbE). Rebuild VMware images
-   (`make uefi-vmdk`). Tune the 82574 MSI-X re-arm (IVAR/EIAC) so the poll
-   backstop can be dropped on validated hardware.
-3. Then a new milestone: **pipes/TTY** (now unblocked by fork/signals groundwork),
-   Phase H (storage maturity), or Phase I (ACPI+APIC+SMP). See
-   `docs/ROADMAP_TO_COMPLETE_OS.md`.
+## ▶▶ NEXT SESSION TASK: pick the next milestone (networking is done)
+M24 is finished and proven on hardware. Options, roughly in order:
+1. **Throughput optimization** (if wanted): TCP window/buffer is 8 KB → bumping to
+   32/64 KB and/or larger RX rings would raise throughput (currently ~270–460
+   Mbit/s on real VMware; the ceiling is `window / RTT`). Low-risk, localized to
+   `net/tcp.c`.
+2. **vmxnet3 / igc hardware validation** — QEMU models neither (igc = 2.5 GbE);
+   needs the real adapter. Tune the 82574 MSI-X re-arm (IVAR/EIAC) so the poll
+   backstop can eventually be dropped.
+3. **New milestone**: **pipes/TTY** (unblocked by fork), Phase H (storage
+   maturity: permissions/timestamps, mount/umount syscalls, ext4 journaling), or
+   Phase I (ACPI + APIC/IOAPIC → SMP). See `docs/ROADMAP_TO_COMPLETE_OS.md`.
 
-### What landed this session (M24 waves 1–4, all live-verified vs QEMU SLIRP)
-- **Wave 1 — UDP/DHCP/DNS** (`net/udp.c`,`net/dhcp.c`,`net/dns.c`). Shell `dhcp`,
-  `nslookup`, `udpsend`. `dhcp` → lease 10.0.2.15; `nslookup example.com` resolves.
-  Fixed a DHCP `xid` endianness bug (written BE, read LE → every OFFER rejected).
-  `ipv4_send` gained a broadcast (no-ARP) path for DHCP.
-- **Wave 2 — TCP** (`net/tcp.c`,`tcp.h`). Full state machine, sliding window,
-  retransmit via `net_tick`, in-order RX rings, active+passive open. Shell
-  `tcptest <ip> <port>` did a real HTTP GET (2435 bytes) vs a host `http.server`.
-- **Wave 3 — sockets + CAP_NET** (`net/socket.c`,`socket.h`). Syscalls 21–30 +
-  libc wrappers. `CAP_NET` = bit 4 of the signed manifest `flags`
-  (`MANIFEST_FLAG_CAP_NET`); `process_t.cap_net`; dispatcher refuses all socket
-  calls without it. Demo gate `M24_NET_DEMO` proves OK-with-cap / DENIED-without.
-- **Wave 4 — MSI-X/NAPI** (gated `-DNET_USE_MSIX`, OFF by default). IDT vector
-  0x42 `isr_net`→`net_irq_handler` (NAPI). e1000/e1000e `irq_enable`/`irq_ack`
-  hooks; e1000e programs the 82574 IVAR. **Validated in QEMU** with `-device
-  e1000e`: ISR fires, DHCP+ping+DNS work in `mode=msix`. Hybrid: keeps a
-  timer-tick poll backstop for completeness.
+### M24 final state (all live-verified on real VMware against a bridged LAN)
+- **Waves 1–4 done**: UDP/DHCP/DNS (`net/udp.c,dhcp.c,dns.c`), TCP
+  (`net/tcp.c`: full state machine, sliding window, retransmit, active+passive),
+  BSD sockets + **CAP_NET** (`net/socket.c`; syscalls 21–30; `CAP_NET` = bit 4 of
+  the signed manifest `flags`, `process_t.cap_net`; demo gate `M24_NET_DEMO`),
+  **MSI-X/NAPI RX now the DEFAULT** (`net_request_irq` tries MSI-X/MSI, falls back
+  to polling; opt out `-DNET_NO_MSIX`; e1000/e1000e `irq_enable`/`irq_ack`, e1000e
+  programs the 82574 IVAR; hybrid keeps a poll backstop).
+- **Drivers**: e1000 binds **both** 82540EM (`100E`, QEMU) and 82545EM (`100F`,
+  VMware "e1000"); e1000e binds 82574L (`10D3`, VMware "e1000e" — the validated
+  one). vmxnet3/igc compile-clean, untested.
+- **Shell**: `netinfo` (shows `rx msix(irq)`/`poll`), `dhcp`, `ping <ip> [count]`
+  (RTT min/avg/max via rdtsc), `nslookup`, `udpsend`, `tcptest <ip> <port> [path]`,
+  `nettest <ip> <port> [path]` (TCP throughput → KB/s + Mbit/s).
+- **Three bugs fixed post-completion** (don't reintroduce): (a) DHCP `xid` written
+  BE / read LE → every OFFER rejected; (b) **`ping` ARPed the destination IP
+  instead of the next hop** → any off-subnet/internet ping timed out *without
+  sending the echo* (LAN worked, TCP worked → looked like a network/ICMP issue but
+  wasn't); fix = resolve next hop (gateway for off-subnet) like `ipv4_send`;
+  (c) `tcp_connect` now warms the next-hop ARP before the SYN (no transient
+  "connect failed").
 
 ### Build/run the networking (interactive — needs a NIC + the shell context)
 ```bash
 make iso && qemu-system-x86_64 -cdrom myos.iso -boot d \
-  -netdev user,id=n0 -device e1000,netdev=n0 \
+  -netdev user,id=n0 -device e1000e,netdev=n0 \
   -serial stdio -display none -no-reboot -m 256M
-# then in the shell: dhcp / netinfo / ping / nslookup example.com / tcptest 10.0.2.2 80
+# shell: dhcp / netinfo / ping 8.8.8.8 10 / nslookup example.com / nettest <ip> <port> /big.bin
+# throughput test: serve a BIG file on the host (python3 -m http.server 8000) then
+#   nettest <hostip> 8000 /big.bin   (nettest WITHOUT a path GETs / = tiny = noise)
 # CAP_NET demo (non-interactive): make iso CFLAGS_EXTRA=-DM24_NET_DEMO=1
-# MSI-X NAPI (validated w/ e1000e): make iso CFLAGS_EXTRA=-DNET_USE_MSIX  + -device e1000e
+# VMware: set ethernet0.virtualDev="e1000e", NAT/Bridged; images via `make uefi-vmdk`
+#   (copied to C:\Users\Luigi\SecOS\ ; verify banner GIT_HASH matches HEAD)
 ```
-**RX gotcha still applies:** test from the shell/idle context (the idle `hlt`s,
-yielding the vCPU so QEMU delivers RX DMA). **`make clean` after any `-D`/header
-change** (Makefile has no header-dep tracking).
+**RX gotcha still applies:** test from the shell/idle context. **`make clean`
+after any `-D`/header change** (no header-dep tracking — a no-clean `make iso`
+after a selftest run links stale demo `.o` files; this bit me this session).
+**Never `pkill -f "qemu-system"`/`"http.server"` in a command that also runs
+them — the pattern matches the command's own line and kills the shell (exit 144).**
 
 ### Key facts for the next session (don't relearn the hard way)
 - **NIC RX needs the shell/idle context**: the idle task `hlt`s between timer
