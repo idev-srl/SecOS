@@ -42,19 +42,17 @@ void net_rx(net_dev_t* dev, const void* frame, uint32_t len) {
 // others fall back to timer-tick polling. NULL when no NIC uses MSI-X.
 static net_dev_t* g_irq_dev;
 
-#ifdef NET_USE_MSIX
 #include "idt.h"
 #include "lapic.h"
 #include "pci.h"
-#endif
 
 net_irq_mode_t net_request_irq(net_dev_t* dev) {
     if (!dev || !dev->poll) { if (dev) dev->irq_mode = NET_IRQ_NONE; return NET_IRQ_NONE; }
-#ifdef NET_USE_MSIX
-    // [M24] NAPI via MSI-X (perf path for 2.5 GbE+). Gated + additive: only the
-    // first NIC is wired; if MSI-X/MSI or the LAPIC are unavailable (e.g. QEMU's
-    // legacy e1000), fall through to polling — behaviour-identical to the default
-    // build. NOT validated on hardware yet (NICs that have MSI-X lack a QEMU model).
+#ifndef NET_NO_MSIX
+    // [M24] NAPI via MSI-X is now the DEFAULT RX path: interrupt-driven, low
+    // latency. Only the first NIC is wired. If MSI-X/MSI or the LAPIC are
+    // unavailable (e.g. QEMU's legacy e1000), fall through to timer-tick polling.
+    // Build with -DNET_NO_MSIX to force pure polling.
     if (!g_irq_dev && lapic_enable() == 0) {
         idt_install_msi_vector(IDT_VECTOR_NET, isr_net);
         extern void isr_net(void);
@@ -63,10 +61,10 @@ net_irq_mode_t net_request_irq(net_dev_t* dev) {
             g_irq_dev = dev;
             if (dev->irq_enable) dev->irq_enable(dev);   // NIC unmasks its RX cause
             dev->irq_mode = NET_IRQ_MSIX;
-            // Hybrid NAPI: the MSI-X interrupt gives low-latency RX wakeups, but we
-            // also keep a timer-tick poll backstop (g_poll) so RX is complete even
-            // if a NIC's interrupt re-arm semantics drop an edge — a watchdog poll
-            // is standard practice in production NIC drivers. Belt and suspenders.
+            // Hybrid NAPI: the MSI-X interrupt is the primary RX wakeup, but we also
+            // keep a timer-tick poll backstop (g_poll) so RX stays complete even if a
+            // NIC's interrupt re-arm semantics drop an edge — a watchdog poll is
+            // standard practice in production NIC drivers. Belt and suspenders.
             if (g_npoll < NET_MAX_DEV) g_poll[g_npoll++] = dev;
             debugcon_writestring("[NET] MSI-X NAPI armed vector=0x42 (+poll backstop)\n");
             return NET_IRQ_MSIX;                         // timers still run via net_tick
@@ -74,7 +72,7 @@ net_irq_mode_t net_request_irq(net_dev_t* dev) {
         debugcon_writestring("[NET] no MSI-X/MSI; staying polled\n");
     }
 #endif
-    // Default: timer-tick polling of dev->poll (works on every NIC/firmware).
+    // Fallback: timer-tick polling of dev->poll (works on every NIC/firmware).
     if (g_npoll < NET_MAX_DEV) {
         g_poll[g_npoll++] = dev;
         dev->irq_mode = NET_IRQ_POLL;
@@ -86,11 +84,10 @@ net_irq_mode_t net_request_irq(net_dev_t* dev) {
 
 // [M24] C half of isr_net (vector 0x42). NAPI: ack the NIC, drain the RX ring via
 // dev->poll, EOI the LAPIC. Protocol timers (ARP/TCP) stay on the timer tick via
-// net_tick(), so they don't run per-packet here. Only fires under NET_USE_MSIX.
+// net_tick(), so they don't run per-packet here. Fires when a NIC uses MSI-X.
 volatile uint32_t g_net_irq_count;
 void net_irq_handler(void) {
     g_net_irq_count++;
-    if (g_net_irq_count <= 3) debugcon_writestring("[NET] IRQ fired\n");
     net_dev_t* d = g_irq_dev;
     if (d) {
         if (d->irq_ack) d->irq_ack(d);
@@ -157,14 +154,15 @@ int net_ping_rtt(uint32_t dst_ip, uint16_t seq, uint64_t* rtt_tsc) {
         if (arp_lookup(dst_ip, mac) != 0) return -1;
     }
     uint32_t before = icmp_echo_replies();
-    uint64_t deadline = timer_get_ticks() + 1000;        // 1 s safety timeout
+    uint64_t deadline = timer_get_ticks() + 2000;        // 2 s safety timeout
     uint64_t t0 = rdtsc();
     icmp_send_echo(d, dst_ip, 0x1234, seq);
-    // Busy-drain the NIC ring: on real HW the reply DMAs in asynchronously, so we
-    // catch it within microseconds (no 1 ms tick quantization). Timer IRQs still
-    // advance timer_get_ticks() for the deadline (we never cli).
+    // Wait via hlt: the reply is drained by the MSI-X interrupt (net_irq_handler)
+    // or the timer-tick poll, both of which bump icmp_echo_replies(). hlt yields
+    // the CPU so the host/NIC delivers the RX DMA — no tight RDT hammering (which
+    // could wedge the ring during the longer wait for an off-subnet reply).
     while (icmp_echo_replies() == before) {
-        if (d->poll) d->poll(d);
+        __asm__ volatile("sti; hlt");
         if (timer_get_ticks() >= deadline) return -1;
     }
     if (rtt_tsc) *rtt_tsc = rdtsc() - t0;
