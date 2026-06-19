@@ -145,6 +145,7 @@ static void sh_uname(const char* a);
 static void sh_netinfo(const char* a); static void sh_ping(const char* a);   // [M24]
 static void sh_dhcp(const char* a); static void sh_nslookup(const char* a);  // [M24]
 static void sh_udpsend(const char* a); static void sh_tcptest(const char* a);// [M24]
+static void sh_nettest(const char* a);                                       // [M24]
 const char* shell_get_cwd(void);   // [M23] current VFS working directory (for the prompt)
 static void sh_run(const char* a);
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
@@ -242,6 +243,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"nslookup",  sh_nslookup},
     {"udpsend",   sh_udpsend},
     {"tcptest",   sh_tcptest},
+    {"nettest",   sh_nettest},
     {"run",       sh_run},
     {"drvreg",    sh_drvreg},
     {"drvunreg",  sh_drvunreg},
@@ -1052,15 +1054,47 @@ static void sh_ping(const char* a){
     net_dev_t* d = net_primary();
     if(!d){ terminal_writestring("ping: no NIC\n"); return; }
     uint32_t ip = d->gateway;   // default: gateway
-    if(*a){   // parse a.b.c.d -> network byte order
+    if(*a && *a>='0' && *a<='9'){   // parse a.b.c.d -> network byte order
         uint32_t parts[4]={0,0,0,0}; int pi=0;
         while(*a && pi<4){ uint32_t v=0; while(*a>='0'&&*a<='9'){ v=v*10+(*a-'0'); a++; } parts[pi++]=v&0xFF; if(*a=='.') a++; }
         ip = parts[0] | (parts[1]<<8) | (parts[2]<<16) | (parts[3]<<24);
     }
-    terminal_writestring("PING "); print_ip(ip); terminal_writestring(" ...\n");
-    int r = net_ping_test(ip);
-    if(r==0){ terminal_writestring("reply from "); print_ip(ip); terminal_writestring(": ok\n"); }
-    else     terminal_writestring("no reply (timeout / ARP failed)\n");
+    // Optional count after the IP (default 4). "ping <ip> <count>".
+    while(*a==' ') a++;
+    int count=4; if(*a>='0'&&*a<='9'){ count=0; while(*a>='0'&&*a<='9'){ count=count*10+(*a-'0'); a++; } }
+    if(count<1) count=1; if(count>100) count=100;
+
+    terminal_writestring("PING "); print_ip(ip); terminal_writestring("  ("); print_dec((uint32_t)count); terminal_writestring(" packets)\n");
+    uint64_t tpu = net_tsc_per_us();                 // cycles per microsecond
+    uint64_t mn=~0ULL, mx=0, sum=0; int got=0;
+    for(int i=0;i<count;i++){
+        uint64_t rtt=0;
+        if(net_ping_rtt(ip, (uint16_t)(i+1), &rtt)==0){
+            uint64_t us = rtt / tpu;                  // cycles -> microseconds
+            got++; sum+=us; if(us<mn) mn=us; if(us>mx) mx=us;
+            terminal_writestring("  reply seq="); print_dec((uint32_t)(i+1));
+            terminal_writestring(" time="); print_dec((uint32_t)(us/1000)); terminal_writestring(".");
+            uint32_t frac=(uint32_t)(us%1000); // 3-digit ms fraction
+            if(frac<100) terminal_writestring("0"); if(frac<10) terminal_writestring("0");
+            print_dec(frac); terminal_writestring(" ms\n");
+        } else {
+            terminal_writestring("  seq="); print_dec((uint32_t)(i+1)); terminal_writestring(" timeout\n");
+        }
+    }
+    terminal_writestring("--- "); print_ip(ip); terminal_writestring(" statistics ---\n");
+    terminal_writestring("  "); print_dec((uint32_t)count); terminal_writestring(" sent, ");
+    print_dec((uint32_t)got); terminal_writestring(" received, ");
+    print_dec((uint32_t)(count-got)); terminal_writestring(" lost\n");
+    if(got){
+        uint64_t avg=sum/got;
+        terminal_writestring("  rtt min/avg/max = ");
+        print_dec((uint32_t)(mn/1000)); terminal_writestring("."); { uint32_t f=(uint32_t)(mn%1000); if(f<100)terminal_writestring("0"); if(f<10)terminal_writestring("0"); print_dec(f); }
+        terminal_writestring(" / ");
+        print_dec((uint32_t)(avg/1000)); terminal_writestring("."); { uint32_t f=(uint32_t)(avg%1000); if(f<100)terminal_writestring("0"); if(f<10)terminal_writestring("0"); print_dec(f); }
+        terminal_writestring(" / ");
+        print_dec((uint32_t)(mx/1000)); terminal_writestring("."); { uint32_t f=(uint32_t)(mx%1000); if(f<100)terminal_writestring("0"); if(f<10)terminal_writestring("0"); print_dec(f); }
+        terminal_writestring(" ms\n");
+    }
 }
 // Parse "a.b.c.d" -> network-order uint32 (octet0 at LSB). Returns 0 on parse.
 static int parse_ip(const char* a, uint32_t* out){
@@ -1139,6 +1173,55 @@ static void sh_tcptest(const char* a){
     }
     terminal_writestring("\ntcptest: received "); print_dec((uint32_t)total); terminal_writestring(" bytes\n");
     tcp_close(c);
+}
+// nettest <ip> <port> [path] — TCP throughput: GET a (large) resource, drain ALL
+// of it to EOF without printing the body, and report bytes / time / KB-s. Serve a
+// big file on the host, e.g. `python3 -m http.server`, then `nettest <host> 8000 /big.bin`.
+static void sh_nettest(const char* a){
+    while(*a==' ') a++;
+    uint32_t ip; if(parse_ip(a,&ip)!=0){ terminal_writestring("Usage: nettest <ip> <port> [path]\n"); return; }
+    while(*a && *a!=' ') a++; while(*a==' ') a++;
+    uint32_t port=0; while(*a>='0'&&*a<='9'){ port=port*10+(*a-'0'); a++; }
+    if(port==0) port=80;
+    while(*a==' ') a++;
+    const char* path = *a ? a : "/";
+    net_dev_t* d = net_primary();
+    if(!d){ terminal_writestring("nettest: no NIC\n"); return; }
+    extern uint64_t timer_get_ticks(void);
+
+    terminal_writestring("nettest: GET "); terminal_writestring(path);
+    terminal_writestring(" from "); print_ip(ip); terminal_writestring("\n");
+    tcp_conn_t* c = tcp_connect(d, ip, (uint16_t)port);
+    if(!c){ terminal_writestring("nettest: connect failed\n"); return; }
+    static char req[256]; int rl=0;
+    const char* g="GET ";
+    for(const char* p=g; *p; p++) req[rl++]=*p;
+    for(const char* p=path; *p && rl<180; p++) req[rl++]=*p;
+    const char* h=" HTTP/1.0\r\nHost: secos\r\nConnection: close\r\n\r\n";
+    for(const char* p=h; *p; p++) req[rl++]=*p;
+
+    uint64_t t0 = timer_get_ticks();
+    tcp_send_all(c, req, (uint32_t)rl);
+    static char buf[2048];
+    uint64_t total=0;
+    for(;;){
+        int n = tcp_recv_block(c, buf, sizeof(buf), 5000);   // 5 s idle timeout
+        if(n<=0) break;
+        total += (uint64_t)n;
+    }
+    uint64_t ms = timer_get_ticks() - t0;                    // ~ms at 1 kHz
+    tcp_close(c);
+
+    terminal_writestring("nettest: "); print_dec((uint32_t)total); terminal_writestring(" bytes in ");
+    print_dec((uint32_t)ms); terminal_writestring(" ms");
+    if(ms>0){
+        // KB/s = bytes/1024 / (ms/1000) = bytes*1000 / (ms*1024)
+        uint64_t kbs = (total*1000ULL) / (ms*1024ULL);
+        uint64_t mbits = (total*8ULL) / (ms*125ULL);         // megabit/s = bytes*8 / (ms*1000) *1000 ... = bytes*8/(ms*125)
+        terminal_writestring(" -> "); print_dec((uint32_t)kbs); terminal_writestring(" KB/s (~");
+        print_dec((uint32_t)mbits); terminal_writestring(" Mbit/s)");
+    }
+    terminal_writestring("\n");
 }
 // =========================================================================
 

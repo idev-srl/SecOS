@@ -119,6 +119,58 @@ uint16_t net_checksum(const void* data, uint32_t len) {
     return (uint16_t)(~sum & 0xFFFF);
 }
 
+// [M24] ---- performance / latency helpers ----
+static inline uint64_t rdtsc(void){
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// Calibrate the TSC against the 1 kHz PIT once: count cycles over 100 ms.
+uint64_t net_tsc_per_us(void) {
+    static uint64_t cached;
+    if (cached) return cached;
+    extern uint64_t timer_get_ticks(void);
+    uint64_t t = timer_get_ticks();
+    while (timer_get_ticks() == t) __asm__ volatile("sti; hlt");  // align to a tick edge
+    uint64_t start_tick = timer_get_ticks();
+    uint64_t start_tsc = rdtsc();
+    while (timer_get_ticks() < start_tick + 100) __asm__ volatile("sti; hlt"); // 100 ms
+    uint64_t cyc = rdtsc() - start_tsc;
+    cached = cyc / 100000;                       // cycles per us (100 ms = 100000 us)
+    if (!cached) cached = 1;
+    return cached;
+}
+
+int net_ping_rtt(uint32_t dst_ip, uint16_t seq, uint64_t* rtt_tsc) {
+    net_dev_t* d = net_primary();
+    if (!d) return -1;
+    extern uint64_t timer_get_ticks(void);
+    uint8_t mac[6];
+    __asm__ volatile("sti");
+    // Resolve ARP first (not part of the timed window).
+    if (arp_lookup(dst_ip, mac) != 0) {
+        arp_request(d, dst_ip);
+        uint64_t adl = timer_get_ticks() + 1000;
+        while (timer_get_ticks() < adl && arp_lookup(dst_ip, mac) != 0)
+            __asm__ volatile("sti; hlt");
+        if (arp_lookup(dst_ip, mac) != 0) return -1;
+    }
+    uint32_t before = icmp_echo_replies();
+    uint64_t deadline = timer_get_ticks() + 1000;        // 1 s safety timeout
+    uint64_t t0 = rdtsc();
+    icmp_send_echo(d, dst_ip, 0x1234, seq);
+    // Busy-drain the NIC ring: on real HW the reply DMAs in asynchronously, so we
+    // catch it within microseconds (no 1 ms tick quantization). Timer IRQs still
+    // advance timer_get_ticks() for the deadline (we never cli).
+    while (icmp_echo_replies() == before) {
+        if (d->poll) d->poll(d);
+        if (timer_get_ticks() >= deadline) return -1;
+    }
+    if (rtt_tsc) *rtt_tsc = rdtsc() - t0;
+    return 0;
+}
+
 int net_init(void) {
     extern int e1000_init(void);
     extern int e1000e_init(void);

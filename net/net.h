@@ -66,6 +66,13 @@ int net_init(void);
  * -1 on ARP/echo timeout. (Result also mirrored to debugcon.) */
 int net_ping_test(uint32_t dst_ip);
 
+/* [M24] Performance helpers. TSC-calibrated RTT for latency tests. */
+uint64_t net_tsc_per_us(void);     /* CPU cycles per microsecond (calibrated once) */
+/* One echo round-trip with TSC timing. ARP is resolved first (not timed). RX is
+ * busy-polled from the NIC ring (accurate on real HW where DMA lands async).
+ * Returns 0 + *rtt_tsc on reply, -1 on timeout. */
+int net_ping_rtt(uint32_t dst_ip, uint16_t seq, uint64_t* rtt_tsc);
+
 /* Called from the timer tick (drives polled NICs + protocol timers like ARP/TCP
  * retransmit). Cheap no-op when networking is absent. */
 void net_tick(void);
