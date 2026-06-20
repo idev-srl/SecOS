@@ -335,7 +335,16 @@ static void sh_pager(const char* a){
     terminal_writestring("Usage: pager [on|off|lines <n>]\n");
 }
 
-static void cmd_clear(void) { terminal_initialize(); }
+static void cmd_clear(void) {
+    terminal_initialize();
+    // terminal_initialize -> fb_console_init drops the double buffer; without it
+    // the console renders direct to VRAM and scrolling READS VRAM (slow even with
+    // WC). Re-enable the dbuf + auto-flush + Write-Combining, as the boot path does.
+    extern int fb_console_enable_dbuf(void); extern void fb_console_set_dbuf_auto(int);
+    extern void fb_apply_wc(void);
+    if (fb_console_enable_dbuf() == 0) fb_console_set_dbuf_auto(1);
+    fb_apply_wc();
+}
 
 static void cmd_echo(const char* args) { if (*args) terminal_writestring(args); terminal_writestring("\n"); }
 

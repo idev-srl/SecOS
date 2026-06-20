@@ -170,7 +170,12 @@ int fb_console_init(void){
         info.virt_addr = tentative;
     }
     fb_width = info.width; fb_height = info.height; fb_pitch = info.pitch; fb_phys_addr = (info.virt_addr ? info.virt_addr : info.addr);
-    fb_enabled = 1; fb_clear(0x000000); cursor_x=0; cursor_y=0; dbuf_enabled=0; dbuf=NULL;
+    fb_enabled = 1; fb_clear(0x000000); cursor_x=0; cursor_y=0;
+    // Drop the double buffer (a re-init may change geometry). Free it first — the
+    // caller (boot / clear) re-enables it; otherwise the console falls back to slow
+    // direct-VRAM rendering (scroll reads VRAM). Previously this leaked dbuf.
+    if(dbuf){ extern void kfree(void* p); kfree(dbuf); }
+    dbuf=NULL; dbuf_enabled=0;
     // Draw SecOS logo on top-right
     extern void fb_console_draw_logo(void); fb_console_draw_logo();
     // Set a more legible default color (white on black)
