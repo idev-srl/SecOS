@@ -89,7 +89,8 @@ static uint32_t atoi(const char* str) {
     return result;
 }
 // Forward declarations of missing commands (ported from previous version)
-static void cmd_help(void);
+static void shell_print_help_compact(void); // forward
+static void shell_print_help_long(void);    // forward
 static void cmd_clear(void);
 static void sh_help(const char* a); // forward wrapper
 static void sh_clear(const char* a); // forward wrapper
@@ -159,7 +160,9 @@ static void sh_date(const char* a);
 
 // Command dispatcher types
 typedef void (*shell_handler_t)(const char* args);
-struct shell_cmd { const char* name; shell_handler_t handler; };
+// [M31] desc != NULL → user-facing (shown in `help`); NULL → hidden dev/legacy
+// command (still callable, e.g. from init.rc / selftests, just not advertised).
+struct shell_cmd { const char* name; shell_handler_t handler; const char* desc; };
 
 // Pager subsystem (generic)
 static int pager_enabled = 1;           // enabled by default
@@ -178,113 +181,130 @@ static void pager_prompt_more(void){
 }
 static void pager_print(const char* line){ if(pager_quit) return; terminal_writestring(line); terminal_writestring("\n"); if(--pager_line_budget <=0 && pager_enabled) pager_prompt_more(); }
 static void pager_end(void){ (void)0; }
-static void shell_print_help_paged(void); // forward after generic pager
 
 static const struct shell_cmd shell_cmds[] = {
-    {"help",      sh_help},
-    {"clear",     sh_clear},
-    {"echo",      sh_echo},
-    {"info",      sh_info},
-    {"uptime",    sh_uptime},
-    {"sleep",     sh_sleep},
-    {"mem",       sh_mem},
-    {"memtest",   sh_memtest},
-    {"memstress", sh_memstress},
-    {"usertest",  sh_usertest},
-    {"elfload",   sh_elfload},
-    {"elfload2",  sh_elfload2},
-    {"elfunload", sh_elfunload},
-    {"kill",      sh_kill},
-    {"pinfo",     sh_pinfo},
-    {"ps",        sh_ps},
-    {"crash",     sh_crash},
-    {"colors",    sh_colors},
-    {"fbinfo",    sh_fbinfo},
-    {"color",     sh_color},
-    {"cursor",    sh_cursor},
-    {"dbuf",      sh_dbuf},
-    {"logo",      sh_logo},
-    {"rfls",      sh_rfls},
-    {"rfcat",     sh_rfcat},
-    {"rfinfo",    sh_rfinfo},
-    {"rfadd",     sh_rfadd},
-    {"rfwrite",   sh_rfwrite},
-    {"rfdel",     sh_rfdel},
-    {"rfmkdir",   sh_rfmkdir},
-    {"rfrmdir",   sh_rfrmdir},
-    {"rfcd",      sh_rfcd},
-    {"rfpwd",     sh_rfpwd},
-    {"rftree",    sh_rftree},
-    {"rfusage",   sh_rfusage},
-    {"rfmv",      sh_rfmv},
-    {"rftruncate", sh_rftruncate},
-    {"vls",       sh_vls},
-    {"vcat",      sh_vcat},
-    {"vinfo",     sh_vinfo},
-    {"vpwd",      sh_vpwd},
-    {"vmount",    sh_vmount},
-    {"vcreate",   sh_vcreate},
-    {"vwrite",    sh_vwrite},
-    {"vtruncate", sh_vtruncate2},
-    {"ext2mount", sh_ext2mount},
-    {"blk",       sh_blk},
-    {"mountdev",  sh_mountdev},
-    // [M23] POSIX-style commands over the VFS
-    {"cd",        sh_cd},
-    {"pwd",       sh_pwd},
-    {"ls",        sh_ls},
-    {"cat",       sh_cat},
-    {"touch",     sh_touch},
-    {"mkdir",     sh_mkdir},
-    {"rm",        sh_rm},
-    {"df",        sh_df},
-    {"free",      sh_free},
-    {"uname",     sh_uname},
-    {"netinfo",   sh_netinfo},
-    {"ping",      sh_ping},
-    {"dhcp",      sh_dhcp},
-    {"nslookup",  sh_nslookup},
-    {"udpsend",   sh_udpsend},
-    {"tcptest",   sh_tcptest},
-    {"nettest",   sh_nettest},
-    {"run",       sh_run},
-    {"stress",    sh_stress},
-    {"pkg",       sh_pkg},
-    {"verbose",   sh_verbose},
-    {"drvreg",    sh_drvreg},
-    {"drvunreg",  sh_drvunreg},
-    {"drvlog",    sh_drvlog},
-    {"drvinfo",   sh_drvinfo},
-    {"drvtest",   sh_drvtest},
-    {"fontdump",  sh_fontdump},
-    {"halt",      sh_halt},
-    {"reboot",    sh_reboot},
-    {"pager",    sh_pager},
+    // --- user-facing (shown in `help`) ---
+    {"help",      sh_help,      "list commands (help -l for descriptions)"},
+    {"clear",     sh_clear,     "clear the screen"},
+    {"echo",      sh_echo,      "print arguments"},
+    {"ls",        sh_ls,        "list a directory"},
+    {"cd",        sh_cd,        "change directory"},
+    {"pwd",       sh_pwd,       "print working directory"},
+    {"cat",       sh_cat,       "print a file"},
+    {"touch",     sh_touch,     "create an empty file"},
+    {"mkdir",     sh_mkdir,     "make a directory"},
+    {"rm",        sh_rm,        "remove a file"},
+    {"df",        sh_df,        "filesystem usage"},
+    {"free",      sh_free,      "memory usage"},
+    {"mem",       sh_mem,       "memory info"},
+    {"ps",        sh_ps,        "list processes"},
+    {"pinfo",     sh_pinfo,     "process details"},
+    {"kill",      sh_kill,      "kill a process"},
+    {"run",       sh_run,       "run a signed program"},
+    {"pkg",       sh_pkg,       "install a signed package (.spkg)"},
+    {"stress",    sh_stress,    "CPU stress test (SMP)"},
+    {"uptime",    sh_uptime,    "time since boot"},
+    {"sleep",     sh_sleep,     "sleep N seconds"},
+    {"uname",     sh_uname,     "system name + build"},
+    {"verbose",   sh_verbose,   "toggle kernel debug logs"},
+    {"info",      sh_info,      "system information"},
+    {"blk",       sh_blk,       "list block devices"},
+    {"mountdev",  sh_mountdev,  "mount a block device"},
+    {"netinfo",   sh_netinfo,   "network status"},
+    {"ping",      sh_ping,      "ping a host"},
+    {"dhcp",      sh_dhcp,      "acquire an IP via DHCP"},
+    {"nslookup",  sh_nslookup,  "resolve a hostname"},
+    {"nettest",   sh_nettest,   "TCP throughput test"},
+    {"halt",      sh_halt,      "halt the system"},
+    {"reboot",    sh_reboot,    "reboot the system"},
 #if ENABLE_RTC
-    {"date",      sh_date},
+    {"date",      sh_date,      "current date/time"},
 #endif
+    // --- hidden dev/legacy (callable, not listed; desc = NULL) ---
+    {"memtest",   sh_memtest,   0},
+    {"memstress", sh_memstress, 0},
+    {"usertest",  sh_usertest,  0},
+    {"elfload",   sh_elfload,   0},
+    {"elfload2",  sh_elfload2,  0},
+    {"elfunload", sh_elfunload, 0},
+    {"crash",     sh_crash,     0},
+    {"colors",    sh_colors,    0},
+    {"fbinfo",    sh_fbinfo,    0},
+    {"color",     sh_color,     0},
+    {"cursor",    sh_cursor,    0},
+    {"dbuf",      sh_dbuf,      0},
+    {"logo",      sh_logo,      0},
+    {"fontdump",  sh_fontdump,  0},
+    {"pager",     sh_pager,     0},
+    {"rfls",      sh_rfls,      0},
+    {"rfcat",     sh_rfcat,     0},
+    {"rfinfo",    sh_rfinfo,    0},
+    {"rfadd",     sh_rfadd,     0},
+    {"rfwrite",   sh_rfwrite,   0},
+    {"rfdel",     sh_rfdel,     0},
+    {"rfmkdir",   sh_rfmkdir,   0},
+    {"rfrmdir",   sh_rfrmdir,   0},
+    {"rfcd",      sh_rfcd,      0},
+    {"rfpwd",     sh_rfpwd,     0},
+    {"rftree",    sh_rftree,    0},
+    {"rfusage",   sh_rfusage,   0},
+    {"rfmv",      sh_rfmv,      0},
+    {"rftruncate", sh_rftruncate, 0},
+    {"vls",       sh_vls,       0},
+    {"vcat",      sh_vcat,      0},
+    {"vinfo",     sh_vinfo,     0},
+    {"vpwd",      sh_vpwd,      0},
+    {"vmount",    sh_vmount,    0},
+    {"vcreate",   sh_vcreate,   0},
+    {"vwrite",    sh_vwrite,    0},
+    {"vtruncate", sh_vtruncate2, 0},
+    {"ext2mount", sh_ext2mount, 0},
+    {"udpsend",   sh_udpsend,   0},
+    {"tcptest",   sh_tcptest,   0},
+    {"drvreg",    sh_drvreg,    0},
+    {"drvunreg",  sh_drvunreg,  0},
+    {"drvlog",    sh_drvlog,    0},
+    {"drvinfo",   sh_drvinfo,   0},
+    {"drvtest",   sh_drvtest,   0},
 };
 
-static void cmd_help(void) { shell_print_help_paged(); }
-
-static void shell_print_help_paged(void){
+// [M31] Compact `help`: user-facing command names laid out in columns.
+static void shell_print_help_compact(void){
     pager_begin();
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    pager_print("");
-    pager_print("Available commands:");
+    pager_print("Commands (run a program by name, or 'help -l' for descriptions):");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-    for (unsigned i=0;i<sizeof(shell_cmds)/sizeof(shell_cmds[0]); i++) { if(pager_should_stop()) break; char namebuf[64]; int k=0; namebuf[k++]=' '; namebuf[k++]=' '; const char* n=shell_cmds[i].name; while(*n && k < (int)sizeof(namebuf)-1) namebuf[k++]=*n++; namebuf[k]=0; pager_print(namebuf); }
-    if(!pager_should_stop()){
-        pager_print("");
-        pager_print("Files (POSIX): ls cd pwd cat touch mkdir rm  (work on /, /mnt, /dev, /proc, /sys)");
-        pager_print("System: uname free df mem uptime ps pinfo info clear echo sleep halt reboot");
-        pager_print("Storage: blk mountdev df  |  Run signed ELF: run <path> [args]");
-        pager_print("Drivers: drvinfo drvreg drvunreg drvlog drvtest");
-        pager_print("Legacy VFS:   vls vcat vinfo vcreate vwrite vtruncate vmount");
-        pager_print("Legacy RAMFS: rfls rfcat rfinfo rfadd rfwrite rfdel rfmkdir rfrmdir rfcd rfpwd rftree rfusage rfmv rftruncate");
-        pager_print("Other: elfload elfload2 elfunload kill ext2mount usertest colors color fbinfo fontdump logo crash date");
-        pager_print("");
-        pager_print("Use 'pager off' to disable paging or 'pager lines N' to change page size.");
+    char line[128]; int pos=0, col=0;
+    for (unsigned i=0;i<sizeof(shell_cmds)/sizeof(shell_cmds[0]); i++) {
+        if(!shell_cmds[i].desc) continue;          // hidden command
+        if(pager_should_stop()) break;
+        const char* n=shell_cmds[i].name; int k=0;
+        while(n[k] && pos<(int)sizeof(line)-2){ line[pos++]=n[k++]; }
+        while(k<15 && pos<(int)sizeof(line)-2){ line[pos++]=' '; k++; } // pad to a column
+        if(++col>=5){ line[pos]=0; pager_print(line); pos=0; col=0; }
+    }
+    if(col>0 && !pager_should_stop()){ line[pos]=0; pager_print(line); }
+    pager_end();
+    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
+}
+
+// [M31] `help -l`: one command per line with a short description.
+static void shell_print_help_long(void){
+    pager_begin();
+    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+    pager_print("Commands:");
+    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
+    char line[128];
+    for (unsigned i=0;i<sizeof(shell_cmds)/sizeof(shell_cmds[0]); i++) {
+        if(!shell_cmds[i].desc) continue;
+        if(pager_should_stop()) break;
+        int pos=0; line[pos++]=' '; line[pos++]=' ';
+        const char* n=shell_cmds[i].name; int k=0;
+        while(n[k] && pos<(int)sizeof(line)-1){ line[pos++]=n[k++]; }
+        while(k<11 && pos<(int)sizeof(line)-1){ line[pos++]=' '; k++; }
+        const char* d=shell_cmds[i].desc;
+        while(*d && pos<(int)sizeof(line)-1){ line[pos++]=*d++; }
+        line[pos]=0; pager_print(line);
     }
     pager_end();
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
@@ -640,7 +660,11 @@ void shell_run(void) {
 // --- Table-driven dispatcher ---
 
 // Wrappers to adapt existing functions that do not take args or have different signatures
-static void sh_help(const char* a){ (void)a; cmd_help(); }
+static void sh_help(const char* a){
+    while(*a==' ') a++;
+    if(a[0]=='-' && a[1]=='l') shell_print_help_long();
+    else shell_print_help_compact();
+}
 static void sh_clear(const char* a){ (void)a; cmd_clear(); }
 static void sh_info(const char* a){ (void)a; cmd_info(); }
 static void sh_uptime(const char* a){ (void)a; cmd_uptime(); }

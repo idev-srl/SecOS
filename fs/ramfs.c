@@ -211,7 +211,7 @@ int ramfs_init(void){ if(ramfs_inited) return 0; ramfs_inited=1; // sample immut
     // Syscalls listing (placeholder)
     static const char syscalls_txt[] = "0 exit\n1 write\n2 read\n3 sleep\n"; ramfs_mkdir("sys"); ramfs_add_static("sys/syscalls.txt", syscalls_txt, sizeof(syscalls_txt)-1);
     // Init script: each line a shell command
-    static const char init_rc_txt[] = "# init.rc SecOS\ncolor light_gray black\nrfusage\nrftree\nrfcat sys/manifest.txt\n"; ramfs_add_static("init.rc", init_rc_txt, sizeof(init_rc_txt)-1);
+    static const char init_rc_txt[] = "# SecOS init.rc - shell commands here run at boot (quiet by default)\n"; ramfs_add_static("init.rc", init_rc_txt, sizeof(init_rc_txt)-1);
     // Dynamic manifest: list initial entries (after base creation) under sys/manifest.txt
     {
         static char manifest_buf[4096]; size_t mp=0;
