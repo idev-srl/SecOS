@@ -86,24 +86,8 @@ void* sbrk(long incr){
     return (void*)old;
 }
 
-/* Minimal first-fit malloc on sbrk. Block header carries size + free flag; the
- * free list is singly linked. No coalescing/splitting yet — enough for ports to
- * allocate, and the free list proves reuse. */
-typedef struct mblock { size_t size; struct mblock* next; int is_free; } mblock_t;
-static mblock_t* g_heap = 0;
-
-void* malloc(size_t size){
-    if (!size) return 0;
-    size = (size + 7UL) & ~7UL;                      /* 8-byte align */
-    mblock_t* prev = 0; mblock_t* b = g_heap;
-    while (b) { if (b->is_free && b->size >= size) { b->is_free = 0; return (void*)(b + 1); } prev = b; b = b->next; }
-    mblock_t* nb = (mblock_t*)sbrk((long)(sizeof(mblock_t) + size));
-    if ((long)nb == -1L) return 0;
-    nb->size = size; nb->is_free = 0; nb->next = 0;
-    if (prev) prev->next = nb; else g_heap = nb;
-    return (void*)(nb + 1);
-}
-void free(void* p){ if (!p) return; mblock_t* b = (mblock_t*)p - 1; b->is_free = 1; }
+/* malloc/free/calloc/realloc live in libc.c (the full C library) so realloc can
+ * read the block header. libc.o is linked into every user program. */
 
 /* [M19] copy-on-write fork: returns child pid in the parent, 0 in the child. */
 int fork(void){ return (int)secos_syscall(SYS_FORK, 0, 0, 0, 0, 0); }

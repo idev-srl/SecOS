@@ -987,6 +987,9 @@ static void m24_run_demo(void) {
 #if M10_RUN_DEMO
 #include "../crypto/user_hello_elf.h"
 #endif
+#if M31_LIBC_DEMO
+#include "../crypto/user_m31_libc_elf.h"
+#endif
 extern void shell_init(void);
 extern void shell_run(void);
 extern void shell_run_line(const char* line);
@@ -1024,6 +1027,18 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
                                         : "[M10] FAIL: tampered disk ELF accepted\n");
         }
         shell_run_line("run /mnt/hello.elf");
+    }
+#endif
+#if M31_LIBC_DEMO
+    // [M31] Run the signed libc test (printf/string/stdlib/ctype) in ring 3. Its
+    // stdout (fd 1) mirrors to debugcon, so the harness can assert on [m31] lines.
+    {
+        extern int vfs_create(const char*, const void*, size_t);
+        extern int vfs_remove(const char*);
+        vfs_remove("/bin/m31");
+        if (vfs_create("/bin/m31", user_m31_libc_elf, user_m31_libc_elf_len) == 0)
+            debugcon_writestring("[M31] wrote signed libc test to /bin/m31\n");
+        shell_run_line("run /bin/m31");
     }
 #endif
     shell_run();

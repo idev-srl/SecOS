@@ -626,6 +626,23 @@ grep -q "\[M8\] PMM stable across rounds: NO LEAK" "$M29LOG"; check "M29-3 no PM
 grep -q "\[M8\] DONE" "$M29LOG"; check "M29-3 multicore workload completes" $?
 ! grep -q "\[EXC\]" "$M29LOG"; check "no CPU exception ([EXC]) during M29 multicore run" $?
 
+# ---- M31: C library (printf/string/stdlib/ctype) in ring 3 ----
+M31LOG=/tmp/secos_selftest_m31.log
+echo "[selftest] Building M31 image (libc test)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA="-DM31_LIBC_DEMO=1" >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M31 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M31 (mb2, ${TIMEOUT}s)..."
+: > "$M31LOG"; set +e
+timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -boot d \
+    -debugcon file:"$M31LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
+set -e
+grep -q "\[m31\] DONE fails=0" "$M31LOG"; check "M31 libc: all printf/string/stdlib/ctype tests pass in ring 3" $?
+! grep -q "\[m31\] FAIL" "$M31LOG"; check "M31 libc: no failing test" $?
+! grep -q "\[EXC\]" "$M31LOG"; check "no CPU exception ([EXC]) during M31 libc run" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
