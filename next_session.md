@@ -20,11 +20,15 @@ and the M30 bullet in `CLAUDE.md`. Highlights:
   with no matching `sti` on the job-done path) → the shell froze at its
   keyboard `hlt` after the first foreground command. Fixed in `0aec6da`.
 
-_Last updated: **2026-06-20 — SecOS RUNS ON REAL HARDWARE** (ASUS E406S, via the
-GRUB ISO). Phases F–K + I done (kernel, process model, VM, storage+journaling, SMP,
-networking, real libc/coreutils, signed packages, init) + **M30 signals/job
-control**. Self-test 173/173 + M30. HEAD `3f776dd`+M30 commits on `main`. Read
-this + the M30 block above first._
+_Last updated: **2026-06-20 — M30 (signals + job control + pipelines) DONE,
+validated on VMware + real HW, pushed.** Phases F–K + I done (kernel, process
+model, VM, storage+journaling, SMP, networking, real libc/coreutils, signed
+packages, init) + **M30**. Self-test **179/179**. HEAD `8041267` on `main`,
+pushed to origin. Read the M30 block above first, then "NEXT SESSION TASK"._
+
+_Images on `C:\Users\Luigi\SecOS\` rebuilt at `git:0aec6da`: `secos-uefi.vmdk`
+(VMware) + `secos.iso` (real HW). Rebuild + recopy after changes; check the
+banner `git:<hash>`._
 _Actionable checklist: `TASKS.md`; long plan: `docs/ROADMAP_TO_COMPLETE_OS.md`;
 per-milestone: `docs/devlog/M28..M32.md`. Memories: `real-hardware-boot`,
 `user-tests-on-vmware`, `working-style-checkpoints`._
