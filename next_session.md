@@ -42,8 +42,11 @@ Images live in `C:\Users\Luigi\SecOS\` (`secos.iso` for real HW, `secos-uefi.vmd
 for VMware) — rebuild + recopy after changes; check the banner `git:<hash>`.
 
 ## ⚠️ TWO OPEN BUGS found by testing on real hardware (high-value to fix)
-1. **Custom UEFI loader triple-faults on real firmware.** ⏳ **FIX READY — needs
-   ASUS validation.** Found TWO root causes (see `docs/devlog/UEFI_REALHW.md`):
+1. **Custom UEFI loader triple-faults on real firmware.** ✅ **FIXED + VALIDATED ON
+   THE ASUS** (2026-06-20, `main` @ `48b7803`). The `secos-uefi.img` now boots
+   natively on the ASUS via UEFI. `reboot` also fixed (FADT reset reg / 0xCF9 /
+   triple fault — was 8042-only, hung on the laptop) and validated on the ASUS.
+   Found TWO root causes (see `docs/devlog/UEFI_REALHW.md`):
    (a) **the real killer** — `acpi.c:pv()` reads ACPI tables via the physmap for
    addresses > 512 MiB, but `vmm_init_physmap` sizes the physmap to *usable* RAM
    only, and firmware puts the tables in *reserved* memory above the usable top →
