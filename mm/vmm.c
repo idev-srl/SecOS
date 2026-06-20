@@ -82,6 +82,55 @@ void vmm_extend_physmap(uint64_t phys_end) {
     terminal_writestring("0x"); terminal_writestring(hex); terminal_writestring(" (fisico)\n");
 }
 
+// [FB-WC] Program PAT entry 1 (selected by a PTE's PWT bit) to Write-Combining so
+// the framebuffer can be mapped WC. On real hardware the firmware MTRRs typically
+// mark the VRAM region UC, making every pixel write a slow uncached bus access;
+// PAT-WC batches writes into burst transfers (what Linux's ioremap_wc/efifb does)
+// — a large console-rendering speedup. Other PAT entries keep their reset defaults
+// and nothing in the kernel maps with PWT, so re-defining slot 1 needs no full
+// cache-disable/WBINVD sequence. PAT is per-CPU; called on the BSP (the console
+// CPU). NOTE: an AP that renders would need this too.
+void vmm_pat_init(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x277));
+    lo = (lo & ~(0xFFu << 8)) | (0x01u << 8);   // PA1 (bits 8..15) = WC (0x01)
+    __asm__ volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(0x277));
+    uint64_t cr3; __asm__ volatile("mov %%cr3,%0":"=r"(cr3));
+    __asm__ volatile("mov %0,%%cr3"::"r"(cr3):"memory");   // flush so the new PAT meaning applies
+}
+
+// [FB-WC] Retag the physmap 2MB pages covering [phys, phys+size) as Write-Combining
+// (PAT slot 1: set PWT, clear PCD and the 2MB-page PAT bit). The framebuffer is its
+// own 2MB-aligned MMIO region, so neighbouring RAM is unaffected. Call vmm_pat_init
+// first.
+void vmm_set_physmap_wc(uint64_t phys, uint64_t size) {
+    if (!physmap_initialized || size == 0) return;
+    const uint64_t HUGE = 2ULL * 1024 * 1024;
+    uint64_t start = phys & ~(HUGE - 1);
+    uint64_t end   = (phys + size + HUGE - 1) & ~(HUGE - 1);
+    vmm_extend_physmap(end);
+    uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+    int pml4_i = (VMM_PHYSMAP_BASE >> 39) & 0x1FF;
+    int pdpt_i_start = (VMM_PHYSMAP_BASE >> 30) & 0x1FF;
+    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) return;
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[pml4_i] & ADDRESS_MASK);
+    for (uint64_t p = start; p < end; p += HUGE) {
+        int pdpt_i = pdpt_i_start + ((p >> 30) & 0x1FF);
+        if (pdpt_i >= 512 || !(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) continue;
+        uint64_t* pdt = (uint64_t*)phys_to_virt(pdpt[pdpt_i] & ADDRESS_MASK);
+        uint64_t virt = VMM_PHYSMAP_BASE + p;
+        int pdt_i = (virt >> 21) & 0x1FF;
+        if (!(pdt[pdt_i] & VMM_FLAG_PRESENT)) continue;
+        uint64_t e = pdt[pdt_i];
+        e |= VMM_FLAG_PWT;          // PWT=1
+        e &= ~VMM_FLAG_PCD;         // PCD=0
+        e &= ~(1ULL << 12);         // PAT bit (2MB page) = 0  -> PAT index 1 = WC
+        pdt[pdt_i] = e;
+        __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    }
+}
+
 // Zero out entire physical frame
 static void zero_frame(uint64_t phys) {
     uint8_t* p;

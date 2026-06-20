@@ -23,11 +23,20 @@ void fb_finalize_mapping(void) {
     if (!g_fb_ready) return;
     if (!g_fb_phys_only) return;
     // Ensure physmap covers the entire framebuffer
-    uint64_t fb_end = g_fb.addr + (uint64_t)g_fb.pitch * g_fb.height;
+    uint64_t fb_size = (uint64_t)g_fb.pitch * g_fb.height;
+    uint64_t fb_end = g_fb.addr + fb_size;
     vmm_extend_physmap(fb_end);
     // Assume physmap now covers the requested range
     g_fb.virt_addr = phys_to_virt(g_fb.addr);
     g_fb_phys_only = 0;
+    // [FB-WC] Map the framebuffer Write-Combining: on real hardware the firmware
+    // MTRRs mark VRAM uncached (UC), so every pixel write is a slow uncached bus
+    // access. WC (PAT) coalesces writes into bursts — large console speedup. Done
+    // after the physmap covers the FB so the 2MB pages exist to retag.
+    extern void vmm_pat_init(void);
+    extern void vmm_set_physmap_wc(uint64_t phys, uint64_t size);
+    vmm_pat_init();
+    vmm_set_physmap_wc(g_fb.addr, fb_size);
 }
 
 int fb_init(uint32_t mb2_info) {

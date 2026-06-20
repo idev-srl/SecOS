@@ -38,6 +38,8 @@ typedef struct vmm_space {
 // Initialize physmap for all physical memory (rounded up to 2MB boundary)
 void vmm_init_physmap(void);
 void vmm_extend_physmap(uint64_t phys_end); // extend physmap if needed (2MB granularity)
+void vmm_pat_init(void);                          // [FB-WC] program PAT slot 1 = Write-Combining
+void vmm_set_physmap_wc(uint64_t phys, uint64_t size); // [FB-WC] retag physmap range as WC
 
 // Helper conversions
 static inline uint64_t phys_to_virt(uint64_t phys) { return VMM_PHYSMAP_BASE + phys; }
