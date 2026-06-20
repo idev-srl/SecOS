@@ -24,3 +24,4 @@ user/*.o
 __pycache__/
 *.vmdk
 uefi_loader.elf
+user/*.spkg
