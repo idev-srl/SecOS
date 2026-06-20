@@ -93,6 +93,7 @@ void vmm_extend_physmap(uint64_t phys_end) {
 void vmm_pat_init(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x277));
+    if (((lo >> 8) & 0xFF) == 0x01) return;     // PA1 already WC — idempotent, cheap re-assert
     lo = (lo & ~(0xFFu << 8)) | (0x01u << 8);   // PA1 (bits 8..15) = WC (0x01)
     __asm__ volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(0x277));
     uint64_t cr3; __asm__ volatile("mov %%cr3,%0":"=r"(cr3));

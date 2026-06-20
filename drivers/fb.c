@@ -18,6 +18,7 @@ static int g_fb_ready = 0;
 static int g_fb_phys_only = 0; // set if high framebuffer physical address not yet virtually mapped
 // Forward declare phys_to_virt
 extern uint64_t phys_to_virt(uint64_t phys);
+void fb_apply_wc(void);   // forward: (re)apply framebuffer Write-Combining
 
 void fb_finalize_mapping(void) {
     if (!g_fb_ready) return;
@@ -29,14 +30,24 @@ void fb_finalize_mapping(void) {
     // Assume physmap now covers the requested range
     g_fb.virt_addr = phys_to_virt(g_fb.addr);
     g_fb_phys_only = 0;
-    // [FB-WC] Map the framebuffer Write-Combining: on real hardware the firmware
-    // MTRRs mark VRAM uncached (UC), so every pixel write is a slow uncached bus
-    // access. WC (PAT) coalesces writes into bursts — large console speedup. Done
-    // after the physmap covers the FB so the 2MB pages exist to retag.
+    // [FB-WC] Map the framebuffer Write-Combining (see fb_apply_wc).
+    fb_apply_wc();
+}
+
+// [FB-WC] (Re)apply Write-Combining to the framebuffer: on real hardware the
+// firmware MTRRs mark VRAM uncached (UC), so every pixel write is a slow uncached
+// bus access. WC (PAT) coalesces writes into bursts — a large console speedup.
+// Idempotent and cheap, so the shell re-asserts it before each command: something
+// in the firmware/platform (e.g. an SMI) can quietly reset the PAT MSR or the
+// page attribute back to UC after the first heavy render, which made the console
+// fast once and slow again afterwards. Re-asserting keeps it fast.
+void fb_apply_wc(void) {
+    if (!g_fb_ready || g_fb_phys_only || !g_fb.virt_addr) return;
+    uint64_t fb_size = (uint64_t)g_fb.pitch * g_fb.height;
     extern void vmm_pat_init(void);
     extern void vmm_set_physmap_wc(uint64_t phys, uint64_t size);
-    vmm_pat_init();
-    vmm_set_physmap_wc(g_fb.addr, fb_size);
+    vmm_pat_init();                            // re-assert PAT slot 1 = WC (no-op if already set)
+    vmm_set_physmap_wc(g_fb.addr, fb_size);    // re-assert the FB page attribute = WC
 }
 
 int fb_init(uint32_t mb2_info) {

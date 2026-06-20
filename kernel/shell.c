@@ -1858,6 +1858,7 @@ static void execute_command(char* line) {
     while(*line==' ') line++;
     if (!*line) return;
     keyboard_clear_break();   // fresh Ctrl-C state for this command (builtins poll it)
+    { extern void fb_apply_wc(void); fb_apply_wc(); }  // re-assert framebuffer WC (kept fast across commands)
 
     // [M30] Trailing '&' => run in the background. Strip it (and trailing space).
     int background=0;
