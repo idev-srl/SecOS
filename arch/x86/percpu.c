@@ -7,9 +7,17 @@
  */
 #include "percpu.h"
 #include "lapic.h"
+#include "spinlock.h"
 
 cpu_t g_cpus[SMP_MAX_CPUS];
 volatile uint32_t g_cpu_count = 0;
+
+// [M29] Serialize multi-call debug lines emitted concurrently from several cores
+// (e.g. switch_to's [SMP] marker) so they don't interleave character-by-character
+// on the shared debugcon port. Returns saved flags for the matching unlock.
+static spinlock_t dbg_lock = SPINLOCK_INIT;
+uint64_t debugcon_line_lock(void) { return spin_lock_irqsave(&dbg_lock); }
+void debugcon_line_unlock(uint64_t flags) { spin_unlock_irqrestore(&dbg_lock, flags); }
 
 cpu_t* cpu_by_index(uint32_t i) { return &g_cpus[i]; }
 uint32_t smp_cpu_count(void) { return g_cpu_count; }

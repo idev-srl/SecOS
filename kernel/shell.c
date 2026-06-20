@@ -148,6 +148,7 @@ static void sh_udpsend(const char* a); static void sh_tcptest(const char* a);// 
 static void sh_nettest(const char* a);                                       // [M24]
 const char* shell_get_cwd(void);   // [M23] current VFS working directory (for the prompt)
 static void sh_run(const char* a);
+static void sh_stress(const char* a);   // [M29] SMP CPU stress
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
 static void sh_drvtest(const char* a);
 #if ENABLE_RTC
@@ -245,6 +246,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"tcptest",   sh_tcptest},
     {"nettest",   sh_nettest},
     {"run",       sh_run},
+    {"stress",    sh_stress},
     {"drvreg",    sh_drvreg},
     {"drvunreg",  sh_drvunreg},
     {"drvlog",    sh_drvlog},
@@ -1233,6 +1235,37 @@ static void sh_nettest(const char* a){
 
 // [M10] run <path>: load+signature-verify a signed ELF from the VFS, spawn it
 // ring-3 and wait for it to exit. Works because the shell runs as the scheduler
+// [M29] stress: launch N CPU-bound ring-3 spinners at once to saturate the
+// vCPUs. Each process is pinned round-robin to an online CPU (cpu_affinity), so
+// the cores run them in parallel — watch the host CPU graph or the per-CPU
+// [SMP] cpu=<idx> run markers on debugcon. The embedded spinner is signed.
+static void sh_stress(const char* a){
+    #include "../crypto/user_spin_elf.h"
+    extern process_t* process_create_from_elf_args(const void*, size_t, int, const char* const*);
+    extern int sched_count_alive_user(void);
+    extern void sched_reap_zombies(void);
+    extern uint32_t smp_online_count(void);
+    while(*a==' ') a++;
+    int n=0; while(*a>='0'&&*a<='9'){ n=n*10+(*a-'0'); a++; }
+    if(n<=0) n = (int)smp_online_count() * 2;   // default: 2x the online cores
+    if(n<1) n=2; if(n>32) n=32;                 // bounded (proc table is 32)
+    const char* av[1] = {"spin"};
+    int base = sched_count_alive_user();
+    int spawned=0;
+    for(int i=0;i<n;i++){
+        process_t* p = process_create_from_elf_args(user_spin_elf, user_spin_elf_len, 1, av);
+        if(p) spawned++;
+    }
+    terminal_writestring("[stress] launched "); print_dec(spawned);
+    terminal_writestring(" spinners across "); print_dec((int)smp_online_count());
+    terminal_writestring(" cpu(s); waiting...\n");
+    // Wait until they all finish (we run as idle; the scheduler runs them on every
+    // core in parallel). Reap zombies so the proc table frees up.
+    while(sched_count_alive_user() > base){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
+    sched_reap_zombies();
+    terminal_writestring("[stress] all "); print_dec(spawned); terminal_writestring(" done\n");
+}
+
 // idle task: the timer preempts us into the spawned process; SYS_EXIT returns
 // here. An unsigned/tampered/missing ELF is refused by the loader gate.
 static void sh_run(const char* a){

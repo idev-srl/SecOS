@@ -189,6 +189,7 @@ user-progs:
 	$(CC) $(USER_CFLAGS) -c user/note_maxmem.S -o user/note_maxmem.o
 	$(CC) $(USER_CFLAGS) -c user/ipc_send.c   -o user/ipc_send.o
 	$(CC) $(USER_CFLAGS) -c user/ipc_recv.c   -o user/ipc_recv.o
+	$(CC) $(USER_CFLAGS) -c user/spin.c       -o user/spin.o
 	$(LD) --gc-sections -T user/user.ld -o user/hello.elf user/crt0.o user/note.o user/libsecos.o user/hello.o
 	python3 tools/secos-sign user/hello.elf --dev
 	python3 tools/elf2h.py user/hello.elf user_hello_elf crypto/user_hello_elf.h
@@ -207,6 +208,10 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/ipc_recv.elf user/crt0.o user/note.o user/libsecos.o user/ipc_recv.o
 	python3 tools/secos-sign user/ipc_recv.elf --dev
 	python3 tools/elf2h.py user/ipc_recv.elf user_ipc_recv_elf crypto/user_ipc_recv_elf.h
+	# [M29] CPU stress spinner for SMP validation (shell `stress`)
+	$(LD) --gc-sections -T user/user.ld -o user/spin.elf user/crt0.o user/note.o user/libsecos.o user/spin.o
+	python3 tools/secos-sign user/spin.elf --dev
+	python3 tools/elf2h.py user/spin.elf user_spin_elf crypto/user_spin_elf.h
 	# [M13] max_mem-limited build of hello (manifest limit too small -> refused at load)
 	$(LD) --gc-sections -T user/user.ld -o user/maxmem.elf user/crt0.o user/note_maxmem.o user/libsecos.o user/hello.o
 	python3 tools/secos-sign user/maxmem.elf --dev

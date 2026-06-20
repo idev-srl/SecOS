@@ -73,9 +73,11 @@ static void switch_to(process_t* next) {
     // multicore scheduling. (idle tasks have pid 0 and never log here.)
     { cpu_t* cpu = this_cpu();
       if (cpu->index != 0 && next->pid != 0) {
+        uint64_t df = debugcon_line_lock();   // keep the line atomic across cores
         debugcon_writestring("[SMP] cpu="); debugcon_print_hex(cpu->index);
         debugcon_writestring(" run pid="); debugcon_print_hex(next->pid);
         debugcon_writestring("\n");
+        debugcon_line_unlock(df);
       } }
     vmm_switch_space(next->space);
     tss_set_kernel_stack(next->kstack_top);

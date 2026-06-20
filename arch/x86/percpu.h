@@ -46,4 +46,8 @@ int smp_register_cpu(uint32_t lapic_id);
  * without disturbing the scheduler state already stored in it. */
 void smp_set_bsp_lapic_id(uint32_t lapic_id);
 
+/* Make a multi-call debugcon line atomic across cores (wrap the calls). */
+uint64_t debugcon_line_lock(void);
+void debugcon_line_unlock(uint64_t flags);
+
 #endif /* PERCPU_H */
