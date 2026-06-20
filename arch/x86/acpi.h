@@ -35,6 +35,12 @@ typedef struct {
     uint16_t slp_typa;    /* SLP_TYPa value for S5 (soft-off)         */
     uint16_t slp_typb;    /* SLP_TYPb value for S5                    */
     int      s5_ok;       /* 1 if PM1a_CNT + _S5 were parsed          */
+    /* FADT reset register (for ACPI reboot — the only method that works on many
+     * modern UEFI laptops, where the legacy 8042 reset line is not wired). */
+    uint8_t  reset_supported; /* FADT flags bit10 set + reg present       */
+    uint8_t  reset_space;     /* GAS AddressSpaceId: 0=SystemMem, 1=SystemIO */
+    uint8_t  reset_value;     /* value to write to the reset register     */
+    uint64_t reset_addr;      /* reset register address (IO port or phys) */
 } acpi_topology_t;
 
 /* Parse ACPI tables into the global topology. rsdp_hint is the RSDP physical
@@ -53,5 +59,11 @@ uint32_t acpi_irq_to_gsi(uint8_t irq, uint16_t* flags_out);
  * the FADT/_S5 values parsed at init, then well-known hypervisor fallbacks. Does
  * not return on success; returns (to let the caller halt) if every method fails. */
 void acpi_poweroff(void);
+
+/* Reboot the machine. Tries, in order: the FADT reset register (the UEFI-correct
+ * method), the 0xCF9 PCI reset control register, the 8042 keyboard controller
+ * pulse, then a CPU triple fault (guaranteed reset on real firmware). Does not
+ * return. */
+void acpi_reboot(void);
 
 #endif /* ACPI_H */

@@ -437,19 +437,13 @@ static void cmd_colors(void) {
 // (Old execute_command version removed; final implementation used at end of file)
 
 static void cmd_reboot(void) {
+    extern void acpi_reboot(void);
     terminal_setcolor(vga_entry_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK));
     terminal_writestring("\nSystem reboot...\n");
-    
-    // Reboot using keyboard controller
-    uint8_t temp;
-    __asm__ volatile ("cli");  // Disable interrupts
-    
-    do {
-        __asm__ volatile ("inb $0x64, %0" : "=a"(temp));
-    } while (temp & 0x02);  // Wait until buffer is empty
-    
-    __asm__ volatile ("outb %0, $0x64" : : "a"((uint8_t)0xFE));  // Pulse reset line
-    
+    // Tries the FADT reset register, 0xCF9, the 8042 pulse, then a triple fault.
+    // The legacy 8042-only path used before did nothing on modern UEFI laptops
+    // (no wired keyboard-controller reset line) — it just printed and hung.
+    acpi_reboot();             // does not return
     __asm__ volatile ("hlt");
 }
 

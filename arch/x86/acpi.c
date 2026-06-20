@@ -110,6 +110,18 @@ static void parse_fadt(uint64_t fadt){
     const uint8_t* f = pv(fadt);
     g_topo.pm1a_cnt = rd32(f + 64);     /* PM1a_CNT_BLK */
     g_topo.pm1b_cnt = rd32(f + 68);     /* PM1b_CNT_BLK */
+    /* Reset register (ACPI 2.0+, FADT >= 129 bytes). RESET_REG is a 12-byte GAS
+     * at offset 116 (AddressSpaceId @116, Address @120), RESET_VALUE @128; FADT
+     * flags @112 bit10 (RESET_REG_SUP) gates support. */
+    if(rd32(f+4) >= 129 && (rd32(f+112) & (1u<<10))){
+        uint64_t raddr = rd64(f + 120);
+        if(raddr){
+            g_topo.reset_supported = 1;
+            g_topo.reset_space     = f[116];
+            g_topo.reset_addr      = raddr;
+            g_topo.reset_value     = f[128];
+        }
+    }
     uint64_t dsdt = rd32(f + 40);       /* DSDT (32-bit) */
     if(rd32(f+4) >= 148){               /* FADT long enough for X_DSDT (64-bit) */
         uint64_t xdsdt = rd64(f + 140);
@@ -203,6 +215,47 @@ void acpi_poweroff(void){
     outw(0xB004, 0x2000);   /* QEMU/Bochs (older)      */
     outw(0x4004, 0x3400);   /* VirtualBox              */
     /* If we are still here, ACPI poweroff is unavailable on this platform. */
+}
+
+static inline void outb_(uint16_t port, uint8_t v){ __asm__ volatile("outb %0,%1"::"a"(v),"Nd"(port)); }
+static inline uint8_t inb_(uint16_t port){ uint8_t v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(port)); return v; }
+static inline void reboot_delay(void){ for(volatile int i=0;i<2000000;i++){ } }
+
+void acpi_reboot(void){
+    debugcon_writestring("[ACPI] reboot: reset_sup="); debugcon_print_hex(g_topo.reset_supported);
+    debugcon_writestring(" space="); debugcon_print_hex(g_topo.reset_space);
+    debugcon_writestring(" addr="); debugcon_print_hex(g_topo.reset_addr);
+    debugcon_writestring(" val="); debugcon_print_hex(g_topo.reset_value);
+    debugcon_writestring("\n");
+    __asm__ volatile("cli");
+
+    /* 1. FADT reset register — the method most modern UEFI laptops actually honor. */
+    if(g_topo.reset_supported){
+        if(g_topo.reset_space == 1){                 /* SystemIO */
+            outb_((uint16_t)g_topo.reset_addr, g_topo.reset_value);
+        } else if(g_topo.reset_space == 0){          /* SystemMemory */
+            vmm_extend_physmap(g_topo.reset_addr + 0x1000);
+            *(volatile uint8_t*)phys_to_virt(g_topo.reset_addr) = g_topo.reset_value;
+        }
+        reboot_delay();
+    }
+
+    /* 2. PCI reset control register (0xCF9): full-reset (0x06) and hard-reset (0x0E). */
+    outb_(0xCF9, 0x02); reboot_delay();
+    outb_(0xCF9, 0x06); reboot_delay();
+    outb_(0xCF9, 0x0E); reboot_delay();
+
+    /* 3. Legacy 8042 keyboard-controller pulse (does nothing on the ASUS, kept for
+     *    older machines / emulators). Drain the input buffer, then pulse reset. */
+    for(int i=0;i<100000;i++){ if(!(inb_(0x64) & 0x02)) break; }
+    outb_(0x64, 0xFE); reboot_delay();
+
+    /* 4. Triple fault: load a zero-length IDT and raise an interrupt. With no valid
+     *    handler the CPU faults thrice and the firmware resets the machine — the
+     *    guaranteed last resort. */
+    struct __attribute__((packed)) { uint16_t limit; uint64_t base; } null_idt = { 0, 0 };
+    __asm__ volatile("lidt %0; int3" :: "m"(null_idt));
+    for(;;) __asm__ volatile("hlt");
 }
 
 uint32_t acpi_irq_to_gsi(uint8_t irq, uint16_t* flags_out){
