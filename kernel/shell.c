@@ -141,6 +141,7 @@ static void sh_vls(const char* a); static void sh_vcat(const char* a); static vo
 static void sh_vcreate(const char* a); static void sh_vwrite(const char* a); static void sh_vtruncate2(const char* a);
 static void sh_ext2mount(const char* a);
 static void sh_blk(const char* a); static void sh_mountdev(const char* a);
+static void sh_lspci(const char* a); static void sh_usbinfo(const char* a);
 // [M23] POSIX-style commands over the VFS (with a real working directory).
 static void sh_cd(const char* a); static void sh_pwd(const char* a); static void sh_ls(const char* a);
 static void sh_cat(const char* a); static void sh_touch(const char* a); static void sh_mkdir(const char* a);
@@ -221,6 +222,8 @@ static const struct shell_cmd shell_cmds[] = {
     {"info",      sh_info,      "system information"},
     {"blk",       sh_blk,       "list block devices"},
     {"mountdev",  sh_mountdev,  "mount a block device"},
+    {"lspci",     sh_lspci,     "list PCI devices (controllers)"},
+    {"usbinfo",   sh_usbinfo,   "xHCI controller + port status"},
     {"netinfo",   sh_netinfo,   "network status"},
     {"ping",      sh_ping,      "ping a host"},
     {"dhcp",      sh_dhcp,      "acquire an IP via DHCP"},
@@ -941,6 +944,89 @@ static void sh_mountdev(const char* a){
     if(fat32_mount(dev, mp)==0){ terminal_writestring("[mountdev] FAT32 mounted "); terminal_writestring(dev); terminal_writestring(" -> "); terminal_writestring(mp); terminal_writestring("\n"); return; }
     if(ext2_mount(dev, mp)==0){ terminal_writestring("[mountdev] ext2/4 mounted "); terminal_writestring(dev); terminal_writestring(" -> "); terminal_writestring(mp); terminal_writestring("\n"); return; }
     terminal_writestring("[mountdev] mount FAILED (device not FAT32/extN, or already mounted there)\n");
+}
+
+// Print v as `digits` uppercase hex nibbles (no 0x), for compact diagnostics.
+static void prhex(uint64_t v, int digits){
+    char buf[17]; const char* hc="0123456789ABCDEF";
+    if(digits>16) digits=16;
+    for(int i=digits-1;i>=0;i--){ buf[i]=hc[v & 0xF]; v>>=4; }
+    buf[digits]=0; terminal_writestring(buf);
+}
+
+// Friendly name for a PCI (class/subclass/progif) triple — enough to spot the
+// storage/USB controllers we care about on real hardware.
+static const char* pci_class_name(uint8_t c, uint8_t s, uint8_t p){
+    if(c==0x0C && s==0x03){ if(p==0x30)return "USB xHCI"; if(p==0x20)return "USB EHCI"; if(p==0x10)return "USB OHCI"; if(p==0x00)return "USB UHCI"; return "USB"; }
+    if(c==0x01 && s==0x06) return "SATA AHCI";
+    if(c==0x01 && s==0x08) return "NVMe";
+    if(c==0x01 && s==0x01) return "IDE";
+    if(c==0x01 && s==0x05) return "ATA";
+    if(c==0x08 && s==0x05) return "SD/eMMC host";
+    if(c==0x02 && s==0x00) return "Ethernet";
+    if(c==0x03)            return "Display";
+    if(c==0x06)            return "Bridge";
+    if(c==0x01)            return "Storage";
+    return "";
+}
+
+// lspci: enumerate every PCI function (legacy CF8/CFC) and print its address,
+// vendor:device, class and a friendly name. Output to the FB console so it works
+// on real hardware with no serial — tells us which storage/USB controllers exist.
+static void sh_lspci(const char* a){ (void)a;
+    extern uint16_t pci_config_read16(uint8_t,uint8_t,uint8_t,uint8_t);
+    extern uint8_t  pci_config_read8 (uint8_t,uint8_t,uint8_t,uint8_t);
+    int found=0;
+    for(uint32_t bus=0; bus<256; bus++){
+        for(uint8_t slot=0; slot<32; slot++){
+            if(pci_config_read16((uint8_t)bus,slot,0,0x00)==0xFFFF) continue;
+            uint8_t nf = (pci_config_read8((uint8_t)bus,slot,0,0x0E)&0x80)?8:1;
+            for(uint8_t fn=0; fn<nf; fn++){
+                uint16_t v = pci_config_read16((uint8_t)bus,slot,fn,0x00);
+                if(v==0xFFFF) continue;
+                uint16_t d = pci_config_read16((uint8_t)bus,slot,fn,0x02);
+                uint8_t pif=pci_config_read8((uint8_t)bus,slot,fn,0x09);
+                uint8_t sub=pci_config_read8((uint8_t)bus,slot,fn,0x0A);
+                uint8_t cls=pci_config_read8((uint8_t)bus,slot,fn,0x0B);
+                print_dec(bus); terminal_writestring(":"); print_dec(slot); terminal_writestring("."); print_dec(fn);
+                terminal_writestring("  "); prhex(v,4); terminal_writestring(":"); prhex(d,4);
+                terminal_writestring("  cls="); prhex(cls,2); terminal_writestring("/"); prhex(sub,2); terminal_writestring("/"); prhex(pif,2);
+                terminal_writestring("  "); terminal_writestring(pci_class_name(cls,sub,pif));
+                terminal_writestring("\n");
+                found++;
+            }
+        }
+    }
+    if(!found) terminal_writestring("[lspci] NO PCI devices found — legacy CF8/CFC config access may be unavailable on this firmware\n");
+    else { terminal_writestring("[lspci] "); print_dec((uint64_t)found); terminal_writestring(" functions\n"); }
+}
+
+// usbinfo: report what the xHCI driver saw — controller presence, root ports, how
+// many devices enumerated, and the LIVE PORTSC of each port. Lets us tell apart
+// "no controller on PCI", "nothing connected", and "connected but enum failed".
+static void sh_usbinfo(const char* a){ (void)a;
+    extern int xhci_present(void); extern uint32_t xhci_num_ports(void);
+    extern int xhci_ndev(void); extern uint32_t xhci_portsc_live(uint32_t);
+    if(!xhci_present()){
+        terminal_writestring("[usbinfo] xHCI NOT initialized: no controller found on PCI, or BAR/init failed.\n");
+        terminal_writestring("          Run 'lspci' and look for a class 0C/03/30 (USB xHCI) function.\n");
+        return;
+    }
+    uint32_t np = xhci_num_ports();
+    terminal_writestring("[usbinfo] xHCI OK  ports="); print_dec((uint64_t)np);
+    terminal_writestring("  enumerated_devices="); print_dec((uint64_t)xhci_ndev()); terminal_writestring("\n");
+    for(uint32_t p=1;p<=np;p++){
+        uint32_t sc = xhci_portsc_live(p);
+        terminal_writestring("  port "); print_dec((uint64_t)p);
+        terminal_writestring((sc&0x1)?"  CONNECTED":"  (empty)  ");
+        if(sc&0x1){
+            terminal_writestring(((sc>>1)&0x1)?" enabled":" NOT-enabled");
+            terminal_writestring(" speed="); print_dec((uint64_t)((sc>>10)&0xF));
+            terminal_writestring(((sc>>9)&0x1)?" pwr":" NOPWR");
+            if((sc>>4)&0x1) terminal_writestring(" resetting");
+        }
+        terminal_writestring("  portsc="); prhex(sc,8); terminal_writestring("\n");
+    }
 }
 
 // ===================== [M23] POSIX-style shell commands =====================

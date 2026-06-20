@@ -607,3 +607,13 @@ int xhci_enable_irq(void) {
     debugcon_writestring("[MSIX] xhci vector=0x40 armed (NOT TESTED)\n");
     return 0;
 }
+
+/* ---- Diagnostics (read-only; for the `usbinfo` shell command) -------------
+ * On real hardware with no serial, these let the framebuffer console report what
+ * the xHCI driver actually saw: whether a controller was found at boot, how many
+ * root ports it has, how many devices enumerated, and the LIVE PORTSC of each
+ * port (so we can tell "no device connected" from "connected but enum failed"). */
+int      xhci_present(void)            { return g_op != 0; }
+uint32_t xhci_num_ports(void)          { return g_op ? g_max_ports : 0; }
+int      xhci_ndev(void)               { return g_ndev; }
+uint32_t xhci_portsc_live(uint32_t p)  { return (g_op && p >= 1 && p <= g_max_ports) ? port_rd((int)p) : 0; }
