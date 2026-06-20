@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+# secos-pkg — build + sign a SecOS package (.spkg). SPDX-License-Identifier: MIT
+#
+# A .spkg bundles files (and directories) to install into the SecOS VFS, sealed
+# with the same Ed25519 signing root as executables: install = verify + unpack.
+# Only a package signed by the trusted key is installed (the M9 trust root,
+# extended to distribution).
+#
+# Layout (all little-endian):
+#   header (64B):  magic "SECOSPKG"; u32 version=1; u32 file_count;
+#                  u64 sig_offset; u8 reserved[40]
+#   entries:       file_count x { char path[128]; u32 mode; u32 type(0=file,1=dir);
+#                                 u64 data_offset; u64 data_size }
+#   data blobs:    file contents at their data_offset
+#   signature:     64-byte Ed25519 sig at sig_offset (file end)
+# Digest = SHA-256 over the whole file with the 64 sig bytes zeroed (same rule as
+# the ELF QSIG digest), Ed25519-signed.
+#
+# Usage:
+#   tools/secos-pkg create OUT.spkg  SRC:/dest/path [SRC:/dest/path ...] [--mkdir /d ...]
+#   tools/secos-pkg verify IN.spkg
+import sys, os, struct, hashlib
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from secos_signlib import DEV_SEED
+
+MAGIC = b"SECOSPKG"
+HDR = struct.Struct("<8sIIQ40s")        # 64 bytes
+ENT = struct.Struct("<128sIIQQ")        # 152 bytes
+
+def build(out, specs, dirs):
+    entries = []   # (path, mode, type, data)
+    for d in dirs:
+        entries.append((d, 0o755, 1, b""))
+    for s in specs:
+        if ":" not in s:
+            sys.stderr.write("bad spec (need SRC:/dest): %s\n" % s); sys.exit(2)
+        src, dest = s.split(":", 1)
+        data = open(src, "rb").read()
+        entries.append((dest, 0o644, 0, data))
+
+    n = len(entries)
+    data_start = HDR.size + n * ENT.size
+    # lay out blobs
+    blobs = bytearray(); offs = []
+    for (_p, _m, _t, d) in entries:
+        offs.append(data_start + len(blobs)); blobs += d
+    sig_off = data_start + len(blobs)
+
+    hdr = HDR.pack(MAGIC, 1, n, sig_off, b"\x00" * 40)
+    tbl = b""
+    for (p, m, t, d), o in zip(entries, offs):
+        pb = p.encode()[:127]
+        tbl += ENT.pack(pb + b"\x00" * (128 - len(pb)), m, t, o, len(d))
+    blob = bytearray(hdr + tbl + bytes(blobs) + b"\x00" * 64)   # 64 zero sig
+
+    digest = hashlib.sha256(blob).digest()
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    except ImportError:
+        sys.stderr.write("[pkg] need python3 'cryptography'\n"); sys.exit(1)
+    sig = Ed25519PrivateKey.from_private_bytes(DEV_SEED).sign(digest)
+    blob[sig_off:sig_off + 64] = sig
+    open(out, "wb").write(blob)
+    sys.stderr.write("[pkg] %s: %d entr%s, %d bytes, digest %s\n"
+                     % (out, n, "y" if n == 1 else "ies", len(blob), digest.hex()[:16]))
+
+def verify(path):
+    data = bytearray(open(path, "rb").read())
+    magic, ver, n, sig_off, _ = HDR.unpack_from(data, 0)
+    if magic != MAGIC: sys.stderr.write("not a .spkg\n"); sys.exit(1)
+    sig = bytes(data[sig_off:sig_off + 64])
+    for k in range(64): data[sig_off + k] = 0
+    digest = hashlib.sha256(data).digest()
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    pub = Ed25519PrivateKey.from_private_bytes(DEV_SEED).public_key()
+    from cryptography.exceptions import InvalidSignature
+    try:
+        pub.verify(sig, digest)
+        print("[pkg] %s OK (%d entries)" % (path, n))
+    except InvalidSignature:
+        print("[pkg] %s SIGNATURE INVALID" % path); sys.exit(1)
+
+def main():
+    a = sys.argv[1:]
+    if len(a) >= 2 and a[0] == "create":
+        out = a[1]; specs = []; dirs = []; i = 2
+        while i < len(a):
+            if a[i] == "--mkdir": i += 1; dirs.append(a[i])
+            else: specs.append(a[i])
+            i += 1
+        build(out, specs, dirs)
+    elif len(a) == 2 and a[0] == "verify":
+        verify(a[1])
+    else:
+        sys.stderr.write(__doc__ or "usage: secos-pkg create OUT SRC:/dest ...\n"); sys.exit(2)
+
+if __name__ == "__main__":
+    main()

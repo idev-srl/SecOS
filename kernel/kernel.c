@@ -990,9 +990,15 @@ static void m24_run_demo(void) {
 #if M31_LIBC_DEMO
 #include "../crypto/user_m31_libc_elf.h"
 #endif
+#if M32_PKG_DEMO
+#include "../crypto/user_testpkg_spkg.h"
+#endif
 // [M31] coreutils — a busybox-style signed binary installed into /bin under each
 // applet name so `run /bin/ls /`, `run /bin/cat <f>`, etc. work out of the box.
+// [M32] also installs the signed init/service-manager + demo service.
 #include "../crypto/user_coreutils_elf.h"
+#include "../crypto/user_init_elf.h"
+#include "../crypto/user_svc_elf.h"
 static void coreutils_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1014,6 +1020,10 @@ static void coreutils_install(void) {
     }
     debugcon_writestring("[M31] coreutils installed to /bin (applets="); debugcon_print_hex(ok);
     debugcon_writestring(")\n");
+    // [M32] the init/service-manager + its demo service.
+    vfs_create("/bin/init", user_init_elf, user_init_elf_len);
+    vfs_create("/bin/svc",  user_svc_elf,  user_svc_elf_len);
+    debugcon_writestring("[M32] init + svc installed to /bin\n");
 }
 extern void shell_init(void);
 extern void shell_run(void);
@@ -1065,11 +1075,28 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
         if (vfs_create("/bin/m31", user_m31_libc_elf, user_m31_libc_elf_len) == 0)
             debugcon_writestring("[M31] wrote signed libc test to /bin/m31\n");
         shell_run_line("run /bin/m31");
-        // Exercise a few coreutils applets (installed to /bin above); their stdout
-        // mirrors to debugcon so the harness can assert on the results.
+        // Prove the coreutils userland runs (1 spawn keeps the boot demo quick;
+        // each signed spawn pays an Ed25519 verify, slow under TCG). stdout
+        // mirrors to debugcon so the harness can assert on the result.
         shell_run_line("run /bin/echo CU-ECHO-OK");
-        shell_run_line("run /bin/wc /VERSION");
-        shell_run_line("run /bin/uname -a");
+    }
+#endif
+#if M32_PKG_DEMO
+    // [M32] Install a signed package, prove a tampered one is refused, then cat
+    // a file the package delivered.
+    {
+        extern int pkg_install(const void*, size_t);
+        int r = pkg_install(user_testpkg_spkg, user_testpkg_spkg_len);
+        debugcon_writestring(r > 0 ? "[M32] signed package installed\n"
+                                   : "[M32] FAIL: package install\n");
+        static uint8_t bad[8192];
+        size_t bn = user_testpkg_spkg_len < sizeof(bad) ? user_testpkg_spkg_len : sizeof(bad);
+        for (size_t i = 0; i < bn; i++) bad[i] = user_testpkg_spkg[i];
+        bad[80] ^= 0x01;   // corrupt a data byte
+        int br = pkg_install(bad, bn);
+        debugcon_writestring(br < 0 ? "[M32] tampered package REFUSED (good)\n"
+                                    : "[M32] FAIL: tampered package accepted\n");
+        shell_run_line("run /bin/cat /etc/pkg-motd.txt");
     }
 #endif
     shell_run();

@@ -1,0 +1,3 @@
+SECOS-PKG-INSTALLED
+This file was delivered by a signed SecOS package (.spkg).
+Install = verify the Ed25519 signature, then unpack into the VFS.

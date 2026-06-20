@@ -60,6 +60,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/pipe.c \
 	$(KERNEL_DIR)/tty.c \
 	$(KERNEL_DIR)/smp.c \
+	$(KERNEL_DIR)/pkg.c \
 	$(KERNEL_DIR)/selftest.c \
 	user/testdriver.c \
 	$(LIB_DIR)/terminal.c \
@@ -226,6 +227,18 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/coreutils.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/coreutils.o user/cu_text.o user/cu_file.o user/cu_misc.o
 	python3 tools/secos-sign user/coreutils.elf --dev
 	python3 tools/elf2h.py user/coreutils.elf user_coreutils_elf crypto/user_coreutils_elf.h
+	# [M32] signed package (.spkg): a dir + a text file, sealed with the dev key
+	python3 tools/secos-pkg create user/testpkg.spkg user/pkg_motd.txt:/etc/pkg-motd.txt --mkdir /opt/pkgdir user/pkg_motd.txt:/opt/pkgdir/info.txt
+	python3 tools/elf2h.py user/testpkg.spkg user_testpkg_spkg crypto/user_testpkg_spkg.h
+	# [M32] init/service-manager + a demo service (signed)
+	$(CC) $(USER_CFLAGS) -c user/svc_demo.c    -o user/svc_demo.o
+	$(LD) --gc-sections -T user/user.ld -o user/svc_demo.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/svc_demo.o
+	python3 tools/secos-sign user/svc_demo.elf --dev
+	python3 tools/elf2h.py user/svc_demo.elf user_svc_elf crypto/user_svc_elf.h
+	$(CC) $(USER_CFLAGS) -c user/init.c        -o user/init.o
+	$(LD) --gc-sections -T user/user.ld -o user/init.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/init.o
+	python3 tools/secos-sign user/init.elf --dev
+	python3 tools/elf2h.py user/init.elf user_init_elf crypto/user_init_elf.h
 	# [M13] max_mem-limited build of hello (manifest limit too small -> refused at load)
 	$(LD) --gc-sections -T user/user.ld -o user/maxmem.elf user/crt0.o user/note_maxmem.o user/libsecos.o user/libc.o user/hello.o
 	python3 tools/secos-sign user/maxmem.elf --dev

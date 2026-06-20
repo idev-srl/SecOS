@@ -149,6 +149,7 @@ static void sh_nettest(const char* a);                                       // 
 const char* shell_get_cwd(void);   // [M23] current VFS working directory (for the prompt)
 static void sh_run(const char* a);
 static void sh_stress(const char* a);   // [M29] SMP CPU stress
+static void sh_pkg(const char* a);      // [M32] signed package install
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
 static void sh_drvtest(const char* a);
 #if ENABLE_RTC
@@ -247,6 +248,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"nettest",   sh_nettest},
     {"run",       sh_run},
     {"stress",    sh_stress},
+    {"pkg",       sh_pkg},
     {"drvreg",    sh_drvreg},
     {"drvunreg",  sh_drvunreg},
     {"drvlog",    sh_drvlog},
@@ -1264,6 +1266,29 @@ static void sh_stress(const char* a){
     while(sched_count_alive_user() > base){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
     sched_reap_zombies();
     terminal_writestring("[stress] all "); print_dec(spawned); terminal_writestring(" done\n");
+}
+
+// [M32] pkg install <file.spkg>: read a signed package from the VFS and install
+// it (verify Ed25519 signature, then unpack). A forged package installs nothing.
+static void sh_pkg(const char* a){
+    while(*a==' ') a++;
+    if(strncmp(a,"install",7)==0){ a+=7; while(*a==' ') a++; }
+    if(!*a){ terminal_writestring("Usage: pkg install <file.spkg>\n"); return; }
+    extern vfs_inode_t* vfs_lookup(const char*);
+    extern int vfs_read_all(const char*, void*, size_t);
+    extern int pkg_install(const void*, size_t);
+    extern void* kmalloc(unsigned long); extern void kfree(void*);
+    vfs_inode_t* ino = vfs_lookup(a);
+    if(!ino || ino->type!=VFS_NODE_FILE){ terminal_writestring("pkg: not found\n"); return; }
+    size_t sz = ino->size; if(sz==0){ terminal_writestring("pkg: empty\n"); return; }
+    uint8_t* buf = (uint8_t*)kmalloc(sz);
+    if(!buf){ terminal_writestring("pkg: out of memory\n"); return; }
+    int r = vfs_read_all(a, buf, sz);
+    if(r<0){ terminal_writestring("pkg: read fail\n"); kfree(buf); return; }
+    int n = pkg_install(buf, (size_t)r);
+    if(n>=0){ terminal_writestring("pkg: installed "); print_dec(n); terminal_writestring(" entries\n"); }
+    else terminal_writestring("pkg: REFUSED (bad signature or format)\n");
+    kfree(buf);
 }
 
 // idle task: the timer preempts us into the spawned process; SYS_EXIT returns

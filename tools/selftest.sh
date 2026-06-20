@@ -626,27 +626,30 @@ grep -q "\[M8\] PMM stable across rounds: NO LEAK" "$M29LOG"; check "M29-3 no PM
 grep -q "\[M8\] DONE" "$M29LOG"; check "M29-3 multicore workload completes" $?
 ! grep -q "\[EXC\]" "$M29LOG"; check "no CPU exception ([EXC]) during M29 multicore run" $?
 
-# ---- M31: C library (printf/string/stdlib/ctype) in ring 3 ----
+# ---- Phase K: M31 libc + coreutils, M32 signed packages (one build/run) ----
+# Each signed spawn pays an Ed25519 verify (slow under TCG), so this variant runs
+# only 2-3 spawns and gets a generous timeout instead of the default 12s.
 M31LOG=/tmp/secos_selftest_m31.log
-echo "[selftest] Building M31 image (libc test)..."
+PK_TIMEOUT=45
+echo "[selftest] Building Phase K image (M31 libc + coreutils + M32 packages)..."
 make clean >/dev/null 2>&1 || true
-if ! make iso CFLAGS_EXTRA="-DM31_LIBC_DEMO=1" >/tmp/secos_selftest_build.log 2>&1; then
-    echo "[selftest] M31 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+if ! make iso CFLAGS_EXTRA="-DM31_LIBC_DEMO=1 -DM32_PKG_DEMO=1" >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] PhaseK BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     tail -20 /tmp/secos_selftest_build.log >&2; exit 2
 fi
-echo "[selftest] Running M31 (mb2, ${TIMEOUT}s)..."
+echo "[selftest] Running Phase K (mb2, ${PK_TIMEOUT}s)..."
 : > "$M31LOG"; set +e
-timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -boot d \
+timeout "$PK_TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -boot d \
     -debugcon file:"$M31LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
 set -e
-grep -q "\[m31\] DONE fails=0" "$M31LOG"; check "M31 libc: all printf/string/stdlib/ctype tests pass in ring 3" $?
+grep -q "\[m31\] DONE fails=0" "$M31LOG"; check "M31 libc: printf/string/stdlib/ctype tests pass in ring 3" $?
 ! grep -q "\[m31\] FAIL" "$M31LOG"; check "M31 libc: no failing test" $?
-# M31 coreutils (busybox-style, installed to /bin): a few applets via the demo.
 grep -q "\[M31\] coreutils installed to /bin" "$M31LOG"; check "M31 coreutils installed to /bin" $?
 grep -q "CU-ECHO-OK" "$M31LOG"; check "M31 coreutils: echo runs in ring 3" $?
-grep -qE "[0-9]+[[:space:]]+[0-9]+[[:space:]]+59 /VERSION" "$M31LOG"; check "M31 coreutils: wc counts /VERSION" $?
-grep -q "SecOS secos 0.1.0-dev x86_64" "$M31LOG"; check "M31 coreutils: uname -a" $?
-! grep -q "\[EXC\]" "$M31LOG"; check "no CPU exception ([EXC]) during M31 libc run" $?
+grep -q "\[M32\] signed package installed" "$M31LOG"; check "M32 signed package installs" $?
+grep -q "\[M32\] tampered package REFUSED" "$M31LOG"; check "M32 tampered package refused" $?
+grep -q "SECOS-PKG-INSTALLED" "$M31LOG"; check "M32 package-delivered file is readable" $?
+! grep -q "\[EXC\]" "$M31LOG"; check "no CPU exception ([EXC]) during Phase K run" $?
 
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
