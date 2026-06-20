@@ -7,11 +7,13 @@ tasks run on application processors in parallel** (`[SMP] cpu=1 run pid=…`). H
 on `main`, pushed. Read this first._
 _Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M29.md`._
 
-## ⚠️ PENDING USER VERIFICATION (M29 multicore)
-The user tests on **VMware** (not QEMU). Build `make uefi-vmdk`, give the VM
-**2+ vCPUs**, boot, and run a workload (e.g. spawn programs from the shell) — it
-should stay stable. SMP is QEMU-verified (`-smp 2/4`, no `[EXC]`, no PMM leak) but
-not yet on VMware hardware.
+## ✅ SMP VERIFIED ON REAL VMWARE (user, 4 vCPUs)
+`stress 8` ran clean on VMware → multicore confirmed on hardware. `stress 16` then
+exposed a real SMP race in the M5 per-process kernel stack (shared kernel page
+table edited at runtime) → fixed (`28ff58a`, `kstack_lock`); `stress 16`/`32` now
+clean (48 procs across 4 cores, no leak). Latest VMware image `git:28ff58a` in
+`C:\Users\Luigi\SecOS\secos-uefi.vmdk`. The shell `stress [N]` command launches N
+CPU-bound spinners (signed `user/spin.c`) to saturate the vCPUs.
 
 ## ▶▶ NEXT SESSION TASK: pick one (Phase I is done)
 Phase I (ACPI → APIC → TSC → SMP) is complete. Open fronts, roughly by value:
