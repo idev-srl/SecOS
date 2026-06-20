@@ -44,6 +44,11 @@
 #define SYS_LSTAT    37 // lstat(path, statbuf)  (does not follow a final symlink)
 #define SYS_MOUNT    38 // mount(dev, target, fstype)
 #define SYS_UMOUNT   39 // umount(target)
+// [M31] file management (for a real userland / coreutils)
+#define SYS_GETDENTS 40 // getdents(path, buf, buflen) -> packed dir entries, bytes
+#define SYS_CREATE   41 // create(path) -> create an empty file, 0/-1
+#define SYS_MKDIR    42 // mkdir(path) -> 0/-1
+#define SYS_UNLINK   43 // unlink(path) -> remove a file/dir, 0/-1
 
 // [M24] socket types
 #define SOCK_STREAM 1   // TCP

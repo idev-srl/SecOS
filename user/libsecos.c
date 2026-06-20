@@ -122,3 +122,10 @@ int sockclose(int fd){ return (int)secos_syscall(SYS_SOCKCLOSE, fd, 0, 0, 0, 0);
 unsigned int ip4(unsigned a, unsigned b, unsigned c, unsigned d){
     return (a & 0xFF) | ((b & 0xFF) << 8) | ((c & 0xFF) << 16) | ((d & 0xFF) << 24);
 }
+
+/* [M31] file management for a real userland. */
+long getdents(const char* path, void* buf, long buflen){ return secos_syscall(40 /*SYS_GETDENTS*/, (long)path, (long)buf, buflen, 0, 0); }
+int  creat_file(const char* path){ return (int)secos_syscall(41 /*SYS_CREATE*/, (long)path, 0, 0, 0, 0); }
+int  mkdir(const char* path, unsigned mode){ (void)mode; return (int)secos_syscall(42 /*SYS_MKDIR*/, (long)path, 0, 0, 0, 0); }
+int  unlink(const char* path){ return (int)secos_syscall(43 /*SYS_UNLINK*/, (long)path, 0, 0, 0, 0); }
+int  rmdir(const char* path){ return unlink(path); }

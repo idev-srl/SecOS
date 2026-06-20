@@ -990,6 +990,31 @@ static void m24_run_demo(void) {
 #if M31_LIBC_DEMO
 #include "../crypto/user_m31_libc_elf.h"
 #endif
+// [M31] coreutils — a busybox-style signed binary installed into /bin under each
+// applet name so `run /bin/ls /`, `run /bin/cat <f>`, etc. work out of the box.
+#include "../crypto/user_coreutils_elf.h"
+static void coreutils_install(void) {
+    extern int vfs_create(const char*, const void*, size_t);
+    extern vfs_inode_t* vfs_lookup(const char*);
+    if (vfs_lookup("/bin/coreutils")) {        // already installed (persistent root)
+        debugcon_writestring("[M31] coreutils already in /bin\n"); return;
+    }
+    static const char* names[] = {
+        "coreutils","echo","cat","wc","head","tail","rev","nl","yes","seq",
+        "ls","mkdir","rm","touch","cp","basename","dirname","stat",
+        "true","false","uname","sleep","clear","hexdump","uptime","help", 0
+    };
+    int ok = 0;
+    for (int i = 0; names[i]; i++) {
+        char path[64]; int p = 0;
+        const char* pre = "/bin/"; for (int k = 0; pre[k]; k++) path[p++] = pre[k];
+        const char* n = names[i]; for (int k = 0; n[k] && p < 60; k++) path[p++] = n[k];
+        path[p] = 0;
+        if (vfs_create(path, user_coreutils_elf, user_coreutils_elf_len) == 0) ok++;
+    }
+    debugcon_writestring("[M31] coreutils installed to /bin (applets="); debugcon_print_hex(ok);
+    debugcon_writestring(")\n");
+}
 extern void shell_init(void);
 extern void shell_run(void);
 extern void shell_run_line(const char* line);
@@ -999,6 +1024,7 @@ static trapframe_t m10_idle_tf;
 
 __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
     shell_init();
+    coreutils_install();   // [M31] populate /bin with the signed coreutils applets
 #if ENABLE_FB
     extern void fb_console_draw_logo(void); fb_console_draw_logo();
     extern void fb_console_flush(void); fb_console_flush();
@@ -1039,6 +1065,11 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
         if (vfs_create("/bin/m31", user_m31_libc_elf, user_m31_libc_elf_len) == 0)
             debugcon_writestring("[M31] wrote signed libc test to /bin/m31\n");
         shell_run_line("run /bin/m31");
+        // Exercise a few coreutils applets (installed to /bin above); their stdout
+        // mirrors to debugcon so the harness can assert on the results.
+        shell_run_line("run /bin/echo CU-ECHO-OK");
+        shell_run_line("run /bin/wc /VERSION");
+        shell_run_line("run /bin/uname -a");
     }
 #endif
     shell_run();

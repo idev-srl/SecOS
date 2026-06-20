@@ -641,6 +641,11 @@ timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -boot d \
 set -e
 grep -q "\[m31\] DONE fails=0" "$M31LOG"; check "M31 libc: all printf/string/stdlib/ctype tests pass in ring 3" $?
 ! grep -q "\[m31\] FAIL" "$M31LOG"; check "M31 libc: no failing test" $?
+# M31 coreutils (busybox-style, installed to /bin): a few applets via the demo.
+grep -q "\[M31\] coreutils installed to /bin" "$M31LOG"; check "M31 coreutils installed to /bin" $?
+grep -q "CU-ECHO-OK" "$M31LOG"; check "M31 coreutils: echo runs in ring 3" $?
+grep -qE "[0-9]+[[:space:]]+[0-9]+[[:space:]]+59 /VERSION" "$M31LOG"; check "M31 coreutils: wc counts /VERSION" $?
+grep -q "SecOS secos 0.1.0-dev x86_64" "$M31LOG"; check "M31 coreutils: uname -a" $?
 ! grep -q "\[EXC\]" "$M31LOG"; check "no CPU exception ([EXC]) during M31 libc run" $?
 
 echo "[selftest] ---"

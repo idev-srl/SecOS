@@ -166,6 +166,27 @@ char* getenv(const char* name){ (void)name; return 0; }   /* no environment yet 
 void exit(int code){ _exit(code); }
 void abort(void){ write(2,"abort\n",6); _exit(134); }
 
+/* ============================== <dirent.h> ============================= */
+#include <dirent.h>
+DIR* opendir(const char* path){
+    DIR* d = malloc(sizeof(DIR)); if(!d) return 0;
+    d->buf = malloc(16384);
+    if(!d->buf){ free(d); return 0; }
+    long n = getdents(path, d->buf, 16384);
+    if(n < 0){ free(d->buf); free(d); return 0; }
+    d->len = (int)n; d->pos = 0;
+    return d;
+}
+struct dirent* readdir(DIR* d){
+    if(!d || d->pos + 256 > d->len) return 0;
+    char* rec = d->buf + d->pos; d->pos += 256;
+    char t = rec[0];
+    d->ent.d_type = t=='d'?DT_DIR : t=='l'?DT_LNK : DT_REG;
+    strlcpy(d->ent.d_name, rec+1, sizeof(d->ent.d_name));
+    return &d->ent;
+}
+int closedir(DIR* d){ if(d){ free(d->buf); free(d); } return 0; }
+
 /* ============================== <time.h> =============================== */
 time_t time(time_t* t){ time_t s=(time_t)(getticks()/1000); if(t)*t=s; return s; }
 clock_t clock(void){ return (clock_t)getticks(); }

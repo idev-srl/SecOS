@@ -99,6 +99,13 @@ long  recvfrom(int fd, void* buf, long len, struct secos_sockaddr* sa);
 int   sockclose(int fd);
 unsigned int ip4(unsigned a, unsigned b, unsigned c, unsigned d);
 
+/* [M31] file management (for a real userland / coreutils) */
+long getdents(const char* path, void* buf, long buflen); /* packed 256B records */
+int  creat_file(const char* path);                       /* create empty file */
+int  mkdir(const char* path, unsigned mode);             /* mode ignored for now */
+int  unlink(const char* path);
+int  rmdir(const char* path);
+
 /* tiny libc helpers */
 size_t  strlen(const char* s);
 int     puts(const char* s);   /* writes s + '\n' to stdout (fd 1) */

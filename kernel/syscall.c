@@ -277,6 +277,42 @@ int ksys_symlink(const char* target, const char* linkpath){
     return vfs_symlink(target, linkpath);
 }
 
+// [M31] Directory enumeration for a real userland (ls/opendir). Packs entries as
+// fixed 256-byte records {char d_type; char d_name[255]} so the libc can iterate
+// without parsing. d_type: 'd' dir, 'l' symlink, 'f' file.
+struct gd_ctx { char* buf; int cap; int len; };
+static void gd_cb(const vfs_inode_t* child, void* user){
+    struct gd_ctx* g = (struct gd_ctx*)user;
+    if(g->len + 256 > g->cap) return;
+    const char* name = child->path; const char* p = child->path;
+    while(*p){ if(*p=='/') name = p+1; p++; }
+    char* e = g->buf + g->len;
+    e[0] = (child->type==VFS_NODE_DIR) ? 'd' : (child->type==VFS_NODE_SYMLINK ? 'l' : 'f');
+    int i=0; while(name[i] && i<254){ e[1+i]=name[i]; i++; } e[1+i]=0;
+    g->len += 256;
+}
+int ksys_getdents(const char* path, void* ubuf, int buflen){
+    extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*);
+    static char kbuf[16384];                 // up to 64 entries
+    struct gd_ctx g = { kbuf, sizeof(kbuf), 0 };
+    if(vfs_readdir(path, gd_cb, &g) != 0) return -1;
+    int n = g.len < buflen ? g.len : buflen;
+    if(n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0) return -1;
+    return n;
+}
+int ksys_create(const char* path){
+    extern int vfs_create(const char*, const void*, size_t);
+    return vfs_create(path, "", 0);
+}
+int ksys_mkdir(const char* path){
+    extern int vfs_mkdir(const char*);
+    return vfs_mkdir(path);
+}
+int ksys_unlink(const char* path){
+    extern int vfs_remove(const char*);
+    return vfs_remove(path);
+}
+
 // [M26] mount/umount: map a block-device name + fstype to the existing FS mount
 // helpers (the same path the boot mount and shell `mountdev` use). fstype:
 // "fat32"/"vfat" -> FAT32; "ext2"/"ext4"/"extN" -> ext driver; "auto"/"" -> try
@@ -489,6 +525,27 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_UMOUNT: {
         char ktgt[256]; if (copy_user_str((const char*)a0, ktgt, sizeof(ktgt)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_umount(ktgt);
+    }
+    case SYS_GETDENTS: {
+        extern int ksys_getdents(const char*, void*, int);
+        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        int len = (int)a2; if (len <= 0 || len > (1<<20) || !user_range_valid((void*)a1, (size_t)len)) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_getdents(kp, (void*)a1, len);
+    }
+    case SYS_CREATE: {
+        extern int ksys_create(const char*);
+        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_create(kp);
+    }
+    case SYS_MKDIR: {
+        extern int ksys_mkdir(const char*);
+        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_mkdir(kp);
+    }
+    case SYS_UNLINK: {
+        extern int ksys_unlink(const char*);
+        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_unlink(kp);
     }
 
     /* [M24] Sockets — gated by CAP_NET in the signed manifest. A staging buffer

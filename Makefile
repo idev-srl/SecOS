@@ -218,6 +218,14 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/m31_libc.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/m31_libc.o
 	python3 tools/secos-sign user/m31_libc.elf --dev
 	python3 tools/elf2h.py user/m31_libc.elf user_m31_libc_elf crypto/user_m31_libc_elf.h
+	# [M31] coreutils — busybox-style multi-call binary (echo/cat/ls/wc/...)
+	$(CC) $(USER_CFLAGS) -c user/coreutils.c   -o user/coreutils.o
+	$(CC) $(USER_CFLAGS) -c user/cu_text.c     -o user/cu_text.o
+	$(CC) $(USER_CFLAGS) -c user/cu_file.c     -o user/cu_file.o
+	$(CC) $(USER_CFLAGS) -c user/cu_misc.c     -o user/cu_misc.o
+	$(LD) --gc-sections -T user/user.ld -o user/coreutils.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/coreutils.o user/cu_text.o user/cu_file.o user/cu_misc.o
+	python3 tools/secos-sign user/coreutils.elf --dev
+	python3 tools/elf2h.py user/coreutils.elf user_coreutils_elf crypto/user_coreutils_elf.h
 	# [M13] max_mem-limited build of hello (manifest limit too small -> refused at load)
 	$(LD) --gc-sections -T user/user.ld -o user/maxmem.elf user/crt0.o user/note_maxmem.o user/libsecos.o user/libc.o user/hello.o
 	python3 tools/secos-sign user/maxmem.elf --dev

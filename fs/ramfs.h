@@ -13,7 +13,7 @@
 // Simple in-memory filesystem with fixed table.
 // Limits: max 32 files, name <= 96 chars, content stored in kernel memory.
 
-#define RAMFS_MAX_FILES 32
+#define RAMFS_MAX_FILES 96  /* [M31] room for /bin coreutils applets + FHS skeleton */
 #define RAMFS_NAME_MAX  96 // aumenta per percorsi con sottodirectory
 
 // flags: bit0 immutable entry, bit1 directory
