@@ -13,6 +13,8 @@
 #include "../config.h"
 #include "vmm.h" // user-space API types/defines
 #include "process.h" // process_t
+#include "sched.h"   // [M30] reap/count for job control
+#include "signal.h"  // [M30] foreground pgid + SIGCONT/SIGKILL
 #include "elf.h" // PF_R PF_X
 #include "mm/elf_manifest.h" // SECOS_NOTE_TYPE e flags manifest
 #include "rtc.h"
@@ -150,6 +152,9 @@ static void sh_udpsend(const char* a); static void sh_tcptest(const char* a);// 
 static void sh_nettest(const char* a);                                       // [M24]
 const char* shell_get_cwd(void);   // [M23] current VFS working directory (for the prompt)
 static void sh_run(const char* a);
+static void sh_jobs(const char* a);     // [M30] list background/stopped jobs
+static void sh_fg(const char* a);       // [M30] resume a job in the foreground
+static void sh_bg(const char* a);       // [M30] resume a stopped job in background
 static void sh_stress(const char* a);   // [M29] SMP CPU stress
 static void sh_smp(const char* a);      // [M29] bring up secondary cores (opt-in)
 static void sh_pkg(const char* a);      // [M32] signed package install
@@ -203,6 +208,9 @@ static const struct shell_cmd shell_cmds[] = {
     {"pinfo",     sh_pinfo,     "process details"},
     {"kill",      sh_kill,      "kill a process"},
     {"run",       sh_run,       "run a signed program"},
+    {"jobs",      sh_jobs,      "list background/stopped jobs"},
+    {"fg",        sh_fg,        "resume a job in the foreground"},
+    {"bg",        sh_bg,        "resume a stopped job in background"},
     {"pkg",       sh_pkg,       "install a signed package (.spkg)"},
     {"stress",    sh_stress,    "CPU stress test"},
     {"smp",       sh_smp,       "bring up extra cores (experimental)"},
@@ -1332,35 +1340,201 @@ static void sh_pkg(const char* a){
     kfree(buf);
 }
 
-// idle task: the timer preempts us into the spawned process; SYS_EXIT returns
-// here. An unsigned/tampered/missing ELF is refused by the loader gate.
+// =========================== [M30] Job control ===========================
+// The shell runs as the scheduler idle task, so it cannot itself be a ring-3
+// process group member — instead it tracks the pipelines it launches. A
+// pipeline is one process group (pgid); the kernel's foreground_pgid routes
+// Ctrl-C (SIGINT) / Ctrl-Z (SIGTSTP) to whichever group is in the foreground.
+// `jobs`/`fg`/`bg` list and resume stopped/background groups.
+#define JOB_MAX   8
+#define JOB_NPROC 8
+typedef struct {
+    int      used;
+    int      stopped;                 // 1 = SIGTSTP'd, 0 = running in background
+    uint32_t pgid;
+    int      npid;
+    uint32_t pids[JOB_NPROC];
+    char     cmd[64];
+} job_t;
+static job_t g_jobs[JOB_MAX];
+
+extern process_t* process_find_by_pid(uint32_t);
+extern void* pipe_alloc(void);
+
+// Drop jobs whose every process has exited (reaped/gone).
+static void job_gc(void){
+    for(int j=0;j<JOB_MAX;j++){
+        if(!g_jobs[j].used) continue;
+        int alive=0;
+        for(int i=0;i<g_jobs[j].npid;i++){
+            process_t* p=process_find_by_pid(g_jobs[j].pids[i]);
+            if(p && p->state!=PROC_ZOMBIE) alive++;
+        }
+        if(!alive) g_jobs[j].used=0;
+    }
+}
+static int job_add(uint32_t pgid, const uint32_t* pids, int npid, const char* cmd, int stopped){
+    job_gc();
+    for(int j=0;j<JOB_MAX;j++){
+        if(g_jobs[j].used) continue;
+        g_jobs[j].used=1; g_jobs[j].stopped=stopped; g_jobs[j].pgid=pgid; g_jobs[j].npid=npid;
+        for(int i=0;i<npid && i<JOB_NPROC;i++) g_jobs[j].pids[i]=pids[i];
+        int k=0; while(cmd && cmd[k] && k<63){ g_jobs[j].cmd[k]=cmd[k]; k++; } g_jobs[j].cmd[k]=0;
+        return j+1;                   // job numbers are 1-based
+    }
+    return -1;
+}
+
+// Wait for the foreground process group to finish or stop. Returns 0 when every
+// process has exited, 1 when the group stopped (Ctrl-Z). Reaps as it goes.
+static int job_wait_foreground(uint32_t pgid, const uint32_t* pids, int npid){
+    signal_set_foreground_pgid(pgid);
+    for(;;){
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        int running=0, stopped=0;
+        for(int i=0;i<npid;i++){
+            process_t* p=process_find_by_pid(pids[i]);
+            if(!p || p->state==PROC_ZOMBIE) continue;     // gone
+            if(p->state==PROC_STOPPED) stopped++; else running++;
+        }
+        if(running==0){
+            sched_reap_zombies();
+            signal_set_foreground_pgid(0);
+            return stopped>0 ? 1 : 0;
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+// Launch a (possibly piped) job: `cmd1 args | cmd2 | ...`, optionally in the
+// background (trailing &, stripped by the caller). 'line' is mutated in place.
+static uint8_t g_job_spawn_buf[65536];
+static void run_job(char* line, int background){
+    // Split on '|' into pipeline stages.
+    char* stages[JOB_NPROC]; int ns=0;
+    stages[ns++]=line;
+    for(char* s=line; *s; s++){ if(*s=='|'){ *s=0; if(ns<JOB_NPROC) stages[ns++]=s+1; } }
+
+    // Tokenize each stage into argv and resolve its program path.
+    static char store[JOB_NPROC][JOB_NPROC][96];
+    const char* av[JOB_NPROC][JOB_NPROC];
+    int argc[JOB_NPROC];
+    static char paths[JOB_NPROC][160];
+    for(int i=0;i<ns;i++){
+        char* a=stages[i]; int ac=0;
+        while(*a && ac<JOB_NPROC){
+            while(*a==' '||*a=='\t') a++;
+            if(!*a) break;
+            int j=0; while(*a && *a!=' ' && *a!='\t' && j<95){ store[i][ac][j++]=*a++; }
+            store[i][ac][j]=0; av[i][ac]=store[i][ac]; ac++;
+        }
+        argc[i]=ac;
+        if(ac==0){ terminal_writestring("syntax error near '|'\n"); return; }
+        const char* c0=av[i][0]; int p=0;
+        if(c0[0]=='/'){ for(const char* s=c0; *s && p<159; s++) paths[i][p++]=*s; }
+        else { const char* pre="/bin/"; for(int k=0;pre[k];k++) paths[i][p++]=pre[k];
+               for(const char* s=c0; *s && p<159; s++) paths[i][p++]=*s; }
+        paths[i][p]=0;
+    }
+
+    extern process_t* process_create_from_elf_args(const void*, size_t, int, const char* const*);
+    extern int vfs_read_all(const char*, void*, size_t);
+    process_t* procs[JOB_NPROC]; uint32_t pids[JOB_NPROC]; int created=0;
+    uint32_t pgid=0; void* prev_read=NULL;
+    for(int i=0;i<ns;i++){
+        int n=vfs_read_all(paths[i], g_job_spawn_buf, sizeof(g_job_spawn_buf));
+        if(n<=0){ terminal_writestring("run: cannot launch "); terminal_writestring(paths[i]);
+                  terminal_writestring(" (missing or unsigned)\n"); goto fail; }
+        process_t* p=process_create_from_elf_args(g_job_spawn_buf,(size_t)n,argc[i],av[i]);
+        if(!p){ terminal_writestring("run: cannot launch "); terminal_writestring(paths[i]);
+                terminal_writestring(" (missing or unsigned)\n"); goto fail; }
+        // Wire stdin from the previous stage's pipe, stdout to a fresh pipe.
+        if(prev_read){ p->fds[0].used=1; p->fds[0].is_pipe=1; p->fds[0].pipe_w=0; p->fds[0].inode=prev_read; prev_read=NULL; }
+        if(i < ns-1){
+            void* pp=pipe_alloc();
+            if(!pp){ terminal_writestring("pipe: out of pipes\n"); procs[created]=p; pids[created]=p->pid; created++; goto fail; }
+            p->fds[1].used=1; p->fds[1].is_pipe=1; p->fds[1].pipe_w=1; p->fds[1].inode=pp;
+            prev_read=pp;
+        }
+        if(i==0) pgid=p->pid;
+        p->pgid=pgid; p->ppid=0;
+        procs[i]=p; pids[i]=p->pid; created++;
+    }
+    for(int i=0;i<created;i++) procs[i]->state=PROC_READY;
+
+    if(background){
+        int jn=job_add(pgid,pids,created,line,0);
+        terminal_writestring("["); print_dec(jn); terminal_writestring("] "); print_dec((int)pgid); terminal_writestring("\n");
+        return;
+    }
+    int stopped=job_wait_foreground(pgid,pids,created);
+    if(stopped){
+        int jn=job_add(pgid,pids,created,line,1);
+        terminal_writestring("\n["); print_dec(jn); terminal_writestring("]+ Stopped\n");
+    }
+    return;
+fail:
+    for(int i=0;i<created;i++) if(procs[i]){ signal_post(procs[i],9/*SIGKILL*/); procs[i]->state=PROC_READY; }
+    for(int spin=0; spin<2000 && sched_count_alive_user()>0; spin++){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
+}
+
+// jobs: list tracked background/stopped pipelines.
+static void sh_jobs(const char* a){ (void)a;
+    job_gc();
+    int any=0;
+    for(int j=0;j<JOB_MAX;j++){
+        if(!g_jobs[j].used) continue; any=1;
+        terminal_writestring("["); print_dec(j+1); terminal_writestring("] ");
+        terminal_writestring(g_jobs[j].stopped ? "Stopped  " : "Running  ");
+        terminal_writestring(g_jobs[j].cmd); terminal_writestring("\n");
+    }
+    if(!any) terminal_writestring("no jobs\n");
+}
+
+// Resolve a "%n" / "n" job spec (or the most recent job if empty) to a slot.
+static int job_pick(const char* a){
+    while(*a==' ') a++;
+    if(*a=='%') a++;
+    if(*a>='1'&&*a<='9'){ int n=0; while(*a>='0'&&*a<='9'){ n=n*10+(*a-'0'); a++; }
+        if(n>=1 && n<=JOB_MAX && g_jobs[n-1].used) return n-1; return -1; }
+    for(int j=JOB_MAX-1;j>=0;j--) if(g_jobs[j].used) return j;   // most recent
+    return -1;
+}
+
+// fg [%n]: resume a job in the foreground (sends SIGCONT, then waits).
+static void sh_fg(const char* a){
+    job_gc();
+    int j=job_pick(a);
+    if(j<0){ terminal_writestring("fg: no such job\n"); return; }
+    terminal_writestring(g_jobs[j].cmd); terminal_writestring("\n");
+    signal_post_pgid(g_jobs[j].pgid, SIGCONT);
+    uint32_t pgid=g_jobs[j].pgid; uint32_t pids[JOB_NPROC]; int npid=g_jobs[j].npid;
+    for(int i=0;i<npid;i++) pids[i]=g_jobs[j].pids[i];
+    g_jobs[j].used=0;                              // detach; re-added if it stops again
+    int stopped=job_wait_foreground(pgid,pids,npid);
+    if(stopped){ int jn=job_add(pgid,pids,npid,"(resumed)",1);
+                 terminal_writestring("\n["); print_dec(jn); terminal_writestring("]+ Stopped\n"); }
+}
+
+// bg [%n]: resume a stopped job in the background (SIGCONT, no wait).
+static void sh_bg(const char* a){
+    job_gc();
+    int j=job_pick(a);
+    if(j<0){ terminal_writestring("bg: no such job\n"); return; }
+    signal_post_pgid(g_jobs[j].pgid, SIGCONT);
+    g_jobs[j].stopped=0;
+    terminal_writestring("["); print_dec(j+1); terminal_writestring("] "); terminal_writestring(g_jobs[j].cmd); terminal_writestring(" &\n");
+}
+
+// [M30] run <path> [args]: now a thin wrapper over run_job, so a foreground
+// program gets job control (Ctrl-C terminates it, Ctrl-Z stops it). run_job
+// resolves an absolute path as-is, or /bin/<name> for a bare name.
 static void sh_run(const char* a){
     while(*a==' ') a++;
     if(!*a){ terminal_writestring("Usage: run <path> [args...]\n"); return; }
-    // [M16] Tokenize: first token is the path, the rest become argv[1..].
-    // argv[0] is the path itself (conventional). Bounded copy into a local store.
-    static char tok[8][128];
-    const char* av[8];
-    int argc=0;
-    while(*a && argc<8){
-        while(*a==' ') a++;
-        if(!*a) break;
-        int j=0; while(*a && *a!=' ' && j<127){ tok[argc][j++]=*a++; } tok[argc][j]=0;
-        av[argc]=tok[argc]; argc++;
-    }
-    if(argc==0){ terminal_writestring("Usage: run <path> [args...]\n"); return; }
-    const char* path = av[0];
-    extern int ksys_spawn_argv(const char*, int, const char* const*);
-    extern int ksys_wait(int);
-    extern void sched_reap_zombies(void);
-    int pid = ksys_spawn_argv(path, argc, av);
-    if(pid<0){ terminal_writestring("run: cannot launch "); terminal_writestring(path); terminal_writestring(" (missing or unsigned)\n"); return; }
-    extern int g_kverbose;
-    if(g_kverbose){ terminal_writestring("[run] pid="); print_dec(pid); terminal_writestring(" "); terminal_writestring(path); terminal_writestring("\n"); }
-    // Let the scheduler run it; we (idle) get preempted in and resumed on exit.
-    while(ksys_wait(pid)==1){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
-    sched_reap_zombies();
-    if(g_kverbose){ terminal_writestring("[run] pid="); print_dec(pid); terminal_writestring(" exited\n"); }
+    char line[256]; int q=0; for(const char* s=a; *s && q<255; s++) line[q++]=*s; line[q]=0;
+    run_job(line, 0);
 }
 
 // [M31] Toggle kernel verbosity (the per-spawn [PROC]/[ELF]/[M5]/... debug noise).
@@ -1503,7 +1677,26 @@ static void sh_elfload2(const char* a) {
     }
 static void sh_elfunload(const char* a) { extern process_t* process_get_last(void); extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t* p); uint32_t pid=0; while(*a==' ') a++; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* target = pid? process_find_by_pid(pid): process_get_last(); if(!target) terminal_writestring("[ELFUNLOAD] process not found\n"); else { int ur=process_destroy(target); if(ur==0) terminal_writestring("[ELFUNLOAD] OK (process destroyed)\n"); else terminal_writestring("[ELFUNLOAD] FAIL\n"); } }
 static void sh_ps(const char* a){ (void)a; pager_begin(); shell_ps_list(); pager_end(); }
-static void sh_kill(const char* a){ extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t*); while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: kill <pid>\n"); return; } uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* t=process_find_by_pid(pid); if(!t){ terminal_writestring("[KILL] PID not found\n"); return; } int r=process_destroy(t); if(r==0) terminal_writestring("[KILL] OK\n"); else terminal_writestring("[KILL] FAIL\n"); }
+// [M30] kill [-SIG] <pid> | kill [-SIG] %job — send a signal (default SIGTERM).
+// Now signal-based (was a forced process_destroy): it works on blocked/stopped
+// targets and respects user handlers, like a real shell `kill`.
+static void sh_kill(const char* a){
+    while(*a==' ') a++;
+    if(!*a){ terminal_writestring("Usage: kill [-SIG] <pid> | kill [-SIG] %job\n"); return; }
+    int sig=15; // SIGTERM
+    if(*a=='-'){ a++; int n=0; while(*a>='0'&&*a<='9'){ n=n*10+(*a-'0'); a++; } if(n>0) sig=n; while(*a==' ') a++; }
+    if(*a=='%'){
+        job_gc(); int j=job_pick(a);
+        if(j<0){ terminal_writestring("kill: no such job\n"); return; }
+        int n=signal_post_pgid(g_jobs[j].pgid, sig);
+        terminal_writestring("[kill] signaled "); print_dec(n); terminal_writestring(" proc(s)\n");
+        return;
+    }
+    uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; }
+    process_t* t=process_find_by_pid(pid);
+    if(!t){ terminal_writestring("[kill] PID not found\n"); return; }
+    if(signal_post(t,sig)==0) terminal_writestring("[kill] OK\n"); else terminal_writestring("[kill] FAIL\n");
+}
 // Helper per decodificare flags manifest
 static void decode_manifest_flags(uint32_t f, char* out, size_t cap) {
     out[0]='\0';
@@ -1564,6 +1757,18 @@ static void sh_pinfo(const char* a){
 static void execute_command(char* line) {
     while(*line==' ') line++;
     if (!*line) return;
+
+    // [M30] Trailing '&' => run in the background. Strip it (and trailing space).
+    int background=0;
+    { int L=0; while(line[L]) L++;
+      while(L>0 && (line[L-1]==' '||line[L-1]=='\t')) L--;
+      if(L>0 && line[L-1]=='&'){ background=1; L--; while(L>0 && (line[L-1]==' '||line[L-1]=='\t')) L--; }
+      line[L]=0; }
+
+    // [M30] A pipeline (`a | b | ...`) is always launched as external programs
+    // through the job-control path — builtins do not participate in pipelines.
+    for(char* s=line; *s; s++) if(*s=='|'){ run_job(line, background); return; }
+
     char* args=line; while(*args && *args!=' ') args++; if(*args){ *args='\0'; args++; while(*args==' ') args++; }
     const char* cmd=line;
     // Ricerca lineare (pochi comandi, costo trascurabile). In futuro: ordinare e binary search.
@@ -1572,6 +1777,7 @@ static void execute_command(char* line) {
     }
     // [M31] Not a builtin → try to launch a signed program: an absolute path as-is,
     // otherwise /bin/<cmd> (so `hexdump f`, `uname -a`, `seq 1 5` run by name).
+    // [M30] Launched through run_job so it gets job control (Ctrl-C/Ctrl-Z, &).
     {
         extern vfs_inode_t* vfs_lookup(const char*);
         char path[160]; int p=0;
@@ -1584,7 +1790,7 @@ static void execute_command(char* line) {
             for(int k=0; path[k] && q<255; k++) rl[q++]=path[k];
             if (*args){ rl[q++]=' '; for(const char* s=args; *s && q<255; s++) rl[q++]=*s; }
             rl[q]=0;
-            sh_run(rl);
+            run_job(rl, background);
             return;
         }
     }

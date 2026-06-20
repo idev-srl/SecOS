@@ -538,6 +538,23 @@ grep -q "\[m25\] DONE-USER" "$M25LOG"; check "M25 pipe demo program completed" $
 grep -q "\[M25\] DONE" "$M25LOG"; check "M25 demo completed ([M25] DONE)" $?
 ! grep -q "\[EXC\]" "$M25LOG"; check "no CPU exception ([EXC]) during M25 run" $?
 
+# ---- M30: signals (handler + raise + sigreturn, SIG_IGN of SIGPIPE) ----
+M30LOG=/tmp/secos_selftest_m30.log
+echo "[selftest] Building M30 image (M30_SIGNAL_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make CFLAGS_EXTRA=-DM30_SIGNAL_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M30 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running M30 (mb2, ${TIMEOUT}s)..."
+tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$M30LOG" >/dev/null 2>&1 || true
+grep -q "\[SIG\] deliver sig=0x000000000000000A" "$M30LOG"; check "M30 SIGUSR1 delivered to a custom handler" $?
+grep -q "\[m30\] caught SIGUSR1" "$M30LOG"; check "M30 handler ran in ring 3" $?
+grep -q "\[m30\] sigreturn ok" "$M30LOG"; check "M30 sigreturn restored the interrupted context" $?
+grep -q "\[m30\] sigpipe epipe ok" "$M30LOG"; check "M30 SIG_IGN of SIGPIPE: EPIPE without termination" $?
+grep -q "\[M30\] DONE" "$M30LOG"; check "M30 demo completed ([M30] DONE)" $?
+! grep -q "\[EXC\]" "$M30LOG"; check "no CPU exception ([EXC]) during M30 run" $?
+
 # ---- M27b: write-side journaling (crash atomicity) ----
 # Build a verify image + two crash images, then for each crash point: run1 cuts
 # power mid-commit, run2 recovers and reports. A write-journalled op must be

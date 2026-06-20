@@ -184,11 +184,12 @@ int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=
     if(c->fds[fd].is_pipe){ pipe_unref((pipe_t*)c->fds[fd].inode, c->fds[fd].pipe_w); c->fds[fd].is_pipe=0; }  // [M25] drop end, may signal EOF/EPIPE
     c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
 int ksys_read(int fd, void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
-    // [M25] fd 0 (stdin) -> the console TTY cooked line discipline (ring-3 input).
-    if(fd==0){ extern int tty_read(void* buf, int len); return tty_read(buf, len); }
-    if(fd<0||fd>=32||!c->fds[fd].used) return -1;
-    if(c->fds[fd].is_pipe){ if(c->fds[fd].pipe_w) return -1; return pipe_read((pipe_t*)c->fds[fd].inode, buf, len); } // [M25] read end only
-    vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->read) return -1;
+    if(fd<0||fd>=32) return -1;
+    // [M30] A redirected pipe/file end takes precedence over the console
+    // special-case, so a pipeline can wire its read end onto fd 0 (stdin).
+    if(c->fds[fd].used && c->fds[fd].is_pipe){ if(c->fds[fd].pipe_w) return -1; return pipe_read((pipe_t*)c->fds[fd].inode, buf, len); } // [M25] read end only
+    if(c->fds[fd].used && c->fds[fd].inode){
+    vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino->ops||!ino->ops->read) return -1;
     // [M20] Read through the unified page cache so file read() and file-backed
     // mmap see the same pages (coherent). [M23] Virtual FSes (devfs/procfs/sysfs)
     // are dynamic — bypass the cache and read live via ->read().
@@ -196,14 +197,20 @@ int ksys_read(int fd, void* buf, int len){ extern process_t* sched_get_current(v
     if(ino->ops->flags & VFS_FS_NOCACHE) r=ino->ops->read(ino, off, buf, (size_t)len);
     else r=pagecache_read(ino, off, buf, (uint64_t)len);
     if(r>0) c->fds[fd].offset += (uint64_t)r; return r; }
+    // [M25] fd 0 (stdin) with no redirection -> the console TTY cooked line discipline.
+    if(fd==0){ extern int tty_read(void* buf, int len); return tty_read(buf, len); }
+    return -1; }
 int ksys_write(int fd, const void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
-    // [M9] fd 1 (stdout) / 2 (stderr) -> console. The buffer was already
-    // user_range_valid()'d by the SYS_WRITE dispatcher; CR3 is the caller's
-    // address space during the syscall, so reading it directly is safe.
+    if(fd<0||fd>=32) return -1;
+    // [M30] A redirected pipe/file end takes precedence over the console
+    // special-case, so a pipeline can wire its write end onto fd 1 (stdout).
+    if(c->fds[fd].used && c->fds[fd].is_pipe){ if(!c->fds[fd].pipe_w) return -1; return pipe_write((pipe_t*)c->fds[fd].inode, buf, len); } // [M25] write end only
+    if(c->fds[fd].used && c->fds[fd].inode){ vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino->ops||!ino->ops->write) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->write(ino, off, buf, (size_t)len); if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); } return r; }
+    // [M9] fd 1 (stdout) / 2 (stderr) with no redirection -> console. The buffer
+    // was already user_range_valid()'d by the SYS_WRITE dispatcher; CR3 is the
+    // caller's address space during the syscall, so reading it directly is safe.
     if(fd==1||fd==2){ const char* p=(const char*)buf; for(int i=0;i<len;i++){ terminal_putchar(p[i]); debugcon_putchar(p[i]); } return len; }
-    if(fd<0||fd>=32||!c->fds[fd].used) return -1;
-    if(c->fds[fd].is_pipe){ if(!c->fds[fd].pipe_w) return -1; return pipe_write((pipe_t*)c->fds[fd].inode, buf, len); } // [M25] write end only
-    vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1; if(!ino->ops||!ino->ops->write) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->write(ino, off, buf, (size_t)len); if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); } return r; }
+    return -1; }
 
 long ksys_lseek(int fd, long offset, int whence){
     extern process_t* sched_get_current(void);

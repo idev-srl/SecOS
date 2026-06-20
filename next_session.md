@@ -1,12 +1,29 @@
 # SECoS — Resume Here (session handoff)
 
+## ✅ M30 (signals + job control + shell pipelines) DONE this session
+Full POSIX-style signals for ring-3 + shell job control. See `docs/devlog/M30.md`
+and the M30 bullet in `CLAUDE.md`. Highlights:
+- `kernel/signal.{c,h}`: per-process pending/blocked masks + `sig_handler[32]` +
+  `pgid`/`ppid` + `PROC_STOPPED`. `signal_dispatch(tf)` at the syscall/timer/
+  exception return-to-ring3 asm chokepoints (default term/stop/ignore, or a
+  custom handler frame returning via the `__sigreturn` trampoline in `crt0.S`).
+  Syscalls 44–48 (SIGACTION/SIGRETURN/KILL/SIGPROCMASK/SETPGID).
+- Async: keyboard Ctrl-C/Ctrl-Z → SIGINT/SIGTSTP to `foreground_pgid`; SIGPIPE;
+  SIGCHLD; EINTR on blocking syscalls.
+- Shell: pipelines `a|b|c`, background `&`, `jobs`/`fg`/`bg`, signal-based `kill`.
+- Validated non-interactively: m30_sig demo (handler+raise+sigreturn, SIGPIPE) +
+  pipelines/bg over serial (`seq 1 100 | wc`→`100 100 292`). **Self-test +M30.**
+- **⚠️ STILL TO VALIDATE INTERACTIVELY ON VMWARE**: async Ctrl-C (kill a
+  compute-bound foreground job), Ctrl-Z→Stopped + `fg`/`bg` resume. The PS/2
+  keyboard IRQ is the only async source (serial input is polled). The delivery
+  mechanism itself is proven; the keyboard path mirrors the VMware-verified
+  M28-2/M25 keyboard handling. Test on the VMware console.
+
 _Last updated: **2026-06-20 — SecOS RUNS ON REAL HARDWARE** (ASUS E406S, via the
 GRUB ISO). Phases F–K + I done (kernel, process model, VM, storage+journaling, SMP,
-networking, real libc/coreutils, signed packages, init). This session: M28 (APIC/
-TSC) + M29 (SMP) + Phase K (M31 libc/coreutils + M32 packages/init) + lots of polish
-(`poweroff` ACPI, clean `help`, run-by-name shell, verbosity gate, fast console
-scroll, SMP made opt-in after a real-HW freeze). Self-test **173/173**.
-HEAD `3f776dd` on `main`, pushed. Read this first._
+networking, real libc/coreutils, signed packages, init) + **M30 signals/job
+control**. Self-test 173/173 + M30. HEAD `3f776dd`+M30 commits on `main`. Read
+this + the M30 block above first._
 _Actionable checklist: `TASKS.md`; long plan: `docs/ROADMAP_TO_COMPLETE_OS.md`;
 per-milestone: `docs/devlog/M28..M32.md`. Memories: `real-hardware-boot`,
 `user-tests-on-vmware`, `working-style-checkpoints`._
@@ -44,9 +61,9 @@ for VMware) — rebuild + recopy after changes; check the banner `git:<hash>`.
   Add an early fault-catching IDT + on-screen markers to diagnose (output isn't
   visible on real UEFI until the FB is mapped; the loader's GOP is the only early
   display). High value: a self-contained bootable OS.
-- **B. Signals (M30)** — async Ctrl-C→SIGINT + SIGPIPE → shell job control &
-  pipelines (`cmd1 | cmd2`; pipes exist). `sched_kill_current` exists (M15), no
-  async delivery. The biggest *process-model* gap; toward a userland shell.
+- **B. ~~Signals (M30)~~ DONE** — see the M30 block at the top. Remaining:
+  interactive VMware validation of async Ctrl-C/Ctrl-Z + fg/bg; optional
+  SA_RESTART / `sigaction` flags / `WIFSTOPPED` waitpid status / sessions.
 - **C. Finish Phase K self-hosting** — `setjmp`/`longjmp` + `printf %f` + `math.h`,
   `open(O_CREAT)`/cwd/env, then **port lua or sqlite from source** and sign it
   (headline "compile OSS from source" proof). See `TASKS.md` Option 4.
