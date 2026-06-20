@@ -1,6 +1,48 @@
 # SECoS — Resume Here (session handoff)
 
-## ✅ M30 (signals + job control + shell pipelines) DONE this session
+## ✅ REAL-HARDWARE HARDENING session (2026-06-21) — HEAD `2b616bb` on `main`, pushed
+Everything below was driven + validated by the user on the **ASUS E406S** (real HW)
+booting the **native UEFI loader** (`secos-uefi.img` on USB). Images on
+`C:\Users\Luigi\SecOS\` rebuilt at **`git:2b616bb`** (`secos-uefi.img` real HW +
+`.vmdk` VMware). Commits this session (newest first):
+- **`2b616bb` fix(fb): `clear` disabled the double buffer → slow direct-VRAM console.**
+  THE root cause of "console fast then slow": `clear`→`fb_console_init` did
+  `dbuf_enabled=0;dbuf=NULL` (+leak), so scrolling memmoved *within VRAM* (reads
+  VRAM, slow even with WC). `cmd_clear` now re-enables dbuf+auto-flush+WC; init
+  frees the old dbuf. ✅ validated on ASUS.
+- **`b81a2d1` / `0e06eff` perf(fb): framebuffer Write-Combining via PAT** +
+  re-assert before each command. Real firmware MTRRs mark VRAM UC (slow writes);
+  WC (PAT slot 1, `vmm_pat_init`/`vmm_set_physmap_wc`, `fb_apply_wc`) batches them.
+  Something resets it between commands on real HW → re-asserted per command. ✅ fast on ASUS.
+- **`fa8c370` fix(shell): Ctrl-C interrupts long builtins** (`cat /dev/random` was
+  uninterruptible — a builtin runs kernel-side, no fg process). `keyboard_break_pending()`
+  flag set on Ctrl-C with no fg pgid; `sh_cat` polls it. ✅ validated on ASUS.
+- **`db45018` feat(usb): multiple USB Mass Storage** (`usb0`..`usb3`, per-instance)
+  + robust MBR/GPT detection (VBR-guard; rescan skips partitions).
+- **`02f872c` fix(xhci): real-time port reset** (ktime, not iteration counts) +
+  100ms settle → **USB enumerates on real Braswell xHCI** (was `enumerated_devices=0`).
+  ✅ ASUS: boot stick enumerates, partitions, FAT32 read. New `usbrescan` (hot-plug).
+- **`91b867d` feat(shell): `lspci` + `usbinfo`** diagnostics (blind-debug, FB-visible).
+- **`ba9912d` feat(block): MBR/GPT partition parsing** → mount FS inside a partition
+  (`usb0p1`, `sda1`…); real partitioned media now usable. `/mnt` auto-mount + `mountdev`.
+- **`afb7f3c`/`48b7803`/`f312d6d` UEFI loader + reboot fixed for real HW** (open bug
+  #1 CLOSED): ACPI `pv()` #PF on large-RAM (tables in reserved mem > usable top →
+  `vmm_extend_physmap`); loader copies the firmware PML4 (full identity) + kernel
+  copies bootinfo; `reboot` uses FADT reset reg/0xCF9/triple-fault (8042 didn't work
+  on the laptop). ✅ both validated on ASUS. See `docs/devlog/UEFI_REALHW.md`.
+- **`8af4772` docs: ARM64 (RPi/SBC) port deferred to post-roadmap** — see
+  `docs/ARM64_PORT.md`, memory `arm64-port-plan`. Keep portability in mind for every change.
+
+**Open follow-ups (low priority):** eMMC/SDHCI driver (the ASUS internal storage —
+Alpine on eMMC — is invisible; not a PCI-standard controller SecOS supports);
+USB hot-plug is manual (`usbrescan`, no async detect); FB-WC re-assert is per-command
+(if a single huge render slows mid-way, add a periodic re-assert). Self-test NOT re-run
+this session per user pref (fast smoke/boot checks instead — see memory `working-style-selftests`).
+
+_NEXT: pick from the candidates below (Phase L security, Phase K self-hosting/lua-sqlite,
+SMP hardening bug #2, or more real-HW polish). The UEFI-loader bug #1 is now CLOSED._
+
+## ✅ M30 (signals + job control + shell pipelines) DONE (prior session)
 Full POSIX-style signals for ring-3 + shell job control. See `docs/devlog/M30.md`
 and the M30 bullet in `CLAUDE.md`. Highlights:
 - `kernel/signal.{c,h}`: per-process pending/blocked masks + `sig_handler[32]` +
@@ -20,15 +62,14 @@ and the M30 bullet in `CLAUDE.md`. Highlights:
   with no matching `sti` on the job-done path) → the shell froze at its
   keyboard `hlt` after the first foreground command. Fixed in `0aec6da`.
 
-_Last updated: **2026-06-20 — M30 (signals + job control + pipelines) DONE,
-validated on VMware + real HW, pushed.** Phases F–K + I done (kernel, process
-model, VM, storage+journaling, SMP, networking, real libc/coreutils, signed
-packages, init) + **M30**. Self-test **179/179**. HEAD `8041267` on `main`,
-pushed to origin. Read the M30 block above first, then "NEXT SESSION TASK"._
+_Last updated: **2026-06-21 — real-HW hardening (UEFI loader+reboot, USB/xHCI,
+partitions, console speed) all validated on the ASUS.** HEAD `2b616bb` on `main`,
+pushed. The native UEFI loader now boots + runs fully on the ASUS. Read the
+real-HW block at the very top first._
 
-_Images on `C:\Users\Luigi\SecOS\` rebuilt at `git:0aec6da`: `secos-uefi.vmdk`
-(VMware) + `secos.iso` (real HW). Rebuild + recopy after changes; check the
-banner `git:<hash>`._
+_Images on `C:\Users\Luigi\SecOS\` rebuilt at **`git:2b616bb`**: `secos-uefi.img`
+(real HW, USB) + `secos-uefi.vmdk` (VMware) + `secos.iso` (GRUB real HW). Rebuild +
+recopy after changes; check the banner `git:<hash>`._
 _Actionable checklist: `TASKS.md`; long plan: `docs/ROADMAP_TO_COMPLETE_OS.md`;
 per-milestone: `docs/devlog/M28..M32.md`. Memories: `real-hardware-boot`,
 `user-tests-on-vmware`, `working-style-checkpoints`._
