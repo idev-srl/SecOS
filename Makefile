@@ -69,6 +69,7 @@ SRC_C   = \
 	$(FS_DIR)/vfs.c \
 	$(FS_DIR)/ramfs_vfs.c \
 	$(FS_DIR)/block.c \
+	$(FS_DIR)/partition.c \
 	$(FS_DIR)/fat32.c \
 	$(FS_DIR)/ext2.c \
 	$(FS_DIR)/ext2ramdev.c \

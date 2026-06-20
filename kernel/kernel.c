@@ -1399,6 +1399,12 @@ static void kernel_main_phase2(void) {
         // disk back-end above.
         extern int usb_init(void);
         usb_init();
+        // Real media (USB sticks, SATA/NVMe disks) is partitioned (MBR/GPT) — the
+        // QEMU test images put a raw FS at LBA 0 and hid this. Register each
+        // partition as a sub-device (usb0p1, sda1, ...) so a filesystem inside a
+        // partition can be found and mounted.
+        extern void block_scan_partitions(void);
+        block_scan_partitions();
         if (have_virtio) {
             block_dev_t* vda = block_find("vda");
             if (vda) {
@@ -1475,6 +1481,17 @@ static void kernel_main_phase2(void) {
             if (!block_find(cand[i])) continue;
             if      (fat32_mount(cand[i], "/mnt") == 0) { fsname = "FAT32"; mounted_dev = cand[i]; }
             else if (ext2_mount (cand[i], "/mnt") == 0) { fsname = "extN";  mounted_dev = cand[i]; }
+        }
+        // Partitioned media: if no whole-disk raw FS mounted, try every registered
+        // block device — including the partition sub-devices (usb0p1, sda1, ...).
+        if (!fsname) {
+            int bn = block_count();
+            for (int bi = 0; bi < bn && !fsname; bi++) {
+                block_dev_t* bd = block_get(bi);
+                if (!bd) continue;
+                if      (fat32_mount(bd->name, "/mnt") == 0) { fsname = "FAT32"; mounted_dev = bd->name; }
+                else if (ext2_mount (bd->name, "/mnt") == 0) { fsname = "extN";  mounted_dev = bd->name; }
+            }
         }
         (void)mounted_dev;
         if (fsname) {

@@ -14,7 +14,9 @@
 // hardware op atomic against this CPU's ISRs too.
 static spinlock_t block_io_lock = SPINLOCK_INIT;
 
-#define BLOCK_MAX_DEVS 4
+// Base disks (vda/sda../nvme0n1/usb0) + their MBR/GPT partition sub-devices
+// (usb0p1, sda1, ...) all live here, so this must be comfortably > a few disks.
+#define BLOCK_MAX_DEVS 24
 static block_dev_t* g_devs[BLOCK_MAX_DEVS];
 static int str_eq(const char* a,const char* b){ while(*a && *b){ if(*a!=*b) return 0; a++; b++; } return *a==0 && *b==0; }
 
