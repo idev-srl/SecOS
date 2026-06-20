@@ -13,11 +13,20 @@
 
 static acpi_topology_t g_topo;
 
-/* ACPI tables live in low RAM. Read them through the kernel's permanent low
- * identity map (0-512 MiB) — it is always present, whereas the physmap may not
- * yet cover the ACPI region on the UEFI path. Fall back to the physmap above 512 MiB. */
+/* Read ACPI tables through the kernel's permanent low identity map (0-512 MiB)
+ * when they live there; otherwise through the physmap.
+ *
+ * [UEFI-FIX] On large-RAM UEFI machines (e.g. 2 GB+, including the ASUS test
+ * laptop) the firmware places the ACPI tables in RESERVED memory ABOVE the usable
+ * RAM top. vmm_init_physmap() sizes the physmap to *usable* RAM only, so that
+ * reserved region is unmapped → dereferencing it here triple-faulted before this
+ * kernel even had an IDT on real hardware (it never happened on small-RAM OVMF
+ * where the tables sit below 512 MiB and take the identity path). Fix: extend the
+ * physmap to cover this address (plus a 1 MiB margin for the table body) before
+ * returning a physmap pointer. vmm_extend_physmap is idempotent and 2MB-granular. */
 static const uint8_t* pv(uint64_t phys){
     if(phys < 0x20000000ULL) return (const uint8_t*)phys;
+    vmm_extend_physmap(phys + 0x100000ULL);
     return (const uint8_t*)phys_to_virt(phys);
 }
 static uint16_t rd16(const uint8_t* p){ return (uint16_t)(p[0] | (p[1]<<8)); }

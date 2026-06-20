@@ -1795,6 +1795,21 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     g_multiboot_magic = multiboot_magic;
     g_multiboot_info  = multiboot_info;
 
+#if CONFIG_UEFI
+    // [UEFI-FIX] The bootinfo struct lives in the loader's memory, which real
+    // firmware may place above 512 MB. We are still on the loader's CR3 here (it
+    // inherits the firmware identity map, so this deref is valid), but once we
+    // install our own page tables in vmm_init() the loader region is no longer
+    // mapped — phase2 (framebuffer) and acpi_init() would then fault dereferencing
+    // it. Copy it into a kernel-owned struct now and use that everywhere after.
+    static struct secos_boot_info g_uefi_bootinfo;
+    if (multiboot_magic == 0 && multiboot_info != 0) {
+        g_uefi_bootinfo  = *(struct secos_boot_info*)multiboot_info;
+        g_multiboot_info = (uint64_t)&g_uefi_bootinfo;
+        multiboot_info   = (uint64_t)&g_uefi_bootinfo; // keep the local in sync for PMM below
+    }
+#endif
+
     terminal_writestring("Multiboot magic: "); print_hex(multiboot_magic);
     terminal_writestring("  info: "); print_hex(multiboot_info); terminal_writestring("\n");
     if (multiboot_magic == 0x2BADB002) {

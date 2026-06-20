@@ -11,29 +11,37 @@
 #include "bootinfo.h"
 // Nota: page table setup minimale (solo identità + segmenti kernel) prima di ExitBootServices.
 
-// Attiva le nostre tabelle di pagine: carica CR3, assicura PAE in CR4, NXE in EFER.
-static void activate_page_tables(uint8_t* pml4) {
-    if (!pml4) return;
-    // CR4: abilita PAE (bit 5)
-    unsigned long cr4;
-    __asm__ __volatile__("mov %%cr4, %0" : "=r"(cr4));
-    cr4 |= (1UL << 5); // PAE
-    __asm__ __volatile__("mov %0, %%cr4" :: "r"(cr4));
+// [UEFI-FIX] Install the kernel's high-half mapping WITHOUT discarding the
+// firmware's identity map.
+//
+// The old code built a fresh PML4 that identity-mapped only 0-512 MB and loaded
+// it into CR3. That assumes the loader image, its stack, the bootinfo struct, the
+// UEFI memory map and the framebuffer all live below 512 MB. OVMF and VMware do
+// place everything low, so they worked. Real firmware (e.g. the ASUS E406S) may
+// place any of those ABOVE 512 MB, so the very next instruction fetch / data
+// access after the CR3 load was unmapped → triple fault, before the kernel IDT
+// exists (no [EXC], the machine just resets — exactly the reported symptom).
+//
+// Fix: COPY the live firmware PML4 (so we inherit its *complete* identity map,
+// wherever RAM/MMIO is) and add only entry 511 → our high-half PDPT. Entry 511 is
+// the top canonical slot the kernel lives in and firmware does not use it.
+static void install_kernel_mapping(uint8_t* pml4_copy, uint8_t* pdpt_hi) {
+    if (!pml4_copy || !pdpt_hi) return;
+    uint64_t cr3;
+    __asm__ __volatile__("mov %%cr3, %0" : "=r"(cr3));
+    const uint64_t* cur = (const uint64_t*)(cr3 & 0x000FFFFFFFFFF000ULL); // firmware PML4 (identity-accessible)
+    uint64_t* dst = (uint64_t*)pml4_copy;
+    for (int i = 0; i < 512; i++) dst[i] = cur[i];            // inherit full firmware identity
+    dst[511] = (uint64_t)pdpt_hi | 0x3;                       // + kernel high half (Present|Write)
 
-    // Carica nuovo CR3 (PML4 phys address). Assumiamo identity mapping fisica per pml4.
-    __asm__ __volatile__("mov %0, %%cr3" :: "r"(pml4));
-
-    // EFER: abilita NXE (bit 11) se non presente. LME è già attivo in ambiente UEFI.
+    // EFER.NXE: the kernel sets the NX bit on data/stack pages. LME/PAE are
+    // already on under UEFI long mode; only NXE may be missing.
     unsigned long eax, edx;
     __asm__ __volatile__("mov $0xC0000080, %%ecx; rdmsr" : "=a"(eax), "=d"(edx) : : "ecx");
     eax |= (1UL << 11); // NXE
     __asm__ __volatile__("mov $0xC0000080, %%ecx; wrmsr" :: "a"(eax), "d"(edx): "ecx");
 
-    // CR0: assicura paging (bit 31) e protezione (bit 0) già attivi. Reinforza PG.
-    unsigned long cr0;
-    __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
-    cr0 |= (1UL << 31); // PG
-    __asm__ __volatile__("mov %0, %%cr0" :: "r"(cr0));
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"((uint64_t)pml4_copy) : "memory");
 }
 
 // Forward: ELF kernel loader (implemented in elf_load.c)
@@ -71,6 +79,19 @@ static void print_hex64(EFI_SYSTEM_TABLE* st, uint64_t v) {
     puts16(st, buf);
 }
 
+// [UEFI-FIX] Blind-debug progress marker: paint a full-width colored stripe
+// straight into the framebuffer. There is no serial on the target laptop, so on a
+// reset the last visible color tells us how far the handoff got. Safe before AND
+// after ExitBootServices because the final CR3 inherits the firmware identity map
+// (the framebuffer is mapped wherever it physically lives). No-op without GOP.
+static void fb_bar(uint64_t fb, uint32_t pitch_px, uint32_t width, uint32_t row, uint32_t color) {
+    if (!fb || !pitch_px || !width) return;
+    volatile uint32_t* p = (volatile uint32_t*)fb;
+    for (uint32_t y = 0; y < 16; y++)
+        for (uint32_t x = 0; x < width; x++)
+            p[(uint64_t)(row * 16 + y) * pitch_px + x] = color;
+}
+
 // Executes expr; if != EFI_SUCCESS prints "<where>: <status>" and returns.
 // Requires `SystemTable` in scope.
 #define CHECK_OK(where, expr) do { \
@@ -87,11 +108,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     // Locate GOP
     EFI_GRAPHICS_OUTPUT_PROTOCOL* gop = NULL;
     CHECK_OK("Locate GOP", SystemTable->BootServices->LocateProtocol(&EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, NULL, (void**)&gop));
+    uint64_t fb_base = 0; uint32_t fb_pitch_px = 0, fb_w = 0;
     if (gop && gop->Mode && gop->Mode->Info) {
         puts16(SystemTable, WIDE("GOP found: ")); print_hex64(SystemTable, gop->Mode->FrameBufferBase); puts16(SystemTable, WIDE("\r\n"));
+        fb_base     = gop->Mode->FrameBufferBase;
+        fb_pitch_px = gop->Mode->Info->PixelsPerScanLine;
+        fb_w        = gop->Mode->Info->HorizontalResolution;
     } else {
         puts16(SystemTable, WIDE("GOP not found\r\n"));
     }
+    // [UEFI-FIX] stage markers (top of screen): blue=entered+GOP.
+    fb_bar(fb_base, fb_pitch_px, fb_w, 0, 0x000000FF);
 
     // Fase 1: Ottieni mappa di memoria completa
     uint64_t map_size = 0, map_key=0, desc_size=0; uint32_t desc_ver=0;
@@ -117,31 +144,28 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     puts16(SystemTable, WIDE("[OK] Kernel ELF caricato, entry= "));
     print_hex64(SystemTable, (uint64_t)kernel_entry);
     puts16(SystemTable, WIDE("\r\n"));
+    fb_bar(fb_base, fb_pitch_px, fb_w, 1, 0x0000FFFF); // stage2: cyan = ELF loaded
 
-    // Fase 2: costruzione tabelle di pagine (PML4, PDPT, PDT, PT) minimale
-    // Strategia: identity map area bassa (<=512MB) + mappa segmenti kernel alle loro vaddr se rientrano.
-    // Per semplicità: usiamo pagine da 2MB (PS) come nel percorso BIOS iniziale.
-    // [M12] Higher-half: PML4[0] -> identity 0-512MB (for the bootloader's own
-    // running code/stack/bootinfo, all < 512MB), and PML4[511] -> the SAME 512MB
-    // page-directory so the kernel is reachable at KERNEL_VMA (0xFFFFFFFF80000000).
-    uint64_t pml4_phys = 0, pdpt_phys = 0, pdt_phys = 0, pdpt_hi_phys = 0;
-    uint8_t* pml4 = NULL; uint8_t* pdpt = NULL; uint8_t* pdt = NULL; uint8_t* pdpt_hi = NULL;
+    // Fase 2: build ONLY the kernel's high-half backing; the low identity map is
+    // inherited from the firmware at activate time (see install_kernel_mapping).
+    // [M12] Higher-half: PML4[511] -> PDPThi[510] -> PDT (2MB pages) so the kernel,
+    // linked at KERNEL_VMA (0xFFFFFFFF80000000) but loaded at its low LMA, is
+    // reachable until it installs its own page tables. We allocate one page for a
+    // COPY of the firmware PML4 (filled in install_kernel_mapping), the high PDPT
+    // and the PDT.
+    uint64_t pml4_phys = 0, pdt_phys = 0, pdpt_hi_phys = 0;
+    uint8_t* pml4_copy = NULL; uint8_t* pdt = NULL; uint8_t* pdpt_hi = NULL;
     CHECK_OK("AllocPages PML4",   SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pml4_phys));
-    CHECK_OK("AllocPages PDPT",   SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdpt_phys));
     CHECK_OK("AllocPages PDT",    SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdt_phys));
     CHECK_OK("AllocPages PDPThi", SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdpt_hi_phys));
-    pml4 = (uint8_t*)pml4_phys; pdpt = (uint8_t*)pdpt_phys; pdt = (uint8_t*)pdt_phys; pdpt_hi = (uint8_t*)pdpt_hi_phys;
-    for(int i=0;i<4096;i++){ pml4[i]=0; pdpt[i]=0; pdt[i]=0; pdpt_hi[i]=0; }
-    // PML4[0] -> PDPT[0] -> PDT (low identity)
-    ((uint64_t*)pml4)[0] = (uint64_t)pdpt | 0x3;
-    ((uint64_t*)pdpt)[0] = (uint64_t)pdt | 0x3;
-    // Identity map prime 512MB con entry 2MB
+    pml4_copy = (uint8_t*)pml4_phys; pdt = (uint8_t*)pdt_phys; pdpt_hi = (uint8_t*)pdpt_hi_phys;
+    for(int i=0;i<4096;i++){ pdt[i]=0; pdpt_hi[i]=0; } // pml4_copy is filled from the live PML4 at activate time
+    // High-half backing: identity phys 0-512MB with 2MB pages, exposed at KERNEL_VMA.
     for(int e=0;e<256;e++) {
         uint64_t phys = (uint64_t)e << 21; // e*2MB
         ((uint64_t*)pdt)[e] = phys | 0x83; // Present|Write|PS
     }
-    // PML4[511] -> PDPThi[510] -> same PDT (high half KERNEL_VMA -> phys 0)
-    ((uint64_t*)pml4)[511]    = (uint64_t)pdpt_hi | 0x3;
+    // PML4[511] -> PDPThi[510] -> PDT (high half KERNEL_VMA -> phys 0)
     ((uint64_t*)pdpt_hi)[510] = (uint64_t)pdt | 0x3;
 
     // Fase 3: Rimappare segmenti ELF (placeholder: già copiati in pool; mapping reale post-ExitBootServices non ancora implementato).
@@ -204,6 +228,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     // Any puts16 after GetMemoryMap allocates console buffers and stales the map_key.
     // Solution: print BEFORE the loop, then only GetMemoryMap + EBS inside it, no console.
     uint64_t final_map_size = alloc_buf_size; uint64_t final_map_key=0; uint64_t final_desc_size=0; uint32_t final_desc_ver=0;
+    fb_bar(fb_base, fb_pitch_px, fb_w, 2, 0x00FFFF00); // stage3: yellow = page tables built, about to EBS
     puts16(SystemTable, WIDE("[BOOT] Calling ExitBootServices\r\n"));
     EFI_STATUS ebs = EFI_INVALID_PARAMETER;
     for (int _att = 0; _att < 8 && ebs == EFI_INVALID_PARAMETER; _att++) {
@@ -217,6 +242,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     // Console still available iff ebs != EFI_SUCCESS (boot services not yet exited)
     if (ebs != EFI_SUCCESS) { print_status(SystemTable, WIDE("ExitBootServices"), ebs); return ebs; }
     /* === No UEFI Boot Services or Console calls past this point === */
+    fb_bar(fb_base, fb_pitch_px, fb_w, 3, 0x00FF00FF); // stage4: magenta = ExitBootServices done
 
     // Fase 5: Costruisci struttura handoff
     static struct secos_boot_info bootinfo;
@@ -243,13 +269,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         /* No console available post-EBS — just halt */
         for(;;){ __asm__ __volatile__("hlt"); }
     }
-    /* Attiva page tables custom prima del handoff.
-     * A questo punto bootinfo è già costruita (gop->Mode letto sopra),
-     * quindi non servono più accessi a strutture dati UEFI.
-     * Il codice del bootloader e il bootinfo statico sono entrambi
-     * sotto 512MB (memoria convenzionale), quindi l'identity map copre
-     * istruzioni correnti, stack e il puntatore bootinfo. */
-    activate_page_tables(pml4);
+    /* Install our page tables before the handoff. bootinfo is already fully built
+     * (GOP/memory map/ACPI read above), so no UEFI structures are touched past
+     * this point. install_kernel_mapping inherits the firmware identity map, so
+     * the loader's current code, stack and the bootinfo pointer stay mapped
+     * REGARDLESS of where firmware placed them (the old 512MB-only map was the
+     * real-hardware triple-fault). The kernel then copies bootinfo into its own
+     * memory in phase1 before switching to its own CR3 (kernel/kernel.c). */
+    install_kernel_mapping(pml4_copy, pdpt_hi);
+    fb_bar(fb_base, fb_pitch_px, fb_w, 4, 0x0000FF00); // stage5: green = CR3 installed, jumping to kernel
     // Firma attesa: void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info)
     void (*kentry)(uint32_t, uint64_t) = (void(*)(uint32_t, uint64_t))kernel_entry;
     kentry(0, (uint64_t)&bootinfo);

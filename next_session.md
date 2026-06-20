@@ -42,14 +42,21 @@ Images live in `C:\Users\Luigi\SecOS\` (`secos.iso` for real HW, `secos-uefi.vmd
 for VMware) — rebuild + recopy after changes; check the banner `git:<hash>`.
 
 ## ⚠️ TWO OPEN BUGS found by testing on real hardware (high-value to fix)
-1. **Custom UEFI loader triple-faults on real firmware.** `uefi/boot.c` →
-   `secos-uefi.img`/`.vmdk` works on QEMU/OVMF + VMware but **reboot-loops on the
-   ASUS** (shows briefly, resets — fault before the IDT, so no `[EXC]`). Disabling
-   APIC+SMP (`-DSECOS_NO_APIC -DSECOS_NO_SMP`, safe-boot gates exist) did NOT help →
-   the bug is in the loader or very-early kernel init (pre-IDT) on real firmware,
-   NOT M28/M29. Workaround: boot via the GRUB ISO. **Fix the loader (or make GRUB
-   the primary boot path).** The ISO needs host pkg `grub-efi-amd64-bin` for the
-   UEFI El Torito (already installed); else it's BIOS-only.
+1. **Custom UEFI loader triple-faults on real firmware.** ⏳ **FIX READY — needs
+   ASUS validation.** Found TWO root causes (see `docs/devlog/UEFI_REALHW.md`):
+   (a) **the real killer** — `acpi.c:pv()` reads ACPI tables via the physmap for
+   addresses > 512 MiB, but `vmm_init_physmap` sizes the physmap to *usable* RAM
+   only, and firmware puts the tables in *reserved* memory above the usable top →
+   kernel `#PF` in `acpi_init` (reproduced at `-m 2G`; certain on the 4 GB ASUS).
+   Fixed: `pv()` calls `vmm_extend_physmap`. (b) the loader installed a 512 MiB-only
+   identity map before the kernel jump → triple fault if firmware placed the loader
+   image/stack/bootinfo high. Fixed: copy the live firmware PML4 (inherit full
+   identity) + add the high half; kernel copies `bootinfo` into its own memory in
+   phase1. **Validated in QEMU+OVMF at `-m 2G/4G/8G` (clean boot, ACPI parsed, no
+   `[EXC]`), smoke `--uefi`/`--mb2` PASS, selftest 179/179.** GOP stage-color bars
+   added for blind debug on the ASUS (blue→cyan→yellow→magenta→green; vanish on
+   success). **NEXT: boot the new `secos-uefi.img`/`.vmdk` on the ASUS.** If it
+   still stops, the last bar color localizes the stage. (NOT yet committed.)
 2. **SMP freezes on real hardware under load.** `stress 8` with real cores brought
    up froze the machine — a race / **missing TLB shootdown** that QEMU (interleaved
    cores) and VMware never exposed. **FIX SHIPPED this session: AP bring-up is now
