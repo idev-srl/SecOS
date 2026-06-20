@@ -115,6 +115,16 @@ init). Remaining toward true self-hosting:
 
 ---
 
+## 🌍 Post-roadmap: ARM64 port (DECIDED, deferred — see `docs/ARM64_PORT.md`)
+- [ ] **AArch64 backend for RPi/SBC**, started **after the x64 roadmap is done**.
+      Not a recompile — a second `arch/arm64` backend (boot/MMU/GIC/timer/context
+      switch/syscall/MMIO drivers). First bring-up target: **QEMU `virt`**.
+- [ ] **Forward discipline meanwhile** (cheap, only when touching those files):
+      trapframe accessors over `tf->rdi`/`tf->rax`; no new port-I/O outside
+      `drivers/`+`arch/`; page-table bits + higher-half constant stay in `mm/vmm.*`.
+
+---
+
 ## 🧹 Smaller open items / tech debt (independent of milestone choice)
 
 - [ ] **Makefile: no header-dep tracking** — `.h`/`-D` changes need a manual
