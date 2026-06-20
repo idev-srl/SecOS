@@ -141,20 +141,26 @@ exists), `SYS_KILL` + a minimal libc `signal`/`kill`/`sigaction`. Unblocks **she
 job control + pipelines** (`cmd1 | cmd2`, `&`). _Security:_ signal delivery respects
 process ownership; no cross-trust-domain signalling.
 
-## Phase K — Userland & (near) self-hosting (M31–M32)
+## ✅ Phase K — Userland & (near) self-hosting — **DONE** (M31–M32)
 
-- **M31 — libc completeness + ported software.** Round out libc: stdio, malloc
-  (have), fuller string/math, time, errno, sockets (have), a **pthreads subset**
-  (on M19/threads). Port real software *from source*: **dash** (or grow the native
-  shell), **lua**, **sqlite**, a coreutils-like toolset. _Security:_ each ported
-  tool is signed before it runs.
-- **M32 — init + service manager + signed packages.** A real `init` (PID 1),
-  service supervision, dependency ordering; a **signed package format** (install =
-  verify + unpack into the FS — the natural extension of the M9 signing root); a
-  package **keyring + revocation**.
+- **M31 — real libc + coreutils.** Standard headers (`string/stdio/stdlib/ctype/
+  unistd/dirent/...`) + `user/libc.c` (printf family, FILE layer, string/stdlib/
+  ctype, malloc/realloc/qsort). File-management syscalls (getdents/create/mkdir/
+  unlink) → a **busybox-style coreutils** (26 applets: echo/cat/wc/head/tail/ls/
+  mkdir/rm/touch/cp/stat/hexdump/seq/uname/...), one signed ELF installed to
+  `/bin`. See `docs/devlog/M31.md`. _Security:_ every applet is the one signed
+  binary; the trust boundary is unchanged.
+- **M32 — signed packages + supervised init.** A `.spkg` format (`tools/secos-pkg`
+  + `kernel/pkg.c`): **install = verify the Ed25519 signature, then unpack** — a
+  forged/tampered package installs nothing (same signing root as code, M9). Shell
+  `pkg install`. A minimal **supervised `init`** (service table, restart-on-exit
+  up to a limit) + a demo service. See `docs/devlog/M32.md`.
 
-**Exit criteria K:** boots to a multi-service userland; can install and run signed
-third-party software built from source.
+**Exit criteria K (met):** a real libc + a coreutils userland; signed packages
+install via the verify-then-unpack rule; a service manager supervises signed
+services. _Open toward full self-hosting:_ `open(O_CREAT)`/cwd/env, `setjmp`/
+`longjmp` + `%f` + `math.h` (to port lua/sqlite from source), package keyring +
+revocation, a boot-wired PID-1 init. Tracked in `TASKS.md`.
 
 ## Phase L — Security hardening (cross-cutting, dedicated pass) (M33–M35)
 
@@ -196,9 +202,11 @@ security events are audited.
 ## Recommended near-term sequence (next few sessions)
 
 1. **M30 — signals** (Ctrl-C→SIGINT, SIGPIPE, `kill`) → shell job control + pipelines.
-2. **SMP polish** (IPI reschedule / per-CPU runqueues) *or* **NIC HW validation**,
-   as opportunity allows.
-3. **Phase K** — grow libc + port a first real tool (sqlite/lua) from source.
+   _Now the most visible gap_ — the libc/userland (Phase K) is in, but a
+   compute-bound foreground program still can't be interrupted.
+2. **Finish Phase K self-hosting** — `setjmp`/`longjmp` + `%f` + `math.h`, then
+   port lua/sqlite from source and sign it (the headline thesis proof).
+3. **SMP polish** (IPI reschedule / per-CPU runqueues) *or* **NIC HW validation**.
 4. **Phase L** — the generalized capability model + audit, then mitigations.
 
 A GUI/display server, window system, and desktop userland are explicitly **out of
@@ -207,6 +215,7 @@ scope here** and would be a later Phase M+.
 ## How this maps to the existing roadmap
 
 Phases A–E (M0–M13) = the original mandatory plan. M14 = first stretch. Phases
-**F–J + H + I are done** (M15–M29). What remains is **M30 (signals)** and Phases
-**K (userland, M31–M32)** and **L (security hardening, M33–M35)** — the path from
-"a complete headless OS kernel" to "a self-hosting, hardened, least-privilege OS".
+**F–K + H + I are done** (M15–M32). What remains is **M30 (signals)**, the
+self-hosting tail of **K** (external ports), and Phase **L (security hardening,
+M33–M35)** — the path from "a complete signed-userland OS" to "a self-hosting,
+hardened, least-privilege OS".

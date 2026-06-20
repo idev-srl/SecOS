@@ -1,6 +1,6 @@
 # SECoS — Task List & Status
 
-_Snapshot: HEAD `a358f42` on `main` (pushed to `origin/main`). Self-test **165/165**._
+_Snapshot: HEAD `7d45b38` on `main` (pushed to `origin/main`). Self-test **173/173**._
 _Last updated: 2026-06-20._
 
 This file tracks what is **done** vs **open**, and the candidate work for the next
@@ -38,10 +38,13 @@ session. The narrative handoff lives in `next_session.md`; the long-term plan in
 | M27b | **Write-side journaling** (SecOS's own metadata writes crash-atomic) — **Phase H complete** | ✅ done |
 | M28 | **Modern platform** (Phase I pt1–3): ACPI discovery + **APIC switchover** (LAPIC timer + IOAPIC retire the 8259) + **TSC monotonic clock** | ✅ done |
 | M29 | **SMP / multicore** (Phase I final): per-CPU data, AP bring-up, CPU-pinned scheduling — **user tasks run on multiple cores**; verified on real VMware | ✅ done |
+| M31 | **Real C library + coreutils** (Phase K): standard headers + `user/libc.c` (printf/string/stdlib/ctype/stdio/dirent); file syscalls (getdents/create/mkdir/unlink); 26-applet busybox-style coreutils installed to `/bin` | ✅ done |
+| M32 | **Signed packages + init** (Phase K): `.spkg` format (`tools/secos-pkg` + `kernel/pkg.c`, verify+unpack, tampered refused); supervised `init` service-manager + demo service | ✅ done |
 
 **Phases done:** A–E (M0–M13), F (M15–M17), G (M18–M20), H (M26–M27), I (M28–M29),
-J/networking (M24). Foundation, process model, VM, storage maturity, modern
-platform + multicore, and networking are all in.
+J/networking (M24), **K (M31–M32)**. Foundation, process model, VM, storage
+maturity, modern platform + multicore, networking, and a real signed userland are
+all in. **Remaining: M30 (signals) and Phase L (security hardening).**
 
 ---
 
@@ -90,12 +93,17 @@ read, and there is no SIGPIPE. This blocks real interactive use.
 - [ ] Validate vmxnet3 on real VMware; igc (2.5 GbE) on real I225/I226.
 - [ ] Tune 82574 MSI-X re-arm; try dropping the poll backstop.
 
-### Option 4 — Phase K: userland & (near) self-hosting _(large, multi-session)_
-- [ ] **libc completeness** — stdio, fuller string/math, time, errno, a pthreads
-      subset (on M19/threads). Port real software *from source* (dash, lua, sqlite).
-- [ ] **init / service manager** (PID 1, supervision, dependency ordering).
-- [ ] **Signed package format** — install = verify + unpack (extends the M9 signing
-      root); keyring + revocation.
+### Option 4 — finish Phase K self-hosting _(libc done; ports remain)_
+Phase K core is **done** (M31 libc+coreutils, M32 signed packages + supervised
+init). Remaining toward true self-hosting:
+- [ ] **`open(O_CREAT)` creates** (today use `creat_file`); `getcwd`/per-process cwd
+      + an environment (so `pwd`/`getenv` work in userland, not just the shell).
+- [ ] **libc gaps** — `printf` floats (`%f/%g`), fuller stdio/locale, `setjmp`/
+      `longjmp` (needed by lua/sqlite), a `math.h`, a pthreads subset (on M19).
+- [ ] **Port a real program from source** (lua or sqlite) and sign it — the
+      headline proof of the "compile OSS from source" thesis.
+- [ ] **Package keyring + revocation**; a real PID-1 `init` wired into boot
+      (today `/bin/init` is run on demand); dependency ordering.
 
 ### Option 5 — Phase L: security hardening _(the differentiator, dedicated pass)_
 - [ ] **Generalized capability model** — lift M11's driver-caps to all processes:

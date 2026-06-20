@@ -1,32 +1,52 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **Phase I COMPLETE — multicore works.** This session shipped M28-2
-(APIC switchover, VMware-verified), M28-3 (TSC clock), and **M29 (SMP)**: M29-1
-primitives + locks, M29-2 AP bring-up, M29-3 multicore scheduling — **ring-3 user
-tasks run on application processors in parallel** (`[SMP] cpu=1 run pid=…`). HEAD
-on `main`, pushed. Read this first._
-_Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M29.md`._
+_Last updated: **Phase K COMPLETE — real userland.** This session also finished
+Phase I (M28 APIC/TSC, M29 SMP — multicore VMware-verified). Phase K: **M31** real
+libc (printf/string/stdlib/stdio/dirent) + file syscalls + a 26-applet busybox
+coreutils in `/bin`; **M32** signed `.spkg` packages (verify+unpack, tampered
+refused) + a supervised `init`. Self-test **173/173**. HEAD `7d45b38` on `main`,
+pushed. Read this first._
+_Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M31.md`, `M32.md`._
 
-## ✅ SMP VERIFIED ON REAL VMWARE (user, 4 vCPUs)
-`stress 8` ran clean on VMware → multicore confirmed on hardware. `stress 16` then
-exposed a real SMP race in the M5 per-process kernel stack (shared kernel page
-table edited at runtime) → fixed (`28ff58a`, `kstack_lock`); `stress 16`/`32` now
-clean (48 procs across 4 cores, no leak). Latest VMware image `git:28ff58a` in
-`C:\Users\Luigi\SecOS\secos-uefi.vmdk`. The shell `stress [N]` command launches N
-CPU-bound spinners (signed `user/spin.c`) to saturate the vCPUs.
+## ⚠️ PENDING USER VERIFICATION (Phase K on VMware)
+Build `make uefi-vmdk`, boot, and try the userland from the shell:
+`run /bin/ls /`, `run /bin/cat /VERSION`, `run /bin/wc <f>`, `run /bin/hexdump <f>`,
+`run /bin/uname -a`, `run /bin/init` (service supervision). Signed packages:
+`pkg install <file.spkg>`. NOTE: each `run` of a signed binary pays an Ed25519
+verify — instant on real hardware, ~seconds under QEMU TCG.
 
-## ▶▶ NEXT SESSION TASK: pick one (Phase I is done)
-Phase I (ACPI → APIC → TSC → SMP) is complete. Open fronts, roughly by value:
-1. **Signals** — async Ctrl-C→SIGINT + SIGPIPE → shell job control & pipelines
+## ▶▶ NEXT SESSION TASK: pick one (Phases F–K + I done)
+1. **Signals (M30)** — async Ctrl-C→SIGINT + SIGPIPE → shell job control & pipelines
    (`cmd1 | cmd2`; pipes already exist). `sched_kill_current` exists (M15); no
-   async delivery yet. Long-requested; unblocks a real interactive shell.
-2. **SMP hardening / polish** — IPI-based reschedule (a wake on another core
-   preempts immediately, not at the next tick); per-CPU run queues (today: one
-   shared proc table under `proc_lock` — fine at 2–8 cores); load balancing /
-   task migration (affinity is static round-robin now). See `docs/devlog/M29.md`
-   "Known follow-ups".
-3. **NIC hardware validation** — vmxnet3 / igc (2.5 GbE) need the real adapter.
-4. **FS follow-ups** — mid-path symlink following; `metadata_csum`; ctime bump.
+   async delivery yet. **Now the most visible gap** — the userland is in but a
+   compute-bound foreground program can't be interrupted.
+2. **Finish Phase K self-hosting** — `setjmp`/`longjmp` + `printf %f` + `math.h`,
+   `open(O_CREAT)`/cwd/env, then **port lua or sqlite from source** and sign it
+   (the headline "compile OSS from source" proof). See `TASKS.md` Option 4.
+3. **SMP polish** (IPI reschedule / per-CPU runqueues) or **NIC HW validation**.
+4. **Phase L** — generalized capability model + audit, exploit mitigations.
+
+### Phase K facts (don't relearn)
+- libc: `user/include/*.h` (standard headers) + `user/libc.c` (impl). `libc.o`
+  links into every user prog. malloc/free/calloc/realloc live in libc.c now.
+  **No GCC nested functions/statement-exprs** in user code — they need an
+  exec-stack trampoline → W^X kill.
+- New syscalls: **40 GETDENTS, 41 CREATE, 42 MKDIR, 43 UNLINK** (over vfs_*).
+  libc wrappers in libsecos.c; `<dirent.h>` opendir/readdir over GETDENTS.
+- **coreutils** = one signed binary (`user/coreutils.c` + `cu_text/file/misc.c`),
+  installed to `/bin/<applet>` at boot (`coreutils_install` in kernel.c,
+  idempotent). `RAMFS_MAX_FILES` 32→96 to fit. Applet = basename(argv[0]).
+- **`.spkg`**: `tools/secos-pkg create OUT SRC:/dest [--mkdir /d]`; digest = SHA-256
+  with the 64 sig bytes zeroed (same as ELF QSIG); `kernel/pkg.c pkg_install`
+  verifies vs `secos_trusted_pubkey` then vfs_create/mkdir. Shell `pkg install`.
+- **Gotcha that bit this session**: editing `kernel.c` (adding `#include
+  crypto/user_*_elf.h`) while a selftest was mid-run broke its later builds —
+  generate embedded headers (`make user-progs`) BEFORE referencing them, and
+  don't edit sources during a selftest run.
+
+### M29/SMP facts (don't relearn)
+- VMware-verified: `stress [N]` saturates the vCPUs. `stress 16` once exposed a
+  race in the M5 per-process kernel stack → fixed with `kstack_lock` (`28ff58a`).
 
 ### M29 facts (don't relearn)
 - **Architecture**: per-CPU run state (`arch/x86/percpu.{c,h}`, `this_cpu()` by
