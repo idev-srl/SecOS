@@ -127,10 +127,20 @@ static uint32_t blink_counter = 0; // measured in ticks
 static uint32_t blink_interval_ticks = 0; // derived from timer frequency (~500ms)
 static int cursor_blink_enabled = 0;
 static void fb_console_cursor_toggle(void);
-// Double buffering
+// Double buffering. Rendering + scrolling go to `dbuf` (normal RAM, fast); the
+// flush copies only the dirty rectangle to the framebuffer (write-only, 64-bit
+// words). This avoids reading VRAM (catastrophically slow over the bus on real
+// hardware) and minimizes VRAM traffic — the fix for slow console scroll.
 static uint8_t* dbuf = NULL; // secondary (virtual) buffer when enabled
 static int dbuf_enabled = 0;
 static int dbuf_auto_flush = 0; // automatic flush flag
+// Dirty rectangle (pixels): [dx0,dx1) x [dy0,dy1). Empty when dx1<=dx0.
+static int dx0, dy0, dx1, dy1;
+static void dirty_reset(void){ dx0 = (int)fb_width; dy0 = (int)fb_height; dx1 = 0; dy1 = 0; }
+static inline void dirty_mark(int x, int y){
+    if(x<dx0)dx0=x; if(y<dy0)dy0=y; if(x+1>dx1)dx1=x+1; if(y+1>dy1)dy1=y+1;
+}
+static inline void dirty_all(void){ dx0=0; dy0=0; dx1=(int)fb_width; dy1=(int)fb_height; }
 // (Scaling removed)
 
 // VGA 16-color palette -> RGB
@@ -353,7 +363,7 @@ void fb_console_set_color(uint8_t fg, uint8_t bg){ current_fg=fg; current_bg=bg;
 static void fb_console_flush_if_auto(void){ if(dbuf_enabled && dbuf_auto_flush) fb_console_flush(); }
 // Scaling helpers removed
 
-static void putpixel_raw(int x,int y,uint32_t rgb){ if(x<0||y<0||x>=(int)fb_width||y>=(int)fb_height) return; if(!fb_enabled) return; uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr; uint32_t* row=(uint32_t*)( (dbuf_enabled && dbuf)? (dbuf + y*fb_pitch) : (base + y*fb_pitch) ); row[x]=rgb; }
+static void putpixel_raw(int x,int y,uint32_t rgb){ if(x<0||y<0||x>=(int)fb_width||y>=(int)fb_height) return; if(!fb_enabled) return; uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr; if(dbuf_enabled && dbuf){ uint32_t* row=(uint32_t*)(dbuf + y*fb_pitch); row[x]=rgb; dirty_mark(x,y); } else { uint32_t* row=(uint32_t*)(base + y*fb_pitch); row[x]=rgb; } }
 static void putpixel(int x,int y,uint32_t rgb){ putpixel_raw(x,y,rgb); }
 
 static void draw_glyph(char c, uint32_t gx, uint32_t gy){
@@ -512,13 +522,16 @@ static void scroll_if_needed(void){
     // First: clear logo area to avoid phantom copy upward
     fb_console_clear_logo_area();
     size_t copy_bytes = fb_pitch * (fb_height - cell_h);
-    for(size_t i=0;i<copy_bytes;i++) target[i] = target[i+line_bytes];
+    // Scroll up in the back buffer (RAM) with 64-bit words — never touches VRAM.
+    { size_t i=0; for(; i+8<=copy_bytes; i+=8) *(uint64_t*)(target+i)=*(uint64_t*)(target+i+line_bytes);
+      for(; i<copy_bytes; i++) target[i]=target[i+line_bytes]; }
     // Clear last row
     for(uint32_t y=fb_height - cell_h; y<fb_height; y++) {
         uint32_t* row=(uint32_t*)(target + y*fb_pitch);
         for(uint32_t x=0;x<fb_width;x++) row[x]=0x000000; }
     cursor_y--;
     fb_console_draw_logo(); // redraw in original position
+    if(dbuf_enabled) dirty_all();               // whole screen shifted
     if(dbuf_enabled && !dbuf_auto_flush) fb_console_flush();
 }
 
@@ -562,10 +575,12 @@ int fb_console_enable_dbuf(void){
     extern void* kmalloc(size_t sz); extern void kfree(void* p);
     size_t sz = fb_pitch * fb_height; dbuf = (uint8_t*)kmalloc(sz);
     if(!dbuf) return -1;
-    // Copy existing content
+    // Copy existing content (one-time; 64-bit words to limit the slow VRAM read).
     uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
-    for(size_t i=0;i<sz;i++) dbuf[i]=base[i];
+    { size_t i=0; for(; i+8<=sz; i+=8) *(uint64_t*)(dbuf+i)=*(volatile uint64_t*)(base+i);
+      for(; i<sz; i++) dbuf[i]=base[i]; }
     dbuf_enabled=1;
+    dirty_reset();
     return 0;
 }
 void fb_console_disable_dbuf(void){
@@ -576,8 +591,22 @@ void fb_console_disable_dbuf(void){
     kfree(dbuf); dbuf=NULL; dbuf_enabled=0;
 }
 void fb_console_flush(void){
-    if(!dbuf_enabled || !dbuf) return; uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
-    size_t sz = fb_pitch * fb_height; for(size_t i=0;i<sz;i++) base[i]=dbuf[i];
+    if(!dbuf_enabled || !dbuf) return;
+    if(dx1<=dx0 || dy1<=dy0) return;            // nothing dirty
+    uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
+    int x0=dx0<0?0:dx0, y0=dy0<0?0:dy0;
+    int x1=dx1>(int)fb_width?(int)fb_width:dx1, y1=dy1>(int)fb_height?(int)fb_height:dy1;
+    // Copy only the dirty pixel rectangle, row by row, with 64-bit words (then a
+    // 32-bit tail). VRAM is written sequentially and never read.
+    size_t byte0 = (size_t)x0 * 4, nbytes = (size_t)(x1 - x0) * 4;
+    for(int y=y0; y<y1; y++){
+        uint8_t* d = dbuf + (size_t)y*fb_pitch + byte0;
+        uint8_t* s = base + (size_t)y*fb_pitch + byte0;
+        size_t i=0;
+        for(; i+8<=nbytes; i+=8) *(volatile uint64_t*)(s+i) = *(uint64_t*)(d+i);
+        for(; i+4<=nbytes; i+=4) *(volatile uint32_t*)(s+i) = *(uint32_t*)(d+i);
+    }
+    dirty_reset();
 }
 void fb_console_set_dbuf_auto(int on){ dbuf_auto_flush = on?1:0; if(dbuf_auto_flush) fb_console_flush(); }
 // Removed scale APIs

@@ -1036,6 +1036,10 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
     shell_init();
     coreutils_install();   // [M31] populate /bin with the signed coreutils applets
 #if ENABLE_FB
+    // Enable the RAM back buffer + auto-flush: rendering/scroll happen in RAM and
+    // only the dirty rectangle is written to VRAM — fixes slow scroll on real HW.
+    { extern int fb_console_enable_dbuf(void); extern void fb_console_set_dbuf_auto(int);
+      if (fb_console_enable_dbuf() == 0) fb_console_set_dbuf_auto(1); }
     extern void fb_console_draw_logo(void); fb_console_draw_logo();
     extern void fb_console_flush(void); fb_console_flush();
 #endif
@@ -1168,6 +1172,7 @@ static void kernel_main_phase2(void) {
     // and timer_frequency=1000 (still used for uptime math); the switchover masks
     // the PIC and drives the same vector 0x20 (isr_timer) from the LAPIC timer at
     // 1 kHz, so timer_ticks keeps advancing. Falls back to PIC/PIT on no MADT.
+#ifndef SECOS_NO_APIC   /* safe-boot: stay on the legacy 8259 PIC + PIT */
     {
         extern int apic_switchover(uint32_t);
         if (apic_switchover(1000) == 0) {
@@ -1188,6 +1193,7 @@ static void kernel_main_phase2(void) {
                                          : "[APIC] FAIL: LAPIC timer not ticking\n");
         }
     }
+#endif /* SECOS_NO_APIC */
 
     // [M28-3] TSC timekeeping: calibrate rdtsc against PIT channel 2 (independent
     // of the 8259/APIC) for a monotonic nanosecond clock. The 1 kHz scheduler tick
@@ -1207,7 +1213,9 @@ static void kernel_main_phase2(void) {
     // [M29-2] Bring up the application processors (INIT-SIPI-SIPI). Each AP
     // enables its LAPIC, registers online, and parks (M29-3 enters the scheduler).
     // No-op on a single-CPU system or without ACPI/APIC.
+#ifndef SECOS_NO_SMP    /* safe-boot: single core, no AP bring-up */
     { extern void smp_init(void); smp_init(); }
+#endif
 
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();
