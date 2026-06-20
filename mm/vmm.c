@@ -13,6 +13,15 @@
 #include "vma.h"       // [M14] per-process demand paging
 #include "process.h"   // [M14] process_t (current process VMAs)
 #include "sched.h"     // [M14] sched_get_current()
+#include "spinlock.h"  // [M29] SMP: serialize runtime kernel page-table edits
+
+// [M29] The M5 per-process kernel-stack slots all live in one shared 2 MiB kernel
+// region (one page table). Mapping/unmapping them happens at RUNTIME on process
+// create/destroy, which under SMP run concurrently on different cores — racing on
+// the shared kernel page table (the `stress 16` panic: vmm_map -3 / "already
+// mapped"). This lock serializes those edits. (User address spaces are per-CPU and
+// need no such lock; this is the one shared-kernel-PT mutation on the hot path.)
+static spinlock_t kstack_lock = SPINLOCK_INIT;
 
 // Basic page table constants
 #define PAGE_SIZE 4096ULL
@@ -533,9 +542,11 @@ uint64_t vmm_alloc_kernel_stack_for_slot(uint32_t slot) {
         for(;;) __asm__ volatile("hlt");
     }
 
+    uint64_t fl = spin_lock_irqsave(&kstack_lock);
     m2_mark_guard(glo);
     m2_map_stack_pages(base, M5_KSTACK_PAGES);
     m2_mark_guard(ghi);
+    spin_unlock_irqrestore(&kstack_lock, fl);
 
     terminal_writestring("[M5] kstack slot=");
     m2_print_hex((uint64_t)slot);
@@ -555,6 +566,7 @@ int vmm_free_kernel_stack_for_slot(uint32_t slot) {
     uint64_t glo  = m5_kstack_guard_lo(slot);
     uint64_t ghi  = m5_kstack_guard_hi(slot);
 
+    uint64_t fl = spin_lock_irqsave(&kstack_lock);
     for (int i = 0; i < M5_KSTACK_PAGES; i++) {
         uint64_t va = base + (uint64_t)i * PAGE_SIZE;
         uint64_t phys = vmm_translate(va);
@@ -565,6 +577,7 @@ int vmm_free_kernel_stack_for_slot(uint32_t slot) {
     }
     m2_mark_guard(glo);
     m2_mark_guard(ghi);
+    spin_unlock_irqrestore(&kstack_lock, fl);
     return 0;
 }
 
