@@ -638,6 +638,25 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return (uint64_t)(int64_t)r;
     }
 
+    /* [M30] Signals + job control. SYS_SIGRETURN is handled in syscall_trap.c
+     * (it needs the live trapframe); the rest are plain dispatches. */
+    case SYS_SIGACTION: {
+        extern long ksys_sigaction(int, uint64_t, uint64_t);
+        return (uint64_t)(int64_t)ksys_sigaction((int)a0, a1, a2);
+    }
+    case SYS_KILL: {
+        extern long ksys_kill(int, int);
+        return (uint64_t)(int64_t)ksys_kill((int)a0, (int)a1);
+    }
+    case SYS_SIGPROCMASK: {
+        extern long ksys_sigprocmask(int, uint64_t, uint64_t*);
+        return (uint64_t)(int64_t)ksys_sigprocmask((int)a0, a1, (uint64_t*)a2);
+    }
+    case SYS_SETPGID: {
+        extern long ksys_setpgid(int, int);
+        return (uint64_t)(int64_t)ksys_setpgid((int)a0, (int)a1);
+    }
+
     default:
         terminal_writestring("[SYSCALL] sconosciuta\n");
         return (uint64_t)(int64_t)-1;

@@ -11,6 +11,7 @@
 BITS 64
 GLOBAL syscall_entry
 EXTERN syscall_handler
+EXTERN signal_dispatch          ; [M30] deliver pending signals on return to ring-3
 
 syscall_entry:
     ; Build int_no / err_code slots (same as ISR_NOERRCODE convention)
@@ -40,6 +41,12 @@ syscall_entry:
 
     ; Patch return value into trapframe->rax
     mov [rsp + 14*8], rax   ; offset of rax in GPR block (14 pushes from top)
+
+    ; [M30] Deliver any pending signal before returning to ring-3. signal_dispatch
+    ; may rewrite the on-stack trapframe (handler entry) — restored below — or
+    ; never return (default terminate/stop switches to another task).
+    mov rdi, rsp
+    call signal_dispatch
 
     ; Restore all GPRs
     pop r15

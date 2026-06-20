@@ -7,6 +7,7 @@
 #include "keyboard.h"
 #include "serial.h"
 #include "spinlock.h"
+#include "signal.h"   // [M30] Ctrl-C/Ctrl-Z -> SIGINT/SIGTSTP to the foreground group
 
 #define KEYBOARD_DATA_PORT 0x60
 #define BUFFER_SIZE 256
@@ -165,6 +166,26 @@ void keyboard_handler(void) {
     // path produced the bare letter.
     if (ctrl_pressed && ((ascii >= 'a' && ascii <= 'z') || (ascii >= 'A' && ascii <= 'Z'))) {
         ascii = (char)(ascii & 0x1F);
+    }
+
+    // [M30] Job control: when a foreground process group owns the console, the
+    // control keys are delivered as signals instead of being buffered for a
+    // read() — Ctrl-C => SIGINT, Ctrl-Z => SIGTSTP. At the shell prompt there is
+    // no foreground group (fg==0), so they fall through and are buffered as the
+    // line-editing control codes (the shell cancels the line on 0x03). Post after
+    // releasing kbd_lock to avoid nesting it under proc_lock.
+    {
+        uint32_t fg = signal_get_foreground_pgid();
+        int sig = 0;
+        if (fg) {
+            if (ascii == 0x03) sig = SIGINT;        // Ctrl-C
+            else if (ascii == 0x1A) sig = SIGTSTP;  // Ctrl-Z
+        }
+        if (sig) {
+            spin_unlock_irqrestore(&kbd_lock, fl);
+            signal_post_pgid(fg, sig);
+            return;
+        }
     }
 
     if (ascii) {

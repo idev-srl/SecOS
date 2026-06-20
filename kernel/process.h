@@ -26,7 +26,8 @@ typedef struct process {
     uint64_t stack_top;
     uint64_t kstack_top; // kernel stack top (for future trap/switch)
     uint8_t  kstack_slot; // bounded slot index for kernel stack region
-    enum { PROC_NEW, PROC_READY, PROC_RUNNING, PROC_BLOCKED, PROC_ZOMBIE } state;
+    enum { PROC_NEW, PROC_READY, PROC_RUNNING, PROC_BLOCKED, PROC_ZOMBIE,
+           PROC_STOPPED /* [M30] job-control stop (SIGSTOP/SIGTSTP) */ } state;
     trapframe_t* tf;      // [M6] saved trapframe for context switch
     struct regs_snapshot {
         uint64_t rip, rsp, rflags;
@@ -68,6 +69,16 @@ typedef struct process {
     uint64_t sleep_until;    // [M17] wake when timer_get_ticks() >= this (0 = n/a)
     int      recv_chan;      // [M17] IPC channel the caller is blocked receiving on (-1)
     void*    wait_pipe;      // [M25] pipe object the caller is blocked on (NULL = none)
+    // [M30] Signals + job control. sig_pending/sig_blocked are bitmasks (bit n =
+    // signal n); sig_handler[n] is the disposition (SIG_DFL/SIG_IGN or a user
+    // handler VA); sig_restorer is the libc trampoline that calls SYS_SIGRETURN.
+    // pgid/ppid drive Ctrl-C delivery (to the foreground group) and SIGCHLD.
+    uint64_t sig_pending;
+    uint64_t sig_blocked;
+    uint64_t sig_handler[32];
+    uint64_t sig_restorer;
+    uint32_t pgid;           // process group id (defaults to pid)
+    uint32_t ppid;           // parent pid (0 = no parent process, e.g. shell-spawned)
     // [M29] SMP: the CPU this process is pinned to. Assigned round-robin at
     // creation; only this CPU schedules, preempts, and reaps it, so the context
     // switch needs no lock and a freed PCB is never touched by another core.

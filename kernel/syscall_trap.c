@@ -14,6 +14,7 @@
 #include "syscall.h"
 #include "sched.h"
 #include "process.h"
+#include "signal.h"
 #include "debugcon.h"
 
 #ifdef SYSCALL_DEBUG
@@ -67,6 +68,14 @@ uint64_t syscall_handler(trapframe_t* tf) {
 
     uint64_t ret;
 
+    // [M30] SYS_SIGRETURN: restore the context saved when a signal handler was
+    // entered (reads the sigframe from the user stack and rewrites tf in place).
+    // The returned value is the interrupted code's original rax, preserved below.
+    if (num == SYS_SIGRETURN) {
+        extern long ksys_sigreturn(trapframe_t*);
+        ret = (uint64_t)ksys_sigreturn(tf);
+    }
+    else
     // [M19] SYS_FORK: copy-on-write child from the parent's live trapframe. The
     // child resumes at the same point with rax=0; the parent gets the child pid.
     if (num == SYS_FORK) {
@@ -90,6 +99,8 @@ uint64_t syscall_handler(trapframe_t* tf) {
                 ret = (uint64_t)(int64_t)-1;            // no such pid
             } else if (child->state == PROC_ZOMBIE) {
                 ret = (uint64_t)(int64_t)child->exit_code; // already exited
+            } else if (cur && signal_pending(cur)) {
+                ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR: a signal is pending
             } else if (cur) {
                 cur->wait_pid = (int)tf->rdi;
                 cur->wait_ready = 0;
@@ -107,7 +118,9 @@ uint64_t syscall_handler(trapframe_t* tf) {
     else if (num == SYS_MSG_RECV) {
         extern int ksys_msg_recv_try(int chan, void* ubuf, int len);
         int n = ksys_msg_recv_try((int)tf->rdi, (void*)tf->rsi, (int)tf->rdx);
-        if (n == 0 && cur) {
+        if (n == 0 && cur && signal_pending(cur)) {
+            ret = (uint64_t)(int64_t)(-4);              // [M30] EINTR
+        } else if (n == 0 && cur) {
             cur->recv_chan = (int)tf->rdi;
             tf->rip -= 2;                               // re-run on wake
             sched_block_current(tf);                    // NORETURN
@@ -123,6 +136,9 @@ uint64_t syscall_handler(trapframe_t* tf) {
         if (cur && cur->sleep_until != 0 && now >= cur->sleep_until) {
             cur->sleep_until = 0;                       // deadline reached
             ret = 0;
+        } else if (cur && signal_pending(cur)) {
+            cur->sleep_until = 0;                       // [M30] EINTR: abandon the sleep
+            ret = (uint64_t)(int64_t)(-4);
         } else if (cur) {
             if (cur->sleep_until == 0) {                // first entry: arm deadline
                 uint64_t ticks = tf->rdi;
@@ -143,7 +159,9 @@ uint64_t syscall_handler(trapframe_t* tf) {
         ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
         if (ret == (uint64_t)(int64_t)(-2) && cur) {
             int fd = (int)tf->rdi;
-            if (fd >= 0 && fd < 32 && cur->fds[fd].used && cur->fds[fd].is_pipe) {
+            if (signal_pending(cur)) {
+                ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR
+            } else if (fd >= 0 && fd < 32 && cur->fds[fd].used && cur->fds[fd].is_pipe) {
                 cur->wait_pipe = cur->fds[fd].inode;
                 tf->rip -= 2;                           // re-run `int 0x80` on wake
                 sched_block_current(tf);                // NORETURN (switches away)

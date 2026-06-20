@@ -6,6 +6,8 @@ BITS 64
 
 section .text
 
+extern signal_dispatch          ; [M30] deliver pending signals on return to ring-3
+
 ; Load IDT descriptor pointed by rdi
 global idt_load
 idt_load:
@@ -116,7 +118,13 @@ isr_common:
     ; Passa il puntatore alla struttura registers
     mov rdi, rsp
     call exception_handler
-    
+
+    ; [M30] A handled ring-3 exception (e.g. a demand-paged #PF) returns here and
+    ; then back to user — deliver any pending signal first. (A fatal ring-3 fault
+    ; never returns from exception_handler; ring-0 faults panic.)
+    mov rdi, rsp
+    call signal_dispatch
+
     ; Ripristina registri
     pop r15
     pop r14
@@ -178,6 +186,12 @@ isr_timer:
     ; Send EOI to whichever controller owns the line (LAPIC in APIC mode, else
     ; the 8259). Caller-saved clobbers are fine — all GPRs are restored below.
     call irq_eoi
+
+    ; [M30] On a non-preemptive timer return to ring-3, deliver any pending signal
+    ; (this is the path that delivers an async Ctrl-C/SIGINT to a compute-bound
+    ; foreground process). On a preemptive switch timer_handler never returned here.
+    mov rdi, rsp
+    call signal_dispatch
 
     pop r15
     pop r14

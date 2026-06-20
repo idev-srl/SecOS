@@ -79,6 +79,16 @@ void    free(void* p);
 /* [M19] copy-on-write fork */
 int     fork(void);
 
+/* [M30] Signals + job control. signal() installs a handler (or SIG_DFL/SIG_IGN);
+ * kill() posts a signal (pid<=0 = the caller's process group); setpgid() joins/
+ * creates a process group. See <signal.h> for the SIG* numbers. */
+typedef void (*sighandler_t)(int);
+sighandler_t signal(int sig, sighandler_t handler);
+int     kill(int pid, int sig);
+int     raise(int sig);
+int     sigprocmask(int how, const unsigned long* set, unsigned long* oldset);
+int     setpgid(int pid, int pgid);
+
 /* [M25] anonymous pipe: fds[0]=read end, fds[1]=write end. 0 on success, -1 on error. */
 int     pipe(int fds[2]);
 

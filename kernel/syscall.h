@@ -49,6 +49,12 @@
 #define SYS_CREATE   41 // create(path) -> create an empty file, 0/-1
 #define SYS_MKDIR    42 // mkdir(path) -> 0/-1
 #define SYS_UNLINK   43 // unlink(path) -> remove a file/dir, 0/-1
+// [M30] Signals + job control
+#define SYS_SIGACTION   44 // sigaction(sig, handler, restorer) -> 0/-1
+#define SYS_SIGRETURN   45 // sigreturn() -> restore the interrupted context (no return value)
+#define SYS_KILL        46 // kill(pid, sig) -> 0/-1 (pid<=0 = caller's process group)
+#define SYS_SIGPROCMASK 47 // sigprocmask(how, set, oldset*) -> 0/-1
+#define SYS_SETPGID     48 // setpgid(pid, pgid) -> 0/-1 (0 = use the target's own pid)
 
 // [M24] socket types
 #define SOCK_STREAM 1   // TCP

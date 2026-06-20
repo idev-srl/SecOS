@@ -15,6 +15,7 @@ void sched_set_idle(process_t* idle);     // register the kernel idle task
 void sched_exit_current(trapframe_t* tf);  // SYS_EXIT: zombie + switch away (no return)
 void sched_kill_current(int reason) __attribute__((noreturn)); // [M15] fault -> kill + switch away
 void sched_block_current(trapframe_t* tf); // [M16/M17] block caller (re-runs syscall on wake)
+void sched_stop_current(trapframe_t* tf) __attribute__((noreturn)); // [M30] SIGSTOP/SIGTSTP
 void sched_wake_waitpid(uint32_t pid, int code); // [M16] wake a SYS_WAIT blocker
 void sched_wake_sleepers(uint64_t now);    // [M17] wake elapsed SYS_SLEEP blockers
 void sched_wake_chan(int chan);            // [M17] wake SYS_MSG_RECV blockers on chan

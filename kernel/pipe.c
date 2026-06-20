@@ -10,6 +10,8 @@
  */
 #include "pipe.h"
 #include "spinlock.h"
+#include "process.h"
+#include "signal.h"
 #include <stddef.h>
 
 #define PIPE_SIZE 4096
@@ -65,6 +67,12 @@ int pipe_write(pipe_t* p, const void* buf, int len) {
     uint64_t fl = spin_lock_irqsave(&g_pipe_lock);
     if (p->readers == 0) {                  /* EPIPE: no reader can ever consume */
         spin_unlock_irqrestore(&g_pipe_lock, fl);
+        // [M30] POSIX: writing to a pipe with no readers raises SIGPIPE (which
+        // terminates by default) in addition to the EPIPE return. Posted after
+        // releasing g_pipe_lock to avoid nesting it under proc_lock.
+        { extern process_t* sched_get_current(void);
+          process_t* cur = sched_get_current();
+          if (cur) signal_post(cur, SIGPIPE); }
         return -1;
     }
     uint32_t space = PIPE_SIZE - p->len;

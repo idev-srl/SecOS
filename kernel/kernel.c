@@ -819,6 +819,58 @@ static void m25_run_demo(void) {
 }
 #endif /* M25_PIPE_DEMO */
 
+// ===================== M30: signals demo =====================
+// A signed ring-3 program installs a SIGUSR1 handler, raise()s it (proving
+// delivery + sigreturn), then SIG_IGNs SIGPIPE and writes to a reader-closed
+// pipe (proving EPIPE without termination). The program's [m30] lines reach
+// debugcon via SYS_WRITE fd 1, so the selftest asserts on them.
+#ifndef M30_SIGNAL_DEMO
+#define M30_SIGNAL_DEMO 0
+#endif
+#if M30_SIGNAL_DEMO
+#include "trapframe.h"
+#include "../crypto/user_m30_sig_elf.h"
+
+static uint8_t m30_idle_stack[16384] __attribute__((aligned(16)));
+static int m30_step = 0, m30_done = 0;
+
+__attribute__((noreturn)) static void m30_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m30_step == 0) {
+            m30_step = 1;
+            debugcon_writestring("[M30] --- signals ---\n");
+            process_t* p = process_create_from_elf(user_m30_sig_elf, user_m30_sig_elf_len);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M30] spawned m30_sig\n"); }
+            else   debugcon_writestring("[M30] FAIL: m30_sig not loaded\n");
+        } else if (m30_step == 1 && sched_count_alive_user() == 0 && !m30_done) {
+            m30_done = 1;
+            debugcon_writestring("[M30] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void m30_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M30] signals demo\n");
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m30_idle_stack + sizeof(m30_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m30_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M30] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf);
+}
+#endif /* M30_SIGNAL_DEMO */
+
 // ---- [M20] Page cache / file-backed mmap demo (gated; off by default) ----
 // Writes a known file into the VFS, then runs the signed `m20_mmap`: it maps the
 // file read-only (MAP_PRIVATE via the page cache), checks the mapped bytes, then
@@ -1601,6 +1653,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M25_PIPE_DEMO
     m25_run_demo(); // anonymous pipes demo — does not return
+#endif
+#if M30_SIGNAL_DEMO
+    m30_run_demo(); // signals demo — does not return
 #endif
     // Self-test VFS (basic): list root and read VERSION
     extern void shell_run_line(const char* line);

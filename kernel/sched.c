@@ -193,6 +193,15 @@ void sched_reap_zombies(void) {
     }
 }
 
+// [M30] Notify the parent of a child's exit/stop via SIGCHLD.
+static void notify_parent_sigchld(process_t* child) {
+    extern process_t* process_find_by_pid(uint32_t);
+    extern int signal_post(process_t*, int);
+    if (!child || child->ppid == 0) return;
+    process_t* parent = process_find_by_pid(child->ppid);
+    if (parent) signal_post(parent, 17 /*SIGCHLD*/);
+}
+
 void sched_exit_current(trapframe_t* tf) {
     (void)tf;
     if (!current || current == idle_task) return;
@@ -201,6 +210,7 @@ void sched_exit_current(trapframe_t* tf) {
     debugcon_writestring("\n");
     // [M16] exit_code was set by the SYS_EXIT handler from the user's status.
     current->state = PROC_ZOMBIE;
+    notify_parent_sigchld(current);                       // [M30] SIGCHLD to parent
     sched_wake_waitpid(current->pid, current->exit_code); // [M16] wake a waiter
 
     process_t* next = pick_user(current);
@@ -227,10 +237,29 @@ void sched_kill_current(int reason) {
     // Encode the fault as a signal-style status (128 + vector), à la POSIX.
     current->exit_code = 128 + (reason & 0x7F);
     current->state = PROC_ZOMBIE;
+    notify_parent_sigchld(current);                       // [M30] SIGCHLD to parent
     sched_wake_waitpid(current->pid, current->exit_code); // [M16] wake a waiter
 
     process_t* next = pick_user(current);
     if (!next) next = idle_task;       // idle reaps the zombie and carries on
+    switch_to(next);                   // NORETURN
+}
+
+// [M30] Stop the current process (SIGSTOP/SIGTSTP): save its ring-3 context,
+// mark it PROC_STOPPED (the scheduler skips it until SIGCONT flips it READY),
+// notify the parent, and switch away. Mirrors sched_block_current. NORETURN.
+void sched_stop_current(trapframe_t* tf) {
+    if (!current || current == idle_task) {
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    debugcon_writestring("[STOP] pid=");
+    debugcon_print_hex(current->pid);
+    debugcon_writestring("\n");
+    save_tf(current, tf);
+    current->state = PROC_STOPPED;
+    notify_parent_sigchld(current);
+    process_t* next = pick_user(current);
+    if (!next) next = idle_task;
     switch_to(next);                   // NORETURN
 }
 

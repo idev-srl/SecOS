@@ -28,6 +28,11 @@
 #define SYS_SENDTO   28
 #define SYS_RECVFROM 29
 #define SYS_SOCKCLOSE 30
+#define SYS_SIGACTION   44
+#define SYS_SIGRETURN   45
+#define SYS_KILL        46
+#define SYS_SIGPROCMASK 47
+#define SYS_SETPGID     48
 
 long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4) {
     long ret;
@@ -65,6 +70,21 @@ int spawn(const char* path, char* const argv[]){ return (int)secos_syscall(SYS_S
 int waitpid(int pid){ return (int)secos_syscall(SYS_WAIT, pid, 0, 0, 0, 0); }
 /* [M17] block the caller for 'ticks' timer ticks. */
 void sleep_ticks(unsigned ticks){ secos_syscall(SYS_SLEEP, (long)ticks, 0, 0, 0, 0); }
+
+/* [M30] Signals. signal() installs 'handler' for 'sig' and registers the libc
+ * sigreturn trampoline (__sigreturn, in crt0.S) as the handler's return address.
+ * SIG_DFL(0)/SIG_IGN(1) select the default/ignore dispositions. Returns 0 / -1. */
+extern void __sigreturn(void);
+sighandler_t signal(int sig, sighandler_t handler){
+    long r = secos_syscall(SYS_SIGACTION, sig, (long)handler, (long)__sigreturn, 0, 0);
+    return (r == 0) ? handler : (sighandler_t)(long)-1; /* SIG_ERR */
+}
+int kill(int pid, int sig){ return (int)secos_syscall(SYS_KILL, pid, sig, 0, 0, 0); }
+int raise(int sig){ return (int)secos_syscall(SYS_KILL, getpid(), sig, 0, 0, 0); }
+int sigprocmask(int how, const unsigned long* set, unsigned long* oldset){
+    return (int)secos_syscall(SYS_SIGPROCMASK, how, set ? (long)*set : 0, (long)oldset, 0, 0);
+}
+int setpgid(int pid, int pgid){ return (int)secos_syscall(SYS_SETPGID, pid, pgid, 0, 0, 0); }
 
 size_t strlen(const char* s) { size_t n = 0; while (s[n]) n++; return n; }
 int puts(const char* s) { write(1, s, strlen(s)); write(1, "\n", 1); return 0; }

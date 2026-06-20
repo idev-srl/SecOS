@@ -290,6 +290,11 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->exit_code = 0;
     p->wait_pid = -1; p->wait_result = 0; p->wait_ready = 0;
     p->sleep_until = 0; p->recv_chan = -1;
+    // [M30] Signals: default dispositions, empty masks, own process group, no
+    // parent process (a shell-spawned program is reaped via the poll path; the
+    // shell sets pgid for pipelines after creation). pid is assigned above.
+    { extern void signal_init_proc(process_t*); signal_init_proc(p); }
+    p->pgid = p->pid; p->ppid = 0;
     p->brk_start = USER_HEAP_BASE; p->brk_cur = USER_HEAP_BASE;
     p->mmap_next = USER_MMAP_BASE; p->mem_limit = 0;
     p->user_mem_bytes = footprint;
@@ -497,6 +502,10 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->sleep_until = 0; c->recv_chan = -1; c->exit_code = 0; c->cpu_ticks = 0;
     c->wait_pipe = NULL;                       // [M25] not blocked on a pipe
     c->proc_type = PROC_TYPE_USER; c->drv_dev_id = -1; c->drv_caps = 0;
+    // [M30] Signal dispositions/mask/restorer are inherited (shallow-copied); the
+    // pending set starts empty in the child (POSIX). ppid = parent; pgid inherited.
+    c->sig_pending = 0;
+    c->ppid = parent->pid; c->pgid = parent->pgid;
     c->state = PROC_BLOCKED;                   // not runnable until fully built
 
     // [M25] The child inherits the parent's open pipe ends (fds were shallow

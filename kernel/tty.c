@@ -21,18 +21,28 @@
  */
 #include <stdint.h>
 #include "terminal.h"
+#include "process.h"
+#include "signal.h"
 
 extern int  keyboard_has_char(void);
 extern char keyboard_getchar(void);
+extern process_t* sched_get_current(void);
 
 #define TTY_LINE 256
 static char g_line[TTY_LINE];   /* assembled line (incl. trailing '\n') */
 static int  g_len = 0;          /* bytes assembled and ready to deliver  */
 static int  g_pos = 0;          /* bytes already delivered to the reader */
 
-static char tty_getchar_blocking(void) {
-    while (!keyboard_has_char()) __asm__ volatile ("sti; hlt");
-    return keyboard_getchar();
+/* Returns 0 and stores a char in *out, or -1 if interrupted by a pending signal
+ * (so the read() returns EINTR and the signal can be delivered). [M30] */
+static int tty_getchar_blocking(char* out) {
+    while (!keyboard_has_char()) {
+        process_t* cur = sched_get_current();
+        if (cur && signal_pending(cur)) return -1;     /* [M30] EINTR */
+        __asm__ volatile ("sti; hlt");
+    }
+    *out = keyboard_getchar();
+    return 0;
 }
 
 /* Cooked line read. Returns >0 bytes (up to len), 0 on EOF (Ctrl-D on an empty
@@ -51,7 +61,8 @@ int tty_read(void* buf, int len) {
     /* Assemble a fresh line. */
     int n = 0;
     for (;;) {
-        char c = tty_getchar_blocking();
+        char c;
+        if (tty_getchar_blocking(&c) != 0) return -1;   /* [M30] interrupted */
         if (c == '\n' || c == '\r') {
             terminal_putchar('\n');
             if (n < TTY_LINE) g_line[n++] = '\n';   /* keep the newline (POSIX) */
