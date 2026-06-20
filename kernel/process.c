@@ -4,6 +4,7 @@
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
  */
+#include "kverbose.h"
 #include "process.h"
 #include "elf.h"
 #include "heap.h"
@@ -440,11 +441,13 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     vmm_harden_user_space(space);
     // [M8] Fully built — now safe for the scheduler to pick.
     p->state = PROC_NEW;
-    terminal_writestring("[PROC] creato PID=");
-    char hx[]="0123456789ABCDEF"; for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->pid>>i)&0xF]);
-    terminal_writestring(" entry="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(entry>>i)&0xF]);
-    terminal_writestring(" stack_top="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(st_top>>i)&0xF]);
-    terminal_writestring(" pages="); for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->mapped_page_count>>i)&0xF]); terminal_writestring("\n");
+    if (g_kverbose) {
+        terminal_writestring("[PROC] creato PID=");
+        char hx[]="0123456789ABCDEF"; for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->pid>>i)&0xF]);
+        terminal_writestring(" entry="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(entry>>i)&0xF]);
+        terminal_writestring(" stack_top="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(st_top>>i)&0xF]);
+        terminal_writestring(" pages="); for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->mapped_page_count>>i)&0xF]); terminal_writestring("\n");
+    }
     return p;
 }
 
@@ -561,6 +564,6 @@ int process_destroy(process_t* p) {
     if (p->space) { vmm_space_destroy(p->space); p->space = NULL; }
     proc_remove(p);
     kfree(p);
-    terminal_writestring("[PROC] distrutto\n");
+    kvlog("[PROC] distrutto\n");
     return 0;
 }

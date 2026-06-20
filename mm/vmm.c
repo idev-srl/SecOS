@@ -4,6 +4,7 @@
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
  */
+#include "kverbose.h"
 #include "vmm.h"
 #include "pmm.h"
 #include "terminal.h"
@@ -548,13 +549,15 @@ uint64_t vmm_alloc_kernel_stack_for_slot(uint32_t slot) {
     m2_mark_guard(ghi);
     spin_unlock_irqrestore(&kstack_lock, fl);
 
-    terminal_writestring("[M5] kstack slot=");
-    m2_print_hex((uint64_t)slot);
-    terminal_writestring(" base="); m2_print_hex(base);
-    terminal_writestring(" top=");  m2_print_hex(top);
-    terminal_writestring(" guards="); m2_print_hex(glo);
-    terminal_writestring("/"); m2_print_hex(ghi);
-    terminal_writestring("\n");
+    if (g_kverbose) {
+        terminal_writestring("[M5] kstack slot=");
+        m2_print_hex((uint64_t)slot);
+        terminal_writestring(" base="); m2_print_hex(base);
+        terminal_writestring(" top=");  m2_print_hex(top);
+        terminal_writestring(" guards="); m2_print_hex(glo);
+        terminal_writestring("/"); m2_print_hex(ghi);
+        terminal_writestring("\n");
+    }
 
     return top;
 }
@@ -733,9 +736,11 @@ vmm_space_t* vmm_space_create_user(void) {
         }
     }
 
-    terminal_writestring("[USER] new address space CR3=");
-    char hx[]="0123456789ABCDEF"; for(int i=60;i>=0;i-=4) terminal_putchar(hx[(space->pml4_phys>>i)&0xF]);
-    terminal_writestring("\n");
+    if (g_kverbose) {
+        terminal_writestring("[USER] new address space CR3=");
+        char hx[]="0123456789ABCDEF"; for(int i=60;i>=0;i-=4) terminal_putchar(hx[(space->pml4_phys>>i)&0xF]);
+        terminal_writestring("\n");
+    }
     return space;
 }
 
@@ -798,12 +803,14 @@ int vmm_space_destroy(vmm_space_t* space) {
     pmm_free_frame((void*)pml4_phys);
     n_tables++;
 
-    char hx[] = "0123456789ABCDEF"; char b[9]; b[8] = '\0';
-    terminal_writestring("[M1.5] vmm_space_destroy freed 0x");
-    uint32_t v = n_pages; for (int i=7;i>=0;i--){ b[i]=hx[v&0xF]; v>>=4; } terminal_writestring(b);
-    terminal_writestring(" pages, 0x");
-    v = n_tables; for (int i=7;i>=0;i--){ b[i]=hx[v&0xF]; v>>=4; } terminal_writestring(b);
-    terminal_writestring(" table frames\n");
+    if (g_kverbose) {
+        char hx[] = "0123456789ABCDEF"; char b[9]; b[8] = '\0';
+        terminal_writestring("[M1.5] vmm_space_destroy freed 0x");
+        uint32_t v = n_pages; for (int i=7;i>=0;i--){ b[i]=hx[v&0xF]; v>>=4; } terminal_writestring(b);
+        terminal_writestring(" pages, 0x");
+        v = n_tables; for (int i=7;i>=0;i--){ b[i]=hx[v&0xF]; v>>=4; } terminal_writestring(b);
+        terminal_writestring(" table frames\n");
+    }
 
     kfree(space);
     return 0;
@@ -1148,9 +1155,9 @@ void vmm_harden_user_space(vmm_space_t* space) {
         if (e & VMM_FLAG_USER) { pml4[i] = e & ~VMM_FLAG_USER; cleared++; }
     }
     if (cleared)
-        terminal_writestring("[SEC][M3] harden: cleared USER bit from kernel-half PML4 entries\n");
+        kvlog("[SEC][M3] harden: cleared USER bit from kernel-half PML4 entries\n");
     else
-        terminal_writestring("[SEC][M3] harden: kernel-half PML4 entries already supervisor-only\n");
+        kvlog("[SEC][M3] harden: kernel-half PML4 entries already supervisor-only\n");
 }
 
 void vmm_dump_entry(uint64_t virt) {

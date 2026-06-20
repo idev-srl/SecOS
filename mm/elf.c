@@ -1,3 +1,4 @@
+#include "kverbose.h"
 #include "elf.h"
 #include "vmm.h"
 #include "terminal.h"
@@ -187,11 +188,13 @@ int elf_load_image_lazy(const uint8_t* image, size_t size, vmm_space_t* space,
             return ELF_ERR_MAP;
         }
         footprint += (end - start);
-        terminal_writestring("[ELF] lazy seg vaddr=");
-        char hx[]="0123456789ABCDEF"; for(int b=60;b>=0;b-=4) terminal_putchar(hx[(vaddr>>b)&0xF]);
-        terminal_writestring(exec?" X-":" -W"); terminal_writestring("\n");
+        if (g_kverbose) {
+            terminal_writestring("[ELF] lazy seg vaddr=");
+            char hx[]="0123456789ABCDEF"; for(int b=60;b>=0;b-=4) terminal_putchar(hx[(vaddr>>b)&0xF]);
+            terminal_writestring(exec?" X-":" -W"); terminal_writestring("\n");
+        }
     }
     if (footprint_out) *footprint_out = footprint;
-    terminal_writestring("[ELF] lazy load completato\n");
+    kvlog("[ELF] lazy load completato\n");
     return ELF_OK;
 }

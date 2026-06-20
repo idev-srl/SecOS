@@ -150,6 +150,7 @@ const char* shell_get_cwd(void);   // [M23] current VFS working directory (for t
 static void sh_run(const char* a);
 static void sh_stress(const char* a);   // [M29] SMP CPU stress
 static void sh_pkg(const char* a);      // [M32] signed package install
+static void sh_verbose(const char* a);  // [M31] toggle kernel debug verbosity
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
 static void sh_drvtest(const char* a);
 #if ENABLE_RTC
@@ -249,6 +250,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"run",       sh_run},
     {"stress",    sh_stress},
     {"pkg",       sh_pkg},
+    {"verbose",   sh_verbose},
     {"drvreg",    sh_drvreg},
     {"drvunreg",  sh_drvunreg},
     {"drvlog",    sh_drvlog},
@@ -1313,12 +1315,23 @@ static void sh_run(const char* a){
     extern int ksys_wait(int);
     extern void sched_reap_zombies(void);
     int pid = ksys_spawn_argv(path, argc, av);
-    if(pid<0){ terminal_writestring("[run] load/verify failed (missing or unsigned?): "); terminal_writestring(path); terminal_writestring("\n"); return; }
-    terminal_writestring("[run] pid="); print_dec(pid); terminal_writestring(" "); terminal_writestring(path); terminal_writestring("\n");
+    if(pid<0){ terminal_writestring("run: cannot launch "); terminal_writestring(path); terminal_writestring(" (missing or unsigned)\n"); return; }
+    extern int g_kverbose;
+    if(g_kverbose){ terminal_writestring("[run] pid="); print_dec(pid); terminal_writestring(" "); terminal_writestring(path); terminal_writestring("\n"); }
     // Let the scheduler run it; we (idle) get preempted in and resumed on exit.
     while(ksys_wait(pid)==1){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
     sched_reap_zombies();
-    terminal_writestring("[run] pid="); print_dec(pid); terminal_writestring(" exited\n");
+    if(g_kverbose){ terminal_writestring("[run] pid="); print_dec(pid); terminal_writestring(" exited\n"); }
+}
+
+// [M31] Toggle kernel verbosity (the per-spawn [PROC]/[ELF]/[M5]/... debug noise).
+static void sh_verbose(const char* a){
+    extern int g_kverbose;
+    while(*a==' ') a++;
+    if(strncmp(a,"on",2)==0) g_kverbose=1;
+    else if(strncmp(a,"off",3)==0) g_kverbose=0;
+    else if(*a==0) { /* toggle */ g_kverbose = !g_kverbose; }
+    terminal_writestring("verbose: "); terminal_writestring(g_kverbose?"on\n":"off\n");
 }
 // --- Driver space commands ---
 static void sh_drvreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev = dev*10 + (*a-'0'); a++; } extern int driver_register_binding(process_t*, int); extern const device_desc_t* driver_get_device(int); extern process_t* sched_get_current(void); extern process_t* process_get_last(void);
@@ -1507,6 +1520,24 @@ static void execute_command(char* line) {
     // Ricerca lineare (pochi comandi, costo trascurabile). In futuro: ordinare e binary search.
     for (unsigned i=0;i<sizeof(shell_cmds)/sizeof(shell_cmds[0]); i++) {
         if (strcmp(cmd, shell_cmds[i].name)==0) { shell_cmds[i].handler(args); return; }
+    }
+    // [M31] Not a builtin → try to launch a signed program: an absolute path as-is,
+    // otherwise /bin/<cmd> (so `hexdump f`, `uname -a`, `seq 1 5` run by name).
+    {
+        extern vfs_inode_t* vfs_lookup(const char*);
+        char path[160]; int p=0;
+        if (cmd[0]=='/') { for(const char* s=cmd; *s && p<159; s++) path[p++]=*s; }
+        else { const char* pre="/bin/"; for(int k=0;pre[k];k++) path[p++]=pre[k];
+               for(const char* s=cmd; *s && p<159; s++) path[p++]=*s; }
+        path[p]=0;
+        if (vfs_lookup(path)) {
+            char rl[256]; int q=0;
+            for(int k=0; path[k] && q<255; k++) rl[q++]=path[k];
+            if (*args){ rl[q++]=' '; for(const char* s=args; *s && q<255; s++) rl[q++]=*s; }
+            rl[q]=0;
+            sh_run(rl);
+            return;
+        }
     }
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
     terminal_writestring("Command not found: "); terminal_writestring(cmd); terminal_writestring("\nType 'help' for the command list.\n");

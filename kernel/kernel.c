@@ -1707,6 +1707,13 @@ static void kernel_main_phase2(void) {
 uint32_t g_multiboot_magic = 0;
 uint64_t g_multiboot_info  = 0;
 
+// [M31] Kernel verbosity gate (see kverbose.h). Quiet by default so the shell
+// shows only program output; the `verbose` command flips it.
+int g_kverbose = 0;
+void kvlog(const char* s) { if (g_kverbose) terminal_writestring(s); }
+void kvhex(uint64_t v)    { if (g_kverbose) print_hex(v); }
+void kvputc(char c)       { if (g_kverbose) terminal_putchar(c); }
+
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // --- Phase 1 begins (old .bss stack) ---
     terminal_initialize();

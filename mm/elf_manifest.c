@@ -4,6 +4,7 @@
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
  */
+#include "kverbose.h"
 #include "mm/elf_manifest.h"
 #include "terminal.h"
 #include "mm/elf.h"
@@ -67,6 +68,7 @@ int elf_manifest_parse(const void* elf_buf, size_t size, elf_manifest_t* out) {
         out->dev_id    = raw->dev_id;
         out->dev_caps  = raw->dev_caps;
     }
+    if (g_kverbose) {
     terminal_writestring("[MANIFEST] parsed versione=");
     char hx[]="0123456789ABCDEF"; for(int i=4;i>=0;i-=4) terminal_putchar(hx[(out->version>>i)&0xF]);
     terminal_writestring(" flags="); for(int i=31;i>=0;i-=4) terminal_putchar(hx[(out->flags>>i)&0xF]);
@@ -76,6 +78,7 @@ int elf_manifest_parse(const void* elf_buf, size_t size, elf_manifest_t* out) {
         terminal_writestring(" caps="); for(int i=7;i>=0;i-=4) terminal_putchar(hx[(out->dev_caps>>i)&0xF]);
     }
     terminal_writestring("\n");
+    }
     return MANIFEST_OK;
 }
 
