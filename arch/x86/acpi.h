@@ -29,6 +29,12 @@ typedef struct {
     struct { uint8_t id; uint64_t base; uint32_t gsi_base; } ioapics[ACPI_MAX_IOAPICS];
     uint32_t override_count;
     struct { uint8_t src_irq; uint32_t gsi; uint16_t flags; } overrides[ACPI_MAX_OVERRIDES];
+    /* FADT/_S5 power management (for ACPI poweroff). */
+    uint32_t pm1a_cnt;    /* PM1a control register port (0 = none)   */
+    uint32_t pm1b_cnt;    /* PM1b control register port (0 = none)   */
+    uint16_t slp_typa;    /* SLP_TYPa value for S5 (soft-off)         */
+    uint16_t slp_typb;    /* SLP_TYPb value for S5                    */
+    int      s5_ok;       /* 1 if PM1a_CNT + _S5 were parsed          */
 } acpi_topology_t;
 
 /* Parse ACPI tables into the global topology. rsdp_hint is the RSDP physical
@@ -42,5 +48,10 @@ const acpi_topology_t* acpi_get(void);
 /* Map a legacy ISA IRQ to its Global System Interrupt, applying MADT interrupt
  * source overrides (identity by default). Used to program the IOAPIC. */
 uint32_t acpi_irq_to_gsi(uint8_t irq, uint16_t* flags_out);
+
+/* Power the machine off via ACPI (writes SLP_TYPx | SLP_EN to PM1a/b_CNT). Tries
+ * the FADT/_S5 values parsed at init, then well-known hypervisor fallbacks. Does
+ * not return on success; returns (to let the caller halt) if every method fails. */
+void acpi_poweroff(void);
 
 #endif /* ACPI_H */

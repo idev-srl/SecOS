@@ -117,6 +117,7 @@ static void sh_color(const char* a);
 static void sh_cursor(const char* a);
 static void sh_dbuf(const char* a);
 static void sh_halt(const char* a);
+static void sh_poweroff(const char* a);  // [M31] ACPI poweroff
 static void sh_reboot(const char* a);
 static void sh_pinfo(const char* a);
 static void sh_logo(const char* a);
@@ -215,7 +216,8 @@ static const struct shell_cmd shell_cmds[] = {
     {"dhcp",      sh_dhcp,      "acquire an IP via DHCP"},
     {"nslookup",  sh_nslookup,  "resolve a hostname"},
     {"nettest",   sh_nettest,   "TCP throughput test"},
-    {"halt",      sh_halt,      "halt the system"},
+    {"poweroff",  sh_poweroff,  "power off (ACPI soft-off)"},
+    {"halt",      sh_halt,      "halt the CPU (no power-off)"},
     {"reboot",    sh_reboot,    "reboot the system"},
 #if ENABLE_RTC
     {"date",      sh_date,      "current date/time"},
@@ -1411,6 +1413,16 @@ static void sh_drvtest(const char* a){ (void)a; extern void user_test_driver(voi
 // Mappa nomi colori (lowercase) -> codice VGA
 static void sh_halt(const char* a){ (void)a; cmd_halt(); }
 static void sh_reboot(const char* a){ (void)a; cmd_reboot(); }
+// [M31] poweroff: ACPI soft-off (works on QEMU/VMware/real HW). If ACPI is
+// unavailable, fall back to halting the CPU.
+static void sh_poweroff(const char* a){ (void)a;
+    extern void acpi_poweroff(void);
+    terminal_writestring("\nPowering off...\n");
+    __asm__ volatile("cli");
+    acpi_poweroff();                 // does not return on success
+    terminal_writestring("ACPI poweroff unavailable; halting.\n");
+    for(;;) __asm__ volatile("hlt");
+}
 #if ENABLE_RTC
 static void sh_date(const char* a){ (void)a; struct rtc_datetime dt; if (rtc_read(&dt)) { char buf[32]; rtc_format(&dt, buf, sizeof(buf)); terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK)); terminal_writestring("\nDate/Time: "); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); terminal_writestring(buf); terminal_writestring("\n"); } else { terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK)); terminal_writestring("\n[FAIL] RTC read failed\n"); terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK)); } }
 #endif
