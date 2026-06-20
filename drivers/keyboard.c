@@ -26,6 +26,9 @@ static int buffer_end = 0;
 static bool shift_pressed = false;
 static bool caps_lock = false;
 static bool ctrl_pressed = false;   // [M25] Left Ctrl (scancode 0x1D) for control codes
+static volatile int g_break_pending = 0;  // Ctrl-C with no foreground process (for shell builtins)
+int  keyboard_break_pending(void) { return g_break_pending; }
+void keyboard_clear_break(void)   { g_break_pending = 0; }
 
 // Inline port I/O
 static inline uint8_t inb(uint16_t port) {
@@ -186,6 +189,11 @@ void keyboard_handler(void) {
             signal_post_pgid(fg, sig);
             return;
         }
+        // No foreground process (shell prompt / a shell builtin is running):
+        // record the Ctrl-C so a long-running builtin loop (e.g. cat /dev/random)
+        // can poll keyboard_break_pending() and abort. Still buffered below so the
+        // prompt line-editor cancels the current line as before.
+        if (!fg && ascii == 0x03) g_break_pending = 1;
     }
 
     if (ascii) {

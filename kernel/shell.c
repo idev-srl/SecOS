@@ -1120,6 +1120,7 @@ static void sh_cat(const char* a){
     static char buf[1024];
     size_t off=0, cap=64*1024;
     while(off<cap){
+        if(keyboard_break_pending()){ terminal_writestring("^C\n"); break; }  // Ctrl-C aborts
         int r = ino->ops && ino->ops->read ? ino->ops->read(ino, off, buf, sizeof(buf)) : -1;
         if(r<=0) break;
         for(int i=0;i<r;i++) terminal_putchar(buf[i]);
@@ -1856,6 +1857,7 @@ static void sh_pinfo(const char* a){
 static void execute_command(char* line) {
     while(*line==' ') line++;
     if (!*line) return;
+    keyboard_clear_break();   // fresh Ctrl-C state for this command (builtins poll it)
 
     // [M30] Trailing '&' => run in the background. Strip it (and trailing space).
     int background=0;
