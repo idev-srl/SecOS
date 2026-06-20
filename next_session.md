@@ -1,19 +1,25 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **Phase K COMPLETE — real userland.** This session also finished
-Phase I (M28 APIC/TSC, M29 SMP — multicore VMware-verified). Phase K: **M31** real
-libc (printf/string/stdlib/stdio/dirent) + file syscalls + a 26-applet busybox
-coreutils in `/bin`; **M32** signed `.spkg` packages (verify+unpack, tampered
-refused) + a supervised `init`. Self-test **173/173**. HEAD `7d45b38` on `main`,
-pushed. Read this first._
+_Last updated: **SecOS RUNS ON REAL HARDWARE** (ASUS E406S, via the GRUB ISO) +
+Phase K complete (real libc/coreutils, signed packages, supervised init) + Phase I
+(M28 APIC/TSC, M29 SMP). Recent polish: `poweroff` (ACPI), clean `help`/quiet boot,
+run-by-name shell, verbosity gate, **fast console scroll** (RAM back buffer).
+Self-test **173/173**. HEAD on `main`, pushed. Read this first._
 _Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M31.md`, `M32.md`._
 
-## ⚠️ PENDING USER VERIFICATION (Phase K on VMware)
-Build `make uefi-vmdk`, boot, and try the userland from the shell:
-`run /bin/ls /`, `run /bin/cat /VERSION`, `run /bin/wc <f>`, `run /bin/hexdump <f>`,
-`run /bin/uname -a`, `run /bin/init` (service supervision). Signed packages:
-`pkg install <file.spkg>`. NOTE: each `run` of a signed binary pays an Ed25519
-verify — instant on real hardware, ~seconds under QEMU TCG.
+## ✅ RUNS ON REAL HARDWARE (2026-06-20) — via the GRUB ISO
+Confirmed on a real ASUS E406S laptop (Braswell, 4 GB, UEFI-only). **Boot path that
+works: the GRUB hybrid ISO** (`make iso` → `secos.iso`, flashed with balenaEtcher,
+UEFI + Secure Boot OFF). See `memory/real-hardware-boot.md`.
+- ⚠️ **OPEN BUG**: the **custom UEFI loader** (`uefi/boot.c` → `secos-uefi.img`/
+  `.vmdk`) **triple-faults into a reboot loop on real firmware** (works on
+  QEMU/OVMF + VMware). Safe-boot (`-DSECOS_NO_APIC -DSECOS_NO_SMP`) didn't help →
+  bug is in the loader or very-early kernel init on real HW, not M28/M29. **A good
+  next task: fix the loader, or make the GRUB path the primary.**
+- The ISO needs host `grub-efi-amd64-bin` for the UEFI El Torito (else BIOS-only).
+- Console scroll was unusably slow on real HW (read VRAM byte-by-byte); fixed in
+  `b6756f0` with a RAM back buffer + dirty-rect flush. If still laggy on fast
+  scroll → next lever is **write-combining (PAT)** framebuffer mapping.
 
 ## ▶▶ NEXT SESSION TASK: pick one (Phases F–K + I done)
 1. **Signals (M30)** — async Ctrl-C→SIGINT + SIGPIPE → shell job control & pipelines
