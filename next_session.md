@@ -1,36 +1,88 @@
 # SECoS — Resume Here (session handoff)
 
-_Last updated: **SecOS RUNS ON REAL HARDWARE** (ASUS E406S, via the GRUB ISO) +
-Phase K complete (real libc/coreutils, signed packages, supervised init) + Phase I
-(M28 APIC/TSC, M29 SMP). Recent polish: `poweroff` (ACPI), clean `help`/quiet boot,
-run-by-name shell, verbosity gate, **fast console scroll** (RAM back buffer).
-Self-test **173/173**. HEAD on `main`, pushed. Read this first._
-_Actionable checklist: `TASKS.md`; per-milestone detail: `docs/devlog/M31.md`, `M32.md`._
+_Last updated: **2026-06-20 — SecOS RUNS ON REAL HARDWARE** (ASUS E406S, via the
+GRUB ISO). Phases F–K + I done (kernel, process model, VM, storage+journaling, SMP,
+networking, real libc/coreutils, signed packages, init). This session: M28 (APIC/
+TSC) + M29 (SMP) + Phase K (M31 libc/coreutils + M32 packages/init) + lots of polish
+(`poweroff` ACPI, clean `help`, run-by-name shell, verbosity gate, fast console
+scroll, SMP made opt-in after a real-HW freeze). Self-test **173/173**.
+HEAD `3f776dd` on `main`, pushed. Read this first._
+_Actionable checklist: `TASKS.md`; long plan: `docs/ROADMAP_TO_COMPLETE_OS.md`;
+per-milestone: `docs/devlog/M28..M32.md`. Memories: `real-hardware-boot`,
+`user-tests-on-vmware`, `working-style-checkpoints`._
 
 ## ✅ RUNS ON REAL HARDWARE (2026-06-20) — via the GRUB ISO
-Confirmed on a real ASUS E406S laptop (Braswell, 4 GB, UEFI-only). **Boot path that
-works: the GRUB hybrid ISO** (`make iso` → `secos.iso`, flashed with balenaEtcher,
-UEFI + Secure Boot OFF). See `memory/real-hardware-boot.md`.
-- ⚠️ **OPEN BUG**: the **custom UEFI loader** (`uefi/boot.c` → `secos-uefi.img`/
-  `.vmdk`) **triple-faults into a reboot loop on real firmware** (works on
-  QEMU/OVMF + VMware). Safe-boot (`-DSECOS_NO_APIC -DSECOS_NO_SMP`) didn't help →
-  bug is in the loader or very-early kernel init on real HW, not M28/M29. **A good
-  next task: fix the loader, or make the GRUB path the primary.**
-- The ISO needs host `grub-efi-amd64-bin` for the UEFI El Torito (else BIOS-only).
-- Console scroll was unusably slow on real HW (read VRAM byte-by-byte); fixed in
-  `b6756f0` with a RAM back buffer + dirty-rect flush. If still laggy on fast
-  scroll → next lever is **write-combining (PAT)** framebuffer mapping.
+Confirmed on a real ASUS E406S laptop (Braswell N3060, 2 cores, 4 GB, UEFI-only,
+eMMC). The shell, file commands, `poweroff` all work; console is fluid.
+**Boot path that works: the GRUB hybrid ISO** (`make iso` → `secos.iso`, flashed
+with balenaEtcher, UEFI mode + Secure Boot OFF). See `memory/real-hardware-boot.md`.
+Images live in `C:\Users\Luigi\SecOS\` (`secos.iso` for real HW, `secos-uefi.vmdk`
+for VMware) — rebuild + recopy after changes; check the banner `git:<hash>`.
 
-## ▶▶ NEXT SESSION TASK: pick one (Phases F–K + I done)
-1. **Signals (M30)** — async Ctrl-C→SIGINT + SIGPIPE → shell job control & pipelines
-   (`cmd1 | cmd2`; pipes already exist). `sched_kill_current` exists (M15); no
-   async delivery yet. **Now the most visible gap** — the userland is in but a
-   compute-bound foreground program can't be interrupted.
-2. **Finish Phase K self-hosting** — `setjmp`/`longjmp` + `printf %f` + `math.h`,
-   `open(O_CREAT)`/cwd/env, then **port lua or sqlite from source** and sign it
-   (the headline "compile OSS from source" proof). See `TASKS.md` Option 4.
-3. **SMP polish** (IPI reschedule / per-CPU runqueues) or **NIC HW validation**.
-4. **Phase L** — generalized capability model + audit, exploit mitigations.
+## ⚠️ TWO OPEN BUGS found by testing on real hardware (high-value to fix)
+1. **Custom UEFI loader triple-faults on real firmware.** `uefi/boot.c` →
+   `secos-uefi.img`/`.vmdk` works on QEMU/OVMF + VMware but **reboot-loops on the
+   ASUS** (shows briefly, resets — fault before the IDT, so no `[EXC]`). Disabling
+   APIC+SMP (`-DSECOS_NO_APIC -DSECOS_NO_SMP`, safe-boot gates exist) did NOT help →
+   the bug is in the loader or very-early kernel init (pre-IDT) on real firmware,
+   NOT M28/M29. Workaround: boot via the GRUB ISO. **Fix the loader (or make GRUB
+   the primary boot path).** The ISO needs host pkg `grub-efi-amd64-bin` for the
+   UEFI El Torito (already installed); else it's BIOS-only.
+2. **SMP freezes on real hardware under load.** `stress 8` with real cores brought
+   up froze the machine — a race / **missing TLB shootdown** that QEMU (interleaved
+   cores) and VMware never exposed. **FIX SHIPPED this session: AP bring-up is now
+   opt-in** (commit `3f776dd`) — default boot is single-core + stable (LAPIC timer
+   still on). Bring cores up on demand with the shell `smp` command, or build
+   `-DSECOS_SMP_AT_BOOT`. **Real fix (open): IPI-based TLB shootdown on shared
+   kernel-PT edits (the M5 kstack reuse) + memory barriers + a real-HW lock
+   audit.** Hard to debug blind (freezes, no output) — needs real-HW diagnostics
+   (USB-serial adapter, or an on-screen heartbeat/watchdog).
+
+## ▶▶ NEXT SESSION TASK: pick one
+- **A. Fix the UEFI loader for real HW** (open bug #1) — so it boots without GRUB.
+  Likely the loader's GOP/memory-map/page-table handoff or pre-IDT kernel init.
+  Add an early fault-catching IDT + on-screen markers to diagnose (output isn't
+  visible on real UEFI until the FB is mapped; the loader's GOP is the only early
+  display). High value: a self-contained bootable OS.
+- **B. Signals (M30)** — async Ctrl-C→SIGINT + SIGPIPE → shell job control &
+  pipelines (`cmd1 | cmd2`; pipes exist). `sched_kill_current` exists (M15), no
+  async delivery. The biggest *process-model* gap; toward a userland shell.
+- **C. Finish Phase K self-hosting** — `setjmp`/`longjmp` + `printf %f` + `math.h`,
+  `open(O_CREAT)`/cwd/env, then **port lua or sqlite from source** and sign it
+  (headline "compile OSS from source" proof). See `TASKS.md` Option 4.
+- **D. SMP hardening** (open bug #2) — TLB shootdown IPI + barriers + real-HW audit.
+  Needs real-HW diagnostics first.
+- **E. Phase L** — generalized capability model + audit, exploit mitigations.
+
+### Build / test / artifacts cheat-sheet
+- `make iso` → `myos.iso` (GRUB hybrid UEFI+BIOS; the **real-HW** path).
+- `make uefi-vmdk` → `secos-uefi.vmdk` (VMware) / `make uefi-disk` → `.img`.
+- `make user-progs` → rebuilds + signs user programs, regenerates `crypto/user_*_*.h`
+  (needs python3 `cryptography`). **Run this BEFORE referencing a new embedded
+  header in the kernel**, else the kernel build fails.
+- `tools/selftest.sh` → 173/173 (~12–15 min; ONE background job; don't build
+  concurrently; don't edit sources while it runs — both bit me this session).
+- After changes: rebuild ISO+vmdk, `cp` to `/mnt/c/Users/Luigi/SecOS/`, tell the
+  user the `git:<hash>` to expect in the banner. User tests on **VMware / real HW**.
+- Quick QEMU UEFI boot of the ISO: `qemu-system-x86_64 -machine q35 -m 256M -bios
+  /usr/share/ovmf/OVMF.fd -cdrom myos.iso -serial stdio -display none -no-reboot`.
+- Headless FB screenshot: QEMU `-monitor stdio` → `screendump /tmp/fb.ppm`, then
+  `python3 -c "from PIL import Image; Image.open('/tmp/fb.ppm').save('/tmp/fb.png')"`
+  and Read the PNG (verified the console renders correctly this way).
+
+### Recent commits (this session, newest first)
+`3f776dd` SMP opt-in (default single-core, `smp` cmd) · `b6756f0` fast console
+scroll (RAM back buffer + dirty rect) · `8cddda1` `poweroff` (ACPI _S5) · `5869fa0`
+clean help (columns + `-l`) + quiet init.rc · `a13d1bc` verbosity gate + run-by-name
+· `7d45b38` M32 signed packages + init · `758fdfb`/`28fc50b` M31 coreutils + libc ·
+`84a0678`/`c390fb4` M29 SMP · `377db8a`/`eb29d94` M28 TSC/APIC.
+
+### Shell commands worth knowing
+`help` / `help -l`, run-by-name (`ls`, `hexdump f`, `uname -a`, `init`, `seq 1 5`),
+`run /bin/<x>`, `pkg install <f.spkg>`, `stress [N]`, `smp` (opt-in multicore),
+`verbose on|off`, `poweroff` / `halt` / `reboot`. Coreutils live in `/bin`
+(installed at boot, idempotent). `uname`/`ls`/`cat`/`echo` are also shell builtins
+(take precedence over `/bin/`).
 
 ### Phase K facts (don't relearn)
 - libc: `user/include/*.h` (standard headers) + `user/libc.c` (impl). `libc.o`
