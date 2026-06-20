@@ -19,6 +19,7 @@
 #include "vmm.h"
 #include "idt.h"
 #include "lapic.h"
+#include "tsc.h"      // ktime_ms — real-time delays for port reset (real-HW timing)
 #include <stddef.h>
 
 // ---- Capability registers ----
@@ -354,24 +355,41 @@ int xhci_reset_endpoint(usb_device_t* d, uint8_t ep_addr) {
     return (cc == CC_SUCCESS) ? 0 : -1;
 }
 
+// Busy-wait `ms` milliseconds using the monotonic TSC clock (calibrated by M28-3,
+// up well before usb_init in phase2). Real wall-clock time — unlike an iteration
+// count, which is meaningless across CPUs/build options and was the reason the
+// USB2 port reset never completed on real hardware.
+static void xdelay_ms(uint64_t ms) {
+    uint64_t end = ktime_ms() + ms;
+    while (ktime_ms() < end) __asm__ volatile("pause");
+}
+
 // Reset one root port and return its speed (0 if it failed to enable).
 static int port_reset(int p) {
     uint32_t sc = port_rd(p);
-    if (!(sc & PORTSC_CCS)) return 0;
-    // USB3 ports auto-enable on connect; otherwise drive a port reset.
-    if (!(sc & PORTSC_PED)) {
-        uint32_t v = (sc & ~PORTSC_RW1C & ~PORTSC_PED) | PORTSC_PR;
-        port_wr(p, v);
-        for (volatile uint64_t i = 0; i < 5000000ull; i++) {
-            sc = port_rd(p);
-            if (sc & PORTSC_PRC) break;
-        }
+    if (!(sc & PORTSC_CCS)) return 0;            // nothing connected
+    // USB3 (SuperSpeed) ports train and auto-enable on connect — no port reset.
+    if (sc & PORTSC_PED) return (int)((sc >> 10) & 0xF);
+
+    // USB2 (LS/FS/HS): drive a port reset. Write PR=1, keep PP, and write 0 to the
+    // RW1C change bits and to PED (PED is write-1-to-DISABLE).
+    port_wr(p, (sc & ~PORTSC_RW1C & ~PORTSC_PED) | PORTSC_PR);
+    // Wait (real time) up to 200ms for the reset to finish: PR self-clears and PRC
+    // (port reset change) sets. The old code spun an iteration count and bailed
+    // before real hardware had completed the reset, leaving the port NOT-enabled.
+    uint64_t end = ktime_ms() + 200;
+    while (ktime_ms() < end) {
+        sc = port_rd(p);
+        if (!(sc & PORTSC_PR) && (sc & PORTSC_PRC)) break;
+        __asm__ volatile("pause");
     }
+    xdelay_ms(10);                               // USB2 reset-recovery (device needs ~10ms)
     sc = port_rd(p);
-    // Acknowledge connect + reset change bits.
-    port_wr(p, (sc & ~PORTSC_PED) | PORTSC_CSC | PORTSC_PRC);
+    // Acknowledge the connect + reset-change bits (RW1C: write 1 to clear) without
+    // disabling the port (clear PED in the written value).
+    port_wr(p, (sc & ~PORTSC_PED & ~PORTSC_RW1C) | PORTSC_CSC | PORTSC_PRC);
     sc = port_rd(p);
-    if (!(sc & PORTSC_PED)) return 0;
+    if (!(sc & PORTSC_PED)) return 0;            // reset did not enable -> no device
     return (int)((sc >> 10) & 0xF);
 }
 
@@ -444,8 +462,18 @@ static usb_device_t* xhci_address_common(int port, int speed, uint32_t route_str
     return d;
 }
 
+// Has a root-port device already been addressed on this port? (so a re-scan after
+// hot-plug doesn't double-address an existing device).
+static int root_port_has_dev(int p) {
+    for (int i = 0; i < g_ndev; i++)
+        if (g_dev[i].tier == 0 && g_dev[i].root_port == p) return 1;
+    return 0;
+}
+
 void xhci_enumerate(void) {
+    if (!g_op) return;
     for (uint32_t p = 1; p <= g_max_ports && g_ndev < MAX_DEV; p++) {
+        if (root_port_has_dev((int)p)) continue;
         int speed = port_reset((int)p);
         if (speed == 0) continue;
         // Root-port device: route 0, no parent, tier 0, root port == this port.
@@ -543,8 +571,10 @@ int xhci_init(void) {
     for (volatile uint64_t i = 0; (op_rd(OP_USBSTS) & USBSTS_HCH); i++)
         if (i > 10000000ull) { debugcon_writestring("[XHCI] run timeout\n"); return -1; }
 
-    // Some controllers need a moment for ports to settle after RS.
-    for (volatile uint64_t i = 0; i < 2000000ull; i++) { }
+    // Ports need real time to debounce/connect after RS (USB2 connect debounce is
+    // ~100ms). The old iteration-count spin was far too short on real hardware, so
+    // ports were still settling when xhci_enumerate ran -> nothing enumerated.
+    xdelay_ms(100);
     debugcon_writestring("[XHCI] running\n");
     g_ndev = 0;
 

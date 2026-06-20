@@ -141,7 +141,7 @@ static void sh_vls(const char* a); static void sh_vcat(const char* a); static vo
 static void sh_vcreate(const char* a); static void sh_vwrite(const char* a); static void sh_vtruncate2(const char* a);
 static void sh_ext2mount(const char* a);
 static void sh_blk(const char* a); static void sh_mountdev(const char* a);
-static void sh_lspci(const char* a); static void sh_usbinfo(const char* a);
+static void sh_lspci(const char* a); static void sh_usbinfo(const char* a); static void sh_usbrescan(const char* a);
 // [M23] POSIX-style commands over the VFS (with a real working directory).
 static void sh_cd(const char* a); static void sh_pwd(const char* a); static void sh_ls(const char* a);
 static void sh_cat(const char* a); static void sh_touch(const char* a); static void sh_mkdir(const char* a);
@@ -224,6 +224,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"mountdev",  sh_mountdev,  "mount a block device"},
     {"lspci",     sh_lspci,     "list PCI devices (controllers)"},
     {"usbinfo",   sh_usbinfo,   "xHCI controller + port status"},
+    {"usbrescan", sh_usbrescan, "re-enumerate USB + rescan partitions"},
     {"netinfo",   sh_netinfo,   "network status"},
     {"ping",      sh_ping,      "ping a host"},
     {"dhcp",      sh_dhcp,      "acquire an IP via DHCP"},
@@ -1027,6 +1028,23 @@ static void sh_usbinfo(const char* a){ (void)a;
         }
         terminal_writestring("  portsc="); prhex(sc,8); terminal_writestring("\n");
     }
+}
+
+// usbrescan: re-run xHCI enumeration (picks up devices connected after boot or
+// that were still settling) and re-scan partitions, so a freshly-found usb0
+// becomes mountable. Idempotent: already-addressed ports / probed disks are
+// skipped.
+static void sh_usbrescan(const char* a){ (void)a;
+    extern void xhci_enumerate(void); extern void block_scan_partitions(void);
+    extern int block_count(void);
+    int before = block_count();
+    terminal_writestring("[usbrescan] re-enumerating USB ports...\n");
+    xhci_enumerate();
+    block_scan_partitions();
+    int after = block_count();
+    terminal_writestring("[usbrescan] block devices "); print_dec((uint64_t)before);
+    terminal_writestring(" -> "); print_dec((uint64_t)after);
+    terminal_writestring(" (run 'blk'; mount e.g. 'mountdev usb0p1 /mnt')\n");
 }
 
 // ===================== [M23] POSIX-style shell commands =====================

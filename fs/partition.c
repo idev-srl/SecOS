@@ -103,8 +103,15 @@ static int probe_gpt(block_dev_t* parent, uint32_t ss){
     return added;
 }
 
+/* Parents already probed — so a re-scan (usbrescan / hot-plug) re-probes only the
+ * newly-appeared disks instead of duplicating partitions of the existing ones. */
+static block_dev_t* g_probed[24];
+static int g_nprobed = 0;
+
 int block_probe_partitions(block_dev_t* parent){
     if(!parent || !parent->read) return 0;
+    for(int i=0;i<g_nprobed;i++) if(g_probed[i]==parent) return 0; /* already done */
+    if(g_nprobed < (int)(sizeof(g_probed)/sizeof(g_probed[0]))) g_probed[g_nprobed++]=parent;
     uint32_t ss = parent->sector_size;
     if(ss < 512 || ss > 4096) return 0;
     static uint8_t sec0[4096];
