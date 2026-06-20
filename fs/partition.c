@@ -124,7 +124,15 @@ int block_probe_partitions(block_dev_t* parent){
         if(g) return g;
         /* fall through: some hybrids also list usable MBR entries */
     }
-    /* Classic MBR: 4 primary entries of 16 bytes at offset 446. */
+    /* Classic MBR: 4 primary entries of 16 bytes at offset 446. A raw FAT/NTFS
+     * volume ALSO has 0x55AA at offset 510, so guard against parsing a VBR's boot
+     * code as a partition table: every entry's boot flag must be 0x00 or 0x80, and
+     * each partition must lie within the disk. If anything looks wrong, treat the
+     * device as an unpartitioned (whole-disk) volume. */
+    for(int i = 0; i < 4; i++){
+        uint8_t bf = sec0[446 + i*16];                   /* boot flag */
+        if(bf != 0x00 && bf != 0x80) return 0;           /* not a real MBR (likely a VBR) */
+    }
     int added = 0;
     for(int i = 0; i < 4; i++){
         const uint8_t* e = sec0 + 446 + i * 16;
@@ -132,17 +140,21 @@ int block_probe_partitions(block_dev_t* parent){
         if(type == 0) continue;                          /* empty */
         if(type == 0x05 || type == 0x0F || type == 0x85) continue; /* extended container (v0: skip) */
         if(type == 0xEE) continue;                       /* already handled as GPT */
-        uint32_t start = rd32le(e + 8);
-        uint32_t cnt   = rd32le(e + 12);
+        uint64_t start = rd32le(e + 8);
+        uint64_t cnt   = rd32le(e + 12);
+        if(cnt == 0 || start >= parent->sector_count || start + cnt > parent->sector_count) continue;
         added += add_partition(parent, start, cnt, i + 1);
     }
     return added;
 }
 
 void block_scan_partitions(void){
-    int n = block_count();          /* snapshot: only base disks registered so far */
+    int n = block_count();
     for(int i = 0; i < n; i++){
         block_dev_t* d = block_get(i);
-        if(d) block_probe_partitions(d);
+        /* Skip our own partition sub-devices (don't parse a partition's FS as a
+         * nested table). On a re-scan, base disks already probed are skipped by the
+         * g_probed guard, so only newly-appeared disks are parsed. */
+        if(d && d->read != part_read) block_probe_partitions(d);
     }
 }
