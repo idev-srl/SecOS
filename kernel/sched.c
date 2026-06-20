@@ -57,6 +57,7 @@ void sched_init(void) {
     // [M29] Ensure the BSP (CPU 0) exists before any per-CPU access. Its real
     // LAPIC ID is fixed up after ACPI/LAPIC bring-up via smp_set_bsp_lapic_id().
     if (smp_cpu_count() == 0) smp_register_cpu(0);
+    cpu_by_index(0)->online = 1;     // the boot CPU is always online
     current = NULL; idle_task = NULL;
 }
 process_t* sched_get_current(void) { return current; }

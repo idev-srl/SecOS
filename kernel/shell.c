@@ -151,6 +151,7 @@ static void sh_nettest(const char* a);                                       // 
 const char* shell_get_cwd(void);   // [M23] current VFS working directory (for the prompt)
 static void sh_run(const char* a);
 static void sh_stress(const char* a);   // [M29] SMP CPU stress
+static void sh_smp(const char* a);      // [M29] bring up secondary cores (opt-in)
 static void sh_pkg(const char* a);      // [M32] signed package install
 static void sh_verbose(const char* a);  // [M31] toggle kernel debug verbosity
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
@@ -203,7 +204,8 @@ static const struct shell_cmd shell_cmds[] = {
     {"kill",      sh_kill,      "kill a process"},
     {"run",       sh_run,       "run a signed program"},
     {"pkg",       sh_pkg,       "install a signed package (.spkg)"},
-    {"stress",    sh_stress,    "CPU stress test (SMP)"},
+    {"stress",    sh_stress,    "CPU stress test"},
+    {"smp",       sh_smp,       "bring up extra cores (experimental)"},
     {"uptime",    sh_uptime,    "time since boot"},
     {"sleep",     sh_sleep,     "sleep N seconds"},
     {"uname",     sh_uname,     "system name + build"},
@@ -1294,6 +1296,17 @@ static void sh_stress(const char* a){
     while(sched_count_alive_user() > base){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
     sched_reap_zombies();
     terminal_writestring("[stress] all "); print_dec(spawned); terminal_writestring(" done\n");
+}
+
+// [M29] smp: bring up the secondary cores on demand (AP bring-up is opt-in —
+// experimental, can freeze under heavy load on real hardware). Reports the online
+// CPU count. Safe to call once; a second call is a no-op for already-online cores.
+static void sh_smp(const char* a){ (void)a;
+    extern void smp_init(void);
+    extern unsigned int smp_online_count(void);
+    terminal_writestring("Bringing up application processors (experimental)...\n");
+    smp_init();
+    terminal_writestring("Online CPUs: "); print_dec((int)smp_online_count()); terminal_writestring("\n");
 }
 
 // [M32] pkg install <file.spkg>: read a signed package from the VFS and install

@@ -581,9 +581,9 @@ fi
 
 # ---- M28-1: ACPI topology discovery (read-only; scales with -smp) ----
 M28LOG=/tmp/secos_selftest_m28.log
-echo "[selftest] Building M28 image (default; ACPI discovery at boot)..."
+echo "[selftest] Building M28 image (ACPI discovery + AP bring-up at boot)..."
 make clean >/dev/null 2>&1 || true
-if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
+if ! make iso CFLAGS_EXTRA="-DSECOS_SMP_AT_BOOT" >/tmp/secos_selftest_build.log 2>&1; then
     echo "[selftest] M28 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     tail -20 /tmp/secos_selftest_build.log >&2; exit 2
 fi
@@ -611,7 +611,7 @@ grep -q "\[SMP\] online cpus=0x0000000000000002" "$M28LOG"; check "M29-2 AP come
 M29LOG=/tmp/secos_selftest_m29.log
 echo "[selftest] Building M29 image (M8 workload, multicore)..."
 make clean >/dev/null 2>&1 || true
-if ! make iso CFLAGS_EXTRA="-DM8_SCHED_DEMO=1 -DDEV_ALLOW_UNSIGNED" >/tmp/secos_selftest_build.log 2>&1; then
+if ! make iso CFLAGS_EXTRA="-DM8_SCHED_DEMO=1 -DDEV_ALLOW_UNSIGNED -DSECOS_SMP_AT_BOOT" >/tmp/secos_selftest_build.log 2>&1; then
     echo "[selftest] M29 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     tail -20 /tmp/secos_selftest_build.log >&2; exit 2
 fi

@@ -1210,10 +1210,13 @@ static void kernel_main_phase2(void) {
                                 : "[TSC] FAIL: clock not advancing\n");
     }
 
-    // [M29-2] Bring up the application processors (INIT-SIPI-SIPI). Each AP
-    // enables its LAPIC, registers online, and parks (M29-3 enters the scheduler).
-    // No-op on a single-CPU system or without ACPI/APIC.
-#ifndef SECOS_NO_SMP    /* safe-boot: single core, no AP bring-up */
+    // [M29-2] Application-processor bring-up is **opt-in** (experimental): on real
+    // hardware with true parallelism, heavy multicore load can deadlock/freeze —
+    // likely a missing TLB shootdown / memory-barrier the QEMU/VMware paths didn't
+    // expose. The default boot stays single-core + stable (with the modern LAPIC
+    // timer). Bring the cores up on demand with the shell `smp` command, or build
+    // with -DSECOS_SMP_AT_BOOT to start them at boot (QEMU/VMware testing).
+#ifdef SECOS_SMP_AT_BOOT
     { extern void smp_init(void); smp_init(); }
 #endif
 
