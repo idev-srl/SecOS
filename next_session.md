@@ -12,12 +12,13 @@ and the M30 bullet in `CLAUDE.md`. Highlights:
   SIGCHLD; EINTR on blocking syscalls.
 - Shell: pipelines `a|b|c`, background `&`, `jobs`/`fg`/`bg`, signal-based `kill`.
 - Validated non-interactively: m30_sig demo (handler+raise+sigreturn, SIGPIPE) +
-  pipelines/bg over serial (`seq 1 100 | wc`→`100 100 292`). **Self-test +M30.**
-- **⚠️ STILL TO VALIDATE INTERACTIVELY ON VMWARE**: async Ctrl-C (kill a
-  compute-bound foreground job), Ctrl-Z→Stopped + `fg`/`bg` resume. The PS/2
-  keyboard IRQ is the only async source (serial input is polled). The delivery
-  mechanism itself is proven; the keyboard path mirrors the VMware-verified
-  M28-2/M25 keyboard handling. Test on the VMware console.
+  pipelines/bg over serial (`seq 1 100 | wc`→`100 100 292`). **Self-test 179/179.**
+- ✅ **VALIDATED INTERACTIVELY on VMware AND real hardware** (user, this session):
+  async Ctrl-C (kills a foreground job), Ctrl-Z→Stopped + `jobs`/`fg`/`bg`,
+  pipelines, background `&` — all working on the PS/2 console.
+- **Bug fixed during bring-up**: `job_wait_foreground` returned with IF=0 (a `cli`
+  with no matching `sti` on the job-done path) → the shell froze at its
+  keyboard `hlt` after the first foreground command. Fixed in `0aec6da`.
 
 _Last updated: **2026-06-20 — SecOS RUNS ON REAL HARDWARE** (ASUS E406S, via the
 GRUB ISO). Phases F–K + I done (kernel, process model, VM, storage+journaling, SMP,
