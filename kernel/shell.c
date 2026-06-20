@@ -1401,7 +1401,8 @@ static int job_wait_foreground(uint32_t pgid, const uint32_t* pids, int npid){
         if(running==0){
             sched_reap_zombies();
             signal_set_foreground_pgid(0);
-            return stopped>0 ? 1 : 0;
+            __asm__ volatile("sti");   // re-enable IRQs before returning: the shell
+            return stopped>0 ? 1 : 0;  // hlt-waits for the keyboard with IF set
         }
         __asm__ volatile("sti; hlt");
     }
