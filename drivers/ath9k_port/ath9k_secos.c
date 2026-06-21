@@ -184,21 +184,23 @@ static void rx_bring_up(void){
     ath9k_hw_startpcureceive(g_ah, 1);
 }
 
-/* Tight, SILENT RX poll for ~dwell_ms, feeding every mgmt frame to collect_beacon.
- * No per-frame printing (it starved RX before). */
+/* Tight, SILENT RX poll for ~dwell_ms. Scans ALL buffers each round (not strict
+ * FIFO order) so a buffer filled out-of-order never stalls the whole poll. */
 static void rx_poll_collect(int dwell_ms){
-    int iters = dwell_ms * 20;                 /* ~50us per idle iter */
-    for (int spin = 0; spin < iters; spin++){
-        struct ath_rx_status rxs;
-        u8* buf = &g_rxpool[g_rx_idx][0];
-        int ret = ath9k_hw_process_rxdesc_edma(g_ah, &rxs, buf);
-        if (ret == -EINPROGRESS){ udelay(50); continue; }
-        if (ret == 0){ g_rx_frames++;
-            if (rxs.rs_status == 0 && rxs.rs_datalen >= 24)
+    int rounds = dwell_ms * 4;                  /* ~250us per idle round */
+    for (int spin = 0; spin < rounds; spin++){
+        int any = 0;
+        for (int i = 0; i < ATH_NRXBUF; i++){
+            struct ath_rx_status rxs;
+            u8* buf = &g_rxpool[i][0];
+            int ret = ath9k_hw_process_rxdesc_edma(g_ah, &rxs, buf);
+            if (ret == -EINPROGRESS) continue;  /* this buffer not filled yet */
+            any = 1; g_rx_frames++;
+            if (ret == 0 && rxs.rs_status == 0 && rxs.rs_datalen >= 24)
                 collect_beacon(buf + g_ah->caps.rx_status_len, rxs.rs_datalen, rxs.rs_rssi);
+            rx_addbuf(i);                        /* zero status + re-queue */
         }
-        rx_addbuf(g_rx_idx);
-        g_rx_idx = (g_rx_idx + 1) % ATH_NRXBUF;
+        if (!any) udelay(250);
     }
 }
 
