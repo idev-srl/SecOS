@@ -1033,12 +1033,8 @@ __attribute__((noreturn)) static void m39b_idle_entry(void) {
             m39b_step = 1;
             debugcon_writestring("[M39] --- GNU bash from source ---\n");
             extern process_t* process_create_from_elf_args(const void*, unsigned long, int, const char* const[]);
-            static const char* const argv[] = {
-                "bash", "-c",
-                "echo SECOS-BASH-OK; for i in 1 2 3; do echo $i; done | while read n; do echo n=$n; done; greet(){ echo hi $1; }; greet world; [ 5 -gt 2 ] && echo cmp-ok; x=foo; echo var=${x}bar; case $x in foo) echo case-ok;; esac; echo FINAL-OK",
-                0
-            };
-            process_t* p = process_create_from_elf_args(user_bash_elf, user_bash_elf_len, 3, argv);
+            static const char* const argv[] = { "bash", "-i", 0 };
+            process_t* p = process_create_from_elf_args(user_bash_elf, user_bash_elf_len, 2, argv);
             if (p) { p->state = PROC_READY; debugcon_writestring("[M39] spawned bash\n"); }
             else   debugcon_writestring("[M39] FAIL: bash not loaded\n");
         } else if (m39b_step == 1 && sched_count_alive_user() == 0 && !m39b_done) {
@@ -1275,6 +1271,12 @@ static void coreutils_install(void) {
 extern void shell_init(void);
 extern void shell_run(void);
 extern void shell_run_line(const char* line);
+// [M39] GNU bash from source. Embedded signed ELF, installed to /bin/bash at boot
+// and launched as the interactive login shell (the SecOS kernel shell stays as
+// the lower-level fallback, reached when bash exits). -DSECOS_NO_BASH drops it.
+#ifndef SECOS_NO_BASH
+#include "../crypto/user_bash_elf.h"
+#endif
 static uint8_t   m10_idle_stack[32768] __attribute__((aligned(16)));
 static process_t m10_idle;
 static trapframe_t m10_idle_tf;
@@ -1282,6 +1284,15 @@ static trapframe_t m10_idle_tf;
 __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
     shell_init();
     coreutils_install();   // [M31] populate /bin with the signed coreutils applets
+#ifndef SECOS_NO_BASH
+    // [M39] Install GNU bash to /bin/bash (idempotent).
+    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
+      if (!vfs_lookup("/bin/bash")) {
+          if (vfs_create("/bin/bash", user_bash_elf, user_bash_elf_len) == 0)
+              debugcon_writestring("[M39] installed GNU bash to /bin/bash\n");
+          else debugcon_writestring("[M39] FAIL: could not install /bin/bash\n");
+      } }
+#endif
 #if ENABLE_FB
     // Enable the RAM back buffer + auto-flush: rendering/scroll happen in RAM and
     // only the dirty rectangle is written to VRAM — fixes slow scroll on real HW.
@@ -1349,6 +1360,16 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
                                     : "[M32] FAIL: tampered package accepted\n");
         shell_run_line("run /bin/cat /etc/pkg-motd.txt");
     }
+#endif
+#ifndef SECOS_NO_BASH
+    // [M39] Boot into GNU bash as the interactive login shell. When bash exits
+    // (Ctrl-D / `exit`), control falls through to the SecOS kernel shell below,
+    // which remains as the low-level recovery layer.
+    { extern vfs_inode_t* vfs_lookup(const char*);
+      if (vfs_lookup("/bin/bash")) {
+          terminal_writestring("Starting GNU bash (exit drops to the SecOS recovery shell)...\n");
+          shell_run_line("run /bin/bash -i");
+      } }
 #endif
     shell_run();
     for (;;) __asm__ volatile("hlt");

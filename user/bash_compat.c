@@ -84,7 +84,7 @@ unsigned long strftime(char* s, unsigned long m, const char* f, const struct tm*
 /* ---- fd / stdio helpers ---- */
 int isascii(int c){ return (c>=0 && c<128); }
 int fchmod(int fd, int mode){ (void)fd;(void)mode; return 0; }
-int fstat(int fd, struct stat* st){ if(!st) return -1; zmem(st,0,sizeof(*st)); st->st_mode = (fd<=2)?S_IFCHR:S_IFREG; st->st_nlink=1; return 0; }
+int fstat(int fd, struct stat* st){ if(!st) return -1; zmem(st,0,sizeof(*st)); return (int)secos_syscall(56 /*SYS_FSTAT*/, fd, (long)st, 0,0,0); }
 int fileno(void* f){ return f ? *(int*)f : -1; }                 /* SecOS FILE: int fd is first member */
 void clearerr(void* f){ (void)f; }
 int setvbuf(void* f, char* b, int m, unsigned long s){ (void)f;(void)b;(void)m;(void)s; return 0; }

@@ -20,7 +20,7 @@ BFLAGS=(-ffreestanding -nostdlib -nostdinc -fno-pie -no-pie -mno-red-zone -mcmod
         -I"$ROOT/user/port-include" -I"$ROOT/user" -I"$ROOT/user/include" -isystem "$GCCINC"
         "${DDEFS[@]}" -include "$ROOT/user/bash_port.h")
 # Files we don't compile (net redirections off, no locale/random.h/iconv, host tool)
-EXCLUDE="random.c netopen.c netconn.c fpurge.c fnxform.c mkbuiltins.c mailstat.c shtty.c locale.c getenv.c strtoimax.c strtoumax.c"
+EXCLUDE="random.c netopen.c netconn.c fpurge.c fnxform.c mkbuiltins.c mailstat.c shtty.c locale.c getenv.c strtoimax.c strtoumax.c getcwd.c"
 
 echo "[port-bash] 1/6 fetch + native build (generates derived sources)"
 if [ ! -d "$WORK" ]; then

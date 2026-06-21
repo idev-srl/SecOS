@@ -52,7 +52,7 @@ int ksys_getpid(void){ extern process_t* sched_get_current(void); process_t* c=s
 // [M10] Load + signature-verify a signed ELF from a VFS path and create a
 // process for it (PROC_READY so the scheduler can pick it up). The signing
 // gate inside process_create_from_elf refuses unsigned/tampered images.
-static uint8_t g_spawn_buf[65536];
+static uint8_t g_spawn_buf[1024*1024];   // [M39] 1 MB: fits GNU bash (548 KB) & friends
 // [M16] Spawn with argv. The single static load buffer is safe because kernel
 // code is non-preemptible (preemption fires only on a ring-3 timer tick) and
 // process_create_from_elf_args copies/pins the image before returning.
@@ -229,7 +229,7 @@ int ksys_open(const char* path, int flags){
     char rp[256]; proc_resolve_path(c, path, rp, sizeof(rp)); path = rp;  // [M39] cwd-relative
     vfs_inode_t* ino=vfs_lookup(path);
     if(!ino && (flags & 0x40)){ if(vfs_create(path,"",0)==0) ino=vfs_lookup(path); }   // O_CREAT
-    if(!ino) return -1;
+    if(!ino) return -2;   // [M39] -ENOENT so libc can set errno (bash rcfile probing)
     if((flags & 0x200) && ino->size){ vfs_truncate(path,0); ino=vfs_lookup(path); if(!ino) return -1; } // O_TRUNC
     int fd=fd_alloc(c); if(fd<0) return -1;
     c->fds[fd].inode=ino; c->fds[fd].flags=flags;
@@ -299,11 +299,20 @@ static void stat_fill(const vfs_inode_t* ino, struct secos_stat* st){
     st->st_nlink = ino->nlink ? ino->nlink : 1;
     st->st_uid = ino->uid; st->st_gid = ino->gid;
     st->st_atime = ino->atime; st->st_mtime = ino->mtime; st->st_ctime = ino->ctime;
+    // [M39] A stable unique inode id (the inode pointer) so userland tree-walks —
+    // bash's getcwd compares (st_dev,st_ino) up the path — work. st_dev is a
+    // single constant (one logical FS namespace to userland).
+    st->st_dev = 1;
+    st->st_ino = (uint64_t)(uintptr_t)ino;
+    st->st_rdev = 0;
+    st->st_blksize = 512;
+    st->st_blocks = (int64_t)((ino->size + 511) / 512);
 }
 
 int ksys_stat(const char* path, struct secos_stat* st){
     extern vfs_inode_t* vfs_lookup_follow(const char*);   // [M26] follows final symlink
-    vfs_inode_t* ino=vfs_lookup_follow(path); if(!ino) return -1;
+    char rp[256]; proc_resolve_path(sched_get_current(), path, rp, sizeof(rp)); path = rp; // [M39] cwd-relative
+    vfs_inode_t* ino=vfs_lookup_follow(path); if(!ino) return -2;  // -ENOENT
     stat_fill(ino, st);
     return 0;
 }
@@ -313,7 +322,8 @@ int ksys_stat(const char* path, struct secos_stat* st){
 // the plain lookup; stat() resolution of symlinks is layered in vfs (M26-3).
 int ksys_lstat(const char* path, struct secos_stat* st){
     extern vfs_inode_t* vfs_lookup(const char*);
-    vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -1;
+    char rp[256]; proc_resolve_path(sched_get_current(), path, rp, sizeof(rp)); path = rp; // [M39] cwd-relative
+    vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -2;  // -ENOENT
     stat_fill(ino, st);
     return 0;
 }
@@ -448,6 +458,21 @@ int ksys_getcwd(char* ubuf, int len){
     return n;
 }
 int ksys_getppid(void){ process_t* c=sched_get_current(); return c? (int)c->ppid : 0; }
+
+// [M39] fstat: stat an open fd's inode so userland gets the CORRECT file type
+// (a libc stub guessing S_IFREG broke bash, which opens "/" and must see S_IFDIR).
+int ksys_fstat(int fd, struct secos_stat* st){
+    process_t* c=sched_get_current(); if(!c||!st) return -1;
+    if(fd<0||fd>=32||!c->fds[fd].used) return -1;
+    for(unsigned i=0;i<sizeof(*st);i++) ((char*)st)[i]=0;
+    vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode;
+    if(!ino || c->fds[fd].is_pipe){             // console / pipe end: a char device
+        st->st_mode = S_IFCHR | 0620; st->st_nlink=1; st->st_dev=1; st->st_ino=(uint64_t)(uintptr_t)&c->fds[fd];
+        return 0;
+    }
+    stat_fill(ino, st);
+    return 0;
+}
 
 /* Minimal termios/ioctl so termios-using programs (a shell, line editors) run.
  * struct secos_termios mirrors the libc layout. We model the console TTY as a
@@ -830,6 +855,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_GETCWD:  return (uint64_t)(int64_t)ksys_getcwd((char*)a0, (int)a1);
     case SYS_IOCTL:   return (uint64_t)(int64_t)ksys_ioctl((int)a0, a1, a2);
     case SYS_GETPPID: return (uint64_t)ksys_getppid();
+    case SYS_FSTAT: {
+        struct secos_stat* st=(struct secos_stat*)a1;
+        if(!user_range_valid(st, sizeof(*st))) return (uint64_t)(int64_t)-EFAULT;
+        return (uint64_t)(int64_t)ksys_fstat((int)a0, st);
+    }
 
     default:
         terminal_writestring("[SYSCALL] sconosciuta\n");

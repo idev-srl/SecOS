@@ -2,6 +2,15 @@
 #include "libsecos.h"
 #include "secos_driver.h"
 #include "include/termios.h"   /* [M39] struct termios for tcgetattr/tcsetattr */
+#include "include/errno.h"     /* [M39] errno mapping for source ports (bash, …) */
+
+/* [M39] Map a negative syscall return to errno and normalize to -1. The kernel
+ * returns -errno for known errors (e.g. -ENOENT=-2, -EINTR=-4, -ECHILD=-10) and
+ * -1 generically; bash and other ports branch on errno, so set it. */
+static long __se(long r){
+    if (r < 0) { errno = (r > -134) ? (int)(-r) : EIO; return -1; }
+    return r;
+}
 
 #define SYS_YIELD    0
 #define SYS_EXIT     1
@@ -46,14 +55,14 @@ long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4) {
 }
 
 ssize_t write(int fd, const void* buf, size_t len) {
-    return secos_syscall(SYS_WRITE, fd, (long)buf, (long)len, 0, 0);
+    return __se(secos_syscall(SYS_WRITE, fd, (long)buf, (long)len, 0, 0));
 }
 ssize_t read(int fd, void* buf, size_t len) {
-    return secos_syscall(3 /*SYS_READ*/, fd, (long)buf, (long)len, 0, 0);
+    return __se(secos_syscall(3 /*SYS_READ*/, fd, (long)buf, (long)len, 0, 0));
 }
-int open(const char* path, int flags) { return (int)secos_syscall(4 /*SYS_OPEN*/, (long)path, flags, 0, 0, 0); }
-int close(int fd) { return (int)secos_syscall(5 /*SYS_CLOSE*/, fd, 0, 0, 0, 0); }
-long lseek(int fd, long offset, int whence) { return secos_syscall(19 /*SYS_LSEEK*/, fd, offset, whence, 0, 0); }
+int open(const char* path, int flags) { return (int)__se(secos_syscall(4 /*SYS_OPEN*/, (long)path, flags, 0, 0, 0)); }
+int close(int fd) { return (int)__se(secos_syscall(5 /*SYS_CLOSE*/, fd, 0, 0, 0, 0)); }
+long lseek(int fd, long offset, int whence) { return __se(secos_syscall(19 /*SYS_LSEEK*/, fd, offset, whence, 0, 0)); }
 static void stzero(struct stat* st){ char* p=(char*)st; for(unsigned i=0;i<sizeof(*st);i++) p[i]=0; }
 int stat(const char* path, struct stat* st) { if(st) stzero(st); return (int)secos_syscall(20 /*SYS_STAT*/, (long)path, (long)st, 0, 0, 0); }
 void _exit(int code) { secos_syscall(SYS_EXIT, code, 0, 0, 0, 0); for (;;) {} }
@@ -159,8 +168,13 @@ int dup2(int oldfd, int newfd){ return (int)secos_syscall(49 /*SYS_DUP2*/, oldfd
 int dup(int oldfd){ return (int)secos_syscall(50 /*SYS_DUP*/, oldfd, 0, 0, 0, 0); }
 int chdir(const char* path){ return (int)secos_syscall(51 /*SYS_CHDIR*/, (long)path, 0, 0, 0, 0); }
 char* getcwd(char* buf, unsigned long size){
-    long n = secos_syscall(52 /*SYS_GETCWD*/, (long)buf, (long)size, 0, 0, 0);
-    return (n >= 0) ? buf : (char*)0;
+    char tmp[1024];
+    long n = secos_syscall(52 /*SYS_GETCWD*/, (long)tmp, (long)sizeof(tmp), 0, 0, 0);
+    if(n < 0) return 0;
+    if(!buf){ buf = (char*)malloc((unsigned long)n + 1); if(!buf) return 0; }  /* GNU malloc form */
+    else if(size && (unsigned long)n + 1 > size){ errno = ERANGE; return 0; }
+    for(long i = 0; i <= n; i++) buf[i] = tmp[i];
+    return buf;
 }
 int ioctl(int fd, unsigned long request, void* arg){
     return (int)secos_syscall(53 /*SYS_IOCTL*/, fd, (long)request, (long)arg, 0, 0);

@@ -64,6 +64,7 @@
 #define SYS_IOCTL       53 // ioctl(fd, cmd, arg) -> 0/-1 (termios TCGETS/TCSETS, TIOCGWINSZ)
 #define SYS_GETPPID     54 // getppid() -> parent pid
 #define SYS_WAITANY     55 // waitany(int* status_out, int options) -> child pid / 0 / -ECHILD
+#define SYS_FSTAT       56 // fstat(fd, statbuf) -> stat the fd's inode (correct file type)
 // Note: execve is emulated in libc (spawn+waitpid+_exit) — no kernel syscall.
 
 // [M24] socket types
@@ -112,6 +113,11 @@ struct secos_stat {
     uint64_t st_atime;  // access time (unix seconds) (offset 24)
     uint64_t st_mtime;  // modify time                (offset 32)
     uint64_t st_ctime;  // change time                (offset 40)
+    uint64_t st_dev;    // device id                  (offset 48)  [M39]
+    uint64_t st_ino;    // inode number (unique id)   (offset 56)  [M39]
+    uint64_t st_rdev;   // special-file device        (offset 64)  [M39]
+    int64_t  st_blksize;// preferred I/O block size   (offset 72)  [M39]
+    int64_t  st_blocks; // 512-byte blocks allocated  (offset 80)  [M39]
 };
 
 // [M26] POSIX mode helpers (S_IFMT mask + type bits; perms in the low 12 bits).
