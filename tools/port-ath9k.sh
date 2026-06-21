@@ -52,6 +52,16 @@ if ! grep -q 'SECOS_BC' "$HWC"; then
   sed -i 's#^\tath9k_hw_init_macaddr(ah);#\tdebugcon_writestring("[ath9k] BC5 pre init_macaddr\\n");\n\tath9k_hw_init_macaddr(ah);#' "$HWC"
   echo "[ath9k] breadcrumbs injected into hw.c"
 fi
+# fine breadcrumbs inside the AR9300 eeprom/OTP restore (the BC2/post_init faulter)
+EEP="$W/ath9k/ar9003_eeprom.c"
+if ! grep -q 'SECOS_BC' "$EEP"; then
+  sed -i '1i extern void debugcon_writestring(const char*); /* SECOS_BC */' "$EEP"
+  sed -i 's#^\tmemcpy(mptr, &ar9300_default, mdata_size);#\tdebugcon_writestring("[ath9k] R1 pre memcpy default\\n");\n\tmemcpy(mptr, \&ar9300_default, mdata_size);#' "$EEP"
+  sed -i 's#^\tread = ar9300_read_eeprom;#\tdebugcon_writestring("[ath9k] R2 try EEPROM hdr\\n");\n\tread = ar9300_read_eeprom;#' "$EEP"
+  sed -i 's#^\tread = ar9300_read_otp;#\tdebugcon_writestring("[ath9k] R3 try OTP hdr\\n");\n\tread = ar9300_read_otp;#' "$EEP"
+  sed -i 's#^\tfor (it = 0; it < MSTATE; it++) {#\tdebugcon_writestring("[ath9k] R4 block loop\\n");\n\tfor (it = 0; it < MSTATE; it++) {#' "$EEP"
+  echo "[ath9k] breadcrumbs injected into ar9003_eeprom.c"
+fi
 
 echo "[ath9k] 2/3 cross-compile vs SecOS shim"
 OBJ=/tmp/ath9k_obj; rm -rf "$OBJ"; mkdir -p "$OBJ"
