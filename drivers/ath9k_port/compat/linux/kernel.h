@@ -40,4 +40,7 @@
 #define KERN_CONT ""
 #define unlikely(x) (x)
 #define likely(x) (x)
+#define NR_CPUS 8
+#define num_possible_cpus() 1
+#define smp_processor_id() 0
 #endif
