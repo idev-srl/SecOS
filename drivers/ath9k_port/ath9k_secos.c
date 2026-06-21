@@ -290,7 +290,6 @@ static int tune_quiet(int chan_num){
     int r = ath9k_hw_reset(g_ah, &g_chan, &g_caldata, 0);
     if (r == 0){
         ath9k_hw_setpower(g_ah, ATH9K_PM_AWAKE);
-        enable_lna_combining();     /* both antennas (AR9565 RX diversity) */
         complete_cal();
         ath9k_ani_reset(g_ah, 0);   /* set sensitive default weak-signal thresholds */
     }
