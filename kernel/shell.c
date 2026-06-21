@@ -142,6 +142,7 @@ static void sh_vcreate(const char* a); static void sh_vwrite(const char* a); sta
 static void sh_ext2mount(const char* a);
 static void sh_blk(const char* a); static void sh_mountdev(const char* a);
 static void sh_lspci(const char* a); static void sh_usbinfo(const char* a); static void sh_usbrescan(const char* a);
+static void sh_audit(const char* a);   // [M35] capability audit log
 // [M23] POSIX-style commands over the VFS (with a real working directory).
 static void sh_cd(const char* a); static void sh_pwd(const char* a); static void sh_ls(const char* a);
 static void sh_cat(const char* a); static void sh_touch(const char* a); static void sh_mkdir(const char* a);
@@ -220,6 +221,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"uname",     sh_uname,     "system name + build"},
     {"verbose",   sh_verbose,   "toggle kernel debug logs"},
     {"info",      sh_info,      "system information"},
+    {"audit",     sh_audit,     "show the capability audit log [M35]"},
     {"blk",       sh_blk,       "list block devices"},
     {"mountdev",  sh_mountdev,  "mount a block device"},
     {"lspci",     sh_lspci,     "list PCI devices (controllers)"},
@@ -1009,6 +1011,23 @@ static void sh_lspci(const char* a){ (void)a;
     }
     if(!found) terminal_writestring("[lspci] NO PCI devices found — legacy CF8/CFC config access may be unavailable on this firmware\n");
     else { terminal_writestring("[lspci] "); print_dec((uint64_t)found); terminal_writestring(" functions\n"); }
+}
+
+// [M35] audit: dump the capability audit log (granted/denied capability checks
+// for confined processes, plus any denial). Proves the audit trail is queryable.
+#include "cap.h"
+static void sh_audit(const char* a){ (void)a;
+    cap_audit_rec_t recs[64];
+    int n = cap_audit_dump(recs, 64);
+    terminal_writestring("capability audit log ("); print_dec((uint64_t)n);
+    terminal_writestring(" of "); print_dec(cap_audit_total()); terminal_writestring(" total):\n");
+    for(int i=0;i<n;i++){
+        terminal_writestring("  pid="); print_dec(recs[i].pid);
+        terminal_writestring(recs[i].allowed ? "  ALLOW " : "  DENY  ");
+        terminal_writestring(cap_name(recs[i].cap));
+        terminal_writestring(" ("); terminal_writestring(recs[i].name); terminal_writestring(")\n");
+    }
+    if(n==0) terminal_writestring("  (empty — no confined process has run)\n");
 }
 
 // usbinfo: report what the xHCI driver saw — controller presence, root ports, how

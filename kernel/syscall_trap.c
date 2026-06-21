@@ -17,6 +17,7 @@
 #include "signal.h"
 #include "debugcon.h"
 #include "kverbose.h"
+#include "cap.h"
 
 #ifdef SYSCALL_DEBUG
 #include "terminal.h"
@@ -83,9 +84,13 @@ uint64_t syscall_handler(trapframe_t* tf) {
     // [M19] SYS_FORK: copy-on-write child from the parent's live trapframe. The
     // child resumes at the same point with rax=0; the parent gets the child pid.
     if (num == SYS_FORK) {
-        extern process_t* process_fork(process_t*, trapframe_t*);
-        process_t* ch = cur ? process_fork(cur, tf) : 0;
-        ret = ch ? (uint64_t)(int64_t)ch->pid : (uint64_t)(int64_t)-1;
+        if (!cap_check(cur, CAP_PROC, num, "fork")) {   // [M35]
+            ret = (uint64_t)(int64_t)-1;
+        } else {
+            extern process_t* process_fork(process_t*, trapframe_t*);
+            process_t* ch = cur ? process_fork(cur, tf) : 0;
+            ret = ch ? (uint64_t)(int64_t)ch->pid : (uint64_t)(int64_t)-1;
+        }
     }
     else
     // [M16] SYS_WAIT: blocking wait for a child, returning its exit status.
@@ -120,17 +125,21 @@ uint64_t syscall_handler(trapframe_t* tf) {
     // wakes it (vs the old non-blocking poll). A pre-queued message returns
     // immediately, so existing pollers keep working.
     else if (num == SYS_MSG_RECV) {
-        extern int ksys_msg_recv_try(int chan, void* ubuf, int len);
-        int n = ksys_msg_recv_try((int)tf->rdi, (void*)tf->rsi, (int)tf->rdx);
-        if (n == 0 && cur && signal_pending(cur)) {
-            ret = (uint64_t)(int64_t)(-4);              // [M30] EINTR
-        } else if (n == 0 && cur) {
-            cur->recv_chan = (int)tf->rdi;
-            tf->rip -= 2;                               // re-run on wake
-            sched_block_current(tf);                    // NORETURN
-            ret = 0;                                     // not reached
+        if (!cap_check(cur, CAP_IPC, num, "msg_recv")) { // [M35]
+            ret = (uint64_t)(int64_t)-1;
         } else {
-            ret = (uint64_t)(int64_t)n;
+            extern int ksys_msg_recv_try(int chan, void* ubuf, int len);
+            int n = ksys_msg_recv_try((int)tf->rdi, (void*)tf->rsi, (int)tf->rdx);
+            if (n == 0 && cur && signal_pending(cur)) {
+                ret = (uint64_t)(int64_t)(-4);              // [M30] EINTR
+            } else if (n == 0 && cur) {
+                cur->recv_chan = (int)tf->rdi;
+                tf->rip -= 2;                               // re-run on wake
+                sched_block_current(tf);                    // NORETURN
+                ret = 0;                                     // not reached
+            } else {
+                ret = (uint64_t)(int64_t)n;
+            }
         }
     }
     // [M17] SYS_SLEEP: block the caller until timer tick deadline.

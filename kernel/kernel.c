@@ -456,6 +456,57 @@ static void m34_run_demo(void) {
 }
 #endif /* M34_LUA_DEMO */
 
+// ---- [M35] Capability confinement demo (gated; off by default) ----
+// Loads a SIGNED program with a CONFINED manifest (CAP_ENFORCE|CAP_FS_READ|
+// CAP_TIME) and runs it. Allowed ops (getticks, read /proc) succeed; out-of-scope
+// syscalls (create/spawn/pipe/socket) are denied (-1) and recorded in the [AUDIT]
+// log — proving the kernel enforces least privilege rooted in the signature.
+#ifndef M35_CAP_DEMO
+#define M35_CAP_DEMO 0
+#endif
+#if M35_CAP_DEMO
+#include "trapframe.h"
+#include "cap.h"
+#include "../crypto/user_m35caps_elf.h"
+static uint8_t m35_idle_stack[16384] __attribute__((aligned(16)));
+static int m35_step = 0;
+__attribute__((noreturn)) static void m35_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m35_step == 0) {
+            m35_step = 1;
+            debugcon_writestring("[M35] loading signed CONFINED program\n");
+            process_t* p = process_create_from_elf(user_m35caps_elf, user_m35caps_elf_len);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M35] confined program spawned\n"); }
+            else    debugcon_writestring("[M35] FAIL: confined ELF not loaded\n");
+        } else if (m35_step == 1 && sched_count_alive_user() == 0) {
+            m35_step = 2;
+            debugcon_writestring("[M35] audit log total events: ");
+            debugcon_print_hex(cap_audit_total());
+            debugcon_writestring("\n[M35] DONE (least privilege enforced + audited)\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+static void m35_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M35] generalized capability / confinement demo\n");
+    static process_t idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m35_idle_stack + sizeof(m35_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m35_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    arch_iret_to_tf(&idle_tf); // does not return
+}
+#endif /* M35_CAP_DEMO */
+
 // ---- [M14] Demand paging demo (gated; off by default) ----
 // Proves, non-interactively, that user pages are NOT eagerly mapped: a signed
 // program is loaded (process_create_from_elf) and BEFORE it runs we count the
@@ -1692,6 +1743,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M34_LUA_DEMO
     m34_run_demo(); // lua-from-source demo — does not return
+#endif
+#if M35_CAP_DEMO
+    m35_run_demo(); // capability confinement demo — does not return
 #endif
 #if M14_DEMAND_DEMO
     m14_run_demo(); // demand paging demo — does not return

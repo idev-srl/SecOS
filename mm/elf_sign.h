@@ -28,4 +28,9 @@ typedef struct secos_sig_raw {
 /* Returns ELF_SIG_OK only for a present, valid signature. */
 int elf_signature_verify(const void* elf_buf, size_t size);
 
+/* [M35] Keyring revocation: a signature from a revoked key_id is refused even if
+ * cryptographically valid (retire a compromised signer without re-keying). */
+void elf_sign_revoke_key(uint32_t key_id);
+int  elf_sign_key_revoked(uint32_t key_id);
+
 #endif /* SECOS_ELF_SIGN_H */

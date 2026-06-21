@@ -17,8 +17,17 @@
 #include "../mm/pagecache.h"  // [M20] unified file page cache
 #include "socket.h"           // [M24] kernel-side socket layer (-Inet)
 #include "pipe.h"             // [M25] anonymous pipes
+#include "cap.h"              // [M35] generalized capability checks
 
 extern uint64_t timer_get_ticks(void);
+
+// [M35] Capability gate: deny (EPERM=-1) + audit if a confined process lacks the
+// capability. Ambient (unconfined) processes always pass. `num` is the in-scope
+// syscall number in syscall_dispatch().
+#define CAP_GATE(capbit, nm) do { \
+    if (!cap_check(sched_get_current(), (capbit), num, (nm))) \
+        return (uint64_t)(int64_t)-1; \
+} while (0)
 
 // [M16] Bounds for SYS_SPAWN argv copy-in (kept small; argstore is static).
 #define SPAWN_MAX_ARGS 8
@@ -367,6 +376,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return (uint64_t)ksys_close((int)a0);
 
     case SYS_OPEN: {
+        /* [M35] A write-intent open needs FS_WRITE; otherwise FS_READ. */
+        CAP_GATE(((int)a1 & 0x3) ? CAP_FS_WRITE : CAP_FS_READ, "open");
         /* [M3] Validate path pointer is in user range (at least 1 byte). */
         const char* path = (const char*)a0;
         if (!user_range_valid(path, 1)) {
@@ -399,6 +410,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     }
 
     case SYS_SPAWN: {
+        CAP_GATE(CAP_PROC, "spawn");     // [M35]
         /* [M3] Validate and copy the user path string into the kernel. */
         const char* upath = (const char*)a0;
         char kpath[256]; int i = 0;
@@ -442,6 +454,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return timer_get_ticks();
 
     case SYS_MSG_SEND: {
+        CAP_GATE(CAP_IPC, "msg_send");   // [M35]
         /* [M13] (a0=chan, a1=buf, a2=len) -> kernel IPC channel. */
         int chan = (int)a0; const void* ubuf = (const void*)a1; int len = (int)a2;
         if (len <= 0 || len > 256 || !user_range_valid(ubuf, (size_t)len))
@@ -480,6 +493,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     }
 
     case SYS_PIPE: {
+        CAP_GATE(CAP_IPC, "pipe");       // [M35]
         /* [M25] pipe(int fds[2]): kernel-side alloc, then copy the two fds out. */
         int kfds[2];
         int r = ksys_pipe(kfds);
@@ -496,14 +510,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return 0;
     }
     case SYS_CHMOD: {
+        CAP_GATE(CAP_FS_WRITE, "chmod");  // [M35]
         char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_chmod(kp, (uint32_t)a1);
     }
     case SYS_CHOWN: {
+        CAP_GATE(CAP_FS_WRITE, "chown");  // [M35]
         char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_chown(kp, (uint32_t)a1, (uint32_t)a2);
     }
     case SYS_UTIMES: {
+        CAP_GATE(CAP_FS_WRITE, "utimes"); // [M35]
         char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_utimes(kp, (uint64_t)a1, (uint64_t)a2);
     }
@@ -517,12 +534,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return (uint64_t)(int64_t)n;
     }
     case SYS_SYMLINK: {
+        CAP_GATE(CAP_FS_WRITE, "symlink"); // [M35]
         char ktarget[256], klink[256];
         if (copy_user_str((const char*)a0, ktarget, sizeof(ktarget)) != 0) return (uint64_t)(int64_t)-EFAULT;
         if (copy_user_str((const char*)a1, klink, sizeof(klink)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_symlink(ktarget, klink);
     }
     case SYS_MOUNT: {
+        CAP_GATE(CAP_FS_WRITE, "mount");  // [M35]
         char kdev[64], ktgt[256], kfs[32];
         if (copy_user_str((const char*)a0, kdev, sizeof(kdev)) != 0) return (uint64_t)(int64_t)-EFAULT;
         if (copy_user_str((const char*)a1, ktgt, sizeof(ktgt)) != 0) return (uint64_t)(int64_t)-EFAULT;
@@ -530,26 +549,31 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return (uint64_t)(int64_t)ksys_mount(kdev, ktgt, kfs);
     }
     case SYS_UMOUNT: {
+        CAP_GATE(CAP_FS_WRITE, "umount"); // [M35]
         char ktgt[256]; if (copy_user_str((const char*)a0, ktgt, sizeof(ktgt)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_umount(ktgt);
     }
     case SYS_GETDENTS: {
+        CAP_GATE(CAP_FS_READ, "getdents"); // [M35]
         extern int ksys_getdents(const char*, void*, int);
         char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
         int len = (int)a2; if (len <= 0 || len > (1<<20) || !user_range_valid((void*)a1, (size_t)len)) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_getdents(kp, (void*)a1, len);
     }
     case SYS_CREATE: {
+        CAP_GATE(CAP_FS_WRITE, "create"); // [M35]
         extern int ksys_create(const char*);
         char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_create(kp);
     }
     case SYS_MKDIR: {
+        CAP_GATE(CAP_FS_WRITE, "mkdir");  // [M35]
         extern int ksys_mkdir(const char*);
         char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_mkdir(kp);
     }
     case SYS_UNLINK: {
+        CAP_GATE(CAP_FS_WRITE, "unlink"); // [M35]
         extern int ksys_unlink(const char*);
         char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_unlink(kp);
@@ -652,6 +676,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return (uint64_t)(int64_t)ksys_sigaction((int)a0, a1, a2);
     }
     case SYS_KILL: {
+        CAP_GATE(CAP_SIGNAL, "kill");     // [M35]
         extern long ksys_kill(int, int);
         return (uint64_t)(int64_t)ksys_kill((int)a0, (int)a1);
     }

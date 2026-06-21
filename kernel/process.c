@@ -282,6 +282,8 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->drv_dev_id = -1;
     p->drv_caps = 0;
     p->cap_net = 0;          // [M24] granted below from the signed manifest flags
+    p->cap_enforce = 0;      // [M35] ambient (full trust) until a manifest confines it
+    p->cap_mask = 0;
     // [M14] No eager page tracking: pages are demand-paged and freed at teardown
     // by vmm_space_destroy() (which frees every present leaf in the user range).
     // mapped_page_count/user_mem_bytes report the RESERVED footprint (sum of VMA
@@ -336,6 +338,15 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
             p->manifest = mf;
             // [M24] CAP_NET from the signed manifest flags (socket syscalls gate on it).
             p->cap_net = (mf->flags & MANIFEST_FLAG_CAP_NET) ? 1 : 0;
+            // [M35] Generalized capabilities. Ambient by default (signature = full
+            // trust); a manifest may opt into least-privilege confinement.
+            p->cap_enforce = (mf->flags & MANIFEST_FLAG_CAP_ENFORCE) ? 1 : 0;
+            p->cap_mask    = mf->flags & MANIFEST_CAP_MASK;
+            if (p->cap_enforce) {
+                debugcon_writestring("[M35] confined process pid loaded, caps=");
+                debugcon_print_hex(p->cap_mask);
+                debugcon_writestring("\n");
+            }
             // [M11] Driver Space: the signed manifest is the trust root for the
             // driver claim. If it declares PROC_TYPE_DRIVER, validate the device
             // and grant only capabilities the device actually supports (subset),

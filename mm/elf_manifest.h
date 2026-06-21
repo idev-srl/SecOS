@@ -27,6 +27,25 @@
 // set (covered by the Ed25519 signature, so it can't grant itself the cap).
 #define MANIFEST_FLAG_CAP_NET               (1u<<4) // socket syscalls allowed
 
+// [M35] Generalized least-privilege capabilities (signature-rooted). The trust
+// model is ambient-by-default: a signed process gets full access UNLESS it opts
+// into confinement by setting CAP_ENFORCE, in which case the kernel restricts it
+// to exactly the capabilities declared below. A program cannot widen its own set
+// (the flags are covered by the Ed25519 signature). Backward compatible: existing
+// programs have CAP_ENFORCE clear and keep ambient access.
+#define MANIFEST_FLAG_CAP_ENFORCE           (1u<<5) // enforce the capability bits below
+#define MANIFEST_FLAG_CAP_FS_READ           (1u<<6) // open/read/stat/getdents/readlink
+#define MANIFEST_FLAG_CAP_FS_WRITE          (1u<<7) // create/write/unlink/mkdir/chmod/...
+#define MANIFEST_FLAG_CAP_PROC              (1u<<8) // spawn/fork/wait
+#define MANIFEST_FLAG_CAP_IPC               (1u<<9) // msg_send/recv, pipe
+#define MANIFEST_FLAG_CAP_SIGNAL            (1u<<10)// kill/signal other processes
+#define MANIFEST_FLAG_CAP_TIME              (1u<<11)// getticks/sleep
+// CAP_NET (bit 4) is the network capability and folds into the same model.
+#define MANIFEST_CAP_MASK \
+    (MANIFEST_FLAG_CAP_NET | MANIFEST_FLAG_CAP_FS_READ | MANIFEST_FLAG_CAP_FS_WRITE | \
+     MANIFEST_FLAG_CAP_PROC | MANIFEST_FLAG_CAP_IPC | MANIFEST_FLAG_CAP_SIGNAL | \
+     MANIFEST_FLAG_CAP_TIME)
+
 // Manifest versions
 #define MANIFEST_VERSION_BASE    1u   // version/flags/max_mem/entry_hint (24-byte desc)
 #define MANIFEST_VERSION_DRIVER  2u   // adds proc_type/dev_id/dev_caps (40-byte desc)

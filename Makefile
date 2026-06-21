@@ -56,6 +56,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/syscall.c \
 	$(KERNEL_DIR)/syscall_trap.c \
 	$(KERNEL_DIR)/signal.c \
+	$(KERNEL_DIR)/cap.c \
 	$(KERNEL_DIR)/driver_if.c \
 	$(KERNEL_DIR)/ipc.c \
 	$(KERNEL_DIR)/pipe.c \
@@ -306,6 +307,12 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/m30_sig.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/m30_sig.o
 	python3 tools/secos-sign user/m30_sig.elf --dev
 	python3 tools/elf2h.py user/m30_sig.elf user_m30_sig_elf crypto/user_m30_sig_elf.h
+	# [M35] capability confinement demo (CONFINED manifest: CAP_ENFORCE|FS_READ|TIME)
+	$(CC) $(USER_CFLAGS) -c user/note_confined.S -o user/note_confined.o
+	$(CC) $(USER_CFLAGS) -c user/m35_caps.c    -o user/m35_caps.o
+	$(LD) --gc-sections -T user/user.ld -o user/m35_caps.elf user/crt0.o user/note_confined.o user/libsecos.o user/libc.o user/m35_caps.o
+	python3 tools/secos-sign user/m35_caps.elf --dev
+	python3 tools/elf2h.py user/m35_caps.elf user_m35caps_elf crypto/user_m35caps_elf.h
 	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig -> crypto/*.h"
 
 # [M34] Port of lua 5.4.7 FROM SOURCE (third_party/lua), signed + embedded.
