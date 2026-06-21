@@ -127,94 +127,86 @@ static void prmac(const u8* m){
         if(i<5) debugcon_putchar(':'); }
 }
 
-/* Parse a beacon/probe-resp; returns 1 if it was a mgmt beacon/probe-resp. */
-static int parse_beacon(const u8* f, int len, int rssi){
+/* Discovered-AP table (deduped by BSSID), shared by scan + connect. */
+#define ATH_MAXAP 24
+struct ath_ap { u8 bssid[6]; char ssid[33]; u8 chan; int8_t rssi; u8 privacy; };
+static struct ath_ap g_aps[ATH_MAXAP];
+static int g_nap;
+
+/* Parse a beacon/probe-resp into the AP table (dedup by BSSID). Returns 1 if mgmt. */
+static int collect_beacon(const u8* f, int len, int rssi){
     if (len < 36) return 0;
-    u8 fc0 = f[0];                          /* type=mgmt(00); subtype 8=beacon, 5=proberesp */
+    u8 fc0 = f[0];                          /* mgmt: 0x80 beacon, 0x50 proberesp */
     if (fc0 != 0x80 && fc0 != 0x50) return 0;
     const u8* bssid = f + 16;
-    const u8* p = f + 36;                    /* 24 hdr + 12 fixed (ts/interval/caps) */
-    const u8* end = f + len;
+    u16 caps = f[34] | (f[35] << 8);        /* capability info (fixed param) */
+    const u8* p = f + 36; const u8* end = f + len;
     char ssid[33]; int slen = 0; int chan = 0;
     while (p + 2 <= end){
         u8 tag = p[0], tlen = p[1]; const u8* val = p + 2;
         if (val + tlen > end) break;
         if (tag == 0 && slen == 0){ slen = tlen > 32 ? 32 : tlen; for(int k=0;k<slen;k++) ssid[k]=val[k]; }
-        else if (tag == 3 && tlen >= 1){ chan = val[0]; }   /* DS param: channel */
+        else if (tag == 3 && tlen >= 1){ chan = val[0]; }
         p = val + tlen;
     }
     ssid[slen] = 0;
-    debugcon_writestring("  SSID '"); debugcon_writestring(ssid);
-    debugcon_writestring("'  bssid "); prmac(bssid);
-    debugcon_writestring("  ch="); debugcon_print_hex((unsigned long)chan);
-    debugcon_writestring("  rssi="); debugcon_print_hex((unsigned long)(rssi & 0xff));
-    debugcon_writestring("\n");
+    for (int i = 0; i < g_nap; i++){            /* dedup */
+        int same = 1; for(int k=0;k<6;k++) if(g_aps[i].bssid[k]!=bssid[k]){ same=0; break; }
+        if (same){ if(rssi > g_aps[i].rssi) g_aps[i].rssi = (int8_t)rssi; return 1; }
+    }
+    if (g_nap < ATH_MAXAP){
+        struct ath_ap* a = &g_aps[g_nap++];
+        for(int k=0;k<6;k++) a->bssid[k]=bssid[k];
+        for(int k=0;k<=slen;k++) a->ssid[k]=ssid[k];
+        a->chan = (u8)chan; a->rssi = (int8_t)rssi; a->privacy = (caps & 0x10) ? 1 : 0;
+    }
     return 1;
 }
 
-/* Listen on the current channel for ~2s, print beacons seen. Returns count. */
-int ath9k_secos_scan(void){
-    if (!g_ah) { debugcon_writestring("[ath9k-port] scan: run wifi up + wifi chan first\n"); return -1; }
+/* Bring RX up on the current channel (idempotent per scan/connect). */
+static void rx_bring_up(void){
     struct ath_common* common = ath9k_hw_common(g_ah);
     g_ah->opmode = NL80211_IFTYPE_STATION;
     common->rx_bufsize = ATH_RXBUF_SZ;
-
-    debugcon_writestring("[ath9k-port] S: set_rx_bufsize\n");
     ath9k_hw_set_rx_bufsize(g_ah, ATH_RXBUF_SZ - g_ah->caps.rx_status_len);
-    debugcon_writestring("[ath9k-port] S: rxena\n");
     ath9k_hw_rxena(g_ah);
-    debugcon_writestring("[ath9k-port] S: addrxbuf\n");
     g_rx_idx = 0;
     for (int i = 0; i < ATH_NRXBUF; i++) rx_addbuf(i);
-    debugcon_writestring("[ath9k-port] S: setopmode\n");
     ath9k_hw_setopmode(g_ah);
-    debugcon_writestring("[ath9k-port] S: setrxfilter\n");
     ath9k_hw_setrxfilter(g_ah, ATH9K_RX_FILTER_UCAST | ATH9K_RX_FILTER_MCAST |
                                ATH9K_RX_FILTER_BCAST | ATH9K_RX_FILTER_BEACON |
                                ATH9K_RX_FILTER_PROM | ATH9K_RX_FILTER_PROBEREQ);
-    debugcon_writestring("[ath9k-port] S: startpcureceive\n");
     ath9k_hw_startpcureceive(g_ah, 1);
+}
 
-    /* --- diagnostics: is RX actually armed? --- */
-    #define RD(off) (*(volatile u32*)(g_mmio + (off)))
-    debugcon_writestring("[diag] buf0 phys="); debugcon_print_hex(ath9k_host_v2p(&g_rxpool[0][0]));
-    debugcon_writestring(" rxchainmask="); debugcon_print_hex((unsigned long)g_ah->rxchainmask);
-    debugcon_writestring(" rxstatuslen="); debugcon_print_hex((unsigned long)g_ah->caps.rx_status_len);
-    debugcon_writestring("\n[diag] AR_CR="); debugcon_print_hex(RD(0x0008));
-    debugcon_writestring(" DIAG_SW="); debugcon_print_hex(RD(0x8048));
-    debugcon_writestring(" RXFILT="); debugcon_print_hex(RD(0x803C));
-    debugcon_writestring(" LP_RXDP="); debugcon_print_hex(RD(0x0078));
-    debugcon_writestring("\n[ath9k-port] RX live, listening ~2s...\n");
-
-    int found = 0, n_done = 0, n_inval = 0;
-    for (int spin = 0; spin < 80000 && found < 64; spin++){
+/* Tight, SILENT RX poll for ~dwell_ms, feeding every mgmt frame to collect_beacon.
+ * No per-frame printing (it starved RX before). */
+static void rx_poll_collect(int dwell_ms){
+    int iters = dwell_ms * 20;                 /* ~50us per idle iter */
+    for (int spin = 0; spin < iters; spin++){
         struct ath_rx_status rxs;
         u8* buf = &g_rxpool[g_rx_idx][0];
         int ret = ath9k_hw_process_rxdesc_edma(g_ah, &rxs, buf);
-        if (ret == -EINPROGRESS){ udelay(50); continue; }   /* not filled yet */
-        if (ret == 0){ n_done++;
-            const u8* fr = buf + g_ah->caps.rx_status_len;
-            if (n_done <= 10){   /* detail the first frames */
-                debugcon_writestring("[rx] st="); debugcon_print_hex((unsigned long)rxs.rs_status);
-                debugcon_writestring(" len="); debugcon_print_hex((unsigned long)rxs.rs_datalen);
-                debugcon_writestring(" fc="); debugcon_print_hex((unsigned long)fr[0]);
-                debugcon_writestring(" hdr:");
-                for(int k=0;k<16 && k<rxs.rs_datalen;k++){ debugcon_putchar(' '); static const char h[]="0123456789abcdef";
-                    debugcon_putchar(h[(fr[k]>>4)&0xF]); debugcon_putchar(h[fr[k]&0xF]); }
-                debugcon_writestring("\n");
-            }
-            if (rxs.rs_status == 0 && rxs.rs_datalen >= 24)
-                found += parse_beacon(fr, rxs.rs_datalen, rxs.rs_rssi);
-        } else { n_inval++; }
-        rx_addbuf(g_rx_idx);                                /* recycle + advance */
+        if (ret == -EINPROGRESS){ udelay(50); continue; }
+        if (ret == 0 && rxs.rs_status == 0 && rxs.rs_datalen >= 24)
+            collect_beacon(buf + g_ah->caps.rx_status_len, rxs.rs_datalen, rxs.rs_rssi);
+        rx_addbuf(g_rx_idx);
         g_rx_idx = (g_rx_idx + 1) % ATH_NRXBUF;
     }
-    debugcon_writestring("[diag] done="); debugcon_print_hex((unsigned long)n_done);
-    debugcon_writestring(" inval="); debugcon_print_hex((unsigned long)n_inval);
-    debugcon_writestring(" matched="); debugcon_print_hex((unsigned long)found);
-    debugcon_writestring("\n[diag] buf0[0..15]:");
-    for(int k=0;k<16;k++){ debugcon_putchar(' '); static const char h[]="0123456789abcdef";
-        debugcon_putchar(h[(g_rxpool[0][k]>>4)&0xF]); debugcon_putchar(h[g_rxpool[0][k]&0xF]); }
-    debugcon_writestring("\n");
-    return found;
+}
+
+/* Listen on the current channel ~3s; print a concise AP summary. Returns count. */
+int ath9k_secos_scan(void){
+    if (!g_ah) { debugcon_writestring("[wifi] run 'wifi up' + 'wifi chan <n>' first\n"); return -1; }
+    g_nap = 0;
+    rx_bring_up();
+    rx_poll_collect(3000);
+    debugcon_writestring("[wifi] networks found: "); debugcon_print_hex((unsigned long)g_nap); debugcon_writestring("\n");
+    for (int i = 0; i < g_nap; i++){
+        debugcon_writestring("  "); prmac(g_aps[i].bssid);
+        debugcon_writestring(g_aps[i].privacy ? " [WPA] " : " [open] ");
+        debugcon_writestring("ch="); debugcon_print_hex((unsigned long)g_aps[i].chan);
+        debugcon_writestring(" '"); debugcon_writestring(g_aps[i].ssid); debugcon_writestring("'\n");
+    }
+    return g_nap;
 }
