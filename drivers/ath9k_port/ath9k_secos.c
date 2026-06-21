@@ -22,7 +22,16 @@ static void sec_multi_read(void* p, u32* addr, u32* val, u16 cnt){ (void)p;
     for (u16 i = 0; i < cnt; i++) val[i] = *(volatile u32*)(g_mmio + addr[i]); }
 static void sec_noop(void* p){ (void)p; }
 
-static struct ath_bus_ops g_bus_ops = { .ath_bus_type = ATH_PCI };
+/* bus ops normally supplied by the PCI layer (ath_pci.c). AR9565 has no
+ * physical EEPROM (OTP only), so eeprom_read returns false -> the eeprom probe
+ * fails cleanly and the restore falls through to the OTP path. */
+static bool sec_eeprom_read(struct ath_common* c, u32 off, u16* data){ (void)c;(void)off;(void)data; return false; }
+static void sec_read_cachesize(struct ath_common* c, int* csz){ (void)c; if(csz) *csz = 16; }
+static struct ath_bus_ops g_bus_ops = {
+    .ath_bus_type   = ATH_PCI,
+    .eeprom_read    = sec_eeprom_read,
+    .read_cachesize = sec_read_cachesize,
+};
 static struct ath_hw* g_ah;
 
 /* Run the upstream ath9k_hw bring-up against the live chip. mmio = mapped BAR0,
