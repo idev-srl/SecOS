@@ -174,21 +174,37 @@ int ath9k_secos_scan(void){
                                ATH9K_RX_FILTER_PROM | ATH9K_RX_FILTER_PROBEREQ);
     debugcon_writestring("[ath9k-port] S: startpcureceive\n");
     ath9k_hw_startpcureceive(g_ah, 1);
-    debugcon_writestring("[ath9k-port] RX live, listening ~2s...\n");
 
-    int found = 0;
+    /* --- diagnostics: is RX actually armed? --- */
+    #define RD(off) (*(volatile u32*)(g_mmio + (off)))
+    debugcon_writestring("[diag] buf0 phys="); debugcon_print_hex(ath9k_host_v2p(&g_rxpool[0][0]));
+    debugcon_writestring(" rxchainmask="); debugcon_print_hex((unsigned long)g_ah->rxchainmask);
+    debugcon_writestring(" rxstatuslen="); debugcon_print_hex((unsigned long)g_ah->caps.rx_status_len);
+    debugcon_writestring("\n[diag] AR_CR="); debugcon_print_hex(RD(0x0008));
+    debugcon_writestring(" DIAG_SW="); debugcon_print_hex(RD(0x8048));
+    debugcon_writestring(" RXFILT="); debugcon_print_hex(RD(0x803C));
+    debugcon_writestring(" LP_RXDP="); debugcon_print_hex(RD(0x0078));
+    debugcon_writestring("\n[ath9k-port] RX live, listening ~2s...\n");
+
+    int found = 0, n_done = 0, n_inval = 0;
     for (int spin = 0; spin < 40000 && found < 64; spin++){
         struct ath_rx_status rxs;
         u8* buf = &g_rxpool[g_rx_idx][0];
         int ret = ath9k_hw_process_rxdesc_edma(g_ah, &rxs, buf);
         if (ret == -EINPROGRESS){ udelay(50); continue; }   /* not filled yet */
-        if (ret == 0 && rxs.rs_status == 0 && rxs.rs_datalen >= 24){
-            found += parse_beacon(buf + g_ah->caps.rx_status_len, rxs.rs_datalen, rxs.rs_rssi);
-        }
+        if (ret == 0){ n_done++;
+            if (rxs.rs_status == 0 && rxs.rs_datalen >= 24)
+                found += parse_beacon(buf + g_ah->caps.rx_status_len, rxs.rs_datalen, rxs.rs_rssi);
+        } else { n_inval++; }
         rx_addbuf(g_rx_idx);                                /* recycle + advance */
         g_rx_idx = (g_rx_idx + 1) % ATH_NRXBUF;
     }
-    debugcon_writestring("[ath9k-port] scan done, frames matched=");
-    debugcon_print_hex((unsigned long)found); debugcon_writestring("\n");
+    debugcon_writestring("[diag] done="); debugcon_print_hex((unsigned long)n_done);
+    debugcon_writestring(" inval="); debugcon_print_hex((unsigned long)n_inval);
+    debugcon_writestring(" matched="); debugcon_print_hex((unsigned long)found);
+    debugcon_writestring("\n[diag] buf0[0..15]:");
+    for(int k=0;k<16;k++){ debugcon_putchar(' '); static const char h[]="0123456789abcdef";
+        debugcon_putchar(h[(g_rxpool[0][k]>>4)&0xF]); debugcon_putchar(h[g_rxpool[0][k]&0xF]); }
+    debugcon_writestring("\n");
     return found;
 }
