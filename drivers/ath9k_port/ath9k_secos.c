@@ -263,6 +263,23 @@ static void complete_cal(void){
     }
 }
 
+/* Configure + enable AR9565 LNA antenna combining (use both antennas). The
+ * dynamic combiner lives in the un-ported antenna.c; set a sensible static
+ * config (main=LNA1, alt=LNA2) and turn on the diversity-enable bit, which
+ * conf_set() itself does not touch. This is the rest of "Enable LNA combining". */
+static void enable_lna_combining(void){
+    struct ath_hw_antcomb_conf conf;
+    ath9k_hw_antdiv_comb_conf_get(g_ah, &conf);   /* fills div_group + AR9565 deltas */
+    conf.main_lna_conf = 2;   /* ATH_ANT_DIV_COMB_LNA1 */
+    conf.alt_lna_conf  = 1;   /* ATH_ANT_DIV_COMB_LNA2 */
+    conf.fast_div_bias = 0x3;
+    conf.main_gaintb = 0; conf.alt_gaintb = 0;
+    ath9k_hw_antdiv_comb_conf_set(g_ah, &conf);
+    /* AR_PHY_MC_GAIN_CTRL bit 24 = AR_ANT_DIV_ENABLE / AR_PHY_ANT_DIV_LNADIV */
+    volatile u32* mc = (volatile u32*)(g_mmio + 0x9e28);
+    *mc |= 0x01000000;
+}
+
 /* Quiet channel tune (no per-step prints) used by the sweep. */
 static int tune_quiet(int chan_num){
     if (chan_num < 1 || chan_num > 14) chan_num = 1;
@@ -273,6 +290,7 @@ static int tune_quiet(int chan_num){
     int r = ath9k_hw_reset(g_ah, &g_chan, &g_caldata, 0);
     if (r == 0){
         ath9k_hw_setpower(g_ah, ATH9K_PM_AWAKE);
+        enable_lna_combining();     /* both antennas (AR9565 RX diversity) */
         complete_cal();
         ath9k_ani_reset(g_ah, 0);   /* set sensitive default weak-signal thresholds */
     }
