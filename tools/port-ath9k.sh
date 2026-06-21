@@ -9,7 +9,7 @@ B='https://raw.githubusercontent.com/torvalds/linux/master/drivers/net/wireless/
 GCCINC="$(echo /usr/lib/gcc/x86_64-linux-gnu/*/include | tr ' ' '\n' | head -1)"
 INC="-I$ROOT/drivers/ath9k_port/compat -I$W/ath9k -I$W -isystem $GCCINC"
 CF="-ffreestanding -nostdlib -nostdinc -m64 -O2 -w -fno-pic -mcmodel=kernel -mno-red-zone -mno-sse -DCONFIG_ATH_DEBUG"
-HW="hw ar9003_hw ar9003_phy ar9003_calib ar9003_mac ar9003_eeprom mac calib eeprom"
+HW="hw ar9003_hw ar9003_phy ar9003_calib ar9003_mac ar9003_eeprom mac calib eeprom ani"
 INITVALS="ar9003_2p2 ar9003_buffalo ar9485 ar9340 ar9330_1p1 ar9330_1p2 ar955x_1p0 ar9580_1p0 \
           ar9462_2p0 ar9462_2p1 ar9565_1p0 ar9565_1p1 ar953x ar956x"
 
@@ -38,6 +38,16 @@ cat > "$W/ath9k/ath9k.h" <<'EOF'
 #endif
 #endif
 EOF
+# AR_MIBC (MIB control) regs ani.c needs but the fetched reg.h lacks; append once.
+if ! grep -q 'AR_MIBC_COW' "$W/ath9k/reg.h"; then
+  cat >> "$W/ath9k/reg.h" <<'EOF'
+#define AR_MIBC      0x0040
+#define AR_MIBC_COW  0x00000001
+#define AR_MIBC_FMC  0x00000002
+#define AR_MIBC_CMC  0x00000004
+#define AR_MIBC_MCS  0x00000008
+EOF
+fi
 
 # [M39] DIAGNOSTIC: inject breadcrumb markers between the __ath9k_hw_init steps
 # so a fault deep inside the upstream bring-up (which never returns to log) is

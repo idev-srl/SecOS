@@ -84,6 +84,7 @@ void ath_printk(const char* lvl, const void* c, const char* fmt, ...){
 void ath_hw_setbssidmask(void* common){ (void)common; }
 unsigned ath_regd_get_band_ctl(void* reg, int band){ (void)reg;(void)band; return 0; /* SD_NO_CTL */ }
 int ath_hw_get_listen_time(void* common){ (void)common; return 0; }
+void ath_hw_cycle_counters_update(void* common){ (void)common; }   /* survey/cycle counters (common.c not ported) */
 void dev_err(const void* d, const char* fmt, ...){ (void)d;(void)fmt; }
 void dev_warn(const void* d, const char* fmt, ...){ (void)d;(void)fmt; }
 void dev_dbg(const void* d, const char* fmt, ...){ (void)d;(void)fmt; }
@@ -93,10 +94,8 @@ void* gpiod_get_index(void* d, const char* c, unsigned i, int f){ (void)d;(void)
 void  gpiod_put(void* d){ (void)d; }
 void  gpiod_set_consumer_name(void* d, const char* n){ (void)d;(void)n; }
 
-/* --- ANI / dynack (not part of basic bring-up) --- */
-void ath9k_ani_reset(void* ah, int is_scanning){ (void)ah;(void)is_scanning; }
-void ath9k_enable_mib_counters(void* ah){ (void)ah; }
-void ath9k_hw_ani_monitor(void* ah, void* chan){ (void)ah;(void)chan; }
+/* --- ANI now comes from the real ported ani.c (sensitivity tuning). Only the
+ * dynack stubs remain here. --- */
 void ath_dynack_reset(void* ah){ (void)ah; }
 void ath_dynack_init(void* ah){ (void)ah; }
 
@@ -112,8 +111,6 @@ void ar9002_hw_enable_async_fifo(void* ah){ (void)ah; }
 void ar9002_hw_load_ani_reg(void* ah, void* chan){ (void)ah;(void)chan; }
 int  ar9002_hw_rf_claim(void* ah){ (void)ah; return 0; }
 int  ar9003_is_paprd_enabled(void* ah){ (void)ah; return 0; }
-void ath9k_hw_ani_init(void* ah){ (void)ah; }
-void ath9k_hw_disable_mib_counters(void* ah){ (void)ah; }
 
 /* --- mem* as global symbols (SecOS's are inline-only; the ported driver needs
  * real symbols). gcc may also lower struct copies to these. --- */
