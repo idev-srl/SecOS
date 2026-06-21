@@ -115,8 +115,13 @@ void* memmove(void* d, const void* s, unsigned long n){ unsigned char* a=d; cons
 int memcmp(const void* a, const void* b, unsigned long n){ const unsigned char* x=a;const unsigned char* y=b; for(unsigned long i=0;i<n;i++){if(x[i]!=y[i])return (int)x[i]-(int)y[i];} return 0; }
 unsigned long strlen(const char* s){ unsigned long n=0; while(s[n])n++; return n; }
 
-/* --- debugcon (SecOS's are static-inline; provide globals for the bridge) --- */
+/* --- debugcon (SecOS's are static-inline; provide globals for the bridge).
+ * Mirror to BOTH the QEMU debug port (0xE9, for serial logs) AND the on-screen
+ * framebuffer console (terminal_*), so the ath9k bring-up narration is visible
+ * on REAL hardware where port 0xE9 goes nowhere. --- */
+extern void terminal_putchar(char c);          /* on-screen console */
+extern void terminal_writestring(const char* s);
 static void e9(char c){ __asm__ volatile("outb %0, %1" :: "a"((unsigned char)c), "Nd"((unsigned short)0xE9)); }
-void debugcon_putchar(char c){ e9(c); }
-void debugcon_writestring(const char* s){ while(*s) e9(*s++); }
-void debugcon_print_hex(unsigned long v){ static const char h[]="0123456789ABCDEF"; e9('0'); e9('x'); for(int i=60;i>=0;i-=4) e9(h[(v>>i)&0xF]); }
+void debugcon_putchar(char c){ e9(c); terminal_putchar(c); }
+void debugcon_writestring(const char* s){ for(const char* p=s; *p; p++) e9(*p); terminal_writestring(s); }
+void debugcon_print_hex(unsigned long v){ static const char h[]="0123456789ABCDEF"; char b[19]; b[0]='0'; b[1]='x'; for(int i=0;i<16;i++) b[2+i]=h[(v>>((15-i)*4))&0xF]; b[18]=0; debugcon_writestring(b); }
