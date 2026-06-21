@@ -122,6 +122,24 @@ process_t* process_reap_one(uint32_t affinity) {
     return z;
 }
 
+// [M39] User-space ASLR: per-process random page-aligned slide for the stack,
+// heap and mmap arena. Entropy from the TSC + xorshift mix (good enough for
+// layout randomization, not crypto). Gate off with -DSECOS_NO_ASLR (slide 0 =
+// the old fixed layout). ELF base ASLR would need PIE user binaries (deferred).
+static uint64_t aslr_slide(uint64_t span_bytes) {
+#ifdef SECOS_NO_ASLR
+    (void)span_bytes; return 0;
+#else
+    if (span_bytes < 0x2000) return 0;
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t x = ((uint64_t)hi << 32) | lo;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;   // xorshift64 so close TSC values diverge
+    uint64_t pages = span_bytes >> 12;
+    return (x % pages) << 12;                    // page-aligned offset in [0, span)
+#endif
+}
+
 // [M16] Write 'n' bytes into user VA 'va' of a not-yet-running space, faulting
 // in the backing (demand-paged) stack pages as needed. Returns 0 / -1.
 static int uwrite(process_t* p, uint64_t va, const void* src, uint64_t n) {
@@ -152,8 +170,11 @@ static int setup_user_args(process_t* p, int argc, const char* const argv[],
                            uint64_t* rsp_out, uint64_t* argv_out, uint64_t* envp_out) {
     if (argc < 0) argc = 0;
     if (argc > PROC_MAX_ARGS) argc = PROC_MAX_ARGS;
-    const uint64_t st_lo = USER_STACK_TOP - 8ULL * 0x1000ULL;
-    uint64_t sp = USER_STACK_TOP;
+    // [M39] Use the process's ASLR-randomized stack top, not the fixed constant,
+    // so argv/env land inside the reserved 8-page stack VMA.
+    const uint64_t st_top = p->stack_top ? p->stack_top : USER_STACK_TOP;
+    const uint64_t st_lo = st_top - 8ULL * 0x1000ULL;
+    uint64_t sp = st_top;
     uint64_t vptr[PROC_MAX_ARGS];
     uint64_t z = 0;
 
@@ -247,10 +268,13 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
         return NULL;
     }
     // [M14] Reserve the user stack as a demand-zero (ANON) VMA — 8 pages below
-    // USER_STACK_TOP. Pages fault in on first push; the absence of a VMA below
-    // the region is the guard (a stack underflow faults to the unhandled path).
+    // the (ASLR-randomized) stack top. Pages fault in on first push; the absence
+    // of a VMA below the region is the guard (a stack underflow faults to the
+    // unhandled path).
     const uint32_t STACK_PAGES = 8;
-    uint64_t st_top = USER_STACK_TOP;
+    // [M39] User ASLR: slide the stack top down by a random page-aligned offset
+    // (<=16MB). Stays well above USER_MMAP_END so argv/env never collide.
+    uint64_t st_top = USER_STACK_TOP - aslr_slide(16ULL * 1024 * 1024);
     uint64_t st_lo  = st_top - (uint64_t)STACK_PAGES * 0x1000ULL;
     if (vma_add(&p->vmas, st_lo, st_top,
                 VMM_FLAG_USER | VMM_FLAG_RW | VMM_FLAG_NOEXEC,
@@ -297,8 +321,11 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     // shell sets pgid for pipelines after creation). pid is assigned above.
     { extern void signal_init_proc(process_t*); signal_init_proc(p); }
     p->pgid = p->pid; p->ppid = 0;
-    p->brk_start = USER_HEAP_BASE; p->brk_cur = USER_HEAP_BASE;
-    p->mmap_next = USER_MMAP_BASE; p->mem_limit = 0;
+    // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases
+    // (<=32MB each, within their multi-GB regions). Transparent to programs.
+    p->brk_start = USER_HEAP_BASE + aslr_slide(32ULL*1024*1024);
+    p->brk_cur = p->brk_start;
+    p->mmap_next = USER_MMAP_BASE + aslr_slide(32ULL*1024*1024); p->mem_limit = 0;
     p->user_mem_bytes = footprint;
     p->mapped_page_count = (uint32_t)(footprint / 4096ULL);
     // Manifest stub
