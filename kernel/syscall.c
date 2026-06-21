@@ -188,7 +188,23 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
     return 0;
 }
 void ksys_exit(int status){ (void)status; extern process_t* sched_get_current(void); extern int process_destroy(process_t*); process_t* c=sched_get_current(); if(c){ process_destroy(c); } }
-int ksys_open(const char* path, int flags){ (void)flags; extern vfs_inode_t* vfs_lookup(const char*); extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -1; int fd=fd_alloc(c); if(fd<0) return -1; c->fds[fd].inode=ino; c->fds[fd].flags=flags; return fd; }
+// [M38] open() now honours O_CREAT (0x40) / O_TRUNC (0x200) / O_APPEND (0x400),
+// so user programs (and the shell's `>`/`>>` redirection) can create+write files.
+int ksys_open(const char* path, int flags){
+    extern vfs_inode_t* vfs_lookup(const char*);
+    extern int vfs_create(const char*, const void*, size_t);
+    extern int vfs_truncate(const char*, size_t);
+    extern process_t* sched_get_current(void);
+    process_t* c=sched_get_current(); if(!c) return -1;
+    vfs_inode_t* ino=vfs_lookup(path);
+    if(!ino && (flags & 0x40)){ if(vfs_create(path,"",0)==0) ino=vfs_lookup(path); }   // O_CREAT
+    if(!ino) return -1;
+    if((flags & 0x200) && ino->size){ vfs_truncate(path,0); ino=vfs_lookup(path); if(!ino) return -1; } // O_TRUNC
+    int fd=fd_alloc(c); if(fd<0) return -1;
+    c->fds[fd].inode=ino; c->fds[fd].flags=flags;
+    c->fds[fd].offset = (flags & 0x400) ? ino->size : 0;    // O_APPEND -> seek to end
+    return fd;
+}
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
     if(c->fds[fd].is_pipe){ pipe_unref((pipe_t*)c->fds[fd].inode, c->fds[fd].pipe_w); c->fds[fd].is_pipe=0; }  // [M25] drop end, may signal EOF/EPIPE
     c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }

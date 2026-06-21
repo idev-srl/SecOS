@@ -14,7 +14,9 @@ static vfs_inode_t inode_cache[RAMFS_MAX_FILES+4];
 static size_t inode_cache_used = 0;
 
 static vfs_inode_t* inode_from_entry(const ramfs_entry_t* e){ if(!e) return NULL; // search cache
-    for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e) return &inode_cache[i]; }
+    // [M38] refresh the cached size on every lookup (a prior write may have grown
+    // the entry) so e.g. `>>` append seeks to the real end of file.
+    for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e){ inode_cache[i].size = e->size; return &inode_cache[i]; } }
     if(inode_cache_used >= sizeof(inode_cache)/sizeof(inode_cache[0])) return NULL;
     vfs_inode_t* ino = &inode_cache[inode_cache_used++];
     // Path already absolute in ramfs_entry_t.name (without leading '/')

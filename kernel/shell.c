@@ -1559,6 +1559,21 @@ static int job_wait_foreground(uint32_t pgid, const uint32_t* pids, int npid){
 // background (trailing &, stripped by the caller). 'line' is mutated in place.
 static uint8_t g_job_spawn_buf[65536];
 static void run_job(char* line, int background){
+    // [M38] Output redirection: strip a trailing `> file` / `>> file` and remember
+    // the target + append mode. Applied to the LAST pipeline stage's fd 1 (stdout).
+    char* redir=NULL; int redir_append=0;
+    for(char* s=line; *s; s++){
+        if(*s=='>'){
+            if(s[1]=='>'){ redir_append=1; *s=0; redir=s+2; }
+            else         { redir_append=0; *s=0; redir=s+1; }
+            break;
+        }
+    }
+    if(redir){
+        while(*redir==' '||*redir=='\t') redir++;
+        char* e=redir; while(*e && *e!=' ' && *e!='\t') e++; *e=0;
+        if(!*redir){ terminal_writestring("syntax error: expected file after '>'\n"); return; }
+    }
     // Split on '|' into pipeline stages.
     char* stages[JOB_NPROC]; int ns=0;
     stages[ns++]=line;
@@ -1604,6 +1619,16 @@ static void run_job(char* line, int background){
             if(!pp){ terminal_writestring("pipe: out of pipes\n"); procs[created]=p; pids[created]=p->pid; created++; goto fail; }
             p->fds[1].used=1; p->fds[1].is_pipe=1; p->fds[1].pipe_w=1; p->fds[1].inode=pp;
             prev_read=pp;
+        } else if(redir){
+            // [M38] last stage: redirect stdout to the file (create / truncate / append).
+            extern vfs_inode_t* vfs_lookup(const char*);
+            extern int vfs_create(const char*, const void*, size_t);
+            extern int vfs_truncate(const char*, size_t);
+            vfs_inode_t* fino=vfs_lookup(redir);
+            if(!fino){ vfs_create(redir,"",0); fino=vfs_lookup(redir); }
+            else if(!redir_append){ vfs_truncate(redir,0); fino=vfs_lookup(redir); }
+            if(fino){ p->fds[1].used=1; p->fds[1].is_pipe=0; p->fds[1].pipe_w=0; p->fds[1].inode=fino; p->fds[1].offset = redir_append ? fino->size : 0; }
+            else { terminal_writestring("redirect: cannot open "); terminal_writestring(redir); terminal_writestring("\n"); procs[created]=p; pids[created]=p->pid; created++; goto fail; }
         }
         if(i==0) pgid=p->pid;
         p->pgid=pgid; p->ppid=0;
@@ -1915,9 +1940,11 @@ static void execute_command(char* line) {
       if(L>0 && line[L-1]=='&'){ background=1; L--; while(L>0 && (line[L-1]==' '||line[L-1]=='\t')) L--; }
       line[L]=0; }
 
-    // [M30] A pipeline (`a | b | ...`) is always launched as external programs
-    // through the job-control path — builtins do not participate in pipelines.
-    for(char* s=line; *s; s++) if(*s=='|'){ run_job(line, background); return; }
+    // [M30] A pipeline (`a | b | ...`) is launched as external programs through the
+    // job-control path. [M38] `> file` / `>> file` output redirection routes the
+    // same way (the redirected command runs as the /bin applet so its fd 1 can be
+    // wired onto the file) — builtins don't participate in either.
+    for(char* s=line; *s; s++) if(*s=='|' || *s=='>'){ run_job(line, background); return; }
 
     char* args=line; while(*args && *args!=' ') args++; if(*args){ *args='\0'; args++; while(*args==' ') args++; }
     const char* cmd=line;
