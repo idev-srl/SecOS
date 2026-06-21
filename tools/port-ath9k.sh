@@ -39,6 +39,20 @@ cat > "$W/ath9k/ath9k.h" <<'EOF'
 #endif
 EOF
 
+# [M39] DIAGNOSTIC: inject breadcrumb markers between the __ath9k_hw_init steps
+# so a fault deep inside the upstream bring-up (which never returns to log) is
+# localized to a precise step. Idempotent. Remove once bring-up is stable.
+HWC="$W/ath9k/hw.c"
+if ! grep -q 'SECOS_BC' "$HWC"; then
+  sed -i '1i extern void debugcon_writestring(const char*); /* SECOS_BC */' "$HWC"
+  sed -i 's#^\tath9k_hw_init_cal_settings(ah);#\tdebugcon_writestring("[ath9k] BC1 pre init_cal_settings\\n");\n\tath9k_hw_init_cal_settings(ah);#' "$HWC"
+  sed -i 's#^\tr = ath9k_hw_post_init(ah);#\tdebugcon_writestring("[ath9k] BC2 pre post_init\\n");\n\tr = ath9k_hw_post_init(ah);#' "$HWC"
+  sed -i 's#^\tath9k_hw_init_mode_gain_regs(ah);#\tdebugcon_writestring("[ath9k] BC3 pre mode_gain_regs\\n");\n\tath9k_hw_init_mode_gain_regs(ah);#' "$HWC"
+  sed -i 's#^\tr = ath9k_hw_fill_cap_info(ah);#\tdebugcon_writestring("[ath9k] BC4 pre fill_cap_info\\n");\n\tr = ath9k_hw_fill_cap_info(ah);#' "$HWC"
+  sed -i 's#^\tath9k_hw_init_macaddr(ah);#\tdebugcon_writestring("[ath9k] BC5 pre init_macaddr\\n");\n\tath9k_hw_init_macaddr(ah);#' "$HWC"
+  echo "[ath9k] breadcrumbs injected into hw.c"
+fi
+
 echo "[ath9k] 2/3 cross-compile vs SecOS shim"
 OBJ=/tmp/ath9k_obj; rm -rf "$OBJ"; mkdir -p "$OBJ"
 for c in $HW; do gcc $CF $INC -c "$W/ath9k/$c.c" -o "$OBJ/$c.o"; done
