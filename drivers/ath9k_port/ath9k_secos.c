@@ -107,6 +107,10 @@ void ath9k_secos_regdump(void){
     debugcon_writestring("[regdump] macRev="); debugcon_print_hex((unsigned long)g_ah->hw_version.macRev);
     debugcon_writestring(" rxmask="); debugcon_print_hex((unsigned long)g_ah->rxchainmask);
     debugcon_writestring(" noise="); debugcon_print_hex((unsigned long)(g_ah->noise & 0xffff));
+    /* eeprom txrxgain: low nibble = rx gain table idx (0=with-xLNA, 1=wo-xLNA) */
+    { u8 trg = g_ah->eeprom.ar9300_eep.baseEepHeader.txrxgain;
+      debugcon_writestring(" txrxgain="); debugcon_print_hex((unsigned long)trg);
+      debugcon_writestring(" rxGainIdx="); debugcon_print_hex((unsigned long)(trg & 0xf)); }
     debugcon_writestring("\n");
     for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++){
         debugcon_writestring("  "); debugcon_writestring(regs[i].n);
