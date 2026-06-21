@@ -31,6 +31,10 @@ void   srand(unsigned seed);
 #define RAND_MAX 0x7fffffff
 
 char*  getenv(const char* name);
+int    setenv(const char* name, const char* value, int overwrite);   /* [M39] */
+int    unsetenv(const char* name);
+int    putenv(char* s);
+extern char** environ;
 
 void   exit(int code) __attribute__((noreturn));
 void   abort(void) __attribute__((noreturn));

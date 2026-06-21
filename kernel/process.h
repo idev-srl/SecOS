@@ -81,6 +81,7 @@ typedef struct process {
     uint64_t sig_restorer;
     uint32_t pgid;           // process group id (defaults to pid)
     uint32_t ppid;           // parent pid (0 = no parent process, e.g. shell-spawned)
+    char     cwd[256];       // [M39] per-process current working directory (for chdir/getcwd + relative paths)
     // [M29] SMP: the CPU this process is pinned to. Assigned round-robin at
     // creation; only this CPU schedules, preempts, and reaps it, so the context
     // switch needs no lock and a freed PCB is never touched by another core.

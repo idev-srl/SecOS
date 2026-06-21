@@ -328,6 +328,11 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/m30_sig.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/m30_sig.o
 	python3 tools/secos-sign user/m30_sig.elf --dev
 	python3 tools/elf2h.py user/m30_sig.elf user_m30_sig_elf crypto/user_m30_sig_elf.h
+	# [M39] POSIX shell-from-source foundation: getcwd/chdir, environ, dup2, termios
+	$(CC) $(USER_CFLAGS) -c user/m39_posix.c   -o user/m39_posix.o
+	$(LD) --gc-sections -T user/user.ld -o user/m39_posix.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/m39_posix.o
+	python3 tools/secos-sign user/m39_posix.elf --dev
+	python3 tools/elf2h.py user/m39_posix.elf user_m39_posix_elf crypto/user_m39_posix_elf.h
 	# [M35] capability confinement demo (CONFINED manifest: CAP_ENFORCE|FS_READ|TIME)
 	$(CC) $(USER_CFLAGS) -c user/note_confined.S -o user/note_confined.o
 	$(CC) $(USER_CFLAGS) -c user/m35_caps.c    -o user/m35_caps.o

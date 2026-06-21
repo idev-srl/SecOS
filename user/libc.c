@@ -187,7 +187,60 @@ void* bsearch(const void* key, const void* base, size_t n, size_t sz, int(*cmp)(
     while(lo<hi){ size_t m=(lo+hi)/2; int r=cmp(key, a+m*sz); if(r<0) hi=m; else if(r>0) lo=m+1; else return (void*)(a+m*sz); }
     return 0;
 }
-char* getenv(const char* name){ (void)name; return 0; }   /* no environment yet */
+/* [M39] In-process environment. environ is a NULL-terminated array of "KEY=VAL"
+ * strings, starting empty (a process inherits none across the spawn-based exec).
+ * getenv/setenv/unsetenv/putenv operate on it. Bounded (64 vars, static storage)
+ * — enough for a shell's own variables. */
+#define ENV_MAX 64
+#define ENV_LEN 256
+static char  env_store[ENV_MAX][ENV_LEN];
+static char* env_ptrs[ENV_MAX + 1];
+char** environ = env_ptrs;
+
+static int env_name_eq(const char* entry, const char* name, size_t nlen){
+    for(size_t i=0;i<nlen;i++) if(entry[i]!=name[i]) return 0;
+    return entry[nlen]=='=';
+}
+char* getenv(const char* name){
+    if(!name) return 0;
+    size_t nlen=0; while(name[nlen]) nlen++;
+    for(int i=0; environ[i]; i++)
+        if(env_name_eq(environ[i], name, nlen)) return environ[i] + nlen + 1;
+    return 0;
+}
+int setenv(const char* name, const char* value, int overwrite){
+    if(!name || !*name) return -1;
+    size_t nlen=0; while(name[nlen]) nlen++;
+    int n=0; for(; environ[n]; n++) if(env_name_eq(environ[n], name, nlen)){
+        if(!overwrite) return 0;
+        char* e=environ[n]; size_t k=nlen+1; e[k-1]='=';
+        for(size_t i=0; value[i] && k<ENV_LEN-1; i++) e[k++]=value[i]; e[k]=0;
+        return 0;
+    }
+    if(n>=ENV_MAX) return -1;
+    char* e=env_store[n]; size_t k=0;
+    for(size_t i=0; name[i] && k<ENV_LEN-1; i++) e[k++]=name[i];
+    if(k<ENV_LEN-1) e[k++]='=';
+    for(size_t i=0; value[i] && k<ENV_LEN-1; i++) e[k++]=value[i]; e[k]=0;
+    environ[n]=e; environ[n+1]=0;
+    return 0;
+}
+int unsetenv(const char* name){
+    if(!name) return -1;
+    size_t nlen=0; while(name[nlen]) nlen++;
+    for(int i=0; environ[i]; i++) if(env_name_eq(environ[i], name, nlen)){
+        int j=i; while(environ[j+1]){ environ[j]=environ[j+1]; j++; } environ[j]=0;
+        return 0;
+    }
+    return 0;
+}
+int putenv(char* s){
+    if(!s) return -1;
+    size_t eq=0; while(s[eq] && s[eq]!='=') eq++;
+    if(s[eq]!='=') return -1;
+    char name[ENV_LEN]; size_t i=0; for(; i<eq && i<ENV_LEN-1; i++) name[i]=s[i]; name[i]=0;
+    return setenv(name, s+eq+1, 1);
+}
 void exit(int code){ _exit(code); }
 void abort(void){ write(2,"abort\n",6); _exit(134); }
 

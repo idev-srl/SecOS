@@ -1,6 +1,7 @@
 /* SecOS minimal user libc. SPDX-License-Identifier: MIT */
 #include "libsecos.h"
 #include "secos_driver.h"
+#include "include/termios.h"   /* [M39] struct termios for tcgetattr/tcsetattr */
 
 #define SYS_YIELD    0
 #define SYS_EXIT     1
@@ -149,3 +150,57 @@ int  creat_file(const char* path){ return (int)secos_syscall(41 /*SYS_CREATE*/, 
 int  mkdir(const char* path, unsigned mode){ (void)mode; return (int)secos_syscall(42 /*SYS_MKDIR*/, (long)path, 0, 0, 0, 0); }
 int  unlink(const char* path){ return (int)secos_syscall(43 /*SYS_UNLINK*/, (long)path, 0, 0, 0, 0); }
 int  rmdir(const char* path){ return unlink(path); }
+
+/* [M39] POSIX shell-from-source foundation: fd duplication, cwd, terminal ioctl,
+ * exec. These bring the libc surface close to what a real shell (bash/dash) and
+ * many open-source programs expect when compiled from source. */
+int dup2(int oldfd, int newfd){ return (int)secos_syscall(49 /*SYS_DUP2*/, oldfd, newfd, 0, 0, 0); }
+int dup(int oldfd){ return (int)secos_syscall(50 /*SYS_DUP*/, oldfd, 0, 0, 0, 0); }
+int chdir(const char* path){ return (int)secos_syscall(51 /*SYS_CHDIR*/, (long)path, 0, 0, 0, 0); }
+char* getcwd(char* buf, unsigned long size){
+    long n = secos_syscall(52 /*SYS_GETCWD*/, (long)buf, (long)size, 0, 0, 0);
+    return (n >= 0) ? buf : (char*)0;
+}
+int ioctl(int fd, unsigned long request, void* arg){
+    return (int)secos_syscall(53 /*SYS_IOCTL*/, fd, (long)request, (long)arg, 0, 0);
+}
+int getppid(void){ return (int)secos_syscall(54 /*SYS_GETPPID*/, 0, 0, 0, 0, 0); }
+
+/* termios over ioctl. struct termios layout must match the kernel's. */
+int tcgetattr(int fd, struct termios* t){ return ioctl(fd, 0x5401 /*TCGETS*/, t); }
+int tcsetattr(int fd, int how, const struct termios* t){ (void)how; return ioctl(fd, 0x5402 /*TCSETS*/, (void*)t); }
+void cfmakeraw(struct termios* t){
+    if(!t) return;
+    t->c_iflag = 0; t->c_oflag = 0;
+    t->c_lflag &= ~(0x0002u /*ICANON*/ | 0x0008u /*ECHO*/ | 0x0001u /*ISIG*/);
+    t->c_cc[4] = 1; /*VMIN*/ t->c_cc[5] = 0; /*VTIME*/
+}
+int tcgetpgrp(int fd){ int pg = -1; ioctl(fd, 0x540F /*TIOCGPGRP*/, &pg); return pg; }
+int tcsetpgrp(int fd, int pgrp){ return ioctl(fd, 0x5410 /*TIOCSPGRP*/, &pgrp); }
+
+/* execve emulated via spawn+wait+exit: run the signed program and exit with its
+ * status. Semantically matches the shell fork()+execve() pattern (the parent's
+ * waitpid on the forked child gets the command's status). The command runs as a
+ * fresh signed process (no in-place image replacement), so envp is not inherited
+ * across the boundary yet — a documented limitation of the emulation. */
+extern char** environ;
+int execve(const char* path, char* const argv[], char* const envp[]){
+    (void)envp;
+    int pid = spawn(path, (char* const*)argv);
+    if(pid < 0) return -1;
+    int st = waitpid(pid);
+    _exit(st & 0xff);
+    return -1; /* unreached */
+}
+int execv(const char* path, char* const argv[]){ return execve(path, argv, environ); }
+int execvp(const char* file, char* const argv[]){
+    int has_slash = 0; for(const char* p=file; *p; p++) if(*p=='/'){ has_slash=1; break; }
+    if(has_slash) return execve(file, argv, environ);
+    char buf[160]; const char* dirs[] = { "/bin/", "/usr/bin/", 0 };
+    for(int d=0; dirs[d]; d++){
+        int k=0; for(const char* p=dirs[d]; *p && k<159; p++) buf[k++]=*p;
+        for(const char* p=file; *p && k<159; p++) buf[k++]=*p; buf[k]=0;
+        execve(buf, argv, environ); /* returns only on failure */
+    }
+    return -1;
+}

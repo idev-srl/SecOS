@@ -190,12 +190,43 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
 void ksys_exit(int status){ (void)status; extern process_t* sched_get_current(void); extern int process_destroy(process_t*); process_t* c=sched_get_current(); if(c){ process_destroy(c); } }
 // [M38] open() now honours O_CREAT (0x40) / O_TRUNC (0x200) / O_APPEND (0x400),
 // so user programs (and the shell's `>`/`>>` redirection) can create+write files.
+// [M39] Resolve a (possibly relative) path against the current process cwd into
+// an absolute, normalized kernel path ("." / ".." / "//" collapsed). Bounded.
+void proc_resolve_path(process_t* c, const char* in, char* out, int outsz){
+    char tmp[512]; int t=0;
+    if(in && in[0]=='/'){
+        for(int i=0; in[i] && t<511; i++) tmp[t++]=in[i];
+    } else {
+        const char* cw = (c && c->cwd[0]) ? c->cwd : "/";
+        for(int i=0; cw[i] && t<511; i++) tmp[t++]=cw[i];
+        if(t==0 || tmp[t-1]!='/'){ if(t<511) tmp[t++]='/'; }
+        for(int i=0; in && in[i] && t<511; i++) tmp[t++]=in[i];
+    }
+    tmp[t]=0;
+    char* parts[64]; int np=0; int i=0;
+    while(tmp[i]){
+        while(tmp[i]=='/') i++;
+        if(!tmp[i]) break;
+        char* seg=&tmp[i];
+        while(tmp[i] && tmp[i]!='/') i++;
+        if(tmp[i]){ tmp[i]=0; i++; }
+        if(seg[0]=='.'&&seg[1]==0) continue;
+        if(seg[0]=='.'&&seg[1]=='.'&&seg[2]==0){ if(np>0) np--; continue; }
+        if(np<64) parts[np++]=seg;
+    }
+    int o=0;
+    if(np==0){ if(outsz>1){ out[0]='/'; out[1]=0; } return; }
+    for(int p=0;p<np;p++){ if(o<outsz-1) out[o++]='/'; for(int k=0;parts[p][k]&&o<outsz-1;k++) out[o++]=parts[p][k]; }
+    out[o]=0;
+}
+
 int ksys_open(const char* path, int flags){
     extern vfs_inode_t* vfs_lookup(const char*);
     extern int vfs_create(const char*, const void*, size_t);
     extern int vfs_truncate(const char*, size_t);
     extern process_t* sched_get_current(void);
     process_t* c=sched_get_current(); if(!c) return -1;
+    char rp[256]; proc_resolve_path(c, path, rp, sizeof(rp)); path = rp;  // [M39] cwd-relative
     vfs_inode_t* ino=vfs_lookup(path);
     if(!ino && (flags & 0x40)){ if(vfs_create(path,"",0)==0) ino=vfs_lookup(path); }   // O_CREAT
     if(!ino) return -1;
@@ -377,6 +408,93 @@ static int copy_user_str(const char* u, char* k, int ksz){
         char c=u[i]; k[i]=c; if(!c) return 0;
     }
     return -1;
+}
+
+// [M39] --- POSIX shell-from-source foundation ---
+int ksys_dup2(int oldfd, int newfd){
+    process_t* c=sched_get_current(); if(!c) return -1;
+    if(oldfd<0||oldfd>=32||newfd<0||newfd>=32) return -1;
+    if(!c->fds[oldfd].used) return -1;
+    if(oldfd==newfd) return newfd;
+    if(c->fds[newfd].used && c->fds[newfd].is_pipe)             // close the old newfd target
+        pipe_unref((pipe_t*)c->fds[newfd].inode, c->fds[newfd].pipe_w);
+    c->fds[newfd]=c->fds[oldfd]; c->fds[newfd].used=1;
+    if(c->fds[newfd].is_pipe) pipe_ref((pipe_t*)c->fds[newfd].inode, c->fds[newfd].pipe_w);
+    return newfd;
+}
+int ksys_dup(int oldfd){
+    process_t* c=sched_get_current(); if(!c) return -1;
+    if(oldfd<0||oldfd>=32||!c->fds[oldfd].used) return -1;
+    int n=fd_alloc(c); if(n<0) return -1;
+    c->fds[n]=c->fds[oldfd]; c->fds[n].used=1;
+    if(c->fds[n].is_pipe) pipe_ref((pipe_t*)c->fds[n].inode, c->fds[n].pipe_w);
+    return n;
+}
+int ksys_chdir(const char* upath){
+    process_t* c=sched_get_current(); if(!c) return -1;
+    char k[256]; if(copy_user_str(upath, k, sizeof(k))!=0) return -1;
+    char abs[256]; proc_resolve_path(c, k, abs, sizeof(abs));
+    extern vfs_inode_t* vfs_lookup_follow(const char*);
+    vfs_inode_t* ino=vfs_lookup_follow(abs);
+    if(!ino || ino->type != VFS_NODE_DIR) return -1;            // must be an existing directory
+    int i=0; for(; abs[i] && i<255; i++) c->cwd[i]=abs[i]; c->cwd[i]=0;
+    return 0;
+}
+int ksys_getcwd(char* ubuf, int len){
+    process_t* c=sched_get_current(); if(!c) return -1;
+    int n=0; while(c->cwd[n]) n++;
+    if(len < n+1 || !user_range_valid(ubuf,(size_t)(n+1))) return -1;
+    if(copy_to_user(ubuf, c->cwd, (size_t)(n+1))!=0) return -1;
+    return n;
+}
+int ksys_getppid(void){ process_t* c=sched_get_current(); return c? (int)c->ppid : 0; }
+
+/* Minimal termios/ioctl so termios-using programs (a shell, line editors) run.
+ * struct secos_termios mirrors the libc layout. We model the console TTY as a
+ * cooked terminal; TCSETS is accepted (and toggles echo/canon globally). */
+struct secos_termios { uint32_t c_iflag, c_oflag, c_cflag, c_lflag; uint8_t c_cc[20]; };
+struct secos_winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
+#define TCGETS_     0x5401
+#define TCSETS_     0x5402
+#define TCSETSW_    0x5403
+#define TCSETSF_    0x5404
+#define TIOCGWINSZ_ 0x5413
+#define TIOCGPGRP_  0x540F
+#define TIOCSPGRP_  0x5410
+#define ICANON_ 0x0002
+#define ECHO_   0x0008
+int g_tty_canon = 1, g_tty_echo = 1;   // [M39] honored by kernel/tty.c
+int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
+    process_t* c=sched_get_current(); if(!c) return -1;
+    if(fd<0||fd>=32) return -1;
+    int is_tty = (fd<=2) || (c->fds[fd].used==0 && fd<=2);   // fds 0/1/2 are the console TTY
+    switch(cmd){
+    case TCGETS_: {
+        if(!is_tty) return -1;
+        struct secos_termios t; for(unsigned i=0;i<sizeof(t);i++) ((uint8_t*)&t)[i]=0;
+        t.c_lflag = (g_tty_canon?ICANON_:0) | (g_tty_echo?ECHO_:0);
+        t.c_cc[4]=1; t.c_cc[5]=0;                               // VMIN=1, VTIME=0
+        if(copy_to_user((void*)arg, &t, sizeof(t))!=0) return -1;
+        return 0;
+    }
+    case TCSETS_: case TCSETSW_: case TCSETSF_: {
+        if(!is_tty) return -1;
+        struct secos_termios t;
+        if(copy_from_user(&t, (void*)arg, sizeof(t))!=0) return -1;
+        g_tty_canon = (t.c_lflag & ICANON_) ? 1 : 0;
+        g_tty_echo  = (t.c_lflag & ECHO_)   ? 1 : 0;
+        return 0;
+    }
+    case TIOCGWINSZ_: {
+        if(!is_tty) return -1;
+        struct secos_winsize w; w.ws_row=25; w.ws_col=80; w.ws_xpixel=0; w.ws_ypixel=0;
+        if(copy_to_user((void*)arg, &w, sizeof(w))!=0) return -1;
+        return 0;
+    }
+    case TIOCGPGRP_: { int pg=(int)c->pgid; if(copy_to_user((void*)arg,&pg,sizeof(pg))!=0) return -1; return 0; }
+    case TIOCSPGRP_: return 0;                                  // accept (single foreground group)
+    default: return -1;
+    }
 }
 
 uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4){
@@ -704,6 +822,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         extern long ksys_setpgid(int, int);
         return (uint64_t)(int64_t)ksys_setpgid((int)a0, (int)a1);
     }
+
+    // [M39] POSIX shell-from-source foundation.
+    case SYS_DUP2:    return (uint64_t)(int64_t)ksys_dup2((int)a0, (int)a1);
+    case SYS_DUP:     return (uint64_t)(int64_t)ksys_dup((int)a0);
+    case SYS_CHDIR:   return (uint64_t)(int64_t)ksys_chdir((const char*)a0);
+    case SYS_GETCWD:  return (uint64_t)(int64_t)ksys_getcwd((char*)a0, (int)a1);
+    case SYS_IOCTL:   return (uint64_t)(int64_t)ksys_ioctl((int)a0, a1, a2);
+    case SYS_GETPPID: return (uint64_t)ksys_getppid();
 
     default:
         terminal_writestring("[SYSCALL] sconosciuta\n");

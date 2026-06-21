@@ -116,6 +116,17 @@ int  mkdir(const char* path, unsigned mode);             /* mode ignored for now
 int  unlink(const char* path);
 int  rmdir(const char* path);
 
+/* [M39] POSIX shell-from-source foundation. termios decls live in <termios.h>. */
+int   dup2(int oldfd, int newfd);
+int   dup(int oldfd);
+int   chdir(const char* path);
+char* getcwd(char* buf, unsigned long size);
+int   getppid(void);
+int   execve(const char* path, char* const argv[], char* const envp[]);
+int   execv(const char* path, char* const argv[]);
+int   execvp(const char* file, char* const argv[]);
+extern char** environ;
+
 /* tiny libc helpers */
 size_t  strlen(const char* s);
 int     puts(const char* s);   /* writes s + '\n' to stdout (fd 1) */

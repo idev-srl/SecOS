@@ -321,6 +321,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     // shell sets pgid for pipelines after creation). pid is assigned above.
     { extern void signal_init_proc(process_t*); signal_init_proc(p); }
     p->pgid = p->pid; p->ppid = 0;
+    p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
     // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases
     // (<=32MB each, within their multi-GB regions). Transparent to programs.
     p->brk_start = USER_HEAP_BASE + aslr_slide(32ULL*1024*1024);

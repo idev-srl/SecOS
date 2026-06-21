@@ -56,6 +56,15 @@
 #define SYS_SIGPROCMASK 47 // sigprocmask(how, set, oldset*) -> 0/-1
 #define SYS_SETPGID     48 // setpgid(pid, pgid) -> 0/-1 (0 = use the target's own pid)
 
+// [M39] POSIX shell-from-source foundation (dup2/cwd/ioctl/exec/env).
+#define SYS_DUP2        49 // dup2(oldfd, newfd) -> newfd / -1
+#define SYS_DUP         50 // dup(oldfd) -> lowest free fd / -1
+#define SYS_CHDIR       51 // chdir(path) -> 0/-1 (sets per-process cwd)
+#define SYS_GETCWD      52 // getcwd(buf, len) -> length / -1
+#define SYS_IOCTL       53 // ioctl(fd, cmd, arg) -> 0/-1 (termios TCGETS/TCSETS, TIOCGWINSZ)
+#define SYS_GETPPID     54 // getppid() -> parent pid
+// Note: execve is emulated in libc (spawn+waitpid+_exit) — no kernel syscall.
+
 // [M24] socket types
 #define SOCK_STREAM 1   // TCP
 #define SOCK_DGRAM  2   // UDP
