@@ -132,6 +132,71 @@ uint32_t ath9k_reg_read(uint32_t off) { return g_ath9k.present ? rd(off) : 0xFFF
 
 static void ath9k_udelay(int us) { for (volatile int i = 0; i < us * 300; i++) { } }
 
+/* [M39] Read `count` bytes from OTP at byte `address`, going DOWNWARD (the AR9300
+ * EEPROM image lives at the TOP of OTP, base 0x3ff, read backwards). Ported from
+ * ath9k ar9003_read_otp. */
+static int ath9k_read_otp_bytes(int address, uint8_t* buf, int count) {
+    for (int i = 0; i < count; i++) {
+        uint32_t data;
+        if (!ath9k_otp_read_word((uint32_t)((address - i) / 4), &data)) return 0;
+        buf[i] = (uint8_t)((data >> (8 * ((address - i) % 4))) & 0xff);
+    }
+    return 1;
+}
+
+/* [M39] Extract the station MAC from the AR9300 OTP EEPROM. The image is stored as
+ * compressed blocks at the top of OTP: each block has a 4-byte header (code,
+ * reference, length), `length` data bytes and a 2-byte checksum. _CompressNone
+ * blocks are a full copy; _CompressBlock blocks are (offset,length,data) deltas
+ * applied onto a template — the macAddr (byte offset 2 of the EEPROM struct) is
+ * written by an early delta, so we recover it without the 16 KB template. Ported
+ * (focused) from ath9k ar9003_eeprom_restore_internal. Returns 1 if a non-zero
+ * MAC was found. */
+int ath9k_read_mac_from_otp(uint8_t mac[6]) {
+    static uint8_t mptr[4096];
+    static uint8_t word[2048];
+    for (int i = 0; i < 6; i++) mac[i] = 0;
+    for (int i = 0; i < 16; i++) mptr[i] = 0;     /* only need the MAC region */
+
+    int cptr = 0x3ff;                              /* AR9300_BASE_ADDR */
+    uint8_t hdr[4];
+    if (!ath9k_read_otp_bytes(cptr, hdr, 4)) return 0;
+    uint32_t h = hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | ((uint32_t)hdr[3]<<24);
+    if (h == 0 || h == 0xffffffff) {               /* try the 512-byte base */
+        cptr = 0x1ff;
+        if (!ath9k_read_otp_bytes(cptr, hdr, 4)) return 0;
+        h = hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | ((uint32_t)hdr[3]<<24);
+        if (h == 0 || h == 0xffffffff) return 0;
+    }
+
+    for (int it = 0; it < 100 && cptr > 4; it++) {
+        if (!ath9k_read_otp_bytes(cptr, word, 4)) break;
+        uint32_t w0 = word[0] | (word[1]<<8) | (word[2]<<16) | ((uint32_t)word[3]<<24);
+        if (w0 == 0 || w0 == 0xffffffff) break;
+        int code      = (word[0] >> 5) & 0x7;
+        int length    = ((word[1] << 4) & 0x7f0) | ((word[2] >> 4) & 0xf);
+        if (length >= 1024 || length > cptr) { cptr -= 4; continue; }
+        if (length + 6 > (int)sizeof(word)) break;
+        if (!ath9k_read_otp_bytes(cptr, word, 4 + length + 2)) break;
+        if (code == 0) {                           /* _CompressNone: full copy */
+            if (length >= 8) for (int j = 0; j < 6; j++) mptr[2+j] = word[4+2+j];
+        } else {                                   /* _CompressBlock: apply deltas */
+            int spot = 0;
+            for (int t = 0; t + 2 <= length; ) {
+                int off = word[4+t] & 0xff; spot += off;
+                int len = word[4+t+1] & 0xff;
+                if (len > 0 && spot >= 0 && spot + len <= (int)sizeof(mptr)) {
+                    if (spot < 16) for (int j = 0; j < len && spot+j < 16; j++) mptr[spot+j] = word[4+t+2+j];
+                } else if (len > 0) break;
+                spot += len; t += len + 2;
+            }
+        }
+        cptr -= (4 + length + 2);
+    }
+    for (int i = 0; i < 6; i++) mac[i] = mptr[2+i];
+    return (mac[0]|mac[1]|mac[2]|mac[3]|mac[4]|mac[5]) ? 1 : 0;
+}
+
 /* [M39] AR9300 power-on wake + RTC reset. On the ASUS the chip wakes only in the
  * always-on domain (SREV/OTP respond) while RTC/MAC/PHY read 0xDEADBEEF (clock
  * gated). This runs the documented ath9k power-on sequence: force-wake, then
@@ -157,10 +222,20 @@ uint32_t ath9k_wake_reset(void) {
     /* Re-assert force-wake (some chips clear it across reset). */
     wr(AR_RTC_FORCE_WAKE, AR_RTC_FORCE_WAKE_EN | AR_RTC_FORCE_WAKE_ON_INT);
     ath9k_udelay(10);
-    /* Refresh the cached SREV/MAC now that the MAC block may respond. */
+    /* Refresh the cached SREV. */
     g_ath9k.srev = rd(AR_SREV);
-    uint32_t id0 = rd(AR_STA_ID0), id1 = rd(AR_STA_ID1);
-    g_ath9k.mac[0]=id0&0xff; g_ath9k.mac[1]=(id0>>8)&0xff; g_ath9k.mac[2]=(id0>>16)&0xff;
-    g_ath9k.mac[3]=(id0>>24)&0xff; g_ath9k.mac[4]=id1&0xff; g_ath9k.mac[5]=(id1>>8)&0xff;
+    /* [M39] Now that the MAC block responds, read the real station MAC from the
+     * OTP EEPROM (the registers are 0 until the driver programs them) and write it
+     * into STA_ID0/1, preserving the STA_ID1 flag bits. */
+    uint8_t mac[6];
+    if (ath9k_read_mac_from_otp(mac)) {
+        wr(AR_STA_ID0, mac[0] | (mac[1]<<8) | (mac[2]<<16) | ((uint32_t)mac[3]<<24));
+        wr(AR_STA_ID1, (rd(AR_STA_ID1) & 0xFFFF0000u) | mac[4] | (mac[5]<<8));
+        for (int i = 0; i < 6; i++) g_ath9k.mac[i] = mac[i];
+    } else {
+        uint32_t id0 = rd(AR_STA_ID0), id1 = rd(AR_STA_ID1);
+        g_ath9k.mac[0]=id0&0xff; g_ath9k.mac[1]=(id0>>8)&0xff; g_ath9k.mac[2]=(id0>>16)&0xff;
+        g_ath9k.mac[3]=(id0>>24)&0xff; g_ath9k.mac[4]=id1&0xff; g_ath9k.mac[5]=(id1>>8)&0xff;
+    }
     return st;
 }
