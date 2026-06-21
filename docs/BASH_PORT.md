@@ -85,3 +85,20 @@ needed kernel work) is done and validated; the rest is a large but mechanical
 libc-completion + config-authoring grind best done iteratively against the bash
 build. The M39 foundation is independently valuable: it is what **any** non-trivial
 source port (dash, busybox, coreutils-from-upstream, …) needs first.
+
+## Status (M39): bash RUNS from source — with one kernel bug to fix
+
+`bash -c '…'` works ring-3: arithmetic `$((6*7))`=42, variables/`${x}`, functions,
+`if`/`[ ]`/`&&`, `case`, `for` loops — all validated, 0 [EXC]. Embedded as
+`crypto/user_bash_elf.h`, demo `M39_BASH_DEMO`.
+
+**Open blocker — COW fork under bash.** Fork-based features (pipelines, `(subshell)`,
+external commands) intermittently hit a ring-3 **page fault** (err=4, read of a
+not-present page) inside bash after a `fork()`. Sometimes a pipeline runs to
+completion (`for … | while read` printed correctly), sometimes the first fork
+faults — i.e. a nondeterministic COW / demand-paging+fork interaction in
+`mm/vmm.c` (`vmm_fork_space`/`vmm_cow_fault`/`vma_fault_in`) exposed by bash's
+large (548 KB + heap) footprint, which the small M19 fork demo never stressed.
+This is the next fix and is a prerequisite for **boot-into-bash** (interactive bash
+needs working pipelines/external commands) — see TASKS. Non-fork bash is fully
+usable today.
