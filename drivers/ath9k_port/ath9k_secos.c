@@ -127,6 +127,7 @@ static void rx_addbuf(int i){
 }
 
 static unsigned g_rx_frames;   /* total descriptors completed (any frame heard) */
+static int g_first_st, g_first_len, g_first_fc;   /* shape of the first frame heard */
 
 static void prmac(const u8* m){
     for(int i=0;i<6;i++){ static const char h[]="0123456789abcdef";
@@ -199,6 +200,10 @@ static void rx_poll_collect(int dwell_ms){
             int ret = ath9k_hw_process_rxdesc_edma(g_ah, &rxs, buf);
             if (ret == -EINPROGRESS) continue;  /* this buffer not filled yet */
             any = 1; g_rx_frames++;
+            if (g_first_len == 0){               /* capture the very first frame's shape */
+                const u8* fr = buf + g_ah->caps.rx_status_len;
+                g_first_st = rxs.rs_status; g_first_len = rxs.rs_datalen; g_first_fc = fr[0];
+            }
             if (ret == 0 && rxs.rs_status == 0 && rxs.rs_datalen >= 24)
                 collect_beacon(buf + g_ah->caps.rx_status_len, rxs.rs_datalen, rxs.rs_rssi);
             rx_addbuf(i);                        /* zero status + re-queue */
@@ -240,7 +245,7 @@ int ath9k_secos_scan(void){
     if (!g_ah) { debugcon_writestring("[wifi] run 'wifi up' first\n"); return -1; }
     struct ath_common* common = ath9k_hw_common(g_ah);
     common->debug_mask = 0;                 /* silence the per-channel reset spam */
-    g_nap = 0; g_rx_frames = 0;
+    g_nap = 0; g_rx_frames = 0; g_first_len = 0; g_first_fc = 0; g_first_st = 0;
     debugcon_writestring("[wifi] scanning channels 1-13");
     for (int ch = 1; ch <= 13; ch++){
         if (tune_quiet(ch) != 0) continue;  /* tune + complete calibration */
@@ -249,7 +254,11 @@ int ath9k_secos_scan(void){
         debugcon_putchar('.');
     }
     debugcon_writestring("\n[wifi] heard "); debugcon_print_hex(g_rx_frames);
-    debugcon_writestring(" frames, networks: "); debugcon_print_hex((unsigned long)g_nap); debugcon_writestring("\n");
+    debugcon_writestring(" frames, NF="); debugcon_print_hex((unsigned long)(g_ah->noise & 0xffff));
+    debugcon_writestring(" first(fc="); debugcon_print_hex((unsigned long)g_first_fc);
+    debugcon_writestring(",len="); debugcon_print_hex((unsigned long)g_first_len);
+    debugcon_writestring(",st="); debugcon_print_hex((unsigned long)g_first_st);
+    debugcon_writestring("), networks: "); debugcon_print_hex((unsigned long)g_nap); debugcon_writestring("\n");
     for (int i = 0; i < g_nap; i++){
         debugcon_writestring("  "); prmac(g_aps[i].bssid);
         debugcon_writestring(g_aps[i].privacy ? " [WPA] " : " [open] ");
