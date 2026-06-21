@@ -20,4 +20,6 @@ struct ieee80211_channel {
 struct cfg80211_chan_def { struct ieee80211_channel* chan; u32 width; u32 center_freq1, center_freq2; };
 struct wiphy { void* priv; };
 #define IEEE80211_CHAN_MAX 64
+enum nl80211_dfs_regions { NL80211_DFS_UNSET=0, NL80211_DFS_FCC, NL80211_DFS_ETSI, NL80211_DFS_JP };
+enum rate_info_bw { RATE_INFO_BW_20=0, RATE_INFO_BW_5, RATE_INFO_BW_10, RATE_INFO_BW_40, RATE_INFO_BW_80, RATE_INFO_BW_160 };
 #endif

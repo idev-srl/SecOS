@@ -1,4 +1,13 @@
 #ifndef _C_KERNEL_H
+#include <linux/compiler.h>
+#include <linux/bitops.h>
+#include <asm/byteorder.h>
+#include <linux/slab.h>
+#include <linux/jiffies.h>
+#include <linux/errno.h>
+#include <linux/spinlock.h>
+#include <linux/timer.h>
+#include <linux/list.h>
 #define _C_KERNEL_H
 #include <linux/types.h>
 #define BIT(n) (1UL<<(n))
@@ -22,7 +31,13 @@
 #define EXPORT_SYMBOL_GPL(x)
 #define __init
 #define __exit
-#define KERN_ERR
+#define KERN_ERR ""
+#define KERN_CRIT ""
+#define KERN_WARNING ""
+#define KERN_INFO ""
+#define KERN_DEBUG ""
+#define KERN_NOTICE ""
+#define KERN_CONT ""
 #define unlikely(x) (x)
 #define likely(x) (x)
 #endif
