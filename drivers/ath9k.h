@@ -35,5 +35,6 @@ int ath9k_otp_read_word(uint32_t addr, uint32_t* out);  /* [M39] OTP word read (
 uint32_t ath9k_reg_read(uint32_t off);                  /* [M39] raw MMIO read for diag */
 uint32_t ath9k_wake_reset(void);                        /* [M39] power-on wake + RTC reset -> RTC_STATUS */
 int ath9k_read_mac_from_otp(uint8_t mac[6]);            // [M39] MAC from OTP EEPROM
+int ath9k_full_bringup(void);                           // [M39] run upstream ath9k_hw_init
 
 #endif

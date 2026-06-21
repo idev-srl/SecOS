@@ -125,6 +125,17 @@ int ath9k_init(void) {
 
 const ath9k_dev_t* ath9k_get(void) { return g_ath9k.present ? &g_ath9k : 0; }
 
+/* [M39] Full radio bring-up via the ported upstream ath9k_hw driver
+ * (drivers/ath9k_port/). Wakes the chip, then hands the mapped BAR0 + devid to
+ * ath9k_secos_bringup -> the real ath9k_hw_init (reset + AR9565 INI tables + PLL
+ * + calibration). Returns ath9k_hw_init's status. */
+int ath9k_full_bringup(void) {
+    extern int ath9k_secos_bringup(volatile void*, unsigned short);
+    if (!g_ath9k.present) return -1;
+    ath9k_wake_reset();
+    return ath9k_secos_bringup(g_ath9k.mmio, g_ath9k.device);
+}
+
 /* [M39] Raw register read, exposed for the `wifi diag` shell dump (real-HW
  * bring-up is iterative and blind without QEMU — these reads from the ASUS guide
  * the next steps: OTP layout, PLL/clock state, PHY liveness). */

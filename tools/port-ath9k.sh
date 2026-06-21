@@ -43,6 +43,7 @@ echo "[ath9k] 2/3 cross-compile vs SecOS shim"
 OBJ=/tmp/ath9k_obj; rm -rf "$OBJ"; mkdir -p "$OBJ"
 for c in $HW; do gcc $CF $INC -c "$W/ath9k/$c.c" -o "$OBJ/$c.o"; done
 gcc $CF $INC -c "$ROOT/drivers/ath9k_port/ath9k_glue.c" -o "$OBJ/glue.o"
+gcc $CF $INC -c "$ROOT/drivers/ath9k_port/ath9k_secos.c" -o "$OBJ/secos.o"
 
 echo "[ath9k] 3/3 link -> drivers/ath9k_port/ath9k_hw.o"
 ld -r "$OBJ"/*.o -o "$ROOT/drivers/ath9k_port/ath9k_hw.o"

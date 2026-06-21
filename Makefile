@@ -114,7 +114,13 @@ OBJS_C   = $(SRC_C:%.c=%.o)
 AP_TRAMPOLINE = $(BOOT_DIR)/ap_trampoline.o
 # [secure-boot] kernel code-signing note (.note.secos, GAS-assembled .S)
 KERNEL_NOTE = $(BOOT_DIR)/kernel_note.o
-OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE)
+# [M39] ported upstream ath9k_hw WiFi driver (built by tools/port-ath9k.sh against
+# the Linux-compat shim; prebuilt + committed so the kernel build needs no network).
+ATH9K_HW = drivers/ath9k_port/ath9k_hw.o
+OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE) $(ATH9K_HW)
+
+$(ATH9K_HW):
+	bash tools/port-ath9k.sh
 KERNEL  = kernel.bin
 ISO     = myos.iso
 ISODIR  = isodir

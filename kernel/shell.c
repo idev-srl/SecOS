@@ -1039,6 +1039,17 @@ static void sh_wifi(const char* a){
     if(!w){ terminal_writestring("wifi: no Atheros AR9300-family adapter found\n");
             terminal_writestring("  (QEMU has no such device; on the ASUS E406S this is the AR9565 168c:0036)\n");
             return; }
+    /* [M39] `wifi up`: full radio bring-up via the ported upstream ath9k_hw
+     * driver (ath9k_hw_init: reset + AR9565 INI tables + PLL + calibration). */
+    if(a && a[0]=='u' && a[1]=='p'){
+        terminal_writestring("AR9565 full bring-up (upstream ath9k_hw_init)...\n");
+        extern int ath9k_full_bringup(void);
+        int r = ath9k_full_bringup();
+        terminal_writestring("  ath9k_hw_init returned "); prhex((uint32_t)r,8);
+        terminal_writestring(r==0 ? "  ✓ OK\n" : "  (see [ath9k-port] on serial)\n");
+        terminal_writestring("  Now run 'wifi diag' — PHY@a000 should be a live configured value.\n");
+        return;
+    }
     /* [M39] `wifi wake`: run the AR9300 power-on wake + RTC reset, then report
      * RTC_STATUS and whether the RTC/MAC/PHY blocks now respond (vs 0xDEADBEEF). */
     if(a && a[0]=='w' && a[1]=='a' && a[2]=='k' && a[3]=='e'){
