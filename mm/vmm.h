@@ -96,6 +96,10 @@ void vmm_dump_entry(uint64_t virt);
 // Protect kernel sections applying W^X: text RX, rodata R (NX), data/bss RW (NX), stack RW (NX), guard page
 void vmm_protect_kernel_sections(void);
 
+// [M39] Boot-time W^X auditor: walks the high-half page tables, logs the count of
+// pages that are both writable and executable (0 = full W^X proven).
+void vmm_audit_wx(void);
+
 // M1.3: Install guard pages for kernel stack and IST stacks.
 // DEPRECATED (M2): superseded by vmm_alloc_kernel_stack() + vmm_alloc_ist_stack().
 // Kept for reference; NOT called from kernel_main in M2.

@@ -311,105 +311,159 @@ extern uint8_t stack_bottom, stack_top; // from boot.asm
 static inline uint64_t align_down(uint64_t v) { return v & ~0xFFFULL; }
 static inline uint64_t align_up_4k(uint64_t v) { return (v + 0xFFFULL) & ~0xFFFULL; }
 
-// Retrieve PDT entry for identity-mapped virtual address (<16MB) and create page table if huge
-static uint64_t* ensure_pt_for_identity(uint64_t virt_base_2mb) {
+// [M39] Walk to the 4K PT backing `va` in the kernel space, splitting a 2 MB huge
+// page into 512 × 4 KB entries on the way (inheriting RW; NX carried from the PDE).
+// physmap-consistent (the page tables live in low RAM, but big-RAM frames are only
+// reachable via the physmap — the old raw-physical walk faulted there). Returns the
+// PT (physmap pointer) or NULL.
+static uint64_t* kernel_split_to_pt(uint64_t va) {
     uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
-    uint64_t* pml4 = (uint64_t*)pml4_phys;
-    int pml4_i = (virt_base_2mb >> 39) & 0x1FF;
-    uint64_t* pdpt = (uint64_t*)(pml4[pml4_i] & ADDRESS_MASK);
-    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) return NULL; // should exist
-    int pdpt_i = (virt_base_2mb >> 30) & 0x1FF;
-    uint64_t* pdt = (uint64_t*)(pdpt[pdpt_i] & ADDRESS_MASK);
-    if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) return NULL;
-    int pdt_i = (virt_base_2mb >> 21) & 0x1FF;
-    uint64_t entry = pdt[pdt_i];
-    if (entry & VMM_FLAG_PS) {
-    void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] alloc PT fail\n"); return NULL; }
-        zero_frame((uint64_t)frame);
-        uint64_t phys_base = (entry & ADDRESS_MASK);
-        uint64_t* pt = (uint64_t*)(((uint64_t)frame) & ADDRESS_MASK);
-        for (int i=0;i<512;i++) {
-            uint64_t phys = phys_base + (i * PAGE_SIZE);
-            // Permissive default: RW + executable; restrictions applied later.
-            pt[i] = phys | VMM_FLAG_PRESENT | VMM_FLAG_RW; // no NX here to avoid conversion faults
-        }
-    pdt[pdt_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW; // clear PS (remove huge)
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+    int i4 = (va >> 39) & 0x1FF;
+    if (!(pml4[i4] & VMM_FLAG_PRESENT)) return NULL;
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[i4] & ADDRESS_MASK);
+    int i3 = (va >> 30) & 0x1FF;
+    if (!(pdpt[i3] & VMM_FLAG_PRESENT)) return NULL;
+    uint64_t* pdt = (uint64_t*)phys_to_virt(pdpt[i3] & ADDRESS_MASK);
+    int i2 = (va >> 21) & 0x1FF;
+    uint64_t pde = pdt[i2];
+    if (!(pde & VMM_FLAG_PRESENT)) return NULL;
+    if (pde & VMM_FLAG_PS) {
+        void* frame = pmm_alloc_frame();
+        if (!frame) { terminal_writestring("[SEC][ERR] PT split alloc fail\n"); return NULL; }
+        uint64_t pt_phys = (uint64_t)frame & ADDRESS_MASK;
+        uint64_t* pt = (uint64_t*)phys_to_virt(pt_phys);
+        uint64_t base = pde & ADDRESS_MASK;
+        uint64_t carry_nx = pde & VMM_FLAG_NOEXEC;
+        for (int k = 0; k < 512; k++)
+            pt[k] = (base + (uint64_t)k * PAGE_SIZE) | VMM_FLAG_PRESENT | VMM_FLAG_RW | carry_nx;
+        // Non-leaf entry: PRESENT|RW, never USER (kernel-only); x86 ANDs RW/USER
+        // across levels, so the leaf PTE remains the sole protection authority.
+        pdt[i2] = pt_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW;
         return pt;
     }
-    return (uint64_t*)(entry & ADDRESS_MASK);
+    return (uint64_t*)phys_to_virt(pde & ADDRESS_MASK);
 }
 
-static void set_page_flags(uint64_t virt, uint64_t flags_mask_clear, uint64_t flags_set) {
-    // Ensure the 2MB chunk is split into 4K pages
-    ensure_pt_for_identity(virt & ~((2ULL*1024*1024)-1));
-    uint64_t* pt = get_pt(virt, 0, 0);
+// Apply (clear, set) to the leaf PTE for `va`, splitting if needed. invlpg after.
+static void kset_flags(uint64_t va, uint64_t clear, uint64_t set) {
+    uint64_t* pt = kernel_split_to_pt(va);
     if (!pt) return;
-    int pt_i = (virt >> 12) & 0x1FF;
-    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return;
-    uint64_t entry = pt[pt_i];
-    entry &= ~flags_mask_clear;
-    entry |= flags_set;
-    pt[pt_i] = entry;
-    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    int i = (va >> 12) & 0x1FF;
+    if (!(pt[i] & VMM_FLAG_PRESENT)) return;
+    uint64_t e = pt[i];
+    e &= ~clear; e |= set;
+    pt[i] = e;
+    __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
 }
 
+// [M39] Full high-half kernel W^X. Until now vmm_protect_kernel_sections was
+// defined but NEVER CALLED, so the high-half image ran RWX (the low identity map
+// was the only thing M36 NX'd). This is the per-section protection M36 deferred.
+//
+// Strategy: split every 2 MB huge page spanning the kernel image to 4 KB, then a
+// single sweep sets each page: .text -> RX (clear RW, no NX); everything else
+// non-writable (rodata, the .note.secos signing note, .eh_frame-less gaps,
+// alignment padding) -> R/NX; data/bss/stack -> RW/NX. No page is left both W and
+// X — gaps included (the old version left them RWX). Finally NX every *other* 2 MB
+// huge page of the high-half phys-0..512MB window (a duplicate RAM view that was
+// RWX) so an arbitrary kernel write can never find an executable alias.
+//
+// Must run after vmm_init_physmap(). NX is universally supported (EFER.NXE is on),
+// so this is a pure protection tightening with no CPU-feature dependency.
 void vmm_protect_kernel_sections(void) {
-    terminal_writestring("[SEC] Protecting kernel sections (W^X)...\n");
+    terminal_writestring("[SEC] Applying high-half kernel W^X...\n");
     uint64_t text_start = (uint64_t)&_text_start;
     uint64_t text_end   = (uint64_t)&_text_end;
-    uint64_t ro_start   = (uint64_t)&_rodata_start;
-    uint64_t ro_end     = (uint64_t)&_rodata_end;
     uint64_t data_start = (uint64_t)&_data_start;
-    uint64_t data_end   = (uint64_t)&_data_end;
-    uint64_t bss_start  = (uint64_t)&_bss_start;
     uint64_t bss_end    = (uint64_t)&_bss_end;
-    uint64_t stack_btm  = (uint64_t)&stack_bottom;
-    uint64_t stack_tp   = (uint64_t)&stack_top;
 
-    // Compute global range to protect (min start through stack top)
-    uint64_t min_addr = text_start;
-    if (ro_start < min_addr) min_addr = ro_start;
-    if (data_start < min_addr) min_addr = data_start;
-    if (bss_start < min_addr) min_addr = bss_start;
-    if (stack_btm < min_addr) min_addr = stack_btm;
-    uint64_t max_addr = stack_tp; // includes stack
+    // The writable span is [.data .. .bss end] — the boot stack and the idle-task
+    // stacks all live inside .bss (stack_bottom == _bss_start). Everything between
+    // .text end and .data (rodata + the signing note) is read-only.
+    uint64_t txt_lo = align_down(text_start);
+    uint64_t txt_hi = align_up_4k(text_end);
+    uint64_t rw_lo  = align_down(data_start);
+    uint64_t rw_hi  = align_up_4k(bss_end);
 
-    uint64_t cur = min_addr & ~((2ULL*1024*1024)-1);
-    uint64_t end = (max_addr + (2ULL*1024*1024 -1)) & ~((2ULL*1024*1024)-1);
-    for (; cur < end; cur += (2ULL*1024*1024)) {
-        ensure_pt_for_identity(cur);
+    // Sweep the full 2 MB-aligned span covering the image so the *tail* of the last
+    // split huge page (the bytes past _bss_end up to the 2 MB boundary) is also
+    // protected — leaving it at the split default (RW, no NX) would be a W&X gap.
+    uint64_t two_mb = 2ULL * 1024 * 1024;
+    uint64_t img_lo = (txt_lo < rw_lo ? txt_lo : rw_lo) & ~(two_mb - 1);
+    uint64_t img_hi = (rw_hi + two_mb - 1) & ~(two_mb - 1);
+    for (uint64_t v = img_lo; v < img_hi; v += PAGE_SIZE) {
+        int is_text = (v >= txt_lo && v < txt_hi);
+        int is_rw   = (v >= rw_lo  && v < rw_hi);
+        uint64_t clear = 0, set = 0;
+        if (is_text) { clear = VMM_FLAG_RW | VMM_FLAG_NOEXEC; }       // RX
+        else if (is_rw) { clear = 0; set = VMM_FLAG_RW | VMM_FLAG_NOEXEC; } // RW/NX
+        else { clear = VMM_FLAG_RW; set = VMM_FLAG_NOEXEC; }          // R/NX (rodata+gaps+note+tail)
+        kset_flags(v, clear, set);
     }
 
-    // Text: RX (clear RW & NX)
-    for (uint64_t v = align_down(text_start); v < align_up_4k(text_end); v += PAGE_SIZE) {
-        set_page_flags(v, VMM_FLAG_RW | VMM_FLAG_NOEXEC, 0); // clear RW & NX
-    }
-    // Rodata: R, NX
-    for (uint64_t v = align_down(ro_start); v < align_up_4k(ro_end); v += PAGE_SIZE) {
-        set_page_flags(v, VMM_FLAG_RW, VMM_FLAG_NOEXEC); // remove RW, set NX
-    }
-    // .note.secos (code-signing note): R, NX — same as rodata, no executable gap.
+    // NX the remaining high-half 2 MB huge pages (the phys 0..512MB window aliased
+    // at KERNEL_VMA that the image does not cover) so no executable RAM alias
+    // survives. Pages we just split are 4K (not PS) and are skipped.
     {
-        extern uint8_t _note_start, _note_end;
-        uint64_t note_start = (uint64_t)&_note_start;
-        uint64_t note_end   = (uint64_t)&_note_end;
-        for (uint64_t v = align_down(note_start); v < align_up_4k(note_end); v += PAGE_SIZE) {
-            set_page_flags(v, VMM_FLAG_RW, VMM_FLAG_NOEXEC);
+        uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
+        uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+        uint64_t base = 0xFFFFFFFF80000000ULL; // KERNEL_VMA
+        for (uint64_t off = 0; off < (512ULL << 20); off += (2ULL << 20)) {
+            uint64_t va = base + off;
+            int i4 = (va >> 39) & 0x1FF, i3 = (va >> 30) & 0x1FF, i2 = (va >> 21) & 0x1FF;
+            if (!(pml4[i4] & VMM_FLAG_PRESENT)) continue;
+            uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[i4] & ADDRESS_MASK);
+            if (!(pdpt[i3] & VMM_FLAG_PRESENT)) continue;
+            uint64_t* pdt = (uint64_t*)phys_to_virt(pdpt[i3] & ADDRESS_MASK);
+            uint64_t pde = pdt[i2];
+            if ((pde & VMM_FLAG_PRESENT) && (pde & VMM_FLAG_PS) && !(pde & VMM_FLAG_NOEXEC)) {
+                pdt[i2] = pde | VMM_FLAG_NOEXEC;   // RW/NX huge page
+                __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+            }
         }
     }
-    // Data + BSS: RW, NX
-    for (uint64_t v = align_down(data_start); v < align_up_4k(data_end); v += PAGE_SIZE) {
-        set_page_flags(v, VMM_FLAG_NOEXEC, VMM_FLAG_NOEXEC | VMM_FLAG_RW); // enforce NX & RW
-    }
-    for (uint64_t v = align_down(bss_start); v < align_up_4k(bss_end); v += PAGE_SIZE) {
-        set_page_flags(v, VMM_FLAG_NOEXEC, VMM_FLAG_NOEXEC | VMM_FLAG_RW);
-    }
-    // Stack: RW, NX (guard page deferred for stability)
-    for (uint64_t v = align_down(stack_btm); v < align_up_4k(stack_tp); v += PAGE_SIZE) {
-        set_page_flags(v, VMM_FLAG_NOEXEC, VMM_FLAG_NOEXEC | VMM_FLAG_RW);
-    }
 
-    terminal_writestring("[SEC] W^X applied: text RX, rodata R/NX, data+bss RW/NX, stack RW/NX with guard page\n");
+    terminal_writestring("[SEC] W^X applied: text RX, rodata R/NX, data+bss+stack RW/NX, high-half alias NX\n");
+}
+
+// [M39] Boot-time W^X auditor. Walks every present leaf page of the high-half
+// kernel image and the phys-0..512MB high-half window and counts pages that are
+// both writable and executable. Logs the result; 0 violations proves full W^X.
+void vmm_audit_wx(void) {
+    uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+    uint64_t base = 0xFFFFFFFF80000000ULL;
+    uint64_t violations = 0, checked = 0, first_bad = 0;
+    for (uint64_t off = 0; off < (512ULL << 20); off += (2ULL << 20)) {
+        uint64_t va = base + off;
+        int i4 = (va >> 39) & 0x1FF, i3 = (va >> 30) & 0x1FF, i2 = (va >> 21) & 0x1FF;
+        if (!(pml4[i4] & VMM_FLAG_PRESENT)) continue;
+        uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[i4] & ADDRESS_MASK);
+        if (!(pdpt[i3] & VMM_FLAG_PRESENT)) continue;
+        uint64_t* pdt = (uint64_t*)phys_to_virt(pdpt[i3] & ADDRESS_MASK);
+        uint64_t pde = pdt[i2];
+        if (!(pde & VMM_FLAG_PRESENT)) continue;
+        if (pde & VMM_FLAG_PS) {
+            checked++;
+            if ((pde & VMM_FLAG_RW) && !(pde & VMM_FLAG_NOEXEC)) { violations++; if(!first_bad) first_bad=va; }
+        } else {
+            uint64_t* pt = (uint64_t*)phys_to_virt(pde & ADDRESS_MASK);
+            for (int k = 0; k < 512; k++) {
+                if (!(pt[k] & VMM_FLAG_PRESENT)) continue;
+                checked++;
+                if ((pt[k] & VMM_FLAG_RW) && !(pt[k] & VMM_FLAG_NOEXEC)) { violations++; if(!first_bad) first_bad=va+(uint64_t)k*PAGE_SIZE; }
+            }
+        }
+    }
+    if (violations) { debugcon_writestring("[WX] first W&X VA="); debugcon_print_hex(first_bad); debugcon_writestring("\n"); }
+    char buf[17]; static const char hx[]="0123456789ABCDEF";
+    terminal_writestring("[WX] high-half audit: pages=");
+    uint64_t v=checked; for(int i=15;i>=0;i--){buf[i]=hx[v&0xF];v>>=4;} buf[16]=0; terminal_writestring(buf);
+    terminal_writestring(" W&X="); v=violations; for(int i=15;i>=0;i--){buf[i]=hx[v&0xF];v>>=4;} buf[16]=0; terminal_writestring(buf);
+    terminal_writestring(violations==0 ? "  CLEAN\n" : "  *** VIOLATIONS ***\n");
+    debugcon_writestring(violations==0 ? "[WX] kernel image W^X verified (0 violations)\n"
+                                       : "[WX] *** W^X VIOLATIONS PRESENT ***\n");
 }
 
 // --- M1.3: Guard pages ---

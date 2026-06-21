@@ -1303,6 +1303,16 @@ static void kernel_main_phase2(void) {
     // A minimal no-STI fallback IDT could be added in M3 for safer debugging.
     idt_init();
 
+    // [M39] Full high-half kernel W^X: text RX, rodata/note R/NX, data/bss/stack
+    // RW/NX, and NX on the duplicate phys-window alias. Until now this was deferred
+    // (the high-half image ran RWX); the IDT is loaded so any latent
+    // write-to-rodata / exec-from-data fault surfaces as [EXC] not a triple fault.
+    // NX is universal (EFER.NXE on) so this is CPU-feature-independent. Then audit.
+#ifndef SECOS_NO_WX
+    vmm_protect_kernel_sections();
+    vmm_audit_wx();
+#endif
+
     heap_init();
     sched_init();
     driver_registry_init();
