@@ -19,4 +19,10 @@
 #define struct_group(name,...) struct { __VA_ARGS__ } name; struct { __VA_ARGS__ }
 #define struct_group_tagged(tag,name,...) struct { __VA_ARGS__ } name
 #define offsetof(t,m) __builtin_offsetof(t,m)
+#define READ_ONCE(x) (*(volatile typeof(x)*)&(x))
+#define WRITE_ONCE(x,v) (*(volatile typeof(x)*)&(x)=(v))
+#define PTR_ERR_OR_ZERO(p) 0
+#define IS_ERR(p) (0)
+#define PTR_ERR(p) (0L)
+#define ERR_PTR(e) ((void*)0)
 #endif
