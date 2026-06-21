@@ -113,6 +113,20 @@ int crypto_selftest(void) {
         fails += report("WPA2 PBKDF2+AES KAT", wpa2_selftest() == 1);
     }
 
+    /* [M39] WPA2 4-way handshake core: AES-decrypt + RFC 3394 key-wrap (GTK) +
+     * PTK/PRF derivation. KAT = RFC 3394 §4.1 vector + PTK smoke. */
+    {
+        extern int wpa2_eapol_selftest(void);
+        fails += report("WPA2 EAPOL (PTK+RFC3394 keywrap) KAT", wpa2_eapol_selftest() == 1);
+    }
+
+    /* [M39] Full WPA2 4-way handshake supplicant, validated end-to-end against a
+     * synthetic authenticator (PTK agreement + MIC + GTK unwrap). */
+    {
+        extern int wpa2_supplicant_selftest(void);
+        fails += report("WPA2 4-way handshake supplicant KAT", wpa2_supplicant_selftest() == 1);
+    }
+
     debugcon_writestring(fails ? "[CRYPTO] --- FAIL ---\n" : "[CRYPTO] --- all PASS ---\n");
     return fails;
 }

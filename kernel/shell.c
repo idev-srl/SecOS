@@ -1046,8 +1046,9 @@ static void sh_wifi(const char* a){ (void)a;
     terminal_writestring(w->awake ? "  (chip responds)\n" : "  (no response)\n");
     terminal_writestring("  MAC=");
     for(int i=0;i<6;i++){ prhex(w->mac[i],2); if(i<5) terminal_writestring(":"); }
-    terminal_writestring("\n  status: identify+map OK; association/WPA2 = real-HW TODO (M38).\n");
-    terminal_writestring("  WPA2 crypto (PBKDF2 PMK + AES-CCM) is implemented and KAT-tested.\n");
+    terminal_writestring("\n  status: identify+map OK; radio bring-up (INI/PHY/scan) = real-HW TODO.\n");
+    terminal_writestring("  WPA2 association core COMPLETE + KAT-validated: PBKDF2 PMK, PTK/PRF,\n");
+    terminal_writestring("  RFC3394 GTK key-wrap, and the full 4-way handshake supplicant.\n");
 }
 
 // usbinfo: report what the xHCI driver saw — controller presence, root ports, how

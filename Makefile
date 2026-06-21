@@ -87,6 +87,7 @@ SRC_C   = \
 	$(CRYPTO_DIR)/sha512.c \
 	$(CRYPTO_DIR)/sha1.c \
 	$(CRYPTO_DIR)/wpa2.c \
+	$(CRYPTO_DIR)/wpa2_eapol.c \
 	$(CRYPTO_DIR)/ed25519.c \
 	$(CRYPTO_DIR)/crypto_selftest.c \
 	$(DRIVERS_DIR)/ath9k.c \
@@ -103,7 +104,8 @@ SRC_C   = \
 	$(NET_DIR)/dhcp.c \
 	$(NET_DIR)/dns.c \
 	$(NET_DIR)/tcp.c \
-	$(NET_DIR)/socket.c
+	$(NET_DIR)/socket.c \
+	$(NET_DIR)/wpa2_supplicant.c
 
 OBJS_ASM = $(SRC_ASM:%.asm=%.o)
 OBJS_C   = $(SRC_C:%.c=%.o)
