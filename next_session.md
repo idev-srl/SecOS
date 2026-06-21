@@ -1,5 +1,63 @@
 # SECoS — Resume Here (session handoff)
 
+## 🌙 AUTONOMOUS session (2026-06-21) — M39: all 4 NEXT candidates — pushed
+Executed the four "NEXT candidates" from the previous handoff in one autonomous
+run (user: "esegui tutti e 4 i candidati … per bash voglio bash"). Each landed as
+a validated commit; KASLR and full bash were honestly scoped (see notes).
+**Selftest re-run after all changes; both smoke paths PASS; secure boot +,−
+validated; W^X audit CLEAN; all WPA2 + POSIX KATs PASS.**
+
+Commits (newest first):
+- **`d1bd579` libc POSIX shims + bash port plan.** getuid/…/umask, gettimeofday,
+  fcntl(F_DUPFD/F_GETFL), `<sys/time.h>`. `docs/BASH_PORT.md` = evidence-based gap
+  analysis (audited bash-5.2's 272 .c files) + staged plan.
+- **`0ca4e0a` (#2 bash foundation) POSIX shell-from-source syscalls/libc.**
+  SYS_DUP2/DUP/CHDIR/GETCWD/IOCTL/GETPPID (49–54); per-process cwd (+relative-path
+  resolution in open); `<termios.h>` (tcgetattr/tcsetattr/cfmakeraw); real
+  `environ`+getenv/setenv; execve emulated (spawn+wait+exit). Demo `M39_POSIX_DEMO`
+  validates every piece ring-3 (getcwd/chdir/env/dup2-redirect/termios — all OK).
+- **`7ee71d1` (#1 WiFi) WPA2 association core.** AES-decrypt + RFC3394 GTK
+  key-wrap + PTK/PRF + EAPOL MIC (`crypto/wpa2_eapol.c`) + the full 4-way handshake
+  supplicant (`net/wpa2_supplicant.c`), validated by a **synthetic handshake KAT**
+  (stub AP drives the supplicant → PTK agreement + MIC + GTK unwrap). Radio
+  bring-up (ath9k INI/PHY/DMA/scan) is the remaining real-HW-iterative TODO.
+- **`e5a991c` (#3) user-space ASLR.** Per-process random slide of stack (≤16MB),
+  heap & mmap (≤32MB). `-DSECOS_NO_ASLR` to disable. M16 argv/M19 fork unaffected.
+- **`021d445` (#3) FULL high-half kernel W^X — was NEVER ACTIVE before.**
+  `vmm_protect_kernel_sections` was defined since M36 but never called → the
+  high-half image ran RWX. Rewrote it physmap-consistent + wired it in + a
+  boot-time auditor: `[WX] kernel image W^X verified (0 violations)` (1789 pages,
+  both paths). NX is universal → low real-HW risk.
+- **`61f52c7` (#4) full secure boot.** UEFI loader Ed25519-verifies the kernel
+  before jumping (`uefi/secure_boot.c` + crypto compiled into the loader);
+  `boot/kernel_note.S` makes kernel.bin signable; Makefile signs it. Validated in
+  QEMU+OVMF: signed → "[SECURE BOOT] kernel signature OK" → shell; one flipped byte
+  → "signature INVALID — refusing to boot", kernel never runs.
+
+### Honest scope notes (read before claiming these "done")
+- **KASLR (kernel text): DEFERRED, not shipped.** Relocation-based kernel-text
+  KASLR with `-mcmodel=kernel` + measured-boot + dual boot paths is a large,
+  blind-risky subsystem I could not validate on your hardware; shipping it active
+  would risk the real-HW boot. Delivered **user-space ASLR** (real, safe) instead
+  and documented the deferral. W^X already removes the executable-alias surface
+  KASLR would protect.
+- **SMAP: audit done, NOT enabled by default.** Found the exact remaining work
+  (the read/write/send/recv fast-path passes user buffers straight to vfs/pipe/
+  socket → needs bounce-buffering before CR4.SMAP can be set). Enabling it blind
+  risked the real-HW boot, so it stays opt-in (`-DSECOS_SMAP`) with the audit
+  recorded. The sigframe + argv paths are already SMAP-safe (physmap/user_copy).
+- **bash: foundation done + validated; the bash BINARY is not built.** bash-5.2 is
+  a 272-file autoconf project needing a hand-curated config.h (autoconf can't probe
+  SecOS) + ~15 more shims + its bundled libs — multi-session. See `docs/BASH_PORT.md`.
+
+**NEXT candidates:** (a) continue the bash port per `docs/BASH_PORT.md` (config.h +
+shim layer + build subset); (b) WiFi radio bring-up (ath9k INI/PHY/scan — the
+crypto+supplicant are ready and KAT'd); (c) SMAP bounce-buffering → enable by
+default; (d) kernel-text KASLR (relocation + reproducible-measurement handling).
+**Rebuild images + verify the banner `git:<hash>` before the ASUS/VMware test.**
+
+---
+
 ## 🌙 AUTONOMOUS OVERNIGHT session (2026-06-21) — M33–M38, Phase L COMPLETE — HEAD `0491f81`, pushed
 Worked autonomously through the remaining roadmap + both user bonuses, then a
 follow-up (shell redirection). **Selftest 182/182, both smoke paths PASS, 0
