@@ -202,6 +202,17 @@ static void rx_poll_collect(int dwell_ms){
     }
 }
 
+/* The AR9003 initial calibrations (IQ/ADC/NF) started by ath9k_hw_reset complete
+ * ASYNCHRONOUSLY; the upstream driver polls ath9k_hw_calibrate from a timer until
+ * they finish. Without that the receiver stays half-calibrated and barely decodes.
+ * Drive it to completion here (longcal => also runs NF + ANI). */
+static void complete_cal(void){
+    for (int i = 0; i < 40; i++){
+        if (ath9k_hw_calibrate(g_ah, &g_chan, g_ah->rxchainmask, 1)) break;
+        udelay(10000);   /* 10 ms between cal polls */
+    }
+}
+
 /* Quiet channel tune (no per-step prints) used by the sweep. */
 static int tune_quiet(int chan_num){
     if (chan_num < 1 || chan_num > 14) chan_num = 1;
@@ -209,7 +220,9 @@ static int tune_quiet(int chan_num){
     g_iec.band = NL80211_BAND_2GHZ; g_iec.center_freq = freq; g_iec.hw_value = chan_num;
     g_chan.chan = &g_iec; g_chan.channel = freq; g_chan.channelFlags = 0;
     g_ah->curchan = &g_chan;
-    return ath9k_hw_reset(g_ah, &g_chan, &g_caldata, 0);
+    int r = ath9k_hw_reset(g_ah, &g_chan, &g_caldata, 0);
+    if (r == 0){ ath9k_hw_setpower(g_ah, ATH9K_PM_AWAKE); complete_cal(); }
+    return r;
 }
 
 /* Sweep channels 1..13 (re-tune + listen ~400ms each); concise summary.
@@ -221,10 +234,9 @@ int ath9k_secos_scan(void){
     g_nap = 0; g_rx_frames = 0;
     debugcon_writestring("[wifi] scanning channels 1-13");
     for (int ch = 1; ch <= 13; ch++){
-        if (tune_quiet(ch) != 0) continue;  /* tune to channel */
+        if (tune_quiet(ch) != 0) continue;  /* tune + complete calibration */
         rx_bring_up();
-        udelay(15000);                      /* let NF cal settle after reset */
-        rx_poll_collect(400);
+        rx_poll_collect(500);
         debugcon_putchar('.');
     }
     debugcon_writestring("\n[wifi] heard "); debugcon_print_hex(g_rx_frames);
