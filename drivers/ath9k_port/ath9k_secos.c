@@ -69,6 +69,12 @@ int ath9k_secos_bringup(volatile void* mmio, unsigned short devid){
     common->bus_ops = &g_bus_ops;
     common->ah = ah;
     common->debug_mask = 0xffffffff;   /* narrate the bring-up on debugcon */
+    /* AR9565 BT/WLAN RX antenna diversity + LNA combining. The main driver
+     * (init.c) sets this from the card's PCI quirk; Alpine's dmesg on this exact
+     * ASUS shows "Set BT/WLAN RX diversity" + "Enable LNA combining". Without it
+     * ath9k_hw_reset never forces AR_BTCOEX_WL_LNADIV and the RX antenna stays
+     * misconfigured -> deaf. Force it on (this card supports it). */
+    common->bt_ant_diversity = 1;
 
     debugcon_writestring("[ath9k-port] S3 calling ath9k_hw_init (upstream driver)...\n");
     int ret = ath9k_hw_init(ah);
@@ -267,6 +273,7 @@ static int tune_quiet(int chan_num){
     int r = ath9k_hw_reset(g_ah, &g_chan, &g_caldata, 0);
     if (r == 0){
         ath9k_hw_setpower(g_ah, ATH9K_PM_AWAKE);
+        ath9k_hw_set_bt_ant_diversity(g_ah, 1);  /* configure AR9565 LNA diversity from eeprom */
         complete_cal();
         ath9k_ani_reset(g_ah, 0);   /* set sensitive default weak-signal thresholds */
     }
