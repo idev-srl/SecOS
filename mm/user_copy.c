@@ -6,6 +6,14 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* [M36] SMAP: when enabled, the kernel may not touch user pages unless RFLAGS.AC
+ * is set. These primitives are the sanctioned bridge, so they raise AC (stac)
+ * around the access and clear it (clac) after. Dormant until SMAP is enabled
+ * (g_smap_enabled, set by cpu_enable_mitigations under -DSECOS_SMAP). */
+extern int g_smap_enabled;
+static inline void ua_begin(void){ if (g_smap_enabled) __asm__ volatile("stac" ::: "cc"); }
+static inline void ua_end(void){ if (g_smap_enabled) __asm__ volatile("clac" ::: "cc"); }
+
 int user_range_valid(const void* ptr, size_t len) {
     uint64_t start = (uint64_t)ptr;
 
@@ -25,7 +33,9 @@ int copy_from_user(void* dst, const void* user_src, size_t len) {
 
     const uint8_t* s = (const uint8_t*)user_src;
     uint8_t*       d = (uint8_t*)dst;
+    ua_begin();
     for (size_t i = 0; i < len; i++) d[i] = s[i];
+    ua_end();
     return 0;
 }
 
@@ -34,6 +44,8 @@ int copy_to_user(void* user_dst, const void* src, size_t len) {
 
     const uint8_t* s = (const uint8_t*)src;
     uint8_t*       d = (uint8_t*)user_dst;
+    ua_begin();
     for (size_t i = 0; i < len; i++) d[i] = s[i];
+    ua_end();
     return 0;
 }

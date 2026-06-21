@@ -232,27 +232,39 @@ static uint64_t vmm_build_kernel_pml4_identity_512mb(void) {
     uint64_t pml4_phys = (uint64_t)pmm_alloc_frame();
     uint64_t pdpt_phys = (uint64_t)pmm_alloc_frame();
     uint64_t pdt_phys  = (uint64_t)pmm_alloc_frame();
+    uint64_t pdt_lo_phys = (uint64_t)pmm_alloc_frame();    // [M36] separate low-identity PDT (NX)
     uint64_t pdpt_hi_phys = (uint64_t)pmm_alloc_frame();   // [M12] high-half PDPT
-    if (!pml4_phys || !pdpt_phys || !pdt_phys || !pdpt_hi_phys) {
+    if (!pml4_phys || !pdpt_phys || !pdt_phys || !pdt_lo_phys || !pdpt_hi_phys) {
         terminal_writestring("[ERR] M1.1: PMM alloc failed for kernel page tables\n");
         return 0;
     }
     zero_frame(pml4_phys);
     zero_frame(pdpt_phys);
     zero_frame(pdt_phys);
+    zero_frame(pdt_lo_phys);
     zero_frame(pdpt_hi_phys);
 
     // Identity cast: frames are within 0–512MB, bootloader tables are still active
     uint64_t* pml4    = (uint64_t*)pml4_phys;
     uint64_t* pdpt    = (uint64_t*)pdpt_phys;
     uint64_t* pdt     = (uint64_t*)pdt_phys;
+    uint64_t* pdt_lo  = (uint64_t*)pdt_lo_phys;
     uint64_t* pdpt_hi = (uint64_t*)pdpt_hi_phys;
 
-    // Low identity 0–512MB (PML4[0] -> PDPT[0] -> PDT, 2MB pages). Still needed
-    // during early init (frames addressed by physical == virtual) and for the
-    // boot transition; the physmap and high half take over afterwards.
-    pml4[0] = pdpt_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW;
-    pdpt[0] = pdt_phys  | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    // Low identity 0–512MB (PML4[0] -> PDPT[0] -> PDT_LO, 2MB pages). Still needed
+    // during early init (frames addressed by physical == virtual), for virtio DMA
+    // and for the boot transition. [M36] W^X: the kernel now runs from the HIGH
+    // half (M12), so nothing legitimately executes from the low identity map —
+    // mark it NX. The first 2MB stays executable for the SMP AP trampoline (which
+    // runs at phys 0x8000 on the kernel CR3 before it jumps high).
+    pml4[0] = pdpt_phys   | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    pdpt[0] = pdt_lo_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    for (int i = 0; i < 256; i++) {
+        uint64_t flags = VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS;
+        if (i != 0) flags |= VMM_FLAG_NOEXEC;        // keep 0–2MB executable (AP trampoline)
+        pdt_lo[i] = ((uint64_t)i << 21) | flags;
+    }
+    // The high-half page directory (kernel image) stays executable.
     for (int i = 0; i < 256; i++) {
         pdt[i] = ((uint64_t)i << 21) | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS;
     }

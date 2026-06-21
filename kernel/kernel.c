@@ -1922,10 +1922,42 @@ void cpu_enable_sse(void) {
     __asm__ volatile("ldmxcsr %0" :: "m"(mxcsr));
 }
 
+// [M36] Exploit mitigations rooted in the CPU. SMEP stops the kernel from ever
+// executing a ring-3 page (ret2usr); SMAP stops stray kernel reads/writes of user
+// memory unless explicitly allowed (stac/clac in the user_copy primitives). Both
+// are gated on CPUID support so the kernel still boots on CPUs that lack them.
+int g_smap_enabled = 0;   // user_copy.c emits stac/clac only when this is set
+void cpu_enable_mitigations(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
+    uint64_t cr4;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    int smep = (b & (1u << 7))  ? 1 : 0;
+    int smap = (b & (1u << 20)) ? 1 : 0;
+    if (smep) cr4 |= (1UL << 20);             // CPUID.7:EBX.SMEP -> CR4.SMEP
+#ifdef SECOS_SMAP
+    /* SMAP is opt-in: enabling it system-wide requires every syscall that passes
+     * a user pointer into deep kernel code (e.g. SYS_OPEN -> vfs_lookup) to copy
+     * the buffer in first. The user_copy primitives already bracket their access
+     * with stac/clac; the full path audit is the remaining work. */
+    if (smap) cr4 |= (1UL << 21);             // CPUID.7:EBX.SMAP -> CR4.SMAP
+#endif
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
+#ifdef SECOS_SMAP
+    if (smap) { g_smap_enabled = 1; __asm__ volatile("clac"); }
+#endif
+    debugcon_writestring("[M36] mitigations: SMEP=");
+    debugcon_writestring(smep ? "on" : "n/a");
+    debugcon_writestring(" SMAP=");
+    debugcon_writestring(g_smap_enabled ? "on" : (smap ? "available(opt-in)" : "n/a"));
+    debugcon_writestring(" stack-canary=on\n");
+}
+
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // --- Phase 1 begins (old .bss stack) ---
     terminal_initialize();
     cpu_enable_sse();   // [M34] FPU/SSE for ring-3 (lua & other FP userland)
+    cpu_enable_mitigations(); // [M36] SMEP/SMAP/canary
     // COM1 serial console: mirrors terminal output and feeds the shell input
     // path, so the interactive shell works headless over `-serial stdio`.
     extern void serial_init(void); serial_init();

@@ -70,7 +70,9 @@ extern void sched_reap_zombies(void);
 void ap_entry(void) {
     cpu_t* c = this_cpu();
     extern void cpu_enable_sse(void);
+    extern void cpu_enable_mitigations(void);
     cpu_enable_sse();                    // [M34] SSE for ring-3 tasks pinned to this AP
+    cpu_enable_mitigations();            // [M36] SMEP (+SMAP) on this AP too
     lapic_enable_this_cpu();
     idt_ap_load();
     tss_setup_ap(c->index, c->kstack_top);

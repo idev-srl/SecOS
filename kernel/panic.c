@@ -10,6 +10,18 @@
 #include "trapframe.h"
 #include "sched.h"
 #include "process.h"
+#include <stdint.h>
+
+/* [M36] Stack-smashing protection. -fstack-protector-strong inserts a canary on
+ * function entry and calls __stack_chk_fail() if it is corrupted on return. The
+ * guard is a fixed non-zero value (KASLR would randomize it per boot). A failure
+ * means a kernel stack buffer overflowed — unrecoverable, halt loudly. */
+uintptr_t __stack_chk_guard = 0x9d8f2b1c7e6a4053UL;
+__attribute__((noreturn)) void __stack_chk_fail(void) {
+    debugcon_writestring("[M36] *** stack smashing detected (canary) — halting ***\n");
+    terminal_writestring("\n*** STACK SMASHING DETECTED — kernel halted ***\n");
+    for (;;) __asm__ volatile("cli; hlt");
+}
 
 // CPU exception names (INT 0-31)
 const char* exception_messages[] = {
