@@ -1445,9 +1445,9 @@ static void kernel_main_phase2(void) {
             if (!block_find(rc[i])) continue;
             if (ext2_mount_root(rc[i]) == 0) {
                 root_is_ext2 = 1;
-                terminal_writestring("[M23] persistent ext2 root mounted from ");
+                terminal_writestring("[M23] persistent ext2/ext4 root mounted from ");
                 terminal_writestring(rc[i]); terminal_writestring("\n");
-                debugcon_writestring("[M23] persistent ext2 root on ");
+                debugcon_writestring("[M23] persistent ext2/ext4 root on ");
                 debugcon_writestring(rc[i]); debugcon_writestring("\n");
                 // Refresh /VERSION on the persistent root (best-effort).
                 extern int vfs_remove(const char*); extern int vfs_create(const char*, const void*, size_t);

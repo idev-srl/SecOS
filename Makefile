@@ -359,9 +359,35 @@ sysdisk-ext2:
 	dd if=/dev/zero of=$(SYSDISK_IMG) bs=1M count=64 status=none
 	mkfs.ext2 -q -O ^has_journal,^metadata_csum -L SECOSROOT -d /tmp/secos_sysroot $(SYSDISK_IMG)
 	@echo "sysdisk-ext2: $(SYSDISK_IMG) (ext2 persistent root, marker /.secosroot)"
-sysdisk-vmdk: sysdisk-ext2
+sysdisk-vmdk: sysdisk-ext4
 	qemu-img convert -f raw -O vmdk $(SYSDISK_IMG) sysdisk.vmdk
 	@echo "sysdisk-vmdk: sysdisk.vmdk ready (attach as SATA/NVMe data disk in VMware)"
+
+# [M33] Persistent ext4 SYSTEM root disk (journal + extents + 64bit). Same FHS
+# skeleton + /.secosroot marker as sysdisk-ext2, but a real ext4 volume — the
+# kernel adopts it as "/", JBD2 write-journaling (M27b) makes its metadata writes
+# crash-atomic. No metadata_csum (proven M27 path).
+.PHONY: sysdisk-ext4 sysdisk-ext4-csum sysroot-stage
+sysroot-stage:
+	rm -rf /tmp/secos_sysroot
+	mkdir -p /tmp/secos_sysroot/bin /tmp/secos_sysroot/etc /tmp/secos_sysroot/dev
+	mkdir -p /tmp/secos_sysroot/proc /tmp/secos_sysroot/sys /tmp/secos_sysroot/tmp
+	mkdir -p /tmp/secos_sysroot/usr /tmp/secos_sysroot/opt /tmp/secos_sysroot/home
+	mkdir -p /tmp/secos_sysroot/lib /tmp/secos_sysroot/root /tmp/secos_sysroot/var
+	printf 'SecOS persistent root marker\n' > /tmp/secos_sysroot/.secosroot
+	printf 'SecOS 0.1.0-dev\n' > /tmp/secos_sysroot/etc/secos-release
+	printf 'Welcome to SecOS (persistent ext4 root)\n' > /tmp/secos_sysroot/etc/motd
+	printf 'hello from the persistent root\n' > /tmp/secos_sysroot/home/hello.txt
+sysdisk-ext4: sysroot-stage
+	dd if=/dev/zero of=$(SYSDISK_IMG) bs=1M count=64 status=none
+	mkfs.ext4 -q -O has_journal,extent,64bit,^metadata_csum -L SECOSROOT -d /tmp/secos_sysroot $(SYSDISK_IMG)
+	@echo "sysdisk-ext4: $(SYSDISK_IMG) (ext4 journal+extents persistent root, marker /.secosroot)"
+# [M33] Full ext4 root WITH metadata_csum (default mkfs.ext4 layout). Exercises the
+# crc32c metadata_csum write path. Must stay e2fsck-clean after SecOS writes.
+sysdisk-ext4-csum: sysroot-stage
+	dd if=/dev/zero of=$(SYSDISK_IMG) bs=1M count=64 status=none
+	mkfs.ext4 -q -O has_journal,extent,64bit,metadata_csum -L SECOSROOT -d /tmp/secos_sysroot $(SYSDISK_IMG)
+	@echo "sysdisk-ext4-csum: $(SYSDISK_IMG) (ext4 journal+extents+metadata_csum root)"
 
 # Run with QEMU (graphical window — needs a working display backend)
 run: iso

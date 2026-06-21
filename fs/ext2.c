@@ -107,6 +107,91 @@ static void mem_zero(uint8_t* p, size_t n){ while(n--) *p++=0; }
 static void mem_copy(uint8_t* d, const uint8_t* s, size_t n){ while(n--) *d++=*s++; }
 static size_t e2_strlen(const char* s){ size_t n=0; while(s[n]) n++; return n; }
 
+/* ── [M33] ext4 metadata_csum (crc32c, Castagnoli) ────────────────────────────
+ * When RO_COMPAT_METADATA_CSUM is set, every metadata block carries a crc32c.
+ * Each mutating write must refresh the relevant checksum or the volume fails
+ * e2fsck / a real ext4 driver. Formulas verified byte-for-byte against a real
+ * `mkfs.ext4` image (superblock, group desc, inode, dir block, bitmaps). */
+static int      g_csum;          /* 1 if the volume has metadata_csum */
+static uint32_t g_csum_seed;     /* s_checksum_seed or crc32c(~0, uuid) */
+static uint8_t  g_csb[MAX_BLK];  /* scratch for bitmap reads inside gd_write */
+
+static uint32_t e2_crc32c(uint32_t crc, const uint8_t* p, uint32_t n){
+    while(n--){ crc ^= *p++; for(int k=0;k<8;k++) crc = (crc>>1) ^ (0x82F63B78u & (uint32_t)(-(int32_t)(crc&1))); }
+    return crc;
+}
+/* per-inode seed = crc32c(crc32c(s_csum_seed, le32(ino)), le32(gen)) */
+static uint32_t e2_ino_seed(uint32_t ino, uint32_t gen){
+    uint8_t b[4]; wr32(b,ino); uint32_t c=e2_crc32c(g_csum_seed,b,4); wr32(b,gen); return e2_crc32c(c,b,4);
+}
+/* Superblock checksum (seed is ~0, NOT s_csum_seed): crc32c(~0, sb[0..0x3FC]). */
+static void sb_finalize_csum(uint8_t* sb){
+    if(g_csum) wr32(sb+0x3FC, e2_crc32c(0xFFFFFFFFu, sb, 0x3FC));
+}
+/* Group descriptor: bitmap csums (stored in the gd) first, then bg_checksum
+ * (low 16 bits) which covers them. Reads both bitmaps for the group. */
+static void gd_finalize_csum(uint32_t group, uint8_t* gd){
+    uint32_t bbmp = rd32(gd+0), ibmp = rd32(gd+4);
+    uint16_t flags = rd16(gd+0x12);
+    if(bbmp && blk_read(bbmp, g_csb)==0){
+        uint32_t c = e2_crc32c(g_csum_seed, g_csb, g_blocks_per_group/8);
+        wr16(gd+0x18, (uint16_t)c);
+        if(g_desc_size>=0x3A) wr16(gd+0x38, (uint16_t)(c>>16));
+        flags &= ~0x2;     /* EXT4_BG_BLOCK_UNINIT: this group now has used blocks */
+    }
+    if(ibmp && blk_read(ibmp, g_csb)==0){
+        uint32_t c = e2_crc32c(g_csum_seed, g_csb, g_inodes_per_group/8);
+        wr16(gd+0x1A, (uint16_t)c);
+        if(g_desc_size>=0x3C) wr16(gd+0x3A, (uint16_t)(c>>16));
+        /* bg_itable_unused = count of never-used inodes at the tail of the table.
+         * Recompute it EXACTLY from the bitmap (highest set bit) so e2fsck agrees;
+         * clear EXT4_BG_INODE_UNINIT since the group has used inodes. */
+        int32_t hibit=-1;
+        for(int32_t b=(int32_t)g_inodes_per_group-1; b>=0; b--){ if(g_csb[b>>3]&(1<<(b&7))){ hibit=b; break; } }
+        flags &= ~0x1;
+        uint32_t unused = g_inodes_per_group - (uint32_t)(hibit+1);
+        wr16(gd+0x1C, (uint16_t)unused);
+        if(g_desc_size>=0x3E) wr16(gd+0x3C, (uint16_t)(unused>>16));
+    }
+    wr16(gd+0x12, flags);
+    uint8_t le_group[4]; wr32(le_group, group);
+    uint8_t z2[2]={0,0};
+    uint32_t c = e2_crc32c(g_csum_seed, le_group, 4);
+    c = e2_crc32c(c, gd, 0x1E);
+    c = e2_crc32c(c, z2, 2);
+    c = e2_crc32c(c, gd+0x20, g_desc_size-0x20);
+    wr16(gd+0x1E, (uint16_t)c);
+}
+/* Inode: crc32c over the inode with the two checksum fields zeroed; lo at 0x7C,
+ * hi at 0x82 (only when i_extra_isize covers it). */
+static void inode_finalize_csum(uint32_t ino, uint8_t* raw){
+    uint32_t gen = rd32(raw+0x64);
+    uint32_t seed = e2_ino_seed(ino, gen);
+    int has_hi = (g_inode_size>128) && (rd16(raw+0x80) >= 4);
+    uint8_t z2[2]={0,0};
+    uint32_t c = e2_crc32c(seed, raw, 0x7C);
+    c = e2_crc32c(c, z2, 2);                          /* i_checksum_lo zeroed */
+    if(has_hi){
+        c = e2_crc32c(c, raw+0x7E, 0x82-0x7E);        /* l_i_reserved + i_extra_isize */
+        c = e2_crc32c(c, z2, 2);                      /* i_checksum_hi zeroed */
+        c = e2_crc32c(c, raw+0x84, g_inode_size-0x84);
+    } else {
+        c = e2_crc32c(c, raw+0x7E, g_inode_size-0x7E);
+    }
+    wr16(raw+0x7C, (uint16_t)c);
+    if(has_hi) wr16(raw+0x82, (uint16_t)(c>>16));
+}
+/* Directory block: write the 12-byte dirent tail at blocksize-12 and its csum.
+ * The entries region is [0, blocksize-12); the tail holds crc32c over it. */
+static void dir_finalize_csum(uint32_t dir_ino, uint32_t gen, uint8_t* buf){
+    uint8_t* t = buf + g_blk_size - 12;
+    wr32(t+0, 0); wr16(t+4, 12); t[6]=0; t[7]=0xDE;
+    uint32_t seed = e2_ino_seed(dir_ino, gen);
+    wr32(t+8, e2_crc32c(seed, buf, g_blk_size-12));
+}
+/* Usable bytes for real dir entries (csum volumes reserve the 12-byte tail). */
+static uint32_t dir_entry_limit(void){ return g_csum ? g_blk_size-12 : g_blk_size; }
+
 /* ── Group descriptor access (read into g_mb) ────────────────────────────── */
 /* Copy a group descriptor into a caller buffer (avoids aliasing g_mb). */
 static int gd_read(uint32_t group, uint8_t* gd /* >= g_desc_size */){
@@ -123,6 +208,7 @@ static int gd_write(uint32_t group, const uint8_t* gd){
     uint32_t within = off % g_blk_size;
     if(blk_read(blk, g_mb)!=0) return -1;
     mem_copy(g_mb+within, gd, g_desc_size);
+    if(g_csum) gd_finalize_csum(group, g_mb+within);   /* [M33] bitmap + bg_checksum */
     return blk_write(blk, g_mb);
 }
 static uint32_t gd_inode_table(uint32_t group){ uint8_t gd[64]; return gd_read(group,gd)==0?rd32(gd+8):0; }
@@ -153,6 +239,7 @@ static int inode_write(uint32_t ino, const uint8_t* in){
     uint32_t within = byte % g_blk_size;
     if(blk_read(blk, g_mb)!=0) return -1;
     mem_copy(g_mb+within, in, g_inode_size);
+    if(g_csum) inode_finalize_csum(ino, g_mb+within);   /* [M33] i_checksum_lo/hi */
     return blk_write(blk, g_mb);
 }
 
@@ -161,12 +248,14 @@ static void sb_adjust_free_blocks(int delta){
     if(blk_read(g_first_data_block, g_mb)!=0) return; /* SB lives in block holding offset 1024 */
     uint8_t* sb = (g_blk_size==1024) ? g_mb : g_mb+1024;
     uint32_t fb = rd32(sb+12); fb=(uint32_t)((int)fb+delta); wr32(sb+12, fb);
+    sb_finalize_csum(sb);                                 /* [M33] s_checksum */
     blk_write(g_first_data_block, g_mb);
 }
 static void sb_adjust_free_inodes(int delta){
     if(blk_read(g_first_data_block, g_mb)!=0) return;
     uint8_t* sb = (g_blk_size==1024) ? g_mb : g_mb+1024;
     uint32_t fi = rd32(sb+16); fi=(uint32_t)((int)fi+delta); wr32(sb+16, fi);
+    sb_finalize_csum(sb);                                 /* [M33] s_checksum */
     blk_write(g_first_data_block, g_mb);
 }
 
@@ -440,6 +529,8 @@ static uint32_t dir_lookup(uint32_t dir_ino, const char* name, size_t nlen){
 static int dir_add(uint32_t dir_ino, const char* name, size_t nlen, uint32_t child, uint8_t ftype){
     uint8_t inode[256];
     if(inode_read(dir_ino, inode)!=0) return -1;
+    uint32_t gen = rd32(inode+0x64);                 /* [M33] dir csum seed */
+    uint32_t lim = dir_entry_limit();
     uint32_t dsize = inode_size_lo(inode);
     uint32_t nblocks = (dsize + g_blk_size -1)/g_blk_size;
     uint32_t need = round4(8 + (uint32_t)nlen);
@@ -447,7 +538,7 @@ static int dir_add(uint32_t dir_ino, const char* name, size_t nlen, uint32_t chi
         uint32_t pb = bmap_read(inode, fb); if(!pb) continue;
         if(blk_read(pb, g_b)!=0) return -1;
         uint32_t off=0;
-        while(off + 8 <= g_blk_size){
+        while(off + 8 <= lim){
             uint32_t e_ino = rd32(g_b+off);
             uint16_t rec   = rd16(g_b+off+4);
             uint8_t  nl    = g_b[off+6];
@@ -461,6 +552,7 @@ static int dir_add(uint32_t dir_ino, const char* name, size_t nlen, uint32_t chi
                 g_b[new_off+6]=(uint8_t)nlen;
                 g_b[new_off+7]=ftype;
                 for(size_t i=0;i<nlen;i++) g_b[new_off+8+i]=(uint8_t)name[i];
+                if(g_csum) dir_finalize_csum(dir_ino, gen, g_b);
                 return blk_write(pb, g_b);
             }
             off += rec;
@@ -471,9 +563,10 @@ static int dir_add(uint32_t dir_ino, const char* name, size_t nlen, uint32_t chi
     uint32_t pb = bmap_alloc(inode, fb); if(!pb) return -1;
     mem_zero(g_b, g_blk_size);
     wr32(g_b+0, child);
-    wr16(g_b+4, (uint16_t)g_blk_size);
+    wr16(g_b+4, (uint16_t)lim);                      /* [M33] leave room for the tail */
     g_b[6]=(uint8_t)nlen; g_b[7]=ftype;
     for(size_t i=0;i<nlen;i++) g_b[8+i]=(uint8_t)name[i];
+    if(g_csum) dir_finalize_csum(dir_ino, gen, g_b);
     if(blk_write(pb, g_b)!=0) return -1;
     uint32_t newsize = (fb+1)*g_blk_size;
     wr32(inode+4, newsize);
@@ -485,13 +578,15 @@ static int dir_add(uint32_t dir_ino, const char* name, size_t nlen, uint32_t chi
 static int dir_remove_entry(uint32_t dir_ino, const char* name, size_t nlen){
     uint8_t inode[256];
     if(inode_read(dir_ino, inode)!=0) return -1;
+    uint32_t gen = rd32(inode+0x64);
+    uint32_t lim = dir_entry_limit();
     uint32_t dsize = inode_size_lo(inode);
     uint32_t nblocks = (dsize + g_blk_size -1)/g_blk_size;
     for(uint32_t fb=0; fb<nblocks; fb++){
         uint32_t pb = bmap_read(inode, fb); if(!pb) continue;
         if(blk_read(pb, g_b)!=0) return -1;
         uint32_t off=0, prev=0xFFFFFFFF;
-        while(off + 8 <= g_blk_size){
+        while(off + 8 <= lim){
             uint32_t e_ino = rd32(g_b+off);
             uint16_t rec   = rd16(g_b+off+4);
             uint8_t  nl    = g_b[off+6];
@@ -499,6 +594,7 @@ static int dir_remove_entry(uint32_t dir_ino, const char* name, size_t nlen){
             if(e_ino!=0 && nl==nlen && name_eq(g_b+off+8, name, nlen)){
                 if(prev!=0xFFFFFFFF){ uint16_t prec=rd16(g_b+prev+4); wr16(g_b+prev+4,(uint16_t)(prec+rec)); }
                 else { wr32(g_b+off+0, 0); } /* first in block: just clear inode */
+                if(g_csum) dir_finalize_csum(dir_ino, gen, g_b);
                 return blk_write(pb, g_b);
             }
             prev=off; off+=rec;
@@ -722,11 +818,13 @@ static int e2_mkdir(const char* path){
     if(split_parent(path,&parent,comp,sizeof(comp))!=0) return -1;
     uint32_t nino=alloc_inode(1); if(!nino) return -1;
     uint32_t db=alloc_block(); if(!db) return -1;
-    /* build "." and ".." */
+    /* build "." and ".." (leave room for the dirent tail on csum volumes) */
+    uint32_t lim=dir_entry_limit();
     mem_zero(g_b, g_blk_size);
     wr32(g_b+0, nino); wr16(g_b+4, round4(8+1)); g_b[6]=1; g_b[7]=DT_DIR; g_b[8]='.';
     uint32_t o2=round4(8+1);
-    wr32(g_b+o2+0, parent); wr16(g_b+o2+4, (uint16_t)(g_blk_size-o2)); g_b[o2+6]=2; g_b[o2+7]=DT_DIR; g_b[o2+8]='.'; g_b[o2+9]='.';
+    wr32(g_b+o2+0, parent); wr16(g_b+o2+4, (uint16_t)(lim-o2)); g_b[o2+6]=2; g_b[o2+7]=DT_DIR; g_b[o2+8]='.'; g_b[o2+9]='.';
+    if(g_csum) dir_finalize_csum(nino, 0, g_b);    /* new inode -> generation 0 */
     if(blk_write(db, g_b)!=0) return -1;
     uint8_t inode[256]; mem_zero(inode, g_inode_size);
     wr16(inode+0, S_IFDIR | 0755);
@@ -850,6 +948,15 @@ static int ext2_read_super(block_dev_t* dev){
     g_desc_size = (feat_incompat & 0x80) ? rd16(sb+254) : 32;   /* INCOMPAT_64BIT */
     if(g_desc_size==0) g_desc_size=32;
     g_use_extents = (feat_incompat & 0x40) ? 1 : 0;             /* INCOMPAT_EXTENTS */
+    /* [M33] metadata_csum: RO_COMPAT bit 0x400. Seed is s_checksum_seed when the
+     * INCOMPAT_CSUM_SEED feature (0x2000) is present, else crc32c(~0, uuid). */
+    uint32_t feat_ro = rd32(sb+100);
+    g_csum = (feat_ro & 0x400) ? 1 : 0;
+    g_csum_seed = 0;
+    if(g_csum){
+        if(feat_incompat & 0x2000) g_csum_seed = rd32(sb+0x270);
+        else g_csum_seed = e2_crc32c(0xFFFFFFFFu, sb+0x68, 16);
+    }
     g_sec_per_blk = g_blk_size/SECSZ;
     g_num_groups  = (g_total_blocks - g_first_data_block + g_blocks_per_group -1)/g_blocks_per_group;
     g_bgdt_block  = g_first_data_block + 1;
