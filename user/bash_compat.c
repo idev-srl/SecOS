@@ -15,15 +15,25 @@
 extern long secos_syscall(long,long,long,long,long,long);
 static void* zmem(void* d, int c, unsigned long n){ char* p=d; while(n--) *p++=(char)c; return d; }
 
-/* ---- process wait: POSIX 3-arg over SecOS SYS_WAIT (returns the exit code) ---- */
+/* ---- process wait: POSIX 3-arg over SecOS SYS_WAIT / SYS_WAITANY ---- */
+extern int errno;
+static int enc_status(long code){
+    return (code >= 128) ? (int)((code-128) & 0x7f)     /* WIFSIGNALED / WTERMSIG */
+                         : (int)((code & 0xff) << 8);   /* WIFEXITED / WEXITSTATUS */
+}
 int bash_waitpid(pid_t pid, int* status, int options){
-    (void)options;
-    long code = secos_syscall(9 /*SYS_WAIT*/, pid, 0,0,0,0);
-    if(code < 0) return -1;
-    if(status){
-        if(code >= 128) *status = (int)((code-128) & 0x7f);          /* killed by signal */
-        else            *status = (int)((code & 0xff) << 8);         /* WEXITSTATUS */
+    if(pid == (pid_t)-1){                 /* wait for ANY child (bash's wait_for loop) */
+        int code = 0;
+        long got = secos_syscall(55 /*SYS_WAITANY*/, (long)&code, (long)options, 0,0,0);
+        if(got == -10){ errno = ECHILD; return -1; }    /* no children */
+        if(got == 0)   return 0;                        /* WNOHANG, none reaped yet */
+        if(got < 0){ errno = EINTR; return -1; }
+        if(status) *status = enc_status(code);
+        return (int)got;
     }
+    long code = secos_syscall(9 /*SYS_WAIT*/, pid, 0,0,0,0);
+    if(code < 0){ errno = ECHILD; return -1; }
+    if(status) *status = enc_status(code);
     return pid > 0 ? pid : 1;
 }
 

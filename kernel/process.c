@@ -109,14 +109,52 @@ void process_foreach(void (*cb)(process_t*, void*), void* user) {
 // and return it (the caller frees it via process_destroy outside the lock). Only
 // the zombie's own affinity CPU reaps, and only once it has switched off the
 // zombie's kernel stack (idle context), so the freed stack is never in use.
+// [M39] wait-any support: find an uncollected ZOMBIE child of `ppid`, and report
+// whether `ppid` has any still-living children. Used by SYS_WAITANY (bash's
+// waitpid(-1) pattern).
+process_t* process_find_zombie_child(uint32_t ppid) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    process_t* z = NULL;
+    for (int i=0;i<MAX_PROCESSES;i++) {
+        process_t* p = proc_table[i];
+        if (p && p->ppid == ppid && p->state == PROC_ZOMBIE && !p->collected) { z = p; break; }
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return z;
+}
+int process_has_children(uint32_t ppid) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    int n = 0;
+    for (int i=0;i<MAX_PROCESSES;i++) {
+        process_t* p = proc_table[i];
+        if (p && p->ppid == ppid) { n++; break; }
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return n;
+}
+
 process_t* process_reap_one(uint32_t affinity) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     process_t* z = NULL;
     for (int i=0;i<MAX_PROCESSES;i++) {
         process_t* p = proc_table[i];
-        if (p && p->state == PROC_ZOMBIE && p->cpu_affinity == affinity) {
-            proc_table[i] = NULL; z = p; break;
+        if (!p || p->state != PROC_ZOMBIE || p->cpu_affinity != affinity) continue;
+        // [M39] Unix zombie semantics: keep a zombie until its parent collects the
+        // status via wait() — otherwise a parent that forks and continues (bash
+        // subshells/pipelines) races this reaper and its SYS_WAIT(pid) finds the
+        // child already gone (-1), so it loses the exit status. Reapable when the
+        // parent collected it, there's no tracking parent (ppid==0, the M10 shell
+        // poll path), or the parent is gone (orphan).
+        int reapable = p->collected || p->ppid == 0;
+        if (!reapable) {
+            int parent_alive = 0;
+            for (int j=0;j<MAX_PROCESSES;j++) {
+                process_t* q = proc_table[j];
+                if (q && q->pid == p->ppid && q->state != PROC_ZOMBIE) { parent_alive = 1; break; }
+            }
+            if (!parent_alive) reapable = 1;   // orphan -> safe to reap
         }
+        if (reapable) { proc_table[i] = NULL; z = p; break; }
     }
     spin_unlock_irqrestore(&proc_lock, fl);
     return z;
@@ -314,6 +352,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     // sizes), which is also what the manifest max_mem limit is checked against.
     p->cpu_ticks = 0;
     p->exit_code = 0;
+    p->collected = 0;
     p->wait_pid = -1; p->wait_result = 0; p->wait_ready = 0;
     p->sleep_until = 0; p->recv_chan = -1;
     // [M30] Signals: default dispositions, empty masks, own process group, no
@@ -537,7 +576,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     *c->tf = *tf;                              // child resumes at the fork syscall...
     c->tf->rax = 0;                            // ...but fork() returns 0 in the child
 
-    c->wait_pid = -1; c->wait_result = 0; c->wait_ready = 0;
+    c->wait_pid = -1; c->wait_result = 0; c->wait_ready = 0; c->collected = 0;
     c->sleep_until = 0; c->recv_chan = -1; c->exit_code = 0; c->cpu_ticks = 0;
     c->wait_pipe = NULL;                       // [M25] not blocked on a pipe
     c->proc_type = PROC_TYPE_USER; c->drv_dev_id = -1; c->drv_caps = 0;

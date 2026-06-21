@@ -108,6 +108,7 @@ uint64_t syscall_handler(trapframe_t* tf) {
                 ret = (uint64_t)(int64_t)-1;            // no such pid
             } else if (child->state == PROC_ZOMBIE) {
                 ret = (uint64_t)(int64_t)child->exit_code; // already exited
+                child->collected = 1;                      // [M39] parent reaped it -> reapable
             } else if (cur && signal_pending(cur)) {
                 ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR: a signal is pending
             } else if (cur) {
@@ -118,6 +119,37 @@ uint64_t syscall_handler(trapframe_t* tf) {
                 ret = 0;                                 // not reached
             } else {
                 ret = (uint64_t)(int64_t)-1;
+            }
+        }
+    }
+    // [M39] SYS_WAITANY: waitpid(-1) — reap ANY child (bash's wait_for loop uses
+    // it). Returns the child's pid (status written to *rdi), 0 if WNOHANG and no
+    // child has exited yet, or -ECHILD(-10) if the caller has no children.
+    else if (num == SYS_WAITANY) {
+        extern process_t* process_find_zombie_child(uint32_t);
+        extern int process_has_children(uint32_t);
+        int* ustatus = (int*)tf->rdi;
+        int wnohang  = (int)tf->rsi & 1;     // WNOHANG bit
+        if (!cur) { ret = (uint64_t)(int64_t)-10; }
+        else {
+            process_t* z = process_find_zombie_child(cur->pid);
+            if (z) {
+                int code = z->exit_code;
+                z->collected = 1;            // reapable now
+                if (ustatus && user_range_valid(ustatus, sizeof(int)))
+                    copy_to_user(ustatus, &code, sizeof(int));
+                ret = (uint64_t)(int64_t)(int)z->pid;
+            } else if (!process_has_children(cur->pid)) {
+                ret = (uint64_t)(int64_t)-10;        // ECHILD
+            } else if (wnohang) {
+                ret = 0;                              // children alive, none reaped yet
+            } else if (signal_pending(cur)) {
+                ret = (uint64_t)(int64_t)-4;          // EINTR
+            } else {
+                cur->wait_pid = -2;                   // [M39] wait-any sentinel
+                tf->rip -= 2;                         // re-run on wake
+                sched_block_current(tf);              // NORETURN
+                ret = 0;
             }
         }
     }

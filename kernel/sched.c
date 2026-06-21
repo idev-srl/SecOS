@@ -211,7 +211,10 @@ void sched_exit_current(trapframe_t* tf) {
     // [M16] exit_code was set by the SYS_EXIT handler from the user's status.
     current->state = PROC_ZOMBIE;
     notify_parent_sigchld(current);                       // [M30] SIGCHLD to parent
-    sched_wake_waitpid(current->pid, current->exit_code); // [M16] wake a waiter
+    // [M16/M39] Deliver the status to a blocked waiter; if one collected it, this
+    // zombie is reapable. Otherwise it persists until the parent calls wait().
+    if (sched_wake_waitpid(current->pid, current->exit_code) > 0) current->collected = 1;
+    sched_wake_parent_waitany(current->ppid);                 // [M39] wait-any waiters
 
     process_t* next = pick_user(current);
     if (!next) next = idle_task;       // last one out → idle reaps and reports
@@ -238,7 +241,8 @@ void sched_kill_current(int reason) {
     current->exit_code = 128 + (reason & 0x7F);
     current->state = PROC_ZOMBIE;
     notify_parent_sigchld(current);                       // [M30] SIGCHLD to parent
-    sched_wake_waitpid(current->pid, current->exit_code); // [M16] wake a waiter
+    if (sched_wake_waitpid(current->pid, current->exit_code) > 0) current->collected = 1;
+    sched_wake_parent_waitany(current->ppid);                 // [M39] wait-any waiters
 
     process_t* next = pick_user(current);
     if (!next) next = idle_task;       // idle reaps the zombie and carries on
@@ -277,7 +281,7 @@ void sched_block_current(trapframe_t* tf) {
 }
 
 // [M16] Wake any process blocked in SYS_WAIT on 'pid', delivering 'code'.
-struct wake_wp_ctx { uint32_t pid; int code; };
+struct wake_wp_ctx { uint32_t pid; int code; int woke; };
 static void wake_wp_cb(process_t* p, void* u) {
     struct wake_wp_ctx* w = (struct wake_wp_ctx*)u;
     if (p->state == PROC_BLOCKED && p->wait_pid >= 0 && (uint32_t)p->wait_pid == w->pid) {
@@ -285,11 +289,30 @@ static void wake_wp_cb(process_t* p, void* u) {
         p->wait_ready  = 1;
         p->wait_pid    = -1;
         p->state       = PROC_READY;
+        w->woke++;
     }
 }
-void sched_wake_waitpid(uint32_t pid, int code) {
-    struct wake_wp_ctx w = { pid, code };
+// [M39] Returns the number of waiters woken (0 = no parent was blocked on this
+// pid yet, so the exiting child must remain an uncollected zombie until wait()).
+int sched_wake_waitpid(uint32_t pid, int code) {
+    struct wake_wp_ctx w = { pid, code, 0 };
     process_foreach(wake_wp_cb, &w);
+    return w.woke;
+}
+
+// [M39] Wake a parent blocked in SYS_WAITANY (waitpid(-1)) when one of its
+// children exits. The parent re-runs SYS_WAITANY and reaps the now-zombie child
+// (which stays uncollected until then), so we just flip it READY.
+static void wake_waitany_cb(process_t* p, void* u) {
+    uint32_t ppid = *(uint32_t*)u;
+    if (p->pid == ppid && p->state == PROC_BLOCKED && p->wait_pid == -2) {
+        p->wait_pid = -1;
+        p->state    = PROC_READY;
+    }
+}
+void sched_wake_parent_waitany(uint32_t ppid) {
+    if (ppid == 0) return;
+    process_foreach(wake_waitany_cb, &ppid);
 }
 
 // [M17] Wake processes whose SYS_SLEEP deadline has elapsed.

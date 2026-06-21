@@ -1314,8 +1314,8 @@ int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     if ((error_code & 1) && (error_code & 2)) {
         process_t* cur = sched_get_current();
         if (cur && cur->space && vmm_cow_fault(cur->space, fault_addr) == 0) {
-            debugcon_writestring("[COW] copy "); debugcon_print_hex(fault_addr & ~0xFFFULL);
-            debugcon_writestring("\n");
+            if (g_kverbose) { debugcon_writestring("[COW] copy "); debugcon_print_hex(fault_addr & ~0xFFFULL);
+                              debugcon_writestring("\n"); }
             return 0; // retry the write
         }
     }

@@ -63,6 +63,7 @@
 #define SYS_GETCWD      52 // getcwd(buf, len) -> length / -1
 #define SYS_IOCTL       53 // ioctl(fd, cmd, arg) -> 0/-1 (termios TCGETS/TCSETS, TIOCGWINSZ)
 #define SYS_GETPPID     54 // getppid() -> parent pid
+#define SYS_WAITANY     55 // waitany(int* status_out, int options) -> child pid / 0 / -ECHILD
 // Note: execve is emulated in libc (spawn+waitpid+_exit) — no kernel syscall.
 
 // [M24] socket types

@@ -62,6 +62,7 @@ typedef struct process {
     uint64_t  mmap_next;
     uint64_t  mem_limit;
     int      exit_code;      // [M15] 0=normal (SYS_EXIT); 128+vec=killed by fault
+    uint8_t  collected;      // [M39] zombie collected by parent's wait() -> reapable
     // [M16/M17] Blocking state. While PROC_BLOCKED, exactly one wait condition is
     // armed; the matching wake (child exit / timer tick / channel send) flips the
     // process back to PROC_READY and it re-runs the syscall (rip was rewound).

@@ -1035,7 +1035,7 @@ __attribute__((noreturn)) static void m39b_idle_entry(void) {
             extern process_t* process_create_from_elf_args(const void*, unsigned long, int, const char* const[]);
             static const char* const argv[] = {
                 "bash", "-c",
-                "echo SECOS-BASH-OK; echo sum=$((6*7)); for i in 1 2 3; do echo loop$i; done",
+                "echo SECOS-BASH-OK; for i in 1 2 3; do echo $i; done | while read n; do echo n=$n; done; greet(){ echo hi $1; }; greet world; [ 5 -gt 2 ] && echo cmp-ok; x=foo; echo var=${x}bar; case $x in foo) echo case-ok;; esac; echo FINAL-OK",
                 0
             };
             process_t* p = process_create_from_elf_args(user_bash_elf, user_bash_elf_len, 3, argv);

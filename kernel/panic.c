@@ -163,9 +163,11 @@ void exception_handler(struct registers* regs) {
         // Headless crash diagnosis: surface the fault on debugcon (the smoke
         // harness captures port 0xE9; the framebuffer is not visible there).
         int from_user = ((regs->cs & 3) == 3);
-        { debugcon_writestring("[EXC] int="); debugcon_print_hex(int_no);
+        { uint64_t _cr2; __asm__ volatile("mov %%cr2, %0":"=r"(_cr2));
+          debugcon_writestring("[EXC] int="); debugcon_print_hex(int_no);
           debugcon_writestring(" err="); debugcon_print_hex(err_code);
           debugcon_writestring(" rip="); debugcon_print_hex(regs->rip);
+          debugcon_writestring(" cr2="); debugcon_print_hex(_cr2);
           debugcon_writestring(" cs="); debugcon_print_hex(regs->cs);
           debugcon_writestring(" rsp="); debugcon_print_hex(regs->rsp);
           debugcon_writestring(from_user ? " ring3\n" : " ring0\n"); }
