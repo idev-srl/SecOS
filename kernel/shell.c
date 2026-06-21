@@ -1034,11 +1034,32 @@ static void sh_audit(const char* a){ (void)a;
 
 // [M38] wifi: report the Atheros ath9k (AR9300 family) WiFi scaffold status.
 #include "../drivers/ath9k.h"
-static void sh_wifi(const char* a){ (void)a;
+static void sh_wifi(const char* a){
     const ath9k_dev_t* w = ath9k_get();
     if(!w){ terminal_writestring("wifi: no Atheros AR9300-family adapter found\n");
             terminal_writestring("  (QEMU has no such device; on the ASUS E406S this is the AR9565 168c:0036)\n");
             return; }
+    /* [M39] `wifi diag`: dump the live AR9565 registers + OTP so the real-HW
+     * radio bring-up (un-testable in QEMU) can proceed from actual chip data. */
+    if(a && a[0]=='d' && a[1]=='i' && a[2]=='a' && a[3]=='g'){
+        terminal_writestring("=== AR9565 diag (report these to guide bring-up) ===\n");
+        struct { const char* n; uint32_t off; } regs[] = {
+            {"AR_SREV       ",0x4020},{"RTC_RC        ",0x7000},{"RTC_STATUS    ",0x7044},
+            {"RTC_PLL_CTRL  ",0x7014},{"RTC_FORCE_WAKE",0x7110},{"STA_ID0       ",0x8000},
+            {"STA_ID1       ",0x8004},{"PHY_BASE@a000 ",0xa000},{"OTP_STATUS    ",0x15f18},{0,0}};
+        for(int i=0;regs[i].n;i++){
+            terminal_writestring("  "); terminal_writestring(regs[i].n);
+            terminal_writestring("= "); prhex(ath9k_reg_read(regs[i].off),8); terminal_writestring("\n");
+        }
+        terminal_writestring("  OTP words[0..7]:\n");
+        for(uint32_t i=0;i<8;i++){
+            uint32_t v=0; int ok=ath9k_otp_read_word(i,&v);
+            terminal_writestring("    ["); prhex(i,1); terminal_writestring("] ");
+            if(ok){ prhex(v,8); } else { terminal_writestring("(timeout)"); }
+            terminal_writestring("\n");
+        }
+        return;
+    }
     terminal_writestring("WiFi adapter: "); terminal_writestring(w->chip);
     terminal_writestring(" (168c:"); prhex(w->device,4); terminal_writestring(")\n");
     terminal_writestring("  BAR0="); prhex(w->mmio_phys,8);
@@ -1047,8 +1068,8 @@ static void sh_wifi(const char* a){ (void)a;
     terminal_writestring("  MAC=");
     for(int i=0;i<6;i++){ prhex(w->mac[i],2); if(i<5) terminal_writestring(":"); }
     terminal_writestring("\n  status: identify+map OK; radio bring-up (INI/PHY/scan) = real-HW TODO.\n");
-    terminal_writestring("  WPA2 association core COMPLETE + KAT-validated: PBKDF2 PMK, PTK/PRF,\n");
-    terminal_writestring("  RFC3394 GTK key-wrap, and the full 4-way handshake supplicant.\n");
+    terminal_writestring("  WPA2 association core COMPLETE + KAT-validated (PBKDF2/PTK/GTK/4-way).\n");
+    terminal_writestring("  Run 'wifi diag' and report the output to drive the radio bring-up.\n");
 }
 
 // usbinfo: report what the xHCI driver saw — controller presence, root ports, how

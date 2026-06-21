@@ -31,5 +31,7 @@ typedef struct {
 
 int ath9k_init(void);                 /* probe + identify; 0 if absent, 1 if found */
 const ath9k_dev_t* ath9k_get(void);   /* NULL if not present */
+int ath9k_otp_read_word(uint32_t addr, uint32_t* out);  /* [M39] OTP word read (0/1) */
+uint32_t ath9k_reg_read(uint32_t off);                  /* [M39] raw MMIO read for diag */
 
 #endif

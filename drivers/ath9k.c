@@ -23,10 +23,40 @@
 #define AR_SREV_VERSION(s)   (((s) & 0xFF0) >> 4)
 #define AR_SREV_VER_AR9565   0x2C0   /* >>4 = 0x2C */
 
+/* [M39] AR9300 OTP (one-time-programmable cal/EEPROM store). The AR9565 has no
+ * external EEPROM chip — MAC + calibration live compressed in on-die OTP, read a
+ * 32-bit word at a time through this interface (ath9k ar9003_otp.c). */
+#define AR9300_OTP_BASE        0x14000
+#define AR9300_OTP_STATUS      0x15f18
+#define   AR9300_OTP_STATUS_TYPE   0x7
+#define   AR9300_OTP_STATUS_VALID  0x4
+#define AR9300_OTP_READ_DATA   0x15f1c
+/* PLL/clock + reset (AR9300) */
+#define AR_RTC_RESET           0x7040
+#define AR_RTC_PLL_CONTROL     0x7014
+#define AR_RTC_REG_CONTROL0    0x7090
+#define AR_RTC_REG_CONTROL1    0x7094
+#define AR_PHY_BASE            0xa000   /* baseband/PHY register block base */
+
 ath9k_dev_t g_ath9k;
 
 static inline uint32_t rd(uint32_t off) { return *(volatile uint32_t*)(g_ath9k.mmio + off); }
 static inline void     wr(uint32_t off, uint32_t v) { *(volatile uint32_t*)(g_ath9k.mmio + off) = v; }
+
+/* [M39] Read one 32-bit OTP word. Start the access with a dummy read of the OTP
+ * data window, then poll STATUS until the type field reads VALID. Returns 1/0. */
+int ath9k_otp_read_word(uint32_t addr, uint32_t* out) {
+    (void)rd(AR9300_OTP_BASE + (addr * 4));            /* kick the state machine */
+    for (int i = 0; i < 2000; i++) {
+        uint32_t s = rd(AR9300_OTP_STATUS);
+        if ((s & AR9300_OTP_STATUS_TYPE) == AR9300_OTP_STATUS_VALID) {
+            *out = rd(AR9300_OTP_READ_DATA);
+            return 1;
+        }
+        for (volatile int d = 0; d < 2000; d++) { }
+    }
+    return 0;
+}
 
 /* AR9300-family PCI device ids (vendor 0x168c). */
 static const struct { uint16_t dev; const char* name; } k_chips[] = {
@@ -94,3 +124,8 @@ int ath9k_init(void) {
 }
 
 const ath9k_dev_t* ath9k_get(void) { return g_ath9k.present ? &g_ath9k : 0; }
+
+/* [M39] Raw register read, exposed for the `wifi diag` shell dump (real-HW
+ * bring-up is iterative and blind without QEMU — these reads from the ASUS guide
+ * the next steps: OTP layout, PLL/clock state, PHY liveness). */
+uint32_t ath9k_reg_read(uint32_t off) { return g_ath9k.present ? rd(off) : 0xFFFFFFFFu; }
