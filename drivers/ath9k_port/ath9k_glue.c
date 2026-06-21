@@ -51,27 +51,35 @@ void eth_broadcast_addr(u8* a){ for(int i=0;i<6;i++) a[i]=0xff; }
  * ath_err logging is visible on serial (localizes the bring-up crash on real HW). */
 #include <stdarg.h>
 extern void debugcon_putchar(char);
-static void e9hex(unsigned long v,int dig){ static const char h[]="0123456789abcdef"; for(int i=(dig-1)*4;i>=0;i-=4) debugcon_putchar(h[(v>>i)&0xF]); }
-static void e9dec(long v){ char b[24]; int n=0; if(v<0){debugcon_putchar('-');v=-v;} if(!v)b[n++]='0'; while(v){b[n++]='0'+v%10;v/=10;} while(n--)debugcon_putchar(b[n]); }
+/* Format the whole line into a buffer, then emit it with ONE debugcon_writestring
+ * so the panic breadcrumb captures the full ath_dbg message (not just a prefix). */
 void ath_printk(const char* lvl, const void* c, const char* fmt, ...){
     (void)lvl; (void)c;
-    debugcon_writestring("[ath9k] ");
+    static const char hx[]="0123456789abcdef";
+    char out[200]; int o=0;
+    #define PUT(ch) do{ if(o<198) out[o++]=(char)(ch); }while(0)
+    #define PUTS(s) do{ const char* _s=(s); while(_s&&*_s) PUT(*_s++); }while(0)
+    PUTS("[ath9k] ");
     va_list ap; va_start(ap, fmt);
     for(const char* p=fmt; *p; p++){
-        if(*p!='%'){ debugcon_putchar(*p); continue; }
+        if(*p!='%'){ PUT(*p); continue; }
         p++; while(*p=='-'||(*p>='0'&&*p<='9')||*p=='.'||*p=='l'||*p=='z'||*p=='#'||*p==' ') p++;
         switch(*p){
-        case 'd': case 'i': e9dec(va_arg(ap,int)); break;
-        case 'u': e9dec((long)va_arg(ap,unsigned)); break;
-        case 'x': case 'X': e9hex(va_arg(ap,unsigned),8); break;
-        case 'p': debugcon_writestring("0x"); e9hex((unsigned long)va_arg(ap,void*),16); break;
-        case 's': { const char* s=va_arg(ap,const char*); debugcon_writestring(s?s:"(null)"); break; }
-        case 'c': debugcon_putchar((char)va_arg(ap,int)); break;
-        case '%': debugcon_putchar('%'); break;
-        default: debugcon_putchar('%'); if(*p) debugcon_putchar(*p); else p--; break;
+        case 'd': case 'i': { long v=va_arg(ap,int); char b[24]; int n=0; if(v<0){PUT('-');v=-v;} if(!v)b[n++]='0'; while(v){b[n++]='0'+v%10;v/=10;} while(n--)PUT(b[n]); } break;
+        case 'u': { unsigned long v=va_arg(ap,unsigned); char b[24]; int n=0; if(!v)b[n++]='0'; while(v){b[n++]='0'+v%10;v/=10;} while(n--)PUT(b[n]); } break;
+        case 'x': case 'X': { unsigned v=va_arg(ap,unsigned); for(int i=28;i>=0;i-=4) PUT(hx[(v>>i)&0xF]); } break;
+        case 'p': { unsigned long v=(unsigned long)va_arg(ap,void*); PUTS("0x"); for(int i=60;i>=0;i-=4) PUT(hx[(v>>i)&0xF]); } break;
+        case 's': PUTS(va_arg(ap,const char*)); break;
+        case 'c': PUT((char)va_arg(ap,int)); break;
+        case '%': PUT('%'); break;
+        default: PUT('%'); if(*p) PUT(*p); else p--; break;
         }
     }
     va_end(ap);
+    out[o]=0;
+    debugcon_writestring(out);   /* mirrors to 0xE9 + screen + breadcrumb */
+    #undef PUT
+    #undef PUTS
 }
 void ath_hw_setbssidmask(void* common){ (void)common; }
 unsigned ath_regd_get_band_ctl(void* reg, int band){ (void)reg;(void)band; return 0; /* SD_NO_CTL */ }
@@ -122,10 +130,15 @@ unsigned long strlen(const char* s){ unsigned long n=0; while(s[n])n++; return n
 extern void terminal_putchar(char c);          /* on-screen console */
 extern void terminal_writestring(const char* s);
 extern void fb_console_flush(void);            /* present the back buffer NOW */
-static void e9(char c){ __asm__ volatile("outb %0, %1" :: "a"((unsigned char)c), "Nd"((unsigned short)0xE9)); }
+extern char g_dbg_breadcrumb[200];             /* panic.c reprints this after clearing the screen */
+static void e9out(char c){ __asm__ volatile("outb %0, %1" :: "a"((unsigned char)c), "Nd"((unsigned short)0xE9)); }
 /* Force a flush after every char: ath9k_hw_init is one long call that crashes
  * WITHOUT returning to the shell loop, so the double buffer would otherwise
  * never be presented and the narration would be invisible on real HW. */
-void debugcon_putchar(char c){ e9(c); terminal_putchar(c); fb_console_flush(); }
-void debugcon_writestring(const char* s){ for(const char* p=s; *p; p++) e9(*p); terminal_writestring(s); fb_console_flush(); }
+void debugcon_putchar(char c){ e9out(c); terminal_putchar(c); fb_console_flush(); }
+void debugcon_writestring(const char* s){
+    /* stash as breadcrumb so the panic dump can reprint it post screen-clear */
+    int i=0; for(; s[i] && i<199; i++) g_dbg_breadcrumb[i]=s[i]; g_dbg_breadcrumb[i]=0;
+    for(const char* p=s; *p; p++) e9out(*p); terminal_writestring(s); fb_console_flush();
+}
 void debugcon_print_hex(unsigned long v){ static const char h[]="0123456789ABCDEF"; char b[19]; b[0]='0'; b[1]='x'; for(int i=0;i<16;i++) b[2+i]=h[(v>>((15-i)*4))&0xF]; b[18]=0; debugcon_writestring(b); }

@@ -12,6 +12,12 @@
 #include "process.h"
 #include <stdint.h>
 
+/* [M39] Debug breadcrumb: drivers doing long in-kernel bring-up (ath9k) write
+ * their last progress line here. The exception handler clears the screen, so we
+ * reprint it inside the panic dump — it's how we localize a fault that happens
+ * deep inside a ported driver without ever returning to the shell. */
+char g_dbg_breadcrumb[200] = {0};
+
 /* [M36] Stack-smashing protection. -fstack-protector-strong inserts a canary on
  * function entry and calls __stack_chk_fail() if it is corrupted on return. The
  * guard is a fixed non-zero value (KASLR would randomize it per boot). A failure
@@ -200,6 +206,9 @@ void exception_handler(struct registers* regs) {
         terminal_writestring("\nRSP: "); print_hex64(regs->rsp);
         terminal_writestring("\nCS: "); print_hex64(regs->cs);
         terminal_writestring("\nRFLAGS: "); print_hex64(regs->rflags);
+        { uint64_t _cr2; __asm__ volatile("mov %%cr2, %0":"=r"(_cr2));
+          terminal_writestring("\nCR2: "); print_hex64(_cr2); }
+        if (g_dbg_breadcrumb[0]) { terminal_writestring("\nLast: "); terminal_writestring(g_dbg_breadcrumb); }
         terminal_writestring("\n\nSistema bloccato.\n");
         while (1) { __asm__ volatile("hlt"); }
     }
