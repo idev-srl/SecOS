@@ -557,6 +557,8 @@ __attribute__((noreturn)) static void m14_idle_entry(void) {
 static void m14_run_demo(void) {
     extern void tss_set_kernel_stack(uint64_t);
     extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    extern int g_kverbose;
+    g_kverbose = 1;   // [M34/M36] this demo's whole point is the [PF] demand page trace
     debugcon_writestring("[M14] demand paging demo\n");
     static process_t  idle; static trapframe_t idle_tf;
     for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;

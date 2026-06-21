@@ -40,11 +40,20 @@ session. The narrative handoff lives in `next_session.md`; the long-term plan in
 | M29 | **SMP / multicore** (Phase I final): per-CPU data, AP bring-up, CPU-pinned scheduling — **user tasks run on multiple cores**; verified on real VMware | ✅ done |
 | M31 | **Real C library + coreutils** (Phase K): standard headers + `user/libc.c` (printf/string/stdlib/ctype/stdio/dirent); file syscalls (getdents/create/mkdir/unlink); 26-applet busybox-style coreutils installed to `/bin` | ✅ done |
 | M32 | **Signed packages + init** (Phase K): `.spkg` format (`tools/secos-pkg` + `kernel/pkg.c`, verify+unpack, tampered refused); supervised `init` service-manager + demo service | ✅ done |
+| M30 | **Signals + job control + shell pipelines**: POSIX signals for ring-3, Ctrl-C/Ctrl-Z, pipelines `a\|b`, `&`/`jobs`/`fg`/`bg`, signal-based `kill` | ✅ done |
+| M33 | **Full ext4 root + metadata_csum (RW)**: crc32c for sb/gd/inode/dir/bitmaps + uninit_bg; default `mkfs.ext4` volume is the e2fsck-clean persistent root | ✅ done |
+| M34 | **Phase K self-hosting tail**: libc float (`%f/%g`)/`strtod`/`setjmp`/`math.h`/SSE; **lua 5.4.7 compiled FROM SOURCE**, signed, runs ring-3 | ✅ done |
+| M35 | **Generalized capability model** (Phase L): least-privilege opt-in caps in the signed manifest, kernel-enforced + `[AUDIT]` + key revocation | ✅ done |
+| M36 | **Exploit mitigations** (Phase L): SMEP, stack canaries, W^X low identity map, SMAP infra (opt-in) | ✅ done |
+| M37 | **Boot integrity** (Phase L): measured boot (kernel self-hash) + reproducible builds (`SOURCE_DATE_EPOCH`) | ✅ done |
+| M38 | **WiFi AR9565 (ath9k) scaffold + WPA2 crypto**: PCI attach/identify + PBKDF2 PMK + AES (KAT-validated); radio association = real-HW TODO | ✅ scaffold + crypto done |
 
 **Phases done:** A–E (M0–M13), F (M15–M17), G (M18–M20), H (M26–M27), I (M28–M29),
-J/networking (M24), **K (M31–M32)**. Foundation, process model, VM, storage
-maturity, modern platform + multicore, networking, and a real signed userland are
-all in. **Remaining: M30 (signals) and Phase L (security hardening).**
+J/networking (M24), **K (M31–M34)**, **L (M35–M37) COMPLETE**, M30 (signals).
+Foundation, process model, VM, storage maturity (incl. full ext4+csum), modern
+platform + multicore, networking, a real signed userland that compiles OSS from
+source (lua), and the full security-hardening pass are all in. **Remaining: WiFi
+radio bring-up (M38, crypto done), and self-hosting external ports (bash/dash).**
 
 ---
 

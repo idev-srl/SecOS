@@ -1,5 +1,58 @@
 # SECoS — Resume Here (session handoff)
 
+## 🌙 AUTONOMOUS OVERNIGHT session (2026-06-21) — M33–M38, Phase L COMPLETE
+Worked autonomously through the remaining roadmap + both user bonuses. **All
+milestones validated in QEMU (build clean, both smoke paths PASS, 0 exceptions);
+real-HW validation (esp. WiFi) is the user's to do.** Commits (newest first):
+
+- **`635f9eb` M38 WiFi: Atheros AR9565 (ath9k) scaffold + WPA2 crypto.** The
+  user's bonus. `drivers/ath9k.{c,h}`: PCI attach for the AR9300 family
+  (`168c:0036` = the ASUS AR9565, **no firmware blob needed**), BAR0 map, chip
+  identify (AR_SREV), MAC read. `net/ieee80211.h` structs. **WPA2 crypto DONE +
+  KAT-validated at boot** (`crypto/sha1.c`, `crypto/wpa2.c`): PBKDF2 PMK (IEEE
+  802.11i vector) + AES-128 (FIPS-197) — both PASS. Shell `wifi`. **Radio
+  association = real-HW iterative TODO** (INI tables/calibration/scan/assoc). See
+  `docs/devlog/M38.md`.
+- **`7d72def` M37 boot integrity (Phase L pt3).** Measured boot: `boot_measure()`
+  SHA-256 of `.text+.rodata` → `[M37] kernel code measurement: <hash>`.
+  Reproducible builds via `SOURCE_DATE_EPOCH` (byte-identical kernel.bin, verified).
+- **`e667a14` M36 exploit mitigations (Phase L pt2).** SMEP (verified on `-cpu
+  Haswell`), stack canaries (`-fstack-protector-strong` + `__stack_chk_*`), **W^X
+  on the 0–512MB low identity map** (NX, separate low PDT; first 2MB kept exec for
+  the AP trampoline), SMAP infra (opt-in `-DSECOS_SMAP`).
+- **`714482a` M35 generalized capability model (Phase L pt1).** Least-privilege
+  opt-in (`CAP_ENFORCE` + per-process FS/PROC/IPC/SIGNAL/NET/TIME caps in the
+  signed manifest), `kernel/cap.{c,h}` enforce + `[AUDIT]` ring + shell `audit`,
+  key revocation in `elf_sign.c`. Demo: confined program denied create/spawn/
+  pipe/socket.
+- **`f4d8a47` M34 libc + lua 5.4.7 FROM SOURCE.** 🎉 The headline. printf
+  `%f/%g` (glibc-accurate on `%.14g`), `strtod`, `setjmp/longjmp`, `math.h`/libm,
+  SSE enabled for ring-3. **lua compiled from source, signed, runs in ring-3**:
+  sqrt/pi/pow/fib/string.format all correct. `make port-lua`, gate `M34_LUA_DEMO`.
+- **`3638fa0` M33 full ext4 + metadata_csum (RW).** The other user bonus. crc32c
+  for sb/gd/inode/dir/bitmaps + `bg_itable_unused`/uninit_bg, so a default
+  `mkfs.ext4` (metadata_csum) volume is the **e2fsck-clean** persistent root.
+  `make sysdisk-ext4-csum`. ext2/ext4 non-csum paths byte-identical (gated).
+
+**Phase L (security hardening) is now COMPLETE** (M35 caps + M36 mitigations +
+M37 boot integrity). Phase K self-hosting tail done (M34 — lua proves OSS-from-
+source). Both user bonuses delivered (ext4 full, WiFi scaffold+crypto).
+
+**Demo gates (off by default):** `M33` via `make sysdisk-ext4-csum`,
+`-DM34_LUA_DEMO=1`, `-DM35_CAP_DEMO=1`. New shell commands: `audit`, `wifi`.
+
+**NEXT candidates:** (a) **WiFi radio bring-up** (AR9300 INI/calibration/scan/
+assoc — the big real-HW effort, crypto is ready); (b) **bash/dash from source**
+(needs termios/ioctl + dup2 + cross-config — see M34 devlog); (c) full **kernel
+W^X** (high-half per-section) + KASLR + finish SMAP audit; (d) **full secure boot**
+(loader verifies the kernel). Build images + test on the ASUS first.
+
+_Images to rebuild + copy to `C:\Users\Luigi\SecOS\`: `secos.iso` (real HW GRUB),
+`secos-uefi.vmdk` (VMware), `secos-uefi.img` (real HW USB). Verify the banner
+`git:<hash>`._
+
+---
+
 ## ✅ REAL-HARDWARE HARDENING session (2026-06-21) — HEAD `2b616bb` on `main`, pushed
 Everything below was driven + validated by the user on the **ASUS E406S** (real HW)
 booting the **native UEFI loader** (`secos-uefi.img` on USB). Images on
