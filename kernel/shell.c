@@ -1062,6 +1062,12 @@ static void sh_wifi(const char* a){
         terminal_writestring(r==0 ? "  ✓ tuned\n" : "  (see [ath9k-port])\n");
         return;
     }
+    /* [M39] `wifi regdump`: dump RX-critical PHY regs for Alpine comparison. */
+    if(a && a[0]=='r' && a[1]=='e' && a[2]=='g'){
+        extern void ath9k_secos_regdump(void);
+        ath9k_secos_regdump();
+        return;
+    }
     /* [M39] `wifi scan`: listen for beacons on the current channel (EDMA RX). */
     if(a && a[0]=='s' && a[1]=='c' && a[2]=='a' && a[3]=='n'){
         terminal_writestring("Scanning for beacons on current channel...\n");

@@ -82,6 +82,38 @@ int ath9k_secos_bringup(volatile void* mmio, unsigned short devid){
 /* Probe a few PHY/MAC registers after init so the shell can show the chip state. */
 unsigned int ath9k_secos_reg(unsigned int off){ return g_mmio ? *(volatile u32*)(g_mmio + off) : 0; }
 
+/* Dump the RX-critical PHY registers + NF state for side-by-side comparison with
+ * a working Alpine boot (ath9k debugfs regdump). These govern RX sensitivity:
+ * TIMING5 = ANI weak-signal (CYCPWR/RSSI) thresholds, CCA = measured noise floor,
+ * MC_GAIN_CTRL = antenna diversity, AGC_CONTROL = AGC state. */
+void ath9k_secos_regdump(void){
+    if (!g_ah){ debugcon_writestring("[regdump] run wifi up + wifi chan first\n"); return; }
+    static const struct { const char* n; unsigned off; } regs[] = {
+        {"SREV       0x4020", 0x4020},
+        {"PHY_TIMING5 0x9810", 0x9810},  /* ANI weak-signal thresholds */
+        {"PHY_EXT_CCA 0x9830", 0x9830},
+        {"PHY_CCA_0  0x9e1c", 0x9e1c},   /* measured NF */
+        {"PHY_CCACTL 0x9e20", 0x9e20},
+        {"PHY_MCGAIN 0x9e28", 0x9e28},   /* antenna diversity */
+        {"PHY_RXOCG  0xa000", 0xa000},
+        {"PHY_AGCCTL 0xa2c4", 0xa2c4},   /* AGC control/state */
+    };
+    debugcon_writestring("[regdump] macRev="); debugcon_print_hex((unsigned long)g_ah->hw_version.macRev);
+    debugcon_writestring(" rxmask="); debugcon_print_hex((unsigned long)g_ah->rxchainmask);
+    debugcon_writestring(" noise="); debugcon_print_hex((unsigned long)(g_ah->noise & 0xffff));
+    debugcon_writestring("\n");
+    for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); i++){
+        debugcon_writestring("  "); debugcon_writestring(regs[i].n);
+        debugcon_writestring(" = "); debugcon_print_hex(*(volatile u32*)(g_mmio + regs[i].off));
+        debugcon_writestring("\n");
+    }
+    /* NF cal history (per chain) */
+    debugcon_writestring("  nfCalHist privNF:");
+    for (int c = 0; c < 3; c++){ debugcon_putchar(' ');
+        debugcon_print_hex((unsigned long)(g_caldata.nfCalHist[c].privNF & 0xffff)); }
+    debugcon_writestring("\n");
+}
+
 /* Tune the radio to a 2.4GHz channel via the upstream ath9k_hw_reset (full PHY/RF
  * reset + per-channel calibration). chan_num = 1..14. Returns ath9k_hw_reset's
  * status. This is the step that actually powers the RF onto a frequency. */
