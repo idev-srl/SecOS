@@ -12,6 +12,8 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <sys/time.h>
+#include <fcntl.h>
 
 int errno = 0;
 
@@ -243,6 +245,44 @@ int putenv(char* s){
 }
 void exit(int code){ _exit(code); }
 void abort(void){ write(2,"abort\n",6); _exit(134); }
+
+/* [M39] Single-user identity + misc POSIX stubs that source ports (a shell, many
+ * utilities) reference. SecOS's trust model is the signature, not uid — so every
+ * signed process runs as uid/gid 0 (root). These are correct for that model. */
+int getuid(void){ return 0; }
+int geteuid(void){ return 0; }
+int getgid(void){ return 0; }
+int getegid(void){ return 0; }
+int setuid(int u){ (void)u; return 0; }
+int setgid(int g){ (void)g; return 0; }
+int setgroups(unsigned n, const int* g){ (void)n; (void)g; return 0; }
+int getgroups(int n, int* g){ (void)n; (void)g; return 0; }
+static unsigned g_umask = 022;
+unsigned umask(unsigned m){ unsigned o = g_umask; g_umask = m & 0777; return o; }
+
+/* Uptime-based clock (no RTC wall clock; getticks() is the 1 kHz tick = ms). */
+int gettimeofday(struct timeval* tv, void* tz){
+    (void)tz;
+    if(!tv) return -1;
+    unsigned long ms = getticks();
+    tv->tv_sec  = (long)(ms / 1000);
+    tv->tv_usec = (long)((ms % 1000) * 1000);
+    return 0;
+}
+
+/* fcntl: F_DUPFD via dup(); flags tracked loosely (enough for a shell). */
+int fcntl(int fd, int cmd, ...){
+    va_list ap; va_start(ap, cmd);
+    long arg = va_arg(ap, long); va_end(ap); (void)arg;
+    switch(cmd){
+    case F_DUPFD: return dup(fd);     /* lowest free fd (>=arg not strictly honored) */
+    case F_GETFD: return 0;
+    case F_SETFD: return 0;
+    case F_GETFL: return O_RDWR;
+    case F_SETFL: return 0;
+    default: return -1;
+    }
+}
 
 /* ============================== <dirent.h> ============================= */
 #include <dirent.h>

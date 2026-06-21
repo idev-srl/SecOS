@@ -14,4 +14,15 @@ unsigned int sleep(unsigned int seconds);   /* whole-second sleep (via SYS_SLEEP
 int   usleep(unsigned long usec);
 int   isatty(int fd);
 
+/* [M39] single-user identity (signature is the trust boundary; everyone is root) */
+int   getuid(void);
+int   geteuid(void);
+int   getgid(void);
+int   getegid(void);
+int   setuid(int u);
+int   setgid(int g);
+int   getgroups(int n, int* g);
+int   setgroups(unsigned n, const int* g);
+unsigned umask(unsigned m);
+
 #endif

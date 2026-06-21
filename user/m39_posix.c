@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <fcntl.h>
+#include <sys/time.h>
 #include "libsecos.h"
 
 static void put(const char* s){ write(1, s, strlen(s)); }
@@ -60,6 +62,20 @@ int main(void){
         t.c_lflag |= (ICANON | ECHO);
         tcsetattr(1, TCSANOW, &t);
     } else put("[M39] tcgetattr FAIL\n");
+
+    /* single-user identity */
+    if(getuid()==0 && geteuid()==0) put("[M39] getuid/geteuid OK\n");
+    else put("[M39] getuid FAIL\n");
+
+    /* gettimeofday (uptime-based) */
+    struct timeval tv;
+    if(gettimeofday(&tv,0)==0 && tv.tv_sec>=0) put("[M39] gettimeofday OK\n");
+    else put("[M39] gettimeofday FAIL\n");
+
+    /* fcntl F_DUPFD */
+    int fd2 = fcntl(1, F_DUPFD, 3);
+    if(fd2>=0){ put("[M39] fcntl F_DUPFD OK\n"); close(fd2); }
+    else put("[M39] fcntl FAIL\n");
 
     put("[M39] POSIX-FOUNDATION DONE\n");
     return 0;
