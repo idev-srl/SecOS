@@ -1,10 +1,35 @@
 # SECoS — Resume Here (session handoff)
 
-## 🌙 AUTONOMOUS OVERNIGHT session (2026-06-21) — M33–M38, Phase L COMPLETE
-Worked autonomously through the remaining roadmap + both user bonuses. **All
-milestones validated in QEMU (build clean, both smoke paths PASS, 0 exceptions);
-real-HW validation (esp. WiFi) is the user's to do.** Commits (newest first):
+## 🌙 AUTONOMOUS OVERNIGHT session (2026-06-21) — M33–M38, Phase L COMPLETE — HEAD `0491f81`, pushed
+Worked autonomously through the remaining roadmap + both user bonuses, then a
+follow-up (shell redirection). **Selftest 182/182, both smoke paths PASS, 0
+exceptions. Both bonuses VALIDATED on real hardware by the user this session.**
 
+### ✅ Real-HW / VMware validation (user, this session)
+- **WiFi AR9565 WORKS on the ASUS E406S**: `lspci` → `168c:0036`; `wifi` →
+  `AR9565 ... BAR0=81200000 AR_SREV=0x002CC2FF (chip responds)`. The silicon
+  responds to a live MMIO read — PCI attach + BAR map + wake + register read all
+  work on the real chip. `MAC=EF:BE:AD:DE:EF:BE` = 0xDEADBEEF poison = **EEPROM not
+  loaded yet** (exactly the documented M38 TODO). The scaffold did everything it can.
+- **ext4 root + persistence WORKS on VMware**: `[M23] persistent ext2/ext4 root
+  mounted from nvme0n1`; `blk` shows `fs=ext2/3/4`; wrote a file, **rebooted, file
+  persisted** (`vcat /home/test.txt` → content survives). **Gotcha for next time:**
+  VMware defaults a new disk to **SCSI**, which SecOS does NOT support — attach the
+  data/root disk as **SATA or NVMe**, then it shows in `blk` and auto-mounts as root.
+- Boots fully to the shell on both, console fluid → W^X-identity + SMEP + canaries
+  + SSE did not break the real-HW boot.
+
+### Follow-up this session: shell `>`/`>>` redirection (`0491f81`)
+`echo hi > f`, `echo more >> f`, `seq 1 100 | wc > out` all work. `open()` now
+honours O_CREAT/O_TRUNC/O_APPEND (also useful for bash/dash later). `cat`/`ls` were
+always available (coreutils applets); `vcreate` existed only because `>` wasn't
+wired — now it is. (`fs/ramfs_vfs.c` cache refreshes size on lookup for `>>`.)
+
+Commits (newest first):
+
+- **`0491f81` shell `>`/`>>` redirection + `open(O_CREAT/O_TRUNC/O_APPEND)`.**
+  Standard commands now replace the `v*` helpers for writing files.
+- **`90b15db` docs**: M33–M38 devlogs + CLAUDE/TASKS/next_session; M14 selftest fix.
 - **`635f9eb` M38 WiFi: Atheros AR9565 (ath9k) scaffold + WPA2 crypto.** The
   user's bonus. `drivers/ath9k.{c,h}`: PCI attach for the AR9300 family
   (`168c:0036` = the ASUS AR9565, **no firmware blob needed**), BAR0 map, chip
@@ -47,9 +72,10 @@ assoc — the big real-HW effort, crypto is ready); (b) **bash/dash from source*
 W^X** (high-half per-section) + KASLR + finish SMAP audit; (d) **full secure boot**
 (loader verifies the kernel). Build images + test on the ASUS first.
 
-_Images to rebuild + copy to `C:\Users\Luigi\SecOS\`: `secos.iso` (real HW GRUB),
-`secos-uefi.vmdk` (VMware), `secos-uefi.img` (real HW USB). Verify the banner
-`git:<hash>`._
+_Images on `C:\Users\Luigi\SecOS\` rebuilt at **`git:0491f81`**: `secos.iso` (real
+HW GRUB), `secos-uefi.vmdk` (VMware), `secos-uefi.img` (real HW USB), `sysdisk.vmdk`
+(persistent **ext4** root — attach as SATA/NVMe, NOT SCSI). Verify the banner
+`git:0491f81`. Rebuild + recopy after changes._
 
 ---
 
