@@ -8,7 +8,7 @@ W="${ATH9K_WORK:-/tmp/ath_tree}"
 B='https://raw.githubusercontent.com/torvalds/linux/master/drivers/net/wireless/ath'
 GCCINC="$(echo /usr/lib/gcc/x86_64-linux-gnu/*/include | tr ' ' '\n' | head -1)"
 INC="-I$ROOT/drivers/ath9k_port/compat -I$W/ath9k -I$W -isystem $GCCINC"
-CF="-ffreestanding -nostdlib -nostdinc -m64 -O2 -w -fno-pic -mcmodel=kernel -mno-red-zone -mno-sse"
+CF="-ffreestanding -nostdlib -nostdinc -m64 -O2 -w -fno-pic -mcmodel=kernel -mno-red-zone -mno-sse -DCONFIG_ATH_DEBUG"
 HW="hw ar9003_hw ar9003_phy ar9003_calib ar9003_mac ar9003_eeprom mac calib eeprom"
 INITVALS="ar9003_2p2 ar9003_buffalo ar9485 ar9340 ar9330_1p1 ar9330_1p2 ar955x_1p0 ar9580_1p0 \
           ar9462_2p0 ar9462_2p1 ar9565_1p0 ar9565_1p1 ar953x ar956x"

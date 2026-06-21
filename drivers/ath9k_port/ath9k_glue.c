@@ -47,7 +47,32 @@ void eth_random_addr(u8* a){ for(int i=0;i<6;i++) a[i]=0; a[0]=0x02; }
 void eth_broadcast_addr(u8* a){ for(int i=0;i<6;i++) a[i]=0xff; }
 
 /* --- ath9k common (common.c/regd.c not ported; safe defaults) --- */
-void ath_printk(const char* lvl, const void* c, const char* fmt, ...){ (void)lvl;(void)c;(void)fmt; }
+/* ath_printk: mini-printf to debugcon so the upstream driver's own ath_dbg/
+ * ath_err logging is visible on serial (localizes the bring-up crash on real HW). */
+#include <stdarg.h>
+extern void debugcon_putchar(char);
+static void e9hex(unsigned long v,int dig){ static const char h[]="0123456789abcdef"; for(int i=(dig-1)*4;i>=0;i-=4) debugcon_putchar(h[(v>>i)&0xF]); }
+static void e9dec(long v){ char b[24]; int n=0; if(v<0){debugcon_putchar('-');v=-v;} if(!v)b[n++]='0'; while(v){b[n++]='0'+v%10;v/=10;} while(n--)debugcon_putchar(b[n]); }
+void ath_printk(const char* lvl, const void* c, const char* fmt, ...){
+    (void)lvl; (void)c;
+    debugcon_writestring("[ath9k] ");
+    va_list ap; va_start(ap, fmt);
+    for(const char* p=fmt; *p; p++){
+        if(*p!='%'){ debugcon_putchar(*p); continue; }
+        p++; while(*p=='-'||(*p>='0'&&*p<='9')||*p=='.'||*p=='l'||*p=='z'||*p=='#'||*p==' ') p++;
+        switch(*p){
+        case 'd': case 'i': e9dec(va_arg(ap,int)); break;
+        case 'u': e9dec((long)va_arg(ap,unsigned)); break;
+        case 'x': case 'X': e9hex(va_arg(ap,unsigned),8); break;
+        case 'p': debugcon_writestring("0x"); e9hex((unsigned long)va_arg(ap,void*),16); break;
+        case 's': { const char* s=va_arg(ap,const char*); debugcon_writestring(s?s:"(null)"); break; }
+        case 'c': debugcon_putchar((char)va_arg(ap,int)); break;
+        case '%': debugcon_putchar('%'); break;
+        default: debugcon_putchar('%'); if(*p) debugcon_putchar(*p); else p--; break;
+        }
+    }
+    va_end(ap);
+}
 void ath_hw_setbssidmask(void* common){ (void)common; }
 unsigned ath_regd_get_band_ctl(void* reg, int band){ (void)reg;(void)band; return 0; /* SD_NO_CTL */ }
 int ath_hw_get_listen_time(void* common){ (void)common; return 0; }

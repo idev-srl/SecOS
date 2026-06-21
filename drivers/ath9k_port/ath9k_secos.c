@@ -45,6 +45,7 @@ int ath9k_secos_bringup(volatile void* mmio, unsigned short devid){
     struct ath_common* common = ath9k_hw_common(ah);
     common->bus_ops = &g_bus_ops;
     common->ah = ah;
+    common->debug_mask = 0xffffffff;   /* narrate the bring-up on debugcon */
 
     debugcon_writestring("[ath9k-port] calling ath9k_hw_init (upstream driver)...\n");
     int ret = ath9k_hw_init(ah);
