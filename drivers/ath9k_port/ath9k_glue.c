@@ -81,3 +81,17 @@ int  ar9002_hw_rf_claim(void* ah){ (void)ah; return 0; }
 int  ar9003_is_paprd_enabled(void* ah){ (void)ah; return 0; }
 void ath9k_hw_ani_init(void* ah){ (void)ah; }
 void ath9k_hw_disable_mib_counters(void* ah){ (void)ah; }
+
+/* --- mem* as global symbols (SecOS's are inline-only; the ported driver needs
+ * real symbols). gcc may also lower struct copies to these. --- */
+void* memcpy(void* d, const void* s, unsigned long n){ unsigned char* a=d; const unsigned char* b=s; while(n--) *a++=*b++; return d; }
+void* memset(void* d, int c, unsigned long n){ unsigned char* a=d; while(n--) *a++=(unsigned char)c; return d; }
+void* memmove(void* d, const void* s, unsigned long n){ unsigned char* a=d; const unsigned char* b=s; if(a<b){while(n--)*a++=*b++;}else{a+=n;b+=n;while(n--)*--a=*--b;} return d; }
+int memcmp(const void* a, const void* b, unsigned long n){ const unsigned char* x=a;const unsigned char* y=b; for(unsigned long i=0;i<n;i++){if(x[i]!=y[i])return (int)x[i]-(int)y[i];} return 0; }
+unsigned long strlen(const char* s){ unsigned long n=0; while(s[n])n++; return n; }
+
+/* --- debugcon (SecOS's are static-inline; provide globals for the bridge) --- */
+static void e9(char c){ __asm__ volatile("outb %0, %1" :: "a"((unsigned char)c), "Nd"((unsigned short)0xE9)); }
+void debugcon_putchar(char c){ e9(c); }
+void debugcon_writestring(const char* s){ while(*s) e9(*s++); }
+void debugcon_print_hex(unsigned long v){ static const char h[]="0123456789ABCDEF"; e9('0'); e9('x'); for(int i=60;i>=0;i-=4) e9(h[(v>>i)&0xF]); }
