@@ -1,5 +1,63 @@
 # SECoS — Resume Here (session handoff)
 
+## 📡 WiFi on real ASUS — ath9k Linux driver ported (2026-06-22) — RX DECODE WALL
+**Goal**: port the whole upstream Linux **ath9k_hw** driver as-is and connect the
+ASUS's **AR9565** (`168c:0036`) to WiFi. User stopped here to resume later with a
+possibly different method ("non andare avanti così giorni"). Hardware is perfect:
+**Alpine Linux scans+connects on the SAME ASUS**, so every remaining problem is in
+our minimal bring-up, not the chip/antenna.
+
+### What WORKS on the real chip (all validated on the ASUS)
+- `wifi up` → `ath9k_hw_init` = **0** (OTP read, caps, MAC). PHY@a000 live, PLL set.
+- `wifi chan <n>` → `ath9k_hw_reset` = **0** (per-channel PHY/RF reset + IQ/AGC cal).
+- `wifi scan` → sweeps ch 1-13, EDMA RX **receives real 802.11 frames** via DMA.
+- Build: `tools/port-ath9k.sh` cross-compiles 10 hw files (+`ani`) + glue + bridge →
+  `drivers/ath9k_port/ath9k_hw.o` (committed `git add -f`), linked into the kernel.
+  Bridge=`ath9k_port/ath9k_secos.c`, glue=`ath9k_glue.c`, shell verbs in
+  `kernel/shell.c sh_wifi` + wrappers in `drivers/ath9k.c`.
+
+### Bugs FOUND & FIXED (the "bridge skips the PCI/main driver" pattern)
+1. `ah->ah_flags |= AH_USE_EEPROM` — else eeprom restore took the flash path → NULL nvram → fault.
+2. `g_bus_ops.eeprom_read` returns false (AR9565 = OTP only) + `read_cachesize`.
+3. **`common->bt_ant_diversity = 1`** — AR9565 BT/WLAN RX antenna diversity. THE
+   breakthrough: Alpine's `dmesg | grep ath` showed `set BT/WLAN RX diversity` +
+   `Enable LNA combining`. Setting the flag makes `ath9k_hw_reset` force
+   `AR_BTCOEX_WL_LNADIV` → **heard frames 4 → 38 per sweep**.
+4. Ported real `ani.c` (added AR_MIBC* to reg.h; ANI helps: 38 frames with vs 3 without).
+
+### THE WALL: frames received but FAIL CRC (decode quality / RX gain)
+Best state (antenna flag + ANI): `heard ≈ 38` frames/sweep, **`networks = 0`**.
+Per-frame diag: `rs_status = 1` (**CRC error**), `NF = 0xFFCD = −51 dBm` (should be
+~−95; measured NF ≈ −77, ~20 dB too high). Classic **over-gain**: receiver hears RF,
+locks preamble, but payload bits are wrong → CRC fail; high NF.
+**Ruled out**: init/IQ/AGC cal completes (ath9k_hw_wait in reset), NF limits correct
+(set_nf_limits runs, nominal −127 for 9565), ar9565 initvals/gain tables present,
+relocations correct, all-buffer poll (no stall), bus-master on. ANI removal makes it
+WORSE (helps reception), explicit LNA conf override makes it WORSE (eeprom config is
+already right — only the *enable* flag was missing).
+
+### NEXT STEP (queued, awaiting one datapoint)
+`wifi regdump` (committed `53f6dd1`) now prints `rxGainIdx` (eeprom txrxgain & 0xf:
+0=with-xLNA, 1=wo-xLNA) + PHY regs (TIMING5/CCA/MC_GAIN/AGC_CTL) + nfCalHist.
+**Get one `wifi up; wifi chan 6; wifi regdump`** and check if the **RX gain table**
+(`ar9003_rx_gain_table_mode0/1`, selected by `ar9003_hw_get_rx_gain_idx` from eeprom
+txrxgain) is wrong → forcing the other table is the prime suspect for high-NF+CRC.
+Alpine's ath9k debugfs is OFF (`/sys/kernel/debug/ieee80211/phy0` empty) so register
+comparison must be reasoned from SecOS's own regdump vs known-good ath9k values.
+**Possible better method to resume with**: (a) build Alpine's kernel with
+`CONFIG_ATH9K_DEBUGFS=y` (or a tiny mmap tool on /sys/.../resource0) to dump the
+working register set for a direct diff; (b) port more of the main driver (antenna.c
+dynamic combiner + periodic calibration timer); (c) QEMU with a real ath9k via VFIO
+passthrough for non-blind iteration. After RX: TX path is scaffolded but unexercised
+→ auth/assoc MLME → WPA2 4-way (`net/wpa2_supplicant.c`, crypto KAT-validated) → DHCP.
+Memory: [[ath9k-bringup-progress]], [[driver-space-vs-inkernel-ath9k]] (ring-0 now,
+move to ring-3 Driver Space later — user wants to discuss). Debug output: framebuffer
+breadcrumb (port 0xE9 invisible on real HW); panic prints `g_dbg_breadcrumb`+CR2.
+Images for ASUS: GRUB ISO only (UEFI loader triple-faults on real HW) → rebuild
+`myos.iso`, copy to `C:\Users\Luigi\SecOS\`.
+
+---
+
 ## 🌙 AUTONOMOUS session (2026-06-21) — M39: all 4 NEXT candidates — pushed
 Executed the four "NEXT candidates" from the previous handoff in one autonomous
 run (user: "esegui tutti e 4 i candidati … per bash voglio bash"). Each landed as
