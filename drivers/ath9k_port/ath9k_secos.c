@@ -108,10 +108,12 @@ void ath9k_secos_regdump(void){
         debugcon_writestring("\n");
     }
     /* NF cal history (per chain) */
-    debugcon_writestring("  nfCalHist privNF:");
-    for (int c = 0; c < 3; c++){ debugcon_putchar(' ');
-        debugcon_print_hex((unsigned long)(g_caldata.nfCalHist[c].privNF & 0xffff)); }
-    debugcon_writestring("\n");
+    if (g_ah->caldata){
+        debugcon_writestring("  nfCalHist privNF:");
+        for (int c = 0; c < 3; c++){ debugcon_putchar(' ');
+            debugcon_print_hex((unsigned long)(g_ah->caldata->nfCalHist[c].privNF & 0xffff)); }
+        debugcon_writestring("\n");
+    }
 }
 
 /* Tune the radio to a 2.4GHz channel via the upstream ath9k_hw_reset (full PHY/RF
