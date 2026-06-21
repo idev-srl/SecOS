@@ -142,6 +142,31 @@ unsigned long strtoul(const char* s, char** end, int base){ return (unsigned lon
 int atoi(const char* s){ return (int)strtol(s,0,10); }
 long atol(const char* s){ return strtol(s,0,10); }
 
+/* strtod: decimal floating point (integer mantissa + single 10^exp scale).
+ * Handles sign, fraction and e/E exponent. Good enough to round-trip the numbers
+ * SecOS's %g printf produces (used by lua's lexer). */
+double strtod(const char* s, char** end){
+    const char* s0=s;
+    while(isspace((unsigned char)*s)) s++;
+    int neg=0; if(*s=='+'||*s=='-'){ neg=(*s=='-'); s++; }
+    unsigned long long mant=0; int mdig=0, exp10=0, any=0;
+    while(isdigit((unsigned char)*s)){ if(mdig<18){ mant=mant*10+(unsigned)(*s-'0'); mdig++; } else exp10++; s++; any=1; }
+    if(*s=='.'){ s++; while(isdigit((unsigned char)*s)){ if(mdig<18){ mant=mant*10+(unsigned)(*s-'0'); mdig++; exp10--; } s++; any=1; } }
+    if(!any){ if(end)*end=(char*)s0; return 0.0; }
+    if(*s=='e'||*s=='E'){ const char* sv=s; s++; int eneg=0; if(*s=='+'||*s=='-'){ eneg=(*s=='-'); s++; }
+        if(isdigit((unsigned char)*s)){ int ex=0; while(isdigit((unsigned char)*s)){ ex=ex*10+(*s-'0'); s++; } exp10 += eneg?-ex:ex; }
+        else s=sv; }
+    double val=(double)mant;
+    if(exp10>0){ for(int i=0;i<exp10;i++) val*=10.0; }
+    else if(exp10<0){ for(int i=0;i<-exp10;i++) val/=10.0; }
+    if(end)*end=(char*)s;
+    return neg? -val : val;
+}
+float strtof(const char* s, char** end){ return (float)strtod(s,end); }
+double atof(const char* s){ return strtod(s,0); }
+long long strtoll(const char* s, char** end, int base){ return (long long)strtol(s,end,base); }
+unsigned long long strtoull(const char* s, char** end, int base){ return (unsigned long long)strtoul(s,end,base); }
+
 static unsigned long g_rand = 123456789UL;
 int rand(void){ g_rand = g_rand*1103515245UL + 12345UL; return (int)((g_rand>>16) & RAND_MAX); }
 void srand(unsigned seed){ g_rand = seed; }
@@ -208,6 +233,75 @@ typedef struct { void (*put)(void*, const char*, size_t); void* arg; int count; 
 static void emit(sink_t* s, const char* p, size_t n){ s->put(s->arg, p, n); s->count += (int)n; }
 static void emitc(sink_t* s, char c){ s->put(s->arg, &c, 1); s->count++; }
 
+/* ===== floating point formatting (%f/%e/%g) — hardware double via SSE =====
+ * dtoa_round extracts `nsig` significant decimal digits with a single exact
+ * power-of-ten scale (≈0.5 ULP, no per-digit accumulation); verified against
+ * glibc printf for the lua-relevant %.14g cases. Not bit-exact for the
+ * round-half-to-even tie case (we round half away from zero). */
+static int dtoa_round(double v, int nsig, char* digs){
+    if(nsig<1) nsig=1;
+    if(nsig>17) nsig=17;
+    if(v<=0){ for(int i=0;i<nsig;i++) digs[i]='0'; return 0; }
+    int e=0; { double t=v; while(t>=1e16){t/=1e16;e+=16;} while(t>=10.0){t/=10.0;e++;} while(t<1.0){t*=10.0;e--;} }
+    int k=nsig-1-e; int ap=k<0?-k:k; double p=1.0; for(int i=0;i<ap;i++) p*=10.0;
+    double scaled=(k>=0)? v*p : v/p;
+    unsigned long long m=(unsigned long long)(scaled+0.5);
+    char tmp[24]; int tn=0; if(m==0) tmp[tn++]='0'; while(m){ tmp[tn++]=(char)('0'+(int)(m%10)); m/=10; }
+    if(tn>nsig) e++;
+    int start=tn-1; for(int i=0;i<nsig;i++){ int idx=start-i; digs[i]=(idx>=0)?tmp[idx]:'0'; }
+    return e;
+}
+static int fmt_fp_body(char* out, double v, char conv, int prec, int alt){
+    char digs[40]; int n=0; if(prec<0) prec=6;
+    if(conv=='e'){
+        int nsig=prec+1; if(nsig<1) nsig=1; int e=dtoa_round(v,nsig,digs);
+        out[n++]=digs[0]; if(prec>0||alt){ out[n++]='.'; for(int i=0;i<prec;i++) out[n++]=(i+1<nsig)?digs[i+1]:'0'; }
+        out[n++]='e'; out[n++]=e<0?'-':'+'; int ae=e<0?-e:e; char eb[6]; int en=0;
+        if(ae==0) eb[en++]='0';
+        while(ae){ eb[en++]='0'+ae%10; ae/=10; }
+        if(en<2) eb[en++]='0';
+        while(en) out[n++]=eb[--en];
+        return n;
+    }
+    if(conv=='f'){
+        int e0=0; { double t=v; if(t>0){ while(t>=1e16){t/=1e16;e0+=16;} while(t>=10.0){t/=10.0;e0++;} while(t<1.0){t*=10.0;e0--;} } }
+        int intdigits=e0>=0?e0+1:0; int nsig=intdigits+prec; if(nsig<1) nsig=1; if(nsig>17) nsig=17;
+        int e=dtoa_round(v,nsig,digs); if(v==0.0) e=0; int di=0;
+        if(e>=0){ for(int i=0;i<=e;i++) out[n++]=(di<nsig)?digs[di++]:'0'; } else out[n++]='0';
+        if(prec>0||alt){ out[n++]='.'; int fc=0;
+            if(e<0){ for(int i=0;i<(-e-1)&&fc<prec;i++){ out[n++]='0'; fc++; } }
+            while(fc<prec){ out[n++]=(di<nsig)?digs[di++]:'0'; fc++; } }
+        return n;
+    }
+    /* %g: shortest of %e/%f with P significant digits, trailing zeros stripped */
+    { int P=(prec<0)?6:(prec==0?1:prec); if(v==0.0) return fmt_fp_body(out,0.0,'f',alt?P-1:0,alt);
+      int X=dtoa_round(v,P,digs); int useF=(X>=-4 && X<P);
+      int body=useF? fmt_fp_body(out,v,'f',P-1-X,alt) : fmt_fp_body(out,v,'e',P-1,alt);
+      if(!alt){ int epos=-1; for(int i=0;i<body;i++) if(out[i]=='e'){ epos=i; break; }
+        int end=(epos>=0)?epos:body; int hd=0; for(int i=0;i<end;i++) if(out[i]=='.'){ hd=1; break; }
+        if(hd){ int j=end-1; while(j>=0&&out[j]=='0') j--; if(j>=0&&out[j]=='.') j--;
+          int cut=end-1-j; if(cut>0){ for(int i=j+1;i<body-cut;i++) out[i]=out[i+cut]; body-=cut; } } }
+      return body; }
+}
+/* Emit a double with sign/width/precision/flags via the active sink. */
+static void emit_double(sink_t* s, double v, char conv, int prec, int width,
+                        int left, int zero, int plus, int space, int alt){
+    char sign=0; union { double d; unsigned long u; } bu; bu.d=v;
+    if(bu.u>>63){ sign='-'; v=-v; } else if(plus) sign='+'; else if(space) sign=' ';
+    int upper=(conv>='A'&&conv<='Z'); char lc=upper?(char)(conv+32):conv;
+    char body[400]; int bn;
+    unsigned long e=(bu.u>>52)&0x7FF, frac=(unsigned long)(bu.u&0xFFFFFFFFFFFFFUL);
+    if(e==0x7FF){ const char* w = frac? (upper?"NAN":"nan") : (upper?"INF":"inf");
+        bn=0; while(w[bn]){ body[bn]=w[bn]; bn++; } sign = (frac)?0:sign; }
+    else { bn=fmt_fp_body(body, v, lc, prec, alt); if(upper) for(int i=0;i<bn;i++) if(body[i]=='e') body[i]='E'; }
+    int slen=sign?1:0; int total=bn+slen; int pad=width>total?width-total:0;
+    if(!left && !zero) for(int i=0;i<pad;i++) emitc(s,' ');
+    if(sign) emitc(s,sign);
+    if(!left && zero) for(int i=0;i<pad;i++) emitc(s,'0');
+    emit(s,body,bn);
+    if(left) for(int i=0;i<pad;i++) emitc(s,' ');
+}
+
 static int fmt_core(sink_t* s, const char* fmt, va_list ap){
     char numbuf[32];
     for(; *fmt; fmt++){
@@ -247,6 +341,9 @@ static int fmt_core(sink_t* s, const char* fmt, va_list ap){
             case 'x': base=16; uv = lng? va_arg(ap,unsigned long):(unsigned long)va_arg(ap,unsigned); if(alt&&uv)prefix="0x"; goto numconv;
             case 'X': base=16; upper=1; uv = lng? va_arg(ap,unsigned long):(unsigned long)va_arg(ap,unsigned); if(alt&&uv)prefix="0X"; goto numconv;
             case 'p': base=16; uv=(unsigned long)va_arg(ap,void*); prefix="0x"; goto numconv;
+            case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
+                emit_double(s, va_arg(ap,double), (conv=='a'||conv=='A')?'g':conv, prec, width, left, zero, plus, space, alt);
+                continue;
             default: emitc(s,'%'); if(conv) emitc(s,conv); continue;
             numconv: {
                 const char* digs = upper? "0123456789ABCDEF":"0123456789abcdef";
@@ -355,6 +452,9 @@ FILE* fopen(const char* path, const char* mode){
     return fdopen(fd,mode);
 }
 int fclose(FILE* f){ if(!f) return EOF; fflush(f); int fd=f->fd; if(f!=&_stdin&&f!=&_stdout&&f!=&_stderr){ close(fd); free(f); } return 0; }
+FILE* freopen(const char* path, const char* mode, FILE* f){ if(f && f!=&_stdin && f!=&_stdout && f!=&_stderr) fclose(f); return path? fopen(path,mode) : f; }
+int strcoll(const char* a, const char* b){ return strcmp(a,b); }    /* no locale collation */
+size_t strxfrm(char* d, const char* s, size_t n){ size_t l=strlen(s); if(n){ size_t c=l<n-1?l:n-1; memcpy(d,s,c); d[c]=0; } return l; }
 int feof(FILE* f){ return f->flags&4?1:0; }
 int ferror(FILE* f){ return f->flags&8?1:0; }
 long ftell(FILE* f){ return lseek(f->fd,0,SEEK_CUR); }

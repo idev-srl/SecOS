@@ -5,6 +5,8 @@
 #define _SIGNAL_H
 #include "libsecos.h"
 
+typedef int sig_atomic_t;
+
 /* Signal numbers (Linux-compatible where it matters for source ports). */
 #define SIGHUP   1
 #define SIGINT   2

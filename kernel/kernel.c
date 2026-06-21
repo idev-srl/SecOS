@@ -407,6 +407,55 @@ static void m13_run_demo(void) {
 }
 #endif /* M13_DEMO */
 
+// ---- [M34] Lua-from-source demo (gated; off by default) ----
+// Loads the embedded SIGNED lua interpreter ELF (built from lua 5.4.7 source with
+// the SecOS libc/libm/setjmp + SSE), runs it in ring-3 on the demand-paged VM.
+// Its built-in demo script exercises the VM, floats (%g printf), math.sqrt, and
+// recursion — proving "compile real OSS from source and run it signed".
+#ifndef M34_LUA_DEMO
+#define M34_LUA_DEMO 0
+#endif
+#if M34_LUA_DEMO
+#include "trapframe.h"
+#include "../crypto/user_lua_elf.h"
+static uint8_t m34_idle_stack[16384] __attribute__((aligned(16)));
+static int m34_step = 0;
+__attribute__((noreturn)) static void m34_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m34_step == 0) {
+            m34_step = 1;
+            debugcon_writestring("[M34] loading signed lua interpreter (lua 5.4.7)\n");
+            process_t* p = process_create_from_elf(user_lua_elf, user_lua_elf_len);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[M34] lua spawned, running demo script\n"); }
+            else    debugcon_writestring("[M34] FAIL: lua ELF not loaded\n");
+        } else if (m34_step == 1 && sched_count_alive_user() == 0) {
+            m34_step = 2;
+            debugcon_writestring("[M34] DONE (lua interpreter ran to completion)\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+static void m34_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M34] lua-from-source demo\n");
+    static process_t idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m34_idle_stack + sizeof(m34_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m34_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[M34] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf); // does not return
+}
+#endif /* M34_LUA_DEMO */
+
 // ---- [M14] Demand paging demo (gated; off by default) ----
 // Proves, non-interactively, that user pages are NOT eagerly mapped: a signed
 // program is loaded (process_create_from_elf) and BEFORE it runs we count the
@@ -1641,6 +1690,9 @@ static void kernel_main_phase2(void) {
 #if M13_DEMO
     m13_run_demo(); // usability & policy demo — does not return
 #endif
+#if M34_LUA_DEMO
+    m34_run_demo(); // lua-from-source demo — does not return
+#endif
 #if M14_DEMAND_DEMO
     m14_run_demo(); // demand paging demo — does not return
 #endif
@@ -1797,9 +1849,29 @@ void kvlog(const char* s) { if (g_kverbose) terminal_writestring(s); }
 void kvhex(uint64_t v)    { if (g_kverbose) print_hex(v); }
 void kvputc(char c)       { if (g_kverbose) terminal_putchar(c); }
 
+// [M34] Enable SSE/SSE2 so ring-3 code (e.g. ported software using doubles, like
+// lua) can run FP instructions without #UD. The kernel itself is built -mno-sse,
+// so it never clobbers XMM; per-process FPU state is saved across context
+// switches (fxsave/fxrstor, see context_switch). Must run before any ring-3 task.
+void cpu_enable_sse(void) {
+    uint64_t cr0, cr4;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1UL << 2);   // CR0.EM = 0 (no x87 emulation)
+    cr0 |=  (1UL << 1);   // CR0.MP = 1 (monitor coprocessor)
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1UL << 9);    // CR4.OSFXSR     = 1 (SSE + fxsave/fxrstor enabled)
+    cr4 |= (1UL << 10);   // CR4.OSXMMEXCPT = 1 (SIMD FP exceptions -> #XF)
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
+    __asm__ volatile("fninit");
+    unsigned int mxcsr = 0x1F80;          // all SIMD exceptions masked (reset default)
+    __asm__ volatile("ldmxcsr %0" :: "m"(mxcsr));
+}
+
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // --- Phase 1 begins (old .bss stack) ---
     terminal_initialize();
+    cpu_enable_sse();   // [M34] FPU/SSE for ring-3 (lua & other FP userland)
     // COM1 serial console: mirrors terminal output and feeds the shell input
     // path, so the interactive shell works headless over `-serial stdio`.
     extern void serial_init(void); serial_init();

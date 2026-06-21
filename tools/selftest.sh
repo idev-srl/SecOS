@@ -461,9 +461,31 @@ timeout "$((TIMEOUT+4))" qemu-system-x86_64 -cdrom myos.iso -boot d \
     -debugcon file:"$M23RLOG" -global isa-debugcon.iobase=0xe9 \
     -no-reboot -no-shutdown -display none -m 256M
 set -e
-grep -q "\[M23\] persistent ext2 root on" "$M23RLOG"; check "M23 persistent ext2 root adopted" $?
+grep -q "\[M23\] persistent ext2/ext4 root on" "$M23RLOG"; check "M23 persistent ext2/ext4 root adopted" $?
 ! grep -q "\[VFS\] root RAMFS mounted" "$M23RLOG"; check "M23 RAMFS root skipped when ext2 root present" $?
 ! grep -q "\[EXC\]" "$M23RLOG"; check "no CPU exception ([EXC]) during M23 persistent-root boot" $?
+
+# ---- M33: full ext4 root WITH metadata_csum stays e2fsck-clean after writes ----
+# Boot a default-mkfs.ext4 (metadata_csum) sysdisk as the root; SecOS installs
+# coreutils + writes /VERSION; the volume must remain e2fsck-clean (crc32c
+# superblock/gd/inode/dir/bitmap checksums all refreshed).
+M33LOG=/tmp/secos_selftest_m33.log
+if command -v e2fsck >/dev/null 2>&1; then
+  echo "[selftest] Running M33 ext4 metadata_csum root..."
+  make sysdisk-ext4-csum >/dev/null 2>&1 || { echo "  [FAIL] M33 csum sysdisk build"; FAIL=$((FAIL+1)); }
+  cp sysdisk.img /tmp/secos_m33csum.img
+  : > "$M33LOG"; set +e
+  timeout "$((TIMEOUT+4))" qemu-system-x86_64 -cdrom myos.iso -boot d \
+      -drive file=/tmp/secos_m33csum.img,if=virtio,format=raw \
+      -debugcon file:"$M33LOG" -global isa-debugcon.iobase=0xe9 \
+      -no-reboot -no-shutdown -display none -m 512M
+  set -e
+  grep -q "\[M23\] persistent ext2/ext4 root on" "$M33LOG"; check "M33 metadata_csum ext4 root adopted" $?
+  e2fsck -fn /tmp/secos_m33csum.img >/tmp/secos_m33fsck.log 2>&1; check "M33 metadata_csum volume e2fsck-clean after SecOS writes" $?
+  ! grep -q "\[EXC\]" "$M33LOG"; check "no CPU exception ([EXC]) during M33 csum-root boot" $?
+else
+  echo "[selftest] (skip M33 ext4 csum: e2fsck not installed)"
+fi
 
 # ---- M27a: JBD2 journal replay (crash recovery) ----
 M27LOG=/tmp/secos_selftest_m27.log

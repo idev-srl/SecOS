@@ -186,6 +186,8 @@ user-progs:
 	$(CC) $(USER_CFLAGS) -c user/note_driver.S -o user/note_driver.o
 	$(CC) $(USER_CFLAGS) -c user/libsecos.c   -o user/libsecos.o
 	$(CC) $(USER_CFLAGS) -c user/libc.c       -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/setjmp.S     -o user/setjmp.o
+	$(CC) $(USER_CFLAGS) -c user/libm.c        -o user/libm.o
 	$(CC) $(USER_CFLAGS) -c user/hello.c      -o user/hello.o
 	$(CC) $(USER_CFLAGS) -c user/drvprobe.c   -o user/drvprobe.o
 	$(CC) $(USER_CFLAGS) -c user/driver_demo.c -o user/driver_demo.o
@@ -305,6 +307,35 @@ user-progs:
 	python3 tools/secos-sign user/m30_sig.elf --dev
 	python3 tools/elf2h.py user/m30_sig.elf user_m30_sig_elf crypto/user_m30_sig_elf.h
 	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig -> crypto/*.h"
+
+# [M34] Port of lua 5.4.7 FROM SOURCE (third_party/lua), signed + embedded.
+# Compiles the lua core + the OS-independent standard libs (base/table/string/
+# math/coroutine/utf8) against the SecOS libc/libm/setjmp, links a freestanding
+# front-end (user/lua_main.c), signs it, and emits crypto/user_lua_elf.h. The
+# committed header lets the default kernel build without recompiling lua; run
+# this after changing the libc or the lua sources. Gate: M34_LUA_DEMO=1.
+LUASRC = third_party/lua/src
+LUA_UF = -ffreestanding -nostdlib -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 -w \
+         -Iuser -Iuser/include -I$(LUASRC) -ffunction-sections -fdata-sections -include user/lua_port.h
+LUA_CORE = lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
+           lstate lstring ltable ltm lundump lvm lzio lauxlib
+LUA_LIBS = lbaselib lcorolib lmathlib lstrlib ltablib lutf8lib
+.PHONY: port-lua
+port-lua:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S     -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note.S     -o user/note.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c     -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/libm.c     -o user/libm.o
+	$(CC) $(USER_CFLAGS) -c user/setjmp.S   -o user/setjmp.o
+	@mkdir -p user/luaobj
+	for f in $(LUA_CORE) $(LUA_LIBS); do $(CC) $(LUA_UF) -c $(LUASRC)/$$f.c -o user/luaobj/$$f.o || exit 1; done
+	$(CC) $(LUA_UF) -c user/lua_main.c -o user/luaobj/lua_main.o
+	$(LD) --gc-sections -T user/user.ld -o user/lua.elf \
+	  user/crt0.o user/note.o user/libsecos.o user/libc.o user/libm.o user/setjmp.o user/luaobj/*.o
+	python3 tools/secos-sign user/lua.elf --dev
+	python3 tools/elf2h.py user/lua.elf user_lua_elf crypto/user_lua_elf.h
+	@echo "port-lua: lua 5.4.7 built from source, signed -> crypto/user_lua_elf.h"
 
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke

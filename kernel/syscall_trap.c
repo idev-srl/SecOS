@@ -16,6 +16,7 @@
 #include "process.h"
 #include "signal.h"
 #include "debugcon.h"
+#include "kverbose.h"
 
 #ifdef SYSCALL_DEBUG
 #include "terminal.h"
@@ -28,12 +29,15 @@ uint64_t syscall_handler(trapframe_t* tf) {
     process_t* cur = sched_get_current();
     uint64_t num = tf->rax;
 
-    // [M7] Debugcon: log pid + syscall number
-    debugcon_writestring("[SYSCALL] pid=");
-    debugcon_print_hex(cur ? cur->pid : 0);
-    debugcon_writestring(" num=");
-    debugcon_print_hex(num);
-    debugcon_writestring("\n");
+    // [M7] Debugcon: log pid + syscall number (gated on verbosity since M34 so it
+    // doesn't interleave with ring-3 program output, e.g. the lua interpreter).
+    if (g_kverbose) {
+        debugcon_writestring("[SYSCALL] pid=");
+        debugcon_print_hex(cur ? cur->pid : 0);
+        debugcon_writestring(" num=");
+        debugcon_print_hex(num);
+        debugcon_writestring("\n");
+    }
 
 #ifdef SYSCALL_DEBUG
     {

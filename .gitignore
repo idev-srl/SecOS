@@ -25,3 +25,8 @@ __pycache__/
 *.vmdk
 uefi_loader.elf
 user/*.spkg
+
+# [M34] lua port build artifacts (source in third_party/lua is committed;
+# the signed embedded header crypto/user_lua_elf.h is committed)
+user/luaobj/
+user/lua.elf

@@ -1252,10 +1252,13 @@ int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
             const vma_t* vv = vma_find(&cur->vmas, fault_addr);
             if (vv && vma_fault_in(cur->space, vv, fault_addr) == 0) {
                 // Quiet success path (faults are frequent): a terse debugcon
-                // marker only, no framebuffer output.
-                debugcon_writestring("[PF] demand page ");
-                debugcon_print_hex(fault_addr & ~0xFFFULL);
-                debugcon_writestring("\n");
+                // marker only, gated on verbosity (M34: a real program like lua
+                // faults in hundreds of pages and would drown its own output).
+                if (g_kverbose) {
+                    debugcon_writestring("[PF] demand page ");
+                    debugcon_print_hex(fault_addr & ~0xFFFULL);
+                    debugcon_writestring("\n");
+                }
                 return 0; // retry the faulting access
             }
         }
