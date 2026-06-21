@@ -36,6 +36,12 @@ int ath9k_secos_bringup(volatile void* mmio, unsigned short devid){
     debugcon_writestring("[ath9k-port] S2 ath_hw allocated\n");
     g_ah = ah;
     ah->hw_version.devid = devid;
+    /* The upstream PCI probe layer (ath9k_init_softc, which we bypass) sets
+     * AH_USE_EEPROM so the AR9300 eeprom restore takes the EEPROM/OTP register
+     * path. Without it, ath9k_hw_use_flash() is true and the restore enters the
+     * flash path -> ath9k_hw_nvram_read() on a NULL blob -> fault. AR9565 is a
+     * PCI card with OTP, so set it. */
+    ah->ah_flags |= AH_USE_EEPROM;   /* 0x1 */
     ah->reg_ops.read        = sec_read;
     ah->reg_ops.write       = sec_write;
     ah->reg_ops.rmw         = sec_rmw;
