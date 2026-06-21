@@ -8,6 +8,10 @@
  */
 #include "hw.h"
 #include <linux/slab.h>
+#include <linux/delay.h>
+#include <linux/errno.h>
+#include "mac.h"
+#include "hw-ops.h"   /* static-inline ath9k_hw_rxena() etc. */
 
 extern void debugcon_writestring(const char*);
 extern void debugcon_print_hex(unsigned long);
@@ -98,4 +102,93 @@ int ath9k_secos_tune(int chan_num){
     debugcon_writestring("[ath9k-port] ath9k_hw_reset ret=");
     debugcon_print_hex((unsigned long)(long)r); debugcon_writestring("\n");
     return r;
+}
+
+/* ---------------------------------------------------------------------------
+ * RX scan (AR9300 EDMA). Sets the chip to receive on the current channel and
+ * polls the EDMA RX FIFO for 802.11 management frames (beacons / probe resp),
+ * extracting SSID + BSSID. This replaces the recv.c ring management (not ported)
+ * with a minimal poll loop. DMA buffer phys addrs come from the SecOS side.
+ * ------------------------------------------------------------------------- */
+#define ATH_NRXBUF   24
+#define ATH_RXBUF_SZ 2048
+static u8  g_rxpool[ATH_NRXBUF][ATH_RXBUF_SZ] __attribute__((aligned(256)));
+static int g_rx_idx;
+extern unsigned long ath9k_host_v2p(void* v);   /* SecOS kvirt_to_phys */
+
+static void rx_addbuf(int i){
+    unsigned long phys = ath9k_host_v2p(&g_rxpool[i][0]);
+    ath9k_hw_addrxbuf_edma(g_ah, (u32)phys, ATH9K_RX_QUEUE_LP);
+}
+
+static void prmac(const u8* m){
+    for(int i=0;i<6;i++){ static const char h[]="0123456789abcdef";
+        debugcon_putchar(h[(m[i]>>4)&0xF]); debugcon_putchar(h[m[i]&0xF]);
+        if(i<5) debugcon_putchar(':'); }
+}
+
+/* Parse a beacon/probe-resp; returns 1 if it was a mgmt beacon/probe-resp. */
+static int parse_beacon(const u8* f, int len, int rssi){
+    if (len < 36) return 0;
+    u8 fc0 = f[0];                          /* type=mgmt(00); subtype 8=beacon, 5=proberesp */
+    if (fc0 != 0x80 && fc0 != 0x50) return 0;
+    const u8* bssid = f + 16;
+    const u8* p = f + 36;                    /* 24 hdr + 12 fixed (ts/interval/caps) */
+    const u8* end = f + len;
+    char ssid[33]; int slen = 0; int chan = 0;
+    while (p + 2 <= end){
+        u8 tag = p[0], tlen = p[1]; const u8* val = p + 2;
+        if (val + tlen > end) break;
+        if (tag == 0 && slen == 0){ slen = tlen > 32 ? 32 : tlen; for(int k=0;k<slen;k++) ssid[k]=val[k]; }
+        else if (tag == 3 && tlen >= 1){ chan = val[0]; }   /* DS param: channel */
+        p = val + tlen;
+    }
+    ssid[slen] = 0;
+    debugcon_writestring("  SSID '"); debugcon_writestring(ssid);
+    debugcon_writestring("'  bssid "); prmac(bssid);
+    debugcon_writestring("  ch="); debugcon_print_hex((unsigned long)chan);
+    debugcon_writestring("  rssi="); debugcon_print_hex((unsigned long)(rssi & 0xff));
+    debugcon_writestring("\n");
+    return 1;
+}
+
+/* Listen on the current channel for ~2s, print beacons seen. Returns count. */
+int ath9k_secos_scan(void){
+    if (!g_ah) { debugcon_writestring("[ath9k-port] scan: run wifi up + wifi chan first\n"); return -1; }
+    struct ath_common* common = ath9k_hw_common(g_ah);
+    g_ah->opmode = NL80211_IFTYPE_STATION;
+    common->rx_bufsize = ATH_RXBUF_SZ;
+
+    debugcon_writestring("[ath9k-port] S: set_rx_bufsize\n");
+    ath9k_hw_set_rx_bufsize(g_ah, ATH_RXBUF_SZ - g_ah->caps.rx_status_len);
+    debugcon_writestring("[ath9k-port] S: rxena\n");
+    ath9k_hw_rxena(g_ah);
+    debugcon_writestring("[ath9k-port] S: addrxbuf\n");
+    g_rx_idx = 0;
+    for (int i = 0; i < ATH_NRXBUF; i++) rx_addbuf(i);
+    debugcon_writestring("[ath9k-port] S: setopmode\n");
+    ath9k_hw_setopmode(g_ah);
+    debugcon_writestring("[ath9k-port] S: setrxfilter\n");
+    ath9k_hw_setrxfilter(g_ah, ATH9K_RX_FILTER_UCAST | ATH9K_RX_FILTER_MCAST |
+                               ATH9K_RX_FILTER_BCAST | ATH9K_RX_FILTER_BEACON |
+                               ATH9K_RX_FILTER_PROM | ATH9K_RX_FILTER_PROBEREQ);
+    debugcon_writestring("[ath9k-port] S: startpcureceive\n");
+    ath9k_hw_startpcureceive(g_ah, 1);
+    debugcon_writestring("[ath9k-port] RX live, listening ~2s...\n");
+
+    int found = 0;
+    for (int spin = 0; spin < 40000 && found < 64; spin++){
+        struct ath_rx_status rxs;
+        u8* buf = &g_rxpool[g_rx_idx][0];
+        int ret = ath9k_hw_process_rxdesc_edma(g_ah, &rxs, buf);
+        if (ret == -EINPROGRESS){ udelay(50); continue; }   /* not filled yet */
+        if (ret == 0 && rxs.rs_status == 0 && rxs.rs_datalen >= 24){
+            found += parse_beacon(buf + g_ah->caps.rx_status_len, rxs.rs_datalen, rxs.rs_rssi);
+        }
+        rx_addbuf(g_rx_idx);                                /* recycle + advance */
+        g_rx_idx = (g_rx_idx + 1) % ATH_NRXBUF;
+    }
+    debugcon_writestring("[ath9k-port] scan done, frames matched=");
+    debugcon_print_hex((unsigned long)found); debugcon_writestring("\n");
+    return found;
 }

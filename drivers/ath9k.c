@@ -143,6 +143,18 @@ int ath9k_tune_channel(int chan) {
     return ath9k_secos_tune(chan);
 }
 
+/* [M39] Translate a kernel VA (RX DMA buffer in the ported driver) to a physical
+ * address for the AR9565 DMA engine. The buffers live in the ath9k_port .bss
+ * (higher-half); kvirt_to_phys resolves them. */
+unsigned long ath9k_host_v2p(void* v) { return kvirt_to_phys((uint64_t)v); }
+
+/* [M39] Scan: receive beacons on the current channel via the EDMA RX path. */
+int ath9k_scan(void) {
+    extern int ath9k_secos_scan(void);
+    if (!g_ath9k.present) return -1;
+    return ath9k_secos_scan();
+}
+
 /* [M39] Raw register read, exposed for the `wifi diag` shell dump (real-HW
  * bring-up is iterative and blind without QEMU — these reads from the ASUS guide
  * the next steps: OTP layout, PLL/clock state, PHY liveness). */

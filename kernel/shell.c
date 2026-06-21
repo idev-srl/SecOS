@@ -1062,6 +1062,15 @@ static void sh_wifi(const char* a){
         terminal_writestring(r==0 ? "  ✓ tuned\n" : "  (see [ath9k-port])\n");
         return;
     }
+    /* [M39] `wifi scan`: listen for beacons on the current channel (EDMA RX). */
+    if(a && a[0]=='s' && a[1]=='c' && a[2]=='a' && a[3]=='n'){
+        terminal_writestring("Scanning for beacons on current channel...\n");
+        extern int ath9k_scan(void);
+        int n = ath9k_scan();
+        terminal_writestring("  beacons matched: "); print_dec(n<0?0:n); terminal_writestring("\n");
+        if(n<=0) terminal_writestring("  (none — run 'wifi chan <n>' first; try chans 1/6/11)\n");
+        return;
+    }
     /* [M39] `wifi wake`: run the AR9300 power-on wake + RTC reset, then report
      * RTC_STATUS and whether the RTC/MAC/PHY blocks now respond (vs 0xDEADBEEF). */
     if(a && a[0]=='w' && a[1]=='a' && a[2]=='k' && a[3]=='e'){
