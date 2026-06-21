@@ -110,7 +110,9 @@ OBJS_C   = $(SRC_C:%.c=%.o)
 # [M29] AP startup trampoline: a flat binary (org 0x8000) wrapped into an object
 # so the kernel can copy it to low memory at runtime.
 AP_TRAMPOLINE = $(BOOT_DIR)/ap_trampoline.o
-OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE)
+# [secure-boot] kernel code-signing note (.note.secos, GAS-assembled .S)
+KERNEL_NOTE = $(BOOT_DIR)/kernel_note.o
+OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE)
 KERNEL  = kernel.bin
 ISO     = myos.iso
 ISODIR  = isodir
@@ -141,6 +143,10 @@ $(BOOT_DIR)/ap_trampoline.o: $(BOOT_DIR)/ap_trampoline.asm
 
 $(BOOT_DIR)/%.o: $(BOOT_DIR)/%.asm
 	$(AS) $(ASFLAGS) $< -o $@
+
+# [secure-boot] GAS-assembled kernel signing note (data only; minimal flags).
+$(BOOT_DIR)/kernel_note.o: $(BOOT_DIR)/kernel_note.S
+	$(CC) -c $< -o $@
 $(ARCH_DIR)/%.o: $(ARCH_DIR)/%.asm
 	$(AS) $(ASFLAGS) $< -o $@
 
@@ -163,6 +169,10 @@ $(NET_DIR)/%.o: $(NET_DIR)/%.c
 
 $(KERNEL): $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	@# [secure-boot] Sign kernel.bin in place (deterministic dev key → reproducible).
+	@# The UEFI loader Ed25519-verifies this before jumping. MB2/GRUB ignores the
+	@# note, so an unsigned kernel (no python3 cryptography) still boots via ISO/CI.
+	@python3 tools/secos-sign $@ --dev || echo "[secure-boot] WARNING: kernel signing skipped (need python3 'cryptography'); UEFI secure boot will REFUSE this kernel."
 
 # Create bootable ISO image
 iso: $(KERNEL)
@@ -469,24 +479,42 @@ tree:
 	@echo "C  : $(SRC_C)"
 
 # --- UEFI build (Strategy B: external bootloader) ---
-UEFI_SRC = uefi/boot.c uefi/elf_load.c
+# [secure-boot] The loader Ed25519-verifies the kernel before jumping. Enforced
+# by default; set SECURE_BOOT=0 to build a non-enforcing loader (e.g. to boot an
+# unsigned kernel during bring-up).
+SECURE_BOOT ?= 1
+UEFI_SRC = uefi/boot.c uefi/elf_load.c uefi/secure_boot.c
 UEFI_HELLO_SRC = uefi/hello.c
 UEFI_OBJS = $(UEFI_SRC:%.c=%.o)
+# Freestanding crypto compiled with the UEFI flags (distinct object names so they
+# never collide with the kernel's crypto/*.o).
+UEFI_CRYPTO_OBJS = uefi/u_sha256.o uefi/u_sha512.o uefi/u_ed25519.o
 UEFI_HELLO_OBJS = $(UEFI_HELLO_SRC:%.c=%.o)
 UEFI_HELLO_APP = $(EFI_BOOT_DIR)/HELLO.EFI
 UEFI_CFLAGS = -ffreestanding -fshort-wchar -O2 -mno-red-zone -m64 -fno-stack-protector -fPIE -fno-omit-frame-pointer -fno-asynchronous-unwind-tables -fno-unwind-tables -fcf-protection=none -mno-sse -mno-mmx $(INCLUDES) -DCONFIG_UEFI
+ifeq ($(SECURE_BOOT),1)
+UEFI_CFLAGS += -DSECOS_SECURE_BOOT
+endif
 UEFI_CRT0 = uefi/crt0.o
 
 uefi/%.o: uefi/%.c uefi/efi.h
 	$(CC) $(UEFI_CFLAGS) -c $< -o $@
 
+# [secure-boot] crypto for the loader (same sources as the kernel, UEFI flags).
+uefi/u_sha256.o: $(CRYPTO_DIR)/sha256.c
+	$(CC) $(UEFI_CFLAGS) -c $< -o $@
+uefi/u_sha512.o: $(CRYPTO_DIR)/sha512.c
+	$(CC) $(UEFI_CFLAGS) -c $< -o $@
+uefi/u_ed25519.o: $(CRYPTO_DIR)/ed25519.c
+	$(CC) $(UEFI_CFLAGS) -c $< -o $@
+
 uefi/crt0.o: uefi/crt0.s
 	$(CC) -c $< -o $@
 
-uefi: $(UEFI_CRT0) $(UEFI_OBJS)
+uefi: $(UEFI_CRT0) $(UEFI_OBJS) $(UEFI_CRYPTO_OBJS)
 	mkdir -p $(EFI_BOOT_DIR)
 	$(LD) -nostdlib -znocombreloc -shared -Bsymbolic -T /usr/lib/elf_x86_64_efi.lds \
-		-L /usr/lib $(UEFI_CRT0) $(UEFI_OBJS) -lgnuefi -lefi -o $(UEFI_LOADER_ELF)
+		-L /usr/lib $(UEFI_CRT0) $(UEFI_OBJS) $(UEFI_CRYPTO_OBJS) -lgnuefi -lefi -o $(UEFI_LOADER_ELF)
 	objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym -j .rel -j .rela -j .reloc --target=efi-app-x86_64 $(UEFI_LOADER_ELF) $(UEFI_APP)
 	python3 -c "import struct; f=open('$(UEFI_APP)','r+b'); f.seek(0x3c); pe=struct.unpack('<I',f.read(4))[0]; f.seek(pe+22); c=struct.unpack('<H',f.read(2))[0]; f.seek(pe+22); f.write(struct.pack('<H',c&~0x0001)); f.close(); print('PE Characteristics: 0x{:04x} -> 0x{:04x}'.format(c, c&~0x0001))"
 	@echo "✅ UEFI loader: $(UEFI_APP) ($(shell ls -lh $(UEFI_APP) | awk '{print $$5}'))"

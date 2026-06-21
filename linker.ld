@@ -47,6 +47,17 @@ SECTIONS
         _rodata_end = .;
     }
 
+    /* Code-signing note (QSEC manifest + QSIG signature). Its own SHT_NOTE
+     * section so ld emits a PT_NOTE phdr; page-aligned + R/NX at runtime
+     * (vmm_protect_kernel_sections). Excluded from the measured-boot hash,
+     * which covers only .text+.rodata. */
+    .note.secos ALIGN(4K) : AT(ADDR(.note.secos) - KERNEL_VMA) {
+        _note_start = .;
+        KEEP(*(.note.secos))
+        . = ALIGN(4K);
+        _note_end = .;
+    }
+
     .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_VMA) {
         _data_start = .;
         *(.data*)
@@ -62,4 +73,9 @@ SECTIONS
 
     /* High VMA end-of-kernel marker (the PMM converts it to physical). */
     _kernel_end = .;
+
+    /* Drop unwind/CFI tables: the freestanding kernel never unwinds, and an
+     * orphan-placed .eh_frame inside the LOAD segment would leave an
+     * unprotected (RWX) gap between sections — a W^X hole. */
+    /DISCARD/ : { *(.eh_frame) *(.eh_frame_hdr) *(.comment) *(.note.GNU-stack) }
 }

@@ -388,6 +388,15 @@ void vmm_protect_kernel_sections(void) {
     for (uint64_t v = align_down(ro_start); v < align_up_4k(ro_end); v += PAGE_SIZE) {
         set_page_flags(v, VMM_FLAG_RW, VMM_FLAG_NOEXEC); // remove RW, set NX
     }
+    // .note.secos (code-signing note): R, NX — same as rodata, no executable gap.
+    {
+        extern uint8_t _note_start, _note_end;
+        uint64_t note_start = (uint64_t)&_note_start;
+        uint64_t note_end   = (uint64_t)&_note_end;
+        for (uint64_t v = align_down(note_start); v < align_up_4k(note_end); v += PAGE_SIZE) {
+            set_page_flags(v, VMM_FLAG_RW, VMM_FLAG_NOEXEC);
+        }
+    }
     // Data + BSS: RW, NX
     for (uint64_t v = align_down(data_start); v < align_up_4k(data_end); v += PAGE_SIZE) {
         set_page_flags(v, VMM_FLAG_NOEXEC, VMM_FLAG_NOEXEC | VMM_FLAG_RW); // enforce NX & RW

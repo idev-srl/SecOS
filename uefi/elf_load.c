@@ -103,8 +103,11 @@ static EFI_STATUS read_file_into_buffer(EFI_SYSTEM_TABLE* st, const CHAR16* name
     EFI_FILE_PROTOCOL* file = NULL;
     status = root->Open(root, &file, name, EFI_FILE_MODE_READ, 0);
     if (status != EFI_SUCCESS || !file) { if(root) root->Close(root); return EFI_ERR(4); }
-    // Read loop: start with an estimate. We attempt doubling strategy.
-    uint64_t alloc_size = 1024*1024; // 1MB initial guess
+    // Read the whole file into one buffer. 16 MB is comfortably above any kernel
+    // size (secure boot needs the EXACT file bytes; a truncated read would fail
+    // the signature, which is the safe direction). file->Read returns the actual
+    // byte count in read_size, so file_len is exact when the buffer is big enough.
+    uint64_t alloc_size = 16*1024*1024; // 16MB
     uint8_t* buffer = NULL;
     status = st->BootServices->AllocatePool(EFI_LOADER_DATA, alloc_size, (void**)&buffer);
     if (status != EFI_SUCCESS) { file->Close(file); root->Close(root); return EFI_ERR(5); }
@@ -123,6 +126,21 @@ EFI_STATUS elf_load_kernel(EFI_SYSTEM_TABLE* SystemTable, void** entry_out) {
     EFI_STATUS status = read_file_into_buffer(SystemTable, (const CHAR16*)L"kernel.elf", &file_buf, &file_len);
     if (status != EFI_SUCCESS) return status;
     if (file_len < sizeof(elf64_ehdr_t)) return EFI_ERR(7);
+#ifdef SECOS_SECURE_BOOT
+    /* Full secure boot: Ed25519-verify the whole kernel image before we even
+     * parse it. A tampered/unsigned kernel is refused here — never loaded, never
+     * jumped to. */
+    {
+        extern int secure_boot_verify(const uint8_t*, uint64_t);
+        if (!secure_boot_verify(file_buf, file_len)) {
+            SystemTable->ConOut->OutputString(SystemTable->ConOut,
+                WIDE("[SECURE BOOT] kernel signature INVALID - refusing to boot\r\n"));
+            return EFI_ERR(20);
+        }
+        SystemTable->ConOut->OutputString(SystemTable->ConOut,
+            WIDE("[SECURE BOOT] kernel signature OK\r\n"));
+    }
+#endif
     elf64_ehdr_t* eh = (elf64_ehdr_t*)file_buf;
     if (eh->e_magic != ELF_MAGIC || eh->e_class != 2 || eh->e_machine != 0x3E) return EFI_ERR(8);
     if (eh->e_phentsize != sizeof(elf64_phdr_t)) return EFI_ERR(9);
