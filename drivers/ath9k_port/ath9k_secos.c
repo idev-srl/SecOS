@@ -117,9 +117,14 @@ static int g_rx_idx;
 extern unsigned long ath9k_host_v2p(void* v);   /* SecOS kvirt_to_phys */
 
 static void rx_addbuf(int i){
+    /* Clear the status region so AR_RxDone is 0 until the hw fills it again
+     * (else a recycled buffer reads stale-done and we reprocess garbage). */
+    for (int k = 0; k < 64; k++) g_rxpool[i][k] = 0;
     unsigned long phys = ath9k_host_v2p(&g_rxpool[i][0]);
     ath9k_hw_addrxbuf_edma(g_ah, (u32)phys, ATH9K_RX_QUEUE_LP);
 }
+
+static unsigned g_rx_frames;   /* total descriptors completed (any frame heard) */
 
 static void prmac(const u8* m){
     for(int i=0;i<6;i++){ static const char h[]="0123456789abcdef";
@@ -188,20 +193,42 @@ static void rx_poll_collect(int dwell_ms){
         u8* buf = &g_rxpool[g_rx_idx][0];
         int ret = ath9k_hw_process_rxdesc_edma(g_ah, &rxs, buf);
         if (ret == -EINPROGRESS){ udelay(50); continue; }
-        if (ret == 0 && rxs.rs_status == 0 && rxs.rs_datalen >= 24)
-            collect_beacon(buf + g_ah->caps.rx_status_len, rxs.rs_datalen, rxs.rs_rssi);
+        if (ret == 0){ g_rx_frames++;
+            if (rxs.rs_status == 0 && rxs.rs_datalen >= 24)
+                collect_beacon(buf + g_ah->caps.rx_status_len, rxs.rs_datalen, rxs.rs_rssi);
+        }
         rx_addbuf(g_rx_idx);
         g_rx_idx = (g_rx_idx + 1) % ATH_NRXBUF;
     }
 }
 
-/* Listen on the current channel ~3s; print a concise AP summary. Returns count. */
+/* Quiet channel tune (no per-step prints) used by the sweep. */
+static int tune_quiet(int chan_num){
+    if (chan_num < 1 || chan_num > 14) chan_num = 1;
+    int freq = (chan_num == 14) ? 2484 : (2407 + chan_num * 5);
+    g_iec.band = NL80211_BAND_2GHZ; g_iec.center_freq = freq; g_iec.hw_value = chan_num;
+    g_chan.chan = &g_iec; g_chan.channel = freq; g_chan.channelFlags = 0;
+    g_ah->curchan = &g_chan;
+    return ath9k_hw_reset(g_ah, &g_chan, &g_caldata, 0);
+}
+
+/* Sweep channels 1..13 (re-tune + listen ~400ms each); concise summary.
+ * Reports total frames heard (the key RX-health number) + the AP table. */
 int ath9k_secos_scan(void){
-    if (!g_ah) { debugcon_writestring("[wifi] run 'wifi up' + 'wifi chan <n>' first\n"); return -1; }
-    g_nap = 0;
-    rx_bring_up();
-    rx_poll_collect(3000);
-    debugcon_writestring("[wifi] networks found: "); debugcon_print_hex((unsigned long)g_nap); debugcon_writestring("\n");
+    if (!g_ah) { debugcon_writestring("[wifi] run 'wifi up' first\n"); return -1; }
+    struct ath_common* common = ath9k_hw_common(g_ah);
+    common->debug_mask = 0;                 /* silence the per-channel reset spam */
+    g_nap = 0; g_rx_frames = 0;
+    debugcon_writestring("[wifi] scanning channels 1-13");
+    for (int ch = 1; ch <= 13; ch++){
+        if (tune_quiet(ch) != 0) continue;  /* tune to channel */
+        rx_bring_up();
+        udelay(15000);                      /* let NF cal settle after reset */
+        rx_poll_collect(400);
+        debugcon_putchar('.');
+    }
+    debugcon_writestring("\n[wifi] heard "); debugcon_print_hex(g_rx_frames);
+    debugcon_writestring(" frames, networks: "); debugcon_print_hex((unsigned long)g_nap); debugcon_writestring("\n");
     for (int i = 0; i < g_nap; i++){
         debugcon_writestring("  "); prmac(g_aps[i].bssid);
         debugcon_writestring(g_aps[i].privacy ? " [WPA] " : " [open] ");
