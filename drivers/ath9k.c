@@ -136,6 +136,13 @@ int ath9k_full_bringup(void) {
     return ath9k_secos_bringup(g_ath9k.mmio, g_ath9k.device);
 }
 
+/* [M39] Tune the radio to a 2.4GHz channel via the upstream ath9k_hw_reset. */
+int ath9k_tune_channel(int chan) {
+    extern int ath9k_secos_tune(int);
+    if (!g_ath9k.present) return -1;
+    return ath9k_secos_tune(chan);
+}
+
 /* [M39] Raw register read, exposed for the `wifi diag` shell dump (real-HW
  * bring-up is iterative and blind without QEMU — these reads from the ASUS guide
  * the next steps: OTP layout, PLL/clock state, PHY liveness). */

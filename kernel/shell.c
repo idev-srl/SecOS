@@ -1050,6 +1050,18 @@ static void sh_wifi(const char* a){
         terminal_writestring("  Now run 'wifi diag' — PHY@a000 should be a live configured value.\n");
         return;
     }
+    /* [M39] `wifi chan <n>`: tune the radio to a 2.4GHz channel (1..14) via the
+     * upstream ath9k_hw_reset (full PHY/RF reset + per-channel calibration). */
+    if(a && a[0]=='c' && a[1]=='h' && a[2]=='a' && a[3]=='n'){
+        int ch = 1; const char* p = a+4; while(*p==' ') p++;
+        if(*p>='0'&&*p<='9'){ ch=0; while(*p>='0'&&*p<='9'){ ch=ch*10+(*p-'0'); p++; } }
+        terminal_writestring("Tuning radio to channel "); print_dec(ch); terminal_writestring(" (ath9k_hw_reset)...\n");
+        extern int ath9k_tune_channel(int);
+        int r = ath9k_tune_channel(ch);
+        terminal_writestring("  ath9k_hw_reset returned "); prhex((uint32_t)r,8);
+        terminal_writestring(r==0 ? "  ✓ tuned\n" : "  (see [ath9k-port])\n");
+        return;
+    }
     /* [M39] `wifi wake`: run the AR9300 power-on wake + RTC reset, then report
      * RTC_STATUS and whether the RTC/MAC/PHY blocks now respond (vs 0xDEADBEEF). */
     if(a && a[0]=='w' && a[1]=='a' && a[2]=='k' && a[3]=='e'){

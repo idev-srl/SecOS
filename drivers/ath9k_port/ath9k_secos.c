@@ -75,3 +75,27 @@ int ath9k_secos_bringup(volatile void* mmio, unsigned short devid){
 
 /* Probe a few PHY/MAC registers after init so the shell can show the chip state. */
 unsigned int ath9k_secos_reg(unsigned int off){ return g_mmio ? *(volatile u32*)(g_mmio + off) : 0; }
+
+/* Tune the radio to a 2.4GHz channel via the upstream ath9k_hw_reset (full PHY/RF
+ * reset + per-channel calibration). chan_num = 1..14. Returns ath9k_hw_reset's
+ * status. This is the step that actually powers the RF onto a frequency. */
+/* ath9k_hw_reset is declared in hw.h (included above). */
+static struct ieee80211_channel g_iec;
+static struct ath9k_channel     g_chan;
+static struct ath9k_hw_cal_data g_caldata;
+
+int ath9k_secos_tune(int chan_num){
+    if (!g_ah) { debugcon_writestring("[ath9k-port] tune: chip not initialized (run wifi up)\n"); return -1; }
+    if (chan_num < 1 || chan_num > 14) chan_num = 1;
+    int freq = (chan_num == 14) ? 2484 : (2407 + chan_num * 5);
+    g_iec.band = NL80211_BAND_2GHZ; g_iec.center_freq = freq; g_iec.hw_value = chan_num;
+    g_chan.chan = &g_iec; g_chan.channel = freq; g_chan.channelFlags = 0; /* 2GHz, 20MHz */
+    g_ah->curchan = &g_chan;
+    debugcon_writestring("[ath9k-port] T0 ath9k_hw_reset ch=");
+    debugcon_print_hex((unsigned long)chan_num);
+    debugcon_writestring(" freq="); debugcon_print_hex((unsigned long)freq); debugcon_writestring("...\n");
+    int r = ath9k_hw_reset(g_ah, &g_chan, &g_caldata, 0);
+    debugcon_writestring("[ath9k-port] ath9k_hw_reset ret=");
+    debugcon_print_hex((unsigned long)(long)r); debugcon_writestring("\n");
+    return r;
+}
