@@ -121,7 +121,11 @@ unsigned long strlen(const char* s){ unsigned long n=0; while(s[n])n++; return n
  * on REAL hardware where port 0xE9 goes nowhere. --- */
 extern void terminal_putchar(char c);          /* on-screen console */
 extern void terminal_writestring(const char* s);
+extern void fb_console_flush(void);            /* present the back buffer NOW */
 static void e9(char c){ __asm__ volatile("outb %0, %1" :: "a"((unsigned char)c), "Nd"((unsigned short)0xE9)); }
-void debugcon_putchar(char c){ e9(c); terminal_putchar(c); }
-void debugcon_writestring(const char* s){ for(const char* p=s; *p; p++) e9(*p); terminal_writestring(s); }
+/* Force a flush after every char: ath9k_hw_init is one long call that crashes
+ * WITHOUT returning to the shell loop, so the double buffer would otherwise
+ * never be presented and the narration would be invisible on real HW. */
+void debugcon_putchar(char c){ e9(c); terminal_putchar(c); fb_console_flush(); }
+void debugcon_writestring(const char* s){ for(const char* p=s; *p; p++) e9(*p); terminal_writestring(s); fb_console_flush(); }
 void debugcon_print_hex(unsigned long v){ static const char h[]="0123456789ABCDEF"; char b[19]; b[0]='0'; b[1]='x'; for(int i=0;i<16;i++) b[2+i]=h[(v>>((15-i)*4))&0xF]; b[18]=0; debugcon_writestring(b); }

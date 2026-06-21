@@ -28,9 +28,12 @@ static struct ath_hw* g_ah;
 /* Run the upstream ath9k_hw bring-up against the live chip. mmio = mapped BAR0,
  * devid = PCI device id (0x0036 for AR9565). Returns ath9k_hw_init's status. */
 int ath9k_secos_bringup(volatile void* mmio, unsigned short devid){
+    debugcon_writestring("[ath9k-port] S0 enter bringup\n");
     g_mmio = (volatile u8*)mmio;
+    debugcon_writestring("[ath9k-port] S1 kzalloc ath_hw...\n");
     struct ath_hw* ah = kzalloc(sizeof(*ah), 0);
     if (!ah) { debugcon_writestring("[ath9k-port] ah alloc fail\n"); return -12; }
+    debugcon_writestring("[ath9k-port] S2 ath_hw allocated\n");
     g_ah = ah;
     ah->hw_version.devid = devid;
     ah->reg_ops.read        = sec_read;
@@ -47,7 +50,7 @@ int ath9k_secos_bringup(volatile void* mmio, unsigned short devid){
     common->ah = ah;
     common->debug_mask = 0xffffffff;   /* narrate the bring-up on debugcon */
 
-    debugcon_writestring("[ath9k-port] calling ath9k_hw_init (upstream driver)...\n");
+    debugcon_writestring("[ath9k-port] S3 calling ath9k_hw_init (upstream driver)...\n");
     int ret = ath9k_hw_init(ah);
     debugcon_writestring("[ath9k-port] ath9k_hw_init ret=");
     debugcon_print_hex((unsigned long)(long)ret);
