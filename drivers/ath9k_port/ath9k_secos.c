@@ -273,7 +273,6 @@ static int tune_quiet(int chan_num){
     int r = ath9k_hw_reset(g_ah, &g_chan, &g_caldata, 0);
     if (r == 0){
         ath9k_hw_setpower(g_ah, ATH9K_PM_AWAKE);
-        ath9k_hw_set_bt_ant_diversity(g_ah, 1);  /* configure AR9565 LNA diversity from eeprom */
         complete_cal();
         ath9k_ani_reset(g_ah, 0);   /* set sensitive default weak-signal thresholds */
     }
