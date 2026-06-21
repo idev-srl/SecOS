@@ -370,6 +370,19 @@ port-lua:
 	python3 tools/elf2h.py user/lua.elf user_lua_elf crypto/user_lua_elf.h
 	@echo "port-lua: lua 5.4.7 built from source, signed -> crypto/user_lua_elf.h"
 
+# [M39] GNU bash 5.2 from source. Builds the SecOS user objects, then runs
+# tools/port-bash.sh (fetch + native-build-to-generate-sources + cross-compile +
+# link + sign + embed). Needs network (first run) + python3 'cryptography'.
+.PHONY: port-bash
+port-bash:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S     -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note.S     -o user/note.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c     -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/libm.c     -o user/libm.o
+	bash tools/port-bash.sh
+	@echo "port-bash: GNU bash 5.2 built from source, signed -> crypto/user_bash_elf.h"
+
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke
 # tests; attach with -drive file=$(DISK_IMG),if=virtio,format=raw.

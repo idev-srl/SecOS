@@ -54,7 +54,8 @@ ssize_t read(int fd, void* buf, size_t len) {
 int open(const char* path, int flags) { return (int)secos_syscall(4 /*SYS_OPEN*/, (long)path, flags, 0, 0, 0); }
 int close(int fd) { return (int)secos_syscall(5 /*SYS_CLOSE*/, fd, 0, 0, 0, 0); }
 long lseek(int fd, long offset, int whence) { return secos_syscall(19 /*SYS_LSEEK*/, fd, offset, whence, 0, 0); }
-int stat(const char* path, struct stat* st) { return (int)secos_syscall(20 /*SYS_STAT*/, (long)path, (long)st, 0, 0, 0); }
+static void stzero(struct stat* st){ char* p=(char*)st; for(unsigned i=0;i<sizeof(*st);i++) p[i]=0; }
+int stat(const char* path, struct stat* st) { if(st) stzero(st); return (int)secos_syscall(20 /*SYS_STAT*/, (long)path, (long)st, 0, 0, 0); }
 void _exit(int code) { secos_syscall(SYS_EXIT, code, 0, 0, 0, 0); for (;;) {} }
 int  getpid(void)    { return (int)secos_syscall(SYS_GETPID, 0, 0, 0, 0, 0); }
 void sched_yield(void){ secos_syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
@@ -117,7 +118,7 @@ int fork(void){ return (int)secos_syscall(SYS_FORK, 0, 0, 0, 0, 0); }
 int pipe(int fds[2]){ return (int)secos_syscall(31 /*SYS_PIPE*/, (long)fds, 0, 0, 0, 0); }
 
 /* [M26] VFS maturity: metadata + symlinks. */
-int lstat(const char* path, struct stat* st){ return (int)secos_syscall(37 /*SYS_LSTAT*/, (long)path, (long)st, 0, 0, 0); }
+int lstat(const char* path, struct stat* st){ if(st) stzero(st); return (int)secos_syscall(37 /*SYS_LSTAT*/, (long)path, (long)st, 0, 0, 0); }
 int chmod(const char* path, unsigned mode){ return (int)secos_syscall(32 /*SYS_CHMOD*/, (long)path, (long)mode, 0, 0, 0); }
 int chown(const char* path, unsigned uid, unsigned gid){ return (int)secos_syscall(33 /*SYS_CHOWN*/, (long)path, (long)uid, (long)gid, 0, 0); }
 int utimes(const char* path, unsigned long atime, unsigned long mtime){ return (int)secos_syscall(34 /*SYS_UTIMES*/, (long)path, (long)atime, (long)mtime, 0, 0); }

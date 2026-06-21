@@ -12,7 +12,9 @@ long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4);
 /* POSIX-ish wrappers */
 ssize_t write(int fd, const void* buf, size_t len);
 ssize_t read(int fd, void* buf, size_t len);
+#ifndef SECOS_BASH_PORT
 int     open(const char* path, int flags);
+#endif
 int     close(int fd);
 /* [M23/M26] file positioning + stat. Layout mirrors struct secos_stat. */
 struct stat {
@@ -21,6 +23,11 @@ struct stat {
     unsigned st_nlink;
     unsigned st_uid, st_gid;
     unsigned long st_atime, st_mtime, st_ctime;
+    /* [M39] POSIX fields the kernel doesn't fill yet (stat() zeroes them). Present
+     * so source ports (bash, …) that reference st_dev/st_ino/st_blocks compile;
+     * same-file detection via st_dev+st_ino degrades to "all distinct". */
+    unsigned long st_dev, st_ino, st_rdev;
+    long st_blksize, st_blocks;
 };
 #define S_IFMT  0xF000
 #define S_IFREG 0x8000
@@ -56,7 +63,9 @@ long    msg_recv(int chan, void* buf, long len);         /* blocks if empty (M17
 
 /* [M16] process control */
 int     spawn(const char* path, char* const argv[]);     /* signed child + argv -> pid, or <0 */
+#ifndef SECOS_BASH_PORT
 int     waitpid(int pid);                                /* block until child exits -> status */
+#endif
 /* [M17] blocking sleep */
 void    sleep_ticks(unsigned ticks);
 
