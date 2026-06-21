@@ -129,3 +129,38 @@ const ath9k_dev_t* ath9k_get(void) { return g_ath9k.present ? &g_ath9k : 0; }
  * bring-up is iterative and blind without QEMU — these reads from the ASUS guide
  * the next steps: OTP layout, PLL/clock state, PHY liveness). */
 uint32_t ath9k_reg_read(uint32_t off) { return g_ath9k.present ? rd(off) : 0xFFFFFFFFu; }
+
+static void ath9k_udelay(int us) { for (volatile int i = 0; i < us * 300; i++) { } }
+
+/* [M39] AR9300 power-on wake + RTC reset. On the ASUS the chip wakes only in the
+ * always-on domain (SREV/OTP respond) while RTC/MAC/PHY read 0xDEADBEEF (clock
+ * gated). This runs the documented ath9k power-on sequence: force-wake, then
+ * toggle the RTC out of reset, then poll RTC_STATUS for ON. Returns the final
+ * RTC_STATUS (caller checks the ON bit). Low-risk: the chip is non-functional
+ * until this succeeds anyway. */
+#define AR_RTC_FORCE_WAKE_ON_INT_BIT 0x00000002
+uint32_t ath9k_wake_reset(void) {
+    /* 1. Force the chip awake (keep it awake across the reset). */
+    wr(AR_RTC_FORCE_WAKE, AR_RTC_FORCE_WAKE_EN | AR_RTC_FORCE_WAKE_ON_INT);
+    ath9k_udelay(10);
+    /* 2. Power-on reset the RTC: drop then raise AR_RTC_RESET. */
+    wr(AR_RTC_RESET, 0);
+    ath9k_udelay(2);
+    wr(AR_RTC_RESET, 1);
+    /* 3. Poll RTC_STATUS for the ON state (bit 1 of the low nibble). */
+    uint32_t st = 0;
+    for (int i = 0; i < 2000; i++) {
+        st = rd(AR_RTC_STATUS);
+        if ((st & AR_RTC_STATUS_M) == AR_RTC_STATUS_ON) break;
+        ath9k_udelay(10);
+    }
+    /* Re-assert force-wake (some chips clear it across reset). */
+    wr(AR_RTC_FORCE_WAKE, AR_RTC_FORCE_WAKE_EN | AR_RTC_FORCE_WAKE_ON_INT);
+    ath9k_udelay(10);
+    /* Refresh the cached SREV/MAC now that the MAC block may respond. */
+    g_ath9k.srev = rd(AR_SREV);
+    uint32_t id0 = rd(AR_STA_ID0), id1 = rd(AR_STA_ID1);
+    g_ath9k.mac[0]=id0&0xff; g_ath9k.mac[1]=(id0>>8)&0xff; g_ath9k.mac[2]=(id0>>16)&0xff;
+    g_ath9k.mac[3]=(id0>>24)&0xff; g_ath9k.mac[4]=id1&0xff; g_ath9k.mac[5]=(id1>>8)&0xff;
+    return st;
+}

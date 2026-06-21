@@ -1039,6 +1039,24 @@ static void sh_wifi(const char* a){
     if(!w){ terminal_writestring("wifi: no Atheros AR9300-family adapter found\n");
             terminal_writestring("  (QEMU has no such device; on the ASUS E406S this is the AR9565 168c:0036)\n");
             return; }
+    /* [M39] `wifi wake`: run the AR9300 power-on wake + RTC reset, then report
+     * RTC_STATUS and whether the RTC/MAC/PHY blocks now respond (vs 0xDEADBEEF). */
+    if(a && a[0]=='w' && a[1]=='a' && a[2]=='k' && a[3]=='e'){
+        terminal_writestring("AR9565 wake+reset...\n");
+        uint32_t st = ath9k_wake_reset();
+        terminal_writestring("  RTC_STATUS="); prhex(st,8);
+        terminal_writestring(((st & 0xf) == 0x2) ? "  ON\n" : "  (not ON yet)\n");
+        struct { const char* n; uint32_t off; } regs[] = {
+            {"RTC_RC  ",0x7000},{"PLL_CTRL",0x7014},{"STA_ID0 ",0x8000},
+            {"STA_ID1 ",0x8004},{"PHY@a000",0xa000},{0,0}};
+        for(int i=0;regs[i].n;i++){ terminal_writestring("  "); terminal_writestring(regs[i].n);
+            terminal_writestring("="); prhex(ath9k_reg_read(regs[i].off),8);
+            terminal_writestring(ath9k_reg_read(regs[i].off)==0xDEADBEEFu?"  (still gated)\n":"  (responds!)\n"); }
+        terminal_writestring("  MAC=");
+        for(int i=0;i<6;i++){ prhex(w->mac[i],2); if(i<5) terminal_writestring(":"); }
+        terminal_writestring("\n  -> report this; if blocks 'respond' we proceed to INI/PHY.\n");
+        return;
+    }
     /* [M39] `wifi diag`: dump the live AR9565 registers + OTP so the real-HW
      * radio bring-up (un-testable in QEMU) can proceed from actual chip data. */
     if(a && a[0]=='d' && a[1]=='i' && a[2]=='a' && a[3]=='g'){
