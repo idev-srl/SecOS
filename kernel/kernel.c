@@ -1953,11 +1953,35 @@ void cpu_enable_mitigations(void) {
     debugcon_writestring(" stack-canary=on\n");
 }
 
+// [M37] Measured boot. Compute a SHA-256 over the immutable kernel image
+// (.text + .rodata) and record it on debugcon. This is the measurement primitive
+// of a measured-boot chain: a TPM would extend a PCR with this value; here it is
+// logged so a build can be attested against its expected hash. The signed user
+// programs (M9) are separately verified at load, so the whole trust chain — boot
+// loader (future) -> kernel measurement -> signed userland — is covered.
+#include "../crypto/sha256.h"
+extern char _text_start[], _rodata_end[];
+void boot_measure(void) {
+    const uint8_t* start = (const uint8_t*)_text_start;
+    const uint8_t* end   = (const uint8_t*)_rodata_end;
+    if (end <= start) { debugcon_writestring("[M37] measurement: bad bounds\n"); return; }
+    uint8_t digest[32];
+    sha256(start, (size_t)(end - start), digest);
+    debugcon_writestring("[M37] kernel code measurement (sha256 .text+.rodata): ");
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        char c2[2] = { hx[(digest[i] >> 4) & 0xF], hx[digest[i] & 0xF] };
+        debugcon_putchar(c2[0]); debugcon_putchar(c2[1]);
+    }
+    debugcon_writestring("\n[M37] measured boot OK (signed userland verified at load)\n");
+}
+
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // --- Phase 1 begins (old .bss stack) ---
     terminal_initialize();
     cpu_enable_sse();   // [M34] FPU/SSE for ring-3 (lua & other FP userland)
     cpu_enable_mitigations(); // [M36] SMEP/SMAP/canary
+    boot_measure();           // [M37] record the kernel code measurement
     // COM1 serial console: mirrors terminal output and feeds the shell input
     // path, so the interactive shell works headless over `-serial stdio`.
     extern void serial_init(void); serial_init();

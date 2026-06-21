@@ -20,7 +20,12 @@ NET_DIR    = net
 INCLUDES = -I. -I$(BOOT_DIR) -I$(ARCH_DIR) -I$(KERNEL_DIR) -I$(DRIVERS_DIR) -I$(MM_DIR) -I$(LIB_DIR) -I$(FS_DIR) -I$(CRYPTO_DIR) -I$(NET_DIR)
 
 ASFLAGS = -f elf64
-BUILD_TS := $(shell date -u +%Y%m%d%H%M%S)
+# [M37] Reproducible builds: BUILD_TS is derived from SOURCE_DATE_EPOCH when set
+# (the reproducible-builds.org standard), so the same source tree yields a
+# byte-identical kernel.bin (the measured-boot hash is then stable). Falls back to
+# the current UTC time for ordinary dev builds.
+#   make iso SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)   # reproducible
+BUILD_TS := $(shell if [ -n "$$SOURCE_DATE_EPOCH" ]; then date -u -d @$$SOURCE_DATE_EPOCH +%Y%m%d%H%M%S; else date -u +%Y%m%d%H%M%S; fi)
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo NOHASH)
 # Nota: CONFIG_MULTIBOOT e CONFIG_UEFI sono ora definiti in config.h (dual-boot support)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
