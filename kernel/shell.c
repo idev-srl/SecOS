@@ -143,6 +143,7 @@ static void sh_ext2mount(const char* a);
 static void sh_blk(const char* a); static void sh_mountdev(const char* a);
 static void sh_lspci(const char* a); static void sh_usbinfo(const char* a); static void sh_usbrescan(const char* a);
 static void sh_audit(const char* a);   // [M35] capability audit log
+static void sh_wifi(const char* a);     // [M38] ath9k WiFi status
 // [M23] POSIX-style commands over the VFS (with a real working directory).
 static void sh_cd(const char* a); static void sh_pwd(const char* a); static void sh_ls(const char* a);
 static void sh_cat(const char* a); static void sh_touch(const char* a); static void sh_mkdir(const char* a);
@@ -228,6 +229,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"usbinfo",   sh_usbinfo,   "xHCI controller + port status"},
     {"usbrescan", sh_usbrescan, "re-enumerate USB + rescan partitions"},
     {"netinfo",   sh_netinfo,   "network status"},
+    {"wifi",      sh_wifi,      "Atheros ath9k WiFi status [M38]"},
     {"ping",      sh_ping,      "ping a host"},
     {"dhcp",      sh_dhcp,      "acquire an IP via DHCP"},
     {"nslookup",  sh_nslookup,  "resolve a hostname"},
@@ -1028,6 +1030,24 @@ static void sh_audit(const char* a){ (void)a;
         terminal_writestring(" ("); terminal_writestring(recs[i].name); terminal_writestring(")\n");
     }
     if(n==0) terminal_writestring("  (empty — no confined process has run)\n");
+}
+
+// [M38] wifi: report the Atheros ath9k (AR9300 family) WiFi scaffold status.
+#include "../drivers/ath9k.h"
+static void sh_wifi(const char* a){ (void)a;
+    const ath9k_dev_t* w = ath9k_get();
+    if(!w){ terminal_writestring("wifi: no Atheros AR9300-family adapter found\n");
+            terminal_writestring("  (QEMU has no such device; on the ASUS E406S this is the AR9565 168c:0036)\n");
+            return; }
+    terminal_writestring("WiFi adapter: "); terminal_writestring(w->chip);
+    terminal_writestring(" (168c:"); prhex(w->device,4); terminal_writestring(")\n");
+    terminal_writestring("  BAR0="); prhex(w->mmio_phys,8);
+    terminal_writestring("  AR_SREV="); prhex(w->srev,8);
+    terminal_writestring(w->awake ? "  (chip responds)\n" : "  (no response)\n");
+    terminal_writestring("  MAC=");
+    for(int i=0;i<6;i++){ prhex(w->mac[i],2); if(i<5) terminal_writestring(":"); }
+    terminal_writestring("\n  status: identify+map OK; association/WPA2 = real-HW TODO (M38).\n");
+    terminal_writestring("  WPA2 crypto (PBKDF2 PMK + AES-CCM) is implemented and KAT-tested.\n");
 }
 
 // usbinfo: report what the xHCI driver saw — controller presence, root ports, how

@@ -85,8 +85,11 @@ SRC_C   = \
 	$(FS_DIR)/sysfs.c \
 	$(CRYPTO_DIR)/sha256.c \
 	$(CRYPTO_DIR)/sha512.c \
+	$(CRYPTO_DIR)/sha1.c \
+	$(CRYPTO_DIR)/wpa2.c \
 	$(CRYPTO_DIR)/ed25519.c \
 	$(CRYPTO_DIR)/crypto_selftest.c \
+	$(DRIVERS_DIR)/ath9k.c \
 	$(DRIVERS_DIR)/e1000.c \
 	$(DRIVERS_DIR)/e1000e.c \
 	$(DRIVERS_DIR)/vmxnet3.c \

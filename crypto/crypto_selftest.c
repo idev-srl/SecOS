@@ -107,6 +107,12 @@ int crypto_selftest(void) {
                         elf_signature_verify(buf, signed_test_elf_len) == ELF_SIG_BAD);
     }
 
+    /* [M38] WPA2-PSK crypto KAT (PBKDF2 IEEE 802.11i PMK + FIPS-197 AES-128). */
+    {
+        extern int wpa2_selftest(void);
+        fails += report("WPA2 PBKDF2+AES KAT", wpa2_selftest() == 1);
+    }
+
     debugcon_writestring(fails ? "[CRYPTO] --- FAIL ---\n" : "[CRYPTO] --- all PASS ---\n");
     return fails;
 }

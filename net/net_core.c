@@ -189,7 +189,12 @@ int net_init(void) {
     e1000e_init();
     vmxnet3_init();
     igc_init();
-    if (g_ndev == 0) { debugcon_writestring("[NET] no NIC found\n"); return 0; }
+    /* [M38] Probe the Atheros AR9300-family WiFi (AR9565 on the ASUS E406S). The
+     * scaffold identifies the chip + maps its registers; it does not yet present
+     * an Ethernet net_dev (that needs association), so it never becomes primary. */
+    extern int ath9k_init(void);
+    ath9k_init();
+    if (g_ndev == 0) { debugcon_writestring("[NET] no Ethernet NIC found (WiFi-only systems use the ath9k scaffold)\n"); return 0; }
 
     // [M24] Static IPv4 config for the primary NIC — QEMU user-mode networking
     // (SLIRP) hands out 10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3. DHCP comes
