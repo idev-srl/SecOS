@@ -81,6 +81,7 @@ int ath9k_secos_bringup(volatile void* mmio, unsigned short devid){
     debugcon_writestring("[ath9k-port] ath9k_hw_init ret=");
     debugcon_print_hex((unsigned long)(long)ret);
     debugcon_writestring("\n");
+    if (ret == 0) ath9k_hw_ani_init(ah);   /* set up ANI state for sensitivity */
     return ret;
 }
 
@@ -231,6 +232,7 @@ static void rx_bring_up(void){
 static void rx_poll_collect(int dwell_ms){
     int rounds = dwell_ms * 4;                  /* ~250us per idle round */
     for (int spin = 0; spin < rounds; spin++){
+        if ((spin & 0x3F) == 0) ath9k_hw_ani_monitor(g_ah, &g_chan);  /* periodic ANI */
         int any = 0;
         for (int i = 0; i < ATH_NRXBUF; i++){
             struct ath_rx_status rxs;
@@ -289,9 +291,7 @@ static int tune_quiet(int chan_num){
     if (r == 0){
         ath9k_hw_setpower(g_ah, ATH9K_PM_AWAKE);
         complete_cal();
-        /* ANI removed: with the (wrongly) high measured NF it RAISES weak-signal
-         * immunity and desensitizes the receiver -> CRC errors. Rely on the
-         * reset's native cal only. */
+        ath9k_ani_reset(g_ah, 0);   /* set sensitive default weak-signal thresholds */
     }
     return r;
 }
