@@ -187,14 +187,24 @@ int ath9k_secos_scan(void){
     debugcon_writestring("\n[ath9k-port] RX live, listening ~2s...\n");
 
     int found = 0, n_done = 0, n_inval = 0;
-    for (int spin = 0; spin < 40000 && found < 64; spin++){
+    for (int spin = 0; spin < 80000 && found < 64; spin++){
         struct ath_rx_status rxs;
         u8* buf = &g_rxpool[g_rx_idx][0];
         int ret = ath9k_hw_process_rxdesc_edma(g_ah, &rxs, buf);
         if (ret == -EINPROGRESS){ udelay(50); continue; }   /* not filled yet */
         if (ret == 0){ n_done++;
+            const u8* fr = buf + g_ah->caps.rx_status_len;
+            if (n_done <= 10){   /* detail the first frames */
+                debugcon_writestring("[rx] st="); debugcon_print_hex((unsigned long)rxs.rs_status);
+                debugcon_writestring(" len="); debugcon_print_hex((unsigned long)rxs.rs_datalen);
+                debugcon_writestring(" fc="); debugcon_print_hex((unsigned long)fr[0]);
+                debugcon_writestring(" hdr:");
+                for(int k=0;k<16 && k<rxs.rs_datalen;k++){ debugcon_putchar(' '); static const char h[]="0123456789abcdef";
+                    debugcon_putchar(h[(fr[k]>>4)&0xF]); debugcon_putchar(h[fr[k]&0xF]); }
+                debugcon_writestring("\n");
+            }
             if (rxs.rs_status == 0 && rxs.rs_datalen >= 24)
-                found += parse_beacon(buf + g_ah->caps.rx_status_len, rxs.rs_datalen, rxs.rs_rssi);
+                found += parse_beacon(fr, rxs.rs_datalen, rxs.rs_rssi);
         } else { n_inval++; }
         rx_addbuf(g_rx_idx);                                /* recycle + advance */
         g_rx_idx = (g_rx_idx + 1) % ATH_NRXBUF;
