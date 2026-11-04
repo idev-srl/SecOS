@@ -673,6 +673,178 @@ grep -q "\[M32\] tampered package REFUSED" "$M31LOG"; check "M32 tampered packag
 grep -q "SECOS-PKG-INSTALLED" "$M31LOG"; check "M32 package-delivered file is readable" $?
 ! grep -q "\[EXC\]" "$M31LOG"; check "no CPU exception ([EXC]) during Phase K run" $?
 
+# ---- M34-M39 shared helper: boot an ISO under mb2 with a given timeout ----
+run_iso() { # run_iso <log> <timeout> [extra qemu args...]
+    local log="$1" t="$2"; shift 2
+    : > "$log"
+    timeout "$t" qemu-system-x86_64 -cdrom myos.iso -boot d \
+        -debugcon file:"$log" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -m 256M "$@" >/dev/null 2>&1
+}
+# Drop scheduler trace lines that can interleave mid-line with ring-3 output.
+declutter() { # declutter <log>  (in place)
+    sed -z -E -i 's/\[SCHED\] (preempt|exit|switch) [0-9A-Fx> -]*\n//g' "$1"
+}
+build_demo() { # build_demo <label> <CFLAGS_EXTRA>
+    make clean >/dev/null 2>&1 || true
+    if ! make iso CFLAGS_EXTRA="$2" >/tmp/secos_selftest_build.log 2>&1; then
+        echo "[selftest] $1 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+        tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+    fi
+}
+
+# ---- M34: lua 5.4.7 compiled from source, signed, runs in ring 3 ----
+# Uses the committed signed crypto/user_lua_elf.h (regenerate with `make port-lua`).
+M34LOG=/tmp/secos_selftest_m34.log
+echo "[selftest] Building M34 image (M34_LUA_DEMO=1, signing enforced)..."
+build_demo M34 "-DM34_LUA_DEMO=1"
+echo "[selftest] Running M34 (mb2, 30s)..."
+run_iso "$M34LOG" 30; declutter "$M34LOG"
+grep -q "\[M34\] lua spawned" "$M34LOG"; check "M34 signed lua interpreter passes the load gate" $?
+grep -q "hello from lua Lua 5.4 on SecOS" "$M34LOG"; check "M34 lua runs its script in ring 3" $?
+grep -q "math.sqrt(2) =.1.4142135623731" "$M34LOG"; check "M34 lua floats: math.sqrt(2) (%.14g)" $?
+grep -q "math.pi =.3.1415926535898" "$M34LOG"; check "M34 lua floats: math.pi" $?
+grep -q "fib(20) =.6765" "$M34LOG"; check "M34 lua recursion: fib(20)=6765" $?
+grep -q "upper =.SECOS ROCKS" "$M34LOG"; check "M34 lua string library" $?
+grep -q "\[M34\] DONE" "$M34LOG"; check "M34 demo completed ([M34] DONE)" $?
+! grep -q "\[EXC\]" "$M34LOG"; check "no CPU exception ([EXC]) during M34 run" $?
+
+# ---- M35: generalized capability model (confined signed program + [AUDIT]) ----
+M35LOG=/tmp/secos_selftest_m35.log
+echo "[selftest] Building M35 image (M35_CAP_DEMO=1, signing enforced)..."
+build_demo M35 "-DM35_CAP_DEMO=1"
+echo "[selftest] Running M35 (mb2, ${TIMEOUT}s)..."
+run_iso "$M35LOG" "$TIMEOUT"; declutter "$M35LOG"
+grep -q "\[M35\] confined process pid loaded, caps=0x0000000000000840" "$M35LOG"; check "M35 manifest confines the process (CAP_ENFORCE|FS_READ|TIME)" $?
+grep -q "\[m35\] getticks() = [0-9]* (CAP_TIME granted" "$M35LOG"; check "M35 granted capability allowed (CAP_TIME)" $?
+grep -q "\[m35\] open(/proc/version, RDONLY) = 3" "$M35LOG"; check "M35 granted capability allowed (CAP_FS_READ)" $?
+grep -q "\[AUDIT\] pid=.* DENY  FS_WRITE (create)" "$M35LOG"; check "M35 create denied + audited (no CAP_FS_WRITE)" $?
+grep -q "\[AUDIT\] pid=.* DENY  PROC (spawn)" "$M35LOG"; check "M35 spawn denied + audited (no CAP_PROC)" $?
+grep -q "\[AUDIT\] pid=.* DENY  IPC (pipe)" "$M35LOG"; check "M35 pipe denied + audited (no CAP_IPC)" $?
+grep -q "\[m35\] socket() = -1" "$M35LOG"; check "M35 socket denied (no CAP_NET)" $?
+grep -q "\[M35\] audit log total events: 0x0000000000000004" "$M35LOG"; check "M35 audit ring recorded the denials (4 events)" $?
+grep -q "\[M35\] DONE" "$M35LOG"; check "M35 demo completed ([M35] DONE)" $?
+! grep -q "\[EXC\]" "$M35LOG"; check "no CPU exception ([EXC]) during M35 run" $?
+
+# ---- M39: POSIX shell-from-source foundation (cwd/env/dup2/termios/...) ----
+M39PLOG=/tmp/secos_selftest_m39posix.log
+echo "[selftest] Building M39 POSIX image (M39_POSIX_DEMO=1, signing enforced)..."
+build_demo M39-POSIX "-DM39_POSIX_DEMO=1"
+echo "[selftest] Running M39 POSIX (mb2, ${TIMEOUT}s)..."
+run_iso "$M39PLOG" "$TIMEOUT"; declutter "$M39PLOG"
+for t in "getcwd" "chdir+getcwd" "setenv/getenv" "setenv overwrite" "getenv-missing" \
+         "getppid" "dup2 redirect" "termios get/set" "getuid/geteuid" "gettimeofday" "fcntl F_DUPFD"; do
+    grep -qF "[M39] $t OK" "$M39PLOG"; check "M39 POSIX: $t" $?
+done
+grep -q "\[M39\] POSIX-FOUNDATION DONE" "$M39PLOG"; check "M39 POSIX foundation program completed" $?
+! grep -q "\[M39\].*FAIL" "$M39PLOG"; check "M39 POSIX: no failing check" $?
+grep -q "\[M39\] DONE" "$M39PLOG"; check "M39 POSIX demo completed ([M39] DONE)" $?
+! grep -q "\[EXC\]" "$M39PLOG"; check "no CPU exception ([EXC]) during M39 POSIX run" $?
+
+# ---- M39: user-space ASLR (per-process stack/heap/mmap slides) ----
+# Every created process logs its randomized layout; across the multi-process
+# M16 + Phase K runs the slides must actually differ between processes.
+cat "$M16LOG" "$M31LOG" 2>/dev/null | grep -o "\[ASLR\] stack_top=0x[0-9A-F]* brk=0x[0-9A-F]* mmap=0x[0-9A-F]*" > /tmp/secos_selftest_aslr.txt || true
+n_aslr=$(wc -l < /tmp/secos_selftest_aslr.txt)
+n_st=$(awk '{print $2}' /tmp/secos_selftest_aslr.txt | sort -u | wc -l)
+n_brk=$(awk '{print $3}' /tmp/secos_selftest_aslr.txt | sort -u | wc -l)
+n_mm=$(awk '{print $4}' /tmp/secos_selftest_aslr.txt | sort -u | wc -l)
+[[ "$n_aslr" -ge 3 ]]; check "M39 ASLR layout logged per process (n=$n_aslr)" $?
+[[ "$n_st" -ge 2 && "$n_brk" -ge 2 && "$n_mm" -ge 2 ]]; check "M39 ASLR slides differ across processes (stack=$n_st brk=$n_brk mmap=$n_mm distinct)" $?
+
+# ---- Phase L (M36/M37) + M38/M39 boot hardening on the DEFAULT image ----
+# Reproducible build (M37): the default image is built twice from clean with a
+# fixed SOURCE_DATE_EPOCH; kernel.bin must be byte-identical.
+MLLOG=/tmp/secos_selftest_ml.log
+export SOURCE_DATE_EPOCH=1700000000
+echo "[selftest] Building default image twice (SOURCE_DATE_EPOCH, reproducibility)..."
+build_demo M37-repro-1 ""
+k1=$(sha256sum kernel.bin | cut -d' ' -f1)
+build_demo M37-repro-2 ""
+k2=$(sha256sum kernel.bin | cut -d' ' -f1)
+unset SOURCE_DATE_EPOCH
+[[ -n "$k1" && "$k1" == "$k2" ]]; check "M37 reproducible build: kernel.bin byte-identical (${k1:0:16})" $?
+echo "[selftest] Running default image (mb2, -cpu Haswell for SMEP, ${TIMEOUT}s)..."
+run_iso "$MLLOG" "$TIMEOUT" -cpu Haswell
+# M36 exploit mitigations.
+grep -q "\[M36\] mitigations: SMEP=on" "$MLLOG"; check "M36 SMEP enabled (-cpu Haswell)" $?
+grep -q "\[M36\] mitigations: .*stack-canary=on" "$MLLOG"; check "M36 stack canaries reported on" $?
+n_chk=$(objdump -d kernel.bin 2>/dev/null | grep -c "call.*<__stack_chk_fail>" || true)
+ksyms=$(nm kernel.bin 2>/dev/null || true)
+grep -q " __stack_chk_guard$" <<<"$ksyms" && [[ "$n_chk" -ge 10 ]]; check "M36 kernel instrumented with stack canaries (__stack_chk_fail calls=$n_chk)" $?
+grep -q "\[WX\] low identity map: checked=0x00000000000000FF NX verified" "$MLLOG"; check "M36 low identity map NX (exec only 0-2MB)" $?
+# M39 high-half kernel image W^X auditor.
+grep -q "\[WX\] kernel image W^X verified (0 violations)" "$MLLOG"; check "M39 kernel image W^X audit: 0 violations" $?
+# M37 measured boot: the logged SHA-256 of .text+.rodata must equal a host-side
+# recomputation over the same bytes of kernel.bin.
+meas=$(grep -o "\[M37\] kernel code measurement (sha256 .text+.rodata): [0-9a-f]*" "$MLLOG" | awk '{print $NF}' || true)
+ts=$(awk '$3=="_text_start"{print $1}' <<<"$ksyms")
+re=$(awk '$3=="_rodata_end"{print $1}' <<<"$ksyms")
+toff=$(readelf -SW kernel.bin | awk '{for(i=1;i<NF;i++) if($i==".text") print $(i+3)}' || true)
+host_meas=""
+if [[ -n "$ts" && -n "$re" && -n "$toff" ]]; then
+    host_meas=$(tail -c +$(( 16#$toff + 1 )) kernel.bin | head -c $(( 16#$re - 16#$ts )) | sha256sum | cut -d' ' -f1 || true)
+fi
+[[ ${#meas} -eq 64 ]]; check "M37 boot measurement logged (sha256 .text+.rodata)" $?
+[[ -n "$meas" && "$meas" == "$host_meas" ]]; check "M37 boot measurement matches host-side sha256 of kernel.bin" $?
+grep -q "\[M37\] measured boot OK" "$MLLOG"; check "M37 measured boot OK" $?
+# M38 WPA2 crypto KATs + M39 association-core KATs (run at boot in crypto selftest).
+grep -q "\[WPA2\] PBKDF2 PMK KAT PASS" "$MLLOG"; check "M38 WPA2 PBKDF2-SHA1 PMK KAT (IEEE 802.11i)" $?
+grep -q "\[WPA2\] AES-128 KAT PASS" "$MLLOG"; check "M38 AES-128 KAT (FIPS-197)" $?
+grep -q "\[WPA2\] RFC3394 key-wrap KAT PASS" "$MLLOG"; check "M39 RFC3394 key-wrap KAT" $?
+grep -q "\[WPA2\] RFC3394 key-unwrap KAT PASS" "$MLLOG"; check "M39 RFC3394 key-unwrap KAT" $?
+grep -q "\[WPA2\] PTK derivation (KCK|KEK|TK) OK" "$MLLOG"; check "M39 WPA2 PTK derivation (PRF)" $?
+grep -q "\[WPA2\] 4-way handshake supplicant KAT PASS" "$MLLOG"; check "M39 synthetic WPA2 4-way handshake KAT" $?
+grep -q "\[CRYPTO\] --- all PASS ---" "$MLLOG"; check "M38/M39 boot crypto suite all PASS" $?
+! grep -q "\[EXC\]" "$MLLOG"; check "no CPU exception ([EXC]) during default -cpu Haswell boot" $?
+
+# ---- M39: boot into GNU bash (built from source) + run a command over serial ----
+# The default image installs the signed bash to /bin/bash and launches it as the
+# login shell. Feed one line over the serial console; bash's output (console fd 1)
+# is mirrored to debugcon. The arithmetic expansion proves bash evaluated it (TTY
+# echo alone would show the unexpanded text). Serial input drops the first char
+# of a line under QEMU, hence the leading spaces.
+BASHLOG=/tmp/secos_selftest_bash.log
+echo "[selftest] Running boot-into-bash (mb2, serial input, 40s)..."
+: > "$BASHLOG"
+( sleep 25; printf '  echo BASH-$((6*7))-OK\r'; sleep 10 ) | \
+    timeout 40 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$BASHLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "\[M39\] installed GNU bash to /bin/bash" "$BASHLOG"; check "M39 signed bash installed to /bin/bash at boot" $?
+grep -q "BASH-42-OK" "$BASHLOG"; check "M39 bash login shell evaluates a command (\$((6*7)) -> 42)" $?
+! grep -q "\[EXC\]" "$BASHLOG"; check "no CPU exception ([EXC]) during boot-into-bash" $?
+
+# ---- M39: UEFI secure boot (loader Ed25519-verifies kernel.elf before jumping) ----
+OVMF=""
+for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
+         /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2-ovmf/OVMF_CODE.fd; do
+    [[ -f "$f" ]] && { OVMF="$f"; break; }
+done
+if [[ -n "$OVMF" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
+    SB=/tmp/secos_selftest_sb
+    rm -rf "$SB"; mkdir -p "$SB"
+    cp -r dist "$SB/esp_good"; cp -r dist "$SB/esp_bad"
+    # Flip one byte inside .text of the tampered copy.
+    toff=$(readelf -SW dist/kernel.elf | awk '{for(i=1;i<NF;i++) if($i==".text") print $(i+3)}')
+    printf '\xff' | dd of="$SB/esp_bad/kernel.elf" bs=1 seek=$(( 16#$toff + 256 )) conv=notrunc 2>/dev/null
+    for v in good bad; do
+        echo "[selftest] Running UEFI secure boot ($v kernel, 25s)..."
+        : > "$SB/ser_$v.log"; : > "$SB/dbg_$v.log"
+        timeout 25 qemu-system-x86_64 -machine q35,accel=tcg -m 256M -bios "$OVMF" \
+            -drive format=raw,file=fat:rw:"$SB/esp_$v"/ \
+            -serial file:"$SB/ser_$v.log" -debugcon file:"$SB/dbg_$v.log" \
+            -global isa-debugcon.iobase=0xe9 -no-reboot -no-shutdown -display none -net none >/dev/null 2>&1
+    done
+    ! cmp -s dist/kernel.elf "$SB/esp_bad/kernel.elf"; check "M39 secure boot: tampered kernel differs from the signed one" $?
+    grep -aq "\[SECURE BOOT\] kernel signature OK" "$SB/ser_good.log"; check "M39 secure boot: signed kernel verified by the UEFI loader" $?
+    grep -q "SECoS build" "$SB/dbg_good.log"; check "M39 secure boot: verified kernel boots" $?
+    grep -aq "\[SECURE BOOT\] kernel signature INVALID - refusing to boot" "$SB/ser_bad.log"; check "M39 secure boot: one flipped byte -> kernel refused" $?
+    ! grep -q "SECoS build" "$SB/dbg_bad.log"; check "M39 secure boot: tampered kernel never runs" $?
+else
+    echo "  [SKIP] M39 secure boot (OVMF missing or make uefi failed)"
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
