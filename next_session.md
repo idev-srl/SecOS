@@ -1,5 +1,9 @@
 # SECoS — Resume Here (session handoff)
 
+> **2026-11-04:** roadmap/docs realigned with the commit history through M39 — see
+> `TASKS.md` (planned order, QEMU-validatable vs real-HW-only open items; physical-HW
+> testing paused) and `docs/devlog/M39.md`. Entries below are historical.
+
 ## 📡 WiFi on real ASUS — ath9k Linux driver ported (2026-06-22) — RX DECODE WALL
 **Goal**: port the whole upstream Linux **ath9k_hw** driver as-is and connect the
 ASUS's **AR9565** (`168c:0036`) to WiFi. User stopped here to resume later with a
