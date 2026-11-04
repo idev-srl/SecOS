@@ -815,6 +815,28 @@ grep -q "\[M39\] installed GNU bash to /bin/bash" "$BASHLOG"; check "M39 signed 
 grep -q "BASH-42-OK" "$BASHLOG"; check "M39 bash login shell evaluates a command (\$((6*7)) -> 42)" $?
 ! grep -q "\[EXC\]" "$BASHLOG"; check "no CPU exception ([EXC]) during boot-into-bash" $?
 
+# ---- Regression: fb console cursor overflow -> heap/PML4 corruption ----
+# Lines longer than one screen row, printed at the bottom of the screen, used to
+# make the blinking-cursor draw write past the end of the RAM back buffer (cursor
+# drawn at cursor_x == cells_per_row before the wrap), corrupting the next heap
+# block; a later fork's kmalloc then overwrote the parent's live PML4 and the
+# kernel froze after a few bash commands. Print 60 over-long lines (fills the
+# 48-row screen, wrapping on the last row), then run 24 fork+exec commands and a
+# final arithmetic echo: it must be evaluated with no CPU exception.
+BURSTLOG=/tmp/secos_selftest_bash_burst.log
+echo "[selftest] Running bash long-line + fork burst (mb2, serial input, 60s)..."
+: > "$BURSTLOG"
+LONGLINE=$(printf 'W%.0s' $(seq 1 150))
+( sleep 25
+  printf '  for i in {1..60}; do echo %s; done\r' "$LONGLINE"; sleep 4
+  for i in $(seq 1 12); do printf '  help\r'; sleep 0.8; printf '  ls\r'; sleep 0.8; done
+  printf '  echo BURST-$((6*7))-OK\r'; sleep 4 ) | \
+    timeout 60 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$BURSTLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "BURST-42-OK" "$BURSTLOG"; check "bash survives long wrapped lines + 24 fork/exec commands (fb cursor overflow regression)" $?
+! grep -q "\[EXC\]" "$BURSTLOG"; check "no CPU exception ([EXC]) during long-line + fork burst" $?
+
 # ---- M39: UEFI secure boot (loader Ed25519-verifies kernel.elf before jumping) ----
 OVMF=""
 for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
