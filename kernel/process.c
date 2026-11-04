@@ -366,6 +366,12 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->brk_start = USER_HEAP_BASE + aslr_slide(32ULL*1024*1024);
     p->brk_cur = p->brk_start;
     p->mmap_next = USER_MMAP_BASE + aslr_slide(32ULL*1024*1024); p->mem_limit = 0;
+    // Record the randomized layout (debugcon only) so the selftest can assert
+    // that per-process slides are actually applied and differ between processes.
+    debugcon_writestring("[ASLR] stack_top="); debugcon_print_hex(st_top);
+    debugcon_writestring(" brk="); debugcon_print_hex(p->brk_start);
+    debugcon_writestring(" mmap="); debugcon_print_hex(p->mmap_next);
+    debugcon_writestring("\n");
     p->user_mem_bytes = footprint;
     p->mapped_page_count = (uint32_t)(footprint / 4096ULL);
     // Manifest stub
