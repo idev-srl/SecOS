@@ -495,7 +495,8 @@ run-vnc: iso
 
 # Clean generated files
 clean:
-	rm -f $(OBJS) $(KERNEL)
+	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(KERNEL)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)
