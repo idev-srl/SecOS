@@ -126,6 +126,11 @@ static int cursor_blink_phase = 0; // 0 shown, 1 hidden (inverted)
 static uint32_t blink_counter = 0; // measured in ticks
 static uint32_t blink_interval_ticks = 0; // derived from timer frequency (~500ms)
 static int cursor_blink_enabled = 0;
+// Set while fb_console_putc() is mutating the console (cursor position, glyphs,
+// scroll). The blink tick runs from the timer IRQ and must not draw the cursor
+// while the position is transiently out of range (e.g. cursor_y == rows during a
+// scroll, or cursor_x == cells_per_row before the wrap) — it skips that tick.
+static volatile int fb_console_busy = 0;
 static void fb_console_cursor_toggle(void);
 // Double buffering. Rendering + scrolling go to `dbuf` (normal RAM, fast); the
 // flush copies only the dirty rectangle to the framebuffer (write-only, 64-bit
@@ -184,12 +189,28 @@ int fb_console_init(void){
     return 0;
 }
 
+// Pixel origin of the cursor cell, or -1 if the cell is not fully on-screen.
+// The cursor underline is drawn with raw row writes (no per-pixel clipping), so
+// an out-of-range cursor (cursor_x == cells_per_row right after the last column
+// of a line, or cursor_y == rows mid-scroll) would write past the end of the
+// framebuffer / RAM back buffer — on the last text row that is past the end of
+// the dbuf heap block, clobbering the next heap block header and whatever the
+// heap later hands out there (observed: a live PML4 overwritten via a corrupted
+// free-block size).
+static int fb_console_cursor_cell(uint32_t* gx, uint32_t* gy){
+    uint32_t x = cursor_x * glyph_w, y = cursor_y * glyph_h;
+    if (x + glyph_w > fb_width || y + glyph_h > fb_height) return -1;
+    *gx = x; *gy = y;
+    return 0;
+}
+
 // Internal helper to draw blinking cursor underline
 static void fb_console_draw_cursor(void){
     if(!fb_enabled || !cursor_blink_enabled) return;
     uint32_t cell_w = glyph_w;
     uint32_t cell_h = glyph_h;
-    uint32_t gx = cursor_x * cell_w; uint32_t gy = cursor_y * cell_h;
+    uint32_t gx, gy;
+    if (fb_console_cursor_cell(&gx, &gy) != 0) return;
     uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
     uint8_t* target = (dbuf_enabled && dbuf)? dbuf : base;
     uint32_t* row; uint32_t fg_rgb = vga_palette[current_fg & 0xF];
@@ -204,7 +225,8 @@ static void fb_console_clear_cursor(void){
     if(!fb_enabled) return;
     uint32_t cell_w = glyph_w;
     uint32_t cell_h = glyph_h;
-    uint32_t gx = cursor_x * cell_w; uint32_t gy = cursor_y * cell_h;
+    uint32_t gx, gy;
+    if (fb_console_cursor_cell(&gx, &gy) != 0) return;
     uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
     uint8_t* target = (dbuf_enabled && dbuf)? dbuf : base;
     uint32_t* row; uint32_t bg_rgb = vga_palette[current_bg & 0xF];
@@ -340,6 +362,7 @@ static void fb_console_draw_logo_glow(void){
 // Timer tick callback
 static void fb_console_tick(void){
     if(!cursor_blink_enabled || !fb_enabled) return;
+    if(fb_console_busy) return;   // putc mid-update: cursor position may be transient
     blink_counter++;
     // Update glow slowly every 5 ticks independent of cursor blink
     if(logo_glow_enabled && (blink_counter % 5)==0){ logo_glow_phase++; fb_console_draw_logo_glow(); }
@@ -540,8 +563,15 @@ static void scroll_if_needed(void){
     if(dbuf_enabled && !dbuf_auto_flush) fb_console_flush();
 }
 
+static void fb_console_putc_locked(char c);
 void fb_console_putc(char c){
     if(!fb_enabled){ return; }
+    fb_console_busy++;            // counter: nests if an IRQ path also prints
+    fb_console_putc_locked(c);
+    fb_console_busy--;
+}
+
+static void fb_console_putc_locked(char c){
     if(c=='\n'){
         if(cursor_blink_enabled && cursor_blink_phase==0){ fb_console_clear_cursor(); }
         cursor_x=0; cursor_y++; scroll_if_needed();
@@ -566,8 +596,11 @@ void fb_console_putc(char c){
     if(cursor_x >= cells_per_row){ cursor_x=0; cursor_y++; scroll_if_needed(); }
     draw_glyph(c, cursor_x*glyph_w, cursor_y*glyph_h);
     cursor_x++;
-    if(cursor_blink_enabled){ fb_console_draw_cursor(); cursor_blink_phase=0; }
+    // Wrap BEFORE drawing the cursor: at cursor_x == cells_per_row the cursor cell
+    // is off the right edge (it used to be drawn there, spilling 8 pixels into the
+    // next row — past the end of the buffer on the last text row).
     if(cursor_x >= cells_per_row){ cursor_x=0; cursor_y++; scroll_if_needed(); }
+    if(cursor_blink_enabled){ fb_console_draw_cursor(); cursor_blink_phase=0; }
     fb_console_flush_if_auto();
 }
 void fb_console_write(const char* s){ while(*s) fb_console_putc(*s++); }
