@@ -10,6 +10,9 @@
 #include "trapframe.h"
 #include "sched.h"
 #include "process.h"
+#include "vmm.h"
+#include "config.h"
+#include "fb_console.h"
 #include <stdint.h>
 
 /* [M39] Debug breadcrumb: drivers doing long in-kernel bring-up (ath9k) write
@@ -65,6 +68,37 @@ const char* exception_messages[] = {
     "Reserved"
 };
 
+/* Set once the kernel has committed to a ring-0 panic (kernel_panic or a fatal
+ * ring-0 exception). Painting the panic screen touches the framebuffer and the
+ * terminal; if that itself faults (e.g. the fault was caused by corrupted page
+ * tables), re-entering the panic path would recurse — each nested #PF repainted
+ * and faulted again, flooding debugcon with hundreds of thousands of lines until
+ * the stack ran out. A fault while this is set halts at once with one line. */
+static volatile int g_in_kernel_panic = 0;
+
+/* Enter the panic path. Returns normally the first time; a nested entry (a fault
+ * raised while already panicking) reports once on debugcon and halts for good.
+ * Also switches to the kernel address space: the faulting context's CR3 may be
+ * the very thing that is corrupted (a process PML4 with its physmap entry wiped),
+ * while the kernel PML4 still maps the physmap + framebuffer, so the screen can
+ * be painted. Kernel stacks/IST live in the shared high half, so this is safe. */
+static void panic_enter(const char* what) {
+    __asm__ volatile("cli");
+    if (g_in_kernel_panic) {
+        debugcon_writestring("[PANIC] nested fault inside the panic path (");
+        debugcon_writestring(what);
+        debugcon_writestring(") -> halting\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    g_in_kernel_panic = 1;
+    vmm_switch_space(vmm_get_kernel_space());
+#if ENABLE_FB
+    // terminal_initialize() would kfree() the console back buffer; the heap may
+    // be corrupted (the reason we are here), so detach it without heap access.
+    fb_console_panic_detach_dbuf();
+#endif
+}
+
 // Convert number to hexadecimal string
 static void print_hex64(uint64_t value) {
     char hex_chars[] = "0123456789ABCDEF";
@@ -78,8 +112,8 @@ static void print_hex64(uint64_t value) {
 
 // Ferma il sistema con un messaggio di panic
 void kernel_panic(const char* message, const char* file, uint32_t line) {
-    // Disabilita interrupt
-    __asm__ volatile("cli");
+    debugcon_writestring("[PANIC] "); debugcon_writestring(message); debugcon_writestring("\n");
+    panic_enter("kernel_panic");   // cli + recursion guard + kernel CR3
     
     // Schermo rosso
     terminal_initialize();
@@ -192,6 +226,7 @@ void exception_handler(struct registers* regs) {
         }
 
         // Kernel-mode fault (or no current process): unrecoverable -> panic/halt.
+        panic_enter("exception");      // recursion guard + kernel CR3 before painting
         terminal_initialize();
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_RED));
         terminal_writestring("\n=== EXCEPTION ===\n");
@@ -210,6 +245,7 @@ void exception_handler(struct registers* regs) {
           terminal_writestring("\nCR2: "); print_hex64(_cr2); }
         if (g_dbg_breadcrumb[0]) { terminal_writestring("\nLast: "); terminal_writestring(g_dbg_breadcrumb); }
         terminal_writestring("\n\nSistema bloccato.\n");
-        while (1) { __asm__ volatile("hlt"); }
+        debugcon_writestring("[PANIC] ring-0 exception: system halted\n");
+        while (1) { __asm__ volatile("cli; hlt"); }
     }
 }

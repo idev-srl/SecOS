@@ -18,6 +18,7 @@ void fb_console_putc(char c);
 void fb_console_write(const char* s);
 int fb_console_enable_dbuf(void); // ritorna 0 se ok
 void fb_console_disable_dbuf(void);
+void fb_console_panic_detach_dbuf(void); // panic: drop dbuf without heap access
 void fb_console_flush(void); // forza copia buffer secondario -> framebuffer
 void fb_console_set_dbuf_auto(int on); // abilita flush automatico
 void fb_console_fontdump(char c); // stampa su console info glyph

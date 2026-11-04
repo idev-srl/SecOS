@@ -621,6 +621,12 @@ int fb_console_enable_dbuf(void){
     dirty_reset();
     return 0;
 }
+// Panic path: stop using the RAM back buffer WITHOUT touching the heap (no flush,
+// no kfree). The heap may be the very thing that is corrupted, and the panic
+// screen is painted straight to VRAM anyway; leaking the buffer is irrelevant.
+void fb_console_panic_detach_dbuf(void){
+    dbuf = NULL; dbuf_enabled = 0;
+}
 void fb_console_disable_dbuf(void){
     if(!dbuf_enabled) return;
     extern void kfree(void* p);
