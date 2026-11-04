@@ -464,6 +464,25 @@ void vmm_audit_wx(void) {
     terminal_writestring(violations==0 ? "  CLEAN\n" : "  *** VIOLATIONS ***\n");
     debugcon_writestring(violations==0 ? "[WX] kernel image W^X verified (0 violations)\n"
                                        : "[WX] *** W^X VIOLATIONS PRESENT ***\n");
+
+    // [M36] Low identity map (PML4[0], 0..512MB, 2MB pages): every entry above
+    // the first 2MB (kept executable for the AP trampoline) must be NX.
+    uint64_t lo_exec = 0, lo_checked = 0;
+    if (pml4[0] & VMM_FLAG_PRESENT) {
+        uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[0] & ADDRESS_MASK);
+        if (pdpt[0] & VMM_FLAG_PRESENT) {
+            uint64_t* pdt = (uint64_t*)phys_to_virt(pdpt[0] & ADDRESS_MASK);
+            for (int i = 1; i < 256; i++) {
+                if (!(pdt[i] & VMM_FLAG_PRESENT)) continue;
+                lo_checked++;
+                if (!(pdt[i] & VMM_FLAG_NOEXEC)) lo_exec++;
+            }
+        }
+    }
+    debugcon_writestring("[WX] low identity map: checked=");
+    debugcon_print_hex(lo_checked);
+    debugcon_writestring(lo_exec == 0 && lo_checked ? " NX verified (exec only 0-2MB)\n"
+                                                    : " *** EXECUTABLE ENTRIES ***\n");
 }
 
 // --- M1.3: Guard pages ---
