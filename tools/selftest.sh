@@ -18,7 +18,10 @@
 #   B. M7 ring-3 cooperative scheduling: two ring-3 processes alternate via
 #      SYS_YIELD (both 1->2 and 2->1 switches observed, no CPU exception).
 
-set -euo pipefail
+# No errexit: a failing assertion must be COUNTED by check() (with -e the first
+# failing grep/[[ ]] silently aborted the run before reaching check/RESULT).
+# Build failures still exit 2 explicitly.
+set -uo pipefail
 
 TIMEOUT=12
 while [[ $# -gt 0 ]]; do
@@ -121,13 +124,11 @@ run_m10_fs() { # run_m10_fs <fs>   (fs = fat32 | ext2 | ext4)
     local fs="$1" log="/tmp/secos_selftest_m10_${1}.log"
     make "disk-${fs}" >/dev/null 2>&1 || { echo "  [FAIL] M10/${fs} disk image build"; FAIL=$((FAIL+1)); return; }
     : > "$log"
-    set +e
     timeout "$((TIMEOUT+6))" qemu-system-x86_64 \
         -cdrom myos.iso \
         -drive file=disk.img,if=virtio,format=raw -boot d \
         -debugcon file:"$log" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -no-shutdown -display none -m 256M
-    set -e
     grep -q "\[VIRTIO-BLK\] ready" "$log";                 check "M10/${fs} virtio-blk online" $?
     grep -q "\[M10\] disk mounted at /mnt"  "$log";        check "M10/${fs} disk FS mounted at /mnt" $?
     grep -q "\[M10\] disk write+readback: OK" "$log";      check "M10/${fs} VFS write+readback persists" $?
@@ -179,12 +180,9 @@ if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
 fi
 echo "[selftest] Running M12 (mb2, -m 2G, ${TIMEOUT}s)..."
 : > "$M12LOG"
-set +e
 timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso \
     -debugcon file:"$M12LOG" -global isa-debugcon.iobase=0xe9 \
     -no-reboot -display none -m 2G
-set -e
-
 # PMM manages all RAM on a 2 GB VM (was clamped to ~512 MB before M12).
 freehex=$(grep -oE "free_MB=0x[0-9A-Fa-f]+" "$M12LOG" | head -1 | sed 's/free_MB=0x//')
 freedec=$(( 16#${freehex:-0} ))
@@ -374,14 +372,11 @@ fi
 make disk-fat32 >/dev/null 2>&1 || { echo "  [FAIL] M21 disk image build"; FAIL=$((FAIL+1)); }
 echo "[selftest] Running M21 (q35 AHCI/SATA data disk, ${TIMEOUT}s)..."
 : > "$M21LOG"
-set +e
 # q35 routes `if=ide` to its built-in AHCI controller -> our driver drives it.
 timeout "$((TIMEOUT+4))" qemu-system-x86_64 -machine q35 -m 256M \
     -cdrom myos.iso -boot d -drive file=disk.img,format=raw,if=ide \
     -debugcon file:"$M21LOG" -global isa-debugcon.iobase=0xe9 \
     -no-reboot -no-shutdown -display none
-set -e
-
 grep -q "\[AHCI\] SATA disk sda" "$M21LOG"; check "M21 AHCI finds a SATA disk (sda)" $?
 grep -q "\[AHCI\] ready" "$M21LOG"; check "M21 AHCI driver ready" $?
 grep -q "\[M10\] disk mounted at /mnt fs=FAT32" "$M21LOG"; check "M21 FAT32 mounts on the AHCI disk" $?
@@ -395,14 +390,12 @@ M22NLOG=/tmp/secos_selftest_m22n.log
 M22ULOG=/tmp/secos_selftest_m22u.log
 echo "[selftest] Running M22 NVMe (q35 + NVMe data disk, ${TIMEOUT}s)..."
 : > "$M22NLOG"
-set +e
 # q35 ISO boot needs -boot d (else SeaBIOS hangs trying to boot the NVMe disk).
 timeout "$((TIMEOUT+4))" qemu-system-x86_64 -machine q35 -m 256M \
     -cdrom myos.iso -boot d \
     -drive file=disk.img,if=none,id=nvm,format=raw -device nvme,serial=secos1,drive=nvm \
     -debugcon file:"$M22NLOG" -global isa-debugcon.iobase=0xe9 \
     -no-reboot -no-shutdown -display none
-set -e
 grep -q "\[NVME\] ready nvme0n1" "$M22NLOG"; check "M22 NVMe namespace ready (nvme0n1)" $?
 grep -q "\[M10\] disk mounted at /mnt fs=FAT32" "$M22NLOG"; check "M22 FAT32 mounts on the NVMe disk" $?
 grep -q "\[M10\] disk write+readback: OK" "$M22NLOG"; check "M22 NVMe write+readback persists" $?
@@ -410,14 +403,12 @@ grep -q "\[M10\] disk write+readback: OK" "$M22NLOG"; check "M22 NVMe write+read
 
 echo "[selftest] Running M22 USB (xHCI + usb-kbd + usb-storage, ${TIMEOUT}s)..."
 : > "$M22ULOG"
-set +e
 timeout "$((TIMEOUT+4))" qemu-system-x86_64 -m 256M \
     -cdrom myos.iso -boot d \
     -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
     -drive file=disk.img,if=none,id=us,format=raw -device usb-storage,bus=xhci.0,drive=us \
     -debugcon file:"$M22ULOG" -global isa-debugcon.iobase=0xe9 \
     -no-reboot -no-shutdown -display none
-set -e
 grep -q "\[XHCI\] running" "$M22ULOG"; check "M22 xHCI controller running" $?
 grep -q "\[HID\] boot keyboard ready" "$M22ULOG"; check "M22 USB HID boot keyboard enumerated" $?
 grep -q "\[MSC\] usb0 ready" "$M22ULOG"; check "M22 USB Mass Storage ready (usb0)" $?
@@ -436,12 +427,11 @@ if ! make iso CFLAGS_EXTRA=-DM23_FS_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; 
 fi
 make disk-fat32 >/dev/null 2>&1 || { echo "  [FAIL] M23 disk image build"; FAIL=$((FAIL+1)); }
 echo "[selftest] Running M23 demo (/dev + /proc + signed ring-3 program)..."
-: > "$M23LOG"; set +e
+: > "$M23LOG"
 timeout "$((TIMEOUT+4))" qemu-system-x86_64 -cdrom myos.iso -boot d \
     -drive file=disk.img,if=virtio,format=raw \
     -debugcon file:"$M23LOG" -global isa-debugcon.iobase=0xe9 \
     -no-reboot -no-shutdown -display none -m 256M
-set -e
 grep -q "devfs(/dev)=0x0000000000000001" "$M23LOG"; check "M23 devfs mounted at /dev" $?
 grep -q "procfs(/proc)=0x0000000000000001" "$M23LOG"; check "M23 procfs mounted at /proc" $?
 grep -q "sysfs(/sys)=0x0000000000000001" "$M23LOG"; check "M23 sysfs mounted at /sys" $?
@@ -455,12 +445,11 @@ grep -q "\[m23fs\] DONE" "$M23LOG"; check "M23 signed prog completes (/proc, sta
 echo "[selftest] Running M23 persistent ext2 root..."
 make iso >/tmp/secos_selftest_build.log 2>&1
 make sysdisk-ext2 >/dev/null 2>&1 || { echo "  [FAIL] M23 sysdisk build"; FAIL=$((FAIL+1)); }
-: > "$M23RLOG"; set +e
+: > "$M23RLOG"
 timeout "$((TIMEOUT+4))" qemu-system-x86_64 -cdrom myos.iso -boot d \
     -drive file=sysdisk.img,if=virtio,format=raw \
     -debugcon file:"$M23RLOG" -global isa-debugcon.iobase=0xe9 \
     -no-reboot -no-shutdown -display none -m 256M
-set -e
 grep -q "\[M23\] persistent ext2/ext4 root on" "$M23RLOG"; check "M23 persistent ext2/ext4 root adopted" $?
 ! grep -q "\[VFS\] root RAMFS mounted" "$M23RLOG"; check "M23 RAMFS root skipped when ext2 root present" $?
 ! grep -q "\[EXC\]" "$M23RLOG"; check "no CPU exception ([EXC]) during M23 persistent-root boot" $?
@@ -474,12 +463,11 @@ if command -v e2fsck >/dev/null 2>&1; then
   echo "[selftest] Running M33 ext4 metadata_csum root..."
   make sysdisk-ext4-csum >/dev/null 2>&1 || { echo "  [FAIL] M33 csum sysdisk build"; FAIL=$((FAIL+1)); }
   cp sysdisk.img /tmp/secos_m33csum.img
-  : > "$M33LOG"; set +e
+  : > "$M33LOG"
   timeout "$((TIMEOUT+4))" qemu-system-x86_64 -cdrom myos.iso -boot d \
       -drive file=/tmp/secos_m33csum.img,if=virtio,format=raw \
       -debugcon file:"$M33LOG" -global isa-debugcon.iobase=0xe9 \
       -no-reboot -no-shutdown -display none -m 512M
-  set -e
   grep -q "\[M23\] persistent ext2/ext4 root on" "$M33LOG"; check "M33 metadata_csum ext4 root adopted" $?
   e2fsck -fn /tmp/secos_m33csum.img >/tmp/secos_m33fsck.log 2>&1; check "M33 metadata_csum volume e2fsck-clean after SecOS writes" $?
   ! grep -q "\[EXC\]" "$M33LOG"; check "no CPU exception ([EXC]) during M33 csum-root boot" $?
@@ -507,10 +495,9 @@ if make disk-journal >/tmp/secos_selftest_build.log 2>&1; then
         check "M27 synthetic journal is e2fsck-recoverable (ground truth)" 1
     fi
     echo "[selftest] Running M27 journal replay (ext4 dirty journal, ${TIMEOUT}s)..."
-    : > "$M27LOG"; set +e
+    : > "$M27LOG"
     timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -drive file=disk.img,if=virtio,format=raw -boot d \
         -debugcon file:"$M27LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
-    set -e
     grep -q "\[M27\] journal recover: txns=0x0000000000000001" "$M27LOG"; check "M27 detects + counts the committed transaction" $?
     grep -q '\[M27\] target.bin n=.* data="NEW"' "$M27LOG"; check "M27 replay rewrites the in-place block (OLD->NEW)" $?
     grep -q "\[M27\] REPLAY OK" "$M27LOG"; check "M27 journal replay OK (matches e2fsck)" $?
@@ -531,10 +518,9 @@ if ! make iso CFLAGS_EXTRA=-DM26_FS_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; 
 fi
 make disk-ext2 >/dev/null 2>&1 || { echo "  [FAIL] M26 ext2 disk build"; FAIL=$((FAIL+1)); }
 echo "[selftest] Running M26 (ext2 /mnt, ${TIMEOUT}s)..."
-: > "$M26LOG"; set +e
+: > "$M26LOG"
 timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -drive file=disk.img,if=virtio,format=raw -boot d \
     -debugcon file:"$M26LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
-set -e
 grep -q "\[M26\] chmod 0640 -> mode=0x00000000000001A0" "$M26LOG"; check "M26 chmod persists + stat reads mode (0640)" $?
 grep -q "\[M26\] chown 1000:1000 -> uid=0x00000000000003E8 gid=0x00000000000003E8" "$M26LOG"; check "M26 chown persists uid/gid" $?
 grep -q 'target="m26.txt"' "$M26LOG"; check "M26 symlink create + readlink target" $?
@@ -627,10 +613,9 @@ if ! make iso CFLAGS_EXTRA="-DSECOS_SMP_AT_BOOT" >/tmp/secos_selftest_build.log 
     tail -20 /tmp/secos_selftest_build.log >&2; exit 2
 fi
 echo "[selftest] Running M28 (mb2, -smp 2, ${TIMEOUT}s)..."
-: > "$M28LOG"; set +e
+: > "$M28LOG"
 timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -smp 2 -boot d \
     -debugcon file:"$M28LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
-set -e
 grep -q "\[ACPI\] CPUs=0x0000000000000002" "$M28LOG"; check "M28 ACPI discovers all CPUs (-smp 2)" $?
 grep -q "lapic=0x00000000FEE00000" "$M28LOG"; check "M28 ACPI reports the LAPIC base" $?
 grep -q "ioapic0=0x00000000FEC00000" "$M28LOG"; check "M28 ACPI reports the IOAPIC base" $?
@@ -655,10 +640,9 @@ if ! make iso CFLAGS_EXTRA="-DM8_SCHED_DEMO=1 -DDEV_ALLOW_UNSIGNED -DSECOS_SMP_A
     tail -20 /tmp/secos_selftest_build.log >&2; exit 2
 fi
 echo "[selftest] Running M29 (mb2, -smp 2, ${TIMEOUT}s)..."
-: > "$M29LOG"; set +e
+: > "$M29LOG"
 timeout "$TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -smp 2 -boot d \
     -debugcon file:"$M29LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
-set -e
 # A ring-3 user task (pid != 0) scheduled on CPU index 1 = it ran on the AP.
 grep -q "\[SMP\] cpu=0x0000000000000001 run pid=" "$M29LOG"; check "M29-3 user task runs on an application processor" $?
 grep -q "\[M8\] PMM stable across rounds: NO LEAK" "$M29LOG"; check "M29-3 no PMM leak under multicore scheduling" $?
@@ -677,10 +661,9 @@ if ! make iso CFLAGS_EXTRA="-DM31_LIBC_DEMO=1 -DM32_PKG_DEMO=1" >/tmp/secos_self
     tail -20 /tmp/secos_selftest_build.log >&2; exit 2
 fi
 echo "[selftest] Running Phase K (mb2, ${PK_TIMEOUT}s)..."
-: > "$M31LOG"; set +e
+: > "$M31LOG"
 timeout "$PK_TIMEOUT" qemu-system-x86_64 -cdrom myos.iso -boot d \
     -debugcon file:"$M31LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
-set -e
 grep -q "\[m31\] DONE fails=0" "$M31LOG"; check "M31 libc: printf/string/stdlib/ctype tests pass in ring 3" $?
 ! grep -q "\[m31\] FAIL" "$M31LOG"; check "M31 libc: no failing test" $?
 grep -q "\[M31\] coreutils installed to /bin" "$M31LOG"; check "M31 coreutils installed to /bin" $?
