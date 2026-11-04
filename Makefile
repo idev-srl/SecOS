@@ -119,6 +119,9 @@ KERNEL_NOTE = $(BOOT_DIR)/kernel_note.o
 ATH9K_HW = drivers/ath9k_port/ath9k_hw.o
 OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE) $(ATH9K_HW)
 
+# Keep `make` (no target) building the kernel: the rule below would otherwise be
+# the first target in the file and become the default goal.
+.DEFAULT_GOAL := all
 $(ATH9K_HW):
 	bash tools/port-ath9k.sh
 KERNEL  = kernel.bin
