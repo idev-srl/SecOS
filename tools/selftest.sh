@@ -1670,6 +1670,83 @@ grep -Eq "PL4- +5000 +5000 +23893-E" "$PIPELOG"; check "PIPE bash seq 1 5000 | w
 grep -q "PL5-42-END" "$PIPELOG"; check "PIPE bash still responsive after the pipelines" $?
 ! grep -q "\[EXC\]\|\[PANIC\]" "$PIPELOG"; check "PIPE no CPU exception ([EXC]) or panic" $?
 
+# ============================================================================
+# M40 GUI GATE: /dev/fb0 (fbdev), /dev/input/eventN (evdev), console handoff,
+# keymaps. tools/gui_drive.py boots the plain image (built for the uaccess
+# gate) with qemu-xhci + usb-tablet + usb-mouse next to the PS/2 keyboard and
+# mouse, types commands into bash over serial and injects input over QMP
+# (sendkey / mouse_move / mouse_button / input-send-event); screendump checks
+# what is really on screen. In-guest markers come from the signed /bin/guitest
+# (user/guitest.c) and its capability-less twin /bin/guitest_nocap.
+# A second run on a KEYMAP=it image adds usb-kbd (USB HID keyboard path, and
+# the build-time default layout).
+# ============================================================================
+GUILOG=/tmp/secos_selftest_gui.log
+GUIDRV=/tmp/secos_selftest_gui.drv
+echo "[selftest] Running M40 GUI gate (fb0/evdev/KDSETMODE/keymap, mb2, serial+QMP, <=300s)..."
+: > "$GUIDRV"
+timeout 330 python3 tools/gui_drive.py --log "$GUILOG" --out "$GUIDRV" --scenario main >/dev/null 2>&1
+for t in guitest-fb-ran guitest-nocap-ran flood-sent guitest-input-ran loadkeys-it guitest-keys-ran \
+         gfx-exit-pixels gfx-exit-console-suppressed gfx-exit-restored-log gfx-exit-text-back gfx-exit-text-drawn \
+         gfx-crash-pixels gfx-crash-console-suppressed gfx-crash-restored-log gfx-crash-text-back gfx-crash-text-drawn \
+         bash-responsive; do
+    grep -q "\[GUI-DRV\] $t OK" "$GUIDRV"; check "M40 driver: $t" $?
+done
+for t in OPEN IOCTL PUTVAR NOTTY MMAP MMAP-RW WRITE-MMAP MMAP-RANGE MMAP-OFFSET MPROTECT-EXEC MPROTECT-RO FORK-SHARED NOLEAK; do
+    grep -q "^GF-$t-OK" "$GUILOG"; check "M40 fb0: $t" $?
+done
+grep -q "G-END fb fails=0" "$GUILOG"; check "M40 fb0: guitest fb completed with 0 failures" $?
+grep -q "^GN-FB-DENIED-OK" "$GUILOG" && grep -q "\[AUDIT\] pid=.* DENY  DISPLAY (fb0-open)" "$GUILOG"
+check "M40 caps: /dev/fb0 refused (EACCES + audit) without CAP_DISPLAY" $?
+grep -q "^GN-INPUT-DENIED-OK" "$GUILOG" && grep -q "\[AUDIT\] pid=.* DENY  INPUT (input-open)" "$GUILOG"
+check "M40 caps: /dev/input/event* refused (EACCES + audit) without CAP_INPUT" $?
+grep -q "^GN-KD-DENIED-OK" "$GUILOG"; check "M40 caps: KD_GRAPHICS refused (EPERM) without CAP_DISPLAY" $?
+ps2='"ImExPS/2 Generic Explorer Mouse"'; um='"QEMU USB Mouse"'; tab='"QEMU USB Tablet"'; kb='"AT Translated Set 2 keyboard"'
+grep -qF "GI-EV $ps2 type=2 code=0 value=10" "$GUILOG" && grep -qF "GI-EV $ps2 type=2 code=1 value=5" "$GUILOG" &&
+grep -qF "GI-EV $ps2 type=2 code=0 value=-3" "$GUILOG" && grep -qF "GI-EV $ps2 type=2 code=1 value=-7" "$GUILOG"
+check "M40 evdev: PS/2 mouse REL_X/REL_Y (+10,+5 / -3,-7) on IRQ12" $?
+grep -qF "GI-EV $ps2 type=1 code=272 value=1" "$GUILOG" && grep -qF "GI-EV $ps2 type=1 code=272 value=0" "$GUILOG" &&
+grep -qF "GI-EV $ps2 type=2 code=8 value=1" "$GUILOG"
+check "M40 evdev: PS/2 mouse BTN_LEFT press/release + REL_WHEEL +1" $?
+grep -qF "GI-EV $um type=2 code=0 value=12" "$GUILOG" && grep -qF "GI-EV $um type=2 code=1 value=-6" "$GUILOG" &&
+grep -qF "GI-EV $um type=1 code=273 value=1" "$GUILOG" && grep -qF "GI-EV $um type=2 code=8 value=-1" "$GUILOG"
+check "M40 evdev: USB HID mouse REL_X/REL_Y, BTN_RIGHT, REL_WHEEL -1" $?
+grep -qF "GI-EV $tab type=3 code=0 value=16384" "$GUILOG" && grep -qF "GI-EV $tab type=3 code=1 value=8192" "$GUILOG" &&
+grep -qF "GI-EV $tab type=1 code=272 value=1" "$GUILOG" && grep -q "GI-ABS event[0-9] r=0 min=0 max=32767" "$GUILOG"
+check "M40 evdev: usb-tablet ABS_X/ABS_Y absolute (16384, 8192) + EVIOCGABS range + button" $?
+grep -qF "GI-EV $kb type=1 code=30 value=1" "$GUILOG" && grep -qF "GI-EV $kb type=1 code=30 value=0" "$GUILOG"
+check "M40 evdev: PS/2 keyboard KEY_A press/release (console tty still fed)" $?
+for t in OPEN SHORTREAD SYN SYN-DROPPED GRAB; do
+    grep -q "^GI-$t-OK" "$GUILOG"; check "M40 evdev: $t" $?
+done
+grep -q "G-END input fails=0" "$GUILOG"; check "M40 evdev: guitest input completed with 0 failures" $?
+KT_IT='3c3e2f3a5f40235b5d7b7dc3a0c3a8c3a9c3acc3b2c3b9607e4022c2a3e282ac'
+grep -q "^GK-BYTES $KT_IT\$" "$GUILOG"; check "M40 keymap it (PS/2): < > / : _ @ # [ ] { } à è é ì ò ù \` ~ @(Ctrl+AltGr) \" £ €" $?
+[ "$(grep -c '\[VT\] text console restored (graphics owner exited' "$GUILOG")" -ge 2 ]
+check "M40 console: text console restored after the graphics owner exits and after it crashes" $?
+grep -q "^GG-CRASHING" "$GUILOG" && grep -q "\[KILL\] pid=" "$GUILOG"; check "M40 console: the crashing graphics client was killed (SIGSEGV)" $?
+! grep -q "\[PANIC\]\|\[EXC\].*ring0" "$GUILOG"; check "M40 no kernel panic / ring-0 fault during the GUI gate" $?
+
+GUIKLOG=/tmp/secos_selftest_gui_it.log
+GUIKDRV=/tmp/secos_selftest_gui_it.drv
+echo "[selftest] Building KEYMAP=it image + USB HID keyboard gate (<=300s)..."
+make clean >/dev/null 2>&1 || true
+if make iso KEYMAP=it >/tmp/secos_selftest_build.log 2>&1; then
+    : > "$GUIKDRV"
+    timeout 330 python3 tools/gui_drive.py --log "$GUIKLOG" --out "$GUIKDRV" --scenario usbkbd >/dev/null 2>&1
+    grep -q "\[KBD\] keymap it" "$GUIKLOG" && grep -q "\[GUI-DRV\] boot-keymap-it OK" "$GUIKDRV"
+    check "M40 keymap: make KEYMAP=it boots with the Italian layout" $?
+    grep -q "^GK-BYTES $KT_IT\$" "$GUIKLOG"; check "M40 keymap it (USB HID keyboard): same bytes as PS/2" $?
+    grep -qF 'GI-EV "QEMU USB Keyboard" type=1 code=30 value=1' "$GUIKLOG" && grep -qF 'GI-EV "QEMU USB Keyboard" type=1 code=30 value=0' "$GUIKLOG"
+    check "M40 evdev: USB HID keyboard KEY_A press/release" $?
+    grep -q "G-END input fails=0" "$GUIKLOG"; check "M40 evdev: guitest input (with usb-kbd) completed with 0 failures" $?
+    grep -q "\[GUI-DRV\] bash-responsive OK" "$GUIKDRV"; check "M40 bash responsive after the USB keyboard gate" $?
+    ! grep -q "\[PANIC\]\|\[EXC\].*ring0" "$GUIKLOG"; check "M40 no kernel panic / ring-0 fault (KEYMAP=it run)" $?
+else
+    echo "[selftest] KEYMAP=it BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "M40 keymap: make KEYMAP=it builds" 1
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
