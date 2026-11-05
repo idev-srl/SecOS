@@ -1,5 +1,6 @@
-#ifndef _PORT_GRP_H
-#define _PORT_GRP_H
+/* <grp.h> - SecOS libc: /etc/group (root when the file is missing). SPDX: MIT */
+#ifndef _GRP_H
+#define _GRP_H
 struct group { char* gr_name; char* gr_passwd; int gr_gid; char** gr_mem; };
 struct group* getgrnam(const char*);
 struct group* getgrgid(int);

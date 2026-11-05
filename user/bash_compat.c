@@ -63,17 +63,7 @@ int sigdelset(sigset_t* s, int n){ if(s) *s &= ~(1UL<<(n&63)); return 0; }
 int sigismember(const sigset_t* s, int n){ return s ? (int)((*s>>(n&63))&1) : 0; }
 int siginterrupt(int s, int f){ (void)s; (void)f; return 0; }
 
-/* ---- single-user identity database ---- */
-static struct passwd g_pw = { (char*)"root", (char*)"x", 0, 0, (char*)"root", (char*)"/root", (char*)"/bin/bash" };
-struct passwd* getpwnam(const char* n){ (void)n; return &g_pw; }
-struct passwd* getpwuid(int u){ (void)u; return &g_pw; }
-struct passwd* getpwent(void){ return 0; }
-void setpwent(void){} void endpwent(void){}
-static struct group g_gr = { (char*)"root", (char*)"x", 0, 0 };
-struct group* getgrnam(const char* n){ (void)n; return &g_gr; }
-struct group* getgrgid(int g){ (void)g; return &g_gr; }
-struct group* getgrent(void){ return 0; }
-void setgrent(void){} void endgrent(void){}
+/* ---- identity database: libc (/etc/passwd, /etc/group) ---- */
 
 /* ---- resource limits: unlimited ---- */
 int getrlimit(int r, struct rlimit* l){ (void)r; if(l){ l->rlim_cur=RLIM_INFINITY; l->rlim_max=RLIM_INFINITY; } return 0; }

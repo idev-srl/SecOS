@@ -248,7 +248,8 @@ int setenv(const char* name, const char* value, int overwrite){
     int n=0; for(; environ[n]; n++) if(env_name_eq(environ[n], name, nlen)){
         if(!overwrite) return 0;
         char* e=environ[n]; size_t k=nlen+1; e[k-1]='=';
-        for(size_t i=0; value[i] && k<ENV_LEN-1; i++) e[k++]=value[i]; e[k]=0;
+        for(size_t i=0; value[i] && k<ENV_LEN-1; i++) e[k++]=value[i];
+        e[k]=0;
         return 0;
     }
     if(n>=ENV_MAX) return -1;
@@ -263,7 +264,8 @@ int setenv(const char* name, const char* value, int overwrite){
     char* e=env_store[slot]; size_t k=0;
     for(size_t i=0; name[i] && k<ENV_LEN-1; i++) e[k++]=name[i];
     if(k<ENV_LEN-1) e[k++]='=';
-    for(size_t i=0; value[i] && k<ENV_LEN-1; i++) e[k++]=value[i]; e[k]=0;
+    for(size_t i=0; value[i] && k<ENV_LEN-1; i++) e[k++]=value[i];
+    e[k]=0;
     environ[n]=e; environ[n+1]=0;
     return 0;
 }
@@ -1109,3 +1111,89 @@ __attribute__((weak)) char* ttyname(int fd){
     static char name[32];
     return ttyname_r(fd, name, sizeof(name)) == 0 ? name : (char*)0;
 }
+
+/* ============================ <pwd.h> / <grp.h> ============================
+ * One account database for every port: /etc/passwd and /etc/group (written at
+ * boot; BusyBox's own libpwdgrp parses the same files and overrides these weak
+ * definitions), with a built-in root entry when a file is missing. Identity is
+ * informational on SecOS: the signature is the trust boundary. */
+#include <pwd.h>
+#include <grp.h>
+static char g_pwbuf[2048];
+static int  g_pwpos = -1, g_grpos = -1;
+static long db_load(const char* path){
+    int fd = open(path, O_RDONLY);
+    if(fd < 0) return -1;
+    long n = 0, r;
+    while(n < (long)sizeof(g_pwbuf) - 1 && (r = read(fd, g_pwbuf + n, sizeof(g_pwbuf) - 1 - (size_t)n)) > 0) n += r;
+    close(fd);
+    g_pwbuf[n] = 0;
+    return n;
+}
+/* Split the line at *pos into ':'-separated fields (in place); returns the count. */
+static int db_next(int* pos, char** f, int nf){
+    for(;;){
+        if(*pos < 0 || !g_pwbuf[*pos]) return 0;
+        char* l = g_pwbuf + *pos;
+        char* e = strchr(l, '\n');
+        if(e){ *e = 0; *pos = (int)(e + 1 - g_pwbuf); } else *pos = (int)(l + strlen(l) - g_pwbuf);
+        if(!*l || *l == '#') continue;
+        int n = 0; f[n++] = l;
+        for(char* c = l; *c && n < nf; c++) if(*c == ':'){ *c = 0; f[n++] = c + 1; }
+        for(int k = n; k < nf; k++) f[k] = 0;
+        return n;
+    }
+}
+static struct passwd g_pwent;
+static struct passwd g_pwroot = { (char*)"root", (char*)"x", 0, 0, (char*)"root", (char*)"/root", (char*)"/bin/bash" };
+__attribute__((weak)) void setpwent(void){ g_pwpos = db_load("/etc/passwd") < 0 ? -1 : 0; }
+__attribute__((weak)) void endpwent(void){ g_pwpos = -1; }
+__attribute__((weak)) struct passwd* getpwent(void){
+    char* f[7];
+    if(g_pwpos < 0) return 0;
+    if(db_next(&g_pwpos, f, 7) < 7) return 0;
+    g_pwent.pw_name = f[0]; g_pwent.pw_passwd = f[1]; g_pwent.pw_uid = atoi(f[2]); g_pwent.pw_gid = atoi(f[3]);
+    g_pwent.pw_gecos = f[4]; g_pwent.pw_dir = f[5]; g_pwent.pw_shell = f[6];
+    return &g_pwent;
+}
+static struct passwd* pw_find(const char* name, int uid){
+    struct passwd* p;
+    setpwent();
+    int have = g_pwpos >= 0;
+    while((p = getpwent()) != 0)
+        if(name ? !strcmp(p->pw_name, name) : p->pw_uid == uid){ endpwent(); return p; }
+    endpwent();
+    if(!have && (name ? !strcmp(name, "root") : uid == 0)) return &g_pwroot;
+    return 0;
+}
+__attribute__((weak)) struct passwd* getpwnam(const char* n){ return n ? pw_find(n, 0) : 0; }
+__attribute__((weak)) struct passwd* getpwuid(int u){ return pw_find(0, u); }
+
+static struct group g_grent;
+static char* g_grmem[16];
+static char* g_grroot_mem[] = { (char*)"root", 0 };
+static struct group g_grroot = { (char*)"root", (char*)"x", 0, g_grroot_mem };
+__attribute__((weak)) void setgrent(void){ g_grpos = db_load("/etc/group") < 0 ? -1 : 0; }
+__attribute__((weak)) void endgrent(void){ g_grpos = -1; }
+__attribute__((weak)) struct group* getgrent(void){
+    char* f[4];
+    if(g_grpos < 0) return 0;
+    if(db_next(&g_grpos, f, 4) < 3) return 0;
+    g_grent.gr_name = f[0]; g_grent.gr_passwd = f[1]; g_grent.gr_gid = atoi(f[2]);
+    int n = 0;
+    if(f[3] && *f[3]){ char* m = f[3]; g_grmem[n++] = m; for(; *m && n < 15; m++) if(*m == ','){ *m = 0; g_grmem[n++] = m + 1; } }
+    g_grmem[n] = 0; g_grent.gr_mem = g_grmem;
+    return &g_grent;
+}
+static struct group* gr_find(const char* name, int gid){
+    struct group* g;
+    setgrent();
+    int have = g_grpos >= 0;
+    while((g = getgrent()) != 0)
+        if(name ? !strcmp(g->gr_name, name) : g->gr_gid == gid){ endgrent(); return g; }
+    endgrent();
+    if(!have && (name ? !strcmp(name, "root") : gid == 0)) return &g_grroot;
+    return 0;
+}
+__attribute__((weak)) struct group* getgrnam(const char* n){ return n ? gr_find(n, 0) : 0; }
+__attribute__((weak)) struct group* getgrgid(int g){ return gr_find(0, g); }
