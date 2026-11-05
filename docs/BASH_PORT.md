@@ -114,3 +114,15 @@ source port (dash, busybox, coreutils-from-upstream, …) needs first.
 - `poll`/`select` (disabled in bash's `config.h` today), wider `ioctl` coverage;
 - readline / job-control polish; serial input drops the first char of a line in
   QEMU (PS/2 unaffected).
+
+**Build hygiene (2026-11):**
+- `tools/port-bash.sh` no longer compiles with `-w`: it uses
+  `-Werror=implicit-function-declaration -Werror=int-conversion
+  -Werror=int-to-pointer-cast`. An implicitly declared libc function returns
+  `int`, so a pointer result is truncated to 32 bits — `strsignal()` crashed bash
+  whenever a child exited with status >= 128 or died by a signal. Every shim bash
+  calls is now prototyped in `user/bash_port.h`; a new gap fails the port.
+- `<signal.h>` defines `NSIG 32` and the port trims the native `signames.h` to
+  signals 0..31 + `DEBUG`/`ERR`/`RETURN`, so `trap … ERR|RETURN|DEBUG` work.
+- Overrides: `BASH_PORT_WORK` (source tree), `BASH_PORT_OBJ` (object dir),
+  `BASH_PORT_WFLAGS` (warning flags).
