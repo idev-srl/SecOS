@@ -44,10 +44,10 @@ make iso
    `crypto/user_bbstub_elf.h`, and regenerates the applet list
    `kernel/busybox_applets.h`.
 
-Binary size: **566 KB** for busybox (470 KB of text at `-Os` with
-`-mcmodel=large`) and 15 KB for the stub. This is well below the 1 MB
-`SYS_SPAWN` load buffer, so embedding is fine and no loading from disk is
-needed.
+Binary size: **565 KB** for busybox (about 470 KB of text at `-Os` with
+`-mcmodel=large`) and 15 KB for the stub. This is well below the 2 MB
+`SYS_SPAWN` load buffer and the 16 MB `SYS_EXECVE` image limit, so embedding
+is fine and no loading from disk is needed.
 
 ## Port layer (all MIT, outside `user/libc.c`)
 
@@ -55,32 +55,33 @@ needed.
 |------|------|
 | `user/busybox_port.h` | Force-included. It gives `read/write/close/dup/dup2`, the path calls, `isatty`, `exec*` and `exit` new link names (asm labels, same prototype) so they reach the shims. After the SecOS headers are parsed, macros route the POSIX `socket/connect/.../mmap/mount/open/waitpid/ioctl/signal` calls to POSIX-shaped shims. It also renames BusyBox's own `spawn()`, which clashes with libsecos. |
 | `user/busybox-include/` | Header overlay. Each header either `#include_next`s the SecOS libc header and adds the missing POSIX parts (types, errno, `O_*`, termios flags, signals/sigaction), or is a complete header (stdio, sockets, netdb, regex, poll, mntent, ...). |
-| `user/busybox_compat.c` | The shims (about 2.4k lines). Generic libc material is marked `TODO(integration): move to libc`. |
+| `user/busybox_compat.c` | The shims (about 1.9k lines). What libc now provides (exec family, time/calendar, poll/select, statfs, sysinfo, klogctl, rename/link/truncate/sync, access, pipe2, ttyname/pty API, termios helpers, strsignal, system, sysconf) was removed in the Phase 2 integration; what is left is BusyBox-specific (POSIX socket shapes, private stdio, errno-setting wrappers, DNS client, mntent, wide chars). |
 | `user/bbstub.c` | The applet stub. |
 
 What `busybox_compat.c` provides:
 
-- **errno and paths.** Several libsecos wrappers return a bare -1. The kernel
-  resolves relative paths only for `open/stat/lstat/chdir`, so every other path
-  call is made absolute first. Also: real `rmdir`/`unlink`/`rename` semantics,
-  `O_EXCL`/`O_DIRECTORY` emulation, `opendir` for directories with more than 64
-  entries, and `realpath`.
+- **errno and paths.** Several libsecos wrappers return a bare -1, so the
+  shims set errno; path calls are made absolute (lexically normalised). `rename`,
+  `link` and `rmdir` are the kernel's atomic syscalls. Also: `O_DIRECTORY`
+  checks, `opendir` for large directories, and `realpath`.
 - **Private stdio** (`bbio_*` link names). The libc FILE reads one byte per
   syscall and has no `getline`/`scanf`/`popen`. This one buffers reads and
   writes and has a printf engine with `%m %j %z %ll %hh` (floating point is
   delegated to libc) and an `sscanf`.
 - **Sockets.** A POSIX API over the SecOS socket syscalls (AF_INET, TCP/UDP).
-  Descriptors start at 64, can be `dup2`ed, and I/O is chunked to the kernel's
-  2 KB bounce buffer. Also a small UDP DNS client
+  A socket is a kernel fd (read/write/close/dup2/fork/exec/poll work on it);
+  the layer only keeps the type and addresses per fd and asks `SYS_SOCKNAME`
+  for the rest. Also a small UDP DNS client
   (`/etc/hosts` and `/etc/resolv.conf` are honoured; QEMU's 10.0.2.3 is the
   default) behind `getaddrinfo`/`gethostbyname`.
 - **Processes.** `waitpid` with `-1`/`WNOHANG` over `SYS_WAIT`/`SYS_WAITANY`.
-  The exec emulation forwards termination signals to the spawned program.
-  `execvp` honours `PATH` and falls back to bash for `sh`. Also `system`,
-  `popen` and `sigaction`.
-- **Time.** UTC `gmtime/mktime/strftime/strptime`.
-- **System information.** `sysinfo` (from `/proc/meminfo`), `uname` (sysname
-  `SecOS`), `sysconf`, `getmntent` (from `/proc/mounts`), and C-locale
+  `execve`/`execv*`/`execl*` are the kernel's in-place `SYS_EXECVE` (the
+  private stdio is flushed first); `execvp` searches `PATH`, runs a file
+  without an ELF header through bash (POSIX ENOEXEC rule) and maps `sh` to
+  bash. Also `popen` and `sigaction`.
+- **Time.** libc's wall clock and UTC calendar; `strptime` lives here.
+- **System information.** `uname` is the kernel's with the node name from
+  `/etc/hostname`; `getmntent` (from `/proc/mounts`), and C-locale
   wide-character functions for musl's regex.
 
 ## Installation and dispatch
@@ -90,17 +91,16 @@ coreutils are installed. It writes `/bin/busybox`, then installs the stub as
 `/bin/<applet>` for each applet, replacing any same-named SecOS coreutils
 program. It also creates a root-only `/etc/passwd` and `/etc/group`.
 
-- **Why stubs, not symlinks or copies.** The ramfs root has no symlinks, and
-  `SYS_SPAWN` does not follow them on ext2/ext4. Each program is signature
-  checked when it is loaded, so a link must resolve to the signed image. A full
-  copy per applet would cost about 70 MB of RAM.
-- **What the stub does.** Each stub is itself signed. It spawns
-  `/bin/busybox` with the same `argv`, and BusyBox dispatches on
-  `basename(argv[0])`. The stub then waits and exits with BusyBox's status,
-  re-raising the signal if BusyBox was killed by one.
-- **Cost.** 123 stubs take 1.8 MB of ramfs. Each command costs two spawns
-  instead of one, until a real in-place `execve` lands. Then the stub becomes
-  an `execve` of `/bin/busybox`, or the stubs can be replaced by symlinks.
+- **Why stubs, not symlinks or copies.** The ramfs root has no symlinks (on
+  an ext2/ext4 root `execve` follows them to the signed image, so symlinks
+  would work there). Each program is signature checked when it is loaded, so a
+  link must resolve to the signed image. A full copy per applet would cost
+  about 70 MB of RAM.
+- **What the stub does.** Each stub is itself signed. It `execve`s
+  `/bin/busybox` with the same `argv` and environment (in place: same pid,
+  fds, signals), and BusyBox dispatches on `basename(argv[0])`.
+- **Cost.** 123 stubs take 1.8 MB of ramfs, and each command costs one extra
+  in-place exec (a signature check of the 565 KB image).
 
 ### Which program wins for each name
 
@@ -125,37 +125,37 @@ is missing.
 |--------|--------|-------|
 | `[` `[[` `test` `true` `false` `expr` `printf` `echo` `seq` `yes` | works | `expr 6 \* 7`, `test -d`, `seq -s,` |
 | `grep` `egrep` `fgrep` | works | `-c -o -i -E`, musl/TRE regex |
-| `sed` | works | `-e`, `s///g`, `-i` (the temp file is renamed by copy) |
+| `sed` | works | `-e`, `s///g`, `-i` (atomic rename) |
 | `awk` | works | arithmetic, `printf %f`, `sqrt`, `length`, `substr` |
 | `sort` `uniq` `cut` `tr` `head` `tail` `wc` `cat` `tac` `rev` `tee` `nl` `fold` `paste` `split` `comm` `expand` `unexpand` `tsort` `shuf` `factor` | works | `sort -n -k`, `uniq -c` |
-| `xargs` | partial | works; a command line is capped at 8 arguments of 127 bytes (`SYS_SPAWN` limit) |
-| `find` | partial | `-name -type -print`; `-exec` hits the same 8-argument spawn limit |
-| `ls` `cp` `mv` `rm` `mkdir` `rmdir` `touch` `stat` `du` `readlink` `realpath` `basename` `dirname` `pwd` `mktemp` | works | `cp -r`, `rm -r`, `mkdir -p`. `mv` of a directory is copy + remove (no rename syscall). Times are whole seconds |
-| `ln` | needs | symlinks on the ramfs root and hard links (no link syscall) |
-| `chmod` `chown` | partial | applied on ext2/ext4; accepted and ignored on ramfs/FAT (no metadata) |
-| `truncate` | partial | only to size 0 (no truncate syscall) |
-| `sync` | partial | succeeds; there is no sync syscall (the ext journal commits each operation) |
+| `xargs` | works | real `execve`: no argument-count limit (`seq 1 30 \| xargs -n 10 echo`) |
+| `find` | works | `-name -type -print -exec` (real `execve`) |
+| `ls` `cp` `mv` `rm` `mkdir` `rmdir` `touch` `stat` `du` `readlink` `realpath` `basename` `dirname` `pwd` `mktemp` | works | `cp -r`, `rm -r`, `mkdir -p`. `mv` is an atomic rename (also of directories) within one filesystem. Times are whole seconds |
+| `ln` | partial | `ln` / `ln -s` work on ext2/ext4 (SYS_LINK, symlinks); the ramfs root supports neither (EPERM) |
+| `chmod` `chown` | works | on disk on ext2/ext4; kept on the in-memory inode on ramfs/devfs (`stat` shows it), not persisted on FAT |
+| `truncate` | works | any size (SYS_TRUNCATE) |
+| `sync` | works | SYS_SYNC (flushes the mounted filesystems) |
 | `md5sum` `sha1sum` `sha256sum` `sha512sum` `cksum` `crc32` | works | match the host values |
 | `od` `hexdump` `xxd` `strings` `base64` `cmp` `diff` `dd` | works | |
 | `tar` `gzip` `gunzip` `zcat` `bzip2` `bunzip2` `bzcat` | works | create/extract/compress round trips in `/tmp` |
 | `xz` `unxz` `xzcat` | works | decompression only (upstream BusyBox has no xz compressor) |
-| `vi` | partial | starts, ex commands (`:s`, `:w`, `:q`) work; insert mode can't be left: the console TTY is cooked-only and drops ESC and other control bytes |
-| `less` `more` | partial | page through a file and quit with `q`; the cooked TTY delivers keys only at Enter |
-| `clear` `reset` `tty` `stty` | partial | `stty` shows and stores the flags; the TTY ignores raw mode |
-| `date` `cal` | partial | `cal` is correct. `date` formats and parses, but the clock is uptime since 1970 (no wall clock yet) |
+| `vi` | works | raw TTY: insert mode, ESC, `:wq` (selftest + scripted session) |
+| `less` `more` | works | raw TTY, keys act at once, `q` quits |
+| `clear` `reset` `tty` `stty` | works | `stty -a` shows the real termios and window size; `tty` names `/dev/console` or `/dev/pts/N` |
+| `date` `cal` | works | RTC-anchored wall clock (UTC) |
 | `sleep` `usleep` `time` `timeout` `watch` | works | `timeout` reaches the real program through the stubs (SIGTERM forwarding) |
 | `id` `whoami` `hostname` `uname` `nproc` | works | single user `root`; hostname from `/etc/hostname` (default `secos`) |
-| `env` `printenv` | partial | run, but see no variables: `SYS_SPAWN` passes no environment |
+| `env` `printenv` | works | the environment crosses `execve`; bash exports PATH/HOME (`/etc/bash.bashrc`) |
 | `which` | works | |
-| `free` `uptime` | works | from `/proc/meminfo` and the tick count (no load average) |
+| `free` `uptime` | works | from `sysinfo()`; real load averages |
 | `kill` | works | |
 | `mount` `umount` | partial | lists `/proc/mounts`; mounts through `SYS_MOUNT` (no flags, no remount/bind) |
-| `df` | needs | `statfs` syscall |
-| `ps` `top` `pidof` `killall` | needs | `/proc/<pid>` directories |
-| `dmesg` | needs | kernel log device (`/proc/kmsg` or `/dev/kmsg`) |
+| `df` | works | SYS_STATFS; the ramfs root reports data + free RAM like tmpfs |
+| `ps` `top` `pidof` `killall` | works | `/proc/<pid>` (`ps aux`, `top -n1`, `pidof bash`, `killall -0`) |
+| `dmesg` | works | kernel log ring (`klogctl`, `/dev/kmsg`) |
 | `wget` | works | HTTP from a host server (`wget http://10.0.2.2:8099/...`); no HTTPS (TLS off) |
 | `nslookup` | works | `nslookup example.com` through QEMU's DNS |
-| `nc` `telnet` | needs | `poll`/`select` readiness: the shim reports every socket as readable, so `nc` blocks on the network before it has sent stdin |
+| `nc` `telnet` | works | real `poll()` readiness (`echo x \| nc -w 5 10.0.2.2 PORT` round trip); `telnet` uses the same path (not run) |
 | `ping` | needs | raw ICMP sockets |
 | `ifconfig` `ip` `netstat` | needs | `SIOCGIF*` ioctls, netlink and `/proc/net/*` |
 
@@ -171,15 +171,18 @@ is missing.
 - **`fs/ramfs.h` and `kernel/syscall.c`, limits.** Ramfs now holds 256 entries
   (was 96) and `SYS_GETDENTS` returns up to 256 names (was 64).
 
-## Still open (kernel features BusyBox would use)
+## Phase 2 integration (2026-11, integ/phase2)
 
-The `TODO(integration)` markers in `busybox_compat.c` show where each one plugs
-in:
+With real `execve`, the environment across exec, raw TTY/termios, ptys,
+`/proc/<pid>`, `/dev/kmsg`, the wall clock, `poll`, `statfs`,
+`rename`/`link`/`truncate`/`sync` and sockets as file descriptors, the port
+layer now uses the kernel interfaces directly (see the table above for the
+applets that moved from partial/needs to works).
 
-- an in-place `execve` that carries `envp` and more than 8 arguments (`env`,
-  `xargs`, `find -exec`, and dropping the stubs);
-- `poll`/`select`, needed by `nc` and `telnet`, and by `vi`/`top` for timeouts;
-- a raw-mode TTY that passes ESC and control bytes (`vi`, `less`, `top`);
-- `statfs` (`df`, `stat -f`), `/proc/<pid>` (`ps`, `top`, `pidof`,
-  `killall`), and a kernel log device (`dmesg`);
-- `rename`, `link`, `truncate`, `sync` and a wall clock (`date`).
+## Still open
+
+- `ping`: raw ICMP sockets; `ifconfig`/`ip`/`netstat`: `SIOCGIF*` ioctls,
+  netlink and `/proc/net/*`.
+- Symlinks and hard links on the ramfs root (`ln`, and applet symlinks instead
+  of stubs).
+- `alarm`/`setitimer` are accepted but never fire (no SIGALRM timer).

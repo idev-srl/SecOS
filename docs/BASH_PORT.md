@@ -209,8 +209,13 @@ What made it possible:
   ECHO*, ISIG (VINTR/VQUIT/VSUSP -> SIGINT/SIGQUIT/SIGTSTP to the foreground
   group), ICRNL/OPOST/ONLCR, VMIN/VTIME, TCSANOW/TCSADRAIN/TCSAFLUSH,
   TIOCGWINSZ (real console size)/TIOCSWINSZ, FIONREAD, TCFLSH. A lone ESC waits
-  ~10 ms for the rest of a sequence so serial input is not split; readline has
-  no `select()` here and decides "bare Escape or arrow key" with FIONREAD.
+  ~10 ms for the rest of a sequence so serial input is not split. Since the
+  Phase 2 integration bash is built with `HAVE_SELECT` (libc `select()` over
+  `SYS_POLL`): readline waits for the rest of an escape sequence with
+  `select()` (keyseq-timeout, so a lone ESC is told apart from an arrow key)
+  and `read -t` times out through `shtimer_select`. bash also uses libc's
+  `ttyname` (a pty slave is `/dev/pts/N`), `strsignal`, `sysconf` and the
+  `/etc/passwd` database, and printf's `%Lf` (bash `printf '%5.1f'`) works.
 - **Keyboards send terminal bytes**: PS/2 and USB HID emit xterm sequences
   (arrows `ESC [ A..D`, Home/End `ESC [ H/F`, `ESC [ 2/3/5/6 ~`, F1-F12,
   Shift-Tab), CR for Enter, DEL for Backspace, Alt = ESC prefix.

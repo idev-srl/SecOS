@@ -33,7 +33,7 @@ Files:
   socket prototypes away and adds the POSIX declarations the port needs.
 - `user/dropbear_compat.c` holds the shims: POSIX sockets, getaddrinfo, select
   over poll, writev, waitpid, sigaction, the root account, time, O_EXCL /
-  O_NOFOLLOW, O_NONBLOCK emulation and the PTY calls. Generic ones are tagged
+  O_NOFOLLOW and the PTY calls. Generic ones are tagged
   `TODO(integration): move to libc`.
 - `user/dropbear-include/` provides `sys/socket.h`, `netinet/*`, `arpa/inet.h`,
   `netdb.h`, `poll.h`, `sys/select.h`, `syslog.h` and `sys/un.h`.
@@ -218,8 +218,8 @@ Still open (not fixed here):
 | Need | Status |
 |---|---|
 | Sockets as fds: `read`/`write`/`close`/`dup2`/fork sharing, `SOCK_NONBLOCK`, `getsockname`/`getpeername` (`SYS_SOCKNAME` 80) | **done** on this branch (`net/socket.c`, `kernel/syscall*.c`) |
-| `poll`/`select` | `SYS_POLL` 78 from feat/kernel-ifaces. `kernel/kiface.c` `ki_fd_revents()` must call `socket_poll(pid, e->is_sock - 1)` for `is_sock` entries, and the interim libc "+64 socket fd" offset must go (both done on the integration test branch). Without it, dropbear prints `this SecOS kernel has no poll()` and exits. |
-| O_NONBLOCK on pipes | **emulated in user space** (`db_fcntl`/`db_read`/`db_write` poll first). TODO: the kernel should return -EAGAIN for an O_NONBLOCK pipe (`SYS_FCNTL` 61 already stores the flag). |
+| `poll`/`select` | **done** (integ/phase2): `SYS_POLL` 78; `ki_fd_revents()` reports socket fds through `socket_poll()` and pty ends through `pty_poll()`; libc's +64 socket offset is gone. |
+| O_NONBLOCK on pipes | **done**: a pipe read/write that would block returns -EAGAIN when O_NONBLOCK is set (`pipe2` flag or `F_SETFL`). |
 | fork + exec of the shell | works with today's spawn+wait emulation. Real in-place `execve` (60) makes pids and job control exact. |
 | `clock_gettime`/`nanosleep`/`fsync`/`link` | used when present (65/67/70/72), with fallbacks otherwise |
 | PTY | **missing**: see the spec below |
@@ -291,15 +291,21 @@ kernel has no `SYS_POLL`.
 
 ## What's pending
 
-- **PTY + interactive shell** (`ssh -p 2222 root@localhost` with no command):
-  needs the kernel interface above. After that, enable the login shell
-  (`-bash`) and window-change handling. `ssh -t` currently degrades to no tty.
+- **PTY sessions work** on integ/phase2 (feat/pty merged): `ssh -t` runs the
+  command on `/dev/pts/N`, the pty-req window size is applied and a
+  window-change resizes the pty and raises SIGWINCH (selftest SSH gate). Note
+  that Dropbear closes the pty master when the client sends EOF (upstream
+  behaviour), so `ssh -tt host cmd </dev/null` hangs the shell up early.
+  Still to check by hand: the login shell (`-bash`) of a session with no
+  command on a real terminal.
 - **Init-managed service:** start `dropbear -R -p 22` from `/bin/init`, after
   DHCP, with the host key on the persistent root. DHCP should also run from
   init or userland, not only the kernel shell.
-- Kernel O_NONBLOCK for pipes (drop the user-space emulation), and move the
-  generic shims (`TODO(integration)`) into libc: sockets API, getaddrinfo,
-  inet_*, poll/select, writev, sigaction, sscanf.
+- Kernel O_NONBLOCK for pipes is done (the user-space emulation and the
+  poll/select shims are gone; passwd/group come from libc's `/etc/passwd`
+  reader, shared with bash). Still in the port: the POSIX sockets API (libc
+  keeps the SecOS-native `socket(type)` signatures), getaddrinfo, inet_*,
+  sigaction, sscanf.
 - `scp` (optional) and `sftp-server` are not built.
 - A real DNS-backed `getaddrinfo` (dbclient to host names). Only numeric IPv4
   and `localhost` work today.
