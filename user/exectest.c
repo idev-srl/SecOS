@@ -24,8 +24,14 @@
 #define LEAK_WARMUP 20
 
 static void say(const char* s) { write(1, s, strlen(s)); }
+/* One write per result line: kernel debugcon lines (preemption traces) can
+ * only land between writes, so a split line would break the selftest grep. */
 static void check(int ok, const char* what) {
-    say("[EXECVE] "); say(what); say(ok ? " OK\n" : " FAIL\n");
+    char line[256]; size_t n = 0;
+    const char* parts[3] = { "[EXECVE] ", what, ok ? " OK\n" : " FAIL\n" };
+    for (int k = 0; k < 3; k++)
+        for (const char* c = parts[k]; *c && n < sizeof(line) - 1; c++) line[n++] = *c;
+    write(1, line, n);
 }
 static void utoa(unsigned long v, char* out) {
     char t[24]; int n = 0;
