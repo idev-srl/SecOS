@@ -106,8 +106,9 @@ static void paint(swpc_t* c) {
     if (read_file("/proc/meminfo", buf, sizeof(buf)) > 0) {
         long tot = meminfo(buf, "MemTotal"), fr = meminfo(buf, "MemFree");
         long av = meminfo(buf, "MemAvailable");
-        if (av < 0) av = fr;
+        if (av < 0 || av > tot) av = fr;     /* some boots report MemAvailable > MemTotal */
         long used = tot - av;
+        if (used < 0) used = 0;
         snprintf(line, sizeof(line), "Memory  %ld / %ld MB used", used / 1024, tot / 1024);
         gfx_text(s, 20, 105, line, TEXT, 0, 0);
         bar(s, 20, 127, c->w - 40, 12, used, tot, ACC);
