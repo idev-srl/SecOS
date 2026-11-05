@@ -1,0 +1,12 @@
+Terminus Font 4.49.1 (https://terminus-font.sourceforge.net/), 8x16 regular
+(ter-u16n.bdf) and bold (ter-u16b.bdf) BDF sources, copied unchanged from
+terminus-font-4.49.1.tar.gz
+(SHA-256 d961c1b781627bf417f9b340693d64fc219e0113ad3a3af1a3424c7aa373ef79).
+
+Copyright (C) 2020 Dimitar Toshkov Zhekov, licensed under the SIL Open Font
+License 1.1 (OFL.TXT, Reserved Font Name "Terminus Font").
+
+tools/bdf2c.py turns a subset of the glyphs into user/secwm/font16.h, a C
+table used by the secwm compositor, its terminal and the GUI clients. The
+glyph bitmaps are not modified; the generated table is not distributed as a
+font under the "Terminus Font" name.
