@@ -393,8 +393,9 @@ check-user-progs: user-progs
 
 # [M34] Port of lua 5.4.7 FROM SOURCE (third_party/lua), signed + embedded.
 # Compiles the lua core + the OS-independent standard libs (base/table/string/
-# math/coroutine/utf8) against the SecOS libc/libm/setjmp, links a freestanding
-# front-end (user/lua_main.c), signs it, and emits crypto/user_lua_elf.h. The
+# math/coroutine/utf8 + io/os) against the SecOS libc/libm/setjmp, links a freestanding
+# front-end with a REPL (user/lua_main.c), signs it, and emits crypto/user_lua_elf.h
+# (installed to /bin/lua at boot). The
 # committed header lets the default kernel build without recompiling lua; run
 # this after changing the libc or the lua sources. Gate: M34_LUA_DEMO=1.
 LUASRC = third_party/lua/src

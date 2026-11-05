@@ -126,3 +126,39 @@ source port (dash, busybox, coreutils-from-upstream, …) needs first.
   signals 0..31 + `DEBUG`/`ERR`/`RETURN`, so `trap … ERR|RETURN|DEBUG` work.
 - Overrides: `BASH_PORT_WORK` (source tree), `BASH_PORT_OBJ` (object dir),
   `BASH_PORT_WFLAGS` (warning flags).
+
+## Job control and the full feature set (2026-11, branch fix/lua-jobs)
+
+bash was configured with `--enable-minimal-config`, which also turns off job
+control, so `jobs`, `fg`, `bg`, `disown` and `suspend` did not exist. The
+port now starts from the minimal config and turns on everything SecOS can back:
+job control, aliases, `history`/`fc` (no `!` expansion), `help`, arrays, brace
+expansion, `[[ ]]`, `(( ))`, `for ((;;))`, `pushd`/`popd`/`dirs`, `select`,
+`time`, extglob and the case-modifying expansions. Process substitution stays
+off (it needs `/dev/fd`). readline stays off too, so there is no line editing
+or arrow-key history. The signed bash grows from 548 KB to 810 KB. A work dir
+configured with different options is reconfigured automatically (`.secos-conf`
+stamp).
+
+Kernel/libc support used by job control:
+- `tcgetpgrp`/`tcsetpgrp` drive the kernel `foreground_pgid` (TIOCGPGRP/
+  TIOCSPGRP, also on a dup of the console fd); `getpgid` (SYS 57),
+  `sigsuspend` (SYS 58), `kill(-pgid)`/`killpg`, and `waitpid(-1, WUNTRACED|
+  WCONTINUED)` reporting stopped (`(sig<<8)|0x7f`) and continued (`0xffff`)
+  children.
+- A background reader of the console gets SIGTTIN, sent to its whole group.
+- A blocking syscall interrupted by a stop restarts after SIGCONT instead of
+  failing with EINTR.
+- A spawned program stays in its spawner's process group, because `execve` is
+  still spawn+wait+_exit, so `kill %1` and Ctrl-Z reach the real program.
+- A console `read()` blocks the reader instead of spinning in ring 0. Before
+  this, a background job made no progress while bash sat at its prompt.
+
+Async Ctrl-Z/Ctrl-C need the PS/2 keyboard (the QEMU GTK window, VMware).
+Serial input is polled, so the selftest uses `kill -STOP/-CONT %1` instead.
+Still approximate: `$!` and `jobs -l` show the pid of bash's forked child
+(the execve shim), not the program's own pid.
+
+Rebuild: `make port-bash` reads the prebuilt `user/libsecos.o`/`libc.o`, so
+run `make user-progs` first after a libc change. Signing runs from the repo
+root, where pyenv's python has `cryptography`.
