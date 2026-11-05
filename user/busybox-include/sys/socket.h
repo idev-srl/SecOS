@@ -1,7 +1,7 @@
 /* SecOS BusyBox overlay: <sys/socket.h>. POSIX socket API mapped onto the
  * SecOS socket syscalls (AF_INET + SOCK_STREAM/SOCK_DGRAM only) by the shims
- * in user/busybox_compat.c; socket descriptors live at BB_SOCK_FD_BASE+ so
- * read/write/close can tell them apart. SPDX-License-Identifier: MIT */
+ * in user/busybox_compat.c; a socket is an ordinary kernel fd.
+ * SPDX-License-Identifier: MIT */
 #ifndef _BB_SYS_SOCKET_H
 #define _BB_SYS_SOCKET_H
 #include <sys/types.h>
@@ -78,7 +78,6 @@ struct ucred { pid_t pid; uid_t uid; gid_t gid; };
 #define SHUT_WR   1
 #define SHUT_RDWR 2
 #define SOMAXCONN 128
-#define BB_SOCK_FD_BASE 64
 int     sbb_socket(int domain, int type, int proto);
 int     sbb_connect(int fd, const struct sockaddr* a, socklen_t l);
 int     sbb_bind(int fd, const struct sockaddr* a, socklen_t l);

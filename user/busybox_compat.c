@@ -120,30 +120,21 @@ int main(int argc, char** argv) {
 /* ===================================================================== */
 /* 2. files, fds, errno                                                   */
 /* ===================================================================== */
-static int is_sock_fd(int fd);
-static ssize_t sock_read(int fd, void* b, size_t n);
-static ssize_t sock_write(int fd, const void* b, size_t n);
-static int sock_close(int fd);
+static void sock_forget(int fd);
+static void sock_copy(int from, int to);
 static int sock_ioctl(int fd, unsigned long req, void* arg);
+static int is_sock_fd(int fd);
 
-ssize_t read(int fd, void* buf, size_t len) {
-    if (is_sock_fd(fd)) return sock_read(fd, buf, len);
-    return sys_read(fd, buf, len);
-}
-ssize_t write(int fd, const void* buf, size_t len) {
-    if (is_sock_fd(fd)) return sock_write(fd, buf, len);
-    return sys_write(fd, buf, len);
-}
-int close(int fd) {
-    if (is_sock_fd(fd)) return sock_close(fd);
-    return sys_close(fd);
-}
+/* Sockets are kernel fds: read/write go straight through; close/dup/dup2 also
+ * keep this layer's per-fd socket metadata (type, addresses) in step. */
+ssize_t read(int fd, void* buf, size_t len) { return sys_read(fd, buf, len); }
+ssize_t write(int fd, const void* buf, size_t len) { return sys_write(fd, buf, len); }
+int close(int fd) { sock_forget(fd); return sys_close(fd); }
 int stat(const char* p, struct stat* st)  { return (int)se(sys_stat(p, st), ENOENT); }
 int lstat(const char* p, struct stat* st) { return (int)se(sys_lstat(p, st), ENOENT); }
 int fstat(int fd, struct stat* st) {
     if (!st) { errno = EFAULT; return -1; }
     memset(st, 0, sizeof(*st));
-    if (is_sock_fd(fd)) { st->st_mode = S_IFSOCK | 0666; return 0; }
     return (int)se(secos_syscall(56 /*SYS_FSTAT*/, fd, (long)st, 0, 0, 0), EBADF);
 }
 int fstatat(int dirfd, const char* p, struct stat* st, int fl) {
@@ -479,53 +470,57 @@ char* dirname(char* p) {
 /* ===================================================================== */
 /* 3. sockets (AF_INET over the SecOS socket syscalls)                    */
 /* ===================================================================== */
-/* A socket lives in g_sock[]; descriptors referring to it are recorded in
- * g_fdmap (index + 1). socket()/accept()/dup() hand out descriptors from
- * BB_SOCK_FD_BASE up (never used by the kernel's 32-entry fd table); dup2()
- * may alias a socket onto a low fd (nc moves its socket to fd 3). */
-#define NSOCK 16
-#define SOCKMAP (BB_SOCK_FD_BASE + 2 * NSOCK)
-#define SOCK_IO_MAX 2048   /* the kernel bounces socket I/O through a 2 KB buffer */
-static struct bbsock {
-    int used, refs, sid, type, connected, nonblock;
-    struct sockaddr_in local, peer;
-} g_sock[NSOCK];
-static signed char g_fdmap[SOCKMAP];
-static int sock_idx(int fd) { return (fd >= 0 && fd < SOCKMAP && g_fdmap[fd]) ? g_fdmap[fd] - 1 : -1; }
-static int is_sock_fd(int fd) { return sock_idx(fd) >= 0; }
-static struct bbsock* sk(int fd) { int i = sock_idx(fd); if (i < 0) { errno = ENOTSOCK; return NULL; } return &g_sock[i]; }
-static int sock_new_fd(int idx) {
-    for (int f = BB_SOCK_FD_BASE; f < SOCKMAP; f++)
-        if (!g_fdmap[f]) { g_fdmap[f] = (signed char)(idx + 1); g_sock[idx].refs++; return f; }
-    errno = EMFILE; return -1;
+/* A socket is a kernel fd (sockets share the fd table with files and pipes,
+ * so dup2/fork/exec and poll work on them). This layer only remembers what the
+ * SecOS socket syscalls do not report back: the type and the addresses, per
+ * fd (lost across exec, where getsockname/getpeername still work through
+ * SYS_SOCKNAME). */
+#define SOCK_IO_MAX 2048   /* datagram calls bounce through a 2 KB kernel buffer */
+struct bbsock { int used, type, connected; struct sockaddr_in local, peer; };
+static struct bbsock g_skm[32];
+static struct bbsock* sk(int fd) {
+    if (fd < 0 || fd >= 32) { errno = EBADF; return NULL; }
+    if (!g_skm[fd].used) {   /* inherited across exec: ask the kernel */
+        struct stat st;
+        if (secos_syscall(56 /*SYS_FSTAT*/, fd, (long)&st, 0, 0, 0) < 0 || !S_ISSOCK(st.st_mode)) { errno = ENOTSOCK; return NULL; }
+        memset(&g_skm[fd], 0, sizeof(g_skm[fd]));
+        g_skm[fd].used = 1; g_skm[fd].type = SOCK_STREAM; g_skm[fd].connected = 1;
+        g_skm[fd].local.sin_family = g_skm[fd].peer.sin_family = AF_INET;
+    }
+    return &g_skm[fd];
 }
-static int sock_alloc(int sid, int type) {
-    int i; for (i = 0; i < NSOCK && g_sock[i].used; i++) {}
-    if (i == NSOCK) { errno = EMFILE; return -1; }
-    memset(&g_sock[i], 0, sizeof(g_sock[i]));
-    g_sock[i].used = 1; g_sock[i].sid = sid; g_sock[i].type = type;
-    g_sock[i].local.sin_family = AF_INET; g_sock[i].peer.sin_family = AF_INET;
-    int fd = sock_new_fd(i);
-    if (fd < 0) g_sock[i].used = 0;
+static int is_sock_fd(int fd) { return fd >= 0 && fd < 32 && g_skm[fd].used; }
+static void sock_forget(int fd) { if (fd >= 0 && fd < 32) g_skm[fd].used = 0; }
+static void sock_copy(int from, int to) {
+    if (to < 0 || to >= 32) return;
+    if (from >= 0 && from < 32 && g_skm[from].used) g_skm[to] = g_skm[from]; else g_skm[to].used = 0;
+}
+static int sock_track(int fd, int type) {
+    if (fd < 0) return fd;
+    if (fd >= 32) return fd;
+    memset(&g_skm[fd], 0, sizeof(g_skm[fd]));
+    g_skm[fd].used = 1; g_skm[fd].type = type;
+    g_skm[fd].local.sin_family = g_skm[fd].peer.sin_family = AF_INET;
     return fd;
+}
+static void sa_from_secos(const struct secos_sockaddr* k, struct sockaddr_in* in) {
+    memset(in, 0, sizeof(*in));
+    in->sin_family = AF_INET; in->sin_addr.s_addr = k->ip; in->sin_port = htons(k->port);
 }
 int socket(int domain, int type, int proto) {
     (void)proto;
     int t = type & 0xf;
     if (domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
     if (t != SOCK_STREAM && t != SOCK_DGRAM) { errno = EPROTONOSUPPORT; return -1; }  /* no raw/ICMP sockets */
-    int sid = sys_socket(t);
-    if (sid < 0) { errno = EACCES; return -1; }   /* no CAP_NET, or table full */
-    int fd = sock_alloc(sid, t);
-    if (fd < 0) { secos_syscall(30 /*SYS_SOCKCLOSE*/, sid, 0, 0, 0, 0); return -1; }
-    sk(fd)->nonblock = !!(type & SOCK_NONBLOCK);
-    return fd;
+    /* SOCK_NONBLOCK / SOCK_CLOEXEC ride in the same word (Linux values). */
+    int fd = (int)se(secos_syscall(21 /*SYS_SOCKET*/, type, 0, 0, 0, 0), EACCES);
+    return sock_track(fd, t);
 }
 int connect(int fd, const struct sockaddr* a, socklen_t l) {
     struct bbsock* s = sk(fd); const struct sockaddr_in* in = (const struct sockaddr_in*)a;
     if (!s) return -1;
     if (!a || l < sizeof(*in) || in->sin_family != AF_INET) { errno = EAFNOSUPPORT; return -1; }
-    if (sys_connect(s->sid, in->sin_addr.s_addr, ntohs(in->sin_port)) < 0) { errno = ECONNREFUSED; return -1; }
+    if (se(sys_connect(fd, in->sin_addr.s_addr, ntohs(in->sin_port)), ECONNREFUSED) < 0) return -1;
     s->peer = *in; s->connected = 1;
     return 0;
 }
@@ -533,40 +528,42 @@ int bind(int fd, const struct sockaddr* a, socklen_t l) {
     struct bbsock* s = sk(fd); const struct sockaddr_in* in = (const struct sockaddr_in*)a;
     if (!s) return -1;
     if (!a || l < sizeof(*in) || in->sin_family != AF_INET) { errno = EAFNOSUPPORT; return -1; }
-    if (in->sin_port && sys_bind(s->sid, ntohs(in->sin_port)) < 0) { errno = EADDRINUSE; return -1; }
+    if (in->sin_port && se(sys_bind(fd, ntohs(in->sin_port)), EADDRINUSE) < 0) return -1;
     s->local = *in;
     return 0;
 }
-int listen(int fd, int bl) { struct bbsock* s = sk(fd); if (!s) return -1; return sys_listen(s->sid, bl) < 0 ? (errno = EOPNOTSUPP, -1) : 0; }
+int listen(int fd, int bl) { if (!sk(fd)) return -1; return (int)se(sys_listen(fd, bl), EOPNOTSUPP); }
 int accept(int fd, struct sockaddr* a, socklen_t* l) {
     struct bbsock* s = sk(fd); if (!s) return -1;
-    int nsid = sys_accept(s->sid);
-    if (nsid < 0) { errno = ECONNABORTED; return -1; }
-    int nfd = sock_alloc(nsid, SOCK_STREAM);
-    if (nfd < 0) { secos_syscall(30 /*SYS_SOCKCLOSE*/, nsid, 0, 0, 0, 0); return -1; }
-    struct bbsock* ns = sk(nfd);
-    ns->connected = 1; ns->local = s->local;
-    if (a && l) { size_t n = *l < sizeof(struct sockaddr_in) ? *l : sizeof(struct sockaddr_in); memcpy(a, &ns->peer, n); *l = sizeof(struct sockaddr_in); }
+    int nfd = (int)se(sys_accept(fd), ECONNABORTED);
+    if (nfd < 0) return -1;
+    sock_track(nfd, SOCK_STREAM);
+    if (nfd < 32) {
+        g_skm[nfd].connected = 1; g_skm[nfd].local = s->local;
+        struct secos_sockaddr k; memset(&k, 0, sizeof(k));
+        if (secos_syscall(80 /*SYS_SOCKNAME*/, nfd, (long)&k, 1, 0, 0) == 0) sa_from_secos(&k, &g_skm[nfd].peer);
+    }
+    if (a && l) {
+        size_t n = *l < sizeof(struct sockaddr_in) ? *l : sizeof(struct sockaddr_in);
+        if (nfd < 32) memcpy(a, &g_skm[nfd].peer, n);
+        *l = sizeof(struct sockaddr_in);
+    }
     return nfd;
 }
-int accept4(int fd, struct sockaddr* a, socklen_t* l, int f) { (void)f; return accept(fd, a, l); }
+int accept4(int fd, struct sockaddr* a, socklen_t* l, int f) {
+    int n = accept(fd, a, l);
+    if (n >= 0 && (f & SOCK_CLOEXEC)) fcntl(n, F_SETFD, FD_CLOEXEC);
+    if (n >= 0 && (f & SOCK_NONBLOCK)) fcntl(n, F_SETFL, O_NONBLOCK);
+    return n;
+}
 ssize_t send(int fd, const void* b, size_t n, int fl) {
     struct bbsock* s = sk(fd); (void)fl; if (!s) return -1;
     if (s->type == SOCK_DGRAM && !s->connected) { errno = EDESTADDRREQ; return -1; }
-    size_t done = 0;
-    while (done < n) {
-        size_t k = n - done > SOCK_IO_MAX ? SOCK_IO_MAX : n - done;
-        long r = sys_send(s->sid, (const char*)b + done, (long)k);
-        if (r <= 0) { if (done) break; errno = EPIPE; return -1; }
-        done += (size_t)r;
-    }
-    return (ssize_t)done;
+    return write(fd, b, n);
 }
 ssize_t recv(int fd, void* b, size_t n, int fl) {
-    struct bbsock* s = sk(fd); (void)fl; if (!s) return -1;
-    long r = sys_recv(s->sid, b, (long)(n > SOCK_IO_MAX ? SOCK_IO_MAX : n));
-    if (r < 0) { errno = s->nonblock ? EAGAIN : ECONNRESET; return -1; }
-    return r;
+    (void)fl; if (!sk(fd)) return -1;
+    return read(fd, b, n);
 }
 ssize_t sendto(int fd, const void* b, size_t n, int fl, const struct sockaddr* a, socklen_t l) {
     struct bbsock* s = sk(fd); if (!s) return -1;
@@ -577,10 +574,9 @@ ssize_t sendto(int fd, const void* b, size_t n, int fl, const struct sockaddr* a
     long r = -1;
     for (int t = 0; t < 4 && r < 0; t++) {   /* a send fails while the next hop's ARP resolves */
         if (t) sleep_ticks(100);
-        r = sys_sendto(s->sid, b, (long)(n > SOCK_IO_MAX ? SOCK_IO_MAX : n), &sa);
+        r = sys_sendto(fd, b, (long)(n > SOCK_IO_MAX ? SOCK_IO_MAX : n), &sa);
     }
-    if (r < 0) { errno = ENETUNREACH; return -1; }
-    return r;
+    return se(r, ENETUNREACH);
 }
 ssize_t recvfrom(int fd, void* b, size_t n, int fl, struct sockaddr* a, socklen_t* l) {
     struct bbsock* s = sk(fd); if (!s) return -1;
@@ -590,10 +586,9 @@ ssize_t recvfrom(int fd, void* b, size_t n, int fl, struct sockaddr* a, socklen_
         return r;
     }
     struct secos_sockaddr sa; memset(&sa, 0, sizeof(sa));
-    long r = sys_recvfrom(s->sid, b, (long)(n > SOCK_IO_MAX ? SOCK_IO_MAX : n), &sa);
-    if (r < 0) { errno = EAGAIN; return -1; }
-    struct sockaddr_in in; memset(&in, 0, sizeof(in));
-    in.sin_family = AF_INET; in.sin_addr.s_addr = sa.ip; in.sin_port = htons(sa.port);
+    long r = se(sys_recvfrom(fd, b, (long)(n > SOCK_IO_MAX ? SOCK_IO_MAX : n), &sa), EAGAIN);
+    if (r < 0) return -1;
+    struct sockaddr_in in; sa_from_secos(&sa, &in);
     if (l) { size_t k = *l < sizeof(in) ? *l : sizeof(in); memcpy(a, &in, k); *l = sizeof(in); }
     return r;
 }
@@ -607,48 +602,34 @@ ssize_t recvmsg(int fd, struct msghdr* m, int fl) {
     return recvfrom(fd, m->msg_iov[0].iov_base, m->msg_iov[0].iov_len, fl, (struct sockaddr*)m->msg_name, m->msg_name ? &m->msg_namelen : NULL);
 }
 static int sock_ioctl(int fd, unsigned long req, void* arg) {
-    struct bbsock* s = sk(fd); if (!s) return -1;
-    if (req == FIONBIO) { s->nonblock = arg ? !!*(int*)arg : 0; return 0; }
+    if (req == FIONBIO) {
+        int fl = fcntl(fd, F_GETFL); if (fl < 0) return -1;
+        return fcntl(fd, F_SETFL, (arg && *(int*)arg) ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK)) < 0 ? -1 : 0;
+    }
     if (req == FIONREAD) { if (arg) *(int*)arg = 0; return 0; }
     errno = ENOTTY; return -1;
 }
-static ssize_t sock_read(int fd, void* b, size_t n) { return recv(fd, b, n, 0); }
-static ssize_t sock_write(int fd, const void* b, size_t n) { return send(fd, b, n, 0); }
-static int sock_close(int fd) {
-    struct bbsock* s = sk(fd); if (!s) return -1;
-    g_fdmap[fd] = 0;
-    if (--s->refs <= 0) { secos_syscall(30 /*SYS_SOCKCLOSE*/, s->sid, 0, 0, 0, 0); s->used = 0; }
-    return 0;
-}
 int dup(int fd) {
-    int i = sock_idx(fd);
-    if (i >= 0) return sock_new_fd(i);
-    return (int)se(sys_dup(fd), EBADF);
+    int n = (int)se(sys_dup(fd), EBADF);
+    if (n >= 0) sock_copy(fd, n);
+    return n;
 }
 int dup2(int o, int n) {
-    int i = sock_idx(o);
-    if (o == n) return (i >= 0 || fcntl(o, F_GETFL) >= 0) ? n : (errno = EBADF, -1);
-    if (i >= 0) {
-        if (n < 0 || n >= SOCKMAP) { errno = EBADF; return -1; }
-        if (is_sock_fd(n)) sock_close(n); else if (n < BB_SOCK_FD_BASE) sys_close(n);
-        g_fdmap[n] = (signed char)(i + 1); g_sock[i].refs++;
-        return n;
-    }
-    if (is_sock_fd(n)) sock_close(n);
-    return (int)se(sys_dup2(o, n), EBADF);
+    int r = (int)se(sys_dup2(o, n), EBADF);
+    if (r >= 0 && o != n) sock_copy(o, n);
+    return r;
 }
 int shutdown(int fd, int how) { (void)how; return sk(fd) ? 0 : -1; }
-int getsockname(int fd, struct sockaddr* a, socklen_t* l) {
-    struct bbsock* s = sk(fd); if (!s) return -1;
-    if (a && l) { size_t k = *l < sizeof(s->local) ? *l : sizeof(s->local); memcpy(a, &s->local, k); *l = sizeof(s->local); }
+static int sockname(int fd, struct sockaddr* a, socklen_t* l, int peer) {
+    if (!sk(fd)) return -1;
+    struct secos_sockaddr k; memset(&k, 0, sizeof(k));
+    if (se(secos_syscall(80 /*SYS_SOCKNAME*/, fd, (long)&k, peer, 0, 0), ENOTCONN) < 0) return -1;
+    struct sockaddr_in in; sa_from_secos(&k, &in);
+    if (a && l) { size_t n = *l < sizeof(in) ? *l : sizeof(in); memcpy(a, &in, n); *l = sizeof(in); }
     return 0;
 }
-int getpeername(int fd, struct sockaddr* a, socklen_t* l) {
-    struct bbsock* s = sk(fd); if (!s) return -1;
-    if (!s->connected) { errno = ENOTCONN; return -1; }
-    if (a && l) { size_t k = *l < sizeof(s->peer) ? *l : sizeof(s->peer); memcpy(a, &s->peer, k); *l = sizeof(s->peer); }
-    return 0;
-}
+int getsockname(int fd, struct sockaddr* a, socklen_t* l) { return sockname(fd, a, l, 0); }
+int getpeername(int fd, struct sockaddr* a, socklen_t* l) { return sockname(fd, a, l, 1); }
 int getsockopt(int fd, int lvl, int opt, void* v, socklen_t* l) {
     struct bbsock* s = sk(fd); if (!s) return -1;
     (void)lvl;
@@ -660,21 +641,8 @@ int socketpair(int d, int t, int p, int sv[2]) { (void)d; (void)t; (void)p; (voi
 unsigned int if_nametoindex(const char* n) { (void)n; errno = ENODEV; return 0; }
 char* if_indextoname(unsigned int i, char* n) { (void)i; (void)n; errno = ENXIO; return NULL; }
 
-/* poll/select: the kernel's SYS_POLL (libc). A descriptor of this layer's
- * socket table is handed to the kernel as the libc socket fd it wraps (dup2
- * may have aliased it onto a low fd the kernel knows nothing about). */
-int poll(struct pollfd* fds, nfds_t n, int timeout) {
-    struct pollfd k[64];
-    if (n > 64) { errno = EINVAL; return -1; }
-    for (nfds_t i = 0; i < n; i++) {
-        k[i] = fds[i];
-        int si = sock_idx(fds[i].fd);
-        if (si >= 0) k[i].fd = g_sock[si].sid;
-    }
-    int r = sys_poll(k, n, timeout);
-    for (nfds_t i = 0; i < n; i++) fds[i].revents = k[i].revents;
-    return r;
-}
+/* poll/select: the kernel's SYS_POLL (libc); sockets are kernel fds. */
+int poll(struct pollfd* fds, nfds_t n, int timeout) { return sys_poll(fds, n, timeout); }
 static int select_ms(int nfd, fd_set* r, fd_set* w, fd_set* e, int ms) {
     struct pollfd pf[64];
     int n = 0;
