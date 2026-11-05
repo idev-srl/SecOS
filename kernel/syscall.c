@@ -86,6 +86,13 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     // program escapes `kill -STOP %1`, Ctrl-C/Ctrl-Z (foreground pgid) and SIGTTIN.
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0) p->pgid = sp->pgid; }
+    // A spawned program starts in its spawner's cwd, as execve() keeps the cwd:
+    // without this `cd /tmp; tar cf a.tar f1` ran tar in "/".
+    { process_t* sp = sched_get_current();
+      if (sp && sp->pid != 0 && sp->cwd[0]) {
+          int i = 0; for (; sp->cwd[i] && i < (int)sizeof(p->cwd) - 1; i++) p->cwd[i] = sp->cwd[i];
+          p->cwd[i] = 0;
+      } }
     p->state = PROC_READY;
     return (int)p->pid;
 }
