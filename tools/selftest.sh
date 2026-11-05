@@ -940,22 +940,25 @@ fi
 #     return address overwritten by the kernel's 88-byte SYS_STAT copy-out.
 # Markers only appear once expanded (the TTY echo shows the raw `$?` text).
 UBLOG=/tmp/secos_selftest_userland.log
-echo "[selftest] Running bash exit-status/signal + stat regressions (mb2, serial, 70s)..."
+echo "[selftest] Running bash exit-status/signal + stat regressions (mb2, serial, 85s)..."
 : > "$UBLOG"
 ( sleep 25
   printf "  bash -c 'exit 142'; echo UB1-\$?\r"; sleep 4
   printf '  sleep 10 & kill -9 $!; wait $!; echo UB2-$?\r'; sleep 4
   printf '  sleep 10 & kill -TERM $!; wait $!; echo UB3-$?\r'; sleep 4
   printf '  stat /bin/bash && echo UB4-$((2+2))\r'; sleep 5
+  printf '  echo UB6-$(head -c 32 /dev/zero | wc -c)\r'; sleep 4
+  printf '  for i in 1 2 3; do sleep 1 & done\r'; sleep 6
   printf '  echo UB5-$((6*7))\r'; sleep 4 ) | \
-    timeout 70 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+    timeout 85 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$UBLOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >/dev/null 2>&1
 grep -q "UB1-142" "$UBLOG"; check "bash survives bash -c 'exit 142' and reports \$? = 142" $?
 grep -q "UB2-137" "$UBLOG"; check "bash survives kill -9 of a child (\$? = 137)" $?
 grep -q "UB3-143" "$UBLOG"; check "bash survives SIGTERM of a child (\$? = 143)" $?
 grep -q "File: /bin/bash" "$UBLOG" && grep -q "UB4-4" "$UBLOG"; check "coreutils stat /bin/bash works (stat ABI)" $?
-grep -q "UB5-42" "$UBLOG"; check "bash still responsive after signal-killed children" $?
+grep -q "UB6-32" "$UBLOG"; check "stdio flushed at exit (head -c 32 /dev/zero | wc -c -> 32)" $?
+grep -q "UB5-42" "$UBLOG"; check "bash survives SIGCHLDs while idle at the prompt (tty -EINTR)" $?
 ! grep -q "\[EXC\]" "$UBLOG"; check "no CPU exception ([EXC]) during exit-status/stat regressions" $?
 
 # ---- M39: UEFI secure boot (loader Ed25519-verifies kernel.elf before jumping) ----
