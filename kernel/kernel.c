@@ -1526,6 +1526,30 @@ static void kernel_main_phase2(void) {
                                 : "[HEAP] FAIL: large kmalloc(64K)\n");
     }
 
+    // Heap hardening selftest: allocation patterns, aligned frees, and the
+    // corruption detectors (exercised in a non-panicking expect mode).
+    heap_selftest();
+
+    // Deliberate heap corruption — must be caught at the source with a clear
+    // HEAP panic. 1 = 1-byte overflow (caught at kfree), 2 = double free.
+#ifndef HEAP_CORRUPT_DEMO
+#define HEAP_CORRUPT_DEMO 0
+#endif
+#if HEAP_CORRUPT_DEMO
+    {
+        uint8_t* hp = (uint8_t*)kmalloc(100);
+        debugcon_writestring("[HEAP-DEMO] start\n");
+#if HEAP_CORRUPT_DEMO == 1
+        hp[100] = 0x41;      // one byte past the end of the allocation
+        kfree(hp);
+#else
+        kfree(hp);
+        kfree(hp);
+#endif
+        debugcon_writestring("[HEAP-DEMO] FAIL: corruption NOT detected\n");
+    }
+#endif
+
     // [M7] Cooperative scheduling demo — two ring3 processes yielding to each
     // other via SYS_YIELD.  Disabled by default so normal boot reaches the
     // shell; the self-test harness builds with -DM7_RING3_DEMO=1.
