@@ -1733,6 +1733,33 @@ fail:
     for(int spin=0; spin<2000 && sched_count_alive_user()>0; spin++){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
 }
 
+// Boot-time launcher (kernel/kernel.c: /bin/init as PID 1). Load and verify one
+// signed program, give it its own process group with the console in the
+// foreground, call `created` on it before it can run, then wait for it to exit.
+// With `keep_running` a stop (SIGSTOP) is undone with SIGCONT instead of
+// returning. Returns -1 when the program is missing or fails its signature
+// check, 0 when it exited, 1 when it stopped.
+int shell_exec_foreground(const char* path, int argc, const char* const* argv,
+                          void (*created)(process_t*), int keep_running){
+    extern process_t* process_create_from_elf_args(const void*, size_t, int, const char* const*);
+    extern int vfs_read_all(const char*, void*, size_t);
+    int n=vfs_read_all(path, g_job_spawn_buf, sizeof(g_job_spawn_buf));
+    if(n<=0) return -1;
+    process_t* p=process_create_from_elf_args(g_job_spawn_buf,(size_t)n,argc,argv);
+    if(!p) return -1;
+    uint32_t pid=p->pid;
+    p->pgid=pid; p->ppid=0;
+    if(created) created(p);
+    p->state=PROC_READY;
+    for(;;){
+        int stopped=job_wait_foreground(pid,&pid,1);
+        if(!stopped || !keep_running) return stopped;
+        process_t* q=process_find_by_pid(pid);
+        if(!q) return 0;
+        signal_post(q,18/*SIGCONT*/);
+    }
+}
+
 // jobs: list tracked background/stopped pipelines.
 static void sh_jobs(const char* a){ (void)a;
     job_gc();

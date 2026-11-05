@@ -226,6 +226,21 @@ static void notify_parent_sigchld(process_t* child) {
     if (parent) signal_post(parent, 17 /*SIGCHLD*/);
 }
 
+// An exiting process's children go to init (PID 1). When init itself exits,
+// say so on the console: the kernel shell takes over (kernel/kernel.c).
+static void exit_reparent(process_t* p) {
+    uint32_t init = process_init_pid();
+    if (!init) return;
+    if (p->pid == init) {
+        process_set_init_pid(0);
+        debugcon_writestring("[INIT] PID 1 (/bin/init) exited, status=");
+        debugcon_print_hex((uint64_t)(uint32_t)p->exit_code);
+        debugcon_writestring("\n");
+        return;
+    }
+    if (process_reparent_children(p->pid)) sched_wake_parent_waitany(init);
+}
+
 void sched_exit_current(trapframe_t* tf) {
     (void)tf;
     if (!current || current == idle_task) return;
@@ -235,6 +250,7 @@ void sched_exit_current(trapframe_t* tf) {
     // [M16] exit_code was set by the SYS_EXIT handler from the user's status.
     process_release_pipes(current);    // close pipe ends now: readers see EOF before wait()
     current->state = PROC_ZOMBIE;
+    exit_reparent(current);                               // children -> PID 1
     notify_parent_sigchld(current);                       // [M30] SIGCHLD to parent
     // [M16/M39] Deliver the status to a blocked waiter; if one collected it, this
     // zombie is reapable. Otherwise it persists until the parent calls wait().
@@ -268,6 +284,7 @@ void sched_kill_current(int sig) {
     current->exit_code = W_SIGNALED(sig);
     process_release_pipes(current);    // close pipe ends now: readers see EOF before wait()
     current->state = PROC_ZOMBIE;
+    exit_reparent(current);                               // children -> PID 1
     notify_parent_sigchld(current);                       // [M30] SIGCHLD to parent
     if (sched_wake_waitpid(current->pid, current->exit_code) > 0) current->collected = 1;
     sched_wake_parent_waitany(current->ppid);                 // [M39] wait-any waiters

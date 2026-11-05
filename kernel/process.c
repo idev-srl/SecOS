@@ -146,6 +146,35 @@ process_t* process_take_jobctl_child(uint32_t ppid, int want_stop, int want_cont
     spin_unlock_irqrestore(&proc_lock, fl);
     return r;
 }
+// PID 1 (/bin/init, started by the kernel at boot). 0 = no init running.
+static uint32_t g_init_pid = 0;
+void     process_set_init_pid(uint32_t pid) { g_init_pid = pid; }
+uint32_t process_init_pid(void) { return g_init_pid; }
+
+// A process `dead` is exiting: hand its children to init (POSIX re-parenting),
+// so init's waitpid(-1) collects their status and no zombie is left without a
+// parent. With no init running the children keep their stale ppid and the
+// reaper frees them as orphans (the pre-init behaviour). Returns 1 when a
+// re-parented child is already a zombie (the caller wakes init's wait).
+int process_reparent_children(uint32_t dead) {
+    uint32_t init = g_init_pid;
+    if (!init || dead == init || dead == 0) return 0;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    int alive = 0, zombie = 0;
+    for (int i=0;i<MAX_PROCESSES;i++) {
+        process_t* q = proc_table[i];
+        if (q && q->pid == init && q->state != PROC_ZOMBIE) { alive = 1; break; }
+    }
+    for (int i=0;i<MAX_PROCESSES && alive;i++) {
+        process_t* p = proc_table[i];
+        if (!p || p->ppid != dead || p->pid == dead) continue;
+        p->ppid = init;
+        if (p->state == PROC_ZOMBIE && !p->collected) zombie = 1;
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return zombie;
+}
+
 int process_has_children(uint32_t ppid) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     int n = 0;
