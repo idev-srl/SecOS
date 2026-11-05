@@ -190,11 +190,10 @@ static int child_role(int argc, char** argv, char** envp) {
         if (c < 0) { bad++; continue; }
         int s = waitpid(c);
         if (!WIFEXITED(s) || WEXITSTATUS(s) != 0) bad++;
-        if (i == LEAK_WARMUP) base = mem_free_kb();
+        if (i == LEAK_WARMUP) { sleep_ticks(100); base = mem_free_kb(); }
+        if (i == 110) { sleep_ticks(100); say_num("[EXECVE] leak: MemFree kB after 110 cycles=", mem_free_kb()); }
     }
-    sleep_ticks(5);                      /* let the last zombie be reaped */
-    int z = fork(); if (z == 0) _exit(0); /* fork reaps collected zombies */
-    waitpid(z);
+    sleep_ticks(100);                    /* let every CPU reap its zombies (idle) */
     long end = mem_free_kb();
     say_num("[EXECVE] leak: MemFree kB after warm-up=", base);
     say_num("[EXECVE] leak: MemFree kB after 200 cycles=", end);
