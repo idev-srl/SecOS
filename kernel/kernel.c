@@ -1247,6 +1247,7 @@ static void m24_run_demo(void) {
 #include "../crypto/user_uaccess_elf.h"
 #include "../crypto/user_abi_test_elf.h"
 #include "../crypto/user_ttytest_elf.h"
+#include "../crypto/user_ptytest_elf.h"
 static void coreutils_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1280,6 +1281,9 @@ static void coreutils_install(void) {
     vfs_create("/bin/abi_test", user_abi_test_elf, user_abi_test_elf_len);
     // [tty] termios / raw mode / VMIN-VTIME / winsize regression test
     vfs_create("/bin/ttytest", user_ttytest_elf, user_ttytest_elf_len);
+    // [pty] pseudo-terminal regression test; also /bin/script (bash on a pty)
+    vfs_create("/bin/ptytest", user_ptytest_elf, user_ptytest_elf_len);
+    vfs_create("/bin/script", user_ptytest_elf, user_ptytest_elf_len);
 }
 extern void shell_init(void);
 extern void shell_run(void);
