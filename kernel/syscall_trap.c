@@ -71,6 +71,17 @@ uint64_t syscall_handler(trapframe_t* tf) {
         return 0; // not reached when a switch occurs
     }
 
+    // Reap this CPU's reapable zombies before creating a process. Zombies were
+    // only reaped from the idle context, which never runs while user tasks stay
+    // runnable (e.g. a bash loop of `$(...)` substitutions), so dead processes
+    // piled up until the process/kernel-stack slots ran out. This is safe here:
+    // every zombie has already switched off its own kernel stack and address
+    // space, and the caller (current) is not a zombie.
+    if (num == SYS_FORK || num == SYS_SPAWN) {
+        extern void sched_reap_zombies(void);
+        sched_reap_zombies();
+    }
+
     uint64_t ret;
 
     // [M30] SYS_SIGRETURN: restore the context saved when a signal handler was
