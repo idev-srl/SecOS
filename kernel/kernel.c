@@ -1246,6 +1246,7 @@ static void m24_run_demo(void) {
 #include "../crypto/user_sysfuzz_elf.h"
 #include "../crypto/user_uaccess_elf.h"
 #include "../crypto/user_abi_test_elf.h"
+#include "../crypto/user_kitest_elf.h"
 static void coreutils_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1277,6 +1278,8 @@ static void coreutils_install(void) {
     vfs_create("/bin/uaccess_test", user_uaccess_elf, user_uaccess_elf_len);
     // [abi] wait-status / DF-on-entry / PROT_NONE regression test
     vfs_create("/bin/abi_test", user_abi_test_elf, user_abi_test_elf_len);
+    // kernel interfaces for userland tools (procfs/klog/time/statfs/poll/...)
+    vfs_create("/bin/kitest", user_kitest_elf, user_kitest_elf_len);
 }
 extern void shell_init(void);
 extern void shell_run(void);

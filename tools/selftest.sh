@@ -1226,6 +1226,85 @@ grep -q "\[ABI-TEST\] pn-fork-parent-copy-isolated OK" "$UALOG"; check "ABI PROT
 ! grep -q "\[ABI-TEST\] .* FAIL" "$UALOG"; check "ABI no case failed" $?
 ! grep -q "\[PANIC\]" "$UALOG"; check "UACCESS no kernel panic" $?
 
+# ============================================================================
+# KERNEL INTERFACES GATE (kernel/kiface.c, fs/procfs.c, kernel/klog.c,
+# kernel/kclock.c): the signed ring-3 program user/kitest.c (/bin/kitest)
+# exercises per-pid /proc (+ a forked child appearing/disappearing), /proc/stat,
+# loadavg, meminfo, mounts, the kernel log (klogctl + /dev/kmsg, dmesg -c),
+# RTC wall clock + nanosleep (sub-tick, EINTR) + strftime, uname/sysinfo/umask/
+# access, statfs, rename/link/truncate/rmdir, poll/select (pipe, tty, timeouts,
+# EINTR) and symlinks in the middle of a path. Boot 1 runs it on the RAMFS root
+# and on a journalled metadata_csum ext4 data disk (/mnt), then stages an atomic
+# rename-over-existing and powers off; boot 2 checks the rename survived and
+# reports statfs, which must equal dumpe2fs; the disk must stay e2fsck-clean.
+# Reuses the plain myos.iso built for the uaccess gate.
+# ============================================================================
+KILOG=/tmp/secos_selftest_kiface.log
+KILOG2=/tmp/secos_selftest_kiface2.log
+KIFLOG=/tmp/secos_selftest_kiface_fat.log
+KIDISK=/tmp/secos_selftest_kiface_ext4.img
+KIFAT=/tmp/secos_selftest_kiface_fat.img
+echo "[selftest] Running kernel-interfaces gate (mb2, serial, ext4 data disk, 2 boots)..."
+dd if=/dev/zero of="$KIDISK" bs=1M count=64 status=none
+mkfs.ext4 -q -F -L KIDATA "$KIDISK"
+: > "$KILOG"
+( sleep 25; printf '  /bin/kitest; echo KI-$((6*7))-END\r'; sleep 15
+  printf '  /bin/kitest disk /mnt; echo KID-$((6*7))-END\r'; sleep 12
+  printf '  /bin/kitest persist1 /mnt; echo KIP-$((6*7))-END\r'; sleep 5
+  printf '  poweroff\r'; sleep 2 ) | \
+    timeout 90 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -drive file="$KIDISK",if=virtio,format=raw \
+        -debugcon file:"$KILOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+host_now=$(date +%s)
+grep -q "KI-42-END" "$KILOG"; check "KIFACE shell survives /bin/kitest (sentinel reached)" $?
+grep -Eq "\[KI-TEST\] DONE pass=[0-9]+ fail=0" "$KILOG"; check "KIFACE RAMFS run: every case passes (DONE fail=0)" $?
+for c in proc-self-symlink proc-pid-stat-parses proc-child-appears proc-child-disappears proc-fd-pipe-link \
+         proc-stat proc-meminfo proc-mounts dmesg-has-boot-line dmesg-clear dev-kmsg-record \
+         time-is-unix-epoch nanosleep-sub-tick-300us nanosleep-eintr-rem strftime-1700000000 \
+         poll-blocks-until-pipe-data poll-tty-no-input-timeout poll-eintr select-readable \
+         midpath-symlink-via-proc-cwd rename-replaces-target rename-exdev rmdir-enotempty; do
+    grep -q "\[KI-TEST\] $c OK" "$KILOG"; check "KIFACE $c" $?
+done
+kt=$(grep -ao "\[KI-TEST\] time=[0-9]*" "$KILOG" | head -1 | sed 's/.*=//')
+[[ -n "$kt" && $(( host_now - kt )) -ge 0 && $(( host_now - kt )) -lt 300 ]]
+check "KIFACE time() is the host's wall clock (guest=${kt:-?} host=$host_now)" $?
+grep -q "KID-42-END" "$KILOG"; check "KIFACE ext4 /mnt run completed" $?
+[[ "$(grep -Ec '\[KI-TEST\] DONE pass=[0-9]+ fail=0' "$KILOG")" -ge 3 ]]; check "KIFACE ext4 + persist runs: every case passes" $?
+for c in link-nlink-2 link-shares-data unlink-one-link-keeps-file rename-dir-moves-children truncate-shrink \
+         ftruncate-grow-zero-fill mtime-is-wall-clock umask-applied-on-create midpath-relative-symlink \
+         midpath-absolute-symlink symlink-loop-eloop midpath-loop-eloop statfs-tracks-allocation persist1-rename; do
+    grep -q "\[KI-TEST\] $c OK" "$KILOG"; check "KIFACE ext4 $c" $?
+done
+e2fsck -fn "$KIDISK" >/dev/null 2>&1; check "KIFACE ext4 data disk e2fsck-clean after boot 1" $?
+: > "$KILOG2"
+( sleep 25; printf '  /bin/kitest persist2 /mnt; echo KIP2-$((6*7))-END\r'; sleep 6
+  printf '  poweroff\r'; sleep 2 ) | \
+    timeout 60 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -drive file="$KIDISK",if=virtio,format=raw \
+        -debugcon file:"$KILOG2" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "\[KI-TEST\] persist2-rename-survived-reboot OK" "$KILOG2"; check "KIFACE ext4 rename-over-existing survives a reboot" $?
+e2fsck -fn "$KIDISK" >/dev/null 2>&1; check "KIFACE ext4 data disk e2fsck-clean after boot 2" $?
+sf=$(grep -ao "statfs-final blocks=[0-9]* bfree=[0-9]* files=[0-9]* ffree=[0-9]*" "$KILOG2" | head -1)
+de=$(dumpe2fs -h "$KIDISK" 2>/dev/null | awk -F: '/^Block count/{b=$2}/^Free blocks/{f=$2}/^Inode count/{i=$2}/^Free inodes/{fi=$2}
+     END{gsub(/ /,"",b);gsub(/ /,"",f);gsub(/ /,"",i);gsub(/ /,"",fi); printf "statfs-final blocks=%s bfree=%s files=%s ffree=%s", b,f,i,fi}')
+[[ -n "$sf" && "$sf" == "$de" ]]; check "KIFACE statfs == dumpe2fs ($sf | $de)" $?
+# FAT32 data disk: rename/truncate/rmdir/statfs (no hard links / symlinks).
+dd if=/dev/zero of="$KIFAT" bs=1M count=64 status=none
+mkfs.fat -F 32 -n KIFAT "$KIFAT" >/dev/null
+: > "$KIFLOG"
+( sleep 25; printf '  /bin/kitest disk /mnt; echo KIF-$((6*7))-END\r'; sleep 12 ) | \
+    timeout 50 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -drive file="$KIFAT",if=virtio,format=raw \
+        -debugcon file:"$KIFLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -Eq "\[KI-TEST\] DONE pass=[0-9]+ fail=0" "$KIFLOG"; check "KIFACE FAT32 /mnt run: every case passes" $?
+grep -q "\[KI-TEST\] statfs /mnt type=0x4d44" "$KIFLOG"; check "KIFACE FAT32 statfs reports MSDOS magic" $?
+fsck.fat -n "$KIFAT" >/dev/null 2>&1; check "KIFACE FAT32 data disk fsck.fat-clean" $?
+! grep -q "\[EXC\]" "$KILOG" "$KILOG2" "$KIFLOG"; check "KIFACE no CPU exception ([EXC])" $?
+! grep -q "\[PANIC\]" "$KILOG" "$KILOG2" "$KIFLOG"; check "KIFACE no kernel panic" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
