@@ -194,6 +194,19 @@ $(CRYPTO_DIR)/%.o: $(CRYPTO_DIR)/%.c
 $(NET_DIR)/%.o: $(NET_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# SSH public keys baked into the image: `make iso SSH_AUTHORIZED_KEYS=~/.ssh/id.pub`
+# (one or more .pub / authorized_keys files, space-separated). The kernel installs
+# them as /root/.ssh/authorized_keys at boot. Without the variable no key is baked
+# and Dropbear refuses every login. The generated header lives in build/ (ignored
+# by git) and is rewritten only when the key set changes. Never commit a key.
+SSH_AUTHORIZED_KEYS ?=
+AUTHKEYS_H = build/authorized_keys.h
+.PHONY: FORCE
+FORCE:
+$(AUTHKEYS_H): FORCE
+	@python3 tools/gen-authorized-keys.py $@ $(SSH_AUTHORIZED_KEYS)
+$(KERNEL_DIR)/kernel.o: $(AUTHKEYS_H)
+
 $(KERNEL): $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 	@# [secure-boot] Sign kernel.bin in place (deterministic dev key → reproducible).
