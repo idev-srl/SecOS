@@ -48,6 +48,19 @@ static int sig_interrupted(process_t* cur, trapframe_t* tf) {
     return signal_pending(cur);
 }
 
+// Socket I/O that may block: read/write/recv/send/recvfrom/sendto/accept on a
+// socket fd. Returns the fd's entry when `num` is one of them and the fd is a
+// socket, else NULL.
+static struct proc_fd_entry* sock_wait_fd(process_t* cur, uint64_t num, uint64_t a0) {
+    if (!cur) return NULL;
+    if (num != SYS_READ && num != SYS_WRITE && num != SYS_RECV && num != SYS_SEND &&
+        num != SYS_RECVFROM && num != SYS_SENDTO && num != SYS_ACCEPT) return NULL;
+    if (a0 >= 32 || !cur->fds[a0].used || !cur->fds[a0].is_sock) return NULL;
+    return &cur->fds[a0];
+}
+#define SOCK_O_NONBLOCK 0x800
+#define SOCK_WAIT_TICKS 2   // re-check readiness every ~2 ms (no RX wakeup hook yet)
+
 uint64_t syscall_handler(trapframe_t* tf) {
     process_t* cur = sched_get_current();
     uint64_t num = tf->rax;
@@ -281,6 +294,27 @@ uint64_t syscall_handler(trapframe_t* tf) {
             ret = 0;                                     // not reached
         } else {
             ret = 0;
+        }
+    }
+    // Blocking socket I/O: the socket layer is non-blocking and returns -EAGAIN;
+    // for a blocking fd sleep a couple of ticks (the timer tick polls the NIC)
+    // and re-run the syscall, so a process waiting on the network yields the
+    // CPU instead of spinning in ring 0. A pending signal ends the wait with
+    // -EINTR. sleep_until is ours between re-runs and is cleared on entry.
+    else if (sock_wait_fd(cur, num, tf->rdi)) {
+        struct proc_fd_entry* e = sock_wait_fd(cur, num, tf->rdi);
+        cur->sleep_until = 0;
+        ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
+        if (ret == (uint64_t)(int64_t)(-11) && !(e->flags & SOCK_O_NONBLOCK)) {
+            if (sig_interrupted(cur, tf)) {
+                ret = (uint64_t)(int64_t)(-4);          // EINTR
+            } else {
+                extern uint64_t timer_get_ticks(void);
+                cur->sleep_until = timer_get_ticks() + SOCK_WAIT_TICKS;
+                tf->rip -= 2;                           // re-run on wake
+                sched_block_current(tf);                // NORETURN
+                ret = 0;                                 // not reached
+            }
         }
     }
     // [M25] SYS_READ / SYS_WRITE on a pipe may block. ksys_read/ksys_write return

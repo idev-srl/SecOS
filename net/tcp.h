@@ -28,13 +28,19 @@ typedef struct tcp_conn tcp_conn_t;
 tcp_conn_t* tcp_alloc(void);                              /* a free CLOSED conn, or NULL */
 void        tcp_free(tcp_conn_t* c);                      /* release (aborts if open) */
 int         tcp_start_connect(tcp_conn_t* c, net_dev_t* dev, uint32_t dip, uint16_t dport);
-int         tcp_start_listen(tcp_conn_t* c, net_dev_t* dev, uint16_t port);
+int         tcp_start_listen(tcp_conn_t* c, net_dev_t* dev, uint16_t port, int backlog);
 tcp_conn_t* tcp_accept_ready(tcp_conn_t* lc);             /* a newly ESTABLISHED child, or NULL */
+int         tcp_accept_pending(const tcp_conn_t* lc);     /* children ready for accept (peek) */
 int         tcp_write(tcp_conn_t* c, const void* data, uint32_t len);   /* bytes queued, <0 err */
 int         tcp_read(tcp_conn_t* c, void* buf, uint32_t len);           /* bytes read; 0=none; -1=closed+empty */
 int         tcp_start_close(tcp_conn_t* c);              /* begin orderly shutdown */
 tcp_state_t tcp_get_state(const tcp_conn_t* c);
 int         tcp_rx_available(const tcp_conn_t* c);       /* buffered receive bytes */
+int         tcp_tx_space(const tcp_conn_t* c);           /* free send-buffer bytes */
+int         tcp_was_reset(const tcp_conn_t* c);          /* peer RST / retransmit give-up */
+void        tcp_get_addrs(const tcp_conn_t* c, uint32_t* lip, uint16_t* lport,
+                          uint32_t* rip, uint16_t* rport); /* ip: network-order octets */
+void        tcp_release(tcp_conn_t* c);                  /* non-blocking close (socket layer) */
 
 /* ---- blocking convenience (shell tcptest) ---- */
 tcp_conn_t* tcp_connect(net_dev_t* dev, uint32_t dip, uint16_t dport);   /* NULL on fail */

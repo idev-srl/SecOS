@@ -12,6 +12,7 @@
  */
 #include "tcp.h"
 #include "debugcon.h"
+#include "../crypto/csprng.h"
 #include <stddef.h>
 
 extern uint64_t timer_get_ticks(void);
@@ -28,6 +29,8 @@ extern uint64_t timer_get_ticks(void);
 #define TCP_RTO      600           /* ~600 ms at 1 kHz */
 #define TCP_MAX_RETX 6
 #define TCP_TIMEWAIT 2000          /* ~2 s linger */
+#define TCP_MAX_BACKLOG 4          /* per-listener queued children (16-entry table) */
+#define TCP_ORPHAN_MS 10000        /* a released conn gets this long to finish FIN */
 
 /* flags */
 #define F_FIN 0x01
@@ -54,11 +57,20 @@ struct tcp_conn {
     uint64_t     tw_deadline;          /* TIME_WAIT expiry */
     struct tcp_conn* listener;         /* parent LISTEN conn (passive children) */
     uint8_t      accepted;             /* child handed out by tcp_accept_ready */
+    uint8_t      orphan;               /* socket released it: free once closed */
+    uint64_t     orphan_deadline;      /* hard limit for an orphan's FIN handshake */
+    int          backlog;              /* LISTEN: max not-yet-accepted children */
 };
 
 static struct tcp_conn g_conns[TCP_MAX_CONN];
+
+/* A connection reached CLOSED: free the slot unless the socket layer still
+ * owns it (an accepted child or an active-open conn stays until released). */
+static void conn_closed(struct tcp_conn* c){
+    c->state = TCP_CLOSED;
+    if (c->orphan || (c->listener && !c->accepted)) c->used = 0;
+}
 static uint16_t g_eph = 49152;
-static uint32_t g_iss_seed = 0x1000;
 static uint8_t  g_seg[1600];           /* TX scratch (header + data) */
 static uint8_t  g_cs[12 + 1600];       /* pseudo-header + segment for checksum */
 
@@ -161,7 +173,7 @@ int tcp_start_connect(tcp_conn_t* c, net_dev_t* dev, uint32_t dip, uint16_t dpor
     if(!c||!dev) return -1;
     c->dev=dev; c->remote_ip=dip; c->remote_port=dport;
     c->local_port=eph_port();
-    c->iss = (g_iss_seed += 0x9E37) ^ (uint32_t)timer_get_ticks();
+    c->iss = csprng_u32();                          /* unpredictable ISN (blind injection) */
     c->snd_una=c->iss; c->snd_nxt=c->iss; c->rcv_nxt=0;
     c->state=TCP_SYN_SENT;
     tcp_xmit(c, F_SYN, NULL, 0, c->iss);
@@ -170,16 +182,34 @@ int tcp_start_connect(tcp_conn_t* c, net_dev_t* dev, uint32_t dip, uint16_t dpor
     return 0;
 }
 
-int tcp_start_listen(tcp_conn_t* c, net_dev_t* dev, uint16_t port){
-    if(!c||!dev) return -1;
-    c->dev=dev; c->local_port=port; c->state=TCP_LISTEN; return 0;
+int tcp_start_listen(tcp_conn_t* c, net_dev_t* dev, uint16_t port, int backlog){
+    if(!c||!dev||!port) return -1;
+    for(int i=0;i<TCP_MAX_CONN;i++)                 /* one listener per port */
+        if(&g_conns[i]!=c && g_conns[i].used && g_conns[i].state==TCP_LISTEN && g_conns[i].local_port==port)
+            return -1;
+    if(backlog<1) backlog=1;
+    if(backlog>TCP_MAX_BACKLOG) backlog=TCP_MAX_BACKLOG;
+    c->dev=dev; c->local_port=port; c->state=TCP_LISTEN; c->backlog=backlog; return 0;
 }
+
+/* Children of 'lc' not yet handed to accept(): embryonic (SYN-RCVD) + ready. */
+static int listener_queued(const struct tcp_conn* lc, int ready_only){
+    int n=0;
+    for(int i=0;i<TCP_MAX_CONN;i++){
+        const struct tcp_conn* c=&g_conns[i];
+        if(c->used && c->listener==lc && !c->accepted &&
+           (!ready_only || c->state==TCP_ESTABLISHED || c->state==TCP_CLOSE_WAIT)) n++;
+    }
+    return n;
+}
+int tcp_accept_pending(const tcp_conn_t* lc){ return lc ? listener_queued(lc, 1) : 0; }
 
 tcp_conn_t* tcp_accept_ready(tcp_conn_t* lc){
     if(!lc) return NULL;
     for(int i=0;i<TCP_MAX_CONN;i++){
         struct tcp_conn* c=&g_conns[i];
-        if(c->used && c->listener==lc && !c->accepted && c->state==TCP_ESTABLISHED){
+        if(c->used && c->listener==lc && !c->accepted &&
+           (c->state==TCP_ESTABLISHED || c->state==TCP_CLOSE_WAIT)){
             c->accepted=1; return c;
         }
     }
@@ -268,11 +298,15 @@ void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len
     if(!c){
         struct tcp_conn* lc=find_listener(dport);
         if(lc && (flags&F_SYN) && !(flags&F_ACK)){
+            /* SYN-flood bound: a listener may hold at most `backlog` children
+             * that accept() has not taken yet, so a flood of SYNs cannot eat
+             * the whole (shared, 16-entry) connection table. */
+            if(listener_queued(lc, 0) >= lc->backlog) return;
             struct tcp_conn* ch=tcp_alloc();
             if(!ch) return;
             ch->dev=dev; ch->remote_ip=src_ip; ch->remote_port=sport; ch->local_port=dport;
             ch->listener=lc;
-            ch->iss=(g_iss_seed+=0x9E37)^(uint32_t)timer_get_ticks();
+            ch->iss=csprng_u32();
             ch->rcv_nxt=seq+1; ch->snd_una=ch->iss; ch->snd_nxt=ch->iss;
             ch->snd_wnd=wnd; ch->state=TCP_SYN_RCVD;
             tcp_xmit(ch, F_SYN|F_ACK, NULL, 0, ch->iss);
@@ -281,7 +315,22 @@ void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len
         return;
     }
 
-    if(flags&F_RST){ c->reset=1; c->state=TCP_CLOSED; if(c->listener) c->used=0; return; }
+    if(flags&F_RST){
+        /* RFC 5961: an RST is honoured only when it hits rcv_nxt exactly (or,
+         * in SYN-SENT, acknowledges our SYN); an in-window RST draws a
+         * challenge ACK; anything else is dropped. Blind RST injection now has
+         * to guess the exact 32-bit sequence number. */
+        int ok;
+        if(c->state==TCP_SYN_SENT) ok = (flags&F_ACK) && ack==c->snd_nxt;
+        else ok = (seq==c->rcv_nxt);
+        if(!ok){
+            uint32_t rwnd = TCP_RXBUF - c->rx_len;
+            if(c->state!=TCP_SYN_SENT && seq_gt(seq, c->rcv_nxt) && seq_lt(seq, c->rcv_nxt+rwnd))
+                tcp_xmit(c, F_ACK, NULL, 0, c->snd_nxt);
+            return;
+        }
+        c->reset=1; conn_closed(c); return;
+    }
 
     c->snd_wnd=wnd;
 
@@ -322,7 +371,7 @@ void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len
             if(c->state==TCP_SYN_RCVD) c->state=TCP_ESTABLISHED;
             else if(c->state==TCP_FIN_WAIT_1 && c->snd_una==c->snd_nxt) c->state=TCP_FIN_WAIT_2;
             else if(c->state==TCP_CLOSING && c->snd_una==c->snd_nxt){ c->state=TCP_TIME_WAIT; c->tw_deadline=timer_get_ticks()+TCP_TIMEWAIT; }
-            else if(c->state==TCP_LAST_ACK && c->snd_una==c->snd_nxt){ c->state=TCP_CLOSED; if(c->listener) c->used=0; return; }
+            else if(c->state==TCP_LAST_ACK && c->snd_una==c->snd_nxt){ conn_closed(c); return; }
         }
     }
 
@@ -357,12 +406,13 @@ void tcp_tick(void){
         struct tcp_conn* c=&g_conns[i];
         if(!c->used) continue;
         if(c->state==TCP_TIME_WAIT){
-            if(now>=c->tw_deadline){ c->state=TCP_CLOSED; if(c->listener) c->used=0; }
+            if(now>=c->tw_deadline) conn_closed(c);
             continue;
         }
+        if(c->orphan && (c->state==TCP_CLOSED || now>=c->orphan_deadline)){ c->used=0; continue; }
         if(c->state==TCP_CLOSED) continue;
         if(c->rto_deadline && now>=c->rto_deadline && c->snd_una!=c->snd_nxt){
-            if(++c->retries>TCP_MAX_RETX){ c->reset=1; c->state=TCP_CLOSED; if(c->listener) c->used=0; continue; }
+            if(++c->retries>TCP_MAX_RETX){ c->reset=1; conn_closed(c); continue; }
             /* Retransmit the oldest unacked unit. */
             if(c->state==TCP_SYN_SENT) tcp_xmit(c, F_SYN, NULL, 0, c->iss);
             else if(c->state==TCP_SYN_RCVD) tcp_xmit(c, F_SYN|F_ACK, NULL, 0, c->iss);
@@ -430,6 +480,35 @@ int tcp_recv_block(tcp_conn_t* c, void* buf, uint32_t len, uint32_t ms){
         __asm__ volatile("sti; hlt");
     }
     return 0;
+}
+
+/* Non-blocking close for the socket layer: start the orderly FIN handshake and
+ * hand the slot to tcp_tick(), which frees it once CLOSED/TIME-WAIT is over (or
+ * after TCP_ORPHAN_MS). A LISTEN conn also drops its not-yet-accepted children. */
+void tcp_release(tcp_conn_t* c){
+    if(!c || !c->used) return;
+    if(c->state==TCP_LISTEN){
+        for(int i=0;i<TCP_MAX_CONN;i++){
+            struct tcp_conn* ch=&g_conns[i];
+            if(ch->used && ch->listener==c){
+                if(!ch->accepted){
+                    if(ch->state!=TCP_CLOSED) tcp_xmit(ch, F_RST|F_ACK, NULL, 0, ch->snd_nxt);
+                    ch->used=0;
+                } else ch->listener=NULL;           /* accepted: owned by its socket now */
+            }
+        }
+        c->used=0; c->state=TCP_CLOSED;
+        return;
+    }
+    if(c->state==TCP_CLOSED || c->state==TCP_SYN_SENT || c->state==TCP_SYN_RCVD){ c->used=0; c->state=TCP_CLOSED; return; }
+    c->orphan=1; c->orphan_deadline=timer_get_ticks()+TCP_ORPHAN_MS;
+    tcp_start_close(c);
+}
+int tcp_tx_space(const tcp_conn_t* c){ return c ? (int)(TCP_TXBUF - c->tx_len) : 0; }
+int tcp_was_reset(const tcp_conn_t* c){ return c ? c->reset : 0; }
+void tcp_get_addrs(const tcp_conn_t* c, uint32_t* lip, uint16_t* lport, uint32_t* rip, uint16_t* rport){
+    *lip = (c && c->dev) ? c->dev->ip : 0; *lport = c ? c->local_port : 0;
+    *rip = c ? c->remote_ip : 0; *rport = c ? c->remote_port : 0;
 }
 
 void tcp_close(tcp_conn_t* c){

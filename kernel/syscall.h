@@ -69,6 +69,8 @@
 #define SYS_GETPGID     57 // getpgid(pid) -> process group id (pid 0 = caller) / -ESRCH
 #define SYS_SIGSUSPEND  58 // sigsuspend(mask) -> -EINTR once a signal was delivered
 #define SYS_REBOOT      59 // reboot(cmd): orderly poweroff(1)/restart(2)/halt(3); returns only on error
+// 60-79 are reserved for execve/fcntl/... and the kiface calls (poll, clock, ...).
+#define SYS_SOCKNAME    80 // sockname(fd, secos_sockaddr*, peer): getsockname (0) / getpeername (1)
 // Note: execve is emulated in libc (spawn+waitpid+_exit) — no kernel syscall.
 
 // [M24] socket types
