@@ -392,7 +392,7 @@ LUA_UF = -ffreestanding -nostdlib -fno-pie -no-pie -mno-red-zone -mcmodel=large 
          -Iuser -Iuser/include -I$(LUASRC) -ffunction-sections -fdata-sections -include user/lua_port.h
 LUA_CORE = lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes lparser \
            lstate lstring ltable ltm lundump lvm lzio lauxlib
-LUA_LIBS = lbaselib lcorolib lmathlib lstrlib ltablib lutf8lib
+LUA_LIBS = lbaselib lcorolib lmathlib lstrlib ltablib lutf8lib liolib loslib
 .PHONY: port-lua
 port-lua:
 	$(CC) $(USER_CFLAGS) -c user/crt0.S     -o user/crt0.o
