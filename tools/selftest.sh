@@ -1727,6 +1727,33 @@ check "M40 console: text console restored after the graphics owner exits and aft
 grep -q "^GG-CRASHING" "$GUILOG" && grep -q "\[KILL\] pid=" "$GUILOG"; check "M40 console: the crashing graphics client was killed (SIGSEGV)" $?
 ! grep -q "\[PANIC\]\|\[EXC\].*ring0" "$GUILOG"; check "M40 no kernel panic / ring-0 fault during the GUI gate" $?
 
+# fb0 under UEFI/OVMF (GOP framebuffer, q35): the same fb + handoff checks.
+# The ESP is a private copy (vvfat is read-write: the guest may write to it).
+OVMF_G=""
+for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
+         /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2-ovmf/OVMF_CODE.fd; do
+    [[ -f "$f" ]] && { OVMF_G="$f"; break; }
+done
+if [[ -n "$OVMF_G" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
+    GUIULOG=/tmp/secos_selftest_gui_uefi.log
+    GUIUDIST=$(mktemp -d /tmp/secos_gui_esp.XXXXXX); cp -r dist/. "$GUIUDIST"/
+    echo "[selftest] Running M40 fb0 under UEFI/OVMF (q35, serial, 115s)..."
+    : > "$GUIULOG"
+    ( sleep 55; printf '\025  /bin/guitest fb\r'; sleep 20; printf '\025  /bin/guitest gfx\r'; sleep 25
+      printf '\025  echo UEFIGUI-$((6*7))-END\r'; sleep 5 ) | \
+        timeout 115 qemu-system-x86_64 -machine q35,accel=tcg -m 512M -bios "$OVMF_G" \
+            -drive format=raw,file=fat:rw:"$GUIUDIST"/ \
+            -debugcon file:"$GUIULOG" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -net none -serial stdio >/dev/null 2>&1
+    rm -rf "$GUIUDIST"
+    grep -q "G-END fb fails=0" "$GUIULOG"; check "M40 UEFI: guitest fb (GOP fb0 ioctls/mmap/refusals/no leak) 0 failures" $?
+    grep -q "^GG-KDGRAPHICS-OK" "$GUIULOG" && grep -q "\[VT\] text console restored (graphics owner exited" "$GUIULOG"
+    check "M40 UEFI: KD_GRAPHICS + text console restored on exit" $?
+    grep -q "UEFIGUI-42-END" "$GUIULOG"; check "M40 UEFI: bash responsive afterwards" $?
+else
+    echo "  [SKIP] M40 UEFI fb0 gate (OVMF missing or make uefi failed)"
+fi
+
 GUIKLOG=/tmp/secos_selftest_gui_it.log
 GUIKDRV=/tmp/secos_selftest_gui_it.drv
 echo "[selftest] Building KEYMAP=it image + USB HID keyboard gate (<=300s)..."
