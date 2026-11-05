@@ -1442,7 +1442,10 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
       static const char bashrc[] =
           "# /etc/bash.bashrc - read by every interactive bash (SecOS)\n"
           "# bash sets TERM=dumb when it is unset: pick the console entry instead.\n"
-          "case \"$TERM\" in \"\"|dumb) export TERM=linux ;; esac\n";
+          "case \"$TERM\" in \"\"|dumb) export TERM=linux ;; esac\n"
+          "# The kernel starts bash with an empty environment: export a PATH and HOME\n"
+          "# so programs it runs (env, BusyBox, lua os.getenv) see them too.\n"
+          "export PATH=\"${PATH:-/bin:/usr/bin}\" HOME=\"${HOME:-/root}\"\n";
       static const char inputrc[] =
           "# /etc/inputrc - GNU readline defaults (SecOS console)\n"
           "set enable-bracketed-paste off\n"

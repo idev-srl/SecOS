@@ -110,7 +110,23 @@ static int ramfs_vfs_rename(const char* oldp, const char* newp){
 }
 static int ramfs_vfs_truncate(const char* path, size_t ns){ if(!path) return -1; const char* p=path; if(p[0]=='/') p++; return ramfs_truncate(p, ns); }
 
+// statfs: like tmpfs, the size is the file data plus the free RAM it can still
+// grow into; inodes are the fixed entry table.
+static int ramfs_vfs_statfs(vfs_statfs_t* st){
+    extern uint64_t pmm_get_free_memory(void);
+    static const ramfs_entry_t* all[RAMFS_MAX_FILES];
+    size_t n = ramfs_list(all, RAMFS_MAX_FILES);
+    uint64_t used = 0;
+    for(size_t i=0;i<n;i++) used += (all[i]->size + 4095) / 4096;
+    uint64_t freeb = pmm_get_free_memory() / 4096;
+    st->bsize = st->frsize = 4096;
+    st->blocks = used + freeb; st->bfree = freeb; st->bavail = freeb;
+    st->files = RAMFS_MAX_FILES; st->ffree = RAMFS_MAX_FILES > n ? RAMFS_MAX_FILES - n : 0;
+    return 0;
+}
+
 static vfs_fs_ops_t ramfs_ops = {
+    .statfs = ramfs_vfs_statfs,
     .lookup = ramfs_vfs_lookup,
     .readdir = ramfs_vfs_readdir,
     .read = ramfs_vfs_read,
