@@ -922,6 +922,65 @@ else
     echo "  [SKIP] M39 secure boot (OVMF missing or make uefi failed)"
 fi
 
+# ======================================================================
+# ---- Heap hardening: integrity checks catch corruption at the source ----
+# ======================================================================
+# (1) Default image: the boot heap selftest (alloc patterns, aligned frees,
+#     every detector in non-panicking expect mode) passes.
+# (2) HEAP_CORRUPT_DEMO=1: a 1-byte overflow past kmalloc(100) must panic at
+#     kfree with the tail-canary message; =2: a double free must panic as such.
+# (3) -DSECOS_HEAP_DEBUG (poison-on-free + periodic full check): boot into
+#     bash, run a command burst, drop to the recovery shell and `heapcheck` —
+#     no false positive, heap sound.
+HEAPLOG=/tmp/secos_selftest_heap.log
+echo "[selftest] Building heap-hardening image (default)..."
+make clean >/dev/null 2>&1 || true
+if ! make >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] HEAP BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    exit 2
+fi
+tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$HEAPLOG" >/dev/null 2>&1 || true
+grep -q "\[HEAP\]\[SELFTEST\] all PASS" "$HEAPLOG"; check "HEAP boot selftest all PASS (patterns, aligned kfree, detectors)" $?
+! grep -q "\[HEAP\]\[SELFTEST\] FAIL" "$HEAPLOG"; check "HEAP no selftest case failed" $?
+! grep -q "\[HEAP\] CORRUPTION DETECTED" "$HEAPLOG"; check "HEAP no corruption reported on a clean boot" $?
+for demo in 1 2; do
+    DLOG=/tmp/secos_selftest_heap_demo$demo.log
+    echo "[selftest] Building HEAP_CORRUPT_DEMO=$demo image..."
+    make clean >/dev/null 2>&1 || true
+    if ! make CFLAGS_EXTRA=-DHEAP_CORRUPT_DEMO=$demo >/tmp/secos_selftest_build.log 2>&1; then
+        echo "[selftest] HEAP DEMO BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+        exit 2
+    fi
+    tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$DLOG" >/dev/null 2>&1 || true
+    grep -q "\[HEAP-DEMO\] start" "$DLOG"; check "HEAP demo $demo reached" $?
+    ! grep -q "\[HEAP-DEMO\] FAIL" "$DLOG"; check "HEAP demo $demo: corruption did not go unnoticed" $?
+done
+grep -q "\[PANIC\] HEAP: heap buffer overflow (tail canary smashed)" /tmp/secos_selftest_heap_demo1.log
+check "HEAP 1-byte overflow -> panic at kfree (tail canary)" $?
+grep -q "\[PANIC\] HEAP: double free" /tmp/secos_selftest_heap_demo2.log
+check "HEAP double free -> panic (double free)" $?
+HDBGLOG=/tmp/secos_selftest_heap_debug.log
+echo "[selftest] Building SECOS_HEAP_DEBUG image + bash burst (serial input, 90s)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA=-DSECOS_HEAP_DEBUG >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] HEAP DEBUG BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    exit 2
+fi
+: > "$HDBGLOG"
+( sleep 25
+  for i in $(seq 1 15); do printf '  ls /\r'; sleep 0.6; printf '  cat /proc/meminfo\r'; sleep 0.6; done
+  printf '  echo HEAPDBG-$((6*7))-OK\r'; sleep 3
+  printf '  exit\r'; sleep 4
+  printf '  heapcheck\r'; sleep 4 ) | \
+    timeout 90 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$HDBGLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "\[HEAP\] hardened heap (debug" "$HDBGLOG"; check "HEAP debug build active (poison + periodic check)" $?
+grep -q "HEAPDBG-42-OK" "$HDBGLOG"; check "HEAP debug: bash command burst completes" $?
+grep -q "\[HEAP\] heapcheck: OK" "$HDBGLOG"; check "HEAP debug: shell heapcheck reports a sound heap" $?
+! grep -q "\[HEAP\] CORRUPTION DETECTED" "$HDBGLOG"; check "HEAP debug: no false-positive corruption report" $?
+! grep -q "\[EXC\]" "$HDBGLOG"; check "no CPU exception ([EXC]) during heap debug run" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

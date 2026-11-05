@@ -106,6 +106,7 @@ static void sh_sleep(const char* a);
 static void sh_mem(const char* a);
 static void sh_memtest(const char* a);
 static void sh_memstress(const char* a);
+static void sh_heapcheck(const char* a);
 static void sh_usertest(const char* a);
 static void sh_elfload(const char* a);
 static void sh_elfload2(const char* a);
@@ -207,6 +208,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"df",        sh_df,        "filesystem usage"},
     {"free",      sh_free,      "memory usage"},
     {"mem",       sh_mem,       "memory info"},
+    {"heapcheck", sh_heapcheck, "validate the kernel heap"},
     {"ps",        sh_ps,        "list processes"},
     {"pinfo",     sh_pinfo,     "process details"},
     {"kill",      sh_kill,      "kill a process"},
@@ -694,6 +696,7 @@ static void sh_uptime(const char* a){ (void)a; cmd_uptime(); }
 static void sh_mem(const char* a){ (void)a; cmd_mem(); }
 static void sh_memtest(const char* a){ (void)a; cmd_memtest(); }
 static void sh_memstress(const char* a){ (void)a; cmd_memstress(); }
+static void sh_heapcheck(const char* a){ (void)a; heap_check_report(); }
 static void sh_colors(const char* a){ (void)a; cmd_colors(); }
 static void sh_fbinfo(const char* a){ (void)a; 
 #if ENABLE_FB
