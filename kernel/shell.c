@@ -672,7 +672,7 @@ void shell_run(void) {
         } else if (c == '\b') {
             if (pos > 0) {
                 pos--;
-                terminal_putchar('\b');
+                terminal_writestring("\b \b");   // BS is non-destructive (VT)
             }
         } else if (c >= 0x20 && c < 0x7f && pos < MAX_COMMAND_LEN - 1) {
             command[pos++] = c;

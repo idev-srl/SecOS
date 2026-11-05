@@ -51,6 +51,9 @@ extern int user_color_set;
 void terminal_restore_user_color(void);
 void terminal_putchar(char c);
 void terminal_writestring(const char* data);
+// [TTY] user output through termios OPOST/ONLCR (raw bytes otherwise)
+void terminal_write_tty(const char* s, size_t n, int onlcr);
+void terminal_get_size(int* cols, int* rows);
 void print_hex(uint64_t value);
 void print_dec(uint64_t value);
 #if ENABLE_FB

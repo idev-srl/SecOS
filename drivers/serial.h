@@ -15,8 +15,10 @@
 void serial_init(void);            // Configure COM1 (115200 8N1)
 int  serial_is_ready(void);        // 1 after serial_init()
 void serial_putchar(char c);       // TX one byte ('\n' -> "\r\n")
+void serial_putchar_raw(char c);   // TX one byte, no translation (TTY output)
 void serial_write(const char* s);  // TX NUL-terminated string
 int  serial_has_char(void);        // 1 if an RX byte is waiting
-int  serial_poll_char(void);       // Non-blocking RX: byte, or -1 if none
+int  serial_poll_char(void);       // Non-blocking RX: byte, or -1 if none ('\r'->'\n', DEL->'\b')
+int  serial_poll_raw(void);        // Non-blocking RX: the byte as received, or -1
 
 #endif // SERIAL_H

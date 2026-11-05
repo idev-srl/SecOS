@@ -55,6 +55,13 @@ void serial_putchar(char c) {
     outb(COM1, (uint8_t)c);
 }
 
+// Raw byte, no newline translation (TTY output already applied termios ONLCR).
+void serial_putchar_raw(char c) {
+    if (!ready) return;
+    while (!tx_ready()) { }
+    outb(COM1, (uint8_t)c);
+}
+
 void serial_write(const char* s) {
     if (!s) return;
     while (*s) serial_putchar(*s++);
@@ -63,6 +70,11 @@ void serial_write(const char* s) {
 int serial_has_char(void) {
     if (!ready) return 0;
     return inb(COM1 + 5) & 0x01; // Data Ready
+}
+
+int serial_poll_raw(void) {
+    if (!serial_has_char()) return -1;
+    return (int)inb(COM1);
 }
 
 int serial_poll_char(void) {

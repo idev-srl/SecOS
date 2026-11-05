@@ -1,6 +1,8 @@
 /*
  * SecOS Kernel - Terminal Abstraction
  * Provides legacy VGA text mode and optional framebuffer console delegation.
+ * Both render through the VT100/xterm interpreter in drivers/vt.c, so escape
+ * sequences and UTF-8 work the same on either backend.
  * Copyright (c) 2025 iDev srl
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
@@ -9,15 +11,16 @@
 #include "fb.h"
 #include "fb_console.h"
 #include "serial.h"
+#include "vt.h"
 #include <stddef.h>
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
 #define VGA_MEMORY 0xB8000
-static size_t terminal_row, terminal_column; static uint8_t terminal_color; static uint16_t* terminal_buffer;
+static uint8_t terminal_color; static uint16_t* terminal_buffer;
 static inline void outb(uint16_t port,uint8_t value){ __asm__ volatile("outb %0, %1"::"a"(value),"Nd"(port)); }
-static inline uint8_t inb(uint16_t port){ uint8_t ret; __asm__ volatile("inb %1, %0":"=a"(ret):"Nd"(port)); return ret; }
-static void update_cursor(void){ uint16_t pos=terminal_row * VGA_WIDTH + terminal_column; outb(0x3D4,0x0F); outb(0x3D5,(uint8_t)(pos & 0xFF)); outb(0x3D4,0x0E); outb(0x3D5,(uint8_t)((pos>>8)&0xFF)); }
+static void vga_set_hw_cursor(int x, int y){ uint16_t pos=(uint16_t)(y * VGA_WIDTH + x); outb(0x3D4,0x0F); outb(0x3D5,(uint8_t)(pos & 0xFF)); outb(0x3D4,0x0E); outb(0x3D5,(uint8_t)((pos>>8)&0xFF)); }
 static void enable_cursor(void){ outb(0x3D4,0x0A); outb(0x3D5,0x0E); outb(0x3D4,0x0B); outb(0x3D5,0x0F); }
+static void disable_cursor(void){ outb(0x3D4,0x0A); outb(0x3D5,0x20); }
 static int use_fb_console = 0;
 uint8_t user_fg = VGA_COLOR_WHITE; // User-selected foreground via shell color command
 uint8_t user_bg = VGA_COLOR_BLACK;
@@ -25,16 +28,55 @@ int user_color_set = 0;
 void terminal_restore_user_color(void){ if(user_color_set) terminal_setcolor(vga_entry_color((enum vga_color)user_fg,(enum vga_color)user_bg)); }
 void terminal_setcolor(uint8_t color){
 	terminal_color=color;
+	uint8_t fg = color & 0x0F; uint8_t bg = (color >>4) & 0x0F;
 #if ENABLE_FB
-	if (use_fb_console) {
-		uint8_t fg = color & 0x0F; uint8_t bg = (color >>4) & 0x0F;
-		fb_console_set_color(fg,bg);
-	}
+	if (use_fb_console) { fb_console_set_color(fg,bg); return; }
 #endif
+	vt_set_colors(fg, bg);
 }
-void terminal_putentryat(char c,uint8_t color,size_t x,size_t y){ terminal_buffer[y*VGA_WIDTH + x] = vga_entry(c,color); }
+void terminal_putentryat(char c,uint8_t color,size_t x,size_t y){
+	if (x >= VGA_WIDTH || y >= VGA_HEIGHT || !terminal_buffer) return;
+	terminal_buffer[y*VGA_WIDTH + x] = vga_entry((unsigned char)c,color);
+}
+
+/* ---- VGA text-mode vt backend (CP437 font in hardware) ---------------------- */
+static unsigned char vga_glyph(uint8_t g){
+	switch (g) {
+	case VT_G_ELLIPSIS: return 0xFA;     /* CP437 small middle dot (closest) */
+	case VT_G_MIDDOT:   return 0xFA;
+	case VT_G_DEGREE:   return 0xF8;
+	case VT_G_UNKNOWN:  return 0xFE;     /* small square */
+	case VT_G_BLOCK:    return 0xDB;
+	case VT_G_SHADE:    return 0xB1;
+	case VT_G_CHECK:    return 0xFB;     /* square-root sign */
+	default: return g;                   /* ASCII + CP437 box codes map 1:1 */
+	}
+}
+static void vgavt_draw_cell(int x, int y, const vt_cell_t* c){
+	uint8_t attr = (uint8_t)((c->fg & 0xF) | ((c->bg & 0xF) << 4));
+	terminal_putentryat((char)vga_glyph(c->ch), attr, (size_t)x, (size_t)y);
+}
+static int vgavt_scroll(int top, int bot, int n){
+	if (!terminal_buffer || top < 0 || bot >= VGA_HEIGHT || top >= bot) return -1;
+	int k = n > 0 ? n : -n;
+	if (k > bot - top) return -1;
+	if (n > 0) {
+		for (int y = top; y <= bot - k; y++)
+			for (int x = 0; x < VGA_WIDTH; x++) terminal_buffer[y*VGA_WIDTH+x] = terminal_buffer[(y+k)*VGA_WIDTH+x];
+	} else {
+		for (int y = bot; y >= top + k; y--)
+			for (int x = 0; x < VGA_WIDTH; x++) terminal_buffer[y*VGA_WIDTH+x] = terminal_buffer[(y-k)*VGA_WIDTH+x];
+	}
+	return 0;
+}
+static void vgavt_cursor(int x, int y, int on){
+	if (on) { vga_set_hw_cursor(x, y); enable_cursor(); }
+	else    { int vx, vy; if (!vt_get_cursor(&vx, &vy)) disable_cursor(); }
+}
+static const vt_ops_t vga_vt_ops = { vgavt_draw_cell, vgavt_scroll, vgavt_cursor, 0, 0 };
+
 void terminal_initialize(void){
-	terminal_row=0; terminal_column=0; terminal_color=vga_entry_color(VGA_COLOR_WHITE,VGA_COLOR_BLACK);
+	terminal_color=vga_entry_color(VGA_COLOR_WHITE,VGA_COLOR_BLACK);
 #if ENABLE_FB
 	// Detect framebuffer console availability (heuristic: kernel_main already invoked fb_init).
 	extern int fb_console_init(void);
@@ -46,32 +88,50 @@ void terminal_initialize(void){
 	}
 #endif
 	if (!use_fb_console) {
-		terminal_buffer=(uint16_t*)VGA_MEMORY; for(size_t y=0;y<VGA_HEIGHT;y++) for(size_t x=0;x<VGA_WIDTH;x++) terminal_buffer[y*VGA_WIDTH + x]= vga_entry(' ',terminal_color); enable_cursor(); update_cursor();
+		terminal_buffer=(uint16_t*)VGA_MEMORY;
+		for(size_t y=0;y<VGA_HEIGHT;y++) for(size_t x=0;x<VGA_WIDTH;x++) terminal_buffer[y*VGA_WIDTH + x]= vga_entry(' ',terminal_color);
+		vt_set_colors(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+		vt_attach(&vga_vt_ops, VGA_WIDTH, VGA_HEIGHT);
+		enable_cursor(); vga_set_hw_cursor(0, 0);
 	}
 }
-static void terminal_scroll(void){ for(size_t y=0;y<VGA_HEIGHT-1;y++) for(size_t x=0;x<VGA_WIDTH;x++) terminal_buffer[y*VGA_WIDTH+x] = terminal_buffer[(y+1)*VGA_WIDTH + x]; for(size_t x=0;x<VGA_WIDTH;x++) terminal_buffer[(VGA_HEIGHT-1)*VGA_WIDTH + x] = vga_entry(' ',terminal_color); }
+
+/* Kernel output: '\n' means "new line" (CR+LF) for every kernel caller. */
 void terminal_putchar(char c){
 	// Mirror every character to COM1 so the console is usable headless
 	// (no-op until serial_init() runs; harmless when no -serial is attached).
 	serial_putchar(c);
-	if (use_fb_console) {
-#if ENABLE_FB
-		fb_console_putc(c);
-#endif
+	if (c == '\n') {
+		static const char crlf[2] = { '\r', '\n' };
+		vt_write(crlf, 2);
 		return;
 	}
-	if(c=='\n'){ terminal_column=0; if(++terminal_row==VGA_HEIGHT){ terminal_scroll(); terminal_row=VGA_HEIGHT-1; } update_cursor(); return; }
-	if(c=='\b'){ if(terminal_column>0) terminal_column--; else if(terminal_row>0){ terminal_row--; terminal_column=VGA_WIDTH-1; } terminal_putentryat(' ',terminal_color,terminal_column,terminal_row); update_cursor(); return; }
-	terminal_putentryat(c,terminal_color,terminal_column,terminal_row);
-	if(++terminal_column==VGA_WIDTH){ terminal_column=0; if(++terminal_row==VGA_HEIGHT){ terminal_scroll(); terminal_row=VGA_HEIGHT-1; } }
-	update_cursor();
+	vt_putc(c);
 }
+
+/* User (TTY) output: bytes go to the emulator as-is, except that with
+ * OPOST|ONLCR a '\n' becomes CR+LF (termios output processing). The serial
+ * mirror follows the same rule so a host terminal sees identical bytes. */
+void terminal_write_tty(const char* s, size_t n, int onlcr){
+	char buf[256]; size_t k = 0;
+	for (size_t i = 0; i < n; i++) {
+		char c = s[i];
+		if (c == '\n' && onlcr) { buf[k++] = '\r'; serial_putchar_raw('\r'); }
+		buf[k++] = c; serial_putchar_raw(c);
+		if (k >= sizeof(buf) - 2) { vt_write(buf, k); k = 0; }
+	}
+	if (k) vt_write(buf, k);
+}
+
 void terminal_write(const char* data,size_t size){ for(size_t i=0;i<size;i++) terminal_putchar(data[i]); }
 static size_t strlen(const char* s){ size_t l=0; while(s[l]) l++; return l; }
 void terminal_writestring(const char* data){ terminal_write(data,strlen(data)); }
 void print_hex(uint64_t value){ char hc[]="0123456789ABCDEF"; char buf[17]; buf[16]='\0'; for(int i=15;i>=0;i--){ buf[i]=hc[value & 0xF]; value >>=4; } terminal_writestring("0x"); terminal_writestring(buf); }
 
 void print_dec(uint64_t v){ char tmp[32]; int i=0; if(v==0){ terminal_putchar('0'); return; } while(v>0){ tmp[i++]='0'+(v%10); v/=10; } while(i>0){ terminal_putchar(tmp[--i]); } }
+
+/* Console geometry in character cells (TIOCGWINSZ). */
+void terminal_get_size(int* cols, int* rows){ vt_get_size(cols, rows); }
 
 #if ENABLE_FB
 int terminal_try_enable_fb(void) {

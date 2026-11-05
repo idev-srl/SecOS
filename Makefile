@@ -50,7 +50,7 @@ SRC_C   = \
 	$(ARCH_DIR)/percpu.c \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
-	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \
+	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c $(DRIVERS_DIR)/vt.c \
 	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
 	$(DRIVERS_DIR)/ahci.c $(DRIVERS_DIR)/nvme.c \
 	$(DRIVERS_DIR)/xhci.c $(DRIVERS_DIR)/usb.c \
