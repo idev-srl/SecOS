@@ -64,7 +64,25 @@ static uint32_t fat_get(uint32_t clus){
     return rd32(g_sec+within) & 0x0FFFFFFFu;
 }
 
+/* The FSInfo sector caches the free-cluster count and a next-free hint. SecOS
+ * does not keep them up to date, so before the first FAT change of a mount it
+ * marks both "unknown" (0xFFFFFFFF, valid per spec): fsck.fat and other OSes
+ * then recount instead of trusting a stale value. */
+static uint32_t g_fsinfo_sec;
+static int      g_fsinfo_done;
+static void fat_fsinfo_invalidate(void){
+    static uint8_t fi[SECSZ];
+    g_fsinfo_done = 1;
+    if(g_fsinfo_sec==0 || g_fsinfo_sec==0xFFFF || g_fsinfo_sec>=g_reserved) return;
+    if(sec_read(g_fsinfo_sec, fi)!=0) return;
+    if(rd32(fi+0)!=0x41615252u || rd32(fi+484)!=0x61417272u) return;
+    if(rd32(fi+488)==0xFFFFFFFFu && rd32(fi+492)==0xFFFFFFFFu) return;
+    wr32(fi+488, 0xFFFFFFFFu); wr32(fi+492, 0xFFFFFFFFu);
+    sec_write(g_fsinfo_sec, fi);
+}
+
 static int fat_set(uint32_t clus, uint32_t val){
+    if(!g_fsinfo_done) fat_fsinfo_invalidate();
     uint32_t off = clus*4;
     uint32_t within = off % g_bytes_per_sec;
     uint64_t rel = off / g_bytes_per_sec;
@@ -105,6 +123,31 @@ static void fat_free_chain(uint32_t c){
         fat_set(c, 0);
         if(next < 0x0FFFFFF8u && next>=2) c = next; else break;
     }
+}
+
+/* ── DOS timestamps (local time == UTC here; 2 s resolution) ─────────────── */
+extern uint64_t kclock_real_sec(void);
+extern void kclock_unix_to_civil(uint64_t t, int* y, int* mo, int* d, int* h, int* mi, int* s);
+extern uint64_t kclock_civil_to_unix(int y, int mo, int d, int h, int mi, int s);
+static void fat_now(uint16_t* tm, uint16_t* dt){
+    int y, mo, d, h, mi, sc;
+    kclock_unix_to_civil(kclock_real_sec(), &y, &mo, &d, &h, &mi, &sc);
+    if(y < 1980){ y = 1980; mo = 1; d = 1; h = mi = sc = 0; }
+    if(y > 2107) y = 2107;
+    *dt = (uint16_t)(((y-1980)<<9) | (mo<<5) | d);
+    *tm = (uint16_t)((h<<11) | (mi<<5) | (sc/2));
+}
+static uint64_t fat_to_unix(uint16_t tm, uint16_t dt){
+    if(dt==0) return 0;
+    int y=1980+(dt>>9), mo=(dt>>5)&15, d=dt&31;
+    if(mo<1||mo>12||d<1) return 0;
+    return kclock_civil_to_unix(y, mo, d, tm>>11, (tm>>5)&63, (tm&31)*2);
+}
+/* Stamp a raw entry: create time (+date) when `create`, always write+access. */
+static void fat_stamp(uint8_t* raw, int create){
+    uint16_t tm, dt; fat_now(&tm, &dt);
+    if(create){ raw[13]=0; wr16(raw+14,tm); wr16(raw+16,dt); }
+    wr16(raw+18,dt); wr16(raw+22,tm); wr16(raw+24,dt);
 }
 
 /* ── 8.3 name conversion ─────────────────────────────────────────────────── */
@@ -359,6 +402,7 @@ static int fat_write_file(fat_node_t* nd, size_t offset, const void* buf, size_t
         wr16(loc.raw+20, (uint16_t)(nd->first_cluster>>16));
         wr16(loc.raw+26, (uint16_t)(nd->first_cluster&0xFFFF));
         wr32(loc.raw+28, nd->size);
+        fat_stamp(loc.raw, 0);                       /* mtime/atime = now */
         if(dent_write_back(&loc)!=0) return -1;
     }
     return (int)written;
@@ -375,6 +419,14 @@ static vfs_inode_t* fat32_lookup(const char* path){
     ino->size = sz;
     fat_node_t* nd = (fat_node_t*)ino->fs_data;
     nd->first_cluster=fc; nd->size=sz; nd->is_dir=isd; nd->ent_clus=loc.clus; nd->ent_off=loc.off;
+    ino->mode = 0; ino->nlink = 1; ino->uid = ino->gid = 0;
+    ino->atime = ino->mtime = ino->ctime = 0;
+    if(loc.clus){                                  /* root has no entry: times stay 0 */
+        ino->mtime = fat_to_unix(rd16(loc.raw+22), rd16(loc.raw+24));
+        ino->ctime = fat_to_unix(rd16(loc.raw+14), rd16(loc.raw+16));
+        ino->atime = fat_to_unix(0, rd16(loc.raw+18));
+        if(!ino->ctime) ino->ctime = ino->mtime;
+    }
     return ino;
 }
 
@@ -441,6 +493,7 @@ static int fat32_create(const char* path, const void* initial, size_t size){
     for(int i=0;i<11;i++) loc.raw[i]=n83[i];
     loc.raw[11]=ATTR_ARCHIVE;
     wr16(loc.raw+20,0); wr16(loc.raw+26,0); wr32(loc.raw+28,0);
+    fat_stamp(loc.raw, 1);
     if(dent_write_back(&loc)!=0) return -1;
     if(initial && size>0){
         fat_node_t nd; nd.first_cluster=0; nd.size=0; nd.is_dir=0; nd.ent_clus=ec; nd.ent_off=eo;
@@ -459,8 +512,12 @@ static int fat32_mkdir(const char* path){
     for(uint32_t i=0;i<SECSZ;i++) g_sec[i]=0;
     uint8_t* dot=g_sec; for(int i=0;i<11;i++) dot[i]=' '; dot[0]='.'; dot[11]=ATTR_DIR;
     wr16(dot+20,(uint16_t)(nc>>16)); wr16(dot+26,(uint16_t)(nc&0xFFFF));
+    fat_stamp(dot, 1);
+    /* ".." of a top-level directory points at cluster 0 (the root), per spec */
+    uint32_t pc = (parent==g_root_clus) ? 0 : parent;
     uint8_t* dd=g_sec+32; for(int i=0;i<11;i++) dd[i]=' '; dd[0]='.'; dd[1]='.'; dd[11]=ATTR_DIR;
-    wr16(dd+20,(uint16_t)(parent>>16)); wr16(dd+26,(uint16_t)(parent&0xFFFF));
+    wr16(dd+20,(uint16_t)(pc>>16)); wr16(dd+26,(uint16_t)(pc&0xFFFF));
+    fat_stamp(dd, 1);
     if(sec_write(clus_lba(nc), g_sec)!=0) return -1;
     /* parent entry */
     uint32_t ec,eo; if(dir_alloc_slot(parent,&ec,&eo)!=0) return -1;
@@ -468,6 +525,7 @@ static int fat32_mkdir(const char* path){
     for(int i=0;i<11;i++) loc.raw[i]=n83[i];
     loc.raw[11]=ATTR_DIR;
     wr16(loc.raw+20,(uint16_t)(nc>>16)); wr16(loc.raw+26,(uint16_t)(nc&0xFFFF)); wr32(loc.raw+28,0);
+    fat_stamp(loc.raw, 1);
     return dent_write_back(&loc);
 }
 
@@ -494,39 +552,104 @@ static int fat32_truncate(const char* path, size_t new_size){
             uint32_t c=fc; for(uint32_t i=1;i<need && clus_valid(c);i++){ uint32_t n=fat_get(c); c=(n<0x0FFFFFF8u&&n>=2)?n:c; }
             uint32_t tail = fat_get(c); fat_set(c, FAT_EOC);
             if(tail>=2 && tail<0x0FFFFFF8u) fat_free_chain(tail);
+            /* zero the kept cluster past the new end: a later grow reads zeros */
+            uint32_t keep = (uint32_t)(new_size % g_clus_bytes);
+            if(keep && clus_valid(c)){
+                for(uint32_t sct=keep/g_bytes_per_sec; sct<g_sec_per_clus; sct++){
+                    if(sec_read(clus_lba(c)+sct, g_sec)!=0) return -1;
+                    uint32_t from = (sct==keep/g_bytes_per_sec) ? keep%g_bytes_per_sec : 0;
+                    for(uint32_t i=from;i<g_bytes_per_sec;i++) g_sec[i]=0;
+                    if(sec_write(clus_lba(c)+sct, g_sec)!=0) return -1;
+                }
+            }
         }
     } else {
         if(fat_ensure_clusters(&fc, need)!=0) return -1;
     }
     wr16(loc.raw+20,(uint16_t)(fc>>16)); wr16(loc.raw+26,(uint16_t)(fc&0xFFFF)); wr32(loc.raw+28,(uint32_t)new_size);
+    fat_stamp(loc.raw, 0);
     return dent_write_back(&loc);
 }
 
+/* rename: an existing target (the VFS checked the type rules) is deleted
+ * first, then the entry is copied to the new name and the old one freed; a
+ * directory moved to another parent gets its ".." re-pointed. Not crash-atomic
+ * (FAT has no journal), but never leaves both names pointing at one chain. */
 static int fat32_rename(const char* oldp, const char* newp){
     if(!g_mounted || !oldp || !newp) return -1;
     uint32_t fc, sz; int isd; dent_loc_t loc; loc.clus=0;
     if(path_resolve(oldp, &fc, &sz, &isd, &loc)!=0) return -1;
     if(loc.clus==0) return -1;
-    if(path_resolve(newp, NULL,NULL,NULL,NULL)==0) return -1; /* dest exists */
     uint32_t parent; uint8_t n83[11]; char comp[64];
     if(split_parent(newp, &parent, n83, comp, sizeof(comp))!=0) return -1;
+    uint32_t oparent; uint8_t o83[11]; char ocomp[64];
+    if(split_parent(oldp, &oparent, o83, ocomp, sizeof(ocomp))!=0) return -1;
+    if(raw_eq(n83, o83) && parent==oparent) return 0;           /* same 8.3 name */
+    uint32_t tfc, tsz; int tisd; dent_loc_t tl; tl.clus=0;
+    if(path_resolve(newp, &tfc, &tsz, &tisd, &tl)==0){          /* replace target */
+        if(tl.clus==0) return -1;
+        if(tfc>=2 && tfc!=fc) fat_free_chain(tfc);
+        tl.raw[0]=DENT_FREE;
+        if(dent_write_back(&tl)!=0) return -1;
+    }
     uint32_t ec,eo; if(dir_alloc_slot(parent,&ec,&eo)!=0) return -1;
     dent_loc_t nl; nl.clus=ec; nl.off=eo;
     for(int i=0;i<32;i++) nl.raw[i]=loc.raw[i];
     for(int i=0;i<11;i++) nl.raw[i]=n83[i];
     if(dent_write_back(&nl)!=0) return -1;
     loc.raw[0]=DENT_FREE;
-    return dent_write_back(&loc);
+    if(dent_write_back(&loc)!=0) return -1;
+    if(isd && fc>=2 && parent!=oparent){                        /* fix ".." */
+        if(sec_read(clus_lba(fc), g_sec)!=0) return -1;
+        uint8_t* dd=g_sec+32;
+        if(dd[0]=='.' && dd[1]=='.'){
+            uint32_t pc = (parent==g_root_clus) ? 0 : parent;
+            wr16(dd+20,(uint16_t)(pc>>16)); wr16(dd+26,(uint16_t)(pc&0xFFFF));
+            if(sec_write(clus_lba(fc), g_sec)!=0) return -1;
+        }
+    }
+    return 0;
+}
+
+/* statfs: clusters as blocks; free ones counted from the first FAT. */
+static int fat32_statfs(vfs_statfs_t* st){
+    if(!g_mounted || !st) return -1;
+    uint64_t freec=0;
+    uint32_t per = g_bytes_per_sec/4;
+    for(uint32_t s=0; s<g_sec_per_fat; s++){
+        if(sec_read(g_fat_start+s, g_sec)!=0) return -1;
+        for(uint32_t i=0;i<per;i++){
+            uint32_t c = s*per+i;
+            if(c<2) continue;
+            if(c>=g_total_clusters+2) goto done;
+            if((rd32(g_sec+i*4)&0x0FFFFFFFu)==0) freec++;
+        }
+    }
+done:
+    st->type = 0x4d44;                   /* MSDOS_SUPER_MAGIC */
+    st->bsize = st->frsize = g_clus_bytes;
+    st->blocks = g_total_clusters;
+    st->bfree = st->bavail = freec;
+    st->files = 0; st->ffree = 0;        /* no inode table */
+    st->namelen = 12;                    /* 8.3 */
+    return 0;
 }
 
 /* FAT and directory updates are written through to the device as they happen
  * (no cached FAT sectors), so there is nothing left to flush at shutdown. */
 static int fat32_sync(void){ return 0; }
 
+static int fat32_mntinfo(const char** src, const char** type){
+    if(!g_mounted) return -1;
+    if(src) *src = (g_dev && g_dev->name) ? g_dev->name : "fat32";
+    if(type) *type = "vfat";
+    return 0;
+}
+
 static vfs_fs_ops_t fat32_ops = {
     .lookup=fat32_lookup, .readdir=fat32_readdir, .read=fat32_read, .write=fat32_write,
     .create=fat32_create, .mkdir=fat32_mkdir, .remove=fat32_remove, .rename=fat32_rename,
-    .truncate=fat32_truncate, .sync=fat32_sync
+    .truncate=fat32_truncate, .sync=fat32_sync, .statfs=fat32_statfs, .mntinfo=fat32_mntinfo
 };
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */
@@ -568,6 +691,8 @@ int fat32_mount(const char* dev_name, const char* mount_point){
     g_total_clusters = data_sectors / g_sec_per_clus;
     g_clus_bytes = g_sec_per_clus * g_bytes_per_sec;
     g_inode_used = 0;
+    g_fsinfo_sec = rd16(bs+48);
+    g_fsinfo_done = 0;
     g_mounted = 1;
     return vfs_mount(mount_point, &fat32_ops, "fat32");
 }
