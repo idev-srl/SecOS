@@ -1101,6 +1101,12 @@ grep -q "\[ABI-TEST\] df-fork-child-ok OK" "$UALOG"; check "ABI fork() entered w
 grep -q "\[ABI-TEST\] df-pipe-write-read OK" "$UALOG" && grep -q "\[ABI-TEST\] df-stat OK" "$UALOG"
 check "ABI write/read/stat entered with DF=1 return correct data" $?
 grep -q "\[ABI-TEST\] df-signal-handler-entry-df0 OK" "$UALOG"; check "ABI signal handler starts with DF=0" $?
+grep -q "\[ABI-TEST\] pn-user-read-sigsegv OK" "$UALOG"; check "ABI ring-3 read of a PROT_NONE page -> SIGSEGV" $?
+grep -q "\[ABI-TEST\] pn-fresh-read-sigsegv OK" "$UALOG"; check "ABI PROT_NONE page is never demand-faulted in" $?
+grep -q "\[ABI-TEST\] pn-kernel-copy-from-efault OK" "$UALOG"; check "ABI kernel copy from a PROT_NONE page -> -EFAULT" $?
+grep -q "\[ABI-TEST\] pn-mprotect-back-keeps-data OK" "$UALOG"; check "ABI mprotect PROT_NONE -> RW restores the page + contents" $?
+grep -q "\[ABI-TEST\] pn-split-guard-sigsegv OK" "$UALOG"; check "ABI partial mprotect splits the VMA (PROT_NONE guard page)" $?
+grep -q "\[ABI-TEST\] pn-fork-parent-copy-isolated OK" "$UALOG"; check "ABI PROT_NONE page shared by fork stays COW-isolated" $?
 ! grep -q "\[ABI-TEST\] .* FAIL" "$UALOG"; check "ABI no case failed" $?
 ! grep -q "\[PANIC\]" "$UALOG"; check "UACCESS no kernel panic" $?
 

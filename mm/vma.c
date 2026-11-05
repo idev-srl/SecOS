@@ -80,6 +80,40 @@ void vma_remove(vma_set_t* s, vma_t* v) {
     v->start = v->end = 0;
 }
 
+int vma_split(vma_set_t* s, vma_t* v, uint64_t addr) {
+    if (!s || !v || v->type == VMA_TYPE_NONE) return -1;
+    if ((addr & 0xFFF) || addr <= v->start || addr >= v->end) return -1;
+    vma_t hi = *v;                              // copy before vma_add may reuse a slot
+    uint64_t d = addr - v->start;
+    hi.start = addr;
+    if (hi.type == VMA_TYPE_FILE && hi.file_inode) {
+        hi.file_voff += d;                      // page-cache backing: shift the file offset
+    } else if (hi.type == VMA_TYPE_FILE) {
+        // Image backing: content sits at region offsets [file_pad, file_pad+file_len).
+        if (d <= hi.file_pad) {
+            hi.file_pad -= d;
+        } else {
+            uint64_t skip = d - hi.file_pad;
+            if (skip >= hi.file_len) { hi.file_len = 0; hi.file_pad = 0; }
+            else { hi.file_off += skip; hi.file_len -= skip; hi.file_pad = 0; }
+        }
+    }
+    if (vma_add(s, hi.start, hi.end, hi.flags, hi.type, hi.file_base,
+                hi.file_off, hi.file_pad, hi.file_len) != 0) return -1;
+    // 'v' still covers addr until it is trimmed below, so vma_find_mut could
+    // return it: look for the new slot explicitly.
+    vma_t* n = 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        vma_t* c = &s->v[i];
+        if (c != v && c->type != VMA_TYPE_NONE && c->start == addr && c->end == hi.end) { n = c; break; }
+    }
+    if (!n) return -1;
+    n->file_inode = hi.file_inode;
+    n->file_voff = hi.file_voff;
+    v->end = addr;
+    return 0;
+}
+
 int vma_overlaps(const vma_set_t* s, uint64_t start, uint64_t end) {
     if (!s) return 0;
     for (uint32_t i = 0; i < s->count; i++) {
@@ -103,6 +137,7 @@ int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr) {
     if (!space || !v) return -1;
     uint64_t pg = addr & ~0xFFFULL;
     if (pg < v->start || pg >= v->end) return -2;
+    if (v->flags & VMM_FLAG_PROTNONE) return -4;   // reserved, inaccessible
 
     void* frame = pmm_alloc_frame();
     if (!frame) return -3;

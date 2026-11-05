@@ -20,6 +20,13 @@
 #define VMM_FLAG_PS        (1ULL<<7)  // Page size (used only in non-PT levels)
 #define VMM_FLAG_GLOBAL    (1ULL<<8)
 #define VMM_FLAG_COW       (1ULL<<9)  // [M19] software bit: copy-on-write page (CPU-ignored)
+// Software bit for PROT_NONE. In a VMA's flags it means "reserved, no access":
+// the #PF handler never demand-faults such a page. In a leaf PTE it marks a
+// PARKED page: PRESENT=0 (so every user AND kernel access faults) but the PTE
+// still holds the frame, so mprotect() back to an accessible protection
+// restores the page with its contents. Walkers that free/share/count user
+// frames must treat a parked leaf as owning its frame (vmm_pte_has_frame).
+#define VMM_FLAG_PROTNONE  (1ULL<<10)
 #define VMM_FLAG_NOEXEC    (1ULL<<63) // NX bit (requires EFER.NXE enabled)
 
 // Address space structure (currently only physical PML4 pointer)
@@ -72,6 +79,10 @@ int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt);
 int vmm_protect_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags); // [M18] change page prot
 vmm_space_t* vmm_fork_space(vmm_space_t* parent); // [M19] COW duplicate of an address space
 int vmm_cow_fault(vmm_space_t* space, uint64_t addr); // [M19] resolve a COW write fault
+// A user leaf PTE that owns a frame: present, or parked by PROT_NONE.
+static inline int vmm_pte_has_frame(uint64_t pte) {
+    return (pte & (VMM_FLAG_PRESENT | VMM_FLAG_PROTNONE)) != 0;
+}
 
 // Translate virtual -> physical (return 0 if not mapped)
 uint64_t vmm_translate(uint64_t virt);

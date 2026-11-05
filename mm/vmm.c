@@ -932,7 +932,7 @@ int vmm_space_destroy(vmm_space_t* space) {
 
                 for (int ti = 0; ti < 512; ti++) {
                     uint64_t pte = pt[ti];
-                    if (!(pte & VMM_FLAG_PRESENT)) continue;
+                    if (!vmm_pte_has_frame(pte)) continue;  // present or PROT_NONE-parked
                     void* lf = (void*)(pte & ADDRESS_MASK); // [M19] COW-aware free
                     if (!pmm_unref_frame(lf)) pmm_free_frame(lf);
                     n_pages++;
@@ -996,7 +996,7 @@ uint32_t vmm_count_user_pages(vmm_space_t* space) {
             uint64_t pt_phys = pdte & ADDRESS_MASK;
             uint64_t* pt = physmap_initialized ? (uint64_t*)phys_to_virt(pt_phys) : (uint64_t*)pt_phys;
             for (int ti = 0; ti < 512; ti++) {
-                if (pt[ti] & VMM_FLAG_PRESENT) n++;
+                if (vmm_pte_has_frame(pt[ti])) n++;
             }
         }
     }
@@ -1030,9 +1030,18 @@ vmm_space_t* vmm_fork_space(vmm_space_t* parent) {
                 uint64_t* pt = (uint64_t*)phys_to_virt(pdte & ADDRESS_MASK);
                 for (int ti = 0; ti < 512; ti++) {
                     uint64_t pte = pt[ti];
-                    if (!(pte & VMM_FLAG_PRESENT)) continue;
+                    if (!vmm_pte_has_frame(pte)) continue;
                     uint64_t va = ((uint64_t)pi << 30) | ((uint64_t)di << 21) | ((uint64_t)ti << 12);
                     uint64_t phys  = pte & ADDRESS_MASK;
+                    if (!(pte & VMM_FLAG_PRESENT)) {
+                        // PROT_NONE-parked: share the frame, park it in the child
+                        // too. It holds no RW, so nothing to COW-protect now; a
+                        // later mprotect(RW) sees the shared refcount and maps it
+                        // RO+COW (vmm_protect_in_space).
+                        uint64_t* cpt = get_pt_space(child, va, 1, VMM_FLAG_USER | VMM_FLAG_RW);
+                        if (cpt) { pmm_share_frame((void*)phys); cpt[ti] = pte; }
+                        continue;
+                    }
                     uint64_t flags = pte & ~ADDRESS_MASK & ~VMM_FLAG_PRESENT;
                     pmm_share_frame((void*)phys);
                     uint64_t childflags = flags;
@@ -1070,6 +1079,13 @@ int vmm_cow_fault(vmm_space_t* space, uint64_t addr) {
     int i = (va >> 12) & 0x1FF;
     uint64_t pte = pt[i];
     if (!(pte & VMM_FLAG_PRESENT) || !(pte & VMM_FLAG_COW)) return -1;
+    {   // Only a region that is writable NOW may be COW-resolved: a COW page
+        // later mprotect()ed read-only keeps its COW bit (it is still shared),
+        // and a write to it is a real violation, not a copy request.
+        process_t* cur = sched_get_current();
+        const vma_t* v = (cur && cur->space == space) ? vma_find(&cur->vmas, va) : 0;
+        if (!v || !(v->flags & VMM_FLAG_RW) || (v->flags & VMM_FLAG_PROTNONE)) return -1;
+    }
     uint64_t oldphys = pte & ADDRESS_MASK;
     void* nf = pmm_alloc_frame();
     if (!nf) return -1;
@@ -1188,7 +1204,8 @@ int vmm_map_in_space(vmm_space_t* space, uint64_t virt, uint64_t phys, uint64_t 
     uint64_t* pt = get_pt_space(space, virt, 1, flags);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
-    if (pt[pt_i] & VMM_FLAG_PRESENT) return -3; // already mapped
+    if (vmm_pte_has_frame(pt[pt_i])) return -3; // already mapped (or PROT_NONE-parked)
+    if (flags & VMM_FLAG_PROTNONE) return -1;    // PROT_NONE is never mapped present
     pt[pt_i] = (phys & ADDRESS_MASK) | (flags & ~VMM_FLAG_PS) | VMM_FLAG_PRESENT;
     return 0;
 }
@@ -1214,9 +1231,10 @@ int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
     uint64_t* pt = get_pt_space(space, virt, 0, 0);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
-    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3; // not mapped
+    if (!vmm_pte_has_frame(pt[pt_i])) return -3; // not mapped
     uint64_t entry = pt[pt_i];
     pt[pt_i] = 0;
+    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
     // Free physical frame — [M19] only when this was the last COW reference.
     void* frame = (void*)(entry & ADDRESS_MASK);
     if (!pmm_unref_frame(frame)) pmm_free_frame(frame);
@@ -1236,9 +1254,25 @@ int vmm_protect_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
     uint64_t* pt = get_pt_space(space, virt, 0, 0);
     if (!pt) return -3;
     int pt_i = (virt >> 12) & 0x1FF;
-    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3;
-    uint64_t phys = pt[pt_i] & ADDRESS_MASK;
-    pt[pt_i] = phys | (flags & ~VMM_FLAG_PS) | VMM_FLAG_PRESENT | VMM_FLAG_USER;
+    uint64_t old = pt[pt_i];
+    if (!vmm_pte_has_frame(old)) return -3;
+    uint64_t phys = old & ADDRESS_MASK;
+    if (flags & VMM_FLAG_PROTNONE) {
+        // Park: not present (no user or kernel access), frame kept for a later
+        // mprotect back. COW is moot while parked (no RW, no access at all).
+        pt[pt_i] = phys | VMM_FLAG_PROTNONE | VMM_FLAG_NOEXEC;
+    } else {
+        uint64_t nf = (flags & ~(VMM_FLAG_PS | VMM_FLAG_COW | VMM_FLAG_PROTNONE))
+                      | VMM_FLAG_PRESENT | VMM_FLAG_USER;
+        // [M19] A frame still shared with another space (fork COW, or a parked
+        // page shared at fork) must never become directly writable: keep it
+        // read-only + COW so the first write copies it. A shared read-only
+        // page keeps COW too, so a later mprotect(RW) still knows to copy.
+        if ((old & VMM_FLAG_COW) || pmm_frame_shared((void*)phys)) {
+            nf = (nf & ~VMM_FLAG_RW) | VMM_FLAG_COW;
+        }
+        pt[pt_i] = phys | nf;
+    }
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
     return 0;
 }
@@ -1358,7 +1392,10 @@ int vmm_try_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
         process_t* cur = sched_get_current();
         if (cur && cur->space) {
             const vma_t* vv = vma_find(&cur->vmas, fault_addr);
-            if (vv && vma_fault_in(cur->space, vv, fault_addr) == 0) {
+            // A PROT_NONE region is reserved but inaccessible: never fault it in
+            // (user access -> SIGSEGV, kernel uaccess -> -EFAULT via the fixup).
+            if (vv && !(vv->flags & VMM_FLAG_PROTNONE) &&
+                vma_fault_in(cur->space, vv, fault_addr) == 0) {
                 // Quiet success path (faults are frequent): a terse debugcon
                 // marker only, gated on verbosity (M34: a real program like lua
                 // faults in hundreds of pages and would drown its own output).

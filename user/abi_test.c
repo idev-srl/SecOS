@@ -10,6 +10,11 @@
  *    fork/sigframe copies, memcpy, ... assume DF=0). Syscalls issued with DF=1
  *    must still copy correctly, the user's DF must survive the round trip, and
  *    a signal handler must start with DF=0.
+ *  - PROT_NONE: a PROT_NONE page is reserved but inaccessible — a ring-3 read
+ *    or write kills with SIGSEGV, a syscall copying from/to it gets -EFAULT,
+ *    demand paging never materializes it, and mprotect back to RW restores
+ *    access with the old contents (also for a page split out of a larger
+ *    mapping, and for a parked page shared across fork()).
  *
  * Output: one "[ABI-TEST] <name> OK|FAIL" line per case, then
  * "[ABI-TEST] DONE pass=<n> fail=<m>". stdout is mirrored to debugcon.
@@ -192,10 +197,87 @@ static void test_df(void) {
     check("df-user-df-preserved-across-syscalls", ok_df, 0);
 }
 
+/* ---------------- PROT_NONE ---------------- */
+#define PG 0x1000UL
+#define EFAULT_ 14
+static volatile char* g_probe;
+static void child_read(void)  { volatile char c = *g_probe; (void)c; _exit(0); }
+static void child_write(void) { *g_probe = 'X'; _exit(0); }
+
+static int probe(void (*fn)(void), volatile char* p) { g_probe = p; return child_status(fn, 0); }
+
+static void test_prot_none(void) {
+    /* (1) 3 RW pages, filled; middle one -> PROT_NONE after it was faulted in. */
+    char* m = (char*)mmap(0, 3 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (m == (char*)-1) { check("pn-mmap", 0, -1); return; }
+    for (unsigned long i = 0; i < 3 * PG; i++) m[i] = (char)('a' + (i / PG));
+    long r = mprotect(m + PG, PG, PROT_NONE);
+    check("pn-mprotect-present-page", r == 0, r);
+    expect_sig("pn-user-read-sigsegv", probe(child_read, m + PG), SIGSEGV_);
+    expect_sig("pn-user-write-sigsegv", probe(child_write, m + PG + 100), SIGSEGV_);
+    expect_exit("pn-neighbours-still-rw", probe(child_write, m), 0);
+    expect_exit("pn-neighbour-after-still-rw", probe(child_write, m + 2 * PG), 0);
+    r = secos_syscall(SYS_WRITE_, 1, (long)(m + PG), 16, 0, 0);
+    check("pn-kernel-copy-from-efault", r == -EFAULT_, r);
+    {
+        int fd = open("/bin/abi_test", 0);
+        r = fd >= 0 ? secos_syscall(SYS_READ_, fd, (long)(m + PG), 16, 0, 0) : -1;
+        check("pn-kernel-copy-to-efault", r == -EFAULT_, r);
+        if (fd >= 0) close(fd);
+    }
+    r = mprotect(m + PG, PG, PROT_READ | PROT_WRITE);
+    int same = r == 0;
+    for (unsigned long i = 0; same && i < PG; i++) same = m[PG + i] == 'b';
+    check("pn-mprotect-back-keeps-data", same, r);
+    m[PG + 5] = 'Z';
+    check("pn-mprotect-back-writable", m[PG + 5] == 'Z' && m[0] == 'a' && m[2 * PG] == 'c', 0);
+
+    /* (2) Fresh PROT_NONE mapping, never touched: demand paging must refuse. */
+    char* n = (char*)mmap(0, 2 * PG, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS);
+    expect_sig("pn-fresh-read-sigsegv", probe(child_read, n), SIGSEGV_);
+    r = secos_syscall(SYS_WRITE_, 1, (long)n, 8, 0, 0);
+    check("pn-fresh-kernel-copy-efault", r == -EFAULT_, r);
+    r = mprotect(n, 2 * PG, PROT_READ | PROT_WRITE);
+    int zero = r == 0 && n[0] == 0 && n[PG + 7] == 0;
+    n[1] = 'q';
+    check("pn-fresh-mprotect-rw-works", zero && n[1] == 'q', r);
+
+    /* (3) Partial mprotect of an untouched mapping (VMA split): page 1 is a
+     * guard, page 0 and 2 still demand-fault RW. */
+    char* g = (char*)mmap(0, 3 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    r = mprotect(g + PG, PG, PROT_NONE);
+    g[0] = 1; g[2 * PG] = 2;
+    check("pn-split-neighbours-demand-rw", r == 0 && g[0] == 1 && g[2 * PG] == 2, r);
+    expect_sig("pn-split-guard-sigsegv", probe(child_read, g + PG), SIGSEGV_);
+    r = mprotect(g + PG, PG, PROT_READ);
+    check("pn-split-guard-to-ro-reads-zero", r == 0 && g[PG + 1] == 0, r);
+    expect_sig("pn-split-guard-ro-write-sigsegv", probe(child_write, g + PG), SIGSEGV_);
+
+    /* (4) A parked page shared across fork(): the child unparks and writes;
+     * the parent's copy must stay intact (COW of the parked frame). */
+    char* f = (char*)mmap(0, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    for (unsigned long i = 0; i < PG; i++) f[i] = 'P';
+    mprotect(f, PG, PROT_NONE);
+    int pid = fork();
+    if (pid == 0) {
+        if (mprotect(f, PG, PROT_READ | PROT_WRITE) != 0) _exit(2);
+        if (f[10] != 'P') _exit(3);
+        f[10] = 'C';
+        _exit(f[10] == 'C' ? 0 : 4);
+    }
+    int st = pid > 0 ? waitpid(pid) : -1;
+    expect_exit("pn-fork-child-unparks-and-writes", st, 0);
+    r = mprotect(f, PG, PROT_READ);
+    check("pn-fork-parent-copy-isolated", r == 0 && f[10] == 'P', r);
+
+    munmap(m, 3 * PG); munmap(n, 2 * PG); munmap(g, 3 * PG); munmap(f, PG);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "segv") == 0) { die_segv(); return 1; }
     test_wait_status();
     test_df();
+    test_prot_none();
     put("[ABI-TEST] DONE pass="); putnum(g_pass);
     put(" fail="); putnum(g_fail); put("\n");
     return g_fail ? 1 : 0;
