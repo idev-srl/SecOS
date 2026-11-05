@@ -60,7 +60,7 @@ int signal_pending(process_t* p) {
     uint64_t deliverable = (p->sig_pending & ~p->sig_blocked) |
                            (p->sig_pending & SIG_UNMASKABLE);
     deliverable &= ~sig_noop_mask(p);
-    return deliverable != 0;
+    return deliverable != 0 || p->sig_rerun_eintr;
 }
 
 // Job control: if a deliverable signal whose action is "stop" is pending
@@ -131,6 +131,8 @@ int signal_post(process_t* p, int sig) {
         // deadline (the EINTR path clears it itself).
         p->wait_pid = -1; p->recv_chan = -1; p->wait_pipe = NULL; p->wait_tty = 0;
         p->wait_pty = NULL;
+        if (sig != SIGKILL && p->sig_handler[sig] > 1 /* caught */ && p->tf)
+            p->sig_eintr_rip = p->tf->rip;       // the rewound `int 0x80`
         p->state = PROC_READY;
     }
     return 0;

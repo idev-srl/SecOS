@@ -64,6 +64,14 @@ static struct proc_fd_entry* sock_wait_fd(process_t* cur, uint64_t num, uint64_t
 uint64_t syscall_handler(trapframe_t* tf) {
     process_t* cur = sched_get_current();
     uint64_t num = tf->rax;
+    // Re-run of a blocking syscall a caught signal woke (see process.h)?
+    if (cur) {
+        cur->sig_rerun_eintr = 0;
+        if (cur->sig_eintr_rip && tf->rip - 2 == cur->sig_eintr_rip) {
+            cur->sig_rerun_eintr = 1;
+            cur->sig_eintr_rip = 0;
+        }
+    }
 
     // [M7] Debugcon: log pid + syscall number (gated on verbosity since M34 so it
     // doesn't interleave with ring-3 program output, e.g. the lua interpreter).
@@ -393,6 +401,7 @@ uint64_t syscall_handler(trapframe_t* tf) {
         for (int i = 0; i < (int)sizeof(trapframe_t); i++) d[i] = s[i];
         cur->tf->rax = ret; // patch return value
     }
+    if (cur) cur->sig_rerun_eintr = 0;
 
     return ret;
 }

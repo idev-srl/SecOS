@@ -101,6 +101,13 @@ typedef struct process {
     void*    wait_pipe;      // [M25] pipe object the caller is blocked on (NULL = none)
     int      pipe_wdone;     // bytes of a blocked pipe write() already queued (the re-run resumes there)
     uint8_t  wait_tty;       // blocked in a console read() until input arrives (tty_read_try)
+    // A caught signal woke this task out of a blocking syscall: sig_eintr_rip is
+    // the user address of that syscall's `int 0x80`. If the handler runs before
+    // the syscall re-runs (a timer tick at the resume boundary), the re-run must
+    // still fail with EINTR instead of blocking again: sig_rerun_eintr is set on
+    // the entry that matches it and makes signal_pending() report true.
+    uint64_t sig_eintr_rip;
+    uint8_t  sig_rerun_eintr;
     void*    wait_pty;       // pty_t* the caller is blocked on (read/write either side; NULL = none)
     uint8_t  power_phase;    // SYS_REBOOT shutdown state machine (kernel/power.c)
     uint64_t power_deadline; // tick deadline of the current shutdown phase
