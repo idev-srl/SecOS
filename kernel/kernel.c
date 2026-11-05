@@ -1593,6 +1593,15 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
               }
               done = found || vfs_write(ak, (size_t)(n > 0 ? n : 0), keys, klen) >= 0;
           }
+          // Dropbear refuses keys under a home it does not trust: /root and
+          // ~/.ssh must be owned by root and not group/world-writable. A
+          // persistent root staged with `mkfs.ext4 -d` carries the build
+          // user's uid, so normalise owner and modes here.
+          { extern int vfs_setattr(const char*, const vfs_attr_t*, unsigned);
+            vfs_attr_t a; a.uid = 0; a.gid = 0; a.atime = a.mtime = 0;
+            a.mode = 0700; vfs_setattr("/root", &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID);
+            vfs_setattr("/root/.ssh", &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID);
+            a.mode = 0600; vfs_setattr(ak, &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID); }
           debugcon_writestring(done ? "[SSH] baked authorized_keys installed to /root/.ssh\n"
                                     : "[SSH] FAIL: could not install the baked authorized_keys\n");
       } else {
