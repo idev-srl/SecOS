@@ -341,6 +341,7 @@ uint64_t syscall_handler(trapframe_t* tf) {
     // peer still open; arm wait_pipe and re-run the syscall on wake. EOF/EPIPE
     // (0 / -1) and all non-pipe reads/writes fall straight through.
     else if (num == SYS_READ || num == SYS_WRITE) {
+        if (cur) { cur->sleep_until = 0; cur->wait_pipe = NULL; }   // our pipe wait (below)
         ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
         // A TTY read interrupted by a stop (Ctrl-Z, SIGTTIN for a background
         // reader, kill -STOP) restarts after SIGCONT instead of failing EINTR.
@@ -377,6 +378,14 @@ uint64_t syscall_handler(trapframe_t* tf) {
                 ret = 0;
             } else if (pipe_fd) {
                 cur->wait_pipe = cur->fds[fd].inode;
+                // SMP: the peer on another CPU can queue data / free room and
+                // call sched_wake_pipe() between our -2 and the block below, a
+                // wakeup nobody repeats. Re-check after a few ticks regardless,
+                // so a lost wakeup costs milliseconds instead of a deadlock.
+                {
+                    extern uint64_t timer_get_ticks(void);
+                    cur->sleep_until = timer_get_ticks() + 5;
+                }
                 tf->rip -= 2;                           // re-run `int 0x80` on wake
                 sched_block_current(tf);                // NORETURN (switches away)
                 ret = 0;                                 // not reached
