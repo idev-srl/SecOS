@@ -30,6 +30,10 @@
 #include <syslog.h>
 
 extern int errno;
+/* Generic POSIX shims are weak: when the SecOS libc provides the real symbol
+ * (poll/select/time/... landed there), the libc definition wins at link time.
+ * Struct layouts here match user/include (fd_set, pollfd, tm, iovec). */
+#define W __attribute__((weak))
 
 #define SYS_WAIT_      9
 #define SYS_SOCKET_    21
@@ -157,7 +161,7 @@ int db_socketpair(int domain, int type, int protocol, int sv[2]){
 }
 
 /* ---- inet helpers (IPv4 only) ---- */
-int inet_aton(const char* s, struct in_addr* out){
+W int inet_aton(const char* s, struct in_addr* out){
     unsigned int oct[4]; int n = 0;
     if(!s) return 0;
     while(n < 4){
@@ -172,7 +176,7 @@ int inet_aton(const char* s, struct in_addr* out){
     return 1;
 }
 in_addr_t db_inet_addr(const char* s){ struct in_addr a; return inet_aton(s, &a) ? a.s_addr : INADDR_NONE; }
-const char* inet_ntop(int af, const void* src, char* dst, socklen_t size){
+W const char* inet_ntop(int af, const void* src, char* dst, socklen_t size){
     if(af != AF_INET){ errno = EAFNOSUPPORT; return 0; }
     const unsigned char* b = (const unsigned char*)src;
     char tmp[16];
@@ -182,14 +186,14 @@ const char* inet_ntop(int af, const void* src, char* dst, socklen_t size){
     return dst;
 }
 char* db_inet_ntoa(struct in_addr in){ static char b[16]; inet_ntop(AF_INET, &in, b, sizeof(b)); return b; }
-int inet_pton(int af, const char* src, void* dst){
+W int inet_pton(int af, const char* src, void* dst){
     if(af != AF_INET){ errno = EAFNOSUPPORT; return -1; }
     struct in_addr a; if(!inet_aton(src, &a)) return 0;
     memcpy(dst, &a, sizeof(a)); return 1;
 }
 
 /* ---- getaddrinfo: numeric IPv4 + "localhost"; no DNS resolver here ---- */
-int getaddrinfo(const char* node, const char* service, const struct addrinfo* hints, struct addrinfo** res){
+W int getaddrinfo(const char* node, const char* service, const struct addrinfo* hints, struct addrinfo** res){
     int family = hints ? hints->ai_family : AF_UNSPEC;
     int socktype = hints ? hints->ai_socktype : 0;
     int flags = hints ? hints->ai_flags : 0;
@@ -217,10 +221,10 @@ int getaddrinfo(const char* node, const char* service, const struct addrinfo* hi
     *res = ai;
     return 0;
 }
-void freeaddrinfo(struct addrinfo* ai){
+W void freeaddrinfo(struct addrinfo* ai){
     while(ai){ struct addrinfo* n = ai->ai_next; free(ai); ai = n; }
 }
-int getnameinfo(const struct sockaddr* sa, socklen_t salen, char* host, socklen_t hostlen,
+W int getnameinfo(const struct sockaddr* sa, socklen_t salen, char* host, socklen_t hostlen,
                 char* serv, socklen_t servlen, int flags){
     (void)flags;
     if(!sa || salen < sizeof(struct sockaddr_in) || sa->sa_family != AF_INET) return EAI_FAMILY;
@@ -229,7 +233,7 @@ int getnameinfo(const struct sockaddr* sa, socklen_t salen, char* host, socklen_
     if(serv && servlen) snprintf(serv, servlen, "%u", (unsigned)ntohs(in->sin_port));
     return 0;
 }
-const char* gai_strerror(int err){
+W const char* gai_strerror(int err){
     switch(err){
     case EAI_NONAME:  return "Name does not resolve (SecOS: numeric IPv4 only)";
     case EAI_FAMILY:  return "Address family not supported";
@@ -240,12 +244,12 @@ const char* gai_strerror(int err){
 }
 
 /* ===================== poll / select (TODO(integration): move to libc) ===================== */
-int poll(struct pollfd* fds, nfds_t n, int timeout_ms){
+W int poll(struct pollfd* fds, nfds_t n, int timeout_ms){
     long r = secos_syscall(SYS_POLL_, (long)fds, (long)n, timeout_ms, 0, 0);
     if(sc_missing(r)) r = -ENOSYS;       /* kernel without SYS_POLL */
     return (int)sc_ret(r);
 }
-int select(int nfds, fd_set* rs, fd_set* ws, fd_set* es, struct timeval* tv){
+W int select(int nfds, fd_set* rs, fd_set* ws, fd_set* es, struct timeval* tv){
     struct pollfd p[FD_SETSIZE];
     int n = 0;
     if(nfds < 0 || nfds > FD_SETSIZE){ errno = EINVAL; return -1; }
@@ -277,8 +281,41 @@ int select(int nfds, fd_set* rs, fd_set* ws, fd_set* es, struct timeval* tv){
     return count;
 }
 
+/* ===================== O_NONBLOCK emulation (see dropbear_port.h) ===================== */
+static unsigned char g_nonblock[FD_SETSIZE];      /* copied by fork with the image */
+static int nb_ready(int fd, short ev){
+    struct pollfd p; p.fd = fd; p.events = ev; p.revents = 0;
+    int r = poll(&p, 1, 0);
+    if(r < 0) return errno == ENOSYS ? 1 : -1;     /* no poll: behave as before */
+    return r > 0 && (p.revents & (ev | POLLHUP | POLLERR | POLLNVAL));
+}
+int db_fcntl(int fd, int cmd, ...){
+    va_list ap; va_start(ap, cmd); long arg = va_arg(ap, long); va_end(ap);
+    int r = (fcntl)(fd, cmd, arg);
+    if(fd >= 0 && fd < FD_SETSIZE){
+        if(cmd == F_SETFL){ g_nonblock[fd] = (arg & O_NONBLOCK) ? 1 : 0; if(r < 0) r = 0; }
+        else if(cmd == F_GETFL && r >= 0 && g_nonblock[fd]) r |= O_NONBLOCK;
+        else if((cmd == F_DUPFD) && r >= 0 && r < FD_SETSIZE) g_nonblock[r] = 0;
+    }
+    return r;
+}
+ssize_t db_read(int fd, void* buf, size_t n){
+    if(fd >= 0 && fd < FD_SETSIZE && g_nonblock[fd]){
+        int k = nb_ready(fd, POLLIN);
+        if(k == 0){ errno = EAGAIN; return -1; }
+    }
+    return (read)(fd, buf, n);
+}
+ssize_t db_write(int fd, const void* buf, size_t n){
+    if(fd >= 0 && fd < FD_SETSIZE && g_nonblock[fd]){
+        int k = nb_ready(fd, POLLOUT);
+        if(k == 0){ errno = EAGAIN; return -1; }
+    }
+    return (write)(fd, buf, n);
+}
+
 /* ===================== I/O ===================== */
-ssize_t writev(int fd, const struct iovec* iov, int cnt){
+W ssize_t writev(int fd, const struct iovec* iov, int cnt){
     ssize_t total = 0;
     for(int i = 0; i < cnt; i++){
         if(!iov[i].iov_len) continue;
@@ -289,7 +326,7 @@ ssize_t writev(int fd, const struct iovec* iov, int cnt){
     }
     return total;
 }
-ssize_t readv(int fd, const struct iovec* iov, int cnt){
+W ssize_t readv(int fd, const struct iovec* iov, int cnt){
     ssize_t total = 0;
     for(int i = 0; i < cnt; i++){
         if(!iov[i].iov_len) continue;
@@ -316,28 +353,28 @@ int db_open(const char* path, int flags, ...){
     if(fd >= 0 && !exists && (flags & O_CREAT)) chmod(path, mode & 07777 & ~022u);
     return fd;
 }
-int fstat(int fd, struct stat* st){
+W int fstat(int fd, struct stat* st){
     if(!st){ errno = EFAULT; return -1; }
     zmem(st, sizeof(*st));
     return (int)sc_ret(secos_syscall(SYS_FSTAT_, fd, (long)st, 0, 0, 0));
 }
-int fsync(int fd){
+W int fsync(int fd){
     long r = secos_syscall(SYS_SYNC_, fd, 0, 0, 0, 0);
     if(sc_missing(r)) return 0;          /* no SYS_SYNC: writes are already synchronous */
     return (int)sc_ret(r);
 }
-int link(const char* oldp, const char* newp){
+W int link(const char* oldp, const char* newp){
     long r = secos_syscall(SYS_LINK_, (long)oldp, (long)newp, 0, 0, 0);
     if(sc_missing(r)) r = -ENOSYS;       /* Dropbear falls back to a direct write */
     return (int)sc_ret(r);
 }
-int fileno(FILE* f){ return f ? f->fd : (errno = EBADF, -1); }
-void clearerr(FILE* f){ (void)f; }
-int setvbuf(FILE* f, char* buf, int mode, size_t size){ (void)f; (void)buf; (void)mode; (void)size; return 0; }
-int fchmod(int fd, mode_t mode){ (void)fd; (void)mode; return 0; }
-int fchown(int fd, uid_t uid, gid_t gid){ (void)fd; (void)uid; (void)gid; return 0; }
-int ftruncate(int fd, off_t len){ (void)fd; (void)len; errno = ENOSYS; return -1; }
-int access(const char* path, int mode){ (void)mode; struct stat st; return stat(path, &st) == 0 ? 0 : -1; }
+W int fileno(FILE* f){ return f ? f->fd : (errno = EBADF, -1); }
+W void clearerr(FILE* f){ (void)f; }
+W int setvbuf(FILE* f, char* buf, int mode, size_t size){ (void)f; (void)buf; (void)mode; (void)size; return 0; }
+W int fchmod(int fd, mode_t mode){ (void)fd; (void)mode; return 0; }
+W int fchown(int fd, uid_t uid, gid_t gid){ (void)fd; (void)uid; (void)gid; return 0; }
+W int ftruncate(int fd, off_t len){ (void)fd; (void)len; errno = ENOSYS; return -1; }
+W int access(const char* path, int mode){ (void)mode; struct stat st; return stat(path, &st) == 0 ? 0 : -1; }
 
 /* ===================== processes / signals ===================== */
 /* waitpid(pid, &st, opt) over SYS_WAIT (one pid, blocking) / SYS_WAITANY. The
@@ -359,7 +396,7 @@ int db_waitpid(pid_t pid, int* status, int options){
 }
 int db_getgroups(int n, int* g){ (void)n; (void)g; errno = ENOSYS; return -1; }
 static void (*g_sigdisp[NSIG])(int);
-int sigaction(int sig, const struct sigaction* act, struct sigaction* old){
+W int sigaction(int sig, const struct sigaction* act, struct sigaction* old){
     if(sig <= 0 || sig >= NSIG){ errno = EINVAL; return -1; }
     if(old){ zmem(old, sizeof(*old)); old->sa_handler = g_sigdisp[sig]; }
     if(act){
@@ -368,24 +405,24 @@ int sigaction(int sig, const struct sigaction* act, struct sigaction* old){
     }
     return 0;
 }
-int sigemptyset(sigset_t* s){ if(s) *s = 0; return 0; }
-int sigfillset(sigset_t* s){ if(s) *s = ~0UL; return 0; }
-int sigaddset(sigset_t* s, int n){ if(s) *s |= (1UL << (n & 63)); return 0; }
-int sigdelset(sigset_t* s, int n){ if(s) *s &= ~(1UL << (n & 63)); return 0; }
-int sigismember(const sigset_t* s, int n){ return s ? (int)((*s >> (n & 63)) & 1) : 0; }
-unsigned int alarm(unsigned int s){ (void)s; return 0; }
-int setegid(gid_t g){ (void)g; return 0; }
-int seteuid(uid_t u){ (void)u; return 0; }
-int initgroups(const char* user, gid_t g){ (void)user; (void)g; return 0; }
-int setpgrp(void){ return setpgid(0, 0); }
-int getrlimit(int r, struct rlimit* l){ (void)r; if(l){ l->rlim_cur = RLIM_INFINITY; l->rlim_max = RLIM_INFINITY; } return 0; }
-int setrlimit(int r, const struct rlimit* l){ (void)r; (void)l; return 0; }
-long sysconf(int name){
+W int sigemptyset(sigset_t* s){ if(s) *s = 0; return 0; }
+W int sigfillset(sigset_t* s){ if(s) *s = ~0UL; return 0; }
+W int sigaddset(sigset_t* s, int n){ if(s) *s |= (1UL << (n & 63)); return 0; }
+W int sigdelset(sigset_t* s, int n){ if(s) *s &= ~(1UL << (n & 63)); return 0; }
+W int sigismember(const sigset_t* s, int n){ return s ? (int)((*s >> (n & 63)) & 1) : 0; }
+W unsigned int alarm(unsigned int s){ (void)s; return 0; }
+W int setegid(gid_t g){ (void)g; return 0; }
+W int seteuid(uid_t u){ (void)u; return 0; }
+W int initgroups(const char* user, gid_t g){ (void)user; (void)g; return 0; }
+W int setpgrp(void){ return setpgid(0, 0); }
+W int getrlimit(int r, struct rlimit* l){ (void)r; if(l){ l->rlim_cur = RLIM_INFINITY; l->rlim_max = RLIM_INFINITY; } return 0; }
+W int setrlimit(int r, const struct rlimit* l){ (void)r; (void)l; return 0; }
+W long sysconf(int name){
     switch(name){ case _SC_OPEN_MAX: return 32; case _SC_CLK_TCK: return 1000; case _SC_PAGESIZE: return 4096; }
     errno = EINVAL; return -1;
 }
-int getpagesize(void){ return 4096; }
-int gethostname(char* name, size_t len){
+W int getpagesize(void){ return 4096; }
+W int gethostname(char* name, size_t len){
     const char* h = "secos";
     if(!name || !len){ errno = EINVAL; return -1; }
     strlcpy(name, h, len); return 0;
@@ -410,7 +447,13 @@ struct group* getgrgid(int g){ return g == 0 ? &g_rootgrp : 0; }
 struct group* getgrent(void){ return 0; }
 void setgrent(void){}
 void endgrent(void){}
-char* crypt(const char* key, const char* salt){ (void)key; (void)salt; errno = ENOSYS; return 0; }
+/* Valid login shells (there is no /etc/shells): the account's own shell. */
+static const char* const g_shells[] = { "/bin/bash", 0 };
+static int g_shell_i;
+char* getusershell(void){ const char* s = g_shells[g_shell_i]; if(s) g_shell_i++; return (char*)s; }
+void setusershell(void){ g_shell_i = 0; }
+void endusershell(void){ g_shell_i = 0; }
+W char* crypt(const char* key, const char* salt){ (void)key; (void)salt; errno = ENOSYS; return 0; }
 
 /* ===================== PTY (kernel side pending; see docs/SSH.md) ===================== */
 /* Standard Linux implementation over /dev/ptmx + TIOCGPTN/TIOCSPTLCK: it
@@ -419,24 +462,24 @@ char* crypt(const char* key, const char* salt){ (void)key; (void)salt; errno = E
  * `ssh host cmd` (exec, no tty) works and `ssh -t` degrades to no tty. */
 #define TIOCGPTN_   0x80045430
 #define TIOCSPTLCK_ 0x40045431
-int posix_openpt(int flags){ return open("/dev/ptmx", flags); }
-int grantpt(int fd){ (void)fd; return 0; }   /* /dev/pts nodes are created owned + 0620 */
-int unlockpt(int fd){ int z = 0; return ioctl(fd, TIOCSPTLCK_, &z); }
-char* ptsname(int fd){
+W int posix_openpt(int flags){ return open("/dev/ptmx", flags); }
+W int grantpt(int fd){ (void)fd; return 0; }   /* /dev/pts nodes are created owned + 0620 */
+W int unlockpt(int fd){ int z = 0; return ioctl(fd, TIOCSPTLCK_, &z); }
+W char* ptsname(int fd){
     static char name[24]; unsigned int n = 0;
     if(ioctl(fd, TIOCGPTN_, &n) != 0) return 0;
     snprintf(name, sizeof(name), "/dev/pts/%u", n);
     return name;
 }
-int tcsendbreak(int fd, int dur){ (void)fd; (void)dur; return 0; }
-speed_t cfgetospeed(const void* t){ (void)t; return 38400; }
-speed_t cfgetispeed(const void* t){ (void)t; return 38400; }
-int cfsetospeed(void* t, speed_t s){ (void)t; (void)s; return 0; }
-int cfsetispeed(void* t, speed_t s){ (void)t; (void)s; return 0; }
-char* ttyname(int fd){ (void)fd; return 0; }
+W int tcsendbreak(int fd, int dur){ (void)fd; (void)dur; return 0; }
+W speed_t cfgetospeed(const void* t){ (void)t; return 38400; }
+W speed_t cfgetispeed(const void* t){ (void)t; return 38400; }
+W int cfsetospeed(void* t, speed_t s){ (void)t; (void)s; return 0; }
+W int cfsetispeed(void* t, speed_t s){ (void)t; (void)s; return 0; }
+W char* ttyname(int fd){ (void)fd; return 0; }
 
 /* ===================== time (TODO(integration): move to libc) ===================== */
-int clock_gettime(clockid_t id, struct timespec* ts){
+W int clock_gettime(clockid_t id, struct timespec* ts){
     if(!ts){ errno = EFAULT; return -1; }
     long r = secos_syscall(SYS_CLOCK_GETTIME_, id, (long)ts, 0, 0, 0);
     if(r == 0) return 0;
@@ -447,7 +490,7 @@ int clock_gettime(clockid_t id, struct timespec* ts){
     ts->tv_sec = (long)(ms / 1000); ts->tv_nsec = (long)(ms % 1000) * 1000000L;
     return 0;
 }
-int nanosleep(const struct timespec* req, struct timespec* rem){
+W int nanosleep(const struct timespec* req, struct timespec* rem){
     if(!req){ errno = EFAULT; return -1; }
     long r = secos_syscall(SYS_NANOSLEEP_, (long)req, (long)rem, 0, 0, 0);
     if(r == 0) return 0;
@@ -461,7 +504,7 @@ static int is_leap(long y){ return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
 static const short g_mdays_cum[2][13] = {
     { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365 },
     { 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 366 } };
-struct tm* gmtime_r(const time_t* t, struct tm* tm){
+W struct tm* gmtime_r(const time_t* t, struct tm* tm){
     long s = (long)*t, days = s / 86400, rem = s % 86400;
     if(rem < 0){ rem += 86400; days--; }
     tm->tm_hour = (int)(rem / 3600); tm->tm_min = (int)(rem % 3600 / 60); tm->tm_sec = (int)(rem % 60);
@@ -476,16 +519,16 @@ struct tm* gmtime_r(const time_t* t, struct tm* tm){
     tm->tm_isdst = 0; tm->tm_gmtoff = 0; tm->tm_zone = "UTC";
     return tm;
 }
-struct tm* localtime_r(const time_t* t, struct tm* tm){ return gmtime_r(t, tm); }   /* UTC only */
-struct tm* gmtime(const time_t* t){ static struct tm tm; return gmtime_r(t, &tm); }
-struct tm* localtime(const time_t* t){ return gmtime(t); }
-time_t mktime(struct tm* tm){
+W struct tm* localtime_r(const time_t* t, struct tm* tm){ return gmtime_r(t, tm); }   /* UTC only */
+W struct tm* gmtime(const time_t* t){ static struct tm tm; return gmtime_r(t, &tm); }
+W struct tm* localtime(const time_t* t){ return gmtime(t); }
+W time_t mktime(struct tm* tm){
     long y = tm->tm_year + 1900, days = 0;
     for(long i = 1970; i < y; i++) days += is_leap(i) ? 366 : 365;
     days += g_mdays_cum[is_leap(y)][tm->tm_mon % 12] + tm->tm_mday - 1;
     return (time_t)(days * 86400L + tm->tm_hour * 3600L + tm->tm_min * 60L + tm->tm_sec);
 }
-size_t strftime(char* s, size_t max, const char* fmt, const struct tm* tm){
+W size_t strftime(char* s, size_t max, const char* fmt, const struct tm* tm){
     static const char* mon[] = { "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec" };
     static const char* wd[] = { "Sun","Mon","Tue","Wed","Thu","Fri","Sat" };
     size_t o = 0;
@@ -516,7 +559,7 @@ size_t strftime(char* s, size_t max, const char* fmt, const struct tm* tm){
 
 /* ===================== strings / misc (TODO(integration): move to libc) ===================== */
 /* sscanf: just the conversions Dropbear uses (%d %u %x with an optional width). */
-int sscanf(const char* s, const char* fmt, ...){
+W int sscanf(const char* s, const char* fmt, ...){
     va_list ap; va_start(ap, fmt);
     int n = 0;
     while(*fmt){
@@ -546,9 +589,9 @@ int sscanf(const char* s, const char* fmt, ...){
     va_end(ap);
     return n;
 }
-char* strsignal(int sig){ static char b[24]; snprintf(b, sizeof b, "Signal %d", sig); return b; }
+W char* strsignal(int sig){ static char b[24]; snprintf(b, sizeof b, "Signal %d", sig); return b; }
 
 /* syslog: Dropbear is built with DISABLE_SYSLOG and run with -E (stderr). */
-void openlog(const char* ident, int opt, int facility){ (void)ident; (void)opt; (void)facility; }
-void syslog(int pri, const char* fmt, ...){ (void)pri; (void)fmt; }
-void closelog(void){}
+W void openlog(const char* ident, int opt, int facility){ (void)ident; (void)opt; (void)facility; }
+W void syslog(int pri, const char* fmt, ...){ (void)pri; (void)fmt; }
+W void closelog(void){}

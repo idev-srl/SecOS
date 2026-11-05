@@ -26,7 +26,7 @@ DFLAGS=(-ffreestanding -nostdlib -nostdinc -fno-pie -no-pie -mno-red-zone -mcmod
         -DHAVE_CONFIG_H -DLOCALOPTIONS_H_EXISTS -DDROPBEAR_MULTI -DDROPBEAR_SERVER -DDROPBEAR_CLIENT
         -I"$WORK" -I"$WORK/src" -I"$WORK/libtomcrypt/src/headers" -I"$WORK/libtommath"
         -I"$ROOT/user/dropbear-include" -I"$ROOT/user/port-include" -I"$ROOT/user" -I"$ROOT/user/include"
-        -isystem "$GCCINC" -include "$ROOT/user/dropbear_port.h")
+        -isystem "$GCCINC" -include "$ROOT/user/dropbear_port.h" ${DROPBEAR_PORT_CFLAGS:-})
 for p in $PROGS; do DFLAGS+=("-DDBMULTI_$p"); done
 
 echo "[port-dropbear] 1/5 fetch + verify $TARBALL"
@@ -65,7 +65,10 @@ echo "[port-dropbear] 3/5 cross-compile against SecOS libc"
 rm -rf "$OBJ"; mkdir -p "$OBJ"/{db,ltc,ltm}
 fail=0
 cc1() { gcc "${DFLAGS[@]}" "$@" || fail=1; }
-for o in $DB_OBJS;  do c="$WORK/src/${o%.o}.c";        cc1 -c "$c" -o "$OBJ/db/$(basename "$o")"; done
+# Dropbear's own sources get the O_NONBLOCK-aware read/write/fcntl wrappers
+# (DB_PORT_IO_WRAP); libtomcrypt calls prng_descriptor[].read() members, so the
+# function-like macros must not reach it.
+for o in $DB_OBJS;  do c="$WORK/src/${o%.o}.c";        cc1 -DDB_PORT_IO_WRAP -c "$c" -o "$OBJ/db/$(basename "$o")"; done
 for o in $LTC_OBJS; do c="$WORK/libtomcrypt/${o%.o}.c"; cc1 -c "$c" -o "$OBJ/ltc/$(echo "${o%.o}" | tr / _).o"; done
 for o in $LTM_OBJS; do c="$WORK/libtommath/${o%.o}.c";  cc1 -c "$c" -o "$OBJ/ltm/$(basename "$o")"; done
 [ "$fail" = 0 ] || { echo "[port-dropbear] compile FAILED"; exit 1; }

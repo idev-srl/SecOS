@@ -67,10 +67,13 @@ ssize_t readv(int fd, const struct iovec* iov, int cnt);
 #define _STRUCT_TIMESPEC
 struct timespec { long tv_sec; long tv_nsec; };
 #endif
+#ifndef CLOCK_MONOTONIC        /* older libc <time.h>: no struct tm / clocks */
+#define DB_NEED_TIME_DECLS 1
 struct tm {
     int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst;
     long tm_gmtoff; const char* tm_zone;
 };
+#endif
 
 /* ---- errno values (Linux numbering, as the kernel returns -errno) ---- */
 #ifndef ENXIO
@@ -112,30 +115,78 @@ struct tm {
 #ifndef ELOOP
 #define ELOOP 40
 #endif
+#ifndef EWOULDBLOCK
 #define EWOULDBLOCK EAGAIN
+#endif
+#ifndef ENOTSOCK
 #define ENOTSOCK 88
+#endif
+#ifndef EDESTADDRREQ
 #define EDESTADDRREQ 89
+#endif
+#ifndef EMSGSIZE
 #define EMSGSIZE 90
+#endif
+#ifndef EPROTOTYPE
 #define EPROTOTYPE 91
+#endif
+#ifndef ENOPROTOOPT
 #define ENOPROTOOPT 92
+#endif
+#ifndef EPROTONOSUPPORT
 #define EPROTONOSUPPORT 93
+#endif
+#ifndef EOPNOTSUPP
 #define EOPNOTSUPP 95
+#endif
+#ifndef ENOTSUP
 #define ENOTSUP EOPNOTSUPP
+#endif
+#ifndef EAFNOSUPPORT
 #define EAFNOSUPPORT 97
+#endif
+#ifndef EADDRINUSE
 #define EADDRINUSE 98
+#endif
+#ifndef EADDRNOTAVAIL
 #define EADDRNOTAVAIL 99
+#endif
+#ifndef ENETDOWN
 #define ENETDOWN 100
+#endif
+#ifndef ENETUNREACH
 #define ENETUNREACH 101
+#endif
+#ifndef ECONNABORTED
 #define ECONNABORTED 103
+#endif
+#ifndef ECONNRESET
 #define ECONNRESET 104
+#endif
+#ifndef ENOBUFS
 #define ENOBUFS 105
+#endif
+#ifndef EISCONN
 #define EISCONN 106
+#endif
+#ifndef ENOTCONN
 #define ENOTCONN 107
+#endif
+#ifndef ETIMEDOUT
 #define ETIMEDOUT 110
+#endif
+#ifndef ECONNREFUSED
 #define ECONNREFUSED 111
+#endif
+#ifndef EHOSTUNREACH
 #define EHOSTUNREACH 113
+#endif
+#ifndef EALREADY
 #define EALREADY 114
+#endif
+#ifndef EINPROGRESS
 #define EINPROGRESS 115
+#endif
 
 /* ---- file modes / open flags ---- */
 #ifndef S_IRUSR
@@ -159,8 +210,12 @@ struct tm {
 #define S_IFIFO  0x1000
 #define S_IFSOCK 0xC000
 #endif
+#ifndef S_ISFIFO
 #define S_ISFIFO(m)  (((m) & 0xF000) == S_IFIFO)
+#endif
+#ifndef S_ISSOCK
 #define S_ISSOCK(m)  (((m) & 0xF000) == S_IFSOCK)
+#endif
 #ifndef F_OK
 #define F_OK 0
 #define X_OK 1
@@ -179,6 +234,23 @@ struct tm {
 #define O_NOFOLLOW 0x20000
 #endif
 #define SOL_TCP 6
+
+/* ---- O_NONBLOCK in user space ----
+ * Dropbear drains its signal self-pipe with `while (read(p, &x, 1) > 0)` and
+ * relies on O_NONBLOCK everywhere. The SecOS kernel does not honour O_NONBLOCK
+ * on pipes yet (and has no fcntl syscall before SYS_FCNTL), so a read on an
+ * empty pipe blocks forever. db_fcntl() records O_NONBLOCK per fd (and still
+ * forwards to the libc fcntl); db_read()/db_write() on such an fd first
+ * poll() with a zero timeout and return EAGAIN when it is not ready.
+ * TODO(integration): drop once the kernel returns -EAGAIN for O_NONBLOCK pipes. */
+int     db_fcntl(int fd, int cmd, ...);
+ssize_t db_read(int fd, void* buf, size_t n);
+ssize_t db_write(int fd, const void* buf, size_t n);
+#ifdef DB_PORT_IO_WRAP
+#define fcntl(...)    db_fcntl(__VA_ARGS__)
+#define read(f,b,n)   db_read(f,b,n)
+#define write(f,b,n)  db_write(f,b,n)
+#endif
 
 /* ---- POSIX functions with SecOS-incompatible prototypes ---- */
 int open(const char* path, int flags, ...);
@@ -220,10 +292,12 @@ int sigdelset(sigset_t* s, int n);
 int sigismember(const sigset_t* s, int n);
 
 /* ---- time (TODO(integration): move to libc) ---- */
+#ifdef DB_NEED_TIME_DECLS
 typedef int clockid_t;
 #define CLOCK_REALTIME  0
 #define CLOCK_MONOTONIC 1
 #define CLOCK_BOOTTIME  7
+#endif
 int clock_gettime(clockid_t id, struct timespec* ts);
 struct tm* gmtime(const time_t* t);
 struct tm* localtime(const time_t* t);
@@ -259,6 +333,9 @@ int   initgroups(const char* user, gid_t g);
 pid_t vfork(void);
 int   execl(const char* path, const char* arg, ...);
 char* crypt(const char* key, const char* salt);
+char* getusershell(void);
+void  setusershell(void);
+void  endusershell(void);
 int   setvbuf(FILE* f, char* buf, int mode, size_t size);
 #ifndef _IOFBF
 #define _IOFBF 0

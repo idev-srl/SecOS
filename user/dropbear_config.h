@@ -39,10 +39,10 @@
 #define HAVE_GETNAMEINFO 1
 #define HAVE_GAI_STRERROR 1
 #define HAVE_CONST_GAI_STRERROR_PROTO 1
-/* basename/daemon/getusershell come from Dropbear's own compat.c. */
+/* basename/daemon come from Dropbear's own compat.c; getusershell from ours. */
+#define HAVE_GETUSERSHELL 1
 #undef HAVE_BASENAME
 #undef HAVE_DAEMON
-#undef HAVE_GETUSERSHELL
 #define HAVE_WRITEV 1          /* compat: a write() loop */
 #undef HAVE_GETRANDOM
 #undef HAVE_CLEARENV
