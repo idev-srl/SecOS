@@ -243,7 +243,6 @@ int putenv(char* s){
     char name[ENV_LEN]; size_t i=0; for(; i<eq && i<ENV_LEN-1; i++) name[i]=s[i]; name[i]=0;
     return setenv(name, s+eq+1, 1);
 }
-void exit(int code){ _exit(code); }
 void abort(void){ write(2,"abort\n",6); _exit(134); }
 
 /* [M39] Single-user identity + misc POSIX stubs that source ports (a shell, many
@@ -499,6 +498,10 @@ FILE* stdout = &_stdout;
 FILE* stderr = &_stderr;
 
 int fflush(FILE* f){ if(!f) return 0; if(f->wlen){ write(f->fd,(char*)f->wbuf,f->wlen); f->wlen=0; } return 0; }
+/* exit() flushes stdio like a hosted libc; _exit() does not. crt0 routes the
+ * return from main() through exit(), so output with no trailing newline (e.g.
+ * `head -c 32 /dev/zero`, `printf x`) is no longer lost at process exit. */
+void exit(int code){ fflush(stdout); fflush(stderr); _exit(code); }
 static void file_putn(FILE* f, const char* p, size_t n){
     for(size_t i=0;i<n;i++){ f->wbuf[f->wlen++]=p[i]; if(f->wlen==BUFSIZ || p[i]=='\n') fflush(f); }
 }

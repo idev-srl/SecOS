@@ -7,8 +7,7 @@ _start:
     xor     rbp, rbp
     call    main
     mov     edi, eax        /* exit code = main() return */
-    mov     rax, 1          /* SYS_EXIT */
-    int     0x80
+    call    exit            /* libc: flush stdio, then SYS_EXIT */
 1:  jmp     1b
 
 /* [M30] Signal return trampoline. When a signal handler returns, it `ret`s here
