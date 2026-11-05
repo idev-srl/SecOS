@@ -67,8 +67,28 @@ int sched_add_process(process_t* p) { (void)p; return 0; }
 
 // ---- low-level switch: load target space + kernel stack, iretq into it ----
 static void switch_to(process_t* next) __attribute__((noreturn));
+// x87/SSE state of user tasks: saved at switch-out, restored at switch-in (the
+// kernel never touches these registers: it is built -mno-sse).
+static const uint8_t g_fpu_init[512] __attribute__((aligned(16))) = {
+    [0] = 0x7F, [1] = 0x03,                        // FCW = 0x037F
+    [24] = 0x80, [25] = 0x1F,                      // MXCSR = 0x1F80
+};
+static void fpu_switch(process_t* prev, process_t* next) {
+    if (prev == next) return;
+    // An exiting task (ZOMBIE) may be reaped on another CPU: never write to it.
+    if (prev && prev != idle_task && prev->pid != 0 && prev->state != PROC_ZOMBIE) {
+        __asm__ volatile("fxsave64 %0" : "=m"(*(uint8_t(*)[512])prev->fpu));
+        prev->fpu_valid = 1;
+    }
+    if (next && next->pid != 0) {
+        const uint8_t* img = next->fpu_valid ? next->fpu : g_fpu_init;
+        __asm__ volatile("fxrstor64 %0" : : "m"(*(const uint8_t(*)[512])img));
+    }
+}
+
 static void switch_to(process_t* next) {
     { extern void kiface_count_switch(void); kiface_count_switch(); }   // /proc/stat ctxt
+    fpu_switch(current, next);
     current = next;
     next->state = PROC_RUNNING;
     // [M29] Observability: a user task running on an application processor proves

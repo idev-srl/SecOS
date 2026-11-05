@@ -476,7 +476,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->stop_report = 0; p->cont_report = 0; p->stop_sig = 0;
     p->wait_tty = 0; p->power_phase = 0; p->power_deadline = 0;
     p->wait_pty = NULL; p->sid = p->pid; p->ctty = NULL; p->ctty_detached = 0;  // own session, console
-    p->sigsusp_active = 0; p->sigsusp_saved = 0; p->sig_eintr_rip = 0; p->sig_rerun_eintr = 0;
+    p->sigsusp_active = 0; p->sigsusp_saved = 0; p->sig_eintr_rip = 0; p->sig_rerun_eintr = 0; p->fpu_valid = 0;
     p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
     // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases
     // (<=32MB each, within their multi-GB regions). Transparent to programs.
@@ -717,6 +717,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     p->sigsusp_active = 0;
     p->sleep_until = 0; p->wait_pipe = NULL; p->pipe_wdone = 0; p->wait_tty = 0; p->wait_pty = NULL; p->recv_chan = -1;
     p->sig_eintr_rip = 0; p->sig_rerun_eintr = 0;
+    p->fpu_valid = 0;                          // proc_fpu_reset() loads the clean state
     p->ki.nsleep_deadline = 0; p->ki.poll_active = 0; p->ki.poll_wait = 0;
 
     // Fresh register state: entry point, new stack, argc/argv/envp (System V).
@@ -758,6 +759,9 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->space = NULL; c->image = NULL; c->manifest = NULL; c->tf = NULL;
     c->kstack_top = 0; c->kstack_slot = 0; c->mapped_pages = NULL;
     c->sig_eintr_rip = 0; c->sig_rerun_eintr = 0;
+    // The parent's live x87/SSE registers (its saved image may be stale).
+    __asm__ volatile("fxsave64 %0" : "=m"(*(uint8_t(*)[512])c->fpu));
+    c->fpu_valid = 1;
 
     c->space = vmm_fork_space(parent->space);
     if (!c->space) { kfree(c); return NULL; }

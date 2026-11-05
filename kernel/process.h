@@ -47,6 +47,13 @@
 #define PROC_TYPE_DRIVER  1
 
 typedef struct process {
+    // User x87/SSE register file (fxsave image, 16-byte aligned: process_t is
+    // kmalloc'd 16-aligned and this is its first member). Ring 3 uses SSE
+    // (doubles, gcc-vectorised memcpy) while the kernel is built -mno-sse, so
+    // the scheduler saves it when a task is switched out and restores it when
+    // the task runs again; fpu_valid = 0 means "start from the clean state".
+    uint8_t  fpu[512] __attribute__((aligned(16)));
+    uint8_t  fpu_valid;
     uint32_t pid;
     vmm_space_t* space;
     uint64_t entry;
