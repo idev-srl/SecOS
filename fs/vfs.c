@@ -411,7 +411,22 @@ int vfs_truncate(const char* path, size_t new_size){
 // op return -1 instead of crashing — chmod on a read-only virtual FS is a no-op).
 int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
     char cp[VFS_PATH]; int e=vfs_walk(path, cp, sizeof(cp), 1); if(e) return e;   // chmod follows
-    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->setattr) return -1; return m->ops->setattr(rel, a, valid);
+    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops) return -1;
+    if(m->ops->setattr) return m->ops->setattr(rel, a, valid);
+    // A filesystem with no on-disk metadata (ramfs, devfs incl. /dev/pts, the
+    // virtual ones): keep the change on the in-memory inode, like devtmpfs, so
+    // chmod/chown succeed (sshd/login chmod the pty slave) and stat shows them.
+    vfs_inode_t* ino=vfs_lookup_follow(cp); if(!ino) return -2;
+    if(valid & VFS_ATTR_MODE){
+        uint32_t t = ino->mode & 0170000u;
+        if(!t) t = ino->type==VFS_NODE_DIR ? 0040000u : ino->type==VFS_NODE_SYMLINK ? 0120000u : 0100000u;
+        ino->mode = t | (a->mode & 07777u);
+    }
+    if(valid & VFS_ATTR_UID)   ino->uid = a->uid;
+    if(valid & VFS_ATTR_GID)   ino->gid = a->gid;
+    if(valid & VFS_ATTR_ATIME) ino->atime = a->atime;
+    if(valid & VFS_ATTR_MTIME) ino->mtime = a->mtime;
+    return 0;
 }
 int vfs_readlink(const char* path, char* buf, size_t len){
     char cp[VFS_PATH];

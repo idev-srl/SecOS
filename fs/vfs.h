@@ -90,7 +90,7 @@ typedef struct vfs_fs_ops {
     // Truncate file
     int (*truncate)(const char* path, size_t new_size);
     // [M26] Change attributes (mode/uid/gid/times); `valid` = VFS_ATTR_* bitmask.
-    // NULL = unsupported (chmod/chown silently no-op on that FS). Returns 0/-1.
+    // NULL = no on-disk metadata: vfs_setattr updates the in-memory inode. Returns 0/-1.
     int (*setattr)(const char* path, const vfs_attr_t* a, unsigned valid);
     // [M26] Read a symlink's target into buf (NUL-terminated). Returns length or -1.
     int (*readlink)(const char* path, char* buf, size_t len);
