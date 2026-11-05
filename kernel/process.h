@@ -82,6 +82,8 @@ typedef struct process {
     uint64_t sig_restorer;
     uint32_t pgid;           // process group id (defaults to pid)
     uint32_t ppid;           // parent pid (0 = no parent process, e.g. shell-spawned)
+    uint32_t spawner_pid;    // pid of the process whose SYS_SPAWN created us (0 = kernel/
+                             // fork). With ppid, the only caller allowed to SYS_WAIT us.
     char     cwd[256];       // [M39] per-process current working directory (for chdir/getcwd + relative paths)
     // [M29] SMP: the CPU this process is pinned to. Assigned round-robin at
     // creation; only this CPU schedules, preempts, and reaps it, so the context

@@ -79,6 +79,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     process_t* p = process_create_from_elf_args(g_spawn_buf, (size_t)n, argc, argv);
     if(!p) return -1;
     spawn_inherit_stdio(sched_get_current(), p);   // before READY: never runs without them
+    p->spawner_pid = sched_get_current() ? sched_get_current()->pid : 0; // SYS_WAIT ownership
     p->state = PROC_READY;
     return (int)p->pid;
 }

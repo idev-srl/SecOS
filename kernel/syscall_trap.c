@@ -18,6 +18,7 @@
 #include "debugcon.h"
 #include "kverbose.h"
 #include "cap.h"
+#include "user_copy.h"
 
 #ifdef SYSCALL_DEBUG
 #include "terminal.h"
@@ -117,6 +118,11 @@ uint64_t syscall_handler(trapframe_t* tf) {
             process_t* child = process_find_by_pid((uint32_t)tf->rdi);
             if (!child) {
                 ret = (uint64_t)(int64_t)-1;            // no such pid
+            } else if (cur && child->ppid != cur->pid && child->spawner_pid != cur->pid) {
+                // Only the parent (fork) or the spawner may wait on / collect a
+                // process; anyone else could otherwise steal its exit status and
+                // mark it collected (reapable) behind the real parent's back.
+                ret = (uint64_t)(int64_t)-10;           // ECHILD: not our child
             } else if (child->state == PROC_ZOMBIE) {
                 ret = (uint64_t)(int64_t)child->exit_code; // already exited
                 child->collected = 1;                      // [M39] parent reaped it -> reapable
