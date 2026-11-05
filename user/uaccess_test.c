@@ -92,6 +92,41 @@ int main(void) {
     const long wild = 0xDEADBEEFL;
     for (unsigned long i = 0; i < PG; i++) rw[i] = 'A';      /* no NUL in the page */
 
+    /* --- the identity-map hole: low user pointers that alias the kernel-only
+     * low identity map (physical 0..512 MB). Before the fix a syscall would
+     * read/write real physical RAM (the IVT at 0x10, the kernel image at ~1 MB,
+     * page tables) on the caller's behalf. Every one must now be refused by the
+     * range check, and the kernel .text must be unchanged (the selftest gate
+     * also checks /proc/version is intact after this run). --- */
+    {
+        const unsigned long lo[] = { 0x10, 0x1000, 0x100000, 0x200000, 0x1FFFFFFF };
+        const char* nm[] = { "ident-read-0x10", "ident-read-0x1000",
+                             "ident-read-0x100000", "ident-read-0x200000",
+                             "ident-read-0x1FFFFFFF" };
+        for (int i = 0; i < 5; i++) {
+            /* read side: write(fd,ptr,n) copies FROM the pointer. */
+            expect_efault(nm[i], sc(SYS_WRITE, 1, (long)lo[i], 16, 0));
+        }
+        /* write side: read(pipe, ptr, n) copies INTO the pointer (the dangerous
+         * direction — a kernel-memory overwrite). Must be refused, not torn. */
+        int wp[2];
+        if (pipe(wp) == 0) {
+            write(wp[1], "PWNED", 5);
+            expect_efault("ident-write-0x100000", sc(SYS_READ, wp[0], 0x100000, 5, 0));
+            expect_efault("ident-write-0x10", sc(SYS_READ, wp[0], 0x10, 5, 0));
+            close(wp[0]); close(wp[1]);
+        }
+        /* output-buffer syscalls into the identity window. */
+        expect_efault("ident-stat-buf-0x100000", sc(SYS_STAT, (long)"/", 0x100000, 0, 0));
+        expect_err("ident-getcwd-0x100000", sc(SYS_GETCWD, 0x100000, 64, 0, 0));
+        /* path/string argument in the identity window. */
+        expect_efault("ident-open-path-0x100000", sc(SYS_OPEN, 0x100000, 0, 0, 0));
+        expect_efault("ident-spawn-path-0x1000", sc(SYS_SPAWN, 0x1000, 0, 0, 0));
+        /* a range straddling the window top (ends just inside user space) must
+         * still be refused as a whole. */
+        expect_efault("ident-straddle-min", sc(SYS_WRITE, 1, 0xFFFFF000UL, 0x4000, 0));
+    }
+
     /* --- the three triggers found by the syscall fuzzer --- */
     expect_efault("spawn-wild-path", sc(SYS_SPAWN, wild, 0, 0, 0));
     expect_efault("lstat-protnone-statbuf", sc(SYS_LSTAT, (long)"/", (long)none, 0, 0));

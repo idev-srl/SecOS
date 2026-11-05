@@ -109,7 +109,7 @@ static u64 g_scratch, g_fresh, g_hole, g_none, g_edge;
 
 /* interesting pointer values */
 static u64 ptrpool(void){
-    switch(rn(16)){
+    switch(rn(20)){
     case 0: return 0;
     case 1: return (u64)g_buf;
     case 2: return (u64)g_buf + 1 + rn(7);
@@ -125,6 +125,12 @@ static u64 ptrpool(void){
     case 12:return 0x1000;
     case 13:return (u64)&g_buf[8192-4];
     case 14:return 0x7FFFFFFFFFFFFFFFUL;
+    /* low addresses that alias the kernel-only low identity map (phys 0..512 MB):
+     * a syscall must never read/write these on the caller's behalf. */
+    case 15:return 0x10;
+    case 16:return 0x100000;        /* ~kernel image load address */
+    case 17:return 0x200000;
+    case 18:return 0x1FFFFFFF;      /* top of the identity window */
     default:return (u64)g_scratch + rn(0x4000);
     }
 }

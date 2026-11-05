@@ -14,7 +14,7 @@
 #   2  BUILD/ENV error
 #
 # Assertions (current):
-#   A. M4 isolation selftest reports 12/12 PASS.
+#   A. M4 isolation selftest reports 20/20 PASS.
 #   B. M7 ring-3 cooperative scheduling: two ring-3 processes alternate via
 #      SYS_YIELD (both 1->2 and 2->1 switches observed, no CPU exception).
 
@@ -61,8 +61,8 @@ fi
 
 echo "[selftest] Assertions:"
 
-# A. M4 isolation selftest 12/12
-grep -q "12/12 PASS" "$LOG"; check "M4 isolation selftest 12/12" $?
+# A. M4 isolation selftest 20/20 (12 base + 8 identity-alias cases)
+grep -q "20/20 PASS" "$LOG"; check "M4 isolation selftest 20/20" $?
 
 # A2. M9 crypto known-answer self-tests
 grep -q "\[CRYPTO\] --- all PASS ---" "$LOG"; check "M9 crypto KATs pass" $?
@@ -1189,15 +1189,25 @@ if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
     echo "[selftest] UACCESS BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     exit 2
 fi
-echo "[selftest] Running uaccess + ABI gate (mb2, serial, 60s)..."
+echo "[selftest] Running uaccess + ABI gate (mb2, serial, 100s)..."
 : > "$UALOG"
-( sleep 25; printf '  /bin/uaccess_test; echo UA-$((6*7))-END\r'; sleep 15
-  printf '  /bin/abi_test; echo ABI-$((6*7))-END\r'; sleep 10 ) | \
-    timeout 60 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+UASER=/tmp/secos_selftest_uaccess_serial.log
+: > "$UASER"
+( sleep 25; printf '  /bin/uaccess_test; echo UA-$((6*7))-END\r'; sleep 20
+  printf '  cat /proc/version; echo VER-$((6*7))-END\r'; sleep 5
+  printf '  /bin/abi_test; echo ABI-$((6*7))-END\r'; sleep 30 ) | \
+    timeout 100 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$UALOG" -global isa-debugcon.iobase=0xe9 \
-        -no-reboot -display none -serial stdio >/dev/null 2>&1
+        -no-reboot -display none -serial stdio >"$UASER" 2>&1
 grep -q "\[UA-TEST\] DONE pass=[0-9]* fail=0" "$UALOG"; check "UACCESS every bad-pointer case returns an error (DONE fail=0)" $?
 grep -q "UA-42-END" "$UALOG"; check "UACCESS shell survives the test (sentinel reached)" $?
+# [identity-map hole] low user pointers that alias the kernel-only identity map
+# must be refused; the kernel image (/proc/version lives in .rodata) stays intact.
+grep -q "\[UA-TEST\] ident-read-0x100000 OK" "$UALOG"; check "UACCESS read via identity alias 0x100000 -> -EFAULT" $?
+grep -q "\[UA-TEST\] ident-write-0x100000 OK" "$UALOG"; check "UACCESS WRITE via identity alias 0x100000 -> -EFAULT (no kernel overwrite)" $?
+grep -q "\[UA-TEST\] ident-straddle-min OK" "$UALOG"; check "UACCESS range straddling the user-window base -> -EFAULT" $?
+grep -q "SecOS version" "$UASER" && grep -q "VER-42-END" "$UASER"
+check "UACCESS kernel .rodata intact after the test (/proc/version readable)" $?
 grep -q "\[UA-TEST\] spawn-wild-path OK" "$UALOG"; check "UACCESS spawn(0xDEADBEEF) -> -EFAULT" $?
 grep -q "\[UA-TEST\] lstat-protnone-statbuf OK" "$UALOG"; check "UACCESS lstat into a PROT_NONE page -> -EFAULT" $?
 grep -q "\[UA-TEST\] write-console-overrun OK" "$UALOG"; check "UACCESS write(1, p, 1 MB) off the mapping -> -EFAULT/short" $?
