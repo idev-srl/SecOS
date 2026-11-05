@@ -667,6 +667,17 @@ run-ssh: iso
 	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -cpu max -serial stdio -display none -no-reboot \
 		-netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0
 
+# Graphical UI in a GTK window (docs/GUI.md): PS/2 keyboard + a USB tablet, so
+# the guest pointer follows the host cursor without a mouse grab. Type
+# `startgui` at the bash prompt; Ctrl+Alt+Backspace leaves the GUI. Italian
+# keyboard: `make run-gui KEYMAP=it` (or `loadkeys it` in SecOS). Debugcon
+# (kernel log + GUI markers) goes to secos-gui.log.
+.PHONY: run-gui
+run-gui: iso
+	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -display gtk \
+		-device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 \
+		-debugcon file:secos-gui.log -global isa-debugcon.iobase=0xe9
+
 # Run with a VNC server on :0 (connect a VNC viewer to localhost:5900)
 .PHONY: run-vnc
 run-vnc: iso

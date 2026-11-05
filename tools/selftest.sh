@@ -1754,6 +1754,39 @@ else
     echo "  [SKIP] M40 UEFI fb0 gate (OVMF missing or make uefi failed)"
 fi
 
+# ============================================================================
+# GUI GATE: secwm compositor + graphical terminal + SWP client isolation
+# (docs/GUI.md). tools/gui_wm_drive.py boots the plain image with a PS/2
+# keyboard and a usb-tablet, starts `startgui --trace` from bash over serial and
+# drives it over QMP: screendump checks the desktop/panel/client pixels, a click
+# focuses the terminal, sendkey types `echo GUI-OK-$((6*7))` and the pty output
+# must come back as GUI-OK-42 (secwm --trace mirrors terminal lines to
+# debugcon), job control on the pty (Ctrl+C / Ctrl+Z / fg), launcher button +
+# Ctrl+Alt+T, Italian AltGr symbols, window drag, Ctrl+Alt+Backspace back to
+# the text console. A second session runs five hostile SWP clients (out of
+# bounds PUT, lying length, unknown "read pixels" request, PUT before CREATE,
+# oversized request) next to a good one; a third kills the compositor with
+# SIGSEGV and checks the console comes back.
+# ============================================================================
+WMLOG=/tmp/secos_selftest_wm.log
+WMDRV=/tmp/secos_selftest_wm.drv
+echo "[selftest] Running GUI compositor gate (secwm + terminal + SWP isolation, mb2, serial+QMP, <=450s)..."
+: > "$WMDRV"
+timeout 480 python3 tools/gui_wm_drive.py --log "$WMLOG" --out "$WMDRV" --timeout 450 >/dev/null 2>&1
+for t in wm-ready term-open client-window client-sandbox-fds client-sandbox-nocap client-sandbox-pts \
+         client-sandbox-confined screen-size desktop-pixel panel-pixel not-text-console client-pixels \
+         term-focus-click client-focus-out pty-echo-42 no-key-leak-to-client job-ctrl-c job-ctrl-z job-fg \
+         pty-winsize shortcut-next-window client-focus-in client-key client-button no-key-leak-to-term \
+         launcher-terminal shortcut-terminal layout-it layout-it-symbols layout-us drag-move \
+         exit-combo exit-message text-console-back bash-after-exit \
+         wm2-ready hostile-oob hostile-len hostile-read hostile-early hostile-big hostile-no-oob-pixels \
+         hostile-good-client-intact hostile-wm-alive exit-button \
+         crash-ready crash-restored crash-bash crash-text-console bash-responsive no-panic; do
+    grep -q "\[WM-DRV\] $t OK" "$WMDRV"; check "GUI wm: $t" $?
+done
+[ "$(grep -c 'SW-VIOLATION client' "$WMLOG")" -eq 5 ]; check "GUI wm: exactly the 5 hostile clients were disconnected" $?
+! grep -q "SWE-STILL-CONNECTED" "$WMLOG"; check "GUI wm: no hostile client stayed connected" $?
+
 GUIKLOG=/tmp/secos_selftest_gui_it.log
 GUIKDRV=/tmp/secos_selftest_gui_it.drv
 echo "[selftest] Building KEYMAP=it image + USB HID keyboard gate (<=300s)..."
