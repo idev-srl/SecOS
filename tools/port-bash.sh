@@ -124,8 +124,12 @@ python3 - "$WORK/lib/readline/input.c" <<'PY'
 import sys
 f = sys.argv[1]; s = open(f).read()
 old = "timerset (&it.it_value, *secs, *usecs);"
-if old in s:
-    open(f, 'w').write(s.replace(old, "it.it_value.tv_sec = *secs; it.it_value.tv_usec = *usecs;"))
+s = s.replace(old, "it.it_value.tv_sec = *secs; it.it_value.tv_usec = *usecs;")
+# rl_getc() declares its fd_set only under HAVE_PSELECT but uses it under
+# HAVE_PSELECT || HAVE_SELECT (upstream bug with select() and no pselect()).
+old = "#if defined (HAVE_PSELECT)\n  sigset_t empty_set;\n  fd_set readfds;\n#endif"
+s = s.replace(old, "#if defined (HAVE_PSELECT) || defined (HAVE_SELECT)\n  sigset_t empty_set;\n  fd_set readfds;\n#endif")
+open(f, 'w').write(s)
 PY
 
 echo "[port-bash] 3/6 regenerate builtin .c from .def"
