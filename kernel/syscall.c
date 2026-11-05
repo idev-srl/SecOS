@@ -131,7 +131,9 @@ static inline uint64_t pgup(uint64_t x){ return (x + 0xFFFULL) & ~0xFFFULL; }
 // munmap(0, 2^63) free KERNEL frames and mprotect(.., 2^63) set USER on kernel
 // PTEs (and loop ~2^35 times). Returns the rounded length, or 0 if invalid.
 static uint64_t m18_user_span(uint64_t addr, uint64_t len){
-    if ((addr & 0xFFF) || len == 0 || addr >= VMM_USER_TOP) return 0;
+    if ((addr & 0xFFF) || len == 0) return 0;
+    if (addr < USER_CODE_BASE || addr >= VMM_USER_TOP) return 0; // low addrs alias
+                                                                 // the identity map
     if (len > VMM_USER_TOP - addr) return 0;
     len = pgup(len);
     if (len > VMM_USER_TOP - addr) return 0;

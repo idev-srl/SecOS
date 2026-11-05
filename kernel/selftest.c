@@ -84,6 +84,27 @@ void m4_run_selftests(void) {
     st_check("A7 huge len rejected",
              user_range_valid((void*)0x1000ULL, (size_t)-1) == 0);
 
+    /* A8: a low address that aliases the kernel-only identity map must be
+     *     rejected — these would let a syscall read/write physical RAM. */
+    st_check("A8 identity-alias 0x10 rejected",
+             user_range_valid((void*)0x10ULL, 16) == 0);
+    st_check("A8b identity-alias 0x100000 rejected",
+             user_range_valid((void*)0x100000ULL, 16) == 0);
+    st_check("A8c identity-alias 0x1FFFFFFF rejected",
+             user_range_valid((void*)0x1FFFFFFFULL, 16) == 0);
+
+    /* A9: just below the user window (USER_ADDR_MIN-1) rejected; the window
+     *     start itself accepted. */
+    st_check("A9 USER_ADDR_MIN-1 rejected",
+             user_range_valid((void*)(USER_ADDR_MIN - 1ULL), 1) == 0);
+    st_check("A9b USER_ADDR_MIN accepted",
+             user_range_valid((void*)USER_ADDR_MIN, 64) == 1);
+
+    /* A10: a range straddling the window start (begins below USER_ADDR_MIN,
+     *      ends inside) must be rejected as a whole. */
+    st_check("A10 straddle USER_ADDR_MIN rejected",
+             user_range_valid((void*)(USER_ADDR_MIN - 0x800ULL), 0x1000) == 0);
+
     /* ----------------------------------------------------------
      * Test B: copy_from_user / copy_to_user (negative + range)
      * ---------------------------------------------------------- */
@@ -110,6 +131,13 @@ void m4_run_selftests(void) {
      *     byte-copy test deferred to M5 when user pages are mapped) */
     st_check("B5 user_range_valid(USER_CODE_BASE,64)=1",
              user_range_valid((void*)USER_CODE_BASE, 64) == 1);
+
+    /* B6: copy_from_user / copy_to_user on an identity-alias low address are
+     *     rejected before the access (would otherwise touch physical RAM). */
+    st_check("B6 copy_from_user(0x100000)=-EFAULT",
+             copy_from_user(kbuf, (void*)0x100000ULL, 8) == -EFAULT);
+    st_check("B6b copy_to_user(0x100000)=-EFAULT",
+             copy_to_user((void*)0x100000ULL, kbuf, 8) == -EFAULT);
 
     /* ----------------------------------------------------------
      * Summary

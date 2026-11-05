@@ -19,9 +19,13 @@ int user_range_valid(const void* ptr, size_t len) {
 
     if (start == 0)              return 0;  /* NULL pointer */
     if (len == 0)                return 0;  /* zero-length transfer */
+    if (start <  USER_ADDR_MIN)  return 0;  /* below the user window (aliases the
+                                               kernel-only low identity map) */
     if (start >= USER_ADDR_MAX)  return 0;  /* starts in kernel range */
     if (len  >  USER_ADDR_MAX)   return 0;  /* length alone exceeds limit */
-    /* Overflow check: start + len must not wrap or cross USER_ADDR_MAX. */
+    /* Overflow check: start + len must not wrap or cross USER_ADDR_MAX.
+     * (start >= USER_ADDR_MIN is already established, so the whole range is in
+     * the user window once the upper bound holds.) */
     if (start + len < start)     return 0;  /* arithmetic overflow */
     if (start + len > USER_ADDR_MAX) return 0;
 
@@ -51,7 +55,7 @@ int copy_to_user(void* user_dst, const void* src, size_t len) {
 long strncpy_from_user(char* dst, const char* user_src, size_t max) {
     uint64_t s = (uint64_t)user_src;
     if (max == 0) return -ENAMETOOLONG;
-    if (s == 0 || s >= USER_ADDR_MAX) return -EFAULT;
+    if (s < USER_ADDR_MIN || s >= USER_ADDR_MAX) return -EFAULT;
     /* Never read past the top of the user range. */
     uint64_t lim = max;
     if (lim > USER_ADDR_MAX - s) lim = USER_ADDR_MAX - s;
