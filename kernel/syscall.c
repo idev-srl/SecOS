@@ -115,6 +115,17 @@ static uint64_t m18_prot_to_flags(int prot){
     return f;
 }
 static inline uint64_t pgup(uint64_t x){ return (x + 0xFFFULL) & ~0xFFFULL; }
+// A page-aligned [addr, addr+len) that lies wholly in the user half (no wrap).
+// munmap/mprotect walk page tables over the range: an unchecked len let
+// munmap(0, 2^63) free KERNEL frames and mprotect(.., 2^63) set USER on kernel
+// PTEs (and loop ~2^35 times). Returns the rounded length, or 0 if invalid.
+static uint64_t m18_user_span(uint64_t addr, uint64_t len){
+    if ((addr & 0xFFF) || len == 0 || addr >= VMM_USER_TOP) return 0;
+    if (len > VMM_USER_TOP - addr) return 0;
+    len = pgup(len);
+    if (len > VMM_USER_TOP - addr) return 0;
+    return len;
+}
 
 uint64_t ksys_brk(uint64_t new_brk){
     process_t* c = sched_get_current();
@@ -146,9 +157,10 @@ uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd){
     process_t* c = sched_get_current();
     if (!c || len == 0) return (uint64_t)-1;
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return (uint64_t)-1; // W^X
-    len = pgup(len);
     uint64_t base = c->mmap_next;
-    if (base + len > USER_MMAP_END) return (uint64_t)-1;      // arena exhausted
+    if (base >= USER_MMAP_END || len > USER_MMAP_END - base) return (uint64_t)-1; // arena exhausted (no wrap)
+    len = pgup(len);
+    if (len > USER_MMAP_END - base) return (uint64_t)-1;
     if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) return (uint64_t)-1;
     if (flags & MAP_ANONYMOUS) {
         if (vma_add(&c->vmas, base, base + len, m18_prot_to_flags(prot), VMA_TYPE_ANON,0,0,0,0) != 0)
@@ -167,10 +179,19 @@ uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd){
 
 int ksys_munmap(uint64_t addr, uint64_t len){
     process_t* c = sched_get_current();
-    if (!c || (addr & 0xFFF) || len == 0) return -1;
-    len = pgup(len);
+    if (!c) return -1;
+    len = m18_user_span(addr, len);
+    if (!len) return -1;                                     // EINVAL
     uint64_t end = addr + len;
-    for (uint64_t va = addr; va < end; va += 0x1000) vmm_unmap_in_space(c->space, va);
+    // Every user page is VMA-backed (M14), so only VMA intersections can hold
+    // present PTEs: unmap those instead of walking the whole (maybe huge) range.
+    for (uint32_t i = 0; i < c->vmas.count; i++) {
+        const vma_t* v = &c->vmas.v[i];
+        if (v->type == VMA_TYPE_NONE || !(addr < v->end && v->start < end)) continue;
+        uint64_t lo = addr > v->start ? addr : v->start;
+        uint64_t hi = end  < v->end   ? end  : v->end;
+        for (uint64_t va = lo & ~0xFFFULL; va < hi; va += 0x1000) vmm_unmap_in_space(c->space, va);
+    }
     for (uint32_t i = 0; i < c->vmas.count; i++) {
         vma_t* v = &c->vmas.v[i];
         if (v->type == VMA_TYPE_NONE) continue;
@@ -189,9 +210,10 @@ int ksys_munmap(uint64_t addr, uint64_t len){
 
 int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
     process_t* c = sched_get_current();
-    if (!c || (addr & 0xFFF) || len == 0) return -1;
+    if (!c) return -1;
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return -1;   // W^X
-    len = pgup(len);
+    len = m18_user_span(addr, len);
+    if (!len) return -1;                                        // EINVAL
     uint64_t end = addr + len;
     if (!vma_overlaps(&c->vmas, addr, end)) return -1;          // must be backed
     uint64_t newf = m18_prot_to_flags(prot);
@@ -201,7 +223,14 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
         if (addr <= v->start && end >= v->end && addr < v->end && v->start < end)
             v->flags = newf;                                     // whole VMA in range
     }
-    for (uint64_t va = addr; va < end; va += 0x1000) vmm_protect_in_space(c->space, va, newf);
+    // Re-protect present PTEs, VMA intersections only (see ksys_munmap).
+    for (uint32_t i = 0; i < c->vmas.count; i++) {
+        const vma_t* v = &c->vmas.v[i];
+        if (v->type == VMA_TYPE_NONE || !(addr < v->end && v->start < end)) continue;
+        uint64_t lo = addr > v->start ? addr : v->start;
+        uint64_t hi = end  < v->end   ? end  : v->end;
+        for (uint64_t va = lo & ~0xFFFULL; va < hi; va += 0x1000) vmm_protect_in_space(c->space, va, newf);
+    }
     return 0;
 }
 void ksys_exit(int status){ (void)status; extern process_t* sched_get_current(void); extern int process_destroy(process_t*); process_t* c=sched_get_current(); if(c){ process_destroy(c); } }

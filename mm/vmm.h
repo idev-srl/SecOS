@@ -176,6 +176,7 @@ uint64_t vmm_alloc_ist_stack(uint64_t guard_lo, uint64_t base, uint64_t top,
 #define USER_CODE_BASE  0x0000000100000000ULL  //  4 GB: ELF code
 #define USER_DATA_BASE  0x0000000200000000ULL  //  8 GB: ELF data/bss
 #define USER_HEAP_BASE  0x0000000280000000ULL  // 10 GB: brk/sbrk heap (grows up)  [M18]
+#define VMM_USER_TOP    0x0000800000000000ULL  // end of the user canonical half (exclusive)
 #define USER_MMAP_BASE  0x0000000300000000ULL  // 12 GB: mmap arena (grows up)     [M18]
 #define USER_MMAP_END   0x00000003F0000000ULL  // below the stack guard band       [M18]
 #define USER_STACK_TOP  0x00000003FFF00000ULL  // 16 GB: stack top (grows down)

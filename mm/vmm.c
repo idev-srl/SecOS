@@ -1208,6 +1208,9 @@ int vmm_unmap(uint64_t virt) {
 int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
     if (!space) return -10;
     if (virt & 0xFFF) return -1; // not aligned
+    // User half only: the kernel half is shared by every space, so unmapping
+    // (and freeing!) a kernel frame here would corrupt the whole kernel.
+    if (virt >= VMM_USER_TOP) return -1;
     uint64_t* pt = get_pt_space(space, virt, 0, 0);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
@@ -1227,6 +1230,8 @@ int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
 int vmm_protect_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
     if (!space) return -10;
     if (virt & 0xFFF) return -1;
+    // User half only: this sets the USER bit, which must never reach a kernel PTE.
+    if (virt >= VMM_USER_TOP) return -1;
     if ((flags & VMM_FLAG_RW) && !(flags & VMM_FLAG_NOEXEC)) return -5; // W^X
     uint64_t* pt = get_pt_space(space, virt, 0, 0);
     if (!pt) return -3;
