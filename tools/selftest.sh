@@ -960,6 +960,51 @@ grep -q "UB6-32" "$UBLOG"; check "stdio flushed at exit (head -c 32 /dev/zero | 
 grep -q "UB5-42" "$UBLOG"; check "bash survives SIGCHLDs while idle at the prompt (tty -EINTR)" $?
 ! grep -q "\[EXC\]" "$UBLOG"; check "no CPU exception ([EXC]) during exit-status/stat regressions" $?
 
+# ============================================================================
+# ---- lua in /bin + bash job control (jobs/fg/bg/%n/wait/kill/disown) ----
+# ============================================================================
+# lua 5.4.7 is installed to /bin/lua at boot; bash is built with job control.
+# Async Ctrl-Z/Ctrl-C can't be sent over the polled serial line, so the job is
+# stopped/continued with kill -STOP/-CONT %1. Markers only appear once
+# expanded (the TTY echo shows the raw text). Also guards two kernel fixes:
+# a console reader blocks instead of spinning in ring 0 (else background jobs
+# never ran while bash sat at its prompt: LJ6 needs `sleep 2 &` to finish on
+# its own), and a background TTY reader gets SIGTTIN (stops, LJ7).
+LJLOG=/tmp/secos_selftest_luajobs.log
+echo "[selftest] Running lua + bash job control (mb2, serial input, 95s)..."
+: > "$LJLOG"
+( sleep 25
+  printf "  echo LJ1-\$(lua -e 'print(6*7)')\r"; sleep 4
+  printf '  echo LJ2-$(type -t jobs fg bg)\r'; sleep 4
+  printf '  sleep 30 &\r'; sleep 3
+  printf '  j=$(jobs); [[ $j == *Running* ]] && echo LJ3-run\r'; sleep 3
+  printf '  kill -STOP %%1; sleep 1; j=$(jobs); [[ $j == *Stopped* ]] && echo LJ4-stopped\r'; sleep 4
+  printf '  kill -CONT %%1; j=$(jobs); [[ $j == *Running* ]] && echo LJ5-run\r'; sleep 3
+  printf '  kill %%1; wait %%1; echo LJW-$?\r'; sleep 4
+  printf '  sleep 2 &\r'; sleep 6
+  printf '  j=$(jobs); [[ $j != *Running* ]] && echo LJ6-finished\r'; sleep 3
+  printf '  cat &\r'; sleep 3
+  printf '  j=$(jobs); [[ $j == *Stopped* ]] && echo LJ7-ttin; kill -9 %%1; sleep 1; wait\r'; sleep 5
+  printf '  sleep 3 & kill -STOP %%%%; sleep 1; fg; echo LJ8-$?\r'; sleep 9
+  printf "  echo 'print(io.read(\"l\"))' > /tmp/lj.lua; echo LJ9-\$(echo hi | lua /tmp/lj.lua)\r"; sleep 4
+  printf '  echo LJ-$((6*7))-END\r'; sleep 3 ) | \
+    timeout 95 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$LJLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "\[M34\] installed lua to /bin/lua" "$LJLOG"; check "lua installed to /bin/lua at boot" $?
+grep -q "LJ1-42" "$LJLOG"; check "lua -e 'print(6*7)' -> 42 from bash" $?
+grep -q "LJ2-builtin builtin builtin" "$LJLOG"; check "bash: jobs/fg/bg are shell builtins (type)" $?
+grep -q "LJ3-run" "$LJLOG"; check "bash: jobs lists the background job (Running)" $?
+grep -q "LJ4-stopped" "$LJLOG"; check "bash: kill -STOP %1 -> jobs shows Stopped" $?
+grep -q "LJ5-run" "$LJLOG"; check "bash: kill -CONT %1 -> job Running again" $?
+grep -q "LJW-143" "$LJLOG"; check "bash: kill %1; wait %1 returns (\$? = 143)" $?
+grep -q "LJ6-finished" "$LJLOG"; check "background job finishes while bash idles at the prompt" $?
+grep -q "LJ7-ttin" "$LJLOG"; check "background TTY reader stops on SIGTTIN" $?
+grep -q "LJ8-0" "$LJLOG"; check "bash: fg resumes a stopped job and waits for it" $?
+grep -q "LJ9-hi" "$LJLOG"; check "lua script reads stdin through io.read" $?
+grep -q "LJ-42-END" "$LJLOG"; check "bash responsive after the job-control sequence" $?
+! grep -q "\[EXC\]" "$LJLOG"; check "no CPU exception ([EXC]) during lua/job-control run" $?
+
 # ---- M39: UEFI secure boot (loader Ed25519-verifies kernel.elf before jumping) ----
 OVMF=""
 for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
