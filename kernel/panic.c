@@ -13,6 +13,8 @@
 #include "vmm.h"
 #include "config.h"
 #include "fb_console.h"
+#include "kverbose.h"
+#include "../mm/user_copy.h"
 #include <stdint.h>
 
 /* [M39] Debug breadcrumb: drivers doing long in-kernel bring-up (ath9k) write
@@ -179,8 +181,10 @@ void exception_handler(struct registers* regs) {
     __asm__ volatile("cli");
 
     // [M6] Save trapframe snapshot into current process (struct registers
-    // and trapframe_t share the same binary layout).
-    {
+    // and trapframe_t share the same binary layout). Only for a ring-3 fault:
+    // a ring-0 fault (e.g. a syscall touching a user buffer) carries kernel
+    // state, which must never overwrite the process's saved user context.
+    if ((regs->cs & 3) == 3) {
         process_t* cur = sched_get_current();
         if (cur && cur->tf) {
             const uint8_t* s = (const uint8_t*)regs;
@@ -194,9 +198,29 @@ void exception_handler(struct registers* regs) {
 
     if (int_no == 14) { // Page Fault
         uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-        extern int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code);
-        if (vmm_handle_page_fault(cr2, err_code) == 0) return; // demand-paged / handled
-        // else: a genuine fault — fall through to the kill/panic logic below.
+        // 1. Demand paging / COW first — also for ring-0 faults on user
+        //    addresses (a not-yet-faulted syscall buffer, M14).
+        if (vmm_try_handle_page_fault(cr2, err_code) == 0) return;
+        // 2. Exception fixup: a ring-0 fault on a USER address raised by a
+        //    registered user-access instruction (copy_from/to_user,
+        //    strncpy_from_user) resumes at its fixup, which returns -EFAULT to
+        //    the syscall. Must run before panic_enter(). Any other ring-0 fault
+        //    on a user address is a kernel bug and still panics below.
+        if ((regs->cs & 3) != 3 && cr2 < USER_ADDR_MAX) {
+            uint64_t fix = uaccess_fixup_lookup(regs->rip);
+            if (fix) {
+                if (g_kverbose) {
+                    debugcon_writestring("[UACCESS] -EFAULT fixup addr=");
+                    debugcon_print_hex(cr2);
+                    debugcon_writestring(" rip="); debugcon_print_hex(regs->rip);
+                    debugcon_writestring("\n");
+                }
+                regs->rip = fix;
+                return;
+            }
+        }
+        vmm_report_page_fault(cr2, err_code);
+        // A genuine fault — fall through to the kill/panic logic below.
     }
 
     if (int_no < 32) {

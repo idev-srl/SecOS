@@ -1332,7 +1332,7 @@ void vmm_dump_entry(uint64_t virt) {
 // Returns 0 if the fault was serviced (the instruction should retry); -1 if it
 // is a genuine violation. [M15] On -1 the caller (exception_handler) decides
 // kill (ring-3) vs panic (ring-0) — this function no longer halts.
-int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+int vmm_try_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     // [M19] COW: a WRITE to a PRESENT page (protection fault) that is marked
     // copy-on-write -> give the writer a private copy and continue.
     if ((error_code & 1) && (error_code & 2)) {
@@ -1363,8 +1363,11 @@ int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
         }
     }
 
-    // Unhandled: a genuine violation (protection, no VMA, or alloc failure).
-    // Report tersely on debugcon and let the caller terminate the offender.
+    return -1; // not serviceable: caller reports / fixes up / kills / panics
+}
+
+// Report an unserviceable fault tersely on debugcon.
+void vmm_report_page_fault(uint64_t fault_addr, uint64_t error_code) {
     debugcon_writestring("[PF] UNHANDLED fault addr=0x"); debugcon_print_hex(fault_addr);
     debugcon_writestring(" ec=0x"); debugcon_print_hex(error_code);
     debugcon_writestring(error_code & 1 ? " (protection" : " (not-present");
@@ -1372,5 +1375,13 @@ int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     debugcon_writestring(error_code & 4 ? ",user" : ",kernel");
     if (error_code & 16) debugcon_writestring(",instr");
     debugcon_writestring(")\n");
+}
+
+// Service a fault (demand paging / COW) or report it. 0=handled, -1=genuine.
+int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+    if (vmm_try_handle_page_fault(fault_addr, error_code) == 0) return 0;
+    // Unhandled: a genuine violation (protection, no VMA, or alloc failure).
+    // Report tersely on debugcon and let the caller terminate the offender.
+    vmm_report_page_fault(fault_addr, error_code);
     return -1;
 }
