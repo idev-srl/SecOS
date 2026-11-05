@@ -165,9 +165,14 @@ vfs_inode_t* vfs_lookup(const char* path){
     return ino;
 }
 
+int vfs_walk(const char* path, char* out, size_t outsz, int follow_final);
 int vfs_readdir(const char* path, vfs_iter_cb cb, void* user){
     if(!cb) return -1;
-    char rel[256];
+    char rel[256], cp[256];
+    // A directory reached through a symlink (/proc/self, a linked dir, ...):
+    // list the canonical target. Plain directories keep their exact path.
+    vfs_inode_t* d = vfs_lookup(path);
+    if((!d || d->type!=VFS_NODE_DIR) && path && path[0]=='/' && vfs_walk(path, cp, sizeof(cp), 1)==0) path = cp;
     vfs_mount_t* m = vfs_resolve(path, rel, sizeof(rel));
     if(!m || !m->ops) return -1;
     return m->ops->readdir(rel, cb, user);
@@ -181,57 +186,288 @@ int vfs_read_all(const char* path, void* buf, size_t bufsize){
     return (r>=0)? (int)ino->size : -1;
 }
 
+// ---- Path walking: symlinks in any component --------------------------------
+// vfs_walk() turns an absolute path into the canonical path of the object it
+// names: "." / ".." / "//" collapse, and every symlink met on the way is
+// replaced by its target (absolute targets restart at "/", relative ones are
+// resolved against the directory holding the link). The final component is
+// followed only when follow_final is set (stat/open vs lstat/unlink/rename).
+// A nonexistent final component is fine (create, mkdir, rename target); a
+// nonexistent or non-directory intermediate one is not. Bounded at VFS_MAXHOPS
+// symlinks per resolution, like Linux's MAXSYMLINKS -> -ELOOP.
+#define VFS_MAXHOPS 40
+#define VFS_PATH    256
+
+static int vfs_copy(char* d, const char* s, size_t cap){
+    size_t i=0; for(; s[i]; i++){ if(i>=cap-1){ d[i]=0; return -1; } d[i]=s[i]; } d[i]=0; return 0;
+}
+
+int vfs_walk(const char* path, char* out, size_t outsz, int follow_final){
+    char todo[VFS_PATH];      // what is still to be resolved (absolute)
+    char res[VFS_PATH];       // canonical prefix resolved so far ("" = root)
+    if(!path || path[0]!='/') return -2;                       // ENOENT
+    if(vfs_copy(todo, path, sizeof(todo))!=0) return -36;      // ENAMETOOLONG
+    int hops = 0;
+restart:
+    res[0]=0;
+    {
+        size_t rl=0, i=0;
+        while(todo[i]){
+            while(todo[i]=='/') i++;
+            if(!todo[i]) break;
+            size_t cs=i; while(todo[i] && todo[i]!='/') i++;
+            size_t cl=i-cs;
+            while(todo[i]=='/') i++;
+            int last = (todo[i]==0);
+            if(cl==1 && todo[cs]=='.') continue;
+            if(cl==2 && todo[cs]=='.' && todo[cs+1]=='.'){       // physical parent
+                while(rl>0 && res[rl-1]!='/') rl--;
+                if(rl>0) rl--;
+                res[rl]=0;
+                continue;
+            }
+            if(rl+1+cl >= sizeof(res)) return -36;
+            size_t base=rl;
+            res[rl++]='/'; for(size_t k=0;k<cl;k++) res[rl++]=todo[cs+k]; res[rl]=0;
+            if(last && !follow_final) break;
+            vfs_inode_t* ino = vfs_lookup(res);
+            if(!ino){
+                if(last) break;                                  // to be created
+                return -2;                                       // ENOENT
+            }
+            if(ino->type==VFS_NODE_SYMLINK){
+                if(++hops > VFS_MAXHOPS) return -40;             // ELOOP
+                char tgt[VFS_PATH];
+                int n = vfs_readlink(res, tgt, sizeof(tgt));
+                if(n<=0) return -2;
+                char nt[VFS_PATH]; size_t o=0;
+                if(tgt[0]!='/'){                                 // relative: link's directory
+                    for(size_t k=0;k<base;k++){ if(o>=sizeof(nt)-1) return -36; nt[o++]=res[k]; }
+                    if(o>=sizeof(nt)-1) return -36;
+                    nt[o++]='/';
+                }
+                for(size_t k=0; tgt[k]; k++){ if(o>=sizeof(nt)-1) return -36; nt[o++]=tgt[k]; }
+                if(todo[i]){                                     // the rest of the path
+                    if(o>=sizeof(nt)-1) return -36;
+                    nt[o++]='/';
+                    for(size_t k=i; todo[k]; k++){ if(o>=sizeof(nt)-1) return -36; nt[o++]=todo[k]; }
+                }
+                nt[o]=0;
+                vfs_copy(todo, nt, sizeof(todo));
+                goto restart;
+            }
+            if(!last && ino->type!=VFS_NODE_DIR) return -20;     // ENOTDIR
+        }
+    }
+    if(res[0]==0){ res[0]='/'; res[1]=0; }
+    if(vfs_copy(out, res, outsz)!=0) return -36;
+    return 0;
+}
+
+// The path's parent directory as a string ("/" for top-level entries).
+static void vfs_parent_of(const char* p, char* out, size_t cap){
+    size_t ls=0; for(size_t i=0;p[i];i++) if(p[i]=='/') ls=i;
+    if(ls==0){ out[0]='/'; out[1]=0; return; }
+    if(ls>cap-1) ls=cap-1;
+    for(size_t i=0;i<ls;i++) out[i]=p[i];
+    out[ls]=0;
+}
+
+// Canonical path for an operation on the entry `path` names (intermediate
+// symlinks followed, the final component not). Fast path: when the parent
+// already resolves to a real directory the path is used as is, so the common
+// case costs one lookup and filesystems keep their exact historical paths.
+static int vfs_canon_entry(const char* path, char* out, size_t cap){
+    if(!path || path[0]!='/') return -2;
+    char par[VFS_PATH]; vfs_parent_of(path, par, sizeof(par));
+    vfs_inode_t* pi = vfs_lookup(par);
+    int dots = 0;
+    for(size_t i=0; path[i]; i++)
+        if(path[i]=='.' && (i==0 || path[i-1]=='/') && (path[i+1]==0 || path[i+1]=='/' ||
+           (path[i+1]=='.' && (path[i+2]==0 || path[i+2]=='/')))) dots = 1;
+    if(pi && pi->type==VFS_NODE_DIR && !dots) return vfs_copy(out, path, cap)==0 ? 0 : -36;
+    return vfs_walk(path, out, cap, 0);
+}
+
+vfs_inode_t* vfs_lookup_ex(const char* path, int follow, int* err){
+    if(err) *err = 0;
+    vfs_inode_t* ino = vfs_lookup(path);
+    if(ino && (!follow || ino->type!=VFS_NODE_SYMLINK)) return ino;  // fast path
+    char cp[VFS_PATH];
+    int r = vfs_walk(path, cp, sizeof(cp), follow);
+    if(r!=0){ if(err) *err = r; return NULL; }
+    ino = vfs_lookup(cp);
+    if(!ino && err) *err = -2;
+    return ino;
+}
+// [M26] Lookup following symlinks (final component included). Used by stat/open.
+vfs_inode_t* vfs_lookup_follow(const char* path){ return vfs_lookup_ex(path, 1, NULL); }
+
 int vfs_create(const char* path, const void* data, size_t size){
-    char rel[256]; vfs_mount_t* m = vfs_resolve(path, rel, sizeof(rel));
-    if(!m || !m->ops) return -1; return m->ops->create(rel, data, size);
+    char cp[VFS_PATH]; int e=vfs_canon_entry(path, cp, sizeof(cp)); if(e) return e;
+    char rel[256]; vfs_mount_t* m = vfs_resolve(cp, rel, sizeof(rel));
+    if(!m || !m->ops) return -1;
+    return m->ops->create(rel, data, size);
 }
 int vfs_write(const char* path, size_t offset, const void* data, size_t len){
-    vfs_inode_t* ino = vfs_lookup(path);
+    vfs_inode_t* ino = vfs_lookup_follow(path);
     if(!ino || ino->type!=VFS_NODE_FILE || !ino->ops) return -1;
     return ino->ops->write(ino, offset, data, len);
 }
-int vfs_mkdir(const char* path){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops) return -1; return m->ops->mkdir(rel); }
-int vfs_remove(const char* path){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops) return -1; return m->ops->remove(rel); }
-int vfs_rename(const char* oldp, const char* newp){
-    char ro[256], rn[256];
-    vfs_mount_t* mo=vfs_resolve(oldp,ro,sizeof(ro));
-    vfs_mount_t* mn=vfs_resolve(newp,rn,sizeof(rn));
-    if(!mo||!mn||mo!=mn||!mo->ops) return -1; // same-FS rename only
-    return mo->ops->rename(ro, rn);
+int vfs_mkdir(const char* path){
+    char cp[VFS_PATH]; int e=vfs_canon_entry(path, cp, sizeof(cp)); if(e) return e;
+    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops) return -1; return m->ops->mkdir(rel);
 }
-int vfs_truncate(const char* path, size_t new_size){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops) return -1; return m->ops->truncate(rel, new_size); }
+int vfs_remove(const char* path){
+    char cp[VFS_PATH]; int e=vfs_canon_entry(path, cp, sizeof(cp)); if(e) return e;
+    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops) return -1; return m->ops->remove(rel);
+}
 
-// [M26] Look up a path following a final-component symlink (bounded to 8 hops to
-// catch loops). Absolute targets replace the path; relative targets join to the
-// link's own directory. Mid-path symlink components are NOT followed yet (the
-// underlying FS walks components as directories) — a documented limitation.
-vfs_inode_t* vfs_lookup_follow(const char* path){
-    char cur[256]; size_t k=0; for(; path[k] && k<sizeof(cur)-1; k++) cur[k]=path[k]; cur[k]=0;
-    for(int hop=0; hop<8; hop++){
-        vfs_inode_t* ino = vfs_lookup(cur);
-        if(!ino || ino->type != VFS_NODE_SYMLINK) return ino;
-        char tgt[256]; int n = vfs_readlink(cur, tgt, sizeof(tgt));
-        if(n<=0) return ino;                              // unreadable -> return the link
-        if(tgt[0]=='/'){                                  // absolute target
-            size_t j=0; for(; tgt[j] && j<sizeof(cur)-1; j++) cur[j]=tgt[j]; cur[j]=0;
-        } else {                                          // relative to the link's dir
-            int slash=-1; for(size_t i=0;cur[i];i++) if(cur[i]=='/') slash=(int)i;
-            char joined[256]; size_t j=0;
-            if(slash>0) for(int i=0;i<slash && j<(int)sizeof(joined)-1;i++) joined[j++]=cur[i];
-            if(j==0 || joined[j-1]!='/') { if(j<sizeof(joined)-1) joined[j++]='/'; }
-            for(size_t i=0;tgt[i] && j<sizeof(joined)-1;i++) joined[j++]=tgt[i];
-            joined[j]=0;
-            for(j=0; joined[j] && j<sizeof(cur)-1; j++) cur[j]=joined[j]; cur[j]=0;
+static int vfs_is_mount_point(const char* p){
+    for(int i=0;i<g_mount_count;i++){ const char* a=g_mounts[i].mount_point; size_t k=0; int eq=1; while(a[k]||p[k]){ if(a[k]!=p[k]){ eq=0; break; } k++; } if(eq) return 1; }
+    return 0;
+}
+struct vfs_count_ctx { int n; };
+static void vfs_count_cb(const vfs_inode_t* c, void* u){ (void)c; ((struct vfs_count_ctx*)u)->n++; }
+
+// rmdir: the entry must be an empty directory that is not a mount point.
+int vfs_rmdir(const char* path){
+    char cp[VFS_PATH]; int e=vfs_canon_entry(path, cp, sizeof(cp)); if(e) return e;
+    vfs_inode_t* ino = vfs_lookup(cp);
+    if(!ino) return -2;                                   // ENOENT
+    if(ino->type!=VFS_NODE_DIR) return -20;               // ENOTDIR
+    if(vfs_is_mount_point(cp)) return -16;                // EBUSY (incl. "/")
+    struct vfs_count_ctx c = { 0 };
+    if(vfs_readdir(cp, vfs_count_cb, &c)!=0) return -5;   // EIO
+    if(c.n) return -39;                                   // ENOTEMPTY
+    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops) return -1;
+    return m->ops->remove(rel) == 0 ? 0 : -5;
+}
+
+// rename: atomic within one filesystem (the FS replaces an existing target in
+// one step — on ext2/ext4 inside one journalled transaction); -EXDEV across
+// mounts. POSIX type rules are checked here so every FS gets them.
+int vfs_rename(const char* oldp, const char* newp){
+    char co[VFS_PATH], cn[VFS_PATH]; int e;
+    if((e=vfs_canon_entry(oldp, co, sizeof(co)))) return e;
+    if((e=vfs_canon_entry(newp, cn, sizeof(cn)))) return e;
+    char ro[256], rn[256];
+    vfs_mount_t* mo=vfs_resolve(co,ro,sizeof(ro));
+    vfs_mount_t* mn=vfs_resolve(cn,rn,sizeof(rn));
+    if(!mo||!mn||!mo->ops) return -2;
+    vfs_inode_t* src = vfs_lookup(co);
+    if(!src) return -2;                                   // ENOENT
+    int src_dir = (src->type==VFS_NODE_DIR);
+    if(mo!=mn) return -18;                                // EXDEV
+    if(vfs_is_mount_point(co) || vfs_is_mount_point(cn)) return -16;   // EBUSY
+    size_t ol=str_len(co);
+    { size_t k=0; while(k<ol && co[k]==cn[k]) k++;
+      if(k==ol && cn[ol]==0) return 0;                    // same entry: no-op
+      if(src_dir && k==ol && cn[ol]=='/') return -22; }   // EINVAL: into itself
+    vfs_inode_t* dst = vfs_lookup(cn);
+    if(dst){
+        int dst_dir = (dst->type==VFS_NODE_DIR);
+        if(src_dir && !dst_dir) return -20;               // ENOTDIR
+        if(!src_dir && dst_dir) return -21;               // EISDIR
+        if(dst_dir){
+            struct vfs_count_ctx c = { 0 };
+            vfs_readdir(cn, vfs_count_cb, &c);
+            if(c.n) return -39;                           // ENOTEMPTY
         }
     }
-    return NULL;                                          // too many hops -> loop
+    if(!mo->ops->rename) return -1;
+    return mo->ops->rename(ro, rn) == 0 ? 0 : -5;         // EIO
+}
+
+// link: a new name for an existing non-directory, same filesystem only.
+int vfs_link(const char* oldp, const char* newp){
+    char co[VFS_PATH], cn[VFS_PATH]; int e;
+    if((e=vfs_canon_entry(oldp, co, sizeof(co)))) return e;
+    if((e=vfs_canon_entry(newp, cn, sizeof(cn)))) return e;
+    vfs_inode_t* src = vfs_lookup(co);
+    if(!src) return -2;                                   // ENOENT
+    if(src->type==VFS_NODE_DIR) return -1;                // EPERM
+    if(vfs_lookup(cn)) return -17;                        // EEXIST
+    char ro[256], rn[256];
+    vfs_mount_t* mo=vfs_resolve(co,ro,sizeof(ro));
+    vfs_mount_t* mn=vfs_resolve(cn,rn,sizeof(rn));
+    if(!mo||!mn) return -2;
+    if(mo!=mn) return -18;                                // EXDEV
+    if(!mo->ops->link) return -1;                         // EPERM: FS has no hard links
+    return mo->ops->link(ro, rn) == 0 ? 0 : -5;
+}
+
+int vfs_truncate(const char* path, size_t new_size){
+    char cp[VFS_PATH]; int e;
+    vfs_inode_t* ino = vfs_lookup_ex(path, 1, &e);        // truncate() follows symlinks
+    if(!ino) return e ? e : -2;
+    if(ino->type==VFS_NODE_DIR) return -21;               // EISDIR
+    if((e=vfs_walk(path, cp, sizeof(cp), 1))) return e;
+    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->truncate) return -1;
+    return m->ops->truncate(rel, new_size);
 }
 
 // [M26] Attribute / symlink routing (NULL-checked: FSes that don't implement the
 // op return -1 instead of crashing — chmod on a read-only virtual FS is a no-op).
-int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->setattr) return -1; return m->ops->setattr(rel, a, valid); }
-int vfs_readlink(const char* path, char* buf, size_t len){ char rel[256]; vfs_mount_t* m=vfs_resolve(path,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->readlink) return -1; return m->ops->readlink(rel, buf, len); }
-int vfs_symlink(const char* target, const char* linkpath){ char rel[256]; vfs_mount_t* m=vfs_resolve(linkpath,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->symlink) return -1; return m->ops->symlink(target, rel); }
+int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
+    char cp[VFS_PATH]; int e=vfs_walk(path, cp, sizeof(cp), 1); if(e) return e;   // chmod follows
+    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->setattr) return -1; return m->ops->setattr(rel, a, valid);
+}
+int vfs_readlink(const char* path, char* buf, size_t len){
+    char cp[VFS_PATH];
+    if(vfs_canon_entry(path, cp, sizeof(cp))!=0) return -1;
+    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->readlink) return -1; return m->ops->readlink(rel, buf, len);
+}
+int vfs_symlink(const char* target, const char* linkpath){
+    char cp[VFS_PATH]; int e=vfs_canon_entry(linkpath, cp, sizeof(cp)); if(e) return e;
+    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops||!m->ops->symlink) return -1; return m->ops->symlink(target, rel);
+}
+
+// ---- statfs ---------------------------------------------------------------
+// Linux f_type magics for the filesystems that carry no ->statfs of their own.
+static uint64_t vfs_magic_by_name(const char* n){
+    struct { const char* n; uint64_t m; } t[] = {
+        {"ramfs", 0x858458f6}, {"procfs", 0x9fa0}, {"devfs", 0x01021994 /* tmpfs, as devtmpfs */},
+        {"sysfs", 0x62656572}, {"fat32", 0x4d44}, {"ext2", 0xEF53},
+    };
+    for(unsigned i=0;i<sizeof(t)/sizeof(t[0]);i++){
+        size_t k=0; while(t[i].n[k] && n[k]==t[i].n[k]) k++;
+        if(!t[i].n[k] && (!n[k] || n[k]=='/' || n[k]=='-' || n[k]=='(')) return t[i].m;
+    }
+    return 0;
+}
+static int vfs_statfs_mount(vfs_mount_t* m, vfs_statfs_t* st){
+    for(size_t i=0;i<sizeof(*st);i++) ((uint8_t*)st)[i]=0;
+    st->namelen = 255; st->bsize = 4096; st->frsize = 4096;
+    int r = (m->ops->statfs) ? m->ops->statfs(st) : 0;
+    if(!st->type) st->type = vfs_magic_by_name(m->fs_name ? m->fs_name : "");
+    if(!st->frsize) st->frsize = st->bsize;
+    return r;
+}
+int vfs_statfs(const char* path, vfs_statfs_t* st){
+    int e; vfs_inode_t* ino = vfs_lookup_ex(path, 1, &e);
+    if(!ino) return e ? e : -2;
+    char cp[VFS_PATH]; if((e=vfs_walk(path, cp, sizeof(cp), 1))) return e;
+    char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops) return -2;
+    return vfs_statfs_mount(m, st);
+}
+int vfs_statfs_ops(const vfs_fs_ops_t* ops, vfs_statfs_t* st){
+    for(int i=0;i<g_mount_count;i++) if(g_mounts[i].ops==ops) return vfs_statfs_mount(&g_mounts[i], st);
+    return -2;
+}
+// Mount point of the filesystem behind `ops` (the longest one when an FS is
+// mounted twice), or NULL. Lets inode paths (mount-relative) be made absolute.
+const char* vfs_mount_point_of(const vfs_fs_ops_t* ops){
+    const char* best=NULL; size_t bl=0;
+    for(int i=0;i<g_mount_count;i++) if(g_mounts[i].ops==ops){ size_t l=str_len(g_mounts[i].mount_point); if(!best||l>bl){ best=g_mounts[i].mount_point; bl=l; } }
+    return best;
+}
+// Sync one filesystem (fsync/fdatasync of a file on it). 0 also when the FS is
+// write-through (no ->sync).
+int vfs_sync_ops(const vfs_fs_ops_t* ops){
+    if(ops && ops->sync) return ops->sync();
+    return 0;
+}
 
 int vfs_mount_count(void){
     uint64_t fl = spin_lock_irqsave(&g_mount_lock);
@@ -246,4 +482,11 @@ int vfs_mount_info(int i, const char** mp, const char** fsname){
     if(fsname) *fsname = g_mounts[i].fs_name;
     spin_unlock_irqrestore(&g_mount_lock, fl);
     return 0;
+}
+// Operations of the i-th mount (for /proc/mounts' device + type), or NULL.
+const vfs_fs_ops_t* vfs_mount_ops_at(int i){
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
+    const vfs_fs_ops_t* o = (i>=0 && i<g_mount_count) ? g_mounts[i].ops : NULL;
+    spin_unlock_irqrestore(&g_mount_lock, fl);
+    return o;
 }

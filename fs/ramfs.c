@@ -72,11 +72,13 @@ int ramfs_write(const char* name, size_t offset, const void* src, size_t len){
 int ramfs_truncate(const char* name, size_t new_size){
     ramfs_entry_t* e = (ramfs_entry_t*)ramfs_find(name); if(!e) return -1; if(e->flags & 1) return -1; // immutable file not truncatable
     if(new_size == e->size) return 0;
+    if(new_size == 0){ if(e->data) kfree(e->data); e->data = NULL; e->size = 0; return 0; }
     uint8_t* new_buf = (uint8_t*)kmalloc(new_size);
     if(!new_buf) return -1;
     size_t copy = (new_size < e->size)? new_size : e->size;
     for(size_t i=0;i<copy;i++) new_buf[i]=e->data[i];
-    kfree(e->data);
+    for(size_t i=copy;i<new_size;i++) new_buf[i]=0;     // a grown file reads zeros (POSIX)
+    if(e->data) kfree(e->data);
     e->data = new_buf;
     e->size = new_size;
     return 0;

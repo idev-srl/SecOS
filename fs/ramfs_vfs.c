@@ -13,12 +13,36 @@
 static vfs_inode_t inode_cache[RAMFS_MAX_FILES+4];
 static size_t inode_cache_used = 0;
 
+static void inode_fill_path(vfs_inode_t* ino, const ramfs_entry_t* e){
+    size_t k=0; const char* src=e->name; if(!src[0]){ ino->path[0]='/'; ino->path[1]=0; return; }
+    ino->path[k++]='/'; for(size_t i=0; src[i] && k<sizeof(ino->path)-1; i++) ino->path[k++]=src[i]; ino->path[k]=0;
+}
+static int inode_is_dead(const vfs_inode_t* ino){ return ino->fs_data==NULL && !(ino->path[0]=='/' && ino->path[1]==0); }
+
+// The cache points into ramfs_table, which ramfs_remove() compacts: after a
+// removal the gone entry's inode is marked dead (reads fail, slot reusable) and
+// every inode of a later entry is moved down one slot with it, so open fds and
+// cached lookups keep naming the same file.
+static void cache_fix_after_remove(const ramfs_entry_t* gone){
+    for(size_t i=0;i<inode_cache_used;i++){
+        const ramfs_entry_t* e=(const ramfs_entry_t*)inode_cache[i].fs_data;
+        if(!e) continue;
+        if(e==gone){ inode_cache[i].fs_data=NULL; inode_cache[i].path[0]='?'; inode_cache[i].path[1]=0; }
+        else if(e>gone) inode_cache[i].fs_data=(void*)(e-1);
+    }
+}
+
 static vfs_inode_t* inode_from_entry(const ramfs_entry_t* e){ if(!e) return NULL; // search cache
     // [M38] refresh the cached size on every lookup (a prior write may have grown
-    // the entry) so e.g. `>>` append seeks to the real end of file.
-    for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e){ inode_cache[i].size = e->size; return &inode_cache[i]; } }
-    if(inode_cache_used >= sizeof(inode_cache)/sizeof(inode_cache[0])) return NULL;
-    vfs_inode_t* ino = &inode_cache[inode_cache_used++];
+    // the entry) so e.g. `>>` append seeks to the real end of file; the path too
+    // (a rename changes the entry's name in place).
+    for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e){ inode_cache[i].size = e->size; inode_fill_path(&inode_cache[i], e); return &inode_cache[i]; } }
+    vfs_inode_t* ino = NULL;
+    for(size_t i=0;i<inode_cache_used;i++) if(inode_is_dead(&inode_cache[i])){ ino=&inode_cache[i]; break; }
+    if(!ino){
+        if(inode_cache_used >= sizeof(inode_cache)/sizeof(inode_cache[0])) return NULL;
+        ino = &inode_cache[inode_cache_used++];
+    }
     // Path already absolute in ramfs_entry_t.name (without leading '/')
     // Build canonical path with leading '/' (root = "/")
     size_t k=0; const char* src=e->name; if(!src[0]){ ino->path[0]='/'; ino->path[1]=0; } else {
@@ -70,8 +94,23 @@ static int ramfs_vfs_read(vfs_inode_t* inode, size_t offset, void* buf, size_t l
 static int ramfs_vfs_write(vfs_inode_t* inode, size_t offset, const void* data, size_t len){ if(!inode || inode->type!=VFS_NODE_FILE) return -1; const ramfs_entry_t* e=(const ramfs_entry_t*)inode->fs_data; if(!e) return -1; return ramfs_write(((const ramfs_entry_t*)e)->name, offset, data, len); }
 static int ramfs_vfs_create(const char* path, const void* initial, size_t size){ if(!path) return -1; const char* p=path; if(p[0]=='/') p++; if(ramfs_find(p)) return -1; return ramfs_add(p, initial, size); }
 static int ramfs_vfs_mkdir(const char* path){ if(!path) return -1; const char* p=path; if(p[0]=='/') p++; return ramfs_mkdir(p); }
-static int ramfs_vfs_remove(const char* path){ if(!path) return -1; const char* p=path; if(p[0]=='/') p++; return ramfs_remove(p); }
-static int ramfs_vfs_rename(const char* oldp, const char* newp){ if(!oldp||!newp) return -1; const char* o=oldp; const char* n=newp; if(o[0]=='/') o++; if(n[0]=='/') n++; return ramfs_rename(o,n); }
+static int ramfs_remove_fixed(const char* p, int dir){
+    const ramfs_entry_t* e=ramfs_find(p); if(!e) return -1;
+    int r = dir ? ramfs_rmdir(p) : ramfs_remove(p);
+    if(r==0) cache_fix_after_remove(e);
+    return r;
+}
+static int ramfs_vfs_remove(const char* path){ if(!path) return -1; const char* p=path; if(p[0]=='/') p++; return ramfs_remove_fixed(p, 0); }
+// rename: an existing target (the VFS checked the type rules) is dropped first;
+// RAMFS is in-memory and the kernel is non-preemptible, so this is atomic.
+static int ramfs_vfs_rename(const char* oldp, const char* newp){
+    if(!oldp||!newp) return -1; const char* o=oldp; const char* n=newp; if(o[0]=='/') o++; if(n[0]=='/') n++;
+    const ramfs_entry_t* src=ramfs_find(o); if(!src) return -1;
+    if(src->flags & 1) return -1;                                  // immutable
+    const ramfs_entry_t* t=ramfs_find(n);
+    if(t && ramfs_remove_fixed(n, (t->flags & 2) ? 1 : 0)!=0) return -1;
+    return ramfs_rename(o,n);
+}
 static int ramfs_vfs_truncate(const char* path, size_t ns){ if(!path) return -1; const char* p=path; if(p[0]=='/') p++; return ramfs_truncate(p, ns); }
 
 static vfs_fs_ops_t ramfs_ops = {

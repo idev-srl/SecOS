@@ -154,10 +154,7 @@ void srandom(unsigned int seed);
 char* mktemp(char* tmpl);
 int mkstemp(char* tmpl);
 char* mkdtemp(char* tmpl);
-void tzset(void);
-struct tm* localtime(const time_t* t);
-struct tm* gmtime(const time_t* t);
-unsigned long strftime(char* s, unsigned long max, const char* fmt, const struct tm* t);
+/* tzset/localtime/gmtime/strftime: declared by <time.h> (SecOS libc). */
 int siginterrupt(int sig, int flag);
 int getdtablesize(void);
 int eaccess(const char* path, int mode);

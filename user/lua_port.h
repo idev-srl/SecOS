@@ -40,16 +40,8 @@ FILE* freopen(const char* path, const char* mode, FILE* f);
 #define LC_MONETARY 4
 #define LC_TIME     5
 #endif
-/* Broken-down time for the os library. SecOS has no wall clock in user space:
- * time() is seconds since boot, so os.date() shows 1970-01-01 + uptime. */
-struct tm { int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst; };
-struct tm* gmtime(const time_t* t);
-struct tm* localtime(const time_t* t);
-struct tm* gmtime_r(const time_t* t, struct tm* r);
-struct tm* localtime_r(const time_t* t, struct tm* r);
-time_t     mktime(struct tm* tm);
-size_t     strftime(char* s, size_t max, const char* fmt, const struct tm* tm);
-double     difftime(time_t a, time_t b);
+/* Broken-down time for the os library comes from <time.h> (real UTC wall
+ * clock: os.time()/os.date() report the RTC-anchored CLOCK_REALTIME). */
 char*      tmpnam(char* s);
 
 #endif

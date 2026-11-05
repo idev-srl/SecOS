@@ -54,17 +54,31 @@ long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4) {
     return ret;
 }
 
+/* Socket descriptors live at SOCKFD_BASE + kernel sockfd, so they share one
+ * namespace with file fds (< 32): read/write/close/poll work on them too. */
+#define SOCKFD_BASE 64
+#define IS_SOCKFD(fd) ((fd) >= SOCKFD_BASE && (fd) < SOCKFD_BASE + 64)
 ssize_t write(int fd, const void* buf, size_t len) {
+    if (IS_SOCKFD(fd)) return send(fd, buf, (long)len);
     return __se(secos_syscall(SYS_WRITE, fd, (long)buf, (long)len, 0, 0));
 }
 ssize_t read(int fd, void* buf, size_t len) {
+    if (IS_SOCKFD(fd)) return recv(fd, buf, (long)len);
     return __se(secos_syscall(3 /*SYS_READ*/, fd, (long)buf, (long)len, 0, 0));
 }
-int open(const char* path, int flags) { return (int)__se(secos_syscall(4 /*SYS_OPEN*/, (long)path, flags, 0, 0, 0)); }
-int close(int fd) { return (int)__se(secos_syscall(5 /*SYS_CLOSE*/, fd, 0, 0, 0, 0)); }
+#include <stdarg.h>
+int open(const char* path, int flags, ...) {
+    unsigned mode = 0;
+    if (flags & 0x40 /*O_CREAT*/) { va_list ap; va_start(ap, flags); mode = va_arg(ap, unsigned); va_end(ap); }
+    return (int)__se(secos_syscall(4 /*SYS_OPEN*/, (long)path, flags, (long)mode, 0, 0));
+}
+int close(int fd) {
+    if (IS_SOCKFD(fd)) return sockclose(fd);
+    return (int)__se(secos_syscall(5 /*SYS_CLOSE*/, fd, 0, 0, 0, 0));
+}
 long lseek(int fd, long offset, int whence) { return __se(secos_syscall(19 /*SYS_LSEEK*/, fd, offset, whence, 0, 0)); }
 static void stzero(struct stat* st){ char* p=(char*)st; for(unsigned i=0;i<sizeof(*st);i++) p[i]=0; }
-int stat(const char* path, struct stat* st) { if(st) stzero(st); return (int)secos_syscall(20 /*SYS_STAT*/, (long)path, (long)st, 0, 0, 0); }
+int stat(const char* path, struct stat* st) { if(st) stzero(st); return (int)__se(secos_syscall(20 /*SYS_STAT*/, (long)path, (long)st, 0, 0, 0)); }
 void _exit(int code) { secos_syscall(SYS_EXIT, code, 0, 0, 0, 0); for (;;) {} }
 int  getpid(void)    { return (int)secos_syscall(SYS_GETPID, 0, 0, 0, 0, 0); }
 void sched_yield(void){ secos_syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
@@ -153,7 +167,7 @@ int pipe(int fds[2]){ return (int)secos_syscall(31 /*SYS_PIPE*/, (long)fds, 0, 0
 int pipe2(int fds[2], int flags){ return (int)__se(secos_syscall(31 /*SYS_PIPE*/, (long)fds, flags, 0, 0, 0)); }
 
 /* [M26] VFS maturity: metadata + symlinks. */
-int lstat(const char* path, struct stat* st){ if(st) stzero(st); return (int)secos_syscall(37 /*SYS_LSTAT*/, (long)path, (long)st, 0, 0, 0); }
+int lstat(const char* path, struct stat* st){ if(st) stzero(st); return (int)__se(secos_syscall(37 /*SYS_LSTAT*/, (long)path, (long)st, 0, 0, 0)); }
 int chmod(const char* path, unsigned mode){ return (int)secos_syscall(32 /*SYS_CHMOD*/, (long)path, (long)mode, 0, 0, 0); }
 int chown(const char* path, unsigned uid, unsigned gid){ return (int)secos_syscall(33 /*SYS_CHOWN*/, (long)path, (long)uid, (long)gid, 0, 0); }
 int utimes(const char* path, unsigned long atime, unsigned long mtime){ return (int)secos_syscall(34 /*SYS_UTIMES*/, (long)path, (long)atime, (long)mtime, 0, 0); }
@@ -164,16 +178,18 @@ int umount(const char* target){ return (int)secos_syscall(39 /*SYS_UMOUNT*/, (lo
 
 /* [M24] BSD-style sockets. Require CAP_NET in the signed manifest, else -1.
  * ip is network-order octets (octet0 in the low byte); port is host order. */
-int socket(int type){ return (int)secos_syscall(SYS_SOCKET, type, 0, 0, 0, 0); }
-int connect(int fd, unsigned int ip, unsigned short port){ return (int)secos_syscall(SYS_CONNECT, fd, (long)ip, port, 0, 0); }
-int bind(int fd, unsigned short port){ return (int)secos_syscall(SYS_BIND, fd, port, 0, 0, 0); }
-int listen(int fd, int backlog){ return (int)secos_syscall(SYS_LISTEN, fd, backlog, 0, 0, 0); }
-int accept(int fd){ return (int)secos_syscall(SYS_ACCEPT, fd, 0, 0, 0, 0); }
-long send(int fd, const void* buf, long len){ return secos_syscall(SYS_SEND, fd, (long)buf, len, 0, 0); }
-long recv(int fd, void* buf, long len){ return secos_syscall(SYS_RECV, fd, (long)buf, len, 0, 0); }
-long sendto(int fd, const void* buf, long len, const struct secos_sockaddr* sa){ return secos_syscall(SYS_SENDTO, fd, (long)buf, len, (long)sa, 0); }
-long recvfrom(int fd, void* buf, long len, struct secos_sockaddr* sa){ return secos_syscall(SYS_RECVFROM, fd, (long)buf, len, (long)sa, 0); }
-int sockclose(int fd){ return (int)secos_syscall(SYS_SOCKCLOSE, fd, 0, 0, 0, 0); }
+static long sk_in(int fd){ return fd >= SOCKFD_BASE ? fd - SOCKFD_BASE : -1; }
+static int  sk_out(long r){ return r >= 0 ? (int)(r + SOCKFD_BASE) : (int)r; }
+int socket(int type){ return sk_out(secos_syscall(SYS_SOCKET, type, 0, 0, 0, 0)); }
+int connect(int fd, unsigned int ip, unsigned short port){ return (int)secos_syscall(SYS_CONNECT, sk_in(fd), (long)ip, port, 0, 0); }
+int bind(int fd, unsigned short port){ return (int)secos_syscall(SYS_BIND, sk_in(fd), port, 0, 0, 0); }
+int listen(int fd, int backlog){ return (int)secos_syscall(SYS_LISTEN, sk_in(fd), backlog, 0, 0, 0); }
+int accept(int fd){ return sk_out(secos_syscall(SYS_ACCEPT, sk_in(fd), 0, 0, 0, 0)); }
+long send(int fd, const void* buf, long len){ return secos_syscall(SYS_SEND, sk_in(fd), (long)buf, len, 0, 0); }
+long recv(int fd, void* buf, long len){ return secos_syscall(SYS_RECV, sk_in(fd), (long)buf, len, 0, 0); }
+long sendto(int fd, const void* buf, long len, const struct secos_sockaddr* sa){ return secos_syscall(SYS_SENDTO, sk_in(fd), (long)buf, len, (long)sa, 0); }
+long recvfrom(int fd, void* buf, long len, struct secos_sockaddr* sa){ return secos_syscall(SYS_RECVFROM, sk_in(fd), (long)buf, len, (long)sa, 0); }
+int sockclose(int fd){ return (int)secos_syscall(SYS_SOCKCLOSE, sk_in(fd), 0, 0, 0, 0); }
 
 /* host-order port <-> network helpers and a dotted-quad parser for demos. */
 unsigned int ip4(unsigned a, unsigned b, unsigned c, unsigned d){
@@ -183,25 +199,53 @@ unsigned int ip4(unsigned a, unsigned b, unsigned c, unsigned d){
 /* [M31] file management for a real userland. */
 long getdents(const char* path, void* buf, long buflen){ return secos_syscall(40 /*SYS_GETDENTS*/, (long)path, (long)buf, buflen, 0, 0); }
 int  creat_file(const char* path){ return (int)secos_syscall(41 /*SYS_CREATE*/, (long)path, 0, 0, 0, 0); }
-int  mkdir(const char* path, unsigned mode){ (void)mode; return (int)secos_syscall(42 /*SYS_MKDIR*/, (long)path, 0, 0, 0, 0); }
+int  mkdir(const char* path, unsigned mode){ return (int)__se(secos_syscall(42 /*SYS_MKDIR*/, (long)path, (long)mode, 0, 0, 0)); }
 int  unlink(const char* path){ return (int)secos_syscall(43 /*SYS_UNLINK*/, (long)path, 0, 0, 0, 0); }
-int  rmdir(const char* path){ return unlink(path); }
-/* <stdio.h> remove/rename. There is no rename syscall yet, so rename() of a
- * regular file is copy + unlink (not atomic); used by bash's history file and
- * lua's os.rename. */
-int  remove(const char* path){ return unlink(path) == 0 ? 0 : -1; }
-int  rename(const char* from, const char* to){
-    int in = open(from, O_RDONLY);
-    if(in < 0){ errno = ENOENT; return -1; }
-    int out = open(to, O_WRONLY | 0x40 | 0x200 /*O_CREAT|O_TRUNC*/);
-    if(out < 0){ close(in); errno = EACCES; return -1; }
-    char b[512]; long r; int ok = 1;
-    while((r = read(in, b, sizeof(b))) > 0)
-        if(write(out, b, (size_t)r) != r){ ok = 0; break; }
-    close(in); close(out);
-    if(!ok || r < 0){ errno = EIO; return -1; }
-    return unlink(from) == 0 ? 0 : -1;
+/* rmdir (SYS_RMDIR 74): empty directories only (ENOTDIR / ENOTEMPTY / EBUSY). */
+int  rmdir(const char* path){ return (int)__se(secos_syscall(74 /*SYS_RMDIR*/, (long)path, 0, 0, 0, 0)); }
+/* <stdio.h> remove: a file or an empty directory. */
+int  remove(const char* path){
+    struct stat st;
+    if(lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR) return rmdir(path);
+    return unlink(path) == 0 ? 0 : -1;
 }
+/* rename (SYS_RENAME 71): atomic within one filesystem, replaces an existing
+ * target; EXDEV across mounts (callers like mv then copy + unlink). */
+int  rename(const char* from, const char* to){ return (int)__se(secos_syscall(71 /*SYS_RENAME*/, (long)from, (long)to, 0, 0, 0)); }
+
+/* ---- kernel interfaces for userland tools (syscalls 65..79) ---- */
+#include "include/time.h"
+#include "include/sys/time.h"
+#include "include/poll.h"
+#include "include/sys/statfs.h"
+#include "include/sys/utsname.h"
+#include "include/sys/sysinfo.h"
+#include "include/sys/klog.h"
+int clock_gettime(clockid_t clk, struct timespec* ts){ return (int)__se(secos_syscall(65, clk, (long)ts, 0, 0, 0)); }
+int clock_settime(clockid_t clk, const struct timespec* ts){ return (int)__se(secos_syscall(66, clk, (long)ts, 0, 0, 0)); }
+int clock_getres(clockid_t clk, struct timespec* res){
+    struct timespec t;
+    if(clock_gettime(clk, &t) != 0) return -1;              /* validates clk */
+    if(res){ res->tv_sec = 0; res->tv_nsec = (clk == CLOCK_REALTIME_COARSE || clk == CLOCK_MONOTONIC_COARSE ||
+                                               clk == CLOCK_PROCESS_CPUTIME_ID || clk == CLOCK_THREAD_CPUTIME_ID) ? 1000000 : 1; }
+    return 0;
+}
+int nanosleep(const struct timespec* req, struct timespec* rem){ return (int)__se(secos_syscall(67, (long)req, (long)rem, 0, 0, 0)); }
+int klogctl(int type, char* buf, int len){ return (int)__se(secos_syscall(68, type, (long)buf, len, 0, 0)); }
+int statfs(const char* path, struct statfs* b){ return (int)__se(secos_syscall(69, (long)path, (long)b, 0, 0, 0)); }
+int fstatfs(int fd, struct statfs* b){ return (int)__se(secos_syscall(69, 0, (long)b, fd, 0, 0)); }
+void sync(void){ secos_syscall(70, -1, 0, 0, 0, 0); }
+int syncfs(int fd){ (void)fd; sync(); return 0; }
+int fsync(int fd){ return (int)__se(secos_syscall(70, fd, 0, 0, 0, 0)); }
+int fdatasync(int fd){ return fsync(fd); }
+int link(const char* oldpath, const char* newpath){ return (int)__se(secos_syscall(72, (long)oldpath, (long)newpath, 0, 0, 0)); }
+int truncate(const char* path, long len){ return (int)__se(secos_syscall(73, (long)path, len, 0, 0, 0)); }
+int ftruncate(int fd, long len){ return (int)__se(secos_syscall(73, 0, len, fd, 0, 0)); }
+int access(const char* path, int mode){ return (int)__se(secos_syscall(75, (long)path, mode, 0, 0, 0)); }
+unsigned umask(unsigned m){ return (unsigned)secos_syscall(76, (long)(m & 0777), 0, 0, 0, 0); }
+int uname(struct utsname* u){ return (int)__se(secos_syscall(77, (long)u, 0, 0, 0, 0)); }
+int poll(struct pollfd* fds, nfds_t n, int timeout){ return (int)__se(secos_syscall(78, (long)fds, (long)n, timeout, 0, 0)); }
+int sysinfo(struct sysinfo* si){ return (int)__se(secos_syscall(79, (long)si, 0, 0, 0, 0)); }
 
 /* [M39] POSIX shell-from-source foundation: fd duplication, cwd, terminal ioctl,
  * exec. These bring the libc surface close to what a real shell (bash/dash) and

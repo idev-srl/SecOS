@@ -105,8 +105,24 @@
 #define SYS_FCNTL 61
 #define SYS_SETSID 85
 #define SYS_GETSID 86
+/* kernel interfaces for userland tools (kernel/kiface.c) */
+#define SYS_CLOCK_GETTIME 65
+#define SYS_CLOCK_SETTIME 66
+#define SYS_NANOSLEEP 67
+#define SYS_SYSLOG 68
+#define SYS_STATFS 69
+#define SYS_SYNC 70
+#define SYS_RENAME 71
+#define SYS_LINK 72
+#define SYS_TRUNCATE 73
+#define SYS_RMDIR 74
+#define SYS_ACCESS 75
+#define SYS_UMASK 76
+#define SYS_UNAME 77
+#define SYS_POLL 78
+#define SYS_SYSINFO 79
 
-#define NSYS_KNOWN 62
+#define NSYS_KNOWN 80
 /* Syscalls numbered past the contiguous range, drawn as well. */
 static const long g_extra_sys[] = { SYS_SETSID, SYS_GETSID };
 #define NSYS_EXTRA ((long)(sizeof(g_extra_sys) / sizeof(g_extra_sys[0])))
@@ -213,6 +229,8 @@ static void one_call(void){
      * shut the machine down: never (its argument checks are trivial). */
     if(n==SYS_SIGSUSPEND) n=SYS_GETTICKS;
     if(n==SYS_REBOOT) n=SYS_GETPID;
+    /* 62..64 are unassigned (60 execve / 61 fcntl have their own cases). */
+    if(n>=62 && n<=64) n=SYS_GETPID;
 
     long a0,a1,a2,a3,a4; a0=a1=a2=a3=a4=0;
     switch(n){
@@ -293,6 +311,29 @@ static void one_call(void){
     case SYS_RECVFROM: case SYS_SOCKCLOSE:
         a0=intpool(); a1=(long)strptr(); a2=(long)lenpool(); a3=(long)strptr(); break;
     case SYS_DRIVER: a0=(long)strptr(); break;
+    /* Blocking calls get bounded waits (a bad pointer, or <= 200 us / 4 ms) so a
+     * batch never hangs; clock_settime only sees pointers it must refuse, so the
+     * fuzzer never moves the wall clock other gates read. */
+    case SYS_NANOSLEEP: {
+        static long ts[2];
+        ts[0]=0; ts[1]=(long)rn(200000);
+        switch(rn(5)){ case 0: a0=0; break; case 1: a0=(long)g_hole; break; case 2: a0=(long)g_none; break;
+                       case 3: a0=(long)0xFFFFFFFF80000000UL; break; default: a0=(long)ts; }
+        a1=(long)strptr(); break; }
+    case SYS_POLL: a0=(long)strptr(); a1=(long)(rn(2)? rn(4) : lenpool()); a2=(long)rn(5); break;
+    case SYS_CLOCK_SETTIME: {
+        static const u64 bad[4]={0,0xDEADBEEFUL,0xFFFF888000000000UL,0x0000800000000000UL-8};
+        a0=(long)rn(10); a1=(long)(rn(2)? bad[rn(4)] : g_none); break; }
+    case SYS_CLOCK_GETTIME: a0=(long)rn(12)-2; a1=(long)strptr(); break;
+    case SYS_SYSLOG: a0=(long)rn(12)-1; a1=(long)strptr(); a2=intpool(); break;
+    case SYS_STATFS: a0=(long)(rn(2)? pathpool() : 0); a1=(long)strptr(); a2=intpool(); break;
+    case SYS_SYNC: a0=intpool(); break;
+    case SYS_RENAME: case SYS_LINK: a0=(long)pathpool(); a1=(long)pathpool(); break;
+    case SYS_TRUNCATE: a0=(long)(rn(2)? pathpool() : 0); a1=(long)lenpool(); a2=intpool(); break;
+    case SYS_RMDIR: a0=(long)pathpool(); break;
+    case SYS_ACCESS: a0=(long)pathpool(); a1=intpool(); break;
+    case SYS_UMASK: a0=intpool(); break;
+    case SYS_UNAME: case SYS_SYSINFO: a0=(long)strptr(); break;
     case SYS_FORK: break;
     default:
         a0=(long)strptr(); a1=(long)strptr(); a2=(long)lenpool(); a3=intpool(); a4=intpool();
@@ -369,6 +410,10 @@ static void init_names(void){
     g_names[52]="getcwd";g_names[53]="ioctl";g_names[54]="getppid";g_names[55]="waitany";
     g_names[56]="fstat";g_names[57]="getpgid";g_names[58]="sigsuspend";g_names[59]="reboot";
     g_names[60]="execve";g_names[61]="fcntl";
+    g_names[65]="clock_gettime";g_names[66]="clock_settime";g_names[67]="nanosleep";g_names[68]="syslog";
+    g_names[69]="statfs";g_names[70]="sync";g_names[71]="rename";g_names[72]="link";
+    g_names[73]="truncate";g_names[74]="rmdir";g_names[75]="access";g_names[76]="umask";
+    g_names[77]="uname";g_names[78]="poll";g_names[79]="sysinfo";
     g_names_ready=1;
 }
 static const char* sysname(long n){

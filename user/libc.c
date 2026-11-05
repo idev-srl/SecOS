@@ -94,6 +94,15 @@ char* strerror(int e){
         case ENOSPC: return "No space left on device";
         case EPIPE:  return "Broken pipe";
         case ENOSYS: return "Function not implemented";
+        case EFAULT: return "Bad address";
+        case EBUSY:  return "Device or resource busy";
+        case EXDEV:  return "Invalid cross-device link";
+        case EROFS:  return "Read-only file system";
+        case ENAMETOOLONG: return "File name too long";
+        case ENOTEMPTY: return "Directory not empty";
+        case ELOOP:  return "Too many levels of symbolic links";
+        case ERANGE: return "Numerical result out of range";
+        case ETIMEDOUT: return "Connection timed out";
         default:     return "Unknown error";
     }
 }
@@ -287,17 +296,24 @@ int setuid(int u){ (void)u; return 0; }
 int setgid(int g){ (void)g; return 0; }
 int setgroups(unsigned n, const int* g){ (void)n; (void)g; return 0; }
 int getgroups(int n, int* g){ (void)n; (void)g; return 0; }
-static unsigned g_umask = 022;
-unsigned umask(unsigned m){ unsigned o = g_umask; g_umask = m & 0777; return o; }
+/* umask() is the kernel's (SYS_UMASK, libsecos.c): it applies to open/mkdir. */
 
-/* Uptime-based clock (no RTC wall clock; getticks() is the 1 kHz tick = ms). */
+/* Wall clock (CLOCK_REALTIME = RTC anchored to the TSC, UTC). */
 int gettimeofday(struct timeval* tv, void* tz){
-    (void)tz;
-    if(!tv) return -1;
-    unsigned long ms = getticks();
-    tv->tv_sec  = (long)(ms / 1000);
-    tv->tv_usec = (long)((ms % 1000) * 1000);
+    if(tz){ struct timezone* z = (struct timezone*)tz; z->tz_minuteswest = 0; z->tz_dsttime = 0; }
+    if(!tv) return 0;
+    struct timespec ts;
+    if(clock_gettime(CLOCK_REALTIME, &ts) != 0) return -1;
+    tv->tv_sec  = ts.tv_sec;
+    tv->tv_usec = ts.tv_nsec / 1000;
     return 0;
+}
+int settimeofday(const struct timeval* tv, const struct timezone* tz){
+    (void)tz;
+    if(!tv) return 0;
+    if(tv->tv_usec < 0 || tv->tv_usec >= 1000000){ errno = EINVAL; return -1; }
+    struct timespec ts = { tv->tv_sec, tv->tv_usec * 1000 };
+    return clock_settime(CLOCK_REALTIME, &ts);
 }
 
 /* fcntl: kernel-backed (SYS_FCNTL): F_DUPFD / F_DUPFD_CLOEXEC honour the minimum
@@ -364,8 +380,299 @@ struct dirent* readdir(DIR* d){
 int closedir(DIR* d){ if(d){ free(d->buf); free(d); } return 0; }
 
 /* ============================== <time.h> =============================== */
-time_t time(time_t* t){ time_t s=(time_t)(getticks()/1000); if(t)*t=s; return s; }
-clock_t clock(void){ return (clock_t)getticks(); }
+/* Real Unix time (UTC). Broken-down time is always UTC: there is no time-zone
+ * database, so localtime == gmtime and mktime == timegm. */
+time_t time(time_t* t){
+    struct timespec ts; time_t s = (clock_gettime(CLOCK_REALTIME, &ts) == 0) ? ts.tv_sec : (time_t)-1;
+    if(t) *t = s;
+    return s;
+}
+clock_t clock(void){
+    struct timespec ts;
+    if(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) return (clock_t)-1;
+    return (clock_t)(ts.tv_sec * CLOCKS_PER_SEC + ts.tv_nsec / (1000000000 / CLOCKS_PER_SEC));
+}
+double difftime(time_t a, time_t b){ return (double)(a - b); }
+int timespec_get(struct timespec* ts, int base){ return (base == TIME_UTC && clock_gettime(CLOCK_REALTIME, ts) == 0) ? base : 0; }
+int clock_nanosleep(clockid_t clk, int flags, const struct timespec* req, struct timespec* rem){
+    struct timespec rel = *req;
+    if(flags & TIMER_ABSTIME){
+        struct timespec now;
+        if(clock_gettime(clk, &now) != 0) return EINVAL;
+        rel.tv_sec = req->tv_sec - now.tv_sec; rel.tv_nsec = req->tv_nsec - now.tv_nsec;
+        if(rel.tv_nsec < 0){ rel.tv_nsec += 1000000000; rel.tv_sec--; }
+        if(rel.tv_sec < 0) return 0;
+        rem = 0;
+    }
+    return nanosleep(&rel, rem) == 0 ? 0 : errno;    /* POSIX: returns the error */
+}
+long  timezone = 0;
+int   daylight = 0;
+char* tzname[2] = { (char*)"UTC", (char*)"UTC" };
+void tzset(void){}
+
+/* Days since 1970-01-01 <-> civil date (H. Hinnant's algorithms). */
+static long days_from_civil(long y, unsigned m, unsigned d){
+    y -= m <= 2;
+    long era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (long)doe - 719468;
+}
+struct tm* gmtime_r(const time_t* t, struct tm* r){
+    long s = (long)*t, days = s / 86400, rem = s % 86400;
+    if(rem < 0){ rem += 86400; days--; }
+    r->tm_hour = (int)(rem / 3600); r->tm_min = (int)(rem % 3600 / 60); r->tm_sec = (int)(rem % 60);
+    r->tm_wday = (int)(((days % 7) + 11) % 7);       /* 1970-01-01 was a Thursday */
+    long z = days + 719468;
+    long era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long y = (long)yoe + era * 400;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    unsigned d = doy - (153 * mp + 2) / 5 + 1;
+    unsigned m = mp < 10 ? mp + 3 : mp - 9;
+    y += m <= 2;
+    r->tm_year = (int)(y - 1900); r->tm_mon = (int)m - 1; r->tm_mday = (int)d;
+    r->tm_yday = (int)(days - days_from_civil(y, 1, 1));
+    r->tm_isdst = 0; r->tm_gmtoff = 0; r->tm_zone = "UTC";
+    return r;
+}
+struct tm* localtime_r(const time_t* t, struct tm* r){ return gmtime_r(t, r); }
+struct tm* gmtime(const time_t* t){ static struct tm r; return gmtime_r(t, &r); }
+struct tm* localtime(const time_t* t){ return gmtime(t); }
+time_t timegm(struct tm* tm){
+    long y = tm->tm_year + 1900L, mon = tm->tm_mon;
+    y += mon / 12; mon %= 12; if(mon < 0){ mon += 12; y--; }
+    long days = days_from_civil(y, (unsigned)mon + 1, 1) + tm->tm_mday - 1;
+    time_t t = (time_t)(days * 86400 + tm->tm_hour * 3600L + tm->tm_min * 60L + tm->tm_sec);
+    gmtime_r(&t, tm);                                /* normalize the fields */
+    return t;
+}
+time_t mktime(struct tm* tm){ return timegm(tm); }
+
+static const char* const g_wday[] = { "Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday" };
+static const char* const g_mon[]  = { "January","February","March","April","May","June","July",
+                                      "August","September","October","November","December" };
+static int is_leap(int y){ return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+/* ISO 8601 week number and week-based year (for %G %g %V). */
+static int iso_week(const struct tm* tm, int* year){
+    int y = tm->tm_year + 1900;
+    int wday = (tm->tm_wday + 6) % 7;                  /* Monday = 0 */
+    int wk = (tm->tm_yday - wday + 10) / 7;
+    if(wk < 1){
+        y--;
+        int yday = tm->tm_yday + 365 + is_leap(y);
+        wk = (yday - wday + 10) / 7;
+    } else if(wk == 53 && tm->tm_yday - wday + 3 >= 365 + is_leap(y)){
+        wk = 1; y++;                                   /* belongs to week 1 of next year */
+    }
+    *year = y;
+    return wk;
+}
+size_t strftime(char* s, size_t max, const char* fmt, const struct tm* tm){
+    size_t n = 0;
+    char tmp[64];
+    if(max == 0) return 0;
+    for(; *fmt; fmt++){
+        const char* add = tmp;
+        tmp[0] = 0;
+        if(*fmt != '%'){ tmp[0] = *fmt; tmp[1] = 0; }
+        else {
+            fmt++;
+            if(*fmt == 'E' || *fmt == 'O') fmt++;       /* locale modifiers: ignored */
+            int h12 = tm->tm_hour % 12 ? tm->tm_hour % 12 : 12;
+            int iy;
+            switch(*fmt){
+            case 'a': snprintf(tmp, sizeof tmp, "%.3s", g_wday[tm->tm_wday % 7]); break;
+            case 'A': add = g_wday[tm->tm_wday % 7]; break;
+            case 'b': case 'h': snprintf(tmp, sizeof tmp, "%.3s", g_mon[tm->tm_mon % 12]); break;
+            case 'B': add = g_mon[tm->tm_mon % 12]; break;
+            case 'c': snprintf(tmp, sizeof tmp, "%.3s %.3s %2d %02d:%02d:%02d %d", g_wday[tm->tm_wday % 7], g_mon[tm->tm_mon % 12],
+                               tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, tm->tm_year + 1900); break;
+            case 'C': snprintf(tmp, sizeof tmp, "%02d", (tm->tm_year + 1900) / 100); break;
+            case 'd': snprintf(tmp, sizeof tmp, "%02d", tm->tm_mday); break;
+            case 'D': case 'x': snprintf(tmp, sizeof tmp, "%02d/%02d/%02d", tm->tm_mon + 1, tm->tm_mday, (tm->tm_year + 1900) % 100); break;
+            case 'e': snprintf(tmp, sizeof tmp, "%2d", tm->tm_mday); break;
+            case 'F': snprintf(tmp, sizeof tmp, "%d-%02d-%02d", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday); break;
+            case 'G': iso_week(tm, &iy); snprintf(tmp, sizeof tmp, "%d", iy); break;
+            case 'g': iso_week(tm, &iy); snprintf(tmp, sizeof tmp, "%02d", iy % 100); break;
+            case 'H': snprintf(tmp, sizeof tmp, "%02d", tm->tm_hour); break;
+            case 'I': snprintf(tmp, sizeof tmp, "%02d", h12); break;
+            case 'j': snprintf(tmp, sizeof tmp, "%03d", tm->tm_yday + 1); break;
+            case 'k': snprintf(tmp, sizeof tmp, "%2d", tm->tm_hour); break;
+            case 'l': snprintf(tmp, sizeof tmp, "%2d", h12); break;
+            case 'm': snprintf(tmp, sizeof tmp, "%02d", tm->tm_mon + 1); break;
+            case 'M': snprintf(tmp, sizeof tmp, "%02d", tm->tm_min); break;
+            case 'n': add = "\n"; break;
+            case 'p': add = tm->tm_hour < 12 ? "AM" : "PM"; break;
+            case 'P': add = tm->tm_hour < 12 ? "am" : "pm"; break;
+            case 'r': snprintf(tmp, sizeof tmp, "%02d:%02d:%02d %s", h12, tm->tm_min, tm->tm_sec, tm->tm_hour < 12 ? "AM" : "PM"); break;
+            case 'R': snprintf(tmp, sizeof tmp, "%02d:%02d", tm->tm_hour, tm->tm_min); break;
+            case 's': { struct tm c = *tm; snprintf(tmp, sizeof tmp, "%ld", (long)timegm(&c)); break; }
+            case 'S': snprintf(tmp, sizeof tmp, "%02d", tm->tm_sec); break;
+            case 't': add = "\t"; break;
+            case 'T': case 'X': snprintf(tmp, sizeof tmp, "%02d:%02d:%02d", tm->tm_hour, tm->tm_min, tm->tm_sec); break;
+            case 'u': snprintf(tmp, sizeof tmp, "%d", tm->tm_wday ? tm->tm_wday : 7); break;
+            case 'U': snprintf(tmp, sizeof tmp, "%02d", (tm->tm_yday + 7 - tm->tm_wday) / 7); break;
+            case 'V': snprintf(tmp, sizeof tmp, "%02d", iso_week(tm, &iy)); break;
+            case 'w': snprintf(tmp, sizeof tmp, "%d", tm->tm_wday); break;
+            case 'W': snprintf(tmp, sizeof tmp, "%02d", (tm->tm_yday + 7 - (tm->tm_wday + 6) % 7) / 7); break;
+            case 'y': snprintf(tmp, sizeof tmp, "%02d", (tm->tm_year + 1900) % 100); break;
+            case 'Y': snprintf(tmp, sizeof tmp, "%d", tm->tm_year + 1900); break;
+            case 'z': add = "+0000"; break;
+            case 'Z': add = "UTC"; break;
+            case '%': add = "%"; break;
+            case 0: fmt--; add = ""; break;
+            default: tmp[0] = '%'; tmp[1] = *fmt; tmp[2] = 0; break;
+            }
+        }
+        for(; *add; add++){ if(n + 1 >= max) return 0; s[n++] = *add; }
+    }
+    s[n] = 0;
+    return n;
+}
+char* asctime_r(const struct tm* tm, char* buf){
+    snprintf(buf, 26, "%.3s %.3s %2d %02d:%02d:%02d %d\n", g_wday[tm->tm_wday % 7], g_mon[tm->tm_mon % 12],
+             tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, tm->tm_year + 1900);
+    return buf;
+}
+char* asctime(const struct tm* tm){ static char b[32]; return asctime_r(tm, b); }
+char* ctime_r(const time_t* t, char* buf){ struct tm r; return asctime_r(gmtime_r(t, &r), buf); }
+char* ctime(const time_t* t){ static char b[32]; return ctime_r(t, b); }
+
+/* <utime.h> */
+#include <utime.h>
+int utime(const char* path, const struct utimbuf* times){
+    time_t a, m;
+    if(times){ a = times->actime; m = times->modtime; } else { a = m = time(0); }
+    return utimes(path, (unsigned long)a, (unsigned long)m);
+}
+
+/* ===================== <poll.h> / <sys/select.h> ======================= */
+#include <poll.h>
+#include <sys/select.h>
+int ppoll(struct pollfd* fds, nfds_t n, const struct timespec* tmo, const unsigned long* sigmask){
+    int ms = -1;
+    if(tmo) ms = (int)(tmo->tv_sec * 1000 + (tmo->tv_nsec + 999999) / 1000000);
+    unsigned long old = 0;
+    if(sigmask) sigprocmask(2 /*SIG_SETMASK*/, sigmask, &old);
+    int r = poll(fds, n, ms);
+    int e = errno;
+    if(sigmask) sigprocmask(2, &old, 0);
+    errno = e;
+    return r;
+}
+/* select() over poll(): one pollfd per descriptor set in any of the sets (the
+ * kernel polls <= 64 descriptors per call). Exceptional conditions map to
+ * POLLPRI, which no SecOS descriptor raises. */
+static int select_ms(int nfds, fd_set* r, fd_set* w, fd_set* e, int ms){
+    struct pollfd pf[64];
+    int n = 0;
+    if(nfds < 0 || nfds > FD_SETSIZE){ errno = EINVAL; return -1; }
+    for(int fd = 0; fd < nfds; fd++){
+        short ev = 0;
+        if(r && FD_ISSET(fd, r)) ev |= POLLIN;
+        if(w && FD_ISSET(fd, w)) ev |= POLLOUT;
+        if(e && FD_ISSET(fd, e)) ev |= POLLPRI;
+        if(!ev) continue;
+        if(n == 64){ errno = EINVAL; return -1; }
+        pf[n].fd = fd; pf[n].events = ev; pf[n].revents = 0; n++;
+    }
+    if(poll(pf, (nfds_t)n, ms) < 0) return -1;
+    for(int i = 0; i < n; i++) if(pf[i].revents & POLLNVAL){ errno = EBADF; return -1; }
+    if(r) FD_ZERO(r);
+    if(w) FD_ZERO(w);
+    if(e) FD_ZERO(e);
+    int cnt = 0;
+    for(int i = 0; i < n; i++){
+        short re = pf[i].revents;
+        if(r && (pf[i].events & POLLIN) && (re & (POLLIN | POLLHUP | POLLERR))){ FD_SET(pf[i].fd, r); cnt++; }
+        if(w && (pf[i].events & POLLOUT) && (re & (POLLOUT | POLLERR))){ FD_SET(pf[i].fd, w); cnt++; }
+        if(e && (re & POLLPRI)){ FD_SET(pf[i].fd, e); cnt++; }
+    }
+    return cnt;
+}
+int select(int nfds, fd_set* r, fd_set* w, fd_set* e, struct timeval* tmo){
+    int ms = -1;
+    struct timespec t0 = { 0, 0 };
+    if(tmo){
+        if(tmo->tv_sec < 0 || tmo->tv_usec < 0){ errno = EINVAL; return -1; }
+        ms = (int)(tmo->tv_sec * 1000 + (tmo->tv_usec + 999) / 1000);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+    }
+    int rv = select_ms(nfds, r, w, e, ms);
+    if(tmo && rv >= 0){                                  /* Linux: timeout -> time left */
+        struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        long used = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
+        long left = tmo->tv_sec * 1000000L + tmo->tv_usec - used;
+        if(left < 0 || rv == 0) left = 0;
+        tmo->tv_sec = left / 1000000; tmo->tv_usec = left % 1000000;
+    }
+    return rv;
+}
+int pselect(int nfds, fd_set* r, fd_set* w, fd_set* e, const struct timespec* tmo, const unsigned long* sigmask){
+    int ms = -1;
+    if(tmo) ms = (int)(tmo->tv_sec * 1000 + (tmo->tv_nsec + 999999) / 1000000);
+    unsigned long old = 0;
+    if(sigmask) sigprocmask(2, sigmask, &old);
+    int rv = select_ms(nfds, r, w, e, ms);
+    int er = errno;
+    if(sigmask) sigprocmask(2, &old, 0);
+    errno = er;
+    return rv;
+}
+
+/* ===================== <sys/uio.h> / <sys/statvfs.h> =================== */
+#include <sys/uio.h>
+#include <sys/statvfs.h>
+#include <sys/statfs.h>
+#include <sys/sysinfo.h>
+long readv(int fd, const struct iovec* iov, int cnt){
+    long tot = 0;
+    if(cnt < 0){ errno = EINVAL; return -1; }
+    for(int i = 0; i < cnt; i++){
+        if(!iov[i].iov_len) continue;
+        long r = read(fd, iov[i].iov_base, iov[i].iov_len);
+        if(r < 0) return tot ? tot : -1;
+        tot += r;
+        if((size_t)r < iov[i].iov_len) break;            /* short read: stop here */
+    }
+    return tot;
+}
+long writev(int fd, const struct iovec* iov, int cnt){
+    long tot = 0;
+    if(cnt < 0){ errno = EINVAL; return -1; }
+    for(int i = 0; i < cnt; i++){
+        if(!iov[i].iov_len) continue;
+        long r = write(fd, iov[i].iov_base, iov[i].iov_len);
+        if(r < 0) return tot ? tot : -1;
+        tot += r;
+        if((size_t)r < iov[i].iov_len) break;
+    }
+    return tot;
+}
+static void statfs_to_vfs(const struct statfs* s, struct statvfs* v){
+    v->f_bsize = (unsigned long)s->f_bsize; v->f_frsize = (unsigned long)(s->f_frsize ? s->f_frsize : s->f_bsize);
+    v->f_blocks = s->f_blocks; v->f_bfree = s->f_bfree; v->f_bavail = s->f_bavail;
+    v->f_files = s->f_files; v->f_ffree = s->f_ffree; v->f_favail = s->f_ffree;
+    v->f_fsid = (unsigned long)(unsigned)s->f_fsid.__val[0]; v->f_flag = (unsigned long)s->f_flags & 1;
+    v->f_namemax = (unsigned long)s->f_namelen;
+}
+int statvfs(const char* path, struct statvfs* v){ struct statfs s; if(statfs(path, &s) != 0) return -1; statfs_to_vfs(&s, v); return 0; }
+int fstatvfs(int fd, struct statvfs* v){ struct statfs s; if(fstatfs(fd, &s) != 0) return -1; statfs_to_vfs(&s, v); return 0; }
+int get_nprocs(void){
+    int fd = open("/proc/stat", O_RDONLY), n = 0;
+    if(fd < 0) return 1;
+    char b[1024]; long r = read(fd, b, sizeof(b) - 1); close(fd);
+    if(r <= 0) return 1;
+    b[r] = 0;
+    for(char* p = b; (p = strstr(p, "\ncpu")) != 0; p++) n++;
+    return n ? n : 1;
+}
+int get_nprocs_conf(void){ return get_nprocs(); }
 
 /* ============================== <assert.h> ============================= */
 void __assert_fail(const char* expr, const char* file, int line){
@@ -374,8 +681,15 @@ void __assert_fail(const char* expr, const char* file, int line){
 }
 
 /* ============================== <unistd.h> extras ====================== */
-unsigned int sleep(unsigned int s){ sleep_ticks(s*1000); return 0; }
-int usleep(unsigned long us){ unsigned t=(unsigned)(us/1000); if(!t)t=1; sleep_ticks(t); return 0; }
+unsigned int sleep(unsigned int s){
+    struct timespec rq = { (long)s, 0 }, rm = { 0, 0 };
+    if(nanosleep(&rq, &rm) == 0) return 0;
+    return (unsigned)rm.tv_sec + (rm.tv_nsec ? 1 : 0);    /* interrupted: seconds left */
+}
+int usleep(unsigned long us){
+    struct timespec rq = { (long)(us / 1000000), (long)(us % 1000000) * 1000 };
+    return nanosleep(&rq, 0);
+}
 /* A terminal is whatever answers TCGETS (the console and its dups, /dev/tty);
  * a redirected stdio fd (pipe, file) is not. */
 int ioctl(int fd, unsigned long request, void* arg);

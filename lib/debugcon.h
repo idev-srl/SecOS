@@ -11,9 +11,20 @@
 
 #include <stdint.h>
 
-/* Write one character to ISA debugcon port 0xE9. */
-static inline void debugcon_putchar(char c) {
+/* Kernel log ring (kernel/klog.c): every kernel debugcon byte is also kept
+ * there for dmesg / SYS_SYSLOG / /proc/kmsg. */
+void klog_putc(char c);
+
+/* Write one character to ISA debugcon port 0xE9 only (not the kernel log):
+ * for user programs' console output, which is not a kernel message. */
+static inline void debugcon_putchar_raw(char c) {
     __asm__ volatile ("outb %0, $0xE9" : : "a"(c) : "memory");
+}
+
+/* Write one character to ISA debugcon port 0xE9 (and the kernel log). */
+static inline void debugcon_putchar(char c) {
+    debugcon_putchar_raw(c);
+    klog_putc(c);
 }
 
 /* Write a NUL-terminated string to debugcon. */

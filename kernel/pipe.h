@@ -21,5 +21,6 @@ int  pipe_read(pipe_t* p, void* buf, int len);     /* >0 bytes; 0 EOF; -2 would-
 int  pipe_write(pipe_t* p, const void* buf, int len); /* >0 bytes; -1 EPIPE; -2 would-block */
 void pipe_ref(pipe_t* p, int writer);              /* bump reader (0) / writer (1) count */
 void pipe_unref(pipe_t* p, int writer);            /* drop ref; wake peers; free when both 0 */
+int  pipe_poll(pipe_t* p, int writer);             /* poll() revents bits for one end */
 
 #endif /* PIPE_H */

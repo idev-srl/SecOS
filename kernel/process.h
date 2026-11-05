@@ -147,6 +147,24 @@ typedef struct process {
     // cloexec: FD_CLOEXEC — the fd is closed by a successful execve() (fcntl
     // F_SETFD, O_CLOEXEC on open, pipe2(O_CLOEXEC), F_DUPFD_CLOEXEC).
     struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; int cloexec; } fds[32];
+    // Kernel-interface bookkeeping (kernel/kiface.c): procfs identity + CPU
+    // accounting, umask, and the in-progress state of the blocking nanosleep /
+    // poll syscalls. Set up by kiface_proc_init() at creation; fork copies it
+    // and kiface_proc_fork() resets the per-instance parts.
+    struct proc_ki {
+        uint32_t umask;              // file-creation mask (default 022)
+        uint64_t start_ns;           // monotonic creation time
+        uint64_t utime_ticks;        // timer ticks spent in ring 3
+        uint64_t stime_ticks;        // timer ticks spent in ring 0 (syscalls)
+        uint64_t nvcsw;              // voluntary context switches (blocks)
+        uint64_t nsleep_deadline;    // nanosleep: absolute monotonic ns, 0 = none
+        uint64_t poll_deadline;      // poll: absolute monotonic ns, ~0 = no timeout
+        uint8_t  poll_active;        // poll() in progress (re-run after a wake)
+        uint8_t  poll_wait;          // blocked in poll(): pipe activity wakes it
+        uint16_t cmdline_len;        // bytes in cmdline (NUL-separated argv)
+        char     comm[16];           // executable name (basename of argv[0])
+        char     cmdline[256];       // argv, NUL-separated (/proc/<pid>/cmdline)
+    } ki;
 } process_t;
 
 int process_init_system(void); // initialize process table

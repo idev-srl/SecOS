@@ -85,13 +85,7 @@ clock_t times(struct tms* t){ unsigned long ms=getticks(); if(t){ t->tms_utime=m
 unsigned int alarm(unsigned int s){ (void)s; return 0; }
 int setitimer(int w, const struct itimerval* n, struct itimerval* o){ (void)w;(void)n; if(o) zmem(o,0,sizeof(*o)); return 0; }
 int getitimer(int w, struct itimerval* o){ (void)w; if(o) zmem(o,0,sizeof(*o)); return 0; }
-struct tm { int tm_sec,tm_min,tm_hour,tm_mday,tm_mon,tm_year,tm_wday,tm_yday,tm_isdst; };
-static struct tm g_tm;
-struct tm* localtime(const long* t){ (void)t; zmem(&g_tm,0,sizeof(g_tm)); g_tm.tm_year=126; return &g_tm; }
-struct tm* gmtime(const long* t){ return localtime(t); }
-long mktime(struct tm* t){ (void)t; return 0; }
-void tzset(void){}
-unsigned long strftime(char* s, unsigned long m, const char* f, const struct tm* t){ (void)f;(void)t; if(m){ s[0]=0; } return 0; }
+/* localtime/gmtime/mktime/strftime/tzset: the SecOS libc (real UTC time). */
 
 /* ---- fd / stdio helpers ---- */
 int isascii(int c){ return (c>=0 && c<128); }
@@ -169,7 +163,7 @@ int setresgid(int r,int e,int s){ (void)r;(void)e;(void)s; return 0; }
 int setreuid(int r,int e){ (void)r;(void)e; return 0; }
 int setregid(int r,int e){ (void)r;(void)e; return 0; }
 long sysconf(int name){ (void)name; return -1; }
-int access(const char* p, int mode){ (void)mode; struct stat st; return stat(p,&st)==0 ? 0 : -1; }
+/* access(): the SecOS libc (SYS_ACCESS). */
 
 /* asprintf (brace expansion {01..10}): format into a malloc'd string. */
 #include <stdarg.h>

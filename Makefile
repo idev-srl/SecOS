@@ -76,6 +76,9 @@ SRC_C   = \
 	$(KERNEL_DIR)/tty.c \
 	$(KERNEL_DIR)/pty.c \
 	$(KERNEL_DIR)/power.c \
+	$(KERNEL_DIR)/kclock.c \
+	$(KERNEL_DIR)/klog.c \
+	$(KERNEL_DIR)/kiface.c \
 	$(KERNEL_DIR)/smp.c \
 	$(KERNEL_DIR)/pkg.c \
 	$(KERNEL_DIR)/selftest.c \
@@ -374,6 +377,11 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/abi_test.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/abi_test.o
 	python3 tools/secos-sign user/abi_test.elf --dev
 	python3 tools/elf2h.py user/abi_test.elf user_abi_test_elf crypto/user_abi_test_elf.h
+	# kernel interfaces for userland tools: procfs/klog/clocks/statfs/rename/link/poll test
+	$(CC) $(USER_CFLAGS) -c user/kitest.c      -o user/kitest.o
+	$(LD) --gc-sections -T user/user.ld -o user/kitest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/kitest.o
+	python3 tools/secos-sign user/kitest.elf --dev
+	python3 tools/elf2h.py user/kitest.elf user_kitest_elf crypto/user_kitest_elf.h
 	$(CC) $(USER_CFLAGS) -c user/power.c       -o user/power.o
 	$(LD) --gc-sections -T user/user.ld -o user/power.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/power.o
 	python3 tools/secos-sign user/power.elf --dev
@@ -395,7 +403,7 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/ptytest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/ptytest.o
 	python3 tools/secos-sign user/ptytest.elf --dev
 	python3 tools/elf2h.py user/ptytest.elf user_ptytest_elf crypto/user_ptytest_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + power + exectest{,_unsigned} + ttytest + ptytest -> crypto/*.h"
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + power + exectest{,_unsigned} + ttytest + ptytest -> crypto/*.h"
 
 # Staleness guard for the committed embedded programs: rebuild + re-sign them
 # (deterministic: same sources -> byte-identical headers) and fail if any

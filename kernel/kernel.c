@@ -1319,6 +1319,7 @@ static void m24_run_demo(void) {
 #include "../crypto/user_abi_test_elf.h"
 #include "../crypto/user_ttytest_elf.h"
 #include "../crypto/user_ptytest_elf.h"
+#include "../crypto/user_kitest_elf.h"
 static void coreutils_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1355,6 +1356,8 @@ static void coreutils_install(void) {
     // [pty] pseudo-terminal regression test; also /bin/script (bash on a pty)
     vfs_create("/bin/ptytest", user_ptytest_elf, user_ptytest_elf_len);
     vfs_create("/bin/script", user_ptytest_elf, user_ptytest_elf_len);
+    // kernel interfaces for userland tools (procfs/klog/time/statfs/poll/...)
+    vfs_create("/bin/kitest", user_kitest_elf, user_kitest_elf_len);
 }
 extern void shell_init(void);
 extern void shell_run(void);
@@ -1625,6 +1628,9 @@ static void kernel_main_phase2(void) {
         debugcon_writestring(ok ? "[TSC] monotonic OK\n"
                                 : "[TSC] FAIL: clock not advancing\n");
     }
+    // Wall clock: read the CMOS RTC (UTC) once and anchor it to the TSC clock
+    // (CLOCK_REALTIME, file timestamps, date).
+    { extern void kclock_init(void); kclock_init(); }
 
     // [M29-2] Application-processor bring-up is **opt-in** (experimental): on real
     // hardware with true parallelism, heavy multicore load can deadlock/freeze —

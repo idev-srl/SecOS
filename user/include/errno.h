@@ -25,4 +25,18 @@ extern int errno;
 #define EPIPE   32
 #define ERANGE  34
 #define ENOSYS  38
+#define ENXIO    6
+#define E2BIG    7
+#define EBUSY   16
+#define EXDEV   18
+#define ENFILE  23
+#define ESPIPE  29
+#define EROFS   30
+#define EDOM    33
+#define ENAMETOOLONG 36
+#define ENOTEMPTY 39
+#define ELOOP   40
+#define EWOULDBLOCK EAGAIN
+#define EOPNOTSUPP 95
+#define ETIMEDOUT 110
 #endif
