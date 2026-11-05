@@ -18,6 +18,7 @@
 #include "socket.h"           // [M24] kernel-side socket layer (-Inet)
 #include "pipe.h"             // [M25] anonymous pipes
 #include "cap.h"              // [M35] generalized capability checks
+#include "heap.h"             // kmalloc for read()/write() bounce buffers
 
 extern uint64_t timer_get_ticks(void);
 
@@ -255,34 +256,109 @@ int ksys_open(const char* path, int flags){
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
     if(c->fds[fd].is_pipe){ pipe_unref((pipe_t*)c->fds[fd].inode, c->fds[fd].pipe_w); c->fds[fd].is_pipe=0; }  // [M25] drop end, may signal EOF/EPIPE
     c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
-int ksys_read(int fd, void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
+// [uaccess] read()/write() never touch the user buffer directly: data moves
+// through a kernel bounce buffer and copy_to/from_user, so an unmapped or
+// read-only user page yields -EFAULT (or a short count) instead of a ring-0
+// fault. Small transfers bounce on the stack; larger ones through one kmalloc'd
+// chunk (UIO_CHUNK), looping. Progress already made is reported as a short count.
+#define UIO_SMALL 512
+#define UIO_CHUNK 65536
+typedef struct { uint8_t* p; uint8_t small[UIO_SMALL]; int heap; int cap; } uio_buf_t;
+static int uio_get(uio_buf_t* u, int len){
+    if(len <= UIO_SMALL){ u->p=u->small; u->heap=0; u->cap=UIO_SMALL; return 0; }
+    u->cap = len < UIO_CHUNK ? len : UIO_CHUNK;
+    u->p = (uint8_t*)kmalloc((size_t)u->cap); u->heap=1;
+    return u->p ? 0 : -1;
+}
+static void uio_put(uio_buf_t* u){ if(u->heap && u->p) kfree(u->p); u->p=0; }
+
+int ksys_read(int fd, void* ubuf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
+    if(len<=0) return -1;
+    int is_pipe = c->fds[fd].used && c->fds[fd].is_pipe;
+    int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
+    if(!is_pipe && !is_file && fd!=0) return -1;
+    uio_buf_t u;
     // [M30] A redirected pipe/file end takes precedence over the console
     // special-case, so a pipeline can wire its read end onto fd 0 (stdin).
-    if(c->fds[fd].used && c->fds[fd].is_pipe){ if(c->fds[fd].pipe_w) return -1; return pipe_read((pipe_t*)c->fds[fd].inode, buf, len); } // [M25] read end only
-    if(c->fds[fd].used && c->fds[fd].inode){
+    if(is_pipe){                                            // [M25] read end only
+        if(c->fds[fd].pipe_w) return -1;
+        int want = len < 4096 ? len : 4096;                 // the pipe holds <= 4 KB: one chunk
+        if(uio_get(&u, want)!=0) return -1;
+        int r = pipe_read((pipe_t*)c->fds[fd].inode, u.p, want);
+        if(r>0 && copy_to_user(ubuf, u.p, (size_t)r)!=0) r = -EFAULT;  // data consumed (as Linux)
+        uio_put(&u);
+        return r;
+    }
+    if(!is_file){                                           // [M25] fd 0 -> console TTY
+        extern int tty_read(void* buf, int len);
+        int want = len < UIO_SMALL ? len : UIO_SMALL;       // a TTY line is <= 256 bytes
+        int r = tty_read(u.small, want);
+        if(r>0 && copy_to_user(ubuf, u.small, (size_t)r)!=0) return -EFAULT;
+        return r;
+    }
     vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino->ops||!ino->ops->read) return -1;
+    if(uio_get(&u, len)!=0) return -1;
     // [M20] Read through the unified page cache so file read() and file-backed
     // mmap see the same pages (coherent). [M23] Virtual FSes (devfs/procfs/sysfs)
     // are dynamic — bypass the cache and read live via ->read().
-    size_t off=c->fds[fd].offset; int r;
-    if(ino->ops->flags & VFS_FS_NOCACHE) r=ino->ops->read(ino, off, buf, (size_t)len);
-    else r=pagecache_read(ino, off, buf, (uint64_t)len);
-    if(r>0) c->fds[fd].offset += (uint64_t)r; return r; }
-    // [M25] fd 0 (stdin) with no redirection -> the console TTY cooked line discipline.
-    if(fd==0){ extern int tty_read(void* buf, int len); return tty_read(buf, len); }
-    return -1; }
-int ksys_write(int fd, const void* buf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
+    int done=0, err=0;
+    while(done < len){
+        int want = (len-done) < u.cap ? (len-done) : u.cap;
+        size_t off=c->fds[fd].offset; int r;
+        if(ino->ops->flags & VFS_FS_NOCACHE) r=ino->ops->read(ino, off, u.p, (size_t)want);
+        else r=pagecache_read(ino, off, u.p, (uint64_t)want);
+        if(r<=0){ if(done==0) err=r; break; }
+        if(copy_to_user((uint8_t*)ubuf+done, u.p, (size_t)r)!=0){ if(done==0) err=-EFAULT; break; }
+        c->fds[fd].offset += (uint64_t)r; done += r;
+        if(r < want) break;                                 // short read: EOF / device end
+    }
+    uio_put(&u);
+    return done ? done : err; }
+int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
-    // [M30] A redirected pipe/file end takes precedence over the console
-    // special-case, so a pipeline can wire its write end onto fd 1 (stdout).
-    if(c->fds[fd].used && c->fds[fd].is_pipe){ if(!c->fds[fd].pipe_w) return -1; return pipe_write((pipe_t*)c->fds[fd].inode, buf, len); } // [M25] write end only
-    if(c->fds[fd].used && c->fds[fd].inode){ vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino->ops||!ino->ops->write) return -1; size_t off=c->fds[fd].offset; int r=ino->ops->write(ino, off, buf, (size_t)len); if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); } return r; }
-    // [M9] fd 1 (stdout) / 2 (stderr) with no redirection -> console. The buffer
-    // was already user_range_valid()'d by the SYS_WRITE dispatcher; CR3 is the
-    // caller's address space during the syscall, so reading it directly is safe.
-    if(fd==1||fd==2){ const char* p=(const char*)buf; for(int i=0;i<len;i++){ terminal_putchar(p[i]); debugcon_putchar(p[i]); } return len; }
-    return -1; }
+    if(len<=0) return -1;
+    int is_pipe = c->fds[fd].used && c->fds[fd].is_pipe;
+    int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
+    if(!is_pipe && !is_file && fd!=1 && fd!=2) return -1;
+    if(is_pipe && !c->fds[fd].pipe_w) return -1;            // [M25] write end only
+    vfs_inode_t* ino = is_file ? (vfs_inode_t*)c->fds[fd].inode : 0;
+    if(ino && (!ino->ops||!ino->ops->write)) return -1;
+    uio_buf_t u;
+    if(is_pipe){
+        // [M30] A redirected pipe end takes precedence over the console. One
+        // chunk per call (the pipe is 4 KB; a short write is POSIX-legal and
+        // the caller loops). A full pipe returns -2 (would block) and the
+        // syscall is re-run, re-copying the data.
+        int want = len < 4096 ? len : 4096;
+        if(uio_get(&u, want)!=0) return -1;
+        int r;
+        if(copy_from_user(u.p, ubuf, (size_t)want)!=0) r = -EFAULT;
+        else r = pipe_write((pipe_t*)c->fds[fd].inode, u.p, want);
+        uio_put(&u);
+        return r;
+    }
+    if(uio_get(&u, len)!=0) return -1;
+    int done=0, err=0;
+    while(done < len){
+        int want = (len-done) < u.cap ? (len-done) : u.cap;
+        if(copy_from_user(u.p, (const uint8_t*)ubuf+done, (size_t)want)!=0){ if(done==0) err=-EFAULT; break; }
+        int r;
+        if(ino){
+            size_t off=c->fds[fd].offset;
+            r=ino->ops->write(ino, off, u.p, (size_t)want);
+            if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); }
+        } else {
+            // [M9] fd 1 (stdout) / 2 (stderr) with no redirection -> console.
+            for(int i=0;i<want;i++){ terminal_putchar((char)u.p[i]); debugcon_putchar((char)u.p[i]); }
+            r = want;
+        }
+        if(r<=0){ if(done==0) err=r; break; }
+        done += r;
+        if(r < want) break;                                 // short write (disk full, ...)
+    }
+    uio_put(&u);
+    return done ? done : err; }
 
 long ksys_lseek(int fd, long offset, int whence){
     extern process_t* sched_get_current(void);
@@ -426,14 +502,10 @@ int ksys_umount(const char* target){
     return vfs_unmount(target);
 }
 
-// [M26] Copy a NUL-terminated user string into a kernel buffer (per-byte
-// validated, bounded). Returns 0 on success, -1 on fault or overflow.
+// [M26] Copy a NUL-terminated user string into a kernel buffer (bounded,
+// fault-tolerant via strncpy_from_user). 0 on success, -1 on fault/overflow.
 static int copy_user_str(const char* u, char* k, int ksz){
-    for(int i=0;i<ksz;i++){
-        if(!user_range_valid(u+i,1)) return -1;
-        char c=u[i]; k[i]=c; if(!c) return 0;
-    }
-    return -1;
+    return strncpy_from_user(k, u, (size_t)ksz) < 0 ? -1 : 0;
 }
 
 // [M39] --- POSIX shell-from-source foundation ---
@@ -554,12 +626,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         /* [M35] A write-intent open needs FS_WRITE; otherwise FS_READ. */
         CAP_GATE(((int)a1 & 0x3) ? CAP_FS_WRITE : CAP_FS_READ, "open");
         /* [M3] Validate path pointer is in user range (at least 1 byte). */
-        const char* path = (const char*)a0;
-        if (!user_range_valid(path, 1)) {
-            terminal_writestring("[SYSCALL][M3] SYS_OPEN: invalid user path pointer\n");
-            return (uint64_t)(int64_t)-EFAULT;
-        }
-        return (uint64_t)ksys_open(path, (int)a1);
+        char kp[256];
+        long sl = strncpy_from_user(kp, (const char*)a0, sizeof(kp));
+        if (sl < 0) return (uint64_t)(int64_t)sl;      /* -EFAULT / -ENAMETOOLONG */
+        return (uint64_t)ksys_open(kp, (int)a1);
     }
 
     case SYS_READ: {
@@ -587,15 +657,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_SPAWN: {
         CAP_GATE(CAP_PROC, "spawn");     // [M35]
         /* [M3] Validate and copy the user path string into the kernel. */
-        const char* upath = (const char*)a0;
-        char kpath[256]; int i = 0;
-        for (; i < 255; i++) {
-            if (!user_range_valid(upath + i, 1)) { return (uint64_t)(int64_t)-EFAULT; }
-            char ch = upath[i];
-            kpath[i] = ch;
-            if (ch == 0) break;
-        }
-        kpath[i] = 0;
+        char kpath[256];
+        long sl = strncpy_from_user(kpath, (const char*)a0, sizeof(kpath));
+        if (sl < 0) return (uint64_t)(int64_t)sl;      /* -EFAULT / -ENAMETOOLONG */
         /* [M16] Optional argv: a1 = user char** (NULL-terminated array of user
          * char*), or NULL for no args. Copy both the pointer array and each
          * string into the kernel (all user accesses validated/bounce-buffered). */
@@ -609,15 +673,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
                 if (copy_from_user(&ustr, uargv + argc, sizeof(ustr)) != 0)
                     return (uint64_t)(int64_t)-EFAULT;
                 if (!ustr) break; /* NULL terminator */
-                int j = 0;
-                for (; j < SPAWN_ARG_LEN - 1; j++) {
-                    char ch;
-                    if (copy_from_user(&ch, ustr + j, 1) != 0)
-                        return (uint64_t)(int64_t)-EFAULT;
-                    argstore[argc][j] = ch;
-                    if (!ch) break;
-                }
-                argstore[argc][j] = 0;
+                /* Over-long args are truncated (historical behaviour). */
+                long al = strncpy_from_user(argstore[argc], ustr, SPAWN_ARG_LEN);
+                if (al == -EFAULT) return (uint64_t)(int64_t)-EFAULT;
                 kargv[argc] = argstore[argc];
             }
         }
@@ -658,10 +716,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return (uint64_t)(int64_t)ksys_lseek((int)a0, (long)a1, (int)a2);
 
     case SYS_STAT: {
-        const char* path = (const char*)a0;
-        if (!user_range_valid(path, 1)) return (uint64_t)(int64_t)-EFAULT;
+        char kp[256];
+        long sl = strncpy_from_user(kp, (const char*)a0, sizeof(kp));
+        if (sl < 0) return (uint64_t)(int64_t)sl;
         struct secos_stat st;
-        int r = ksys_stat(path, &st);
+        int r = ksys_stat(kp, &st);
         if (r != 0) return (uint64_t)(int64_t)r;
         if (copy_to_user((void*)a1, &st, sizeof(st)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return 0;
@@ -872,9 +931,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_IOCTL:   return (uint64_t)(int64_t)ksys_ioctl((int)a0, a1, a2);
     case SYS_GETPPID: return (uint64_t)ksys_getppid();
     case SYS_FSTAT: {
-        struct secos_stat* st=(struct secos_stat*)a1;
-        if(!user_range_valid(st, sizeof(*st))) return (uint64_t)(int64_t)-EFAULT;
-        return (uint64_t)(int64_t)ksys_fstat((int)a0, st);
+        struct secos_stat kst;
+        if(!user_range_valid((void*)a1, sizeof(kst))) return (uint64_t)(int64_t)-EFAULT;
+        int r = ksys_fstat((int)a0, &kst);
+        if(r != 0) return (uint64_t)(int64_t)r;
+        if(copy_to_user((void*)a1, &kst, sizeof(kst)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        return 0;
     }
 
     default:
