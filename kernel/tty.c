@@ -20,6 +20,7 @@
  * real signal-delivery mechanism, which is deferred (see docs/devlog/M25.md).
  */
 #include <stdint.h>
+#include <stdbool.h>
 #include "terminal.h"
 #include "process.h"
 #include "signal.h"
@@ -36,12 +37,26 @@ static int  g_asm = 0;          /* bytes of the line being typed (not yet comple
 
 #define TTY_EINTR (-4)          /* -EINTR: libc maps it to errno=EINTR */
 
-/* Returns 0 and stores a char in *out, or -1 if interrupted by a pending signal
- * (so the read() returns EINTR and the signal can be delivered). [M30] */
+#define TTY_WOULDBLOCK (-2)     /* no input yet: the syscall layer blocks the reader */
+
+/* When set (tty_read_try), a reader with no input pending gives the CPU away
+ * instead of spinning: the syscall layer blocks it (wait_tty) and the timer tick
+ * wakes it when input arrives. The INT 0x80 path only preempts ring 3, so a
+ * reader spinning here in ring 0 starved every other process: background jobs
+ * made no progress while bash sat at its prompt. */
+static int g_tty_may_block = 0;
+
+/* Returns 0 and stores a char in *out, -1 if interrupted by a pending signal
+ * (so the read() returns EINTR and the signal can be delivered) [M30], or -2
+ * when the caller should block (tty_read_try only). */
 static int tty_getchar_blocking(char* out) {
     while (!keyboard_has_char()) {
         process_t* cur = sched_get_current();
         if (cur && signal_pending(cur)) return -1;     /* [M30] EINTR */
+        if (g_tty_may_block && cur && cur->pid != 0) {
+            cur->wait_tty = 1;                         /* armed; tty_wake_readers() */
+            return -2;
+        }
         __asm__ volatile ("sti; hlt");
     }
     *out = keyboard_getchar();
@@ -69,9 +84,10 @@ int tty_read(void* buf, int len) {
     int n = g_asm;
     for (;;) {
         char c;
-        if (tty_getchar_blocking(&c) != 0) {             /* [M30] interrupted */
+        int gr = tty_getchar_blocking(&c);
+        if (gr != 0) {                                   /* [M30] interrupted / would block */
             g_asm = n;                                   /* resume on re-read */
-            return TTY_EINTR;
+            return gr == -2 ? TTY_WOULDBLOCK : TTY_EINTR;
         }
         if (c == '\n' || c == '\r') {
             terminal_putchar('\n');
@@ -95,4 +111,30 @@ int tty_read(void* buf, int len) {
     int m = 0;
     while (g_pos < g_len && m < len) out[m++] = g_line[g_pos++];
     return m;
+}
+
+/* Console read() entry used by SYS_READ on fd 0: like tty_read(), but returns
+ * TTY_WOULDBLOCK (-2) with current->wait_tty armed instead of spinning in ring 0
+ * when no input is pending; syscall_trap.c then blocks the caller and re-runs
+ * the read once tty_wake_readers() sees input. */
+int tty_read_try(void* buf, int len) {
+    g_tty_may_block = 1;
+    int r = tty_read(buf, len);
+    g_tty_may_block = 0;
+    return r;
+}
+
+/* Timer tick: wake blocked console readers when PS/2/serial input is waiting,
+ * and every TTY_POLL_TICKS regardless so the reader re-polls the USB HID
+ * keyboard (which must not be polled from an ISR). */
+#define TTY_POLL_TICKS 8
+static void tty_wake_cb(process_t* p, void* u) {
+    (void)u;
+    if (p->state == PROC_BLOCKED && p->wait_tty) { p->wait_tty = 0; p->state = PROC_READY; }
+}
+void tty_wake_readers(uint64_t now) {
+    extern bool keyboard_input_pending_noirq(void);
+    extern void process_foreach(void (*cb)(process_t*, void*), void* user);
+    if ((now % TTY_POLL_TICKS) != 0 && !keyboard_input_pending_noirq()) return;
+    process_foreach(tty_wake_cb, 0);
 }

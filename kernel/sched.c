@@ -102,7 +102,8 @@ extern void irq_eoi(void);
 void sched_on_timer_tick(trapframe_t* tf) {
     if (current) current->cpu_ticks++;
     // [M17] Wake any sleepers whose deadline elapsed (independent of preemption).
-    { extern uint64_t timer_get_ticks(void); sched_wake_sleepers(timer_get_ticks()); }
+    { extern uint64_t timer_get_ticks(void); sched_wake_sleepers(timer_get_ticks());
+      extern void tty_wake_readers(uint64_t); tty_wake_readers(timer_get_ticks()); }  // blocked console readers
     if (!idle_task) return;            // preemption only active once a scheduler is armed
     if (!current) return;              // not yet running the scheduler
 

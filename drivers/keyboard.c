@@ -105,6 +105,16 @@ bool keyboard_has_char(void) {
     return has || serial_has_char();
 }
 
+// Input already waiting in the PS/2 ring buffer or the serial RX register.
+// Unlike keyboard_has_char() it never polls the USB HID keyboard, so it is safe
+// from the timer ISR (used to wake a blocked TTY reader promptly).
+bool keyboard_input_pending_noirq(void) {
+    uint64_t fl = spin_lock_irqsave(&kbd_lock);
+    bool has = (buffer_start != buffer_end);
+    spin_unlock_irqrestore(&kbd_lock, fl);
+    return has || serial_has_char();
+}
+
 // [M22] Inject a character from another input source (USB HID keyboard).
 void keyboard_inject_char(char c) {
     if (c) buffer_put(c);

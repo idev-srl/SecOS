@@ -222,7 +222,14 @@ uint64_t syscall_handler(trapframe_t* tf) {
         if (ret == (uint64_t)(int64_t)(-2) && cur) {
             int fd = (int)tf->rdi;
             if (signal_pending(cur)) {
+                cur->wait_tty = 0;
                 ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR
+            } else if (num == SYS_READ && cur->wait_tty) {
+                // Console read with no input yet: sleep until tty_wake_readers()
+                // (timer tick) sees input, then re-run the read.
+                tf->rip -= 2;
+                sched_block_current(tf);                // NORETURN
+                ret = 0;
             } else if (fd >= 0 && fd < 32 && cur->fds[fd].used && cur->fds[fd].is_pipe) {
                 cur->wait_pipe = cur->fds[fd].inode;
                 tf->rip -= 2;                           // re-run `int 0x80` on wake

@@ -364,6 +364,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     // shell sets pgid for pipelines after creation). pid is assigned above.
     { extern void signal_init_proc(process_t*); signal_init_proc(p); }
     p->pgid = p->pid; p->ppid = 0; p->spawner_pid = 0;
+    p->wait_tty = 0;
     p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
     // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases
     // (<=32MB each, within their multi-GB regions). Transparent to programs.
@@ -594,6 +595,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     // pending set starts empty in the child (POSIX). ppid = parent; pgid inherited.
     c->sig_pending = 0;
     c->ppid = parent->pid; c->pgid = parent->pgid; c->spawner_pid = 0;
+    c->wait_tty = 0;
     c->state = PROC_BLOCKED;                   // not runnable until fully built
 
     // [M25] The child inherits the parent's open pipe ends (fds were shallow

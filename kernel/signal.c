@@ -73,7 +73,7 @@ int signal_post(process_t* p, int sig) {
         // Tear down the wait condition so the woken task does not re-block before
         // it gets a chance to see the signal. SIGKILL needs no syscall re-run, but
         // making it READY lets the scheduler dispatch (and then kill) it.
-        p->wait_pid = -1; p->sleep_until = 0; p->recv_chan = -1; p->wait_pipe = NULL;
+        p->wait_pid = -1; p->sleep_until = 0; p->recv_chan = -1; p->wait_pipe = NULL; p->wait_tty = 0;
         p->state = PROC_READY;
     }
     return 0;

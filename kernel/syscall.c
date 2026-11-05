@@ -321,9 +321,9 @@ int ksys_read(int fd, void* ubuf, int len){ extern process_t* sched_get_current(
         return r;
     }
     if(!is_file){                                           // [M25] fd 0 -> console TTY
-        extern int tty_read(void* buf, int len);
+        extern int tty_read_try(void* buf, int len);   // -2: block (wait_tty)
         int want = len < UIO_SMALL ? len : UIO_SMALL;       // a TTY line is <= 256 bytes
-        int r = tty_read(u.small, want);
+        int r = tty_read_try(u.small, want);
         if(r>0 && copy_to_user(ubuf, u.small, (size_t)r)!=0) return -EFAULT;
         return r;
     }

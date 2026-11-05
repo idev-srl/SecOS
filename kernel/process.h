@@ -72,6 +72,7 @@ typedef struct process {
     uint64_t sleep_until;    // [M17] wake when timer_get_ticks() >= this (0 = n/a)
     int      recv_chan;      // [M17] IPC channel the caller is blocked receiving on (-1)
     void*    wait_pipe;      // [M25] pipe object the caller is blocked on (NULL = none)
+    uint8_t  wait_tty;       // blocked in a console read() until input arrives (tty_read_try)
     // [M30] Signals + job control. sig_pending/sig_blocked are bitmasks (bit n =
     // signal n); sig_handler[n] is the disposition (SIG_DFL/SIG_IGN or a user
     // handler VA); sig_restorer is the libc trampoline that calls SYS_SIGRETURN.

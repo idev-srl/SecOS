@@ -14,6 +14,7 @@ void keyboard_init(void);              // Initialize driver
 void keyboard_handler(void);           // Interrupt handler (ISR)
 char keyboard_getchar(void);           // Blocking read char
 bool keyboard_has_char(void);          // Non-blocking availability check
+bool keyboard_input_pending_noirq(void); // PS/2 buffer or serial RX waiting (no USB poll; ISR-safe)
 void keyboard_readline(char* buffer, int max_len); // Read line until Enter
 void keyboard_inject_char(char c);     // [M22] Inject a char (e.g. from a USB HID keyboard)
 // Ctrl-C pressed with no foreground process group (i.e. at the shell / inside a
