@@ -39,7 +39,7 @@ def rnd_word(r): return r.choice(WORDS)
 
 def gen_command(r, st):
     """Return (cmd, expect_substr_or_None). cmd must be a single bash line."""
-    f=r.randint(0,24)
+    f=r.randint(0,26)
     tmp=st["tmp"]
     if f==0:  return (f"echo {rnd_word(r)}", None)
     if f==1:  return ("seq 1 %d" % r.randint(1,40), None)
@@ -68,6 +68,22 @@ def gen_command(r, st):
     if f==22: return ("stat %s/f%d 2>/dev/null || echo NOSTAT" % (tmp, max(0,st['fc']-1)), None)
     if f==23 and st["cmdsub"]: return ("echo S-$(echo SUB)", "S-SUB")
     if f==24 and st["pipes"]:  return ("seq 1 10 | head -3 | tail -1", None)
+    # Large pipelines (many times the 4 KB pipe buffer) with verified counts:
+    # pipes once dropped bytes whenever a write found the pipe nearly full.
+    # The expectation only appears once bash expanded the $(...) (the TTY echo
+    # shows the raw text), and the "-E" terminator makes the match exact.
+    if f in (25, 26) and st["pipes"]:
+        k=r.randint(0,2)
+        if k==0:
+            n=r.choice([5000,10000,20000])
+            return (f"echo BP-$(seq 1 {n} | wc -l)-E", f"BP-{n}-E")
+        if k==1:
+            n=r.choice([2000,20000,50000])
+            return (f"echo BY-$(yes | head -n {n} | wc -l)-E", f"BY-{n}-E")
+        n=r.choice([3000,15000])
+        size=sum(len(str(i))+1 for i in range(1,n+1))
+        return (f"seq 1 {n} > {tmp}/big; echo BC-$(cat {tmp}/big | cat | cat | wc -c)-E",
+                f"BC-{size}-E")
     return ("echo tick", None)
 
 def main():
