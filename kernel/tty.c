@@ -490,9 +490,16 @@ int tty_ioctl(uint64_t cmd, uint64_t arg) {
         struct tty_winsize w;
         int r = k_copy_from(&w, (void*)arg, sizeof(w));
         if (r) return r;
-        g_ws_row = w.ws_row; g_ws_col = w.ws_col;
-        uint32_t fg = signal_get_foreground_pgid();
-        if (fg) signal_post_pgid(fg, SIGWINCH);
+        int cols, rows; terminal_get_size(&cols, &rows);
+        uint16_t old_r = g_ws_row ? g_ws_row : (uint16_t)rows;
+        uint16_t old_c = g_ws_col ? g_ws_col : (uint16_t)cols;
+        /* Setting the real size (readline re-sets what it read) clears the override. */
+        g_ws_row = (w.ws_row == rows) ? 0 : w.ws_row;
+        g_ws_col = (w.ws_col == cols) ? 0 : w.ws_col;
+        if (w.ws_row != old_r || w.ws_col != old_c) {   /* Linux: only on a change */
+            uint32_t fg = signal_get_foreground_pgid();
+            if (fg) signal_post_pgid(fg, SIGWINCH);
+        }
         return 0;
     }
     case TTY_FIONREAD: {
