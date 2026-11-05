@@ -191,7 +191,8 @@ extern int  vfs_create(const char* path, const void* data, size_t size);
 extern int  vfs_read_all(const char* path, void* buf, size_t bufsize);
 
 static uint8_t  m9_idle_stack[16384] __attribute__((aligned(16)));
-static uint8_t  m9_loadbuf[8192];
+// Sized with headroom: hello links the libc stdio (exit() flushes it), ~14 KB.
+static uint8_t  m9_loadbuf[32768];
 static int      m9_spawned = 0, m9_done = 0;
 
 __attribute__((noreturn)) static void m9_idle_entry(void) {
