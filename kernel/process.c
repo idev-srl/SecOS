@@ -523,7 +523,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->regs.rax = p->regs.rbx = p->regs.rcx = p->regs.rdx = 0;
     p->regs.rsi = p->regs.rdi = p->regs.rbp = 0;
     // Init fd table
-    for(int i=0;i<32;i++){ p->fds[i].inode=NULL; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].used=0; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; }
+    for(int i=0;i<32;i++){ p->fds[i].inode=NULL; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].used=0; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; p->fds[i].is_sock=0; }
     // [M25] Reserve fds 0/1/2 as stdin/stdout/stderr so open()/pipe() allocate
     // from fd 3 up (otherwise a pipe end would land on fd 0/1/2 and collide with
     // the console special-cases in ksys_read/ksys_write). They carry no inode —
@@ -699,11 +699,14 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
         if (p->fds[i].is_pipe) {
             extern void pipe_unref(void*, int);
             pipe_unref(p->fds[i].inode, p->fds[i].pipe_w);
+        } else if (p->fds[i].is_sock) {
+            extern void socket_unref(int);
+            socket_unref(p->fds[i].is_sock - 1);
         } else {
             pty_unref(p->fds[i].inode);            // a pty end: drop this holder
         }
         p->fds[i].used = 0; p->fds[i].inode = NULL; p->fds[i].is_pipe = 0;
-        p->fds[i].pipe_w = 0; p->fds[i].cloexec = 0; p->fds[i].offset = 0; p->fds[i].flags = 0;
+        p->fds[i].pipe_w = 0; p->fds[i].cloexec = 0; p->fds[i].is_sock = 0; p->fds[i].offset = 0; p->fds[i].flags = 0;
     }
     // Signals (POSIX): caught signals revert to SIG_DFL (their handlers lived in
     // the old image); ignored stay ignored; mask and pending set are preserved.
@@ -798,11 +801,12 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     // [M25] The child inherits the parent's open pipe ends (fds were shallow
     // copied) — bump each inherited end's refcount so EOF/EPIPE accounting stays
     // correct across fork. The pipe object itself is shared (kernel-owned).
-    // Pty ends and the controlling terminal are counted the same way.
-    { extern void pipe_ref(void*, int);
+    // Pty ends, sockets and the controlling terminal are counted the same way.
+    { extern void pipe_ref(void*, int); extern void socket_ref(int);
       for (int i = 0; i < 32; i++) {
           if (!c->fds[i].used) continue;
           if (c->fds[i].is_pipe) pipe_ref(c->fds[i].inode, c->fds[i].pipe_w);
+          else if (c->fds[i].is_sock) socket_ref(c->fds[i].is_sock - 1);
           else pty_ref(c->fds[i].inode);
       }
       pty_ctty_ref(c->ctty); }
@@ -842,9 +846,15 @@ void process_print(const process_t* p) {
 // slave's last close lets the master read EIO), and so is the controlling
 // terminal (a session leader's exit hangs up its foreground group).
 void process_release_pipes(process_t* p) {
-    extern void pipe_unref(void*, int);
+    extern void pipe_unref(void*, int); extern void socket_unref(int);
     if (!p) return;
     for (int i = 0; i < 32; i++) {
+        if (p->fds[i].used && p->fds[i].is_sock) {   // last ref closes the connection (FIN)
+            int sx = p->fds[i].is_sock - 1;
+            p->fds[i].is_sock = 0; p->fds[i].used = 0; p->fds[i].inode = NULL;
+            socket_unref(sx);
+            continue;
+        }
         if (p->fds[i].used && p->fds[i].is_pipe) {
             void* pp = p->fds[i].inode;
             int   w  = p->fds[i].pipe_w;
@@ -865,12 +875,10 @@ int process_destroy(process_t* p) {
     // stale pointer surviving kfree(p) could later alias a reused process and
     // grant it the dead driver's device — clear it unconditionally.
     driver_remove_all_bindings(p);
-    // [M24] Close any sockets this process still owns (frees TCP conns + UDP binds).
-    extern void socket_owner_cleanup(uint32_t pid);
-    socket_owner_cleanup(p->pid);
-    // [M25] Drop any still-open pipe ends so the peer observes EOF/EPIPE and the
-    // pipe object is freed once both ends are gone. Normally already done at exit
-    // (process_release_pipes); this catches processes destroyed without exiting.
+    // [M25] Drop any still-open pipe ends and sockets so the peer observes
+    // EOF/EPIPE and the objects are freed once the last reference is gone.
+    // Normally already done at exit (process_release_pipes); this catches
+    // processes destroyed without exiting.
     process_release_pipes(p);
     extern int elf_unload_process(process_t* p);
     elf_unload_process(p);                       // unmap + free user page frames, zero PTEs

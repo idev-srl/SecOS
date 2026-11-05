@@ -37,7 +37,21 @@ void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
 #define SPAWN_MAX_ARGS 8
 #define SPAWN_ARG_LEN  128
 
-static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; return i; } } return -1; }
+static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; p->fds[i].is_sock=0; return i; } } return -1; }
+
+// Take / drop the extra reference a duplicated fd entry holds on its object
+// (pipe end, socket, or pty end; pty_ref/pty_unref ignore any other inode).
+// Used by dup/dup2/fcntl(F_DUPFD)/spawn stdio inheritance and close.
+static void fd_entry_ref(struct proc_fd_entry* e){
+    if(e->is_pipe) pipe_ref((pipe_t*)e->inode, e->pipe_w);
+    else if(e->is_sock) socket_ref(e->is_sock - 1);
+    else pty_ref(e->inode);
+}
+static void fd_entry_unref(struct proc_fd_entry* e){
+    if(e->is_pipe){ pipe_unref((pipe_t*)e->inode, e->pipe_w); e->is_pipe=0; }
+    else if(e->is_sock){ int sx=e->is_sock-1; e->is_sock=0; socket_unref(sx); }
+    else { void* ino=e->inode; e->inode=NULL; pty_unref(ino); }   // a pty end may hang up
+}
 
 // [M25] pipe(): allocate a pipe object and two fds (read end + write end).
 // pipe2(O_CLOEXEC) marks both ends close-on-exec (ksys_pipe2).
@@ -53,9 +67,11 @@ int ksys_pipe(int kfds[2]){
 }
 #define K_O_CLOEXEC 0x80000   // Linux value (user/include/fcntl.h)
 static int ksys_pipe2(int kfds[2], int flags){
-    if(flags & ~K_O_CLOEXEC & ~0x800 /*O_NONBLOCK: accepted, ignored*/) return -22; // -EINVAL
+    if(flags & ~K_O_CLOEXEC & ~0x800) return -22;                                  // -EINVAL
     int r=ksys_pipe(kfds); if(r!=0) return r;
-    if(flags & K_O_CLOEXEC){ process_t* c=sched_get_current(); c->fds[kfds[0]].cloexec=1; c->fds[kfds[1]].cloexec=1; }
+    process_t* c=sched_get_current();
+    if(flags & K_O_CLOEXEC){ c->fds[kfds[0]].cloexec=1; c->fds[kfds[1]].cloexec=1; }
+    if(flags & 0x800){ c->fds[kfds[0]].flags|=0x800; c->fds[kfds[1]].flags|=0x800; }  // O_NONBLOCK -> -EAGAIN
     return 0;
 }
 
@@ -79,8 +95,7 @@ static void spawn_inherit_stdio(process_t* parent, process_t* child){
         if(!parent->fds[i].used) continue;
         child->fds[i]=parent->fds[i];
         child->fds[i].cloexec=0;
-        if(child->fds[i].is_pipe) pipe_ref((pipe_t*)child->fds[i].inode, child->fds[i].pipe_w);
-        else pty_ref(child->fds[i].inode);                 // a pty end: one more holder
+        fd_entry_ref(&child->fds[i]);
     }
 }
 
@@ -283,6 +298,7 @@ uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd){
     } else {
         // [M20] File-backed mmap (MAP_PRIVATE) via the page cache, from offset 0.
         if (fd < 0 || fd >= 32 || !c->fds[fd].used) return (uint64_t)-1;
+        if (c->fds[fd].is_pipe || c->fds[fd].is_sock) return (uint64_t)-1;  // not a file
         vfs_inode_t* ino = (vfs_inode_t*)c->fds[fd].inode;
         if (!ino) return (uint64_t)-1;
         if (vma_add_file(&c->vmas, base, base + len, m18_prot_to_flags(prot), ino, 0) != 0)
@@ -426,8 +442,7 @@ int ksys_open_mode(const char* path, int flags, uint32_t mode){
 }
 int ksys_open(const char* path, int flags){ return ksys_open_mode(path, flags, 0); }
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
-    if(c->fds[fd].is_pipe){ pipe_unref((pipe_t*)c->fds[fd].inode, c->fds[fd].pipe_w); c->fds[fd].is_pipe=0; }  // [M25] drop end, may signal EOF/EPIPE
-    else { void* ino=c->fds[fd].inode; c->fds[fd].inode=NULL; c->fds[fd].used=0; pty_unref(ino); return 0; }  // a pty end may hang up
+    fd_entry_unref(&c->fds[fd]);   // drop pipe end (EOF/EPIPE) / socket ref (FIN on the last) / pty end (hangup)
     c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
 // [uaccess] read()/write() never touch the user buffer directly: data moves
 // through a kernel bounce buffer and copy_to/from_user, so an unmapped or
@@ -435,6 +450,7 @@ int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=
 // fault. Small transfers bounce on the stack; larger ones through one kmalloc'd
 // chunk (UIO_CHUNK), looping. Progress already made is reported as a short count.
 #define UIO_SMALL 512
+#define ENOMEM_K 12
 #define UIO_CHUNK 65536
 typedef struct { uint8_t* p; uint8_t small[UIO_SMALL]; int heap; int cap; } uio_buf_t;
 static int uio_get(uio_buf_t* u, int len){
@@ -445,9 +461,32 @@ static int uio_get(uio_buf_t* u, int len){
 }
 static void uio_put(uio_buf_t* u){ if(u->heap && u->p) kfree(u->p); u->p=0; }
 
+// Socket fds: one bounce chunk per call (a short read/write is POSIX-legal).
+// Returns bytes, 0 = EOF, -EAGAIN = would block (kernel/syscall_trap.c sleeps
+// and re-runs the syscall unless the fd is O_NONBLOCK), other -errno.
+#define SOCK_IO_CHUNK 16384
+static int ksys_sock_read(process_t* c, int fd, void* ubuf, int len){
+    uio_buf_t u; int want = len < SOCK_IO_CHUNK ? len : SOCK_IO_CHUNK;
+    if(uio_get(&u, want)!=0) return -ENOMEM_K;
+    int r = socket_recv(c->fds[fd].is_sock - 1, u.p, want, 0, 0);
+    if(r>0 && copy_to_user(ubuf, u.p, (size_t)r)!=0) r = -EFAULT;
+    uio_put(&u);
+    return r;
+}
+static int ksys_sock_write(process_t* c, int fd, const void* ubuf, int len){
+    uio_buf_t u; int want = len < SOCK_IO_CHUNK ? len : SOCK_IO_CHUNK;
+    if(uio_get(&u, want)!=0) return -ENOMEM_K;
+    int r;
+    if(copy_from_user(u.p, ubuf, (size_t)want)!=0) r = -EFAULT;
+    else r = socket_send(c->fds[fd].is_sock - 1, u.p, want);
+    uio_put(&u);
+    return r;
+}
+
 int ksys_read(int fd, void* ubuf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
     if(len<=0) return -1;
+    if(c->fds[fd].used && c->fds[fd].is_sock) return ksys_sock_read(c, fd, ubuf, len);
     int is_pipe = c->fds[fd].used && c->fds[fd].is_pipe;
     int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
     if(!is_pipe && !is_file && fd!=0) return -1;
@@ -500,6 +539,7 @@ int ksys_read(int fd, void* ubuf, int len){ extern process_t* sched_get_current(
 int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
     if(len<=0) return -1;
+    if(c->fds[fd].used && c->fds[fd].is_sock) return ksys_sock_write(c, fd, ubuf, len);
     int is_pipe = c->fds[fd].used && c->fds[fd].is_pipe;
     int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
     if(!is_pipe && !is_file && fd!=1 && fd!=2) return -1;
@@ -566,6 +606,7 @@ long ksys_lseek(int fd, long offset, int whence){
     extern process_t* sched_get_current(void);
     process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32||!c->fds[fd].used) return -1;
+    if(c->fds[fd].is_pipe || c->fds[fd].is_sock) return -29;   // -ESPIPE: not a seekable file
     vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1;
     if(c->fds[fd].is_pipe || pty_is_inode(ino)) return -29;   // -ESPIPE: a stream
     long base;
@@ -729,13 +770,11 @@ int ksys_dup2(int oldfd, int newfd){
     if(!c->fds[oldfd].used) return -1;
     if(oldfd==newfd) return newfd;
     // Take the new reference before dropping the old target, so dup2 of a pty
-    // fd over another fd of the same pty never transiently hits zero.
-    if(c->fds[oldfd].is_pipe) pipe_ref((pipe_t*)c->fds[oldfd].inode, c->fds[oldfd].pipe_w);
-    else pty_ref(c->fds[oldfd].inode);
+    // or socket fd over another fd of the same object never hits zero.
+    fd_entry_ref(&c->fds[oldfd]);
     struct proc_fd_entry old = c->fds[newfd];
     c->fds[newfd]=c->fds[oldfd]; c->fds[newfd].used=1; c->fds[newfd].cloexec=0; // POSIX: dup clears FD_CLOEXEC
-    if(old.used && old.is_pipe) pipe_unref((pipe_t*)old.inode, old.pipe_w);   // close the old newfd target
-    else if(old.used) pty_unref(old.inode);
+    if(old.used) fd_entry_unref(&old);                         // close the old newfd target
     return newfd;
 }
 int ksys_dup(int oldfd){
@@ -743,8 +782,7 @@ int ksys_dup(int oldfd){
     if(oldfd<0||oldfd>=32||!c->fds[oldfd].used) return -1;
     int n=fd_alloc(c); if(n<0) return -1;
     c->fds[n]=c->fds[oldfd]; c->fds[n].used=1; c->fds[n].cloexec=0;
-    if(c->fds[n].is_pipe) pipe_ref((pipe_t*)c->fds[n].inode, c->fds[n].pipe_w);
-    else pty_ref(c->fds[n].inode);
+    fd_entry_ref(&c->fds[n]);
     return n;
 }
 // fcntl(fd, cmd, arg): descriptor flags (FD_CLOEXEC), status flags, and
@@ -766,14 +804,13 @@ int ksys_fcntl(int fd, int cmd, long arg){
         if(n<0) return -24;                                  // -EMFILE
         c->fds[n]=c->fds[fd]; c->fds[n].used=1;
         c->fds[n].cloexec = (cmd==K_F_DUPFD_CLOEXEC) ? 1 : 0;
-        if(c->fds[n].is_pipe) pipe_ref((pipe_t*)c->fds[n].inode, c->fds[n].pipe_w);
-        else pty_ref(c->fds[n].inode);
+        fd_entry_ref(&c->fds[n]);
         return n;
     }
     case K_F_GETFD: return c->fds[fd].cloexec ? 1 : 0;      // FD_CLOEXEC = 1
     case K_F_SETFD: c->fds[fd].cloexec = (arg & 1) ? 1 : 0; return 0;
     case K_F_GETFL:
-        if(c->fds[fd].is_pipe) return c->fds[fd].pipe_w ? 1 /*O_WRONLY*/ : 0 /*O_RDONLY*/;
+        if(c->fds[fd].is_pipe) return (c->fds[fd].pipe_w ? 1 /*O_WRONLY*/ : 0 /*O_RDONLY*/) | (int)(c->fds[fd].flags & 0x800);
         if(fd<3 && !c->fds[fd].inode) return 2;              // console stdio: O_RDWR
         return (int)(c->fds[fd].flags & ~K_O_CLOEXEC);
     case K_F_SETFL:                                          // only O_APPEND/O_NONBLOCK change
@@ -808,6 +845,10 @@ int ksys_fstat(int fd, struct secos_stat* st){
     if(fd<0||fd>=32||!c->fds[fd].used) return -1;
     for(unsigned i=0;i<sizeof(*st);i++) ((char*)st)[i]=0;
     vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode;
+    if(c->fds[fd].is_sock){                     // socket
+        st->st_mode = 0xC000 /*S_IFSOCK*/ | 0600; st->st_nlink=1; st->st_dev=2; st->st_ino=(uint64_t)c->fds[fd].is_sock;
+        return 0;
+    }
     if(!ino || c->fds[fd].is_pipe){             // console / pipe end: a char device
         st->st_mode = S_IFCHR | 0620; st->st_nlink=1; st->st_dev=1; st->st_ino=(uint64_t)(uintptr_t)&c->fds[fd];
         return 0;
@@ -843,8 +884,8 @@ int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
     // tcgetpgrp/tcsetpgrp on it.
     extern int devfs_is_console(void* inode);
     int is_tty = (fd<=2 && !c->fds[fd].used) ||
-                 (c->fds[fd].used && !c->fds[fd].inode && !c->fds[fd].is_pipe) ||
-                 (c->fds[fd].used && !c->fds[fd].is_pipe && devfs_is_console(c->fds[fd].inode));
+                 (c->fds[fd].used && !c->fds[fd].inode && !c->fds[fd].is_pipe && !c->fds[fd].is_sock) ||
+                 (c->fds[fd].used && !c->fds[fd].is_pipe && !c->fds[fd].is_sock && devfs_is_console(c->fds[fd].inode));
     switch(cmd){
     case TIOCGSID_: {
         if(!is_tty) return -25;                 // -ENOTTY
@@ -1110,68 +1151,84 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return (uint64_t)(int64_t)ksys_unlink(kp);
     }
 
-    /* [M24] Sockets — gated by CAP_NET in the signed manifest. A staging buffer
-     * bounces user payloads; blocking calls (connect/accept/recv) spin in the
-     * socket layer with RX driven by the timer tick. */
+    /* [M24] Sockets — gated by CAP_NET in the signed manifest. A socket is an
+     * ordinary fd (fds[fd].is_sock = socket index + 1): read/write/close/dup/
+     * fork/poll work on it. The calls below are non-blocking at this level;
+     * -EAGAIN on a blocking fd is turned into a sleep + re-run by
+     * kernel/syscall_trap.c (no ring-0 spinning). connect() still spins for
+     * the TCP handshake. */
     case SYS_SOCKET: case SYS_CONNECT: case SYS_BIND: case SYS_LISTEN:
     case SYS_ACCEPT: case SYS_SEND: case SYS_RECV: case SYS_SENDTO:
-    case SYS_RECVFROM: case SYS_SOCKCLOSE: {
+    case SYS_RECVFROM: case SYS_SOCKCLOSE: case SYS_SOCKNAME: {
         process_t* c = sched_get_current();
         if (!c || !c->cap_net) {
             debugcon_writestring("[NET] socket syscall denied: no CAP_NET\n");
-            return (uint64_t)(int64_t)-1;            /* EPERM-ish */
+            return (uint64_t)(int64_t)-1;            /* EPERM */
         }
-        uint32_t pid = c->pid;
-        static uint8_t netbuf[2048];
+        if (num == SYS_SOCKET) {
+            int type = (int)(a0 & 0xff);
+            int sx = socket_create(type);
+            if (sx < 0) return (uint64_t)(int64_t)sx;
+            int fd = fd_alloc(c);
+            if (fd < 0) { socket_unref(sx); return (uint64_t)(int64_t)-24; }   /* -EMFILE */
+            c->fds[fd].is_sock = sx + 1;
+            c->fds[fd].flags = (uint32_t)(a0 & 0x800);                         /* SOCK_NONBLOCK */
+            return (uint64_t)(int64_t)fd;
+        }
+        int fd = (int)a0;
+        if (fd < 0 || fd >= 32 || !c->fds[fd].used) return (uint64_t)(int64_t)-9;       /* -EBADF */
+        if (!c->fds[fd].is_sock) return (uint64_t)(int64_t)-88;                           /* -ENOTSOCK */
+        int sx = c->fds[fd].is_sock - 1;
         switch (num) {
-        case SYS_SOCKET:
-            return (uint64_t)(int64_t)socket_create(pid, (int)a0);
         case SYS_SOCKCLOSE:
-            return (uint64_t)(int64_t)socket_close(pid, (int)a0);
+            return (uint64_t)(int64_t)ksys_close(fd);
         case SYS_CONNECT:
-            return (uint64_t)(int64_t)socket_connect(pid, (int)a0, (uint32_t)a1, (uint16_t)a2);
+            return (uint64_t)(int64_t)socket_connect(sx, (uint32_t)a1, (uint16_t)a2);
         case SYS_BIND:
-            return (uint64_t)(int64_t)socket_bind(pid, (int)a0, (uint16_t)a1);
+            return (uint64_t)(int64_t)socket_bind(sx, (uint16_t)a1);
         case SYS_LISTEN:
-            return (uint64_t)(int64_t)socket_listen(pid, (int)a0, (int)a1);
-        case SYS_ACCEPT:
-            return (uint64_t)(int64_t)socket_accept(pid, (int)a0);
-        case SYS_SEND: {
-            int len = (int)a2;
-            if (len < 0 || len > (int)sizeof(netbuf) || !user_range_valid((void*)a1, (size_t)len))
-                return (uint64_t)(int64_t)-EFAULT;
-            if (copy_from_user(netbuf, (void*)a1, (size_t)len) != 0) return (uint64_t)(int64_t)-EFAULT;
-            return (uint64_t)(int64_t)socket_send(pid, (int)a0, netbuf, len);
+            return (uint64_t)(int64_t)socket_listen(sx, (int)a1);
+        case SYS_ACCEPT: {
+            int nfd = fd_alloc(c);
+            if (nfd < 0) return (uint64_t)(int64_t)-24;                                  /* -EMFILE */
+            int nsx = socket_accept(sx);
+            if (nsx < 0) { c->fds[nfd].used = 0; return (uint64_t)(int64_t)nsx; }      /* -EAGAIN: re-run */
+            c->fds[nfd].is_sock = nsx + 1;
+            return (uint64_t)(int64_t)nfd;
         }
+        case SYS_SEND:
+            return (uint64_t)(int64_t)ksys_write(fd, (const void*)a1, (int)a2);
+        case SYS_RECV:
+            return (uint64_t)(int64_t)ksys_read(fd, (void*)a1, (int)a2);
         case SYS_SENDTO: {
+            uint8_t netbuf[1024];                     /* per call: no shared static (SMP) */
             int len = (int)a2;
-            if (len < 0 || len > (int)sizeof(netbuf) || !user_range_valid((void*)a1, (size_t)len))
-                return (uint64_t)(int64_t)-EFAULT;
+            if (len < 0 || len > (int)sizeof(netbuf)) return (uint64_t)(int64_t)-90;    /* -EMSGSIZE */
             struct secos_sockaddr sa;
             if (copy_from_user(&sa, (void*)a3, sizeof(sa)) != 0) return (uint64_t)(int64_t)-EFAULT;
-            if (copy_from_user(netbuf, (void*)a1, (size_t)len) != 0) return (uint64_t)(int64_t)-EFAULT;
-            return (uint64_t)(int64_t)socket_sendto(pid, (int)a0, netbuf, len, sa.ip, sa.port);
-        }
-        case SYS_RECV: {
-            int len = (int)a2;
-            if (len <= 0 || len > (int)sizeof(netbuf) || !user_range_valid((void*)a1, (size_t)len))
-                return (uint64_t)(int64_t)-EFAULT;
-            int n = socket_recv(pid, (int)a0, netbuf, len, 0, 0);
-            if (n > 0 && copy_to_user((void*)a1, netbuf, (size_t)n) != 0) return (uint64_t)(int64_t)-EFAULT;
-            return (uint64_t)(int64_t)n;
+            if (len && copy_from_user(netbuf, (void*)a1, (size_t)len) != 0) return (uint64_t)(int64_t)-EFAULT;
+            return (uint64_t)(int64_t)socket_sendto(sx, netbuf, len, sa.ip, sa.port);
         }
         case SYS_RECVFROM: {
+            uint8_t netbuf[1024];
             int len = (int)a2;
-            if (len <= 0 || len > (int)sizeof(netbuf) || !user_range_valid((void*)a1, (size_t)len))
-                return (uint64_t)(int64_t)-EFAULT;
+            if (len <= 0) return (uint64_t)(int64_t)-22;
+            if (len > (int)sizeof(netbuf)) len = (int)sizeof(netbuf);
             uint32_t sip = 0; uint16_t sport = 0;
-            int n = socket_recv(pid, (int)a0, netbuf, len, &sip, &sport);
+            int n = socket_recv(sx, netbuf, len, &sip, &sport);
             if (n > 0 && copy_to_user((void*)a1, netbuf, (size_t)n) != 0) return (uint64_t)(int64_t)-EFAULT;
-            if (a3) {
+            if (n >= 0 && a3) {
                 struct secos_sockaddr sa; sa.ip = sip; sa.port = sport; sa._pad = 0;
-                copy_to_user((void*)a3, &sa, sizeof(sa));
+                if (copy_to_user((void*)a3, &sa, sizeof(sa)) != 0) return (uint64_t)(int64_t)-EFAULT;
             }
             return (uint64_t)(int64_t)n;
+        }
+        case SYS_SOCKNAME: {
+            struct secos_sockaddr sa; sa._pad = 0;
+            int r = socket_name(sx, a2 ? 1 : 0, &sa.ip, &sa.port);
+            if (r < 0) return (uint64_t)(int64_t)r;
+            if (copy_to_user((void*)a1, &sa, sizeof(sa)) != 0) return (uint64_t)(int64_t)-EFAULT;
+            return 0;
         }
         }
         return (uint64_t)(int64_t)-1;

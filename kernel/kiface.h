@@ -13,10 +13,6 @@
 
 struct process;
 
-/* libc places socket descriptors at SECOS_SOCKFD_BASE + kernel sockfd so they
- * share one namespace with file fds (poll() decodes them the same way). */
-#define SECOS_SOCKFD_BASE 64
-
 /* Process lifecycle hooks (kernel/process.c). argv may be NULL. */
 void kiface_proc_init(struct process* p, int argc, const char* const* argv);
 void kiface_proc_fork(struct process* child);

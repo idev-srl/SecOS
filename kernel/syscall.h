@@ -92,6 +92,7 @@
 #define SYS_UNAME         77 // uname(struct utsname*)
 #define SYS_POLL          78 // poll(struct pollfd*, nfds, timeout_ms)              (blocks)
 #define SYS_SYSINFO       79 // sysinfo(struct sysinfo*)
+#define SYS_SOCKNAME    80 // sockname(fd, secos_sockaddr*, peer): getsockname (0) / getpeername (1)
 
 // [M24] socket types
 #define SOCK_STREAM 1   // TCP

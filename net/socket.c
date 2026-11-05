@@ -4,40 +4,55 @@
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
  *
- * A small kernel-owned socket table. Socket descriptors are a namespace separate
- * from the per-process file fds (a program knows which is which). Each TCP socket
- * wraps a tcp_conn_t; each UDP socket binds a port whose callback enqueues
- * datagrams into a per-socket ring. The blocking calls (connect/accept/recv) spin
- * on `hlt` so the timer tick drives net_tick()->poll for RX — the same idiom as
- * the ping self-test, valid because the timer ISR runs net_tick even while a
- * ring-0 syscall is in progress. CAP_NET (signed manifest) is enforced by the
- * syscall dispatcher before any of these run.
+ * A small kernel-owned socket table. Sockets are ordinary per-process file
+ * descriptors: the fd entry carries `is_sock` (socket index + 1), so read/write/
+ * close/dup/dup2/fork/poll work on them and a socket survives fork with a
+ * reference count (the fd table is the only authority — there is no per-pid
+ * owner check any more). Each TCP socket wraps a tcp_conn_t; each UDP socket
+ * binds a port whose callback enqueues datagrams into a per-socket ring.
+ *
+ * Every operation here is non-blocking: "nothing to do yet" returns -EAGAIN and
+ * the syscall layer (kernel/syscall_trap.c) turns that into a scheduler sleep +
+ * re-run for a blocking descriptor, so a process waiting on the network no
+ * longer spins in ring 0 and starves the CPU. tcp_connect() (active open) still
+ * spins for its handshake. CAP_NET (signed manifest) is enforced by the syscall
+ * dispatcher before socket creation and the socket-specific calls.
  */
+#include "socket.h"
 #include "tcp.h"
 #include "udp.h"
 #include "net.h"
 #include "debugcon.h"
 #include <stddef.h>
 
-extern uint64_t timer_get_ticks(void);
-
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
-#define MAX_SOCK    16
+#define MAX_SOCK    32
 #define SOCK_DGRAM_MAX 1024
 #define SOCK_DQ     6
+
+#define E_AGAIN   (-11)
+#define E_BADF    (-9)
+#define E_INVAL   (-22)
+#define E_PIPE    (-32)
+#define E_NOBUFS  (-105)
+#define E_NOTCONN (-107)
+#define E_CONNREFUSED (-111)
+#define E_ADDRINUSE   (-98)
+#define E_NETDOWN (-100)
+#define E_OPNOTSUPP (-95)
 
 struct dgram { uint32_t ip; uint16_t port; uint16_t len; uint8_t data[SOCK_DGRAM_MAX]; };
 
 struct sock {
     int      used;
     int      type;            /* SOCK_STREAM / SOCK_DGRAM */
-    uint32_t owner;           /* pid */
+    int      refs;            /* fd-table references (dup/fork) */
+    uint16_t port;            /* bound local port (TCP: used by listen) */
     /* TCP */
     tcp_conn_t* tcp;
     int      listening;
     /* UDP */
-    uint16_t udp_port;
     int      udp_bound;
     struct dgram dq[SOCK_DQ];
     int      dq_head, dq_count;
@@ -47,9 +62,9 @@ struct sock {
 
 static struct sock g_sock[MAX_SOCK];
 
-static struct sock* sk(int fd){
-    if (fd < 0 || fd >= MAX_SOCK || !g_sock[fd].used) return NULL;
-    return &g_sock[fd];
+static struct sock* sk(int idx){
+    if (idx < 0 || idx >= MAX_SOCK || !g_sock[idx].used) return NULL;
+    return &g_sock[idx];
 }
 
 // UDP receive callback: enqueue the datagram (drop if the ring is full).
@@ -57,7 +72,7 @@ static void sock_udp_cb(void* ctx, net_dev_t* dev, uint32_t src_ip,
                         uint16_t src_port, const uint8_t* data, uint32_t len){
     (void)dev;
     struct sock* s = (struct sock*)ctx;
-    if (s->dq_count >= SOCK_DQ) return;
+    if (!s->used || s->dq_count >= SOCK_DQ) return;
     if (len > SOCK_DGRAM_MAX) len = SOCK_DGRAM_MAX;
     int slot = (s->dq_head + s->dq_count) % SOCK_DQ;
     s->dq[slot].ip = src_ip; s->dq[slot].port = src_port; s->dq[slot].len = (uint16_t)len;
@@ -65,176 +80,193 @@ static void sock_udp_cb(void* ctx, net_dev_t* dev, uint32_t src_ip,
     s->dq_count++;
 }
 
-int socket_create(uint32_t pid, int type){
-    if (type != SOCK_STREAM && type != SOCK_DGRAM) return -1;
+int socket_create(int type){
+    if (type != SOCK_STREAM && type != SOCK_DGRAM) return E_INVAL;
     for (int i = 0; i < MAX_SOCK; i++) if (!g_sock[i].used){
         struct sock* s = &g_sock[i];
         for (size_t k = 0; k < sizeof(*s); k++) ((uint8_t*)s)[k] = 0;
-        s->used = 1; s->type = type; s->owner = pid;
+        s->used = 1; s->type = type; s->refs = 1;
         return i;
     }
-    return -1;
+    return E_NOBUFS;
 }
 
 static void sock_release(struct sock* s){
-    if (s->type == SOCK_DGRAM && s->udp_bound) udp_unbind(s->udp_port);
-    if (s->type == SOCK_STREAM && s->tcp){ tcp_close(s->tcp); s->tcp = NULL; }
+    if (s->type == SOCK_DGRAM && s->udp_bound) udp_unbind(s->port);
+    if (s->type == SOCK_STREAM && s->tcp){ tcp_release(s->tcp); s->tcp = NULL; }
     s->used = 0;
 }
 
-int socket_close(uint32_t pid, int fd){
-    struct sock* s = sk(fd);
-    if (!s || s->owner != pid) return -1;
-    sock_release(s);
+void socket_ref(int idx){ struct sock* s = sk(idx); if (s) s->refs++; }
+void socket_unref(int idx){
+    struct sock* s = sk(idx);
+    if (!s) return;
+    if (--s->refs <= 0) sock_release(s);
+}
+
+static int udp_autobind(struct sock* s){
+    if (s->udp_bound) return 0;
+    uint16_t ep = udp_ephemeral_port();
+    if (udp_bind(ep, sock_udp_cb, s) != 0) return E_NOBUFS;
+    s->port = ep; s->udp_bound = 1;
     return 0;
 }
 
-void socket_owner_cleanup(uint32_t pid){
-    for (int i = 0; i < MAX_SOCK; i++)
-        if (g_sock[i].used && g_sock[i].owner == pid) sock_release(&g_sock[i]);
-}
-
-int socket_bind(uint32_t pid, int fd, uint16_t port){
-    struct sock* s = sk(fd);
-    if (!s || s->owner != pid) return -1;
+int socket_bind(int idx, uint16_t port){
+    struct sock* s = sk(idx);
+    if (!s) return E_BADF;
     if (s->type == SOCK_DGRAM){
-        if (s->udp_bound) udp_unbind(s->udp_port);
-        if (udp_bind(port, sock_udp_cb, s) != 0) return -1;
-        s->udp_port = port; s->udp_bound = 1;
+        if (s->udp_bound) udp_unbind(s->port);
+        s->udp_bound = 0;
+        if (udp_bind(port, sock_udp_cb, s) != 0) return E_ADDRINUSE;
+        s->port = port; s->udp_bound = 1;
         return 0;
     }
-    /* TCP bind is folded into listen() for simplicity. */
-    s->udp_port = port;
+    if (s->tcp) return E_INVAL;                     /* already listening/connected */
+    s->port = port;                                 /* TCP bind is folded into listen() */
     return 0;
 }
 
-int socket_connect(uint32_t pid, int fd, uint32_t ip, uint16_t port){
-    struct sock* s = sk(fd);
-    if (!s || s->owner != pid) return -1;
+int socket_connect(int idx, uint32_t ip, uint16_t port){
+    struct sock* s = sk(idx);
+    if (!s) return E_BADF;
     net_dev_t* dev = net_primary();
-    if (!dev) return -1;
+    if (!dev) return E_NETDOWN;
     if (s->type == SOCK_DGRAM){
         s->peer_ip = ip; s->peer_port = port;
-        if (!s->udp_bound){                         /* auto-bind an ephemeral port */
-            uint16_t ep = udp_ephemeral_port();
-            if (udp_bind(ep, sock_udp_cb, s) != 0) return -1;
-            s->udp_port = ep; s->udp_bound = 1;
-        }
-        return 0;
+        return udp_autobind(s);
     }
-    s->tcp = tcp_connect(dev, ip, port);            /* blocking handshake */
-    return s->tcp ? 0 : -1;
+    if (s->tcp) return E_INVAL;
+    s->tcp = tcp_connect(dev, ip, port);            /* blocking handshake (spins) */
+    return s->tcp ? 0 : E_CONNREFUSED;
 }
 
-int socket_listen(uint32_t pid, int fd, int backlog){
-    (void)backlog;
-    struct sock* s = sk(fd);
-    if (!s || s->owner != pid || s->type != SOCK_STREAM) return -1;
+int socket_listen(int idx, int backlog){
+    struct sock* s = sk(idx);
+    if (!s || s->type != SOCK_STREAM) return E_OPNOTSUPP;
+    if (s->listening) return 0;
+    if (s->tcp || !s->port) return E_INVAL;
     net_dev_t* dev = net_primary();
-    if (!dev) return -1;
+    if (!dev) return E_NETDOWN;
     s->tcp = tcp_alloc();
-    if (!s->tcp) return -1;
-    if (tcp_start_listen(s->tcp, dev, s->udp_port) != 0) return -1;
+    if (!s->tcp) return E_NOBUFS;
+    if (tcp_start_listen(s->tcp, dev, s->port, backlog) != 0){ tcp_free(s->tcp); s->tcp = NULL; return E_ADDRINUSE; }
     s->listening = 1;
     return 0;
 }
 
-int socket_accept(uint32_t pid, int fd){
-    struct sock* s = sk(fd);
-    if (!s || s->owner != pid || !s->listening) return -1;
-    uint64_t deadline = timer_get_ticks() + 30000;  /* up to ~30 s */
-    tcp_conn_t* ch = NULL;
-    while (timer_get_ticks() < deadline){
-        ch = tcp_accept_ready(s->tcp);
-        if (ch) break;
-        __asm__ volatile ("sti; hlt");
-    }
-    if (!ch) return -1;
-    int nfd = socket_create(pid, SOCK_STREAM);
-    if (nfd < 0){ tcp_close(ch); return -1; }
-    g_sock[nfd].tcp = ch;
-    return nfd;
+// Non-blocking: a new socket index, or -EAGAIN when no connection is pending.
+int socket_accept(int idx){
+    struct sock* s = sk(idx);
+    if (!s || !s->listening) return E_INVAL;
+    if (!tcp_accept_pending(s->tcp)) return E_AGAIN;
+    int nidx = socket_create(SOCK_STREAM);
+    if (nidx < 0) return nidx;                      /* leave the child queued */
+    tcp_conn_t* ch = tcp_accept_ready(s->tcp);
+    if (!ch){ g_sock[nidx].used = 0; return E_AGAIN; }
+    g_sock[nidx].tcp = ch;
+    return nidx;
 }
 
-int socket_send(uint32_t pid, int fd, const void* buf, int len){
-    struct sock* s = sk(fd);
-    if (!s || s->owner != pid || len < 0) return -1;
+// Non-blocking: bytes queued (may be short), -EAGAIN when the send buffer is
+// full, -EPIPE once the connection can no longer carry data.
+int socket_send(int idx, const void* buf, int len){
+    struct sock* s = sk(idx);
+    if (!s || len < 0) return E_BADF;
     net_dev_t* dev = net_primary();
-    if (!dev) return -1;
+    if (!dev) return E_NETDOWN;
     if (s->type == SOCK_STREAM){
-        if (!s->tcp) return -1;
-        return tcp_send_all(s->tcp, buf, (uint32_t)len) == 0 ? len : -1;
+        if (!s->tcp || s->listening) return E_NOTCONN;
+        tcp_state_t st = tcp_get_state(s->tcp);
+        if (st != TCP_ESTABLISHED && st != TCP_CLOSE_WAIT) return E_PIPE;
+        if (len == 0) return 0;
+        int n = tcp_write(s->tcp, buf, (uint32_t)len);
+        if (n < 0) return E_PIPE;
+        return n > 0 ? n : E_AGAIN;
     }
-    /* UDP: send to the connected peer. */
-    if (!s->peer_ip) return -1;
-    if (!s->udp_bound){
-        uint16_t ep = udp_ephemeral_port();
-        if (udp_bind(ep, sock_udp_cb, s) != 0) return -1;
-        s->udp_port = ep; s->udp_bound = 1;
-    }
-    return udp_send(dev, s->peer_ip, s->udp_port, s->peer_port, buf, (uint32_t)len) == 0 ? len : -1;
+    if (!s->peer_ip) return E_NOTCONN;
+    int r = udp_autobind(s); if (r) return r;
+    return udp_send(dev, s->peer_ip, s->port, s->peer_port, buf, (uint32_t)len) == 0 ? len : E_NOBUFS;
 }
 
-int socket_sendto(uint32_t pid, int fd, const void* buf, int len, uint32_t ip, uint16_t port){
-    struct sock* s = sk(fd);
-    if (!s || s->owner != pid || s->type != SOCK_DGRAM || len < 0) return -1;
+int socket_sendto(int idx, const void* buf, int len, uint32_t ip, uint16_t port){
+    struct sock* s = sk(idx);
+    if (!s || s->type != SOCK_DGRAM || len < 0) return E_INVAL;
     net_dev_t* dev = net_primary();
-    if (!dev) return -1;
-    if (!s->udp_bound){
-        uint16_t ep = udp_ephemeral_port();
-        if (udp_bind(ep, sock_udp_cb, s) != 0) return -1;
-        s->udp_port = ep; s->udp_bound = 1;
-    }
-    return udp_send(dev, ip, s->udp_port, port, buf, (uint32_t)len) == 0 ? len : -1;
+    if (!dev) return E_NETDOWN;
+    int r = udp_autobind(s); if (r) return r;
+    return udp_send(dev, ip, s->port, port, buf, (uint32_t)len) == 0 ? len : E_NOBUFS;
 }
 
-// Blocking receive (bounded). For TCP returns stream bytes (0 = EOF); for UDP
-// returns one datagram and fills *src_ip/*src_port. Returns bytes, 0 = none/EOF.
-int socket_recv(uint32_t pid, int fd, void* buf, int len, uint32_t* src_ip, uint16_t* src_port){
-    struct sock* s = sk(fd);
-    if (!s || s->owner != pid || len <= 0) return -1;
-    uint64_t deadline = timer_get_ticks() + 30000;
+// Non-blocking receive. TCP: stream bytes, 0 = EOF (peer closed and drained, or
+// reset). UDP: one datagram, filling *src_ip/*src_port. -EAGAIN = nothing yet.
+int socket_recv(int idx, void* buf, int len, uint32_t* src_ip, uint16_t* src_port){
+    struct sock* s = sk(idx);
+    if (!s || len <= 0) return E_INVAL;
     if (s->type == SOCK_STREAM){
-        if (!s->tcp) return -1;
-        while (timer_get_ticks() < deadline){
-            int n = tcp_read(s->tcp, buf, (uint32_t)len);
-            if (n > 0) return n;
-            if (n < 0) return 0;                     /* peer closed, drained = EOF */
-            __asm__ volatile ("sti; hlt");
-        }
+        if (!s->tcp || s->listening) return E_NOTCONN;
+        int n = tcp_read(s->tcp, buf, (uint32_t)len);
+        if (n > 0) return n;
+        if (n < 0) return 0;                        /* peer closed, drained = EOF */
+        return E_AGAIN;
+    }
+    if (s->dq_count > 0){
+        struct dgram* d = &s->dq[s->dq_head];
+        int n = d->len; if (n > len) n = len;
+        uint8_t* o = (uint8_t*)buf;
+        for (int i = 0; i < n; i++) o[i] = d->data[i];
+        if (src_ip) *src_ip = d->ip;
+        if (src_port) *src_port = d->port;
+        s->dq_head = (s->dq_head + 1) % SOCK_DQ; s->dq_count--;
+        return n;
+    }
+    return E_AGAIN;
+}
+
+// Readiness for poll()/select(): Linux revents bits, never blocks. `pid` is
+// unused (kept for the kiface poll hook signature; access is via the fd table).
+int socket_poll(uint32_t pid, int idx){
+    (void)pid;
+    struct sock* s = sk(idx);
+    if (!s) return SOCK_POLLNVAL;
+    int ev = 0;
+    if (s->type == SOCK_DGRAM){
+        if (s->dq_count > 0) ev |= SOCK_POLLIN;
+        return ev | SOCK_POLLOUT;
+    }
+    if (!s->tcp) return 0;
+    if (s->listening) return tcp_accept_pending(s->tcp) ? SOCK_POLLIN : 0;
+    tcp_state_t st = tcp_get_state(s->tcp);
+    if (tcp_rx_available(s->tcp) > 0) ev |= SOCK_POLLIN;
+    if (st == TCP_ESTABLISHED || st == TCP_CLOSE_WAIT){
+        if (tcp_tx_space(s->tcp) > 0) ev |= SOCK_POLLOUT;
+    }
+    if (st == TCP_CLOSE_WAIT || st == TCP_CLOSING || st == TCP_LAST_ACK ||
+        st == TCP_TIME_WAIT || st == TCP_CLOSED)
+        ev |= SOCK_POLLIN;                          /* EOF is readable */
+    if (st == TCP_CLOSED || tcp_was_reset(s->tcp)) ev |= SOCK_POLLHUP | SOCK_POLLOUT;
+    if (tcp_was_reset(s->tcp)) ev |= SOCK_POLLERR;
+    return ev;
+}
+
+// getsockname (peer=0) / getpeername (peer=1).
+int socket_name(int idx, int peer, uint32_t* ip, uint16_t* port){
+    struct sock* s = sk(idx);
+    if (!s) return E_BADF;
+    *ip = 0; *port = 0;
+    if (s->type == SOCK_DGRAM){
+        if (peer){ if (!s->peer_ip) return E_NOTCONN; *ip = s->peer_ip; *port = s->peer_port; return 0; }
+        net_dev_t* dev = net_primary();
+        *ip = dev ? dev->ip : 0; *port = s->port;
         return 0;
     }
-    /* UDP datagram. */
-    while (timer_get_ticks() < deadline){
-        if (s->dq_count > 0){
-            struct dgram* d = &s->dq[s->dq_head];
-            int n = d->len; if (n > len) n = len;
-            uint8_t* o = (uint8_t*)buf;
-            for (int i = 0; i < n; i++) o[i] = d->data[i];
-            if (src_ip) *src_ip = d->ip;
-            if (src_port) *src_port = d->port;
-            s->dq_head = (s->dq_head + 1) % SOCK_DQ; s->dq_count--;
-            return n;
-        }
-        __asm__ volatile ("sti; hlt");
-    }
+    if (!s->tcp){ if (peer) return E_NOTCONN; *port = s->port; return 0; }
+    uint32_t lip, rip; uint16_t lport, rport;
+    tcp_get_addrs(s->tcp, &lip, &lport, &rip, &rport);
+    if (peer){
+        if (s->listening) return E_NOTCONN;
+        *ip = rip; *port = rport;
+    } else { *ip = lip; *port = lport; }
     return 0;
 }
 
-// poll(): readiness bits (POLLIN 1, POLLOUT 4, POLLERR 8, POLLHUP 0x10, POLLNVAL
-// 0x20) of socket `fd` owned by `pid`. Non-blocking; RX keeps arriving from the
-// NIC interrupt / timer tick, so a poll() sleeper just re-checks.
-int socket_poll(uint32_t pid, int fd){
-    struct sock* s = sk(fd);
-    if (!s || s->owner != pid) return 0x20;
-    if (s->type == SOCK_DGRAM) return (s->dq_count > 0 ? 0x01 : 0) | 0x04;
-    if (s->listening) return tcp_accept_pending(s->tcp) ? 0x01 : 0;
-    if (!s->tcp) return 0x10;
-    int r = 0;
-    tcp_state_t st = tcp_get_state(s->tcp);
-    if (tcp_rx_available(s->tcp) > 0) r |= 0x01;
-    if (st == TCP_ESTABLISHED || st == TCP_CLOSE_WAIT) r |= 0x04;
-    if (st == TCP_CLOSE_WAIT || st == TCP_CLOSED || st == TCP_TIME_WAIT ||
-        st == TCP_LAST_ACK || st == TCP_CLOSING) r |= 0x01 | 0x10;   /* EOF readable */
-    return r;
-}

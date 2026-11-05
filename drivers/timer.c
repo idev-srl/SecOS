@@ -36,6 +36,7 @@ static inline uint8_t inb(uint16_t port) {
 // does not return (it iretq's into the next task and EOIs itself).
 void timer_handler(trapframe_t* tf) {
     timer_ticks++;
+    { extern void csprng_stir_tsc(void); csprng_stir_tsc(); }   // IRQ timing -> RNG pool
     // Execute registered callbacks first (uptime, cursor blink, ...).
     for(int i=0;i<tick_cb_count;i++) {
         if (tick_cbs[i]) tick_cbs[i]();

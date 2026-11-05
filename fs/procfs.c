@@ -121,7 +121,7 @@ struct psnap {
     int      nvma;
     struct { uint64_t start, end, flags; uint8_t type; uint8_t has_inode; } vma[PS_MAXVMA];
 };
-enum { FDK_NONE=0, FDK_FILE, FDK_PIPE, FDK_TTY };
+enum { FDK_NONE=0, FDK_FILE, FDK_PIPE, FDK_TTY, FDK_SOCK };
 static struct psnap g_ps;
 static uint32_t g_ps_want;
 
@@ -152,6 +152,7 @@ static void snap_cb(process_t* p, void* u){
         s->fd[i].kind=FDK_NONE; s->fd[i].path[0]=0; s->fd[i].obj=0; s->fd[i].ops=0;
         if(!e->used) continue;
         if(e->is_pipe){ s->fd[i].kind=FDK_PIPE; s->fd[i].pipe_w=(uint8_t)e->pipe_w; s->fd[i].obj=e->inode; }
+        else if(e->is_sock){ s->fd[i].kind=FDK_SOCK; s->fd[i].obj=(void*)(uintptr_t)(e->is_sock-1); }
         else if(!e->inode) s->fd[i].kind=FDK_TTY;
         else {
             const vfs_inode_t* ino=(const vfs_inode_t*)e->inode;
@@ -199,6 +200,7 @@ static void fd_target(struct sb* s, int i){
     switch(g_ps.fd[i].kind){
     case FDK_PIPE: sb_str(s,"pipe:["); sb_u64(s, ((uint64_t)(uintptr_t)g_ps.fd[i].obj>>4)&0xffffff); sb_putc(s,']'); return;
     case FDK_TTY:  sb_str(s,"/dev/tty"); return;
+    case FDK_SOCK: sb_str(s,"socket:["); sb_u64(s, (uint64_t)(uintptr_t)g_ps.fd[i].obj); sb_putc(s,']'); return;
     case FDK_FILE: {
         const char* mp = vfs_mount_point_of(g_ps.fd[i].ops);
         if(mp && !(mp[0]=='/' && mp[1]==0)){ sb_str(s, mp); if(g_ps.fd[i].path[0]=='/' && g_ps.fd[i].path[1]==0) return; }

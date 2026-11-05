@@ -101,6 +101,7 @@ SRC_C   = \
 	$(CRYPTO_DIR)/wpa2.c \
 	$(CRYPTO_DIR)/wpa2_eapol.c \
 	$(CRYPTO_DIR)/ed25519.c \
+	$(CRYPTO_DIR)/csprng.c \
 	$(CRYPTO_DIR)/crypto_selftest.c \
 	$(DRIVERS_DIR)/ath9k.c \
 	$(DRIVERS_DIR)/e1000.c \
@@ -470,6 +471,20 @@ port-busybox:
 	bash tools/port-busybox.sh
 	@echo "port-busybox: BusyBox 1.36.1 built from source, signed -> crypto/user_busybox_elf.h"
 
+# Dropbear SSH (2026.94, SHA-256 pinned) from source: public-key auth only,
+# ed25519 + curve25519/mlkem768 + chacha20-poly1305/aes-gcm/aes-ctr. Builds the
+# SecOS user objects, then runs tools/port-dropbear.sh (fetch + verify + cross-
+# compile + link with the confined CAP_NET manifest + sign + embed as
+# crypto/user_dropbear_elf.h, installed to /bin/dropbearmulti). See docs/SSH.md.
+.PHONY: port-dropbear
+port-dropbear:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S     -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c     -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/libm.c     -o user/libm.o
+	bash tools/port-dropbear.sh
+	@echo "port-dropbear: Dropbear SSH built from source, signed -> crypto/user_dropbear_elf.h"
+
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke
 # tests; attach with -drive file=$(DISK_IMG),if=virtio,format=raw.
@@ -568,6 +583,14 @@ run-disk: iso
 .PHONY: run-serial
 run-serial: iso
 	qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none -no-reboot
+
+# Serial console + an e1000 NIC with host port 2222 forwarded to guest :22, for
+# the Dropbear SSH server (docs/SSH.md). -cpu max gives the guest RDRAND/RDSEED
+# for the kernel RNG.
+.PHONY: run-ssh
+run-ssh: iso
+	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -cpu max -serial stdio -display none -no-reboot \
+		-netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0
 
 # Run with a VNC server on :0 (connect a VNC viewer to localhost:5900)
 .PHONY: run-vnc

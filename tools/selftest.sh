@@ -1552,6 +1552,70 @@ fsck.fat -n "$KIFAT" >/dev/null 2>&1; check "KIFACE FAT32 data disk fsck.fat-cle
 ! grep -q "\[EXC\]" "$KILOG" "$KILOG2" "$KIFLOG"; check "KIFACE no CPU exception ([EXC])" $?
 ! grep -q "\[PANIC\]" "$KILOG" "$KILOG2" "$KIFLOG"; check "KIFACE no kernel panic" $?
 
+# ============================================================================
+# ---- SSH: Dropbear (from source) — non-interactive exec over QEMU hostfwd ----
+# ============================================================================
+# Boots the default image with a user-net NIC forwarding a host port to guest
+# :22, takes a DHCP lease from the kernel shell, installs a throwaway test key
+# (generated here, never committed) as /root/.ssh/authorized_keys, starts
+# `dropbearmulti dropbear -F -R` from bash and runs ssh from the host: an exec
+# channel with output + exit status, stderr, a wrong key, an unknown user and a
+# password-only client (password auth is compiled out). Needs host ssh +
+# ssh-keygen, and a kernel with SYS_POLL (78); otherwise SKIP. See docs/SSH.md.
+SSHLOG=/tmp/secos_selftest_ssh.log
+if ! command -v ssh >/dev/null 2>&1 || ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "  [SKIP] SSH gate (host has no ssh / ssh-keygen)"
+else
+    echo "[selftest] Running Dropbear SSH exec gate (mb2, user-net hostfwd, ~110s)..."
+    SSHDIR=$(mktemp -d /tmp/secos_selftest_ssh.XXXXXX)
+    ssh-keygen -q -t ed25519 -N '' -C secos-selftest -f "$SSHDIR/id"
+    ssh-keygen -q -t ed25519 -N '' -C secos-wrong -f "$SSHDIR/bad"
+    SSHPUB=$(cat "$SSHDIR/id.pub")
+    SSHPORT=$((22000 + $$ % 1000))
+    sshq() { # sshq <out> <ssh args...>
+        local out="$1"; shift
+        timeout 40 ssh -p "$SSHPORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR "$@" </dev/null >"$out" 2>&1
+        echo "RC=$?" >>"$out"
+    }
+    : > "$SSHLOG"
+    ( sleep 25; printf '  exit\r'; sleep 3; printf '  dhcp\r'; sleep 8
+      printf '  run /bin/bash\r'; sleep 6
+      printf '  mkdir /root/.ssh\r'; sleep 2
+      printf "  echo '%s' > /root/.ssh/authorized_keys\r" "$SSHPUB"; sleep 2
+      printf '  dropbearmulti dropbear -F -R -p 22 &\r'; sleep 6
+      sshq "$SSHDIR/o1" -i "$SSHDIR/id" -o IdentitiesOnly=yes root@localhost 'echo SSH-$((6*7))-OK; uname -s'
+      sshq "$SSHDIR/o2" -i "$SSHDIR/id" -o IdentitiesOnly=yes root@localhost 'echo SSH-ERR >&2; exit 3'
+      sshq "$SSHDIR/o3" -i "$SSHDIR/bad" -o IdentitiesOnly=yes root@localhost 'echo SSH-BADKEY-RAN'
+      sshq "$SSHDIR/o4" -i "$SSHDIR/id" -o IdentitiesOnly=yes nobody@localhost 'echo SSH-NOUSER-RAN'
+      sshq "$SSHDIR/o5" -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive root@localhost true
+      sshq "$SSHDIR/o6" -i "$SSHDIR/id" -o IdentitiesOnly=yes root@localhost 'seq 1 500 > /tmp/s; wc -l < /tmp/s'
+      sleep 2 ) | \
+        timeout 150 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+            -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$SSHPORT"-:22 -device e1000,netdev=n0 \
+            -debugcon file:"$SSHLOG" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -serial stdio >/dev/null 2>&1
+    for f in o1 o2 o3 o4 o5 o6; do { echo "--- $f"; cat "$SSHDIR/$f" 2>/dev/null; } >>"$SSHLOG"; done
+    if grep -q "has no poll() (SYS_POLL 78)" "$SSHLOG"; then
+        echo "  [SKIP] SSH gate (kernel lacks SYS_POLL 78; Dropbear needs poll/select)"
+    else
+        grep -q "\[SSH\] installed dropbear to /bin/dropbearmulti" "$SSHLOG"; check "SSH dropbearmulti installed to /bin at boot" $?
+        grep -q "Generated hostkey /etc/dropbear/dropbear_ed25519_host_key" "$SSHLOG"; check "SSH ed25519 host key generated on first connection (-R)" $?
+        grep -q "^SSH-42-OK" "$SSHDIR/o1" && grep -q "^SecOS" "$SSHDIR/o1" && grep -q "^RC=0" "$SSHDIR/o1"
+        check "SSH exec channel: output + uname, exit status 0" $?
+        grep -q "^SSH-ERR" "$SSHDIR/o2" && grep -q "^RC=3" "$SSHDIR/o2"; check "SSH exec channel: stderr forwarded, exit status 3 propagated" $?
+        ! grep -q "SSH-BADKEY-RAN" "$SSHDIR/o3" && grep -q "Permission denied (publickey)" "$SSHDIR/o3"
+        check "SSH unauthorized key refused" $?
+        ! grep -q "SSH-NOUSER-RAN" "$SSHDIR/o4" && grep -q "Permission denied" "$SSHDIR/o4"; check "SSH unknown user refused" $?
+        grep -q "Permission denied (publickey)" "$SSHDIR/o5" && ! grep -qi "password" <(grep -v "^RC=" "$SSHDIR/o5" | grep -v "PreferredAuthentications")
+        check "SSH password authentication not offered (publickey only)" $?
+        grep -q "^500" "$SSHDIR/o6"; check "SSH sequential sessions keep working (6th session, file I/O)" $?
+        ! grep -q "\[EXC\]" "$SSHLOG"; check "SSH no CPU exception ([EXC])" $?
+        ! grep -q "\[PANIC\]" "$SSHLOG"; check "SSH no kernel panic" $?
+    fi
+    rm -rf "$SSHDIR"
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

@@ -437,10 +437,9 @@ struct k_pollfd { int32_t fd; int16_t events, revents; };
 #define PW_CONSOLE 1
 #define PW_PTY     2
 static int ki_fd_revents(process_t* c, int fd, int events, int* watch) {
-    if (fd >= SECOS_SOCKFD_BASE && fd < SECOS_SOCKFD_BASE + 64)
-        return c->cap_net ? socket_poll(c->pid, fd - SECOS_SOCKFD_BASE) : POLLNVAL;
     if (fd < 0 || fd >= 32) return POLLNVAL;
     struct proc_fd_entry* e = &c->fds[fd];
+    if (e->used && e->is_sock) return socket_poll(c->pid, e->is_sock - 1);
     if (e->used && e->is_pipe) return pipe_poll((pipe_t*)e->inode, e->pipe_w);
     if (e->used && e->inode && pty_is_inode(e->inode)) {
         *watch |= PW_PTY;
@@ -448,7 +447,7 @@ static int ki_fd_revents(process_t* c, int fd, int events, int* watch) {
         return r < 0 ? POLLNVAL : r;
     }
     if ((e->used && e->inode && devfs_is_console(e->inode)) ||
-        (e->used && !e->inode) || (!e->used && fd <= 2)) {          /* console TTY */
+        (e->used && !e->inode && !e->is_sock) || (!e->used && fd <= 2)) {          /* console TTY */
         *watch |= PW_CONSOLE;
         return tty_console_poll(events | POLLIN | POLLOUT);
     }

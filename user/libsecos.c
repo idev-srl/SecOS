@@ -54,16 +54,11 @@ long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4) {
     return ret;
 }
 
-/* Socket descriptors live at SOCKFD_BASE + kernel sockfd, so they share one
- * namespace with file fds (< 32): read/write/close/poll work on them too. */
-#define SOCKFD_BASE 64
-#define IS_SOCKFD(fd) ((fd) >= SOCKFD_BASE && (fd) < SOCKFD_BASE + 64)
+/* Sockets are ordinary kernel fds: read/write/close/poll work on them. */
 ssize_t write(int fd, const void* buf, size_t len) {
-    if (IS_SOCKFD(fd)) return send(fd, buf, (long)len);
     return __se(secos_syscall(SYS_WRITE, fd, (long)buf, (long)len, 0, 0));
 }
 ssize_t read(int fd, void* buf, size_t len) {
-    if (IS_SOCKFD(fd)) return recv(fd, buf, (long)len);
     return __se(secos_syscall(3 /*SYS_READ*/, fd, (long)buf, (long)len, 0, 0));
 }
 #include <stdarg.h>
@@ -73,7 +68,6 @@ int open(const char* path, int flags, ...) {
     return (int)__se(secos_syscall(4 /*SYS_OPEN*/, (long)path, flags, (long)mode, 0, 0));
 }
 int close(int fd) {
-    if (IS_SOCKFD(fd)) return sockclose(fd);
     return (int)__se(secos_syscall(5 /*SYS_CLOSE*/, fd, 0, 0, 0, 0));
 }
 long lseek(int fd, long offset, int whence) { return __se(secos_syscall(19 /*SYS_LSEEK*/, fd, offset, whence, 0, 0)); }
@@ -178,8 +172,8 @@ int umount(const char* target){ return (int)secos_syscall(39 /*SYS_UMOUNT*/, (lo
 
 /* [M24] BSD-style sockets. Require CAP_NET in the signed manifest, else -1.
  * ip is network-order octets (octet0 in the low byte); port is host order. */
-static long sk_in(int fd){ return fd >= SOCKFD_BASE ? fd - SOCKFD_BASE : -1; }
-static int  sk_out(long r){ return r >= 0 ? (int)(r + SOCKFD_BASE) : (int)r; }
+static long sk_in(int fd){ return fd; }        /* a socket is a plain kernel fd */
+static int  sk_out(long r){ return (int)r; }
 int socket(int type){ return sk_out(secos_syscall(SYS_SOCKET, type, 0, 0, 0, 0)); }
 int connect(int fd, unsigned int ip, unsigned short port){ return (int)secos_syscall(SYS_CONNECT, sk_in(fd), (long)ip, port, 0, 0); }
 int bind(int fd, unsigned short port){ return (int)secos_syscall(SYS_BIND, sk_in(fd), port, 0, 0, 0); }

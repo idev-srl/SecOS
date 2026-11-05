@@ -124,14 +124,9 @@ static int devfs_readdir(const char* dir, vfs_iter_cb cb, void* user) {
     return 0;
 }
 
-// xorshift64* PRNG for /dev/random — NOT cryptographically secure (a real CSPRNG
-// would seed from the in-kernel crypto). Seeded from the tick counter.
-static uint64_t g_rng;
-static uint64_t rng_next(void) {
-    if (!g_rng) g_rng = timer_get_ticks() | 1;
-    uint64_t x = g_rng; x ^= x >> 12; x ^= x << 25; x ^= x >> 27; g_rng = x;
-    return x * 0x2545F4914F6CDD1DULL;
-}
+// /dev/random and /dev/urandom: the kernel CSPRNG (crypto/csprng.c, SHA-256
+// DRBG seeded from RDSEED/RDRAND + TSC jitter). Never blocks.
+#include "../crypto/csprng.h"
 
 static int blk_byte_io(block_dev_t* b, size_t off, void* buf, size_t len, int write);
 
@@ -161,7 +156,7 @@ static int devfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
         case DEV_ZERO: for (size_t i=0;i<len;i++) out[i]=0; return (int)len;
         case DEV_FULL: for (size_t i=0;i<len;i++) out[i]=0; return (int)len;
         case DEV_RANDOM: {
-            for (size_t i=0;i<len;i++) out[i] = (uint8_t)rng_next();
+            csprng_get(out, len);
             return (int)len;
         }
         case DEV_PTMX: return -1;                                  // replaced at open

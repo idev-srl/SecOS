@@ -144,9 +144,11 @@ typedef struct process {
     // Simple file descriptor table
     // [M25] When is_pipe, `inode` holds a pipe_t* and pipe_w selects the end
     // (1 = write end, 0 = read end). Otherwise `inode` is a vfs_inode_t*.
+    // is_sock: socket index + 1 (0 = not a socket); `inode` stays NULL for a
+    // socket so no file path can mistake it for a vfs_inode_t.
     // cloexec: FD_CLOEXEC — the fd is closed by a successful execve() (fcntl
     // F_SETFD, O_CLOEXEC on open, pipe2(O_CLOEXEC), F_DUPFD_CLOEXEC).
-    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; int cloexec; } fds[32];
+    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; int cloexec; int is_sock; } fds[32];
     // Kernel-interface bookkeeping (kernel/kiface.c): procfs identity + CPU
     // accounting, umask, and the in-progress state of the blocking nanosleep /
     // poll syscalls. Set up by kiface_proc_init() at creation; fork copies it
@@ -186,6 +188,6 @@ process_t* process_find_by_pid(uint32_t pid);
 void process_foreach(void (*cb)(process_t*, void*), void* user);
 process_t* process_reap_one(uint32_t affinity); // [M29] detach+return one ZOMBIE
 int process_destroy(process_t* p);
-void process_release_pipes(process_t* p); // drop pipe ends at exit (EOF to peers)
+void process_release_pipes(process_t* p); // drop pipe ends + sockets at exit (EOF to peers)
 
 #endif // PROCESS_H
