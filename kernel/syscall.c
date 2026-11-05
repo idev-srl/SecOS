@@ -524,7 +524,7 @@ static void gd_cb(const vfs_inode_t* child, void* user){
 }
 int ksys_getdents(const char* path, void* ubuf, int buflen){
     extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*);
-    static char kbuf[16384];                 // up to 64 entries
+    static char kbuf[65536];                 // up to 256 entries (BusyBox fills /bin)
     struct gd_ctx g = { kbuf, sizeof(kbuf), 0 };
     if(vfs_readdir(path, gd_cb, &g) != 0) return -1;
     int n = g.len < buflen ? g.len : buflen;
