@@ -103,7 +103,8 @@ char* mkdtemp(char* t){ fill_template(t); return mkdir(t,0700)==0 ? t : (char*)0
 
 /* ---- string / number ---- */
 void bcopy(const void* s, void* d, unsigned long n){ const char* a=s; char* b=d; if(b<a) while(n--) *b++=*a++; else { a+=n; b+=n; while(n--) *--b=*--a; } }
-char* strsignal(int s){ static char buf[24]; const char* d="Signal "; int i=0; for(; d[i]; i++) buf[i]=d[i]; if(s>=100){ buf[i++]='0'+s/100; s%=100; } if(s>=10){ buf[i++]='0'+s/10; } buf[i++]='0'+s%10; buf[i]=0; return buf; }
+char* strsignal(int s){ static char buf[24]; const char* d="Signal "; int i=0; for(; d[i]; i++) buf[i]=d[i]; if(s<0) s=0; if(s>=100) buf[i++]='0'+(s/100)%10; if(s>=10) buf[i++]='0'+(s/10)%10; buf[i++]='0'+s%10; buf[i]=0; return buf; }
+void srandom(unsigned int seed){ extern void srand(unsigned); srand(seed); }
 long double strtold(const char* s, char** e){ extern double strtod(const char*,char**); return (long double)strtod(s,e); }
 unsigned long strtoumax(const char* s, char** e, int b){ extern unsigned long long strtoull(const char*,char**,int); return (unsigned long)strtoull(s,e,b); }
 long strtoimax(const char* s, char** e, int b){ extern long long strtoll(const char*,char**,int); return (long)strtoll(s,e,b); }

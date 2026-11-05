@@ -15,7 +15,7 @@ DDEFS=(-DCONF_MACHTYPE='"x86_64-secos"' -DCONF_VENDOR='"secos"' -DCONF_OSTYPE='"
        -DCONF_CPUTYPE='"x86_64"' -DCONF_HOSTTYPE='"x86_64"' -DRELSTATUS='"release"'
        -DLOCALEDIR='"/usr/share/locale"' -DPACKAGE='"bash"' -DDEFAULT_PATH_VALUE='"/bin:/usr/bin"'
        -DSTANDARD_UTILS_PATH='"/bin"' -DSYS_BASHRC='"/etc/bash.bashrc"' -DSYS_BASH_LOGOUT='"/etc/bash.bash_logout"')
-BFLAGS=(-ffreestanding -nostdlib -nostdinc -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 -w
+BFLAGS=(-ffreestanding -nostdlib -nostdinc -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 ${BASH_PORT_WFLAGS:--Wno-discarded-qualifiers -Wno-misleading-indentation -Wno-format-zero-length -Werror=implicit-function-declaration -Werror=int-conversion -Werror=int-to-pointer-cast}
         -DHAVE_CONFIG_H -DSHELL -I"$WORK" -I"$WORK/include" -I"$WORK/builtins" -I"$WORK/lib"
         -I"$ROOT/user/port-include" -I"$ROOT/user" -I"$ROOT/user/include" -isystem "$GCCINC"
         "${DDEFS[@]}" -include "$ROOT/user/bash_port.h")
@@ -52,7 +52,7 @@ echo "[port-bash] 3/6 regenerate builtin .c from .def"
 ( cd builtins && for d in *.def; do ./mkbuiltins -D . "$d" >/dev/null 2>&1; done )
 
 echo "[port-bash] 4/6 cross-compile objects against SecOS libc"
-OBJ=/tmp/secos-bashobj; rm -rf "$OBJ"; mkdir -p "$OBJ"
+OBJ="${BASH_PORT_OBJ:-/tmp/secos-bashobj}"; rm -rf "$OBJ"; mkdir -p "$OBJ"
 top=$(sed -n '/-o bash /p' <(make -n bash 2>/dev/null) | grep -oE '[a-z_0-9.]+\.o' | grep -v '^bash.o' | sed 's/\.o$/.c/' | sort -u)
 [ -n "$top" ] || top=$(ls *.c | grep -vE 'mksyntax|mksignames|buildversion|bashversion')
 for c in $top; do bn=$(basename "$c"); case " $EXCLUDE " in *" $bn "*) continue;; esac

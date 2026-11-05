@@ -128,6 +128,44 @@ unsigned int alarm(unsigned int);
 long sysconf(int);
 char* ttyname(int);
 imaxdiv_t imaxdiv(long, long);
+/* Prototypes for every libc/shim function bash calls that no SecOS header
+ * declares (implementations: user/bash_compat.c, user/libc.c). Without a
+ * prototype C89 implicit declaration makes the call return `int`, so a returned
+ * 64-bit pointer is truncated to 32 bits (strsignal() crashed bash in strlen when
+ * a child exited >=128 / died by signal). tools/port-bash.sh builds with
+ * -Werror=implicit-function-declaration so a new gap fails the build instead. */
+struct stat;
+struct tm;
+int fileno(void* f);
+void clearerr(void* f);
+int setvbuf(void* f, char* b, int m, unsigned long s);
+int fstat(int fd, struct stat* st);
+int fchmod(int fd, int mode);
+int strcoll(const char* a, const char* b);
+char* strsignal(int sig);
+long double strtold(const char* s, char** e);
+void srandom(unsigned int seed);
+char* mktemp(char* tmpl);
+int mkstemp(char* tmpl);
+char* mkdtemp(char* tmpl);
+void tzset(void);
+struct tm* localtime(const time_t* t);
+struct tm* gmtime(const time_t* t);
+unsigned long strftime(char* s, unsigned long max, const char* fmt, const struct tm* t);
+int siginterrupt(int sig, int flag);
+int getdtablesize(void);
+int eaccess(const char* path, int mode);
+int isatty(int fd);
+int isascii(int c);
+int gethostname(char* name, unsigned long len);
+int setreuid(int r, int e);
+int setregid(int r, int e);
+int setresuid(int r, int e, int s);
+int setresgid(int r, int e, int s);
+void bcopy(const void* src, void* dst, unsigned long n);
+void* dlsym(void* h, const char* sym);
+char* dlerror(void);
+int dlclose(void* h);
 #ifndef MB_CUR_MAX
 #define MB_CUR_MAX 1
 #endif
