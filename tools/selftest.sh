@@ -837,6 +837,46 @@ LONGLINE=$(printf 'W%.0s' $(seq 1 150))
 grep -q "BURST-42-OK" "$BURSTLOG"; check "bash survives long wrapped lines + 24 fork/exec commands (fb cursor overflow regression)" $?
 ! grep -q "\[EXC\]" "$BURSTLOG"; check "no CPU exception ([EXC]) during long-line + fork burst" $?
 
+# ============================================================================
+# STRESS/FUZZ GATES (short, fixed-seed versions of tools/soak.sh + the signed
+# ring-3 syscall fuzzer user/sysfuzz.c). The LONG versions stay manual:
+#   tools/soak.sh --long            # ~10-15 min randomized bash session
+#   /bin/sysfuzz -s <seed> -b N -c M [-S]   (from the shell)
+# These gates reuse the already-built myos.iso. The fuzzer runs in SAFE mode
+# (-S): it avoids passing string/path syscalls an unmapped/PROT_NONE pointer,
+# which is a KNOWN unfixed kernel bug (ring-0 panic in copy_to/from_user on an
+# in-range but non-present user page — reproduce with `/bin/sysfuzz -s 1 -b 1`
+# WITHOUT -S). Safe mode still exercises every syscall's argument validation,
+# fd/length/numeric edges and fork/wait, and must never fault the kernel.
+# ============================================================================
+# ---- stress: ring-3 syscall fuzzer (safe mode, fixed seed) ----
+FUZZLOG=/tmp/secos_selftest_sysfuzz.log
+echo "[selftest] Running ring-3 syscall fuzzer (safe mode, mb2, serial, 45s)..."
+: > "$FUZZLOG"
+( sleep 25; printf '  /bin/sysfuzz -s 777 -b 12 -c 150 -S; echo FUZZEND\r'; sleep 18 ) | \
+    timeout 50 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$FUZZLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "\[sysfuzz\] DONE ok" "$FUZZLOG"; check "syscall fuzzer (safe mode) ran every syscall to completion" $?
+! grep -q "ring0" "$FUZZLOG"; check "no ring-0 CPU fault during safe-mode syscall fuzzing" $?
+! grep -q "\[PANIC\]" "$FUZZLOG"; check "no kernel panic during safe-mode syscall fuzzing" $?
+
+# ---- stress: short randomized soak (fixed seed) via tools/soak_drive.py ----
+SOAKLOG=/tmp/secos_selftest_soak.log
+echo "[selftest] Running short randomized bash soak (mb2, serial, fixed seed)..."
+: > "$SOAKLOG"
+if python3 tools/soak_drive.py --seed 4242 --iters 60 --settle 28 --stall 25 \
+        --log "$SOAKLOG" -- \
+        qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon "file:$SOAKLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/tmp/secos_selftest_soak_run.log 2>&1; then
+    check "randomized bash soak (60 commands) completed with all sentinels" 0
+else
+    check "randomized bash soak (60 commands) completed with all sentinels" 1
+    tail -5 /tmp/secos_selftest_soak_run.log | sed 's/^/    /'
+fi
+! grep -q "ring0\|\[PANIC\]" "$SOAKLOG"; check "no kernel panic/ring-0 fault during bash soak" $?
+
 # ---- M39: UEFI secure boot (loader Ed25519-verifies kernel.elf before jumping) ----
 OVMF=""
 for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
