@@ -383,6 +383,11 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/kitest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/kitest.o
 	python3 tools/secos-sign user/kitest.elf --dev
 	python3 tools/elf2h.py user/kitest.elf user_kitest_elf crypto/user_kitest_elf.h
+	# [pipe] blocking-pipe integrity test: PIPE_BUF atomicity, full blocking writes, EINTR/EPIPE
+	$(CC) $(USER_CFLAGS) -c user/pipe_test.c   -o user/pipe_test.o
+	$(LD) --gc-sections -T user/user.ld -o user/pipe_test.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/pipe_test.o
+	python3 tools/secos-sign user/pipe_test.elf --dev
+	python3 tools/elf2h.py user/pipe_test.elf user_pipe_test_elf crypto/user_pipe_test_elf.h
 	$(CC) $(USER_CFLAGS) -c user/power.c       -o user/power.o
 	$(LD) --gc-sections -T user/user.ld -o user/power.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/power.o
 	python3 tools/secos-sign user/power.elf --dev
@@ -404,7 +409,7 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/ptytest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/ptytest.o
 	python3 tools/secos-sign user/ptytest.elf --dev
 	python3 tools/elf2h.py user/ptytest.elf user_ptytest_elf crypto/user_ptytest_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + power + exectest{,_unsigned} + ttytest + ptytest -> crypto/*.h"
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + exectest{,_unsigned} + ttytest + ptytest -> crypto/*.h"
 
 # Staleness guard for the committed embedded programs: rebuild + re-sign them
 # (deterministic: same sources -> byte-identical headers) and fail if any

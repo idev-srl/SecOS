@@ -130,7 +130,20 @@ int sigsuspend(const unsigned long* mask){
 }
 
 size_t strlen(const char* s) { size_t n = 0; while (s[n]) n++; return n; }
-int puts(const char* s) { write(1, s, strlen(s)); write(1, "\n", 1); return 0; }
+/* Loop over short counts / EINTR so a pipe never silently truncates output. */
+static int put_all(int fd, const char* p, size_t n) {
+    while (n) {
+        ssize_t r = write(fd, p, n);
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r == 0) return -1;
+        p += r; n -= (size_t)r;
+    }
+    return 0;
+}
+int puts(const char* s) {
+    if (put_all(1, s, strlen(s)) < 0 || put_all(1, "\n", 1) < 0) return -1;
+    return 0;
+}
 
 /* [M18] dynamic memory */
 void* mmap(void* addr, size_t len, int prot, int flags){ return (void*)secos_syscall(SYS_MMAP,(long)addr,(long)len,prot,flags,-1); }

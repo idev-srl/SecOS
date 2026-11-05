@@ -1320,6 +1320,7 @@ static void m24_run_demo(void) {
 #include "../crypto/user_ttytest_elf.h"
 #include "../crypto/user_ptytest_elf.h"
 #include "../crypto/user_kitest_elf.h"
+#include "../crypto/user_pipe_test_elf.h"
 static void coreutils_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1358,6 +1359,8 @@ static void coreutils_install(void) {
     vfs_create("/bin/script", user_ptytest_elf, user_ptytest_elf_len);
     // kernel interfaces for userland tools (procfs/klog/time/statfs/poll/...)
     vfs_create("/bin/kitest", user_kitest_elf, user_kitest_elf_len);
+    // [pipe] blocking-pipe integrity test (PIPE_BUF atomicity, full writes, EINTR/EPIPE)
+    vfs_create("/bin/pipe_test", user_pipe_test_elf, user_pipe_test_elf_len);
 }
 // BusyBox 1.36.1 from source (tools/port-busybox.sh): the signed multi-call
 // binary goes to /bin/busybox and a tiny signed stub (user/bbstub.c, re-execs

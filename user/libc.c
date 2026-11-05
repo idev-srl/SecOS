@@ -937,8 +937,21 @@ static int fmt_core(sink_t* s, const char* fmt, va_list ap){
     return s->count;
 }
 
+/* Write all n bytes, looping over short counts (a pipe or socket may accept
+ * fewer bytes than asked) and retrying writes interrupted by a signal handler
+ * (EINTR). Returns 0, or -1 on a real error / no progress. */
+static int write_all(int fd, const char* p, size_t n){
+    while(n){
+        ssize_t r = write(fd, p, n);
+        if(r < 0){ if(errno == EINTR) continue; return -1; }
+        if(r == 0) return -1;
+        p += r; n -= (size_t)r;
+    }
+    return 0;
+}
+
 /* sinks */
-static void sink_fd(void* a, const char* p, size_t n){ write((int)(long)a, p, n); }
+static void sink_fd(void* a, const char* p, size_t n){ (void)write_all((int)(long)a, p, n); }
 struct bufsink { char* p; size_t cap; size_t len; };
 static void sink_buf(void* a, const char* p, size_t n){
     struct bufsink* b=a;
@@ -964,7 +977,13 @@ FILE* stdin  = &_stdin;
 FILE* stdout = &_stdout;
 FILE* stderr = &_stderr;
 
-int fflush(FILE* f){ if(!f) return 0; if(f->wlen){ write(f->fd,(char*)f->wbuf,f->wlen); f->wlen=0; } return 0; }
+int fflush(FILE* f){
+    if(!f || !f->wlen) return 0;
+    int r = write_all(f->fd, (char*)f->wbuf, f->wlen);
+    f->wlen = 0;
+    if(r < 0){ f->flags |= 8; return EOF; }             /* ferror() */
+    return 0;
+}
 /* exit() flushes stdio like a hosted libc; _exit() does not. crt0 routes the
  * return from main() through exit(), so output with no trailing newline (e.g.
  * `head -c 32 /dev/zero`, `printf x`) is no longer lost at process exit. */

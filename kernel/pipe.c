@@ -14,7 +14,7 @@
 #include "signal.h"
 #include <stddef.h>
 
-#define PIPE_SIZE 4096
+#define PIPE_SIZE PIPE_BUF
 #define PIPE_MAX  16
 
 struct pipe {
@@ -62,7 +62,7 @@ int pipe_read(pipe_t* p, void* buf, int len) {
     return (int)n;
 }
 
-int pipe_write(pipe_t* p, const void* buf, int len) {
+static int pipe_write_mode(pipe_t* p, const void* buf, int len, int atomic) {
     if (!p || len <= 0) return -1;
     uint64_t fl = spin_lock_irqsave(&g_pipe_lock);
     if (p->readers == 0) {                  /* EPIPE: no reader can ever consume */
@@ -76,18 +76,29 @@ int pipe_write(pipe_t* p, const void* buf, int len) {
         return -1;
     }
     uint32_t space = PIPE_SIZE - p->len;
-    if (space == 0) {                       /* full but readers live -> would block */
+    // POSIX atomicity: a write of <= PIPE_BUF bytes is never split. Splitting
+    // one used to lose data: a line-buffered stdio flush of "1234\n" into a
+    // nearly-full pipe stored "123", returned 3, and libc dropped the "4\n".
+    if (space == 0 || (atomic && space < (uint32_t)len)) {   /* readers live -> would block */
         spin_unlock_irqrestore(&g_pipe_lock, fl);
         return -2;
     }
     const uint8_t* s = (const uint8_t*)buf;
-    uint32_t n = (uint32_t)len; if (n > space) n = space;  /* short write is allowed */
+    uint32_t n = (uint32_t)len; if (n > space) n = space;  /* non-atomic only */
     uint32_t tail = (p->head + p->len) % PIPE_SIZE;
     for (uint32_t i = 0; i < n; i++) p->buf[(tail + i) % PIPE_SIZE] = s[i];
     p->len += n;
     spin_unlock_irqrestore(&g_pipe_lock, fl);
     sched_wake_pipe(p);                     /* data available -> wake blocked readers */
     return (int)n;
+}
+
+int pipe_write(pipe_t* p, const void* buf, int len) {
+    return pipe_write_mode(p, buf, len, len <= PIPE_BUF);
+}
+
+int pipe_write_some(pipe_t* p, const void* buf, int len) {
+    return pipe_write_mode(p, buf, len, 0);
 }
 
 void pipe_ref(pipe_t* p, int writer) {

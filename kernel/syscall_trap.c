@@ -343,11 +343,18 @@ uint64_t syscall_handler(trapframe_t* tf) {
             int fd = (int)tf->rdi;
             int pipe_fd = fd >= 0 && fd < 32 && cur->fds[fd].used && cur->fds[fd].is_pipe;
             if (pipe_fd && (cur->fds[fd].flags & 0x800 /*O_NONBLOCK*/)) {
-                ret = (uint64_t)(int64_t)(-11);         // -EAGAIN: never block
+                // Never block: report the bytes already queued, else -EAGAIN.
+                ret = (num == SYS_WRITE && cur->pipe_wdone > 0) ? (uint64_t)cur->pipe_wdone
+                                                                : (uint64_t)(int64_t)(-11);
+                cur->pipe_wdone = 0;
             } else if (sig_interrupted(cur, tf)) {
                 cur->wait_tty = 0;
                 cur->wait_pty = NULL;
                 ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR
+                // A pipe write interrupted after queueing some bytes reports
+                // them (POSIX short count) instead of failing with EINTR.
+                if (num == SYS_WRITE && cur->pipe_wdone > 0) ret = (uint64_t)cur->pipe_wdone;
+                cur->pipe_wdone = 0;
             } else if (cur->wait_pty) {
                 // Pty read/write that cannot progress yet: sleep until the
                 // other side (sched_wake_pty) or the tty tick re-runs it.

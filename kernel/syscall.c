@@ -565,17 +565,30 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
     }
     if(ino && (!ino->ops||!ino->ops->write)) return -1;
     if(is_pipe){
-        // [M30] A redirected pipe end takes precedence over the console. One
-        // chunk per call (the pipe is 4 KB; a short write is POSIX-legal and
-        // the caller loops). A full pipe returns -2 (would block) and the
-        // syscall is re-run, re-copying the data.
-        int want = len < 4096 ? len : 4096;
-        if(uio_get(&u, want)!=0) return -1;
-        int r;
-        if(copy_from_user(u.p, ubuf, (size_t)want)!=0) r = -EFAULT;
-        else r = pipe_write((pipe_t*)c->fds[fd].inode, u.p, want);
+        // [M30] A redirected pipe end takes precedence over the console.
+        // Blocking-pipe POSIX semantics: the whole buffer is written before
+        // returning, and a write of <= PIPE_BUF bytes atomically (pipe_write).
+        // When the pipe fills part-way we return -2 (would block); the trap
+        // layer re-runs the syscall on wake, and c->pipe_wdone carries the
+        // bytes already queued so the re-run resumes after them. A signal
+        // makes the trap return pipe_wdone (short count), or -EINTR if 0.
+        pipe_t* pp = (pipe_t*)c->fds[fd].inode;
+        int done = c->pipe_wdone, err = 0;
+        c->pipe_wdone = 0;
+        if(done < 0 || done >= len) done = 0;
+        if(uio_get(&u, len < PIPE_BUF ? len : PIPE_BUF)!=0) return done ? done : -1;
+        while(done < len){
+            int want = (len-done) < PIPE_BUF ? (len-done) : PIPE_BUF;
+            if(copy_from_user(u.p, (const uint8_t*)ubuf+done, (size_t)want)!=0){ err = -EFAULT; break; }
+            int r = (len <= PIPE_BUF) ? pipe_write(pp, u.p, want)        // atomic
+                                      : pipe_write_some(pp, u.p, want);  // may split
+            if(r == -2){ c->pipe_wdone = done; err = -2; break; }       // block; resume at done
+            if(r <= 0){ err = (r == -1) ? -EPIPE : r; break; }           // no reader left
+            done += r;
+        }
         uio_put(&u);
-        return r;
+        if(err == -2) return -2;
+        return done ? done : err;
     }
     if(uio_get(&u, len)!=0) return -1;
     int done=0, err=0;

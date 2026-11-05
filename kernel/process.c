@@ -529,7 +529,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     // the console special-cases in ksys_read/ksys_write). They carry no inode —
     // the std-stream paths are keyed on the fd number.
     p->fds[0].used=1; p->fds[1].used=1; p->fds[2].used=1;
-    p->wait_pipe=NULL; // [M25]
+    p->wait_pipe=NULL; p->pipe_wdone=0; // [M25]
     { extern void kiface_proc_init(process_t*, int, const char* const*);
       kiface_proc_init(p, argc, argv); }   // procfs identity, umask, CPU accounting
     if (proc_add(p)!=0) {
@@ -715,7 +715,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
             p->sig_handler[s] = 0;
     p->sig_restorer = 0;
     p->sigsusp_active = 0;
-    p->sleep_until = 0; p->wait_pipe = NULL; p->wait_tty = 0; p->wait_pty = NULL; p->recv_chan = -1;
+    p->sleep_until = 0; p->wait_pipe = NULL; p->pipe_wdone = 0; p->wait_tty = 0; p->wait_pty = NULL; p->recv_chan = -1;
     p->ki.nsleep_deadline = 0; p->ki.poll_active = 0; p->ki.poll_wait = 0;
 
     // Fresh register state: entry point, new stack, argc/argv/envp (System V).
@@ -785,7 +785,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
 
     c->wait_pid = -1; c->wait_result = 0; c->wait_ready = 0; c->collected = 0;
     c->sleep_until = 0; c->recv_chan = -1; c->exit_code = 0; c->cpu_ticks = 0;
-    c->wait_pipe = NULL;                       // [M25] not blocked on a pipe
+    c->wait_pipe = NULL; c->pipe_wdone = 0;    // [M25] not blocked on a pipe
     c->proc_type = PROC_TYPE_USER; c->drv_dev_id = -1; c->drv_caps = 0;
     // [M30] Signal dispositions/mask/restorer are inherited (shallow-copied); the
     // pending set starts empty in the child (POSIX). ppid = parent; pgid inherited.

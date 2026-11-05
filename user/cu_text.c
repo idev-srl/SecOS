@@ -516,13 +516,14 @@ int applet_nl(int argc, char** argv) {
 
 int applet_yes(int argc, char** argv) {
     const char* s = (argc > 1) ? argv[1] : "y";
-    /* BOUND: this OS has no Ctrl-C yet, so an unbounded loop would hang the
-     * shell forever. Cap the output at 1000 iterations. */
-    for (int i = 0; i < 1000; i++) {
+    /* Unbounded, like POSIX yes: `yes | head -N` ends when head exits and the
+     * next write raises SIGPIPE (or fails with EPIPE if SIGPIPE is ignored);
+     * an interactive `yes` is stopped with Ctrl-C. */
+    for (;;) {
         fputs(s, stdout);
         fputc('\n', stdout);
+        if (ferror(stdout)) return 1;
     }
-    return 0;
 }
 
 /* ------------------------------------------------------------------ */
