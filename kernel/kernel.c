@@ -1519,6 +1519,9 @@ static void kernel_main_phase2(void) {
         debugcon_writestring(ok ? "[TSC] monotonic OK\n"
                                 : "[TSC] FAIL: clock not advancing\n");
     }
+    // Wall clock: read the CMOS RTC (UTC) once and anchor it to the TSC clock
+    // (CLOCK_REALTIME, file timestamps, date).
+    { extern void kclock_init(void); kclock_init(); }
 
     // [M29-2] Application-processor bring-up is **opt-in** (experimental): on real
     // hardware with true parallelism, heavy multicore load can deadlock/freeze —

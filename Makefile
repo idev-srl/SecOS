@@ -75,6 +75,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/pipe.c \
 	$(KERNEL_DIR)/tty.c \
 	$(KERNEL_DIR)/power.c \
+	$(KERNEL_DIR)/kclock.c \
 	$(KERNEL_DIR)/klog.c \
 	$(KERNEL_DIR)/smp.c \
 	$(KERNEL_DIR)/pkg.c \
