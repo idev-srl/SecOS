@@ -440,7 +440,46 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/loadkeys.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/loadkeys.o
 	python3 tools/secos-sign user/loadkeys.elf --dev
 	python3 tools/elf2h.py user/loadkeys.elf user_loadkeys_elf crypto/user_loadkeys_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys -> crypto/*.h"
+	$(MAKE) --no-print-directory gui-progs
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+
+# Graphical UI (docs/GUI.md): the secwm compositor + terminal (signed
+# CAP_INPUT|CAP_DISPLAY, the only program holding fb0 and the input devices),
+# and its clients, signed with the confined manifest (CAP_ENFORCE|FS_READ|TIME):
+# sysinfo (System panel) and swptest (isolation selftest). The keymap tables
+# are the kernel's own drivers/keymap.c compiled once more for user space.
+# font16.h is generated from the vendored Terminus Font (SIL OFL 1.1):
+#   python3 tools/bdf2c.py user/secwm/font16.h third_party/terminus-font/ter-u16{n,b}.bdf
+SWM = user/secwm
+SWM_CFLAGS = $(USER_CFLAGS) -I$(SWM)
+.PHONY: gui-progs
+gui-progs:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note_gui.S   -o user/note_gui.o
+	$(CC) $(USER_CFLAGS) -c user/note_confined.S -o user/note_confined.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c   -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c       -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/libm.c       -o user/libm.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/gfx.c       -o $(SWM)/gfx.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/term.c      -o $(SWM)/term.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/swpc.c      -o $(SWM)/swpc.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/secwm.c     -o $(SWM)/secwm.o
+	$(CC) $(SWM_CFLAGS) -c drivers/keymap.c   -o $(SWM)/keymap.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/sysinfo.c   -o $(SWM)/sysinfo.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/swptest.c   -o $(SWM)/swptest.o
+	$(LD) --gc-sections -T user/user.ld -o $(SWM)/secwm.elf user/crt0.o user/note_gui.o user/libsecos.o user/libc.o user/libm.o \
+	  $(SWM)/secwm.o $(SWM)/term.o $(SWM)/gfx.o $(SWM)/keymap.o
+	$(LD) --gc-sections -T user/user.ld -o $(SWM)/sysinfo.elf user/crt0.o user/note_confined.o user/libsecos.o user/libc.o user/libm.o \
+	  $(SWM)/sysinfo.o $(SWM)/swpc.o $(SWM)/gfx.o
+	$(LD) --gc-sections -T user/user.ld -o $(SWM)/swptest.elf user/crt0.o user/note_confined.o user/libsecos.o user/libc.o \
+	  $(SWM)/swptest.o $(SWM)/swpc.o $(SWM)/gfx.o
+	python3 tools/secos-sign $(SWM)/secwm.elf --dev
+	python3 tools/secos-sign $(SWM)/sysinfo.elf --dev
+	python3 tools/secos-sign $(SWM)/swptest.elf --dev
+	python3 tools/elf2h.py $(SWM)/secwm.elf user_secwm_elf crypto/user_secwm_elf.h
+	python3 tools/elf2h.py $(SWM)/sysinfo.elf user_sysinfo_elf crypto/user_sysinfo_elf.h
+	python3 tools/elf2h.py $(SWM)/swptest.elf user_swptest_elf crypto/user_swptest_elf.h
+	@echo "gui-progs: built+signed secwm + sysinfo + swptest -> crypto/*.h"
 
 # Staleness guard for the committed embedded programs: rebuild + re-sign them
 # (deterministic: same sources -> byte-identical headers) and fail if any
