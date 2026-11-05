@@ -14,8 +14,20 @@
  * halts the kernel, which the harness detects on debugcon. The child only
  * touches a private /tmp/fz sandbox and never closes/replaces console fds.
  *
- * Usage: sysfuzz [-s seed] [-b batches] [-c calls] [-r batch] [-v]
+ * Every pointer/length class is fuzzed (bad user pointers must return -EFAULT
+ * via the uaccess exception-table fixups, never fault ring 0). The only
+ * argument shaping is to keep the run NON-BLOCKING, so a batch always ends:
+ *  - read/write target a private regular file (/tmp/fz/w, recreated per batch)
+ *    or an invalid fd, never the TTY (fd 0 blocks on a line) or a pipe the
+ *    fuzzer created itself (a self-deadlock: empty pipe with our own writer, or
+ *    a full one with our own reader); that file fd is never closed/dup2'd over;
+ *  - msg_recv is preceded by a 1-byte msg_send on the same channel, so a valid
+ *    channel is never empty (M17 blocks the caller on an empty channel);
+ *  - sigreturn (which kills a caller outside a handler) is drawn rarely.
+ *
+ * Usage: sysfuzz [-s seed] [-b batches] [-c calls] [-r batch] [-v] [-F]
  *   -r N   replay only batch N verbosely (reproducer)
+ *   -F     run batches in-process (no fork), for verbose panic triage
  */
 #include "libsecos.h"
 #include <stdio.h>
@@ -84,7 +96,6 @@
 typedef unsigned long u64;
 
 static u64 g_rng;
-static int g_safe;   /* -S: never pass a string/path syscall an unmapped hole */
 static int g_nofork; /* -F: run batches in-process (verbose panic triage) */
 static u64 rnd(void){ g_rng^=g_rng>>12; g_rng^=g_rng<<25; g_rng^=g_rng>>27; return g_rng*2685821657736338717UL; }
 static u64 rn(u64 n){ return n? rnd()%n : 0; }
@@ -115,11 +126,6 @@ static u64 ptrpool(void){
     }
 }
 static u64 lenpool(void){
-    /* In safe mode a length always stays within safeptr()'s buffer (g_buf, 8 KB,
-     * offset <= 0x1600), so a kernel copy never walks off the mapping into an
-     * unmapped page — that is the known ring-0 panic class (e.g. the ksys_write
-     * console loop with a huge len), reproduced in non-safe mode. */
-    if(g_safe) return rn(0x400);
     switch(rn(10)){
     case 0: return 0; case 1: return 1; case 2: return rn(64);
     case 3: return 4096; case 4: return 0x100000; case 5: return 0x7FFFFFFFFFFFFFFFUL;
@@ -139,33 +145,14 @@ static const char* g_fzpaths[] = {
     "/tmp/fz","/tmp/fz/a","/tmp/fz/b","/tmp/fz/d","/tmp/fz/d/x","/tmp/fz/l",
     "/tmp/fz//a","/tmp/fz/","","  ","/tmp/fz/.","/tmp/fz/..",
 };
-/* a pointer that is reliably readable AND writable from the kernel: a present
- * RW page or a never-touched RW anon page (demand-fills cleanly). This avoids
- * the known ring-0 panic class (unmapped hole / PROT_NONE / straddle into a
- * hole) so -S can explore numeric/fd/length/logic bugs past it. */
-static u64 safeptr(void){
-    /* Only the always-present 8 KB static buffer (ELF data segment, no adjacent
-     * unmapped hole), bounded so a <=256B kernel copy never leaves it. This lets
-     * -S explore logic bugs without re-tripping the known copy-to-unmapped panic
-     * (which the fuzzer's own mmap fixtures and fuzzed mmap would otherwise hit). */
-    switch(rn(3)){
-    case 0: return (u64)g_buf;
-    case 1: return (u64)g_buf + 1 + rn(7);
-    default:return (u64)g_buf + rn(0x1600);
-    }
-}
-static u64 strptr(void){ return g_safe ? safeptr() : ptrpool(); }
+static u64 strptr(void){ return ptrpool(); }
 static u64 pathpool(void){
     if(rn(3)==0) return strptr();
     return (u64)g_fzpaths[rn(sizeof(g_fzpaths)/sizeof(g_fzpaths[0]))];
 }
 
 static int g_verbose;
-/* safe-pointer mode: never hand a string/path syscall a fully-unmapped in-range
- * pointer (0xDEADBEEF, kernel half, physmap, the unmapped hole). Those trip the
- * known ring-0 panic (user_range_valid passes a range with no page), which halts
- * the kernel and blocks exploration of every other syscall. With -S the fuzzer
- * keeps probing numeric/fd/length edge cases and partially-mapped buffers. */
+static int g_ffd = -1; /* per-batch regular file: the only real fd read/write use */
 static const char* sysname(long n);
 
 static void one_call(void){
@@ -175,35 +162,25 @@ static void one_call(void){
 
     if(n==SYS_EXIT){ n=SYS_GETPID; }
     if(n==SYS_FORK && rn(4)!=0){ n=SYS_GETTICKS; }
-    /* -S: the memory syscalls would unmap/reprotect the fuzzer's own safe
-     * buffers, so a later copy_to/from_user would hit an unmapped page and trip
-     * the known ring-0 panic class. Neutralise them so -S explores the other
-     * ~50 syscalls (fd, path, numeric, logic) instead of re-finding that one. */
-    if(g_safe && (n==SYS_MUNMAP||n==SYS_MPROTECT||n==SYS_BRK)) n=SYS_GETTICKS;
-    /* -S also skips SYS_SPAWN: its argv is a valid char** whose *contents* are
-     * garbage pointer values the kernel dereferences, which reaches the same
-     * ring-0 panic class indirectly (not controllable via the top-level ptr). */
-    if(g_safe && n==SYS_SPAWN) n=SYS_GETPID;
-    /* -S also skips SYS_SIGRETURN: outside a signal handler it restores a forged
-     * context and self-destructs the caller (a ring-3 kill, kernel-safe per M30),
-     * which would end every batch early. It is exercised in non-safe mode. */
-    if(g_safe && n==SYS_SIGRETURN) n=SYS_GETTICKS;
-    /* -S skips SYS_MSG_RECV: on an empty channel it blocks (M17) until a send,
-     * which would hang the batch. msg_send + the IPC demos cover that path. */
-    if(g_safe && n==SYS_MSG_RECV) n=SYS_MSG_SEND;
+    /* SYS_SIGRETURN outside a handler restores a forged context and kills the
+     * caller (a ring-3 kill, kernel-safe per M30): keep it, but rare, so most
+     * batches run to the end. */
+    if(n==SYS_SIGRETURN && rn(8)!=0) n=SYS_GETTICKS;
 
     long a0,a1,a2,a3,a4; a0=a1=a2=a3=a4=0;
     switch(n){
     case SYS_WRITE: case SYS_READ:
-        a0=intpool(); a1=(long)strptr(); a2=(long)lenpool();
-        /* A blocking read (console/TTY, or a pipe read-end with an open writer)
-         * never returns and would hang the batch. In -S force READ to an invalid
-         * fd so it always errors without blocking (copy_to_user's buffer path is
-         * covered by stat/getcwd/fstat). In non-safe mode keep it as-is. */
-        if(n==SYS_READ && g_safe) a0 = -1 - (long)rn(200);
+        /* Never the TTY or a fuzzer-made pipe (they block): the batch file,
+         * or an invalid fd. Pointer and length stay fully fuzzed. */
+        switch(rn(4)){
+        case 0: a0=-1-(long)rn(200); break;
+        case 1: a0=64+(long)rn(1000); break;
+        default:a0=g_ffd; break;
+        }
+        a1=(long)strptr(); a2=(long)lenpool();
         break;
     case SYS_OPEN: a0=(long)pathpool(); a1=intpool(); break;
-    case SYS_CLOSE: a0=intpool(); if(a0>=0&&a0<=2) a0=10+a0; break;
+    case SYS_CLOSE: a0=intpool(); if((a0>=0&&a0<=2)||a0==g_ffd) a0=10+(a0&3); break;
     case SYS_STAT: case SYS_LSTAT:
         a0=(long)pathpool(); a1=(long)strptr(); break;
     case SYS_FSTAT: a0=intpool(); a1=(long)strptr(); break;
@@ -212,7 +189,13 @@ static void one_call(void){
     case SYS_MUNMAP: a0=(long)ptrpool(); a1=(long)lenpool(); break;
     case SYS_MPROTECT: a0=(long)ptrpool(); a1=(long)lenpool(); a2=(long)rn(8); break;
     case SYS_BRK: a0=(long)ptrpool(); break;
-    case SYS_MSG_SEND: case SYS_MSG_RECV: a0=intpool(); a1=(long)strptr(); a2=(long)lenpool(); break;
+    case SYS_MSG_SEND: a0=intpool(); a1=(long)strptr(); a2=(long)lenpool(); break;
+    case SYS_MSG_RECV:
+        /* M17: recv blocks on an EMPTY valid channel. Queue a byte first, so a
+         * valid channel is non-empty (or full) and recv returns at once. */
+        a0=(long)rn(6)-1; a1=(long)strptr(); a2=(long)lenpool();
+        sc(SYS_MSG_SEND,a0,(long)g_buf,1,0,0);
+        break;
     case SYS_SLEEP: a0=(long)rn(2); break;
     case SYS_GETDENTS: a0=(long)pathpool(); a1=(long)strptr(); a2=(long)lenpool(); break;
     case SYS_CREATE: case SYS_MKDIR: case SYS_UNLINK: a0=(long)pathpool(); break;
@@ -226,7 +209,7 @@ static void one_call(void){
     case SYS_CHDIR: a0=(long)pathpool(); break;
     case SYS_GETCWD: a0=(long)strptr(); a1=(long)lenpool(); break;
     case SYS_DUP: a0=intpool(); break;
-    case SYS_DUP2: a0=intpool(); a1=10+(long)rn(16); break;
+    case SYS_DUP2: a0=intpool(); a1=10+(long)rn(16); if(a1==g_ffd) a1=26; break;
     case SYS_IOCTL: a0=intpool(); a1=(long)intpool(); a2=(long)strptr(); break;
     case SYS_PIPE: a0=(long)strptr(); break;
     case SYS_SIGACTION: a0=(long)rn(34); a1=(long)strptr(); a2=(long)strptr(); break;
@@ -272,6 +255,16 @@ static void setup_fixtures(void){
     creat_file("/tmp/fz/a"); creat_file("/tmp/fz/b");
 }
 
+/* (Re)create the batch's private regular file and open it RW: the only real fd
+ * the fuzzed read/write target, so neither can block (see header). Recreated per
+ * batch so fuzzed lseek+write growth never accumulates across batches. */
+static void batch_file(void){
+    if(g_ffd>=0) close(g_ffd);
+    unlink("/tmp/fz/w");
+    creat_file("/tmp/fz/w");
+    g_ffd = open("/tmp/fz/w", O_RDWR);
+}
+
 static int g_names_ready;
 static const char* g_names[NSYS_KNOWN];
 static void init_names(void){
@@ -307,10 +300,9 @@ int main(int argc, char** argv){
         else if(argv[i][0]=='-'&&argv[i][1]=='c'&&i+1<argc) calls=atou(argv[++i]);
         else if(argv[i][0]=='-'&&argv[i][1]=='r'&&i+1<argc) replay=atou(argv[++i]);
         else if(argv[i][0]=='-'&&argv[i][1]=='v') g_verbose=1;
-        else if(argv[i][0]=='-'&&argv[i][1]=='S') g_safe=1;
         else if(argv[i][0]=='-'&&argv[i][1]=='F') g_nofork=1;
     }
-    printf("[sysfuzz] seed=%lu batches=%ld calls=%ld safe=%d\n",seed,batches,calls,g_safe);
+    printf("[sysfuzz] seed=%lu batches=%ld calls=%ld\n",seed,batches,calls);
     setup_fixtures();
 
     for(long b=0;b<batches;b++){
@@ -321,6 +313,7 @@ int main(int argc, char** argv){
              * before the call that faults — the last line in the log names the
              * offending syscall even when the fault PANICS the kernel. */
             g_rng = batch_seed ? batch_seed : 1;
+            batch_file();
             for(long k=0;k<calls;k++) one_call();
             printf("[sysfuzz] batch %ld ok (nofork)\n",b);
             continue;
@@ -329,6 +322,7 @@ int main(int argc, char** argv){
         if(pid==0){
             g_rng = batch_seed ? batch_seed : 1;
             if(replay>=0) g_verbose=1;
+            batch_file();
             for(long k=0;k<calls;k++) one_call();
             _exit((int)(batch_seed%100));
         } else if(pid>0){

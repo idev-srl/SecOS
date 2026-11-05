@@ -170,10 +170,10 @@ def main():
         i += 1
         if i % 50 == 0: print(f"[soak] {i}/{n} commands ok", flush=True)
 
-    # optional: run the signed syscall fuzzer at the end (safe mode, bounded)
+    # optional: run the signed syscall fuzzer at the end (full mode, bounded)
     if o["fuzz"]:
         with lock: since=len(buf)
-        p.stdin.write(b"/bin/sysfuzz -s %d -b 10 -c 120 -S; echo FUZZ\"\"DONE\r" % (o["seed"] & 0xffff))
+        p.stdin.write(b"/bin/sysfuzz -s %d -b 10 -c 120; echo FUZZ\"\"DONE\r" % (o["seed"] & 0xffff))
         p.stdin.flush()
         if not wait_for("FUZZDONE", 120, since=since):
             print("[soak] FAIL: syscall fuzzer did not finish")

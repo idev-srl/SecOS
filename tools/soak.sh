@@ -19,7 +19,7 @@
 #   tools/soak.sh --mem 512M|1G|4G
 #   tools/soak.sh --smp 1|2
 #   tools/soak.sh --disk          # attach an ext4 virtio-blk data disk at /mnt
-#   tools/soak.sh --fuzz          # also run the signed syscall fuzzer (safe mode)
+#   tools/soak.sh --fuzz          # also run the signed syscall fuzzer (full mode)
 #   tools/soak.sh --no-cmdsub     # disable $(...) command substitution (default on)
 #   tools/soak.sh --no-pipes      # disable pipelines (default on)
 #   tools/soak.sh --log PATH      # debugcon+serial log path (default /tmp/soak.log)

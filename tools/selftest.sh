@@ -896,25 +896,24 @@ grep -q "CS9-42" "$CSLOG"; check "bash still responsive after the substitution l
 # STRESS/FUZZ GATES (short, fixed-seed versions of tools/soak.sh + the signed
 # ring-3 syscall fuzzer user/sysfuzz.c). The LONG versions stay manual:
 #   tools/soak.sh --long            # ~10-15 min randomized bash session
-#   /bin/sysfuzz -s <seed> -b N -c M [-S]   (from the shell)
-# These gates reuse the already-built myos.iso. The fuzzer runs in SAFE mode
-# (-S): it avoids passing string/path syscalls an unmapped/PROT_NONE pointer,
-# which is a KNOWN unfixed kernel bug (ring-0 panic in copy_to/from_user on an
-# in-range but non-present user page — reproduce with `/bin/sysfuzz -s 1 -b 1`
-# WITHOUT -S). Safe mode still exercises every syscall's argument validation,
-# fd/length/numeric edges and fork/wait, and must never fault the kernel.
+#   /bin/sysfuzz -s <seed> -b N -c M        (from the shell)
+# These gates reuse the already-built myos.iso. The fuzzer runs in FULL mode:
+# every pointer class (NULL, kernel half, non-canonical, unmapped hole,
+# PROT_NONE, buffers running off a mapping) reaches every syscall, and must come
+# back as an error (uaccess exception-table fixups -> -EFAULT), never a ring-0
+# fault. Its arguments are shaped only to stay non-blocking (see user/sysfuzz.c).
 # ============================================================================
-# ---- stress: ring-3 syscall fuzzer (safe mode, fixed seed) ----
+# ---- stress: ring-3 syscall fuzzer (full mode, fixed seed) ----
 FUZZLOG=/tmp/secos_selftest_sysfuzz.log
-echo "[selftest] Running ring-3 syscall fuzzer (safe mode, mb2, serial, 45s)..."
+echo "[selftest] Running ring-3 syscall fuzzer (full mode, mb2, serial, 60s)..."
 : > "$FUZZLOG"
-( sleep 25; printf '  /bin/sysfuzz -s 777 -b 12 -c 150 -S; echo FUZZEND\r'; sleep 18 ) | \
-    timeout 50 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+( sleep 25; printf '  /bin/sysfuzz -s 777 -b 12 -c 150; echo FUZZEND\r'; sleep 33 ) | \
+    timeout 65 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$FUZZLOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >/dev/null 2>&1
-grep -q "\[sysfuzz\] DONE ok" "$FUZZLOG"; check "syscall fuzzer (safe mode) ran every syscall to completion" $?
-! grep -q "ring0" "$FUZZLOG"; check "no ring-0 CPU fault during safe-mode syscall fuzzing" $?
-! grep -q "\[PANIC\]" "$FUZZLOG"; check "no kernel panic during safe-mode syscall fuzzing" $?
+grep -q "\[sysfuzz\] DONE ok" "$FUZZLOG"; check "syscall fuzzer (full mode) ran every syscall to completion" $?
+! grep -q "ring0" "$FUZZLOG"; check "no ring-0 CPU fault during full-mode syscall fuzzing" $?
+! grep -q "\[PANIC\]" "$FUZZLOG"; check "no kernel panic during full-mode syscall fuzzing" $?
 
 # ---- stress: short randomized soak (fixed seed) via tools/soak_drive.py ----
 SOAKLOG=/tmp/secos_selftest_soak.log
