@@ -246,7 +246,15 @@ W const char* gai_strerror(int err){
 /* ===================== poll / select (TODO(integration): move to libc) ===================== */
 W int poll(struct pollfd* fds, nfds_t n, int timeout_ms){
     long r = secos_syscall(SYS_POLL_, (long)fds, (long)n, timeout_ms, 0, 0);
-    if(sc_missing(r)) r = -ENOSYS;       /* kernel without SYS_POLL */
+    if(sc_missing(r)){                   /* kernel without SYS_POLL: say so once */
+        static int warned;
+        if(!warned){
+            static const char m[] = "dropbear: this SecOS kernel has no poll() (SYS_POLL 78); "
+                                    "the SSH server needs it\n";
+            warned = 1; (write)(2, m, sizeof(m) - 1);
+        }
+        r = -ENOSYS;
+    }
     return (int)sc_ret(r);
 }
 W int select(int nfds, fd_set* rs, fd_set* ws, fd_set* es, struct timeval* tv){
