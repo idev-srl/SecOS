@@ -493,7 +493,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     // the console special-cases in ksys_read/ksys_write). They carry no inode —
     // the std-stream paths are keyed on the fd number.
     p->fds[0].used=1; p->fds[1].used=1; p->fds[2].used=1;
-    p->wait_pipe=NULL; // [M25]
+    p->wait_pipe=NULL; p->pipe_wdone=0; // [M25]
     if (proc_add(p)!=0) {
         terminal_writestring("[PROC] table full\n");
         if (p->manifest) kfree(p->manifest);
@@ -613,7 +613,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
 
     c->wait_pid = -1; c->wait_result = 0; c->wait_ready = 0; c->collected = 0;
     c->sleep_until = 0; c->recv_chan = -1; c->exit_code = 0; c->cpu_ticks = 0;
-    c->wait_pipe = NULL;                       // [M25] not blocked on a pipe
+    c->wait_pipe = NULL; c->pipe_wdone = 0;    // [M25] not blocked on a pipe
     c->proc_type = PROC_TYPE_USER; c->drv_dev_id = -1; c->drv_caps = 0;
     // [M30] Signal dispositions/mask/restorer are inherited (shallow-copied); the
     // pending set starts empty in the child (POSIX). ppid = parent; pgid inherited.

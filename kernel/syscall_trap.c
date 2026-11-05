@@ -298,6 +298,10 @@ uint64_t syscall_handler(trapframe_t* tf) {
             if (sig_interrupted(cur, tf)) {
                 cur->wait_tty = 0;
                 ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR
+                // A pipe write interrupted after queueing some bytes reports
+                // them (POSIX short count) instead of failing with EINTR.
+                if (num == SYS_WRITE && cur->pipe_wdone > 0) ret = (uint64_t)cur->pipe_wdone;
+                cur->pipe_wdone = 0;
             } else if (num == SYS_READ && cur->wait_tty) {
                 // Console read with no input yet: sleep until tty_wake_readers()
                 // (timer tick) sees input, then re-run the read.

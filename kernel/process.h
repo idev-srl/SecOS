@@ -82,6 +82,7 @@ typedef struct process {
     uint64_t sleep_until;    // [M17] wake when timer_get_ticks() >= this (0 = n/a)
     int      recv_chan;      // [M17] IPC channel the caller is blocked receiving on (-1)
     void*    wait_pipe;      // [M25] pipe object the caller is blocked on (NULL = none)
+    int      pipe_wdone;     // bytes of a blocked pipe write() already queued (the re-run resumes there)
     uint8_t  wait_tty;       // blocked in a console read() until input arrives (tty_read_try)
     uint8_t  power_phase;    // SYS_REBOOT shutdown state machine (kernel/power.c)
     uint64_t power_deadline; // tick deadline of the current shutdown phase
