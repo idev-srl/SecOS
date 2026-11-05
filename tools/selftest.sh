@@ -1226,6 +1226,45 @@ grep -q "\[ABI-TEST\] pn-fork-parent-copy-isolated OK" "$UALOG"; check "ABI PROT
 ! grep -q "\[ABI-TEST\] .* FAIL" "$UALOG"; check "ABI no case failed" $?
 ! grep -q "\[PANIC\]" "$UALOG"; check "UACCESS no kernel panic" $?
 
+# ============================================================================
+# PIPE GATE: blocking-pipe data integrity. Pipes used to lose data once more
+# than the 4 KB ring was in flight: a write into a nearly-full pipe stored what
+# fitted and returned a short count that libc's fflush() dropped, so
+# `seq 1 2000 | wc` reported ~1997 lines. The signed ring-3 /bin/pipe_test
+# (user/pipe_test.c) checks pattern+checksum transfers (1 B .. 1 MB) across
+# fork, PIPE_BUF atomicity with two writers, a signal interrupting a blocked
+# writer, EPIPE/SIGPIPE and stdio through a pipe; then bash pipelines with
+# exact counts. Reuses the plain image built for the uaccess gate.
+# ============================================================================
+PIPELOG=/tmp/secos_selftest_pipe.log
+echo "[selftest] Running pipe integrity gate (mb2, serial, 170s)..."
+: > "$PIPELOG"
+( sleep 25; printf '  /bin/pipe_test; echo PT-$((6*7))-END\r'; sleep 45
+  printf '  echo PL1-$(seq 1 20000 | wc -l)-E\r'; sleep 10
+  printf '  seq 1 30000 > /tmp/big; echo PL2-$(wc -c < /tmp/big)-$(cat /tmp/big | cat | cat | wc -c)-E\r'; sleep 15
+  printf '  echo PL3-$(yes | head -n 100000 | wc -l)-E\r'; sleep 35
+  printf '  echo PL4-$(seq 1 5000 | wc)-E\r'; sleep 8
+  printf '  echo PL5-$((6*7))-END\r'; sleep 5 ) | \
+    timeout 170 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$PIPELOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "\[PIPE-TEST\] DONE pass=[0-9]* fail=0" "$PIPELOG"; check "PIPE every pipe_test case passes (DONE fail=0)" $?
+for t in xfer-1B xfer-4095 xfer-4096 xfer-4097 xfer-64K-one-write xfer-1M-64K-writes \
+         xfer-64K-small-writes-5B xfer-256K-slow-reader xfer-256K-slow-writer \
+         atomic-1000B-records-2-writers atomic-4096B-records-2-writers \
+         signal-partial-write-returns-count signal-empty-write-returns-eintr \
+         epipe-ignored-returns-epipe epipe-blocked-writer-returns-partial stdio-printf-20000-lines; do
+    grep -q "\[PIPE-TEST\] $t OK" "$PIPELOG"; check "PIPE $t" $?
+done
+! grep -q "\[PIPE-TEST\] .* FAIL" "$PIPELOG"; check "PIPE no pipe_test case failed" $?
+grep -q "PT-42-END" "$PIPELOG"; check "PIPE shell survives pipe_test (sentinel reached)" $?
+grep -q "PL1-20000-E" "$PIPELOG"; check "PIPE bash seq 1 20000 | wc -l -> 20000" $?
+grep -q "PL2-168894-168894-E" "$PIPELOG"; check "PIPE bash cat f | cat | cat | wc -c == file size (168894)" $?
+grep -q "PL3-100000-E" "$PIPELOG"; check "PIPE bash yes | head -n 100000 | wc -l -> 100000 (SIGPIPE ends yes)" $?
+grep -Eq "PL4- +5000 +5000 +23893-E" "$PIPELOG"; check "PIPE bash seq 1 5000 | wc -> 5000 5000 23893" $?
+grep -q "PL5-42-END" "$PIPELOG"; check "PIPE bash still responsive after the pipelines" $?
+! grep -q "\[EXC\]\|\[PANIC\]" "$PIPELOG"; check "PIPE no CPU exception ([EXC]) or panic" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
