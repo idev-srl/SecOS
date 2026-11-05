@@ -1638,7 +1638,7 @@ static int job_wait_foreground(uint32_t pgid, const uint32_t* pids, int npid){
 
 // Launch a (possibly piped) job: `cmd1 args | cmd2 | ...`, optionally in the
 // background (trailing &, stripped by the caller). 'line' is mutated in place.
-static uint8_t g_job_spawn_buf[1024*1024];   // [M39] 1 MB: fits GNU bash (548 KB)
+static uint8_t g_job_spawn_buf[2*1024*1024]; // 2 MB: GNU bash with readline is ~1.1 MB
 static void run_job(char* line, int background){
     // [M38] Output redirection: strip a trailing `> file` / `>> file` and remember
     // the target + append mode. Applied to the LAST pipeline stage's fd 1 (stdout).

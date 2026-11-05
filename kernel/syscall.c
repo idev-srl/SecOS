@@ -53,7 +53,7 @@ int ksys_getpid(void){ extern process_t* sched_get_current(void); process_t* c=s
 // [M10] Load + signature-verify a signed ELF from a VFS path and create a
 // process for it (PROC_READY so the scheduler can pick it up). The signing
 // gate inside process_create_from_elf refuses unsigned/tampered images.
-static uint8_t g_spawn_buf[1024*1024];   // [M39] 1 MB: fits GNU bash (548 KB) & friends
+static uint8_t g_spawn_buf[2*1024*1024]; // 2 MB: GNU bash with readline is ~1.1 MB
 // [M16] Spawn with argv. The single static load buffer is safe because kernel
 // code is non-preemptible (preemption fires only on a ring-3 timer tick) and
 // process_create_from_elf_args copies/pins the image before returning.

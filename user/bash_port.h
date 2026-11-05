@@ -20,6 +20,11 @@ typedef unsigned long sigset_t;
 struct timespec { long tv_sec; long tv_nsec; };
 #endif
 struct itimerval { struct { long tv_sec, tv_usec; } it_interval, it_value; };
+/* fd_set for readline's prototypes (no select() on SecOS; FD_SET stays undefined). */
+#ifndef _SECOS_FD_SET_T
+#define _SECOS_FD_SET_T
+typedef struct { unsigned long fds_bits[1024 / (8 * sizeof(unsigned long))]; } fd_set;
+#endif
 typedef long imaxdiv_t_lo; typedef struct { long quot; long rem; } imaxdiv_t;
 
 /* errno values bash references that SecOS errno.h may lack */

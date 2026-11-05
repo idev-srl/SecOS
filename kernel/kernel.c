@@ -1308,7 +1308,34 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
           if (vfs_create("/bin/bash", user_bash_elf, user_bash_elf_len) == 0)
               debugcon_writestring("[M39] installed GNU bash to /bin/bash\n");
           else debugcon_writestring("[M39] FAIL: could not install /bin/bash\n");
-      } }
+      }
+      // Line-editing defaults (only when absent: a persistent root keeps its
+      // own). TERM selects the built-in termcap entry of the console (any
+      // value but "dumb"); readline's inputrc adds the Home/End/Delete
+      // variants other terminals send (serial host terminals, VT220 style).
+      static const char bashrc[] =
+          "# /etc/bash.bashrc - read by every interactive bash (SecOS)\n"
+          "# bash sets TERM=dumb when it is unset: pick the console entry instead.\n"
+          "case \"$TERM\" in \"\"|dumb) export TERM=linux ;; esac\n";
+      static const char inputrc[] =
+          "# /etc/inputrc - GNU readline defaults (SecOS console)\n"
+          "set enable-bracketed-paste off\n"
+          "set bell-style none\n"
+          "\"\\e[1~\": beginning-of-line\n"
+          "\"\\e[4~\": end-of-line\n"
+          "\"\\e[7~\": beginning-of-line\n"
+          "\"\\e[8~\": end-of-line\n"
+          "\"\\e[H\": beginning-of-line\n"
+          "\"\\e[F\": end-of-line\n"
+          "\"\\eOH\": beginning-of-line\n"
+          "\"\\eOF\": end-of-line\n"
+          "\"\\e[3~\": delete-char\n"
+          "\"\\e[2~\": overwrite-mode\n"
+          "\"\\e[1;5C\": forward-word\n"
+          "\"\\e[1;5D\": backward-word\n";
+      if (!vfs_lookup("/etc/bash.bashrc")) vfs_create("/etc/bash.bashrc", bashrc, sizeof(bashrc) - 1);
+      if (!vfs_lookup("/etc/inputrc")) vfs_create("/etc/inputrc", inputrc, sizeof(inputrc) - 1);
+    }
 #endif
     // Orderly shutdown commands (one signed multi-call program, SYS_REBOOT).
     { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
