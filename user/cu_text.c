@@ -150,18 +150,54 @@ static void wc_count(FILE* f, long* lines, long* words, long* bytes) {
     *bytes = b;
 }
 
+/* Print the selected counts (sel: bit0=lines bit1=words bit2=bytes). A single
+ * selected count with no file name is printed bare, like GNU `wc -l < f`. */
+static void wc_print(int sel, long l, long w, long b, const char* name) {
+    long v[3] = { l, w, b };
+    int n = 0;
+    for (int k = 0; k < 3; k++)
+        if (sel & (1 << k))
+            n++;
+    for (int k = 0; k < 3; k++) {
+        if (!(sel & (1 << k)))
+            continue;
+        if (n == 1 && !name)
+            printf("%ld", v[k]);
+        else
+            printf("%8ld", v[k]);
+    }
+    if (name)
+        printf(" %s", name);
+    printf("\n");
+}
+
 int applet_wc(int argc, char** argv) {
-    if (argc < 2) {
+    int sel = 0, first = 1;
+    for (; first < argc && argv[first][0] == '-' && argv[first][1]; first++) {
+        for (const char* o = argv[first] + 1; *o; o++) {
+            if (*o == 'l') sel |= 1;
+            else if (*o == 'w') sel |= 2;
+            else if (*o == 'c') sel |= 4;
+            else {
+                fprintf(stderr, "wc: invalid option -- '%c'\n", *o);
+                return 1;
+            }
+        }
+    }
+    if (!sel)
+        sel = 7;
+
+    if (first >= argc) {
         long l, w, b;
         wc_count(stdin, &l, &w, &b);
-        printf("%8ld%8ld%8ld\n", l, w, b);
+        wc_print(sel, l, w, b, NULL);
         return 0;
     }
 
     int rc = 0;
     long tl = 0, tw = 0, tb = 0;
     int files = 0;
-    for (int i = 1; i < argc; i++) {
+    for (int i = first; i < argc; i++) {
         int is_stdin;
         FILE* f = open_input("wc", argv[i], &is_stdin);
         if (!f) {
@@ -170,7 +206,7 @@ int applet_wc(int argc, char** argv) {
         }
         long l, w, b;
         wc_count(f, &l, &w, &b);
-        printf("%8ld%8ld%8ld %s\n", l, w, b, argv[i]);
+        wc_print(sel, l, w, b, argv[i]);
         tl += l;
         tw += w;
         tb += b;
@@ -179,7 +215,7 @@ int applet_wc(int argc, char** argv) {
             fclose(f);
     }
     if (files > 1)
-        printf("%8ld%8ld%8ld total\n", tl, tw, tb);
+        wc_print(sel, tl, tw, tb, "total");
     return rc;
 }
 
