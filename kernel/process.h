@@ -81,6 +81,15 @@ typedef struct process {
     uint64_t sig_blocked;
     uint64_t sig_handler[32];
     uint64_t sig_restorer;
+    // Job control: a stop/continue not yet reported to the parent's
+    // waitpid(WUNTRACED / WCONTINUED). stop_sig = the signal that stopped us.
+    uint8_t  stop_report;
+    uint8_t  cont_report;
+    int      stop_sig;
+    // sigsuspend(): the mask to restore once the interrupting signal has been
+    // dispatched (the handler frame saves it, so sigreturn restores it).
+    uint8_t  sigsusp_active;
+    uint64_t sigsusp_saved;
     uint32_t pgid;           // process group id (defaults to pid)
     uint32_t ppid;           // parent pid (0 = no parent process, e.g. shell-spawned)
     uint32_t spawner_pid;    // pid of the process whose SYS_SPAWN created us (0 = kernel/

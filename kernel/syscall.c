@@ -81,6 +81,11 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     if(!p) return -1;
     spawn_inherit_stdio(sched_get_current(), p);   // before READY: never runs without them
     p->spawner_pid = sched_get_current() ? sched_get_current()->pid : 0; // SYS_WAIT ownership
+    // Job control: libc's execve is emulated as spawn+wait+_exit, so the spawned
+    // program must stay in the caller's process group, otherwise a job's real
+    // program escapes `kill -STOP %1`, Ctrl-C/Ctrl-Z (foreground pgid) and SIGTTIN.
+    { process_t* sp = sched_get_current();
+      if (sp && sp->pid != 0) p->pgid = sp->pgid; }
     p->state = PROC_READY;
     return (int)p->pid;
 }
@@ -610,7 +615,11 @@ int g_tty_canon = 1, g_tty_echo = 1;   // [M39] honored by kernel/tty.c
 int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
-    int is_tty = (fd<=2) || (c->fds[fd].used==0 && fd<=2);   // fds 0/1/2 are the console TTY
+    // The console TTY: fds 0/1/2 when not redirected, and any dup of a console
+    // fd (inode==NULL, not a pipe). bash keeps its terminal fd as dup(2) moved
+    // to a high fd and does tcgetpgrp/tcsetpgrp on it.
+    int is_tty = (fd<=2 && !c->fds[fd].used) ||
+                 (c->fds[fd].used && !c->fds[fd].inode && !c->fds[fd].is_pipe);
     switch(cmd){
     case TCGETS_: {
         if(!is_tty) return -1;
@@ -634,8 +643,27 @@ int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
         if(copy_to_user((void*)arg, &w, sizeof(w))!=0) return -1;
         return 0;
     }
-    case TIOCGPGRP_: { int pg=(int)c->pgid; if(copy_to_user((void*)arg,&pg,sizeof(pg))!=0) return -1; return 0; }
-    case TIOCSPGRP_: return 0;                                  // accept (single foreground group)
+    // Job control: the console's foreground process group is the kernel's
+    // foreground_pgid (Ctrl-C/Ctrl-Z target, SIGTTIN check in tty_read). With
+    // no foreground group set, the caller's own group is reported (so a shell
+    // started outside job control sees itself in the foreground).
+    case TIOCGPGRP_: {
+        if(!is_tty) return -25;                 // -ENOTTY
+        extern uint32_t signal_get_foreground_pgid(void);
+        uint32_t fg = signal_get_foreground_pgid();
+        int pg = (int)(fg ? fg : c->pgid);
+        if(copy_to_user((void*)arg,&pg,sizeof(pg))!=0) return -EFAULT;
+        return 0;
+    }
+    case TIOCSPGRP_: {
+        if(!is_tty) return -25;                 // -ENOTTY
+        extern void signal_set_foreground_pgid(uint32_t);
+        int pg;
+        if(copy_from_user(&pg,(void*)arg,sizeof(pg))!=0) return -EFAULT;
+        if(pg <= 0) return -22;                // -EINVAL
+        signal_set_foreground_pgid((uint32_t)pg);
+        return 0;
+    }
     default: return -1;
     }
 }
@@ -960,6 +988,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_GETCWD:  return (uint64_t)(int64_t)ksys_getcwd((char*)a0, (int)a1);
     case SYS_IOCTL:   return (uint64_t)(int64_t)ksys_ioctl((int)a0, a1, a2);
     case SYS_GETPPID: return (uint64_t)ksys_getppid();
+    case SYS_GETPGID: {                       // job control (bash getpgrp/getpgid)
+        extern long ksys_getpgid(int);
+        return (uint64_t)(int64_t)ksys_getpgid((int)a0);
+    }
     case SYS_FSTAT: {
         struct secos_stat kst;
         if(!user_range_valid((void*)a1, sizeof(kst))) return (uint64_t)(int64_t)-EFAULT;

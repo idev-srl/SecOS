@@ -264,7 +264,11 @@ void sched_stop_current(trapframe_t* tf) {
     debugcon_writestring("\n");
     save_tf(current, tf);
     current->state = PROC_STOPPED;
+    current->stop_report = 1;          // waitpid(WUNTRACED) reports it once
+    current->cont_report = 0;
+    if (current->stop_sig <= 0) current->stop_sig = 19 /*SIGSTOP*/;
     notify_parent_sigchld(current);
+    sched_wake_parent_waitany(current->ppid);   // a blocked waitpid(-1, WUNTRACED)
     process_t* next = pick_user(current);
     if (!next) next = idle_task;
     switch_to(next);                   // NORETURN
@@ -316,6 +320,14 @@ static void wake_waitany_cb(process_t* p, void* u) {
 void sched_wake_parent_waitany(uint32_t ppid) {
     if (ppid == 0) return;
     process_foreach(wake_waitany_cb, &ppid);
+}
+
+// Job control: a stopped child was resumed by SIGCONT. SIGCHLD + wake a parent
+// blocked in waitpid(-1, WCONTINUED). Called from signal_post (outside proc_lock).
+void sched_notify_parent_cont(process_t* child) {
+    if (!child) return;
+    notify_parent_sigchld(child);
+    sched_wake_parent_waitany(child->ppid);
 }
 
 // [M17] Wake processes whose SYS_SLEEP deadline has elapsed.

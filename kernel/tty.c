@@ -36,6 +36,7 @@ static int  g_pos = 0;          /* bytes already delivered to the reader */
 static int  g_asm = 0;          /* bytes of the line being typed (not yet complete) */
 
 #define TTY_EINTR (-4)          /* -EINTR: libc maps it to errno=EINTR */
+#define TTY_EIO   (-5)          /* -EIO: background read with SIGTTIN blocked/ignored */
 
 #define TTY_WOULDBLOCK (-2)     /* no input yet: the syscall layer blocks the reader */
 
@@ -72,6 +73,20 @@ static int tty_getchar_blocking(char* out) {
 int tty_read(void* buf, int len) {
     if (len <= 0) return -1;
     char* out = (char*)buf;
+
+    /* Job control: only the foreground process group may read the console. A
+     * background reader gets SIGTTIN (its whole group stops, so a shell sees the
+     * job as Stopped) and its read restarts once it is resumed in the
+     * foreground; with SIGTTIN blocked/ignored it gets EIO (POSIX). */
+    {
+        process_t* cur = sched_get_current();
+        uint32_t fg = signal_get_foreground_pgid();
+        if (cur && fg && cur->pgid != fg) {
+            if (!signal_ttin_acts(cur)) return TTY_EIO;
+            signal_post_pgid(cur->pgid, SIGTTIN);
+            return TTY_EINTR;
+        }
+    }
 
     /* Deliver leftover from a line that didn't fit the previous buffer. */
     if (g_pos < g_len) {

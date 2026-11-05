@@ -70,12 +70,15 @@ void signal_dispatch(trapframe_t* tf);          /* deliver at return-to-ring3 */
 int  signal_post(struct process* p, int sig);   /* post one signal to a process */
 int  signal_post_pgid(uint32_t pgid, int sig);  /* post to a whole process group */
 int  signal_pending(struct process* p);         /* a deliverable signal is pending? */
+int  signal_take_stop(struct process* p);       /* consume a pending default-stop signal -> signo / 0 */
+int  signal_ttin_acts(struct process* p);       /* SIGTTIN neither blocked nor ignored? */
 
 /* Syscall backends (args already validated/copied by the trap layer). */
 long ksys_sigaction(int sig, uint64_t handler, uint64_t restorer);
 long ksys_sigreturn(trapframe_t* tf);           /* restores tf in place; returns saved rax */
 long ksys_kill(int pid, int sig);
 long ksys_sigprocmask(int how, uint64_t set, uint64_t* oldset_user);
+long ksys_getpgid(int pid);                     /* pid 0 = caller; -ESRCH */
 
 /* Foreground process group for the console (job control). 0 = none (shell). */
 void     signal_set_foreground_pgid(uint32_t pgid);

@@ -27,6 +27,26 @@
 extern uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1,
                                  uint64_t a2, uint64_t a3, uint64_t a4);
 
+// Job control: a blocking syscall about to sleep or fail with EINTR first
+// checks for a pending default-action stop (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU).
+// If there is one, the caller stops right here with the syscall rewound, so on
+// SIGCONT it re-runs transparently instead of returning EINTR (Linux restarts
+// syscalls across a stop). NORETURN when it stops; otherwise returns.
+static void stop_and_restart_if_pending(process_t* cur, trapframe_t* tf) {
+    if (!cur) return;
+    int ss = signal_take_stop(cur);
+    if (!ss) return;
+    cur->stop_sig = ss;
+    tf->rip -= 2;                                   // re-run `int 0x80` after SIGCONT
+    sched_stop_current(tf);                         // NORETURN
+}
+// "Would a blocking syscall be interrupted?" Stops+restarts on a pending stop
+// signal (NORETURN then), else reports whether an effective signal is pending.
+static int sig_interrupted(process_t* cur, trapframe_t* tf) {
+    stop_and_restart_if_pending(cur, tf);
+    return signal_pending(cur);
+}
+
 uint64_t syscall_handler(trapframe_t* tf) {
     process_t* cur = sched_get_current();
     uint64_t num = tf->rax;
@@ -126,7 +146,7 @@ uint64_t syscall_handler(trapframe_t* tf) {
             } else if (child->state == PROC_ZOMBIE) {
                 ret = (uint64_t)(int64_t)child->exit_code; // already exited
                 child->collected = 1;                      // [M39] parent reaped it -> reapable
-            } else if (cur && signal_pending(cur)) {
+            } else if (cur && sig_interrupted(cur, tf)) {
                 ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR: a signal is pending
             } else if (cur) {
                 cur->wait_pid = (int)tf->rdi;
@@ -145,26 +165,57 @@ uint64_t syscall_handler(trapframe_t* tf) {
     else if (num == SYS_WAITANY) {
         extern process_t* process_find_zombie_child(uint32_t);
         extern int process_has_children(uint32_t);
+        extern process_t* process_take_jobctl_child(uint32_t, int, int, int*);
         int* ustatus = (int*)tf->rdi;
-        int wnohang  = (int)tf->rsi & 1;     // WNOHANG bit
+        int opts     = (int)tf->rsi;
+        int wnohang  = opts & 1;             // WNOHANG
+        int wuntrace = opts & 2;             // WUNTRACED: report stopped children
+        int wcont    = opts & 8;             // WCONTINUED: report resumed children
         if (!cur) { ret = (uint64_t)(int64_t)-10; }
         else {
             process_t* z = process_find_zombie_child(cur->pid);
+            process_t* j = 0; int jst = 0;
+            if (!z && (wuntrace || wcont))
+                j = process_take_jobctl_child(cur->pid, wuntrace, wcont, &jst);
             if (z) {
                 int code = z->exit_code;
                 z->collected = 1;            // reapable now
                 if (ustatus && user_range_valid(ustatus, sizeof(int)))
                     copy_to_user(ustatus, &code, sizeof(int));
                 ret = (uint64_t)(int64_t)(int)z->pid;
+            } else if (j) {                  // stopped (sig<<8|0x7f) / continued (0xffff)
+                if (ustatus && user_range_valid(ustatus, sizeof(int)))
+                    copy_to_user(ustatus, &jst, sizeof(int));
+                ret = (uint64_t)(int64_t)(int)j->pid;
             } else if (!process_has_children(cur->pid)) {
                 ret = (uint64_t)(int64_t)-10;        // ECHILD
             } else if (wnohang) {
                 ret = 0;                              // children alive, none reaped yet
-            } else if (signal_pending(cur)) {
+            } else if (sig_interrupted(cur, tf)) {
                 ret = (uint64_t)(int64_t)-4;          // EINTR
             } else {
                 cur->wait_pid = -2;                   // [M39] wait-any sentinel
                 tf->rip -= 2;                         // re-run on wake
+                sched_block_current(tf);              // NORETURN
+                ret = 0;
+            }
+        }
+    }
+    // SYS_SIGSUSPEND(mask): install `mask` and sleep until a signal that does
+    // something is delivered; the old mask comes back after the handler ran
+    // (signal_dispatch stores it in the handler frame). Always -EINTR.
+    else if (num == SYS_SIGSUSPEND) {
+        if (!cur) { ret = (uint64_t)(int64_t)-4; }
+        else {
+            if (!cur->sigsusp_active) {
+                cur->sigsusp_saved  = cur->sig_blocked;
+                cur->sig_blocked    = tf->rdi & ~SIG_UNMASKABLE;
+                cur->sigsusp_active = 1;
+            }
+            if (sig_interrupted(cur, tf)) {
+                ret = (uint64_t)(int64_t)-4;          // EINTR; dispatch restores the mask
+            } else {
+                tf->rip -= 2;                         // re-run on wake (any signal_post)
                 sched_block_current(tf);              // NORETURN
                 ret = 0;
             }
@@ -179,7 +230,7 @@ uint64_t syscall_handler(trapframe_t* tf) {
         } else {
             extern int ksys_msg_recv_try(int chan, void* ubuf, int len);
             int n = ksys_msg_recv_try((int)tf->rdi, (void*)tf->rsi, (int)tf->rdx);
-            if (n == 0 && cur && signal_pending(cur)) {
+            if (n == 0 && cur && sig_interrupted(cur, tf)) {
                 ret = (uint64_t)(int64_t)(-4);              // [M30] EINTR
             } else if (n == 0 && cur) {
                 cur->recv_chan = (int)tf->rdi;
@@ -198,7 +249,7 @@ uint64_t syscall_handler(trapframe_t* tf) {
         if (cur && cur->sleep_until != 0 && now >= cur->sleep_until) {
             cur->sleep_until = 0;                       // deadline reached
             ret = 0;
-        } else if (cur && signal_pending(cur)) {
+        } else if (cur && sig_interrupted(cur, tf)) {
             cur->sleep_until = 0;                       // [M30] EINTR: abandon the sleep
             ret = (uint64_t)(int64_t)(-4);
         } else if (cur) {
@@ -219,9 +270,13 @@ uint64_t syscall_handler(trapframe_t* tf) {
     // (0 / -1) and all non-pipe reads/writes fall straight through.
     else if (num == SYS_READ || num == SYS_WRITE) {
         ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
+        // A TTY read interrupted by a stop (Ctrl-Z, SIGTTIN for a background
+        // reader, kill -STOP) restarts after SIGCONT instead of failing EINTR.
+        if (ret == (uint64_t)(int64_t)(-4) && cur && num == SYS_READ)
+            stop_and_restart_if_pending(cur, tf);
         if (ret == (uint64_t)(int64_t)(-2) && cur) {
             int fd = (int)tf->rdi;
-            if (signal_pending(cur)) {
+            if (sig_interrupted(cur, tf)) {
                 cur->wait_tty = 0;
                 ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR
             } else if (num == SYS_READ && cur->wait_tty) {

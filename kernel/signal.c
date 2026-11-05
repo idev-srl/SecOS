@@ -40,13 +40,55 @@ void signal_init_proc(process_t* p) {
     p->sig_restorer = 0;
 }
 
-// Is a non-blocked (or unmaskable) signal pending? Used by blocking syscalls to
-// return EINTR instead of sleeping.
+// Pending signals whose delivery would do nothing: explicitly ignored, or
+// default-ignore (SIGCHLD/SIGCONT with SIG_DFL). They must not interrupt a
+// blocking syscall (POSIX), e.g. the SIGCONT that resumes a stopped job.
+static uint64_t sig_noop_mask(process_t* p) {
+    uint64_t m = 0;
+    for (int s = 1; s < NSIG; s++) {
+        uint64_t d = p->sig_handler[s];
+        if (s == SIGKILL || s == SIGSTOP) continue;
+        if (d == SIG_IGN || (d == SIG_DFL && sig_default_ignore(s))) m |= SIGBIT(s);
+    }
+    return m;
+}
+
+// Is a non-blocked (or unmaskable) signal pending whose delivery has an effect?
+// Used by blocking syscalls to return EINTR instead of sleeping.
 int signal_pending(process_t* p) {
     if (!p) return 0;
     uint64_t deliverable = (p->sig_pending & ~p->sig_blocked) |
                            (p->sig_pending & SIG_UNMASKABLE);
+    deliverable &= ~sig_noop_mask(p);
     return deliverable != 0;
+}
+
+// Job control: if a deliverable signal whose action is "stop" is pending
+// (SIGSTOP, or SIGTSTP/SIGTTIN/SIGTTOU at SIG_DFL), consume it and return its
+// number, else 0. A blocking syscall uses this to stop the caller with the
+// syscall rewound, so it transparently restarts after SIGCONT instead of
+// failing with EINTR (Linux restarts syscalls interrupted by a stop).
+int signal_take_stop(process_t* p) {
+    if (!p) return 0;
+    uint64_t deliverable = (p->sig_pending & ~p->sig_blocked) |
+                           (p->sig_pending & SIG_UNMASKABLE);
+    if (deliverable & SIGBIT(SIGKILL)) return 0;    // dying: never stop again
+    for (int s = 1; s < NSIG; s++) {
+        if (!((deliverable >> s) & 1)) continue;
+        if (s == SIGSTOP || (sig_default_stop(s) && p->sig_handler[s] == SIG_DFL)) {
+            p->sig_pending &= ~SIGBIT(s);
+            return s;
+        }
+    }
+    return 0;
+}
+
+// Would SIGTTIN be acted on (neither blocked nor ignored)? A background reader
+// of the TTY whose SIGTTIN is blocked/ignored gets EIO instead (POSIX).
+int signal_ttin_acts(process_t* p) {
+    if (!p) return 0;
+    if ((p->sig_blocked >> SIGTTIN) & 1) return 0;
+    return p->sig_handler[SIGTTIN] != SIG_IGN;
 }
 
 // Post one signal to a process. If it is blocked in a syscall and the signal is
@@ -60,8 +102,17 @@ int signal_post(process_t* p, int sig) {
     if (sig == SIGCONT) {
         p->sig_pending &= ~(SIGBIT(SIGSTOP) | SIGBIT(SIGTSTP) |
                             SIGBIT(SIGTTIN) | SIGBIT(SIGTTOU));
-        if (p->state == PROC_STOPPED) p->state = PROC_READY;
+        if (p->state == PROC_STOPPED) {
+            p->state = PROC_READY;
+            // waitpid(WCONTINUED) report + SIGCHLD to the parent (POSIX).
+            p->stop_report = 0; p->cont_report = 1;
+            extern void sched_notify_parent_cont(process_t*);
+            sched_notify_parent_cont(p);
+        }
     }
+    // SIGKILL also ends a stopped process (POSIX): make it runnable so the
+    // pending SIGKILL is acted on at its next kernel exit.
+    if (sig == SIGKILL && p->state == PROC_STOPPED) { p->state = PROC_READY; p->stop_report = 0; }
     // A stop signal cancels a pending SIGCONT.
     if (sig_default_stop(sig)) p->sig_pending &= ~SIGBIT(SIGCONT);
 
@@ -69,26 +120,47 @@ int signal_post(process_t* p, int sig) {
 
     int deliverable = (sig == SIGKILL || sig == SIGSTOP) ||
                       !((p->sig_blocked >> sig) & 1);
+    // A signal whose delivery is a no-op (ignored / default-ignore) must not
+    // knock a blocked task out of its syscall.
+    if (deliverable && (sig_noop_mask(p) & SIGBIT(sig))) deliverable = 0;
     if (deliverable && p->state == PROC_BLOCKED) {
         // Tear down the wait condition so the woken task does not re-block before
         // it gets a chance to see the signal. SIGKILL needs no syscall re-run, but
         // making it READY lets the scheduler dispatch (and then kill) it.
-        p->wait_pid = -1; p->sleep_until = 0; p->recv_chan = -1; p->wait_pipe = NULL; p->wait_tty = 0;
+        // sleep_until is kept: a stop restarts SYS_SLEEP with its original
+        // deadline (the EINTR path clears it itself).
+        p->wait_pid = -1; p->recv_chan = -1; p->wait_pipe = NULL; p->wait_tty = 0;
         p->state = PROC_READY;
     }
     return 0;
 }
 
-struct pg_ctx { uint32_t pgid; int sig; int n; };
+// Collect the group under proc_lock, post outside it: signal_post may look up
+// the parent (SIGCONT -> SIGCHLD), which takes proc_lock again.
+#define PG_MAX 64
+struct pg_ctx { uint32_t pgid; int n; process_t* t[PG_MAX]; uint32_t skip; int all; };
 static void pg_cb(process_t* p, void* u) {
     struct pg_ctx* c = (struct pg_ctx*)u;
-    if (p->pgid == c->pgid && p->state != PROC_ZOMBIE) { signal_post(p, c->sig); c->n++; }
+    if (p->state == PROC_ZOMBIE || c->n >= PG_MAX) return;
+    if (c->all ? (p->pid != 0 && p->pid != c->skip) : (p->pgid == c->pgid)) c->t[c->n++] = p;
+}
+static int post_collected(struct pg_ctx* c, int sig) {
+    int n = 0;
+    for (int i = 0; i < c->n; i++) if (signal_post(c->t[i], sig) == 0) n++;
+    return n;
 }
 int signal_post_pgid(uint32_t pgid, int sig) {
     if (pgid == 0) return 0;
-    struct pg_ctx c = { pgid, sig, 0 };
+    struct pg_ctx c; c.pgid = pgid; c.n = 0; c.skip = 0; c.all = 0;
     process_foreach(pg_cb, &c);
-    return c.n;
+    return post_collected(&c, sig);
+}
+// kill(-1, sig): every user process except the caller (POSIX "all processes
+// the caller may signal"; single-user system).
+static int signal_post_all(uint32_t except, int sig) {
+    struct pg_ctx c; c.pgid = 0; c.n = 0; c.skip = except; c.all = 1;
+    process_foreach(pg_cb, &c);
+    return post_collected(&c, sig);
 }
 
 // ---- delivery: called from the asm return-to-ring3 chokepoints ----
@@ -105,10 +177,13 @@ void signal_dispatch(trapframe_t* tf) {
     for (;;) {
         uint64_t deliverable = (cur->sig_pending & ~cur->sig_blocked) |
                                (cur->sig_pending & SIG_UNMASKABLE);
-        if (!deliverable) return;
-
         int sig = 1; while (sig < NSIG && !((deliverable >> sig) & 1)) sig++;
-        if (sig >= NSIG) return;
+        if (!deliverable || sig >= NSIG) {
+            // sigsuspend() returned without a handler frame taking over its
+            // saved mask (only ignored signals): restore the mask now.
+            if (cur->sigsusp_active) { cur->sig_blocked = cur->sigsusp_saved; cur->sigsusp_active = 0; }
+            return;
+        }
         cur->sig_pending &= ~SIGBIT(sig);
 
         uint64_t disp = cur->sig_handler[sig];
@@ -116,12 +191,12 @@ void signal_dispatch(trapframe_t* tf) {
         // SIGKILL is never catchable.
         if (sig == SIGKILL) sched_kill_current(sig);          // NORETURN
         // SIGSTOP is never catchable.
-        if (sig == SIGSTOP) sched_stop_current(tf);           // NORETURN
+        if (sig == SIGSTOP) { cur->stop_sig = sig; sched_stop_current(tf); }  // NORETURN
 
         if (disp == SIG_IGN) continue;
         if (disp == SIG_DFL) {
             if (sig_default_ignore(sig)) continue;
-            if (sig_default_stop(sig))   sched_stop_current(tf);   // NORETURN
+            if (sig_default_stop(sig)) { cur->stop_sig = sig; sched_stop_current(tf); } // NORETURN
             sched_kill_current(sig);                                // NORETURN (term)
         }
 
@@ -129,6 +204,10 @@ void signal_dispatch(trapframe_t* tf) {
         sigframe_t sf;
         sf.magic = SIGFRAME_MAGIC;
         sf.saved_mask = cur->sig_blocked;
+        if (cur->sigsusp_active) {               // handler interrupts sigsuspend():
+            sf.saved_mask = cur->sigsusp_saved;  // sigreturn restores the pre-suspend mask
+            cur->sigsusp_active = 0;
+        }
         sf.saved = *tf;                          // full interrupted context
 
         uint64_t usp = tf->rsp;
@@ -184,19 +263,35 @@ long ksys_sigreturn(trapframe_t* tf) {
     return (long)s->rax;                                // preserve interrupted rax
 }
 
+// POSIX kill(): pid > 0 one process, 0 the caller's group, -1 everyone else,
+// < -1 the process group -pid (killpg; bash's `kill %job`). Errors: -EINVAL(22)
+// for a bad signal, -ESRCH(3) when nothing matched.
+struct pg_exists { uint32_t g; int n; };
+static void pg_exists_cb(process_t* p, void* u) {
+    struct pg_exists* e = (struct pg_exists*)u;
+    if (p->pgid == e->g && p->state != PROC_ZOMBIE) e->n++;
+}
 long ksys_kill(int pid, int sig) {
-    if (sig < 0 || sig >= NSIG) return -1;
+    if (sig < 0 || sig >= NSIG) return -22;
+    process_t* cur = sched_get_current();
     if (pid <= 0) {
-        // pid 0 / -1: address the caller's process group (job-control friendly).
-        process_t* cur = sched_get_current();
-        if (!cur) return -1;
-        if (sig == 0) return 0;
-        return signal_post_pgid(cur->pgid, sig) > 0 ? 0 : -1;
+        if (!cur) return -3;
+        if (pid == -1) {
+            if (sig == 0) return 0;
+            return signal_post_all(cur->pid, sig) > 0 ? 0 : -3;
+        }
+        uint32_t g = (pid == 0) ? cur->pgid : (uint32_t)(-pid);
+        if (sig == 0) {                                  // existence check only
+            struct pg_exists e = { g, 0 };
+            process_foreach(pg_exists_cb, &e);
+            return e.n > 0 ? 0 : -3;
+        }
+        return signal_post_pgid(g, sig) > 0 ? 0 : -3;
     }
     process_t* t = process_find_by_pid((uint32_t)pid);
-    if (!t) return -1;
-    if (sig == 0) return 0;                              // existence check only
-    return signal_post(t, sig);
+    if (!t) return -3;
+    if (sig == 0 || t->state == PROC_ZOMBIE) return 0;   // exists (a zombie until reaped)
+    return signal_post(t, sig) == 0 ? 0 : -3;
 }
 
 // [M30] setpgid(pid, pgid): pid 0 = caller; pgid 0 = the target's own pid (make
@@ -224,4 +319,12 @@ long ksys_sigprocmask(int how, uint64_t set, uint64_t* oldset_user) {
     cur->sig_blocked &= ~SIG_UNMASKABLE;                 // KILL/STOP never blockable
     if (oldset_user) { if (copy_to_user(oldset_user, &old, sizeof(old)) != 0) return -1; }
     return 0;
+}
+
+// getpgid(pid): pid 0 = caller. -ESRCH(3) for an unknown pid.
+long ksys_getpgid(int pid) {
+    process_t* cur = sched_get_current();
+    process_t* t = (pid == 0) ? cur : process_find_by_pid((uint32_t)pid);
+    if (!t) return -3;
+    return (long)t->pgid;
 }

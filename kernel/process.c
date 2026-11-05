@@ -122,6 +122,28 @@ process_t* process_find_zombie_child(uint32_t ppid) {
     spin_unlock_irqrestore(&proc_lock, fl);
     return z;
 }
+// Job control: find a child of `ppid` with an unreported stop (WUNTRACED) or
+// continue (WCONTINUED), consume the report, and return it; *status gets the
+// POSIX encoding: stopped = (sig << 8) | 0x7f, continued = 0xffff.
+process_t* process_take_jobctl_child(uint32_t ppid, int want_stop, int want_cont, int* status) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    process_t* r = NULL;
+    for (int i=0;i<MAX_PROCESSES && !r;i++) {
+        process_t* p = proc_table[i];
+        if (!p || p->ppid != ppid || p->state == PROC_ZOMBIE) continue;
+        if (want_stop && p->stop_report && p->state == PROC_STOPPED) {
+            p->stop_report = 0;
+            *status = ((p->stop_sig & 0xff) << 8) | 0x7f;
+            r = p;
+        } else if (want_cont && p->cont_report) {
+            p->cont_report = 0;
+            *status = 0xffff;
+            r = p;
+        }
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return r;
+}
 int process_has_children(uint32_t ppid) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     int n = 0;
@@ -364,7 +386,9 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     // shell sets pgid for pipelines after creation). pid is assigned above.
     { extern void signal_init_proc(process_t*); signal_init_proc(p); }
     p->pgid = p->pid; p->ppid = 0; p->spawner_pid = 0;
+    p->stop_report = 0; p->cont_report = 0; p->stop_sig = 0;
     p->wait_tty = 0;
+    p->sigsusp_active = 0; p->sigsusp_saved = 0;
     p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
     // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases
     // (<=32MB each, within their multi-GB regions). Transparent to programs.
@@ -595,7 +619,9 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     // pending set starts empty in the child (POSIX). ppid = parent; pgid inherited.
     c->sig_pending = 0;
     c->ppid = parent->pid; c->pgid = parent->pgid; c->spawner_pid = 0;
+    c->stop_report = 0; c->cont_report = 0; c->stop_sig = 0;
     c->wait_tty = 0;
+    c->sigsusp_active = 0; c->sigsusp_saved = 0;
     c->state = PROC_BLOCKED;                   // not runnable until fully built
 
     // [M25] The child inherits the parent's open pipe ends (fds were shallow
