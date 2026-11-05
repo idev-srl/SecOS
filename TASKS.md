@@ -108,6 +108,8 @@ robustness and the paused real-hardware bring-up — see below.
 - [ ] Symlinks / hard links on the ramfs root (BusyBox `ln`, applet symlinks).
 - [ ] Rare flake: M10/fat32 once ran `hello` a second time after its `SYS_EXIT` and
       faulted (1 of ~11 runs; 8/8 reruns clean) — zombie resumed? Needs a repro.
+- [ ] Signal handler frames do not save the x87/SSE state (the scheduler does since
+      integ/phase2): a handler using doubles can clobber the interrupted code's XMM.
 - [ ] **Serial input drops the first char of a line** under bash in QEMU (PS/2 is fine) —
       cosmetic, but hurts serial-driven tests.
 - [ ] pthreads subset (on M19 COW/fork), fuller stdio/locale.
