@@ -1050,6 +1050,43 @@ grep -q "\[HEAP\] heapcheck: OK" "$HDBGLOG"; check "HEAP debug: shell heapcheck 
 ! grep -q "\[HEAP\] CORRUPTION DETECTED" "$HDBGLOG"; check "HEAP debug: no false-positive corruption report" $?
 ! grep -q "\[EXC\]" "$HDBGLOG"; check "no CPU exception ([EXC]) during heap debug run" $?
 
+# ============================================================================
+# UACCESS GATE: bad user pointers in syscalls return -EFAULT, never a ring-0
+# fault. The signed ring-3 program user/uaccess_test.c (/bin/uaccess_test)
+# hands ~25 syscalls an in-range but unmapped (munmap'd hole, 0xDEADBEEF) or
+# read-only (PROT_NONE) pointer — including the three fuzzer-found triggers
+# (spawn wild path, lstat into PROT_NONE, write(1, p, 1 MB) off the mapping) —
+# and asserts the error code. It also checks the paths the fixups must NOT
+# break: kernel-mode demand paging of a fresh buffer (M14), a kernel write into
+# a copy-on-write page after fork (M19, needs CR0.WP), and a sigframe pushed
+# from the #PF return path onto a fresh stack page (nested #PF, needs #PF off
+# IST). Rebuilds a plain image: the heap section above left a debug build.
+# ============================================================================
+UALOG=/tmp/secos_selftest_uaccess.log
+echo "[selftest] Building plain image for the uaccess gate..."
+make clean >/dev/null 2>&1 || true
+if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] UACCESS BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    exit 2
+fi
+echo "[selftest] Running uaccess gate (mb2, serial, 50s)..."
+: > "$UALOG"
+( sleep 25; printf '  /bin/uaccess_test; echo UA-$((6*7))-END\r'; sleep 15 ) | \
+    timeout 50 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$UALOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "\[UA-TEST\] DONE pass=[0-9]* fail=0" "$UALOG"; check "UACCESS every bad-pointer case returns an error (DONE fail=0)" $?
+grep -q "UA-42-END" "$UALOG"; check "UACCESS shell survives the test (sentinel reached)" $?
+grep -q "\[UA-TEST\] spawn-wild-path OK" "$UALOG"; check "UACCESS spawn(0xDEADBEEF) -> -EFAULT" $?
+grep -q "\[UA-TEST\] lstat-protnone-statbuf OK" "$UALOG"; check "UACCESS lstat into a PROT_NONE page -> -EFAULT" $?
+grep -q "\[UA-TEST\] write-console-overrun OK" "$UALOG"; check "UACCESS write(1, p, 1 MB) off the mapping -> -EFAULT/short" $?
+grep -q "\[UA-TEST\] read-into-demand-page OK" "$UALOG"; check "UACCESS kernel-mode demand paging still serviced (M14)" $?
+grep -q "\[UA-TEST\] kernel-write-to-cow-page OK" "$UALOG"; check "UACCESS kernel write into a COW page copies it (M19, CR0.WP)" $?
+grep -q "\[UA-TEST\] sigframe-from-pf-path OK" "$UALOG"; check "UACCESS sigframe from the #PF return path (nested #PF)" $?
+! grep -q "\[UA-TEST\] .* FAIL" "$UALOG"; check "UACCESS no case failed" $?
+! grep -q "ring0" "$UALOG"; check "UACCESS no ring-0 CPU fault" $?
+! grep -q "\[PANIC\]" "$UALOG"; check "UACCESS no kernel panic" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

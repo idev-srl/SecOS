@@ -394,11 +394,15 @@ void vmm_protect_kernel_sections(void) {
     uint64_t img_hi = (rw_hi + two_mb - 1) & ~(two_mb - 1);
     for (uint64_t v = img_lo; v < img_hi; v += PAGE_SIZE) {
         int is_text = (v >= txt_lo && v < txt_hi);
-        int is_rw   = (v >= rw_lo  && v < rw_hi);
+        // The tail past _bss_end (up to the 2 MB boundary) is RW/NX, not R/NX:
+        // the PMM places its frame bitmap + COW refcount array at _kernel_end,
+        // so it is live writable kernel data. It was only "writable" before
+        // because CR0.WP was clear (ring-0 writes ignored the RO bit).
+        int is_rw   = (v >= rw_lo  && v < img_hi);
         uint64_t clear = 0, set = 0;
         if (is_text) { clear = VMM_FLAG_RW | VMM_FLAG_NOEXEC; }       // RX
         else if (is_rw) { clear = 0; set = VMM_FLAG_RW | VMM_FLAG_NOEXEC; } // RW/NX
-        else { clear = VMM_FLAG_RW; set = VMM_FLAG_NOEXEC; }          // R/NX (rodata+gaps+note+tail)
+        else { clear = VMM_FLAG_RW; set = VMM_FLAG_NOEXEC; }          // R/NX (rodata+gaps+note)
         kset_flags(v, clear, set);
     }
 
@@ -1204,6 +1208,9 @@ int vmm_unmap(uint64_t virt) {
 int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
     if (!space) return -10;
     if (virt & 0xFFF) return -1; // not aligned
+    // User half only: the kernel half is shared by every space, so unmapping
+    // (and freeing!) a kernel frame here would corrupt the whole kernel.
+    if (virt >= VMM_USER_TOP) return -1;
     uint64_t* pt = get_pt_space(space, virt, 0, 0);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
@@ -1223,6 +1230,8 @@ int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
 int vmm_protect_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
     if (!space) return -10;
     if (virt & 0xFFF) return -1;
+    // User half only: this sets the USER bit, which must never reach a kernel PTE.
+    if (virt >= VMM_USER_TOP) return -1;
     if ((flags & VMM_FLAG_RW) && !(flags & VMM_FLAG_NOEXEC)) return -5; // W^X
     uint64_t* pt = get_pt_space(space, virt, 0, 0);
     if (!pt) return -3;
@@ -1332,7 +1341,7 @@ void vmm_dump_entry(uint64_t virt) {
 // Returns 0 if the fault was serviced (the instruction should retry); -1 if it
 // is a genuine violation. [M15] On -1 the caller (exception_handler) decides
 // kill (ring-3) vs panic (ring-0) — this function no longer halts.
-int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+int vmm_try_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     // [M19] COW: a WRITE to a PRESENT page (protection fault) that is marked
     // copy-on-write -> give the writer a private copy and continue.
     if ((error_code & 1) && (error_code & 2)) {
@@ -1363,8 +1372,11 @@ int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
         }
     }
 
-    // Unhandled: a genuine violation (protection, no VMA, or alloc failure).
-    // Report tersely on debugcon and let the caller terminate the offender.
+    return -1; // not serviceable: caller reports / fixes up / kills / panics
+}
+
+// Report an unserviceable fault tersely on debugcon.
+void vmm_report_page_fault(uint64_t fault_addr, uint64_t error_code) {
     debugcon_writestring("[PF] UNHANDLED fault addr=0x"); debugcon_print_hex(fault_addr);
     debugcon_writestring(" ec=0x"); debugcon_print_hex(error_code);
     debugcon_writestring(error_code & 1 ? " (protection" : " (not-present");
@@ -1372,5 +1384,13 @@ int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     debugcon_writestring(error_code & 4 ? ",user" : ",kernel");
     if (error_code & 16) debugcon_writestring(",instr");
     debugcon_writestring(")\n");
+}
+
+// Service a fault (demand paging / COW) or report it. 0=handled, -1=genuine.
+int vmm_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
+    if (vmm_try_handle_page_fault(fault_addr, error_code) == 0) return 0;
+    // Unhandled: a genuine violation (protection, no VMA, or alloc failure).
+    // Report tersely on debugcon and let the caller terminate the offender.
+    vmm_report_page_fault(fault_addr, error_code);
     return -1;
 }

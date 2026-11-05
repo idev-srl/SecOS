@@ -28,24 +28,52 @@ int user_range_valid(const void* ptr, size_t len) {
     return 1;
 }
 
+/* Fault-tolerant primitives (arch/x86/uaccess.asm), covered by .ex_table. */
+extern uint64_t __uaccess_copy(void* dst, const void* src, uint64_t n);
+extern long     __uaccess_strncpy(char* dst, const char* usrc, uint64_t max);
+
 int copy_from_user(void* dst, const void* user_src, size_t len) {
     if (!user_range_valid(user_src, len)) return -EFAULT;
-
-    const uint8_t* s = (const uint8_t*)user_src;
-    uint8_t*       d = (uint8_t*)dst;
     ua_begin();
-    for (size_t i = 0; i < len; i++) d[i] = s[i];
+    uint64_t left = __uaccess_copy(dst, user_src, len);
     ua_end();
-    return 0;
+    return left ? -EFAULT : 0;
 }
 
 int copy_to_user(void* user_dst, const void* src, size_t len) {
     if (!user_range_valid(user_dst, len)) return -EFAULT;
-
-    const uint8_t* s = (const uint8_t*)src;
-    uint8_t*       d = (uint8_t*)user_dst;
     ua_begin();
-    for (size_t i = 0; i < len; i++) d[i] = s[i];
+    uint64_t left = __uaccess_copy(user_dst, src, len);
     ua_end();
+    return left ? -EFAULT : 0;
+}
+
+long strncpy_from_user(char* dst, const char* user_src, size_t max) {
+    uint64_t s = (uint64_t)user_src;
+    if (max == 0) return -ENAMETOOLONG;
+    if (s == 0 || s >= USER_ADDR_MAX) return -EFAULT;
+    /* Never read past the top of the user range. */
+    uint64_t lim = max;
+    if (lim > USER_ADDR_MAX - s) lim = USER_ADDR_MAX - s;
+    ua_begin();
+    long n = __uaccess_strncpy(dst, user_src, lim);
+    ua_end();
+    if (n < 0) return -EFAULT;                       /* faulted mid-string */
+    if ((uint64_t)n == lim) {                        /* no NUL within lim */
+        dst[max - 1] = 0;
+        return (lim < max) ? -EFAULT : -ENAMETOOLONG;
+    }
+    return n;
+}
+
+/* Exception-table search. The table is tiny (one entry per user-access insn),
+ * so a linear scan is fine. Returns the fixup rip, or 0 if rip is not a
+ * registered user-access instruction. */
+struct ex_entry { uint64_t insn, fixup; };
+extern const struct ex_entry __ex_table_start[], __ex_table_end[];
+
+uint64_t uaccess_fixup_lookup(uint64_t rip) {
+    for (const struct ex_entry* e = __ex_table_start; e < __ex_table_end; e++)
+        if (e->insn == rip) return e->fixup;
     return 0;
 }

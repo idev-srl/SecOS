@@ -44,6 +44,13 @@ SECTIONS
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VMA) {
         _rodata_start = .;
         *(.rodata*)
+        /* Exception table: {faulting insn, fixup} pairs for the user-access
+         * primitives (arch/x86/uaccess.asm). Read-only, searched on a ring-0
+         * #PF on a user address (kernel/panic.c -> uaccess_fixup_lookup). */
+        . = ALIGN(8);
+        __ex_table_start = .;
+        KEEP(*(.ex_table))
+        __ex_table_end = .;
         _rodata_end = .;
     }
 

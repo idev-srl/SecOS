@@ -116,7 +116,7 @@ void tss_init(uint64_t kernel_rsp0) {
 
     // IST pointers: virtual tops (stacks grow downward from top)
     tss.ist1 = m2_ist1_top;   // Double Fault   (#8)
-    tss.ist2 = m2_ist2_top;   // Page Fault     (#14)
+    tss.ist2 = m2_ist2_top;   // reserved: #PF no longer uses an IST (must nest; see idt.c)
     tss.ist3 = m2_ist3_top;   // GPF            (#13)
 
     tss.iomap_base = sizeof(tss_t);

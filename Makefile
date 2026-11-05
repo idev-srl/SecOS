@@ -39,7 +39,8 @@ DEPFLAGS = -MMD -MP
 CFLAGS  += $(DEPFLAGS)
 LDFLAGS = -n -T linker.ld
 
-SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.asm $(ARCH_DIR)/context_switch_asm.asm
+SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.asm $(ARCH_DIR)/context_switch_asm.asm \
+          $(ARCH_DIR)/uaccess.asm
 SRC_C   = \
 	$(KERNEL_DIR)/kernel.c \
 	$(ARCH_DIR)/idt.c $(ARCH_DIR)/tss.c $(ARCH_DIR)/context_switch.c \
@@ -361,6 +362,11 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/sysfuzz.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/sysfuzz.o
 	python3 tools/secos-sign user/sysfuzz.elf --dev
 	python3 tools/elf2h.py user/sysfuzz.elf user_sysfuzz_elf crypto/user_sysfuzz_elf.h
+	# [uaccess] bad-user-pointer -EFAULT regression test (selftest uaccess gate)
+	$(CC) $(USER_CFLAGS) -c user/uaccess_test.c -o user/uaccess_test.o
+	$(LD) --gc-sections -T user/user.ld -o user/uaccess_test.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/uaccess_test.o
+	python3 tools/secos-sign user/uaccess_test.elf --dev
+	python3 tools/elf2h.py user/uaccess_test.elf user_uaccess_elf crypto/user_uaccess_elf.h
 	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig -> crypto/*.h"
 
 # Staleness guard for the committed embedded programs: rebuild + re-sign them

@@ -1243,6 +1243,7 @@ static void m24_run_demo(void) {
 #include "../crypto/user_init_elf.h"
 #include "../crypto/user_svc_elf.h"
 #include "../crypto/user_sysfuzz_elf.h"
+#include "../crypto/user_uaccess_elf.h"
 static void coreutils_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1270,6 +1271,8 @@ static void coreutils_install(void) {
     debugcon_writestring("[M32] init + svc installed to /bin\n");
     // [stress] seeded ring-3 syscall fuzzer (soak.sh / selftest fuzz gate)
     vfs_create("/bin/sysfuzz", user_sysfuzz_elf, user_sysfuzz_elf_len);
+    // [uaccess] bad-user-pointer regression test (-EFAULT, never a ring-0 fault)
+    vfs_create("/bin/uaccess_test", user_uaccess_elf, user_uaccess_elf_len);
 }
 extern void shell_init(void);
 extern void shell_run(void);
@@ -2105,11 +2108,24 @@ void cpu_enable_mitigations(void) {
 #ifdef SECOS_SMAP
     if (smap) { g_smap_enabled = 1; __asm__ volatile("clac"); }
 #endif
+    // CR0.WP: make ring-0 writes honour read-only PTEs. Without it a kernel
+    // write into a user page (copy_to_user from read()/stat()) silently ignored
+    // the RO bit: it scribbled on PROT_NONE / mprotect(RO) pages and, worse, on
+    // a copy-on-write frame still shared with the fork parent (no COW fault ->
+    // the child's read() modified the parent's memory). With WP set the write
+    // faults, and the #PF handler COW-copies or the uaccess fixup returns
+    // -EFAULT. It also enforces RO kernel sections against ring-0 writes.
+    {
+        uint64_t cr0;
+        __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+        cr0 |= (1UL << 16);                   // CR0.WP
+        __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
+    }
     debugcon_writestring("[M36] mitigations: SMEP=");
     debugcon_writestring(smep ? "on" : "n/a");
     debugcon_writestring(" SMAP=");
     debugcon_writestring(g_smap_enabled ? "on" : (smap ? "available(opt-in)" : "n/a"));
-    debugcon_writestring(" stack-canary=on\n");
+    debugcon_writestring(" stack-canary=on WP=on\n");
 }
 
 // [M37] Measured boot. Compute a SHA-256 over the immutable kernel image
