@@ -20,8 +20,8 @@
 #   tools/soak.sh --smp 1|2
 #   tools/soak.sh --disk          # attach an ext4 virtio-blk data disk at /mnt
 #   tools/soak.sh --fuzz          # also run the signed syscall fuzzer (safe mode)
-#   tools/soak.sh --cmdsub        # enable $(...) command substitution (known-hung
-#                                 # on main until fix/bash-cmdsubst lands)
+#   tools/soak.sh --no-cmdsub     # disable $(...) command substitution (default on)
+#   tools/soak.sh --no-pipes      # disable pipelines (default on)
 #   tools/soak.sh --log PATH      # debugcon+serial log path (default /tmp/soak.log)
 #
 # Exit: 0 = PASS (session completed, no kernel fault), 1 = FAIL (see log + .repro).
@@ -30,8 +30,8 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-LONG=0; SEED=$RANDOM; ITERS=250; MEM=256M; SMP=1; DISK=0; FUZZ=0; CMDSUB=0
-LOG=/tmp/soak.log; SETTLE=28; STALL=25; PIPES=0
+LONG=0; SEED=$RANDOM; ITERS=250; MEM=256M; SMP=1; DISK=0; FUZZ=0; CMDSUB=1
+LOG=/tmp/soak.log; SETTLE=28; STALL=25; PIPES=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --long)   LONG=1 ;;
@@ -42,7 +42,9 @@ while [[ $# -gt 0 ]]; do
         --disk)   DISK=1 ;;
         --fuzz)   FUZZ=1 ;;
         --cmdsub) CMDSUB=1 ;;
+        --no-cmdsub) CMDSUB=0 ;;
         --pipes)  PIPES=1 ;;
+        --no-pipes) PIPES=0 ;;
         --log)    shift; LOG=$1 ;;
         --settle) shift; SETTLE=$1 ;;
         --stall)  shift; STALL=$1 ;;
@@ -68,15 +70,15 @@ if [[ $DISK -eq 1 ]]; then
     QEMU+=(-drive file=disk.img,if=virtio,format=raw)
 fi
 
-echo "[soak] seed=$SEED iters=$ITERS mem=$MEM smp=$SMP disk=$DISK fuzz=$FUZZ cmdsub=$CMDSUB"
+echo "[soak] seed=$SEED iters=$ITERS mem=$MEM smp=$SMP disk=$DISK fuzz=$FUZZ cmdsub=$CMDSUB pipes=$PIPES"
 : > "$LOG"
 
 OPTS=(--seed "$SEED" --iters "$ITERS" --settle "$SETTLE" --stall "$STALL"
       --smp "$SMP" --log "$LOG")
 [[ $DISK   -eq 1 ]] && OPTS+=(--disk)
 [[ $FUZZ   -eq 1 ]] && OPTS+=(--fuzz)
-[[ $CMDSUB -eq 1 ]] && OPTS+=(--cmdsub)
-export SOAK_PIPES=$PIPES
+[[ $CMDSUB -eq 0 ]] && OPTS+=(--no-cmdsub)
+[[ $PIPES  -eq 0 ]] && OPTS+=(--no-pipes)
 
 python3 tools/soak_drive.py "${OPTS[@]}" -- "${QEMU[@]}"
 rc=$?

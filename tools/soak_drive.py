@@ -18,7 +18,7 @@
 import sys, os, time, random, subprocess, threading, re
 
 def parse(argv):
-    o = {"seed":1234,"iters":400,"settle":25.0,"stall":20.0,"cmdsub":0,"fuzz":0,
+    o = {"seed":1234,"iters":400,"settle":25.0,"stall":20.0,"cmdsub":1,"pipes":1,"fuzz":0,
          "disk":0,"log":"/tmp/soak.log","smp":1}
     i=0
     while i < len(argv):
@@ -27,7 +27,8 @@ def parse(argv):
         k=a.lstrip("-")
         if k in ("seed","iters","smp"): o[k]=int(argv[i+1]); i+=2; continue
         if k in ("settle","stall"):     o[k]=float(argv[i+1]); i+=2; continue
-        if k in ("cmdsub","fuzz","disk"): o[k]=1; i+=1; continue
+        if k in ("cmdsub","pipes","fuzz","disk"): o[k]=1; i+=1; continue
+        if k in ("no-cmdsub","no-pipes"): o[k[3:]]=0; i+=1; continue
         if k=="log": o["log"]=argv[i+1]; i+=2; continue
         i+=1
     return o, []
@@ -73,10 +74,11 @@ def main():
     o, qemu = parse(sys.argv[1:])
     r = random.Random(o["seed"])
     st = {"tmp":"/tmp","fc":0,"dc":0,
-          "pipes": bool(o.get("pipes",1)),  # pipelines on unless disabled
-          "cmdsub": o["cmdsub"]}
-    # pipelines are known-broken on main until fix/bash-cmdsubst lands; default off
-    st["pipes"] = bool(int(os.environ.get("SOAK_PIPES","0")))
+          "pipes": bool(o["pipes"]),  # pipelines on unless --no-pipes
+          "cmdsub": o["cmdsub"]}       # $(...) on unless --no-cmdsub
+    # legacy override: SOAK_PIPES=0 disables pipelines
+    if os.environ.get("SOAK_PIPES") is not None:
+        st["pipes"] = bool(int(os.environ["SOAK_PIPES"]))
 
     print(f"[soak] seed={o['seed']} iters={o['iters']} smp={o['smp']} disk={o['disk']} "
           f"cmdsub={o['cmdsub']} fuzz={o['fuzz']} pipes={st['pipes']}", flush=True)
