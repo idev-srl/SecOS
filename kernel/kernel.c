@@ -1290,6 +1290,7 @@ extern void shell_run_line(const char* line);
 #ifndef SECOS_NO_LUA
 #include "../crypto/user_lua_elf.h"      // [M34] installed to /bin/lua at boot
 #endif
+#include "../crypto/user_power_elf.h"    // /bin/{poweroff,reboot,halt,shutdown}
 static uint8_t   m10_idle_stack[32768] __attribute__((aligned(16)));
 static process_t m10_idle;
 static trapframe_t m10_idle_tf;
@@ -1306,6 +1307,14 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
           else debugcon_writestring("[M39] FAIL: could not install /bin/bash\n");
       } }
 #endif
+    // Orderly shutdown commands (one signed multi-call program, SYS_REBOOT).
+    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
+      static const char* const pw[] = { "/bin/poweroff", "/bin/reboot", "/bin/halt", "/bin/shutdown", 0 };
+      int ok = 0;
+      for (int i = 0; pw[i]; i++)
+          if (vfs_lookup(pw[i]) || vfs_create(pw[i], user_power_elf, user_power_elf_len) == 0) ok++;
+      debugcon_writestring(ok == 4 ? "[POWER] poweroff/reboot/halt/shutdown installed to /bin\n"
+                                   : "[POWER] FAIL: could not install the power commands\n"); }
 #ifndef SECOS_NO_LUA
     // [M34] Install the signed lua 5.4.7 interpreter to /bin/lua (idempotent, also
     // on a persistent root populated before lua was installed by default).

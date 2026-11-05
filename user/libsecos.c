@@ -101,6 +101,9 @@ int setpgid(int pid, int pgid){ return (int)__se(secos_syscall(SYS_SETPGID, pid,
  * a process-group leader and getsid() reports the group. */
 int getpgid(int pid){ return (int)__se(secos_syscall(57 /*SYS_GETPGID*/, pid, 0, 0, 0, 0)); }
 int getpgrp(void){ return getpgid(0); }
+/* Orderly shutdown (SYS_REBOOT 59): terminate all processes, sync + unmount
+ * the filesystems, then power off / reset / halt. Returns only on failure. */
+int secos_reboot(int cmd){ return (int)secos_syscall(59 /*SYS_REBOOT*/, cmd, 0, 0, 0, 0); }
 int killpg(int pgrp, int sig){
     if(pgrp <= 1){ errno = EINVAL; return -1; }
     return kill(-pgrp, sig);

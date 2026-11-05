@@ -117,6 +117,10 @@ int     killpg(int pgrp, int sig);                       /* == kill(-pgrp, sig) 
 int     setsid(void);                                    /* no sessions: become a group leader */
 int     getsid(int pid);
 int     sigsuspend(const unsigned long* mask);           /* always -1/EINTR */
+#define SECOS_REBOOT_POWEROFF 1                          /* secos_reboot() commands */
+#define SECOS_REBOOT_RESTART  2
+#define SECOS_REBOOT_HALT     3
+int     secos_reboot(int cmd);                           /* orderly shutdown; returns only on error */
 
 /* [M25] anonymous pipe: fds[0]=read end, fds[1]=write end. 0 on success, -1 on error. */
 int     pipe(int fds[2]);
