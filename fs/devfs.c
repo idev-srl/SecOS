@@ -21,7 +21,7 @@
 
 extern uint64_t timer_get_ticks(void);
 
-enum dev_kind { DEV_NULL, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_CONSOLE, DEV_BLOCK };
+enum dev_kind { DEV_NULL, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_CONSOLE, DEV_BLOCK, DEV_KMSG };
 
 struct dev_node {
     char name[16];
@@ -29,7 +29,7 @@ struct dev_node {
     block_dev_t* blk;     // for DEV_BLOCK
 };
 
-#define DEVFS_MAX 16
+#define DEVFS_MAX 20
 static struct dev_node g_nodes[DEVFS_MAX];
 static int g_nnodes;
 static vfs_inode_t g_inodes[DEVFS_MAX + 1];   // +1 for the root dir
@@ -59,6 +59,7 @@ static void devfs_build(void) {
     add("urandom", DEV_RANDOM, NULL);
     add("console", DEV_CONSOLE, NULL);
     add("tty", DEV_CONSOLE, NULL);
+    add("kmsg", DEV_KMSG, NULL);                 // kernel log, one record per read()
     int n = block_count();
     for (int i = 0; i < n; i++) {
         block_dev_t* b = block_get(i);
@@ -138,6 +139,10 @@ static int devfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
             return tty_read(buf, (int)len);
         }
         case DEV_BLOCK: return blk_byte_io(d->blk, off, buf, len, 0);
+        case DEV_KMSG: {
+            extern int klog_kmsg_read(uint64_t off, char* out, size_t len);
+            return klog_kmsg_read(off, (char*)buf, len);
+        }
     }
     return -1;
 }
@@ -152,6 +157,12 @@ static int devfs_write(vfs_inode_t* inode, size_t off, const void* buf, size_t l
         case DEV_RANDOM: return (int)len;                         // reseed ignored
         case DEV_CONSOLE: for (size_t i=0;i<len;i++) terminal_putchar((char)in[i]); return (int)len;
         case DEV_BLOCK: return blk_byte_io(d->blk, off, (void*)(uintptr_t)buf, len, 1);
+        case DEV_KMSG: {                                          // userspace -> kernel log
+            extern void klog_putc(char c);
+            for (size_t i=0;i<len && i<512;i++) klog_putc((char)in[i]);
+            if (len && in[len-1] != '\n') klog_putc('\n');
+            return (int)len;
+        }
     }
     return -1;
 }
