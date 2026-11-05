@@ -16,9 +16,14 @@ static size_t inode_cache_used = 0;
 static vfs_inode_t* inode_from_entry(const ramfs_entry_t* e){ if(!e) return NULL; // search cache
     // [M38] refresh the cached size on every lookup (a prior write may have grown
     // the entry) so e.g. `>>` append seeks to the real end of file.
-    for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e){ inode_cache[i].size = e->size; return &inode_cache[i]; } }
-    if(inode_cache_used >= sizeof(inode_cache)/sizeof(inode_cache[0])) return NULL;
-    vfs_inode_t* ino = &inode_cache[inode_cache_used++];
+    // A ramfs slot is reused after a remove, so the cached path/type may belong to
+    // the slot's previous file: rebuild them too (cheap) whenever we hand it out.
+    vfs_inode_t* ino = NULL;
+    for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e){ ino = &inode_cache[i]; break; } }
+    if(!ino){
+        if(inode_cache_used >= sizeof(inode_cache)/sizeof(inode_cache[0])) return NULL;
+        ino = &inode_cache[inode_cache_used++];
+    }
     // Path already absolute in ramfs_entry_t.name (without leading '/')
     // Build canonical path with leading '/' (root = "/")
     size_t k=0; const char* src=e->name; if(!src[0]){ ino->path[0]='/'; ino->path[1]=0; } else {
