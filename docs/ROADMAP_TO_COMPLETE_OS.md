@@ -2,8 +2,8 @@
 
 _Strategic plan from the current state to a complete, networked, multi-process,
 secure operating system — headless (no GUI) for now._
-_Written 2026-06-18; **realigned to actual state 2026-06-20** (HEAD `a358f42`,
-selftest 165/165). Companion to `ROADMAP_SECoS.md` (technical) and
+_Written 2026-06-18; realigned 2026-06-20; **realigned again 2026-11-04** to the
+commit history through M39 (selftest 182/182 at `e66a57f`). Companion to `ROADMAP_SECoS.md` (technical) and
 `docs/DEVELOPMENT_PLAN.md` (phases A–E)._
 
 > **Reading note on milestone numbers.** This document was first written with
@@ -11,7 +11,13 @@ selftest 165/165). Companion to `ROADMAP_SECoS.md` (technical) and
 > a different numbering. This file now uses the **real** numbers: M0–M13 (A–E),
 > M14 (demand paging), M15–M17 (F), M18–M20 (G), M21 (AHCI), M22 (NVMe+USB),
 > M23 (POSIX FS), M24 (networking, pulled early), M25 (pipes+TTY), M26–M27 (H),
-> M28–M29 (I = ACPI/APIC/TSC + SMP). Remaining future work is renumbered **M30+**.
+> M28–M29 (I = ACPI/APIC/TSC + SMP), M30 (signals), M31–M32 (K), **M33 (full
+> ext4 + metadata_csum)**, **M34 (lua from source)**, **M35 (capabilities)**,
+> **M36 (mitigations)**, **M37 (measured boot)**, **M38 (WiFi scaffold + WPA2
+> crypto)**, **M39 (secure boot, full kernel W^X, user ASLR, POSIX foundation,
+> bash from source + boot-into-bash, ath9k_hw port)**. An earlier draft of this
+> file used M33–M35 for caps/mitigations/boot integrity — those shipped as
+> M35–M37. Open work is tracked in `TASKS.md` (no pre-assigned numbers).
 
 ## Definition of "complete OS (no GUI)"
 
@@ -19,28 +25,33 @@ A system that:
 1. **survives misbehaving userspace** (a faulting/abusive process is killed, not
    the kernel); ✅ (M15)
 2. has a **real process model** — argv/env, exec, fork-or-spawn, signals,
-   blocking wait, pipes, a TTY with job control; **mostly ✅** (M16/M17/M19/M25) —
-   **signals + job control still open** (M30);
+   blocking wait, pipes, a TTY with job control; ✅ (M16/M17/M19/M25/M30) —
+   _open:_ in-place `execve` (emulated today), raw-mode TTY, poll/select;
 3. has a **complete virtual-memory API** — mmap/mprotect/brk, COW, shared memory,
    a unified page cache; ✅ (M18–M20) — `MAP_SHARED` still future;
 4. has a **mature storage stack** — permissions/ownership, symlinks, journaling /
    crash consistency, pseudo-filesystems (dev/proc); ✅ (M23/M26/M27);
 5. uses **modern interrupts and runs on multiple cores** (APIC/IOAPIC, SMP);
-   ✅ (M28/M29);
+   ✅ APIC/TSC (M28); **SMP implemented but OFF by default** (M29 — AP bring-up
+   opt-in since `3f776dd` after a real-HW freeze; needs TLB shootdown + audit);
 6. is **networked** — a driver, a TCP/IP stack, BSD sockets; ✅ (M24);
 7. ships a **usable userland** — a real libc, a shell, ported tools, an init /
-   service manager; **partial** — native shell + minimal libc; full libc / ported
-   tools / init still open (Phase K, M31–M32);
+   service manager; ✅ (M31/M32/M34/M39: libc, coreutils, signed packages,
+   supervised init, lua + **GNU bash compiled from source**, bash as the boot
+   shell) — _open:_ PID-1 init at boot, more ports (sqlite, dash);
 8. keeps its **security identity central** — everything signed, capability-rooted
-   permissions, exploit mitigations, an audit trail; **partial** — signing +
-   driver caps in; generalized caps / mitigations / audit open (Phase L, M33–M35).
+   permissions, exploit mitigations, an audit trail; ✅ (M35–M37 + M39: caps +
+   `[AUDIT]` + key revocation, SMEP/canaries/full W^X, measured + UEFI secure boot,
+   user ASLR) — _open:_ SMAP by default, kernel KASLR, package keyring.
 
-**Where we are:** points 1, 3, 4, 5, 6 are **done**; 2 is done except async
-signals; 7 and 8 are the remaining frontier. SECoS boots dual UEFI/MB2, runs a
-higher-half SMP kernel on multiple cores with demand paging, **mandatory Ed25519
-code signing as the root of trust**, a capability-mediated driver space, RW
-FAT32/ext2/ext4 with journaling, a full TCP/IP stack, and a multi-process signed
-userland that survives faults.
+**Where we are:** all eight points are met at a first level; the remaining work
+is depth (POSIX completeness for ports, robustness, SMP hardening, SMAP/KASLR) and
+real-hardware bring-up (WiFi radio, NIC/UEFI validation). SECoS boots dual
+UEFI/MB2 (UEFI path secure-booted), runs a higher-half fully-W^X kernel with
+demand paging, **mandatory Ed25519 code signing as the root of trust**,
+capability-confined processes, RW FAT32/ext2/ext4 (journaling + metadata_csum), a
+full TCP/IP stack, and a signed userland whose login shell is GNU bash compiled
+from source.
 
 ## Guiding principles
 
@@ -61,7 +72,7 @@ An unhandled ring-3 fault **kills the offending process** and returns to the
 scheduler instead of halting (M15, `sched_kill_current`, exit status `128+vector`).
 argv/env on the demand-paged user stack + `SYS_SPAWN` + blocking `SYS_WAIT` (M16).
 Wait queues + block/wake core + `SYS_SLEEP` + blocking `SYS_MSG_RECV` (M17).
-_Deferred to Phase L:_ async signal delivery (Ctrl-C → SIGINT) — see M30.
+Async signal delivery (Ctrl-C → SIGINT) shipped later in M30.
 
 ## ✅ Phase G — Virtual memory completeness — **DONE** (M18–M20)
 
@@ -95,8 +106,7 @@ capability-gated packet-filter firewall — folds into Phase L's generalized cap
 
 Anonymous pipes (`SYS_PIPE`, blocking, EOF/EPIPE, fork-inherited), console cooked
 line discipline (echo/backspace/Ctrl-D/Ctrl-C-as-line-cancel), TCP window 8K→64K.
-_Open:_ **async Ctrl-C → SIGINT** and shell pipelines/job control — need signals
-(M30).
+Async Ctrl-C → SIGINT and shell pipelines/job control shipped in M30.
 
 ## ✅ Phase H — Storage & filesystem maturity — **DONE** (M26–M27)
 
@@ -105,7 +115,7 @@ ext2 fast symlinks, mount/umount syscalls (M26). **JBD2 journal replay** — saf
 mount a dirty ext3/4 left by a crash (M27a). **Write-side journaling** — SecOS's
 own metadata writes are crash-atomic (transaction → commit → checkpoint;
 read-your-writes; atomic rollback), proven with a fault-injection harness (M27b).
-_Not implemented:_ `metadata_csum` (journals to `^metadata_csum` volumes).
+`metadata_csum` RW followed in M33 (see below).
 
 ## ✅ Phase I — Modern platform: ACPI, APIC, timekeeping, SMP — **DONE** (M28–M29)
 
@@ -118,96 +128,119 @@ _Not implemented:_ `metadata_csum` (journals to `^metadata_csum` volumes).
   (INIT-SIPI-SIPI trampoline), per-CPU GDT/TSS/idle, **CPU-pinned processes**
   (`cpu_affinity`, round-robin) with fine-grained spinlocks instead of a Big Kernel
   Lock — **user tasks run on multiple cores in parallel**. Verified on real VMware
-  (shell `stress [N]`). The locking audit found one runtime shared-kernel-PT
+  (shell `stress [N]`). **⚠ Since `3f776dd` AP bring-up is OFF by default**:
+  `stress 8` froze the real ASUS (2 cores) — likely a missing TLB shootdown or a
+  lock race the QEMU/VMware paths never exposed. Default boot is single-core (LAPIC
+  timer kept); opt in with `-DSECOS_SMP_AT_BOOT` or shell `smp`. The locking audit found one runtime shared-kernel-PT
   mutation (the M5 per-process kernel stack) → fixed with `kstack_lock`.
   _Open (polish):_ IPI reschedule, per-CPU run queues, task migration + TLB
   shootdown — see `docs/devlog/M29.md` and `TASKS.md`.
 
-**Exit criteria I (met):** boots and schedules on multiple cores with modern
+**Exit criteria I (met in QEMU/VMware; multicore opt-in on real HW):** boots and schedules on multiple cores with modern
 interrupts; monotonic timekeeping; runs on bare-metal/VMware storage. _Driver Space
 for IRQ/DMA (the old "M25" payoff) remains future work alongside Phase L._
 
 ---
 
-# ▶▶ REMAINING WORK (renumbered M30+)
+# Shipped after Phase I (M30–M39)
 
-## M30 — Signals & job control _(next; small, high-leverage)_
+## ✅ M30 — Signals & job control — **DONE**
 
-The process model's last gap. Build on the M16/M17 block/wake + trapframe core:
-per-process pending mask + handler table, delivered on return-to-user. **Ctrl-C →
-SIGINT** (the TTY raises it on the foreground process; default = terminate, reuse
-M15's kill path), **SIGPIPE** (write to a pipe/socket with no reader; EPIPE already
-exists), `SYS_KILL` + a minimal libc `signal`/`kill`/`sigaction`. Unblocks **shell
-job control + pipelines** (`cmd1 | cmd2`, `&`). _Security:_ signal delivery respects
-process ownership; no cross-trust-domain signalling.
+Per-process pending/blocked masks + handler table delivered at the three
+return-to-ring-3 chokepoints; custom handler frames via a libc `__sigreturn`
+trampoline; `SIGACTION/SIGRETURN/KILL/SIGPROCMASK/SETPGID` (44–48). Async sources:
+Ctrl-C/Ctrl-Z → SIGINT/SIGTSTP to the foreground pgid, SIGPIPE, SIGCHLD; blocking
+syscalls return `-EINTR`. Shell pipelines, `&`, `jobs`/`fg`/`bg`, `kill`. See
+`docs/devlog/M30.md`.
 
-## ✅ Phase K — Userland & (near) self-hosting — **DONE** (M31–M32)
+## ✅ Phase K — Userland & self-hosting — **DONE** (M31, M32, M34; bash in M39)
 
-- **M31 — real libc + coreutils.** Standard headers (`string/stdio/stdlib/ctype/
-  unistd/dirent/...`) + `user/libc.c` (printf family, FILE layer, string/stdlib/
-  ctype, malloc/realloc/qsort). File-management syscalls (getdents/create/mkdir/
-  unlink) → a **busybox-style coreutils** (26 applets: echo/cat/wc/head/tail/ls/
-  mkdir/rm/touch/cp/stat/hexdump/seq/uname/...), one signed ELF installed to
-  `/bin`. See `docs/devlog/M31.md`. _Security:_ every applet is the one signed
-  binary; the trust boundary is unchanged.
-- **M32 — signed packages + supervised init.** A `.spkg` format (`tools/secos-pkg`
-  + `kernel/pkg.c`): **install = verify the Ed25519 signature, then unpack** — a
-  forged/tampered package installs nothing (same signing root as code, M9). Shell
-  `pkg install`. A minimal **supervised `init`** (service table, restart-on-exit
-  up to a limit) + a demo service. See `docs/devlog/M32.md`.
+- **M31 — real libc + coreutils.** Standard headers + `user/libc.c` (printf
+  family, FILE layer, string/stdlib/ctype, malloc/realloc/qsort); file syscalls
+  (getdents/create/mkdir/unlink); a busybox-style 26-applet coreutils ELF in
+  `/bin`. See `docs/devlog/M31.md`.
+- **M32 — signed packages + supervised init.** `.spkg` (`tools/secos-pkg` +
+  `kernel/pkg.c`): **install = verify the Ed25519 signature, then unpack**. Shell
+  `pkg install`. A supervised `init` (restart-on-exit, bounded). See
+  `docs/devlog/M32.md`.
+- **M34 — lua 5.4.7 from source.** libc `%f/%e/%g`, `strtod`, `setjmp/longjmp`,
+  `math.h`; SSE enabled for ring-3; lua compiled from source, signed, runs ring-3.
+  See `docs/devlog/M34.md`.
+- **M39 (part) — GNU bash 5.2 from source**, now the boot login shell (see M39).
 
-**Exit criteria K (met):** a real libc + a coreutils userland; signed packages
-install via the verify-then-unpack rule; a service manager supervises signed
-services. _Open toward full self-hosting:_ `open(O_CREAT)`/cwd/env, `setjmp`/
-`longjmp` + `%f` + `math.h` (to port lua/sqlite from source), package keyring +
-revocation, a boot-wired PID-1 init. Tracked in `TASKS.md`.
+_Open:_ PID-1 init wired into boot, package keyring + revocation, more ports
+(sqlite, dash), real in-place `execve`.
 
-## Phase L — Security hardening (cross-cutting, dedicated pass) (M33–M35)
+## ✅ M33 — Full ext4 root + metadata_csum RW — **DONE**
 
-> _The differentiator._ Pieces land throughout; this phase makes SECoS's security
-> claims rigorous and provable.
+crc32c for superblock / group descriptors / bitmaps / inodes / directory tails +
+uninit_bg bookkeeping, validated byte-for-byte against `mkfs.ext4`: a default
+`mkfs.ext4` volume is the e2fsck-clean persistent root. See `docs/devlog/M33.md`.
 
-- **M33 — Generalized capability/permission model.** Lift the M11 driver-capability
-  idea to **all** processes: the signed manifest declares FS scope, network scope
-  (folding in the deferred firewall), IPC peers, and an allowed-syscall set; the
-  kernel enforces them. Keyring with multiple keys + **revocation** + a structured
-  **audit subsystem** (`[AUDIT]` → a queryable log). Also: real `DRIVER_OP_MAP_MEM`,
-  IRQ-to-driver delivery, a DMA sandbox, driver auto-restart.
-- **M34 — Exploit mitigations.** ASLR + KASLR; SMEP/SMAP; stack canaries; CFI;
-  **W^X everywhere** (drop the 0–512 MB identity RWX huge-page map + the low
-  identity map; guard pages on every kernel/user stack); spectre/meltdown-class
-  mitigations as feasible.
-- **M35 — Boot integrity.** A measured/secure boot chain (verify the kernel +
-  initial userland against the signing root; TPM-backed measurement later);
-  reproducible builds (extends the existing `BUILD_TS`/`GIT_HASH`).
+## ✅ Phase L — Security hardening — **DONE** (M35–M37, extended in M39)
 
-**Exit criteria L:** every executable and the boot chain are verified; processes
-run under least-privilege capabilities; common exploit primitives are mitigated;
-security events are audited.
+- **M35 — Generalized capability model.** Opt-in least privilege rooted in the
+  signed manifest (`CAP_ENFORCE` + `CAP_FS_READ/FS_WRITE/PROC/IPC/SIGNAL/TIME/NET`),
+  `kernel/cap.{c,h}`, `[AUDIT]` ring + shell `audit`, key revocation. See
+  `docs/devlog/M35.md`.
+- **M36 — Exploit mitigations.** SMEP, stack canaries, W^X on the 0–512 MB low
+  identity map, SMAP infrastructure (opt-in `-DSECOS_SMAP`). See
+  `docs/devlog/M36.md`.
+- **M37 — Boot integrity.** Measured boot (`boot_measure()` SHA-256 of
+  `.text+.rodata`) + reproducible builds (`SOURCE_DATE_EPOCH`). See
+  `docs/devlog/M37.md`.
+- **M39 — extensions:** UEFI-loader **secure boot** (Ed25519-verifies the kernel),
+  **full high-half kernel W^X** + boot auditor (the M36 routine had never been
+  called), **user-space ASLR**.
+
+_Not done:_ **kernel KASLR** (deferred — relocation + measured boot + two boot
+paths), **SMAP by default** (fast-path read/write/send/recv need bounce
+buffers), CFI, PIE user binaries (ELF-base ASLR), real `DRIVER_OP_MAP_MEM` /
+IRQ-to-driver / DMA sandbox, TPM-backed measurement.
+
+## 🔶 M38–M39 — WiFi (Atheros AR9565) — **scaffold + crypto done; radio PARKED**
+
+M38: PCI attach + identify + WPA2 crypto (PBKDF2, AES) KAT-validated. M39: WPA2
+4-way supplicant (KAT'd with a synthetic handshake) + the upstream Linux
+**ath9k_hw** layer ported as-is via a compat shim (`drivers/ath9k_port/`).
+init/reset/calibration/EDMA RX work on the real chip, but received frames fail CRC
+(over-gain) — **parked**; real-hardware-only work. See `docs/devlog/M38.md`,
+`docs/devlog/M39.md`.
 
 ---
 
+# ▶▶ REMAINING WORK
+
+Physical-hardware testing is **paused as of 2026-11-04**; current work targets
+items that can be validated in QEMU. The ordered plan and the real-HW-only list
+live in `TASKS.md`. In short:
+
+1. **Selftest coverage M34–M39** + this docs realignment.
+2. **bash / shell usability:** real in-place `execve`, raw-mode termios in
+   `kernel/tty.c`, `poll`/`select`, wider `ioctl`, mid-path symlink following
+   (`fs/vfs.c`), per-pid `/proc/<pid>`.
+3. **Kernel robustness:** buddy/multi-frame heap, `MAP_SHARED` + shared text,
+   PID-1 init at boot, package keyring + revocation.
+4. **More source ports:** sqlite, dash.
+5. **Security depth:** SMAP by default, kernel KASLR.
+6. **SMP prep in QEMU `-smp 4`:** TLB shootdown, IPI reschedule — prerequisite to
+   re-enabling SMP by default (which itself needs real-HW re-validation).
+
+**Real-hardware-only (paused):** ath9k RX/TX/assoc, UEFI loader on real firmware
+(conflicting reports — re-verify), the SMP freeze, vmxnet3/igc/e1000e-MSI-X.
+
 ## Big rocks & risks (size honestly)
 
-- **SMP (M29)** — _done._ Was the largest correctness effort; the per-CPU-pinned +
-  fine-grained-lock design avoided a Big Kernel Lock. The `stress`-test found the
-  one missed shared-kernel-PT race; budget for "the audit misses something" held.
-- **TLB shootdown** — deliberately absent (pinned per-CPU spaces). A **hard
-  prerequisite** for task migration / `MAP_SHARED` across cores / any cross-core
-  kernel-VA unmap. Build it before those.
-- **Generalized capability model (M33)** — touches every subsystem's permission
-  checks; design the manifest schema once, enforce everywhere.
-- **Journaling (M27)** — _done;_ crash-consistency proven with fault injection.
-
-## Recommended near-term sequence (next few sessions)
-
-1. **M30 — signals** (Ctrl-C→SIGINT, SIGPIPE, `kill`) → shell job control + pipelines.
-   _Now the most visible gap_ — the libc/userland (Phase K) is in, but a
-   compute-bound foreground program still can't be interrupted.
-2. **Finish Phase K self-hosting** — `setjmp`/`longjmp` + `%f` + `math.h`, then
-   port lua/sqlite from source and sign it (the headline thesis proof).
-3. **SMP polish** (IPI reschedule / per-CPU runqueues) *or* **NIC HW validation**.
-4. **Phase L** — the generalized capability model + audit, then mitigations.
+- **SMP hardening** — M29 works in QEMU/VMware but froze real hardware under load.
+  **TLB shootdown** is absent (pinned per-CPU spaces) and is a hard prerequisite
+  for re-enabling SMP by default, task migration, `MAP_SHARED` across cores, or
+  any cross-core kernel-VA unmap.
+- **In-place `execve`** — replaces the spawn+wait emulation; touches process
+  identity, fd inheritance, signals and job control. Needed for correct bash
+  semantics.
+- **Kernel KASLR** — relocation with `-mcmodel=kernel` vs measured boot,
+  reproducible builds and two boot paths.
+- **WiFi radio** — blind register debugging on one real chip; parked.
 
 A GUI/display server, window system, and desktop userland are explicitly **out of
 scope here** and would be a later Phase M+.
@@ -215,7 +248,7 @@ scope here** and would be a later Phase M+.
 ## How this maps to the existing roadmap
 
 Phases A–E (M0–M13) = the original mandatory plan. M14 = first stretch. Phases
-**F–K + H + I are done** (M15–M32). What remains is **M30 (signals)**, the
-self-hosting tail of **K** (external ports), and Phase **L (security hardening,
-M33–M35)** — the path from "a complete signed-userland OS" to "a self-hosting,
-hardened, least-privilege OS".
+**F–L are done** (M15–M37), plus M38–M39 (WiFi scaffold, secure boot, full W^X,
+ASLR, bash). What remains is depth and hardening (see REMAINING WORK) and the
+paused real-hardware bring-up — the path from "a signed, hardened OS with a
+from-source userland" to "a robust, self-hosting, multicore-on-real-HW OS".

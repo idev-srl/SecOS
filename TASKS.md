@@ -1,11 +1,33 @@
 # SECoS — Task List & Status
 
-_Snapshot: HEAD `7d45b38` on `main` (pushed to `origin/main`). Self-test **173/173**._
-_Last updated: 2026-06-20._
+_Snapshot: realigned to the commit history through `ae2be37` (M39 + ath9k RX
+bring-up). Last full self-test **182/182** (at `e66a57f`)._
+_Last updated: 2026-11-04._
 
-This file tracks what is **done** vs **open**, and the candidate work for the next
-session. The narrative handoff lives in `next_session.md`; the long-term plan in
+This file tracks what is **done** vs **open**, and the planned order of work. The
+narrative handoff lives in `next_session.md`; the long-term plan in
 `docs/ROADMAP_TO_COMPLETE_OS.md`. This is the actionable checklist on top of those.
+
+---
+
+## 🧭 Process note (2026-11-04)
+
+**Physical-hardware testing is paused as of 2026-11-04.** Current work targets
+items that can be **validated in QEMU** (smoke tests + `tools/selftest.sh` +
+serial). Real-hardware-only items are parked in their own section below and are
+resumed only when hardware testing restarts.
+
+### Planned order (QEMU-validatable)
+1. **Selftest coverage M34–M39 + docs realignment** (in progress — this file,
+   `ROADMAP_TO_COMPLETE_OS.md`, `CLAUDE.md`, `docs/BASH_PORT.md`, `docs/devlog/M39.md`).
+2. **bash / shell usability:** real in-place `execve`, raw-mode termios in
+   `kernel/tty.c`, `poll`/`select`, `ioctl` coverage, mid-path symlink following
+   (`fs/vfs.c`), per-pid `/proc/<pid>`.
+3. **Kernel robustness:** buddy heap, `MAP_SHARED`, PID-1 init in boot, package
+   keyring + revocation.
+4. **More source ports:** sqlite, dash.
+5. **Security depth:** SMAP by default, kernel KASLR.
+6. **SMP prep** (TLB shootdown, IPIs) validated in QEMU `-smp 4`.
 
 ---
 
@@ -37,90 +59,112 @@ session. The narrative handoff lives in `next_session.md`; the long-term plan in
 | M27a | JBD2 journal **replay** (mount a dirty ext3/4 left by a crash) | ✅ done |
 | M27b | **Write-side journaling** (SecOS's own metadata writes crash-atomic) — **Phase H complete** | ✅ done |
 | M28 | **Modern platform** (Phase I pt1–3): ACPI discovery + **APIC switchover** (LAPIC timer + IOAPIC retire the 8259) + **TSC monotonic clock** | ✅ done |
-| M29 | **SMP / multicore** (Phase I final): per-CPU data, AP bring-up, CPU-pinned scheduling — **user tasks run on multiple cores**; verified on real VMware | ✅ done |
+| M29 | **SMP / multicore** (Phase I final): per-CPU data, AP bring-up, CPU-pinned scheduling; verified on real VMware. **⚠ AP bring-up OFF by default since `3f776dd`** (froze the real ASUS under `stress 8`); opt-in via `-DSECOS_SMP_AT_BOOT` or shell `smp`; no TLB shootdown yet | ✅ done, **opt-in** |
+| M30 | **Signals + job control + shell pipelines**: POSIX signals for ring-3, Ctrl-C/Ctrl-Z, pipelines `a\|b`, `&`/`jobs`/`fg`/`bg`, signal-based `kill` | ✅ done |
 | M31 | **Real C library + coreutils** (Phase K): standard headers + `user/libc.c` (printf/string/stdlib/ctype/stdio/dirent); file syscalls (getdents/create/mkdir/unlink); 26-applet busybox-style coreutils installed to `/bin` | ✅ done |
 | M32 | **Signed packages + init** (Phase K): `.spkg` format (`tools/secos-pkg` + `kernel/pkg.c`, verify+unpack, tampered refused); supervised `init` service-manager + demo service | ✅ done |
-| M30 | **Signals + job control + shell pipelines**: POSIX signals for ring-3, Ctrl-C/Ctrl-Z, pipelines `a\|b`, `&`/`jobs`/`fg`/`bg`, signal-based `kill` | ✅ done |
 | M33 | **Full ext4 root + metadata_csum (RW)**: crc32c for sb/gd/inode/dir/bitmaps + uninit_bg; default `mkfs.ext4` volume is the e2fsck-clean persistent root | ✅ done |
 | M34 | **Phase K self-hosting tail**: libc float (`%f/%g`)/`strtod`/`setjmp`/`math.h`/SSE; **lua 5.4.7 compiled FROM SOURCE**, signed, runs ring-3 | ✅ done |
 | M35 | **Generalized capability model** (Phase L): least-privilege opt-in caps in the signed manifest, kernel-enforced + `[AUDIT]` + key revocation | ✅ done |
 | M36 | **Exploit mitigations** (Phase L): SMEP, stack canaries, W^X low identity map, SMAP infra (opt-in) | ✅ done |
 | M37 | **Boot integrity** (Phase L): measured boot (kernel self-hash) + reproducible builds (`SOURCE_DATE_EPOCH`) | ✅ done |
-| M38 | **WiFi AR9565 (ath9k) scaffold + WPA2 crypto**: PCI attach/identify + PBKDF2 PMK + AES (KAT-validated); radio association = real-HW TODO | ✅ scaffold + crypto done |
+| M38 | **WiFi AR9565 (ath9k) scaffold + WPA2 crypto**: PCI attach/identify + PBKDF2 PMK + AES (KAT-validated) | ✅ scaffold + crypto done |
+| M39 | **Secure boot** (UEFI loader verifies kernel, `61f52c7`) + **full kernel W^X** + auditor (`021d445`) + **user ASLR** (`e5a991c`) + **WPA2 4-way supplicant** (`7ee71d1`) + **POSIX foundation** (syscalls 49–56: dup/dup2/chdir/getcwd/ioctl/getppid/waitany/fstat, cwd, termios, environ, emulated execve) + **GNU bash 5.2 from source = boot login shell** (`2881cf4`/`8762198`/`e66a57f`) + **ath9k_hw Linux driver port** (init/reset/cal/RX on real chip; RX CRC wall → parked). See `docs/devlog/M39.md` | ✅ done (WiFi radio parked) |
 
-**Phases done:** A–E (M0–M13), F (M15–M17), G (M18–M20), H (M26–M27), I (M28–M29),
-J/networking (M24), **K (M31–M34)**, **L (M35–M37) COMPLETE**, M30 (signals).
-Foundation, process model, VM, storage maturity (incl. full ext4+csum), modern
-platform + multicore, networking, a real signed userland that compiles OSS from
-source (lua), and the full security-hardening pass are all in. **Remaining: WiFi
-radio bring-up (M38, crypto done), and self-hosting external ports (bash/dash).**
+**Phases done:** A–E (M0–M13), F (M15–M17), G (M18–M20), H (M26–M27, + M33),
+I (M28–M29, SMP opt-in), J/networking (M24), K (M31–M32, M34, bash in M39),
+**L (M35–M37, extended in M39)**, M30 (signals). Remaining work is depth,
+robustness and the paused real-hardware bring-up — see below.
+
+### Previously-open checklist items now shipped (for the record)
+- [x] Signal delivery + Ctrl-C→SIGINT + SIGPIPE + `SYS_KILL`/`sigaction` + shell job control/pipelines (M30)
+- [x] `open(O_CREAT/O_TRUNC/O_APPEND)` + shell `>`/`>>` redirection (`0491f81`)
+- [x] Per-process cwd + `getcwd`/`chdir` + a real `environ`/`getenv`/`setenv` (M39)
+- [x] libc `printf` floats, `strtod`, `setjmp`/`longjmp`, `math.h` (M34)
+- [x] Port a real program from source and sign it — lua 5.4.7 (M34), GNU bash 5.2 (M39)
+- [x] Generalized capability model + `[AUDIT]` + **code-key** revocation (M35)
+- [x] SMEP, stack canaries (M36); user ASLR (M39)
+- [x] W^X of the 0–512 MB identity map (M36) + full high-half kernel W^X (M39) — W^X everywhere
+- [x] Measured boot + reproducible builds (M37); UEFI secure boot of the kernel (M39)
+- [x] `metadata_csum` read-write (M33)
+- [x] `ioctl` (termios/winsize/pgrp subset) + `fcntl` (M39)
+- [x] Fork/pipes under bash (Unix zombie semantics + `SYS_WAITANY`, `8762198`)
 
 ---
 
-## 🔶 DONE-BUT-UNVALIDATED (works in QEMU / logic only — needs real hardware)
+## 🟢 OPEN — QEMU-validatable (current focus)
 
-- [ ] **vmxnet3 driver** — compile-clean, QEMU has no model → untested on real HW.
+### Shell / POSIX usability (bash)
+- [ ] **Real in-place `execve`** — today emulated as spawn+wait+exit (`user/libsecos.c`):
+      pid changes, env not inherited, job control under bash is approximate.
+- [ ] **Raw-mode termios** — `TCSETS` sets `g_tty_canon`/`g_tty_echo`
+      (`kernel/syscall.c`) but `kernel/tty.c` never consults them; console is always cooked.
+      Prerequisite for readline in bash.
+- [ ] **`poll`/`select`** syscalls (disabled in bash's `config.h` today).
+- [ ] **Wider `ioctl` coverage** beyond TCGETS/TCSETS/TIOCGWINSZ/TIOCG/SPGRP.
+- [ ] **Mid-path symlink components** — `vfs_lookup_follow` (`fs/vfs.c`) follows only
+      the final component (M26 limitation).
+- [ ] **Per-pid `/proc/<pid>`** — procfs has only `/proc/self` + global files.
+- [ ] **Serial input drops the first char of a line** under bash in QEMU (PS/2 is fine) —
+      cosmetic, but hurts serial-driven tests.
+- [ ] pthreads subset (on M19 COW/fork), fuller stdio/locale.
+
+### Kernel robustness
+- [ ] **Buddy / free-list heap** — `mm/heap.c` is still a single-lock first-fit list.
+- [ ] **`MAP_SHARED` + shared read-only text** — retire the M14 per-process pinned ELF
+      image via the M20 page cache (cross-core use needs TLB shootdown).
+- [ ] **PID-1 init wired into boot** — `/bin/init` is run on demand today (boot launches bash).
+- [ ] **Package keyring + revocation** — `kernel/pkg.c` verifies against the single
+      `secos_trusted_pubkey`; the M35 key-revocation list (`mm/elf_sign.c`) covers ELFs only.
+- [ ] Dependency ordering for packages/services.
+
+### More source ports
+- [ ] **sqlite** from source (signed).
+- [ ] **dash** from source (signed).
+
+### Security depth
+- [ ] **SMAP by default** — needs bounce-buffering in the read/write/send/recv fast paths
+      (they pass user buffers straight to vfs/pipe/socket); opt-in `-DSECOS_SMAP` today.
+- [ ] **Kernel KASLR** — deferred in M39 (relocation with `-mcmodel=kernel` vs measured
+      boot, reproducible builds, both boot paths).
+- [ ] ELF-base ASLR (needs PIE user binaries); CFI.
+- [ ] **Driver Space depth**: real `DRIVER_OP_MAP_MEM`; IRQ-to-driver (`IRQ_SUBSCRIBE` +
+      IPC queue); DMA sandbox; auto-restart. (Ported ath9k currently runs ring-0.)
+
+### SMP prep (QEMU `-smp 4`)
+- [ ] **TLB shootdown infrastructure** (IPI-based) — prerequisite for re-enabling SMP by
+      default, task migration, `MAP_SHARED` across cores, cross-core kernel-VA unmap.
+- [ ] **IPI-based reschedule** — a wake on another core preempts immediately (`lapic_ipi` exists).
+- [ ] **Per-CPU run queues**; then load balancing / task migration.
+- [ ] **debugcon line-locking everywhere** (only `switch_to`'s `[SMP]` line is atomic).
+
+### Test coverage
+- [ ] **Selftest coverage for M34–M39** (lua, caps, mitigations, measured boot, WPA2 KATs,
+      W^X audit, ASLR, POSIX demo, bash) — in progress in `tools/selftest.sh`.
+
+---
+
+## 🔴 OPEN — requires real hardware (PAUSED since 2026-11-04)
+
+- [ ] **ath9k radio (AR9565 on the ASUS E406S)** — RX frames fail CRC (over-gain / high
+      NF); then TX, auth/assoc MLME, WPA2 4-way (supplicant ready), DHCP. PARKED; first
+      step on resume = `wifi up; wifi chan 6; wifi regdump`. See `docs/devlog/M39.md`.
+- [ ] **UEFI loader on real firmware — conflicting reports, needs re-verification on the
+      ASUS** (possible regression from the secure-boot commit `61f52c7`). `afb7f3c` and the
+      2026-06-21 real-HW hardening entry in `next_session.md` say it was fixed/validated on
+      the ASUS; the newest `next_session.md` entry (WiFi, 2026-06-22) says "GRUB ISO only
+      (UEFI loader triple-faults on real HW)". Do not assume either until re-tested.
+- [ ] **SMP freeze on real HW** (`stress 8` on the ASUS, `3f776dd`) — must be root-caused
+      and re-validated on hardware before AP bring-up is re-enabled by default.
+- [ ] **vmxnet3 driver** — compile-clean, QEMU has no model → untested.
 - [ ] **igc driver (2.5 GbE, I225/I226)** — compile-clean, needs the real adapter.
-- [ ] **82574 (e1000e) MSI-X re-arm tuning** — IVAR/EIAC so the poll backstop can
-      eventually be dropped (currently a hybrid: MSI-X + poll backstop).
-- [ ] **USB hub support** (`drivers/usb_hub.c`) — logic-verified only; QEMU CI has
-      no hub. DA TESTARE su hardware reale.
-- [ ] **MSI/MSI-X for NVMe/xHCI** — additive, OFF by default (storage still polled);
-      gated behind `-DXHCI_USE_IRQ`/`-DNVME_USE_IRQ`. NVMe I/O CQ still IEN=0 →
-      needs recreate with IEN=1 + vector to truly fire. Needs HW validation.
-- [ ] **USB Mass Storage on real hardware** — verified in QEMU, not yet on a real stick.
-
----
-
-## 🎯 CANDIDATE NEXT WORK (pick one to start)
-
-### Option 1 — **Signals** _(recommended — the biggest usability gap)_
-The process model is complete *except* async signals. Today a ring-3 fault is the
-only way a process dies asynchronously (M15); Ctrl-C only interrupts an in-progress
-read, and there is no SIGPIPE. This blocks real interactive use.
-- [ ] **Signal delivery mechanism** — per-process pending mask + handler table;
-      deliver on return-to-user (build on the M16/M17 block/wake + trapframe core).
-- [ ] **Ctrl-C → SIGINT** — the TTY (`kernel/tty.c`) raises SIGINT on the
-      foreground process; default action = terminate (reuse M15's kill path).
-- [ ] **SIGPIPE** — a write to a pipe/socket with no reader raises it (pipes/EPIPE
-      already exist in `kernel/pipe.c`).
-- [ ] **`SYS_KILL` + libc `signal`/`kill`/`sigaction`** (minimal subset).
-- [ ] **Shell job control + pipelines** (`cmd1 | cmd2`, Ctrl-C, `&`) — unblocked by
-      this + the existing pipes/fork/exec.
-
-### Option 2 — SMP hardening / polish _(multicore works; make it better)_
-- [ ] **IPI-based reschedule** — a wake on another core preempts immediately
-      instead of at the next tick (currently up to 1 ms latency). `lapic_ipi` exists.
-- [ ] **Per-CPU run queues** — today one shared proc table under `proc_lock`; fine
-      at 2–8 cores, but a per-CPU queue scales better and cuts contention.
-- [ ] **Load balancing / task migration** — affinity is static round-robin; a
-      migrating scheduler needs an **IPI TLB shootdown** first (see `docs/devlog/M29.md`).
-- [ ] **debugcon line-locking everywhere** — only `switch_to`'s `[SMP]` line is
-      atomic now; other concurrent boot/runtime debug can still interleave.
-
-### Option 3 — NIC hardware validation _(needs real adapters)_
-- [ ] Validate vmxnet3 on real VMware; igc (2.5 GbE) on real I225/I226.
-- [ ] Tune 82574 MSI-X re-arm; try dropping the poll backstop.
-
-### Option 4 — finish Phase K self-hosting _(libc done; ports remain)_
-Phase K core is **done** (M31 libc+coreutils, M32 signed packages + supervised
-init). Remaining toward true self-hosting:
-- [ ] **`open(O_CREAT)` creates** (today use `creat_file`); `getcwd`/per-process cwd
-      + an environment (so `pwd`/`getenv` work in userland, not just the shell).
-- [ ] **libc gaps** — `printf` floats (`%f/%g`), fuller stdio/locale, `setjmp`/
-      `longjmp` (needed by lua/sqlite), a `math.h`, a pthreads subset (on M19).
-- [ ] **Port a real program from source** (lua or sqlite) and sign it — the
-      headline proof of the "compile OSS from source" thesis.
-- [ ] **Package keyring + revocation**; a real PID-1 `init` wired into boot
-      (today `/bin/init` is run on demand); dependency ordering.
-
-### Option 5 — Phase L: security hardening _(the differentiator, dedicated pass)_
-- [ ] **Generalized capability model** — lift M11's driver-caps to all processes:
-      the signed manifest declares FS/network/IPC/syscall scope, kernel-enforced.
-      Keyring + revocation + a queryable `[AUDIT]` subsystem.
-- [ ] **Exploit mitigations** — ASLR/KASLR, SMEP/SMAP, stack canaries, CFI,
-      **W^X everywhere** (drop the 0–512 MB identity RWX huge-page map).
-- [ ] **Boot integrity** — measured/secure boot chain; reproducible builds.
+- [ ] **82574 (e1000e) MSI-X re-arm tuning** — IVAR/EIAC so the poll backstop can be
+      dropped (currently MSI-X + poll backstop hybrid).
+- [ ] **USB hub support** (`drivers/usb_hub.c`) — logic-verified only; QEMU CI has no hub.
+- [ ] **MSI/MSI-X for NVMe/xHCI** — OFF by default (`-DXHCI_USE_IRQ`/`-DNVME_USE_IRQ`);
+      NVMe I/O CQ still IEN=0 → needs recreate with IEN=1 + vector.
+- [ ] **Async Ctrl-C/Ctrl-Z + fg/bg of a stopped job** on a PS/2 keyboard (M30; serial
+      can't async-interrupt).
 
 ---
 
@@ -134,28 +178,14 @@ init). Remaining toward true self-hosting:
 
 ---
 
-## 🧹 Smaller open items / tech debt (independent of milestone choice)
+## 🧹 Build / tooling tech debt
 
 - [ ] **Makefile: no header-dep tracking** — `.h`/`-D` changes need a manual
       `make clean`. Proper dependency tracking would remove a recurring footgun.
 - [ ] **`isodir/boot/grub/grub.cfg` is tracked but `make clean` deletes it** —
       consider untracking it (recurring papercut).
-- [ ] **Heap allocator** (`mm/heap.c`) is simple first-fit (+ a global lock since
-      M29) — a buddy/free-list allocator would scale better under SMP contention.
-- [ ] **`MAP_SHARED` + shared read-only text** — retire the M14 per-process pinned
-      ELF image via the M20 page cache.
-- [ ] **TLB shootdown infrastructure** — not needed today (pinned per-CPU spaces;
-      see `docs/devlog/M29.md`) but a **prerequisite** for task migration,
-      `MAP_SHARED` across cores, or any cross-core kernel-VA unmap.
-- [ ] **W^X of the 0–512 MB identity huge-page map** — still RWX (deferred since M12).
-- [ ] **Mid-path symlink components** — `vfs_lookup_follow` follows only the final
-      component (M26 limitation).
-- [ ] **`metadata_csum`** — M27b journals to `^metadata_csum` volumes only; csum
-      support is an orthogonal follow-up.
-- [ ] **Driver Space depth**: real `DRIVER_OP_MAP_MEM` (still a validating stub);
-      IRQ-to-driver (`IRQ_SUBSCRIBE` + IPC queue); DMA sandbox; auto-restart.
-- [ ] **POSIX completeness**: `ioctl`, fuller libc, wider syscalls (poll/select/
-      fcntl), per-pid `/proc/<pid>`.
+- [ ] **Prebuilt `drivers/ath9k_port/ath9k_hw.o` is committed** (`git add -f`) —
+      regenerate with `tools/port-ath9k.sh` after touching the port.
 
 ---
 
@@ -164,8 +194,8 @@ init). Remaining toward true self-hosting:
 - **NIC RX only works in the shell/idle context** — test networking from the shell.
 - **Don't build concurrently with `tools/selftest.sh`** (shared build dir + /tmp logs).
 - **Never `pkill -f "qemu-system"`** in a command that also launches qemu.
-- **SMP testing**: `-smp 2/4`; shell `stress [N]` saturates the vCPUs. The user
-  validates on **real VMware** (2+ vCPUs), not QEMU.
+- **SMP testing**: default boot is single-core; build with `-DSECOS_SMP_AT_BOOT` or run
+  shell `smp`, then `-smp 2/4` + `stress [N]`.
 - **Runtime kernel page-table edits must be locked** (the M5 kstack race, fixed in
   `28ff58a`): any new runtime kernel-VA map/unmap needs `kstack_lock` (or a shared
   kernel-PT lock) + an IPI shootdown if another core can touch the VA.

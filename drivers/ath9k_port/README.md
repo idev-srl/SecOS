@@ -12,7 +12,16 @@ shim), and the foundation for porting other Linux drivers. The shim
   on-die OTP and programmed into STA_ID — proves we can read the chip's
   calibration data (`drivers/ath9k.c`, ported from ath9k ar9003_eeprom).
 
-## Port state
+## Current status (supersedes the lists below)
+Steps 1–3 are done and part of 4: the ath9k_hw files (+ `ani.c`) compile and link
+as-is (`tools/port-ath9k.sh` → committed `ath9k_hw.o`), the bridge
+(`ath9k_secos.c`) runs `ath9k_hw_init`/`ath9k_hw_reset`/calibration on the real
+AR9565, and EDMA RX receives frames (`wifi up/chan/scan/regdump`). **Blocked**:
+received frames fail CRC (over-gain, noise floor ~20 dB high) — work is PARKED.
+TX, association and the supplicant hookup (step 5) remain. See
+`docs/devlog/M39.md` and the WiFi entry at the top of `next_session.md`.
+
+## Port state (original plan)
 - `compat/` — ~50 Linux kernel-API header stubs (types, io, delay, slab,
   byteorder, unaligned, minimal net/cfg80211 + net/mac80211 structs, …) wired so
   `REG_READ/REG_WRITE` route through the driver's `reg_ops` to SecOS MMIO.

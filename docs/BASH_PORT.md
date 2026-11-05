@@ -86,19 +86,31 @@ libc-completion + config-authoring grind best done iteratively against the bash
 build. The M39 foundation is independently valuable: it is what **any** non-trivial
 source port (dash, busybox, coreutils-from-upstream, …) needs first.
 
-## Status (M39): bash RUNS from source — with one kernel bug to fix
+## Status (M39, current): bash is the boot login shell
 
-`bash -c '…'` works ring-3: arithmetic `$((6*7))`=42, variables/`${x}`, functions,
-`if`/`[ ]`/`&&`, `case`, `for` loops — all validated, 0 [EXC]. Embedded as
-`crypto/user_bash_elf.h`, demo `M39_BASH_DEMO`.
+> The sections above are the original pre-port plan, kept for history. Stages 1–4
+> are done; stage 5 (polish) is the open work.
 
-**Open blocker — COW fork under bash.** Fork-based features (pipelines, `(subshell)`,
-external commands) intermittently hit a ring-3 **page fault** (err=4, read of a
-not-present page) inside bash after a `fork()`. Sometimes a pipeline runs to
-completion (`for … | while read` printed correctly), sometimes the first fork
-faults — i.e. a nondeterministic COW / demand-paging+fork interaction in
-`mm/vmm.c` (`vmm_fork_space`/`vmm_cow_fault`/`vma_fault_in`) exposed by bash's
-large (548 KB + heap) footprint, which the small M19 fork demo never stressed.
-This is the next fix and is a prerequisite for **boot-into-bash** (interactive bash
-needs working pipelines/external commands) — see TASKS. Non-fork bash is fully
-usable today.
+- **Built from source** (`2881cf4`, `make port-bash` / `tools/port-bash.sh`):
+  140 objects cross-compiled against SecOS libc with `user/bash_port.h`,
+  `user/bash_compat.c` (~60 shims) and `user/port-include/` stub headers;
+  `--without-readline --enable-minimal-config`. Embedded signed as
+  `crypto/user_bash_elf.h` (548 KB), demo `M39_BASH_DEMO`.
+- **The fork/pipe crash under bash is FIXED** (`8762198`). It was not a COW bug but
+  two scheduler bugs: eager zombie reaping lost the child's exit status (bash's
+  `waitpid(pid)` got -1 → `abort()`), and there was no `waitpid(-1)`. Zombies now
+  follow Unix semantics (persist until collected) and `SYS_WAITANY` (55) was
+  added. Pipelines, subshells, functions, `case`, loops all work.
+- **Interactive + boot into bash** (`e66a57f`): errno mapping in libc wrappers, a
+  stable `st_ino`, cwd-relative `stat`/`lstat`, `SYS_FSTAT` (56). The signed bash
+  is installed to `/bin/bash` at boot and launched `run /bin/bash -i`; the kernel
+  shell is the fallback when bash exits. `-DSECOS_NO_BASH` drops it.
+
+**Still open (stage 5 polish, tracked in `TASKS.md`):**
+- real in-place `execve` (today emulated as spawn + wait + exit → pids change,
+  job control approximate, env not inherited across exec);
+- raw-mode termios honoured by `kernel/tty.c` (`TCSETS` sets `g_tty_canon`/
+  `g_tty_echo`, but the console stays cooked) — prerequisite for readline;
+- `poll`/`select` (disabled in bash's `config.h` today), wider `ioctl` coverage;
+- readline / job-control polish; serial input drops the first char of a line in
+  QEMU (PS/2 unaffected).
