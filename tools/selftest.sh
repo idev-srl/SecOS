@@ -932,6 +932,32 @@ else
 fi
 ! grep -q "ring0\|\[PANIC\]" "$SOAKLOG"; check "no kernel panic/ring-0 fault during bash soak" $?
 
+# ---- Regression: bash child exit >= 128 / killed by signal; stale stat ABI ----
+# (a) strsignal() was implicitly declared in the bash build, so bash truncated
+#     its returned pointer to 32 bits and crashed in strlen() reporting a child
+#     that exited >= 128 or died by a signal.
+# (b) a coreutils `stat` built against the old 56-byte struct stat had its
+#     return address overwritten by the kernel's 88-byte SYS_STAT copy-out.
+# Markers only appear once expanded (the TTY echo shows the raw `$?` text).
+UBLOG=/tmp/secos_selftest_userland.log
+echo "[selftest] Running bash exit-status/signal + stat regressions (mb2, serial, 70s)..."
+: > "$UBLOG"
+( sleep 25
+  printf "  bash -c 'exit 142'; echo UB1-\$?\r"; sleep 4
+  printf '  sleep 10 & kill -9 $!; wait $!; echo UB2-$?\r'; sleep 4
+  printf '  sleep 10 & kill -TERM $!; wait $!; echo UB3-$?\r'; sleep 4
+  printf '  stat /bin/bash && echo UB4-$((2+2))\r'; sleep 5
+  printf '  echo UB5-$((6*7))\r'; sleep 4 ) | \
+    timeout 70 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$UBLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "UB1-142" "$UBLOG"; check "bash survives bash -c 'exit 142' and reports \$? = 142" $?
+grep -q "UB2-137" "$UBLOG"; check "bash survives kill -9 of a child (\$? = 137)" $?
+grep -q "UB3-143" "$UBLOG"; check "bash survives SIGTERM of a child (\$? = 143)" $?
+grep -q "File: /bin/bash" "$UBLOG" && grep -q "UB4-4" "$UBLOG"; check "coreutils stat /bin/bash works (stat ABI)" $?
+grep -q "UB5-42" "$UBLOG"; check "bash still responsive after signal-killed children" $?
+! grep -q "\[EXC\]" "$UBLOG"; check "no CPU exception ([EXC]) during exit-status/stat regressions" $?
+
 # ---- M39: UEFI secure boot (loader Ed25519-verifies kernel.elf before jumping) ----
 OVMF=""
 for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
