@@ -149,6 +149,20 @@ int puts(const char* s) {
 void* mmap(void* addr, size_t len, int prot, int flags){ return (void*)secos_syscall(SYS_MMAP,(long)addr,(long)len,prot,flags,-1); }
 /* [M20] file-backed mmap (MAP_PRIVATE via the page cache), from file offset 0. */
 void* mmap_file(void* addr, size_t len, int prot, int flags, int fd){ return (void*)secos_syscall(SYS_MMAP,(long)addr,(long)len,prot,flags,fd); }
+/* [M40] 6-argument mmap: the file offset travels in r9 (the Linux register). */
+void* secos_mmap(void* addr, size_t len, int prot, int flags, int fd, long off){
+    long ret;
+    register long r8 asm("r8") = fd;
+    register long r9 asm("r9") = off;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "0"((long)SYS_MMAP), "D"((long)addr), "S"((long)len), "d"((long)prot),
+                       "c"((long)flags), "r"(r8), "r"(r9)
+                     : "memory");
+    if (ret < 0 && ret > -4096) { errno = (int)-ret; return MAP_FAILED; }
+    if (ret == -1 || ret == 0) { errno = ENOMEM; return MAP_FAILED; }
+    return (void*)ret;
+}
 int   munmap(void* addr, size_t len){ return (int)secos_syscall(SYS_MUNMAP,(long)addr,(long)len,0,0,0); }
 int   mprotect(void* addr, size_t len, int prot){ return (int)secos_syscall(SYS_MPROTECT,(long)addr,(long)len,prot,0,0); }
 unsigned long brk_set(unsigned long addr){ return (unsigned long)secos_syscall(SYS_BRK,(long)addr,0,0,0,0); }

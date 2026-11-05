@@ -409,7 +409,26 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/ptytest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/ptytest.o
 	python3 tools/secos-sign user/ptytest.elf --dev
 	python3 tools/elf2h.py user/ptytest.elf user_ptytest_elf crypto/user_ptytest_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + exectest{,_unsigned} + ttytest + ptytest -> crypto/*.h"
+	# [M40] GUI kernel interfaces: /dev/fb0 + /dev/input/eventN demo and test
+	# (signed with the CAP_INPUT|CAP_DISPLAY manifest), a capability-less twin
+	# of the test (refusals), and loadkeys (console keyboard layout)
+	$(CC) $(USER_CFLAGS) -c user/note_gui.S    -o user/note_gui.o
+	$(CC) $(USER_CFLAGS) -c user/fbdemo.c      -o user/fbdemo.o
+	$(LD) --gc-sections -T user/user.ld -o user/fbdemo.elf user/crt0.o user/note_gui.o user/libsecos.o user/libc.o user/fbdemo.o
+	python3 tools/secos-sign user/fbdemo.elf --dev
+	python3 tools/elf2h.py user/fbdemo.elf user_fbdemo_elf crypto/user_fbdemo_elf.h
+	$(CC) $(USER_CFLAGS) -c user/guitest.c     -o user/guitest.o
+	$(LD) --gc-sections -T user/user.ld -o user/guitest.elf user/crt0.o user/note_gui.o user/libsecos.o user/libc.o user/guitest.o
+	$(LD) --gc-sections -T user/user.ld -o user/guitest_nocap.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/guitest.o
+	python3 tools/secos-sign user/guitest.elf --dev
+	python3 tools/secos-sign user/guitest_nocap.elf --dev
+	python3 tools/elf2h.py user/guitest.elf user_guitest_elf crypto/user_guitest_elf.h
+	python3 tools/elf2h.py user/guitest_nocap.elf user_guitest_nocap_elf crypto/user_guitest_nocap_elf.h
+	$(CC) $(USER_CFLAGS) -c user/loadkeys.c    -o user/loadkeys.o
+	$(LD) --gc-sections -T user/user.ld -o user/loadkeys.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/loadkeys.o
+	python3 tools/secos-sign user/loadkeys.elf --dev
+	python3 tools/elf2h.py user/loadkeys.elf user_loadkeys_elf crypto/user_loadkeys_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys -> crypto/*.h"
 
 # Staleness guard for the committed embedded programs: rebuild + re-sign them
 # (deterministic: same sources -> byte-identical headers) and fail if any

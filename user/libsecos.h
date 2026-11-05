@@ -92,6 +92,15 @@ void    sleep_ticks(unsigned ticks);
 #define MAP_ANONYMOUS 0x20
 void*   mmap(void* addr, size_t len, int prot, int flags);
 void*   mmap_file(void* addr, size_t len, int prot, int flags, int fd); /* [M20] */
+/* [M40] Linux-order 6-argument mmap. The offset is honoured for device maps
+ * (/dev/fb0 needs MAP_SHARED); returns MAP_FAILED with errno set on error. */
+#ifndef MAP_SHARED
+#define MAP_SHARED    0x01
+#endif
+#ifndef MAP_FAILED
+#define MAP_FAILED    ((void*)-1)
+#endif
+void*   secos_mmap(void* addr, size_t len, int prot, int flags, int fd, long off);
 int     munmap(void* addr, size_t len);
 int     mprotect(void* addr, size_t len, int prot);
 void*   sbrk(long incr);
