@@ -32,8 +32,16 @@ int      udp_send(net_dev_t* dev, uint32_t dst_ip, uint16_t src_port,
 /* ---- DHCP client (net/dhcp.c) ---- */
 /* Run a full DISCOVER/OFFER/REQUEST/ACK exchange on dev. On success sets
  * dev->ip/netmask/gateway/dns from the lease. Returns 0 ok, -1 on timeout.
- * Must run from the shell/idle context (RX needs the CPU to hlt — see M24). */
+ * Spins on hlt: kernel shell/idle context only (RX needs the CPU to hlt — M24). */
 int      dhcp_configure(net_dev_t* dev);
+/* Asynchronous form (used by SYS_NETCTL): dhcp_start() sends DISCOVER and
+ * returns (0, -EBUSY while another exchange runs, -ENODEV); dhcp_poll() advances
+ * the exchange and returns its phase. A failed exchange restores the previous
+ * address; a lease sets dev->ip/netmask/gateway/dns. */
+enum { DHCP_PH_IDLE = 0, DHCP_PH_DISCOVER, DHCP_PH_REQUEST, DHCP_PH_BOUND, DHCP_PH_FAILED };
+int      dhcp_start(net_dev_t* dev);
+int      dhcp_poll(net_dev_t* dev);
+int      dhcp_has_lease(const net_dev_t* dev);   /* 1: dev's address is a DHCP lease */
 
 /* ---- DNS client (net/dns.c) ---- */
 /* Resolve a hostname (A record) via dev->dns into *out_ip (network order).

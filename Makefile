@@ -115,6 +115,7 @@ SRC_C   = \
 	$(NET_DIR)/icmp.c \
 	$(NET_DIR)/udp.c \
 	$(NET_DIR)/dhcp.c \
+	$(NET_DIR)/netctl.c \
 	$(NET_DIR)/dns.c \
 	$(NET_DIR)/tcp.c \
 	$(NET_DIR)/socket.c \

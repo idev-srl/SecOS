@@ -1311,6 +1311,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     // Sessions (pseudo-terminal support).
     case SYS_SETSID:  return (uint64_t)(int64_t)ksys_setsid();
     case SYS_GETSID:  return (uint64_t)(int64_t)ksys_getsid((int)a0);
+    case SYS_NETCTL: {                        // NIC config + DHCP from ring 3 (CAP_NET)
+        extern long ksys_netctl(uint64_t, uint64_t, uint64_t);
+        return (uint64_t)(int64_t)ksys_netctl(a0, a1, a2);
+    }
 
     case SYS_FSTAT: {
         struct secos_stat kst;

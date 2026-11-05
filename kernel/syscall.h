@@ -74,6 +74,8 @@
 // Sessions + pseudo-terminals (numbers 85-89 are reserved for the pty work).
 #define SYS_SETSID      85 // setsid() -> new session id / -EPERM (already a group leader)
 #define SYS_GETSID      86 // getsid(pid) -> session id (pid 0 = caller) / -ESRCH
+// 90-94 are reserved for the GUI work; 95-99 for init / system services.
+#define SYS_NETCTL      95 // netctl(op, ifindex, arg): NIC info / static config / DHCP (CAP_NET; net/netctl.c)
 
 // Kernel interfaces for standard userland tools (kernel/kiface.c; semantics +
 // Linux struct layouts in kernel/kiface.c). Errors are -errno (Linux values).
