@@ -20,9 +20,9 @@ resumed only when hardware testing restarts.
 ### Planned order (QEMU-validatable)
 1. **Selftest coverage M34–M39 + docs realignment** (in progress — this file,
    `ROADMAP_TO_COMPLETE_OS.md`, `CLAUDE.md`, `docs/BASH_PORT.md`, `docs/devlog/M39.md`).
-2. **bash / shell usability:** ~~real in-place `execve`~~ (done), raw-mode termios in
-   `kernel/tty.c`, `poll`/`select`, `ioctl` coverage, mid-path symlink following
-   (`fs/vfs.c`), per-pid `/proc/<pid>`.
+2. **bash / shell usability:** done on `integ/phase2` (real `execve`, raw termios +
+   readline, ptys + sessions, `poll`/`select`, per-pid `/proc`, mid-path symlinks,
+   BusyBox userland, Dropbear SSH with pty sessions).
 3. **Kernel robustness:** buddy heap, `MAP_SHARED`, PID-1 init in boot, package
    keyring + revocation.
 4. **More source ports:** sqlite, dash.
@@ -97,14 +97,17 @@ robustness and the paused real-hardware bring-up — see below.
 ### Shell / POSIX usability (bash)
 - [x] **Real in-place `execve`** — `SYS_EXECVE` (60) + `FD_CLOEXEC`/`fcntl` (61) +
       `pipe2`; libc's spawn+wait+exit emulation removed (`docs/BASH_PORT.md`).
-- [ ] **Raw-mode termios** — `TCSETS` sets `g_tty_canon`/`g_tty_echo`
-      (`kernel/syscall.c`) but `kernel/tty.c` never consults them; console is always cooked.
-      Prerequisite for readline in bash.
-- [ ] **`poll`/`select`** syscalls (disabled in bash's `config.h` today).
-- [ ] **Wider `ioctl` coverage** beyond TCGETS/TCSETS/TIOCGWINSZ/TIOCG/SPGRP.
-- [ ] **Mid-path symlink components** — `vfs_lookup_follow` (`fs/vfs.c`) follows only
-      the final component (M26 limitation).
-- [ ] **Per-pid `/proc/<pid>`** — procfs has only `/proc/self` + global files.
+- [x] **Raw-mode termios** + GNU readline in bash, VT100 console, ptys/sessions
+      (`kernel/tty.c`, `kernel/pty.c`, `drivers/vt.c`; `docs/PTY.md`).
+- [x] **`poll`/`select`** (`SYS_POLL` 78; bash/readline built with `HAVE_SELECT`).
+- [x] **Wider `ioctl` coverage** (termios, winsize, FIONREAD/FIONBIO, job control, sessions, ptmx).
+- [x] **Mid-path symlink components** (`vfs_walk`).
+- [x] **Per-pid `/proc/<pid>`** + `/dev/kmsg`, wall clock, statfs, rename/link/truncate.
+- [x] **BusyBox 1.36.1** on the real kernel APIs (`docs/BUSYBOX_PORT.md`), **Dropbear SSH**
+      with pty sessions (`docs/SSH.md`). Integrated + validated on `integ/phase2`.
+- [ ] Symlinks / hard links on the ramfs root (BusyBox `ln`, applet symlinks).
+- [ ] Rare flake: M10/fat32 once ran `hello` a second time after its `SYS_EXIT` and
+      faulted (1 of ~11 runs; 8/8 reruns clean) — zombie resumed? Needs a repro.
 - [ ] **Serial input drops the first char of a line** under bash in QEMU (PS/2 is fine) —
       cosmetic, but hurts serial-driven tests.
 - [ ] pthreads subset (on M19 COW/fork), fuller stdio/locale.
