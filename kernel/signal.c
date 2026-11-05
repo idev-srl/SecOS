@@ -273,6 +273,12 @@ static void pg_exists_cb(process_t* p, void* u) {
     struct pg_exists* e = (struct pg_exists*)u;
     if (p->pgid == e->g && p->state != PROC_ZOMBIE) e->n++;
 }
+// Does a live process group `pgid` exist? (TIOCSPGRP validation)
+int signal_pgid_exists(uint32_t pgid) {
+    struct pg_exists e = { pgid, 0 };
+    process_foreach(pg_exists_cb, &e);
+    return e.n > 0;
+}
 long ksys_kill(int pid, int sig) {
     if (sig < 0 || sig >= NSIG) return -22;
     process_t* cur = sched_get_current();

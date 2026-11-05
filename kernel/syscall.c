@@ -690,6 +690,8 @@ int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
         int pg;
         if(copy_from_user(&pg,(void*)arg,sizeof(pg))!=0) return -EFAULT;
         if(pg <= 0) return -22;                // -EINVAL
+        extern int signal_pgid_exists(uint32_t);
+        if(!signal_pgid_exists((uint32_t)pg)) return -1;   // -EPERM: no such group
         signal_set_foreground_pgid((uint32_t)pg);
         return 0;
     }
