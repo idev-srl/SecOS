@@ -97,6 +97,7 @@ SRC_C   = \
 	$(CRYPTO_DIR)/wpa2.c \
 	$(CRYPTO_DIR)/wpa2_eapol.c \
 	$(CRYPTO_DIR)/ed25519.c \
+	$(CRYPTO_DIR)/csprng.c \
 	$(CRYPTO_DIR)/crypto_selftest.c \
 	$(DRIVERS_DIR)/ath9k.c \
 	$(DRIVERS_DIR)/e1000.c \
