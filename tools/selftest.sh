@@ -905,13 +905,16 @@ grep -q "CS9-42" "$CSLOG"; check "bash still responsive after the substitution l
 # ============================================================================
 # ---- stress: ring-3 syscall fuzzer (full mode, fixed seed) ----
 FUZZLOG=/tmp/secos_selftest_sysfuzz.log
-echo "[selftest] Running ring-3 syscall fuzzer (full mode, mb2, serial, 60s)..."
+echo "[selftest] Running ring-3 syscall fuzzer (full mode, mb2, serial, 80s)..."
 : > "$FUZZLOG"
-( sleep 25; printf '  /bin/sysfuzz -s 777 -b 12 -c 150; echo FUZZEND\r'; sleep 33 ) | \
-    timeout 65 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+( sleep 25; printf '  /bin/sysfuzz -s 777 -b 12 -c 150; echo FUZZEND\r'; sleep 28
+  printf '  /bin/sysfuzz -s 33 -b 24 -c 120 > /dev/null; /bin/echo FZALIVE""-42\r'; sleep 15 ) | \
+    timeout 80 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$FUZZLOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >/dev/null 2>&1
 grep -q "\[sysfuzz\] DONE ok" "$FUZZLOG"; check "syscall fuzzer (full mode) ran every syscall to completion" $?
+# seed 33 batch 23 once umount()ed "/" -> empty namespace, every later exec failed.
+grep -q "^FZALIVE-42" "$FUZZLOG"; check "system still execs /bin programs after fuzzing (root not unmountable)" $?
 ! grep -q "ring0" "$FUZZLOG"; check "no ring-0 CPU fault during full-mode syscall fuzzing" $?
 ! grep -q "\[PANIC\]" "$FUZZLOG"; check "no kernel panic during full-mode syscall fuzzing" $?
 

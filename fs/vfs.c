@@ -74,6 +74,10 @@ int vfs_mount(const char* mount_point, const vfs_fs_ops_t* ops, const char* fs_n
 
 int vfs_unmount(const char* mount_point){
     if(!mount_point) return -1;
+    // Never detach the root filesystem: every path resolves through it, so a
+    // umount("/") (found by the syscall fuzzer) left an empty namespace — no
+    // /bin, no /dev — and every later exec/stat failed for the whole system.
+    if(mount_point[0]=='/' && mount_point[1]==0) return -1;
     uint64_t fl = spin_lock_irqsave(&g_mount_lock);
     for(int i=0;i<g_mount_count;i++){
         const char* a=g_mounts[i].mount_point; const char* b=mount_point; size_t k=0; int eq=1;

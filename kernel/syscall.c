@@ -551,9 +551,14 @@ int ksys_mount(const char* dev, const char* target, const char* fstype){
     if(isauto){ if(fat32_mount(dev,target)==0) return 0; return ext2_mount(dev,target); }
     return -1;                                            // unknown fstype
 }
+void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
 int ksys_umount(const char* target){
     extern int vfs_unmount(const char*);
-    return vfs_unmount(target);
+    // Normalize like every other path syscall ("/mnt/", "/mnt/.", relative
+    // paths, "" -> cwd), so "/" cannot be reached under another spelling.
+    char abs[256];
+    proc_resolve_path(sched_get_current(), target, abs, sizeof(abs));
+    return vfs_unmount(abs);
 }
 
 // [M26] Copy a NUL-terminated user string into a kernel buffer (bounded,

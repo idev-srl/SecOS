@@ -273,11 +273,23 @@ static void test_prot_none(void) {
     munmap(m, 3 * PG); munmap(n, 2 * PG); munmap(g, 3 * PG); munmap(f, PG);
 }
 
+/* umount must never detach the root filesystem, under any spelling (the
+ * syscall fuzzer did it once and every later exec/stat in the system failed). */
+static void test_umount_root(void) {
+    static const char* spell[] = { "/", "", ".", "/tmp/..", "//", "/./" };
+    int ok = 1;
+    for (unsigned i = 0; i < sizeof(spell) / sizeof(spell[0]); i++)
+        if (secos_syscall(39 /*SYS_UMOUNT*/, (long)spell[i], 0, 0, 0, 0) >= 0) ok = 0;
+    struct stat st;
+    check("umount-root-refused", ok && stat("/bin/abi_test", &st) == 0, 0);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "segv") == 0) { die_segv(); return 1; }
     test_wait_status();
     test_df();
     test_prot_none();
+    test_umount_root();
     put("[ABI-TEST] DONE pass="); putnum(g_pass);
     put(" fail="); putnum(g_fail); put("\n");
     return g_fail ? 1 : 0;
