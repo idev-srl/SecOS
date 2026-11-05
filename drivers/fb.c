@@ -90,12 +90,13 @@ int fb_init(uint32_t mb2_info) {
     if (found->type_fb == 1) {
     // Masks start immediately after the base fields
         uint8_t* extra = (uint8_t*)found + sizeof(struct multiboot2_tag_framebuffer);
-        g_fb.red_mask_size = extra[0];
-        g_fb.red_mask_pos  = extra[1];
-        g_fb.green_mask_size = extra[2];
-        g_fb.green_mask_pos  = extra[3];
-        g_fb.blue_mask_size = extra[4];
-        g_fb.blue_mask_pos  = extra[5];
+        // Multiboot2 order: field position, then mask size, per colour.
+        g_fb.red_mask_pos    = extra[0];
+        g_fb.red_mask_size   = extra[1];
+        g_fb.green_mask_pos  = extra[2];
+        g_fb.green_mask_size = extra[3];
+        g_fb.blue_mask_pos   = extra[4];
+        g_fb.blue_mask_size  = extra[5];
     } else {
         g_fb.red_mask_size = g_fb.red_mask_pos = 0;
         g_fb.green_mask_size = g_fb.green_mask_pos = 0;

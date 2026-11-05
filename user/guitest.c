@@ -68,7 +68,9 @@ static int t_fb(void) {
            f.visual, f.id);
     ok("GF-IOCTL", r1 == 0 && r2 == 0 && v.xres > 0 && v.yres > 0 && v.bits_per_pixel == 32 &&
                    f.line_length >= v.xres * 4 && f.smem_len >= f.line_length * v.yres &&
-                   f.visual == FB_VISUAL_TRUECOLOR && f.smem_start == 0);
+                   f.visual == FB_VISUAL_TRUECOLOR && f.smem_start == 0 &&
+                   v.red.offset == 16 && v.red.length == 8 && v.green.offset == 8 &&
+                   v.green.length == 8 && v.blue.offset == 0 && v.blue.length == 8);
     /* FBIOPUT: same mode accepted, a different resolution refused cleanly. */
     struct fb_var_screeninfo w = v;
     int same = ioctl(fd, FBIOPUT_VSCREENINFO, &w);
