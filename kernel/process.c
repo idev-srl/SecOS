@@ -18,6 +18,7 @@
 #include "spinlock.h"   // [M29] SMP: serialize the process table
 #include "percpu.h"     // [M29] smp_online_count for CPU affinity
 #include "user_copy.h"  // EFAULT
+#include "pty.h"        // pty fd / controlling-terminal references
 
 #define MAX_PROCESSES 32
 static process_t* proc_table[MAX_PROCESSES];
@@ -474,6 +475,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->pgid = p->pid; p->ppid = 0; p->spawner_pid = 0;
     p->stop_report = 0; p->cont_report = 0; p->stop_sig = 0;
     p->wait_tty = 0; p->power_phase = 0; p->power_deadline = 0;
+    p->wait_pty = NULL; p->sid = p->pid; p->ctty = NULL; p->ctty_detached = 0;  // own session, console
     p->sigsusp_active = 0; p->sigsusp_saved = 0;
     p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
     // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases
@@ -695,6 +697,8 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
         if (p->fds[i].is_pipe) {
             extern void pipe_unref(void*, int);
             pipe_unref(p->fds[i].inode, p->fds[i].pipe_w);
+        } else {
+            pty_unref(p->fds[i].inode);            // a pty end: drop this holder
         }
         p->fds[i].used = 0; p->fds[i].inode = NULL; p->fds[i].is_pipe = 0;
         p->fds[i].pipe_w = 0; p->fds[i].cloexec = 0; p->fds[i].offset = 0; p->fds[i].flags = 0;
@@ -706,7 +710,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
             p->sig_handler[s] = 0;
     p->sig_restorer = 0;
     p->sigsusp_active = 0;
-    p->sleep_until = 0; p->wait_pipe = NULL; p->wait_tty = 0; p->recv_chan = -1;
+    p->sleep_until = 0; p->wait_pipe = NULL; p->wait_tty = 0; p->wait_pty = NULL; p->recv_chan = -1;
 
     // Fresh register state: entry point, new stack, argc/argv/envp (System V).
     {
@@ -783,24 +787,30 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->ppid = parent->pid; c->pgid = parent->pgid; c->spawner_pid = 0;
     c->stop_report = 0; c->cont_report = 0; c->stop_sig = 0;
     c->wait_tty = 0; c->power_phase = 0; c->power_deadline = 0;
+    c->wait_pty = NULL;                        // sid/ctty/ctty_detached inherited (copied)
     c->sigsusp_active = 0; c->sigsusp_saved = 0;
     c->state = PROC_BLOCKED;                   // not runnable until fully built
 
     // [M25] The child inherits the parent's open pipe ends (fds were shallow
     // copied) — bump each inherited end's refcount so EOF/EPIPE accounting stays
     // correct across fork. The pipe object itself is shared (kernel-owned).
+    // Pty ends and the controlling terminal are counted the same way.
     { extern void pipe_ref(void*, int);
-      for (int i = 0; i < 32; i++)
-          if (c->fds[i].used && c->fds[i].is_pipe)
-              pipe_ref(c->fds[i].inode, c->fds[i].pipe_w); }
+      for (int i = 0; i < 32; i++) {
+          if (!c->fds[i].used) continue;
+          if (c->fds[i].is_pipe) pipe_ref(c->fds[i].inode, c->fds[i].pipe_w);
+          else pty_ref(c->fds[i].inode);
+      }
+      pty_ctty_ref(c->ctty); }
 
     if (proc_add(c) != 0) {
+        process_release_pipes(c);
         kfree(c->tf); if (c->manifest) kfree(c->manifest); if (c->image) kfree(c->image);
         vmm_space_destroy(c->space); kfree(c); return NULL;
     }
     c->kstack_top = vmm_alloc_kernel_stack_for_slot(c->kstack_slot);
     if (!c->kstack_top) {
-        proc_remove(c); kfree(c->tf); if (c->manifest) kfree(c->manifest);
+        proc_remove(c); process_release_pipes(c); kfree(c->tf); if (c->manifest) kfree(c->manifest);
         if (c->image) kfree(c->image); vmm_space_destroy(c->space); kfree(c); return NULL;
     }
     debugcon_writestring("[FORK] parent="); debugcon_print_hex(parent->pid);
@@ -824,6 +834,9 @@ void process_print(const process_t* p) {
 // zombie is kept until the parent wait()s, so a write end held until reap means
 // a parent that reads to EOF before waiting (bash command substitution `$(...)`)
 // never sees EOF and deadlocks. Idempotent: released slots are cleared.
+// Pty ends are dropped here too (a master's last close hangs the slave up; a
+// slave's last close lets the master read EIO), and so is the controlling
+// terminal (a session leader's exit hangs up its foreground group).
 void process_release_pipes(process_t* p) {
     extern void pipe_unref(void*, int);
     if (!p) return;
@@ -833,8 +846,13 @@ void process_release_pipes(process_t* p) {
             int   w  = p->fds[i].pipe_w;
             p->fds[i].is_pipe = 0; p->fds[i].used = 0; p->fds[i].inode = NULL;
             pipe_unref(pp, w);
+        } else if (p->fds[i].used && pty_is_inode(p->fds[i].inode)) {
+            void* ino = p->fds[i].inode;
+            p->fds[i].used = 0; p->fds[i].inode = NULL;
+            pty_unref(ino);
         }
     }
+    pty_proc_exit(p);
 }
 
 int process_destroy(process_t* p) {

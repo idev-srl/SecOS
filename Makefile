@@ -50,7 +50,7 @@ SRC_C   = \
 	$(ARCH_DIR)/percpu.c \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
-	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c \
+	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c $(DRIVERS_DIR)/vt.c \
 	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
 	$(DRIVERS_DIR)/ahci.c $(DRIVERS_DIR)/nvme.c \
 	$(DRIVERS_DIR)/xhci.c $(DRIVERS_DIR)/usb.c \
@@ -74,6 +74,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/ipc.c \
 	$(KERNEL_DIR)/pipe.c \
 	$(KERNEL_DIR)/tty.c \
+	$(KERNEL_DIR)/pty.c \
 	$(KERNEL_DIR)/power.c \
 	$(KERNEL_DIR)/smp.c \
 	$(KERNEL_DIR)/pkg.c \
@@ -384,7 +385,17 @@ user-progs:
 	python3 tools/secos-sign user/exectest.elf --dev
 	python3 tools/elf2h.py user/exectest.elf user_exectest_elf crypto/user_exectest_elf.h
 	python3 tools/elf2h.py user/exectest_unsigned.elf user_exectest_unsigned_elf crypto/user_exectest_unsigned_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + power + exectest{,_unsigned} -> crypto/*.h"
+	# [tty] termios/raw-mode/VMIN-VTIME/winsize regression test (selftest line-editing gate)
+	$(CC) $(USER_CFLAGS) -c user/ttytest.c     -o user/ttytest.o
+	$(LD) --gc-sections -T user/user.ld -o user/ttytest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/ttytest.o
+	python3 tools/secos-sign user/ttytest.elf --dev
+	python3 tools/elf2h.py user/ttytest.elf user_ttytest_elf crypto/user_ttytest_elf.h
+	# [pty] pseudo-terminal regression test + script(1)-style relay (selftest pty gate)
+	$(CC) $(USER_CFLAGS) -c user/ptytest.c     -o user/ptytest.o
+	$(LD) --gc-sections -T user/user.ld -o user/ptytest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/ptytest.o
+	python3 tools/secos-sign user/ptytest.elf --dev
+	python3 tools/elf2h.py user/ptytest.elf user_ptytest_elf crypto/user_ptytest_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + power + exectest{,_unsigned} + ttytest + ptytest -> crypto/*.h"
 
 # Staleness guard for the committed embedded programs: rebuild + re-sign them
 # (deterministic: same sources -> byte-identical headers) and fail if any

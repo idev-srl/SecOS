@@ -134,8 +134,7 @@ port now starts from the minimal config and turns on everything SecOS can back:
 job control, aliases, `history`/`fc` (no `!` expansion), `help`, arrays, brace
 expansion, `[[ ]]`, `(( ))`, `for ((;;))`, `pushd`/`popd`/`dirs`, `select`,
 `time`, extglob and the case-modifying expansions. Process substitution stays
-off (it needs `/dev/fd`). readline stays off too, so there is no line editing
-or arrow-key history. The signed bash grows from 548 KB to 810 KB. A work dir
+off (it needs `/dev/fd`). readline is on since the line-editing work below. The signed bash grows from 548 KB to 810 KB. A work dir
 configured with different options is reconfigured automatically (`.secos-conf`
 stamp).
 
@@ -195,3 +194,38 @@ the signal).
 Tests: `EXECVE_DEMO` (`user/exectest.c`, log
 `/tmp/secos_selftest_execve.log`) and the "bash over the real execve" section
 of `tools/selftest.sh` (`/tmp/secos_selftest_bashexec.log`).
+
+## Line editing: GNU readline on a real termios console (2026-11, feat/line-editing)
+
+bash is built with its bundled GNU readline (`--enable-readline
+--without-installed-readline`): arrow-key history, Left/Right/Home/End/Delete
+editing, Ctrl-A/E/K/U/W/D, Tab completion of file and command names (double
+Tab lists the candidates), Ctrl-R incremental search, `bind` and `/etc/inputrc`.
+Progcomp (`complete`/`compgen`) stays off.
+
+What made it possible:
+- **Console termios** (`kernel/tty.c`, ABI in `kernel/tty.h` = libc
+  `<termios.h>`, Linux flag values and `c_cc` indices): canonical or raw mode,
+  ECHO*, ISIG (VINTR/VQUIT/VSUSP -> SIGINT/SIGQUIT/SIGTSTP to the foreground
+  group), ICRNL/OPOST/ONLCR, VMIN/VTIME, TCSANOW/TCSADRAIN/TCSAFLUSH,
+  TIOCGWINSZ (real console size)/TIOCSWINSZ, FIONREAD, TCFLSH. A lone ESC waits
+  ~10 ms for the rest of a sequence so serial input is not split; readline has
+  no `select()` here and decides "bare Escape or arrow key" with FIONREAD.
+- **Keyboards send terminal bytes**: PS/2 and USB HID emit xterm sequences
+  (arrows `ESC [ A..D`, Home/End `ESC [ H/F`, `ESC [ 2/3/5/6 ~`, F1-F12,
+  Shift-Tab), CR for Enter, DEL for Backspace, Alt = ESC prefix.
+- **ANSI console** (`drivers/vt.c`): cursor motion/addressing, erase,
+  insert/delete, scroll regions, SGR colors, alternate screen, UTF-8 (one cell
+  per code point; common punctuation folded to ASCII, box drawing mapped).
+- **termcap**: SecOS has no termcap/terminfo database; `user/termcap.c`
+  compiles in the console entry (`tgetent`/`tgetstr`/`tgoto`/`tputs`), returned
+  for any `TERM` except `dumb`. `/etc/bash.bashrc` (written at boot when absent)
+  exports `TERM=linux`; `/etc/inputrc` adds VT220/xterm Home/End/Delete variants
+  and turns bracketed paste off (also off by default in the port's `rlconf.h`).
+
+Port notes: `lib/sh/shtty.c` is compiled now (the old stubs never applied the
+settings, so `read -s/-n` did nothing); `lib/readline` is compiled except the
+helpers duplicating bash's (`xmalloc.c`, `xfree.c`, `shell.c`, `tilde.c`); the
+readline SIGALRM timeout path has an upstream macro bug (`timerset(&x.y, ...)`)
+that the port patches. `/bin/ttytest` and the selftest "line editing" section
+drive all of it over serial; `tools/soak_drive.py` types some lines with edits.

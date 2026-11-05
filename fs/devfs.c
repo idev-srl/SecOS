@@ -11,17 +11,24 @@
  * kernel block driver). Char devices (null/zero/full/random/urandom/console/tty)
  * are synthesized; block devices (sda/nvme0n1/usb0/vda...) are byte-addressed
  * over the registered block_dev_t. A pure namespace: no create/mkdir/remove.
+ *
+ * Terminals: /dev/console is the console; /dev/tty is the opener's controlling
+ * terminal (the console, or a pty slave - ksys_open asks kernel/pty.c to
+ * substitute it); /dev/ptmx allocates a pseudo-terminal and /dev/pts/N are the
+ * live slaves (both served by kernel/pty.c).
  */
 #include "vfs.h"
 #include "block.h"
 #include "terminal.h"
 #include "keyboard.h"
+#include "pty.h"
 #include <stddef.h>
 #include <stdint.h>
 
 extern uint64_t timer_get_ticks(void);
 
-enum dev_kind { DEV_NULL, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_CONSOLE, DEV_BLOCK };
+enum dev_kind { DEV_NULL, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_CONSOLE, DEV_BLOCK,
+                DEV_TTY /* controlling terminal */, DEV_PTMX /* pty multiplexer */ };
 
 struct dev_node {
     char name[16];
@@ -29,7 +36,7 @@ struct dev_node {
     block_dev_t* blk;     // for DEV_BLOCK
 };
 
-#define DEVFS_MAX 16
+#define DEVFS_MAX 24
 static struct dev_node g_nodes[DEVFS_MAX];
 static int g_nnodes;
 static vfs_inode_t g_inodes[DEVFS_MAX + 1];   // +1 for the root dir
@@ -58,7 +65,8 @@ static void devfs_build(void) {
     add("random", DEV_RANDOM, NULL);
     add("urandom", DEV_RANDOM, NULL);
     add("console", DEV_CONSOLE, NULL);
-    add("tty", DEV_CONSOLE, NULL);
+    add("tty", DEV_TTY, NULL);
+    add("ptmx", DEV_PTMX, NULL);
     int n = block_count();
     for (int i = 0; i < n; i++) {
         block_dev_t* b = block_get(i);
@@ -97,6 +105,8 @@ static int find_node(const char* rel) {
 
 static vfs_inode_t* devfs_lookup(const char* rel) {
     devfs_build();
+    vfs_inode_t* pt = pty_devfs_lookup(rel);           /* /pts, /pts/N */
+    if (pt) return pt;
     int i = find_node(rel);
     if (i == -2) return NULL;
     return fill_inode(i);
@@ -105,8 +115,10 @@ static vfs_inode_t* devfs_lookup(const char* rel) {
 static int devfs_readdir(const char* dir, vfs_iter_cb cb, void* user) {
     devfs_build();
     if (!cb) return -1;
-    if (!(dir && dir[0]=='/' && dir[1]==0)) return -1;   // only the root dir lists
+    if (dir && seq(dir, "/pts")) return pty_devfs_readdir(cb, user);
+    if (!(dir && dir[0]=='/' && dir[1]==0)) return -1;   // only the root dir and /pts list
     for (int i=0;i<g_nnodes;i++) cb(fill_inode(i), user);
+    cb(pty_devfs_lookup("/pts"), user);
     return 0;
 }
 
@@ -121,6 +133,23 @@ static uint64_t rng_next(void) {
 
 static int blk_byte_io(block_dev_t* b, size_t off, void* buf, size_t len, int write);
 
+/* Is this inode /dev/tty or /dev/console? (termios ioctls apply to it.) */
+int devfs_is_console(void* p) {
+    vfs_inode_t* inode = (vfs_inode_t*)p;
+    if (!inode || !inode->fs_data) return 0;
+    struct dev_node* d = (struct dev_node*)inode->fs_data;
+    return (d >= g_nodes && d < g_nodes + DEVFS_MAX && (d->kind == DEV_CONSOLE || d->kind == DEV_TTY));
+}
+static int devfs_kind_is(void* p, enum dev_kind k) {
+    vfs_inode_t* inode = (vfs_inode_t*)p;
+    if (!inode || !inode->fs_data) return 0;
+    struct dev_node* d = (struct dev_node*)inode->fs_data;
+    return (d >= g_nodes && d < g_nodes + DEVFS_MAX && d->kind == k);
+}
+/* /dev/tty (resolved per opener) and /dev/ptmx (a new pty per open). */
+int devfs_is_devtty(void* p) { return devfs_kind_is(p, DEV_TTY); }
+int devfs_is_ptmx(void* p) { return devfs_kind_is(p, DEV_PTMX); }
+
 static int devfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
     if (!inode || !inode->fs_data) return -1;
     struct dev_node* d = (struct dev_node*)inode->fs_data;
@@ -133,9 +162,12 @@ static int devfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
             for (size_t i=0;i<len;i++) out[i] = (uint8_t)rng_next();
             return (int)len;
         }
-        case DEV_CONSOLE: {                                        // [M25] cooked TTY line read
-            extern int tty_read(void* buf, int len);
-            return tty_read(buf, (int)len);
+        case DEV_PTMX: return -1;                                  // replaced at open
+        case DEV_TTY:
+        case DEV_CONSOLE: {                                        // [M25] console TTY read
+            // -2 = would block: SYS_READ blocks the caller (wait_tty) and re-runs.
+            extern int tty_read_try(void* buf, int len);
+            return tty_read_try(buf, (int)(len > 4096 ? 4096 : len));
         }
         case DEV_BLOCK: return blk_byte_io(d->blk, off, buf, len, 0);
     }
@@ -150,7 +182,9 @@ static int devfs_write(vfs_inode_t* inode, size_t off, const void* buf, size_t l
         case DEV_NULL: case DEV_ZERO: return (int)len;            // sink
         case DEV_FULL: return -1;                                 // ENOSPC
         case DEV_RANDOM: return (int)len;                         // reseed ignored
-        case DEV_CONSOLE: for (size_t i=0;i<len;i++) terminal_putchar((char)in[i]); return (int)len;
+        case DEV_PTMX: return -1;                                 // replaced at open
+        case DEV_TTY:
+        case DEV_CONSOLE: { extern int tty_write(const void*, int); return tty_write(in, (int)len); }
         case DEV_BLOCK: return blk_byte_io(d->blk, off, (void*)(uintptr_t)buf, len, 1);
     }
     return -1;

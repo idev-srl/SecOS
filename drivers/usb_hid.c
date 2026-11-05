@@ -8,7 +8,8 @@
  * (SET_PROTOCOL 0), then keeps one 8-byte boot report outstanding on the
  * interrupt-IN endpoint. usb_hid_poll() (driven from the keyboard input wait,
  * NOT an ISR) non-blockingly checks for a completed report, translates new
- * key-down usages to ASCII and injects them into the shared keyboard buffer,
+ * key-down usages to the bytes a terminal sends (ASCII, C0 controls, ESC [
+ * sequences for arrows/Home/End/...) and injects them into the shared buffer,
  * then re-arms. Single keyboard supported.
  */
 #include "usb.h"
@@ -27,7 +28,7 @@ static const char hid_unshift[0x68] = {
     [0x19]='v',[0x1A]='w',[0x1B]='x',[0x1C]='y',[0x1D]='z',
     [0x1E]='1',[0x1F]='2',[0x20]='3',[0x21]='4',[0x22]='5',[0x23]='6',[0x24]='7',
     [0x25]='8',[0x26]='9',[0x27]='0',
-    [0x28]='\n',[0x29]=27,[0x2A]='\b',[0x2B]='\t',[0x2C]=' ',
+    [0x28]='\r',[0x29]=27,[0x2A]=0x7F,[0x2B]='\t',[0x2C]=' ',
     [0x2D]='-',[0x2E]='=',[0x2F]='[',[0x30]=']',[0x31]='\\',
     [0x33]=';',[0x34]='\'',[0x35]='`',[0x36]=',',[0x37]='.',[0x38]='/',
 };
@@ -38,7 +39,7 @@ static const char hid_shift[0x68] = {
     [0x19]='V',[0x1A]='W',[0x1B]='X',[0x1C]='Y',[0x1D]='Z',
     [0x1E]='!',[0x1F]='@',[0x20]='#',[0x21]='$',[0x22]='%',[0x23]='^',[0x24]='&',
     [0x25]='*',[0x26]='(',[0x27]=')',
-    [0x28]='\n',[0x29]=27,[0x2A]='\b',[0x2B]='\t',[0x2C]=' ',
+    [0x28]='\r',[0x29]=27,[0x2A]=0x7F,[0x2B]='\t',[0x2C]=' ',
     [0x2D]='_',[0x2E]='+',[0x2F]='{',[0x30]='}',[0x31]='|',
     [0x33]=':',[0x34]='"',[0x35]='~',[0x36]='<',[0x37]='>',[0x38]='?',
 };
@@ -55,24 +56,52 @@ static int key_in_report(const uint8_t* rep, uint8_t code) {
     return 0;
 }
 
+/* Non-character usages -> KEY_* (cursor/editing/function keys, keypad). */
+static int hid_special(uint8_t code) {
+    if (code >= 0x3A && code <= 0x45) return KEY_F1 + (code - 0x3A);
+    switch (code) {
+    case 0x49: return KEY_INS;   case 0x4A: return KEY_HOME;  case 0x4B: return KEY_PGUP;
+    case 0x4C: return KEY_DEL;   case 0x4D: return KEY_END;   case 0x4E: return KEY_PGDN;
+    case 0x4F: return KEY_RIGHT; case 0x50: return KEY_LEFT;  case 0x51: return KEY_DOWN;
+    case 0x52: return KEY_UP;
+    /* keypad (boot protocol reports no Num Lock state: treat as digits) */
+    case 0x54: return '/';  case 0x55: return '*';  case 0x56: return '-';  case 0x57: return '+';
+    case 0x58: return '\r'; case 0x59: return '1'; case 0x5A: return '2'; case 0x5B: return '3';
+    case 0x5C: return '4';  case 0x5D: return '5';  case 0x5E: return '6';  case 0x5F: return '7';
+    case 0x60: return '8';  case 0x61: return '9';  case 0x62: return '0';  case 0x63: return '.';
+    default: return 0;
+    }
+}
+
 static void process_report(void) {
     uint8_t mods = g_report[0];
     int shift = (mods & 0x22) != 0;   // L/R shift
     int ctrl  = (mods & 0x11) != 0;   // [M25] L/R ctrl -> control codes
+    int alt   = (mods & 0x44) != 0;   // L/R alt -> ESC prefix (meta)
     for (int i = 2; i < 8; i++) {
         uint8_t code = g_report[i];
         if (code == 0 || code == 1) continue;             // none / rollover
         if (key_in_report(g_last, code)) continue;        // still held -> not a new press
         if (code == 0x39) { g_caps = !g_caps; continue; } // Caps Lock toggle
         if (code >= 0x68) continue;
-        char c = shift ? hid_shift[code] : hid_unshift[code];
-        if (!shift && g_caps && c >= 'a' && c <= 'z') c -= 32;
-        if (ctrl && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) c = (char)(c & 0x1F);  // [M25]
-        if (c) {
+        int key = hid_special(code);
+        int kmods = (ctrl ? KMOD_CTRL : 0) | (alt ? KMOD_ALT : 0);
+        if (!key) {
+            char c = shift ? hid_shift[code] : hid_unshift[code];
+            if (!shift && g_caps && c >= 'a' && c <= 'z') c -= 32;
+            if (shift && g_caps && c >= 'A' && c <= 'Z') c += 32;
+            if (c == '\t' && shift) key = KEY_BACKTAB;
+            else key = (unsigned char)c;
+        } else if (key >= 0x100 && shift) {
+            kmods |= KMOD_SHIFT;
+        }
+        char seq[8];
+        int n = key ? keyboard_key_bytes(key, kmods, seq) : 0;
+        if (n > 0) {
 #ifdef HID_DEBUG_INJECT
-            debugcon_writestring("[HID] key 0x"); debugcon_print_hex((uint64_t)(uint8_t)c); debugcon_writestring("\n");
+            debugcon_writestring("[HID] key 0x"); debugcon_print_hex((uint64_t)(uint8_t)seq[0]); debugcon_writestring("\n");
 #endif
-            keyboard_inject_char(c);
+            keyboard_inject_seq(seq, n);
         }
     }
     for (int i = 0; i < 8; i++) g_last[i] = g_report[i];

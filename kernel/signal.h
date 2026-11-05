@@ -40,6 +40,8 @@
 #define SIGTSTP  20             /* default: stop (Ctrl-Z) */
 #define SIGTTIN  21
 #define SIGTTOU  22
+#define SIGURG   23             /* default: ignore */
+#define SIGWINCH 28             /* default: ignore (terminal resized) */
 
 /* Handler sentinels (must match user/include/signal.h). */
 #define SIG_DFL  0UL

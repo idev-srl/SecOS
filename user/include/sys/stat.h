@@ -7,4 +7,12 @@
 #define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
 #define S_ISCHR(m)  (((m) & S_IFMT) == S_IFCHR)
 #define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
+#ifndef S_IFIFO
+#define S_IFIFO  0x1000
+#endif
+#ifndef S_IFSOCK
+#define S_IFSOCK 0xC000
+#endif
+#define S_ISFIFO(m)  (((m) & S_IFMT) == S_IFIFO)
+#define S_ISSOCK(m)  (((m) & S_IFMT) == S_IFSOCK)
 #endif

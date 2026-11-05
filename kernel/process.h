@@ -100,6 +100,7 @@ typedef struct process {
     int      recv_chan;      // [M17] IPC channel the caller is blocked receiving on (-1)
     void*    wait_pipe;      // [M25] pipe object the caller is blocked on (NULL = none)
     uint8_t  wait_tty;       // blocked in a console read() until input arrives (tty_read_try)
+    void*    wait_pty;       // pty_t* the caller is blocked on (read/write either side; NULL = none)
     uint8_t  power_phase;    // SYS_REBOOT shutdown state machine (kernel/power.c)
     uint64_t power_deadline; // tick deadline of the current shutdown phase
     // [M30] Signals + job control. sig_pending/sig_blocked are bitmasks (bit n =
@@ -121,6 +122,15 @@ typedef struct process {
     uint64_t sigsusp_saved;
     uint32_t pgid;           // process group id (defaults to pid)
     uint32_t ppid;           // parent pid (0 = no parent process, e.g. shell-spawned)
+    // Sessions + controlling terminal. sid = session id (a kernel-created process
+    // leads its own). ctty = the struct tty* of a pty that is our controlling
+    // terminal (holds a pty reference); NULL means the console, unless
+    // ctty_detached is set (after setsid()/TIOCNOTTY: no controlling terminal).
+    // A ctty whose tty->session no longer matches sid was hung up / given away
+    // and counts as none (see pty_proc_ctty()).
+    uint32_t sid;
+    void*    ctty;
+    uint8_t  ctty_detached;
     uint32_t spawner_pid;    // pid of the process whose SYS_SPAWN created us (0 = kernel/
                              // fork). With ppid, the only caller allowed to SYS_WAIT us.
     char     cwd[256];       // [M39] per-process current working directory (for chdir/getcwd + relative paths)

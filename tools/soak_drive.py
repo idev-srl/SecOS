@@ -5,7 +5,8 @@
 # Boots the SecOS ISO in QEMU (into the signed GNU bash login shell) and drives
 # a long, seeded, realistic session over the serial console: coreutils, loops,
 # background jobs, file I/O in /tmp (ramfs), /proc and /dev reads, and (when
-# available) the signed syscall fuzzer. Every logical step ends with a unique
+# available) the signed syscall fuzzer. Lines are typed through bash's readline,
+# some with cursor/history editing (--no-edit types them plainly). Every logical step ends with a unique
 # sentinel `echo OK-$((<n>))` whose expansion OK-<n> must appear in the output — a missing sentinel,
 # a CPU exception/panic/kill, a heap-corruption marker, or a stall all FAIL.
 #
@@ -19,7 +20,7 @@ import sys, os, time, random, subprocess, threading, re
 
 def parse(argv):
     o = {"seed":1234,"iters":400,"settle":25.0,"stall":20.0,"cmdsub":1,"pipes":1,"fuzz":0,
-         "disk":0,"log":"/tmp/soak.log","smp":1}
+         "disk":0,"log":"/tmp/soak.log","smp":1,"edit":1}
     i=0
     while i < len(argv):
         a=argv[i]
@@ -27,11 +28,35 @@ def parse(argv):
         k=a.lstrip("-")
         if k in ("seed","iters","smp"): o[k]=int(argv[i+1]); i+=2; continue
         if k in ("settle","stall"):     o[k]=float(argv[i+1]); i+=2; continue
-        if k in ("cmdsub","pipes","fuzz","disk"): o[k]=1; i+=1; continue
-        if k in ("no-cmdsub","no-pipes"): o[k[3:]]=0; i+=1; continue
+        if k in ("cmdsub","pipes","fuzz","disk","edit"): o[k]=1; i+=1; continue
+        if k in ("no-cmdsub","no-pipes","no-edit"): o[k[3:]]=0; i+=1; continue
         if k=="log": o["log"]=argv[i+1]; i+=2; continue
         i+=1
     return o, []
+
+# ---- line-editing modes ---------------------------------------------------
+# bash runs GNU readline on the console, so a command can be typed with an edit
+# that only produces the right line if the editing keys work. The typed text is
+# never the expanded output, so sentinels/expectations stay unambiguous.
+#   plain : type the line, Enter
+#   fix   : type the line without its first char, Ctrl-A (start), the char, Enter
+#   left  : type the line without its last char, Left, the char, End, Enter
+#           (the last char is ')' of the sentinel; inserting before ')' then
+#           moving the original ')' after it works only with cursor motion)
+#   hist  : Up (recall the previous line), Ctrl-U (kill it), type the line, Enter
+EDIT_MODES = ("plain", "plain", "fix", "left", "hist")
+
+def keys_for(line, mode):
+    """Bytes to send for `line` typed with editing `mode` (Enter included)."""
+    if mode == "fix" and len(line) > 1:
+        return line[1:] + "\x01" + line[0] + "\r"
+    if mode == "left" and line.endswith("))"):
+        # line = ...$((N)) : type up to the second-to-last char, move left over
+        # the final ')' typed first, insert the other ')', then End.
+        return line[:-1] + "\x1b[D" + ")" + "\x1b[F" + "\r"
+    if mode == "hist":
+        return "\x1b[A\x15" + line + "\r"
+    return line + "\r"
 
 # ---- command-fragment generators (each returns a bash command string) --------
 WORDS=["alpha","bravo","charlie","delta","echo1","foxtrot","42","secos","x","hello world"]
@@ -81,7 +106,7 @@ def main():
         st["pipes"] = bool(int(os.environ["SOAK_PIPES"]))
 
     print(f"[soak] seed={o['seed']} iters={o['iters']} smp={o['smp']} disk={o['disk']} "
-          f"cmdsub={o['cmdsub']} fuzz={o['fuzz']} pipes={st['pipes']}", flush=True)
+          f"cmdsub={o['cmdsub']} fuzz={o['fuzz']} pipes={st['pipes']} edit={o['edit']}", flush=True)
 
     p = subprocess.Popen(qemu, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT)
@@ -136,15 +161,18 @@ def main():
     while i < n:
         cmd, expect = gen_command(r, st)
         sentinel = f"OK-{i}"
-        # The TTY echoes the typed line, so the sentinel must only appear once
-        # bash has *expanded* it: `echo OK-$((i))` echoes as "OK-$((i))" and
-        # prints "OK-i". (A literal `echo OK-i` matched its own echo, so the
-        # driver never waited for a command to finish and typed ahead.)
+        # readline echoes (and redraws) the typed line, so the sentinel must
+        # only appear once bash has *expanded* it: `echo OK-$((i))` echoes as
+        # "OK-$((i))" and prints "OK-i". (A literal `echo OK-i` matched its own
+        # echo, so the driver never waited for a command to finish and typed
+        # ahead.) Lines are sometimes typed with an edit (see keys_for).
         line = f"{cmd}; echo OK-$(({i}))"
-        sent.append((i, line, expect))
+        mode = r.choice(EDIT_MODES) if o["edit"] else "plain"
+        keys = keys_for(line, mode)
+        sent.append((i, line if mode == "plain" else f"{line}   [typed as {mode}: {keys!r}]", expect))
         with lock: since = len(buf)
         try:
-            p.stdin.write(line.encode()+b"\r"); p.stdin.flush()
+            p.stdin.write(keys.encode()); p.stdin.flush()
         except BrokenPipeError:
             print(f"[soak] FAIL: QEMU stdin closed (crash?) at cmd {i}: {cmd}")
             bundle(o, sent, tail(), "stdin-closed"); p.kill(); sys.exit(1)

@@ -71,6 +71,9 @@
 #define SYS_REBOOT      59 // reboot(cmd): orderly poweroff(1)/restart(2)/halt(3); returns only on error
 #define SYS_EXECVE      60 // execve(path, argv, envp): replace the caller's image in place; returns only on error (-errno)
 #define SYS_FCNTL       61 // fcntl(fd, cmd, arg): F_DUPFD[_CLOEXEC] / F_GETFD / F_SETFD / F_GETFL / F_SETFL
+// Sessions + pseudo-terminals (numbers 85-89 are reserved for the pty work).
+#define SYS_SETSID      85 // setsid() -> new session id / -EPERM (already a group leader)
+#define SYS_GETSID      86 // getsid(pid) -> session id (pid 0 = caller) / -ESRCH
 
 // [M24] socket types
 #define SOCK_STREAM 1   // TCP

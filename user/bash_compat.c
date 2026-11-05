@@ -154,17 +154,6 @@ int isnetconn(int fd){ (void)fd; return 0; }
 const char* fnx_fromfs(char* s, unsigned long n){ (void)n; return s; }
 int shtimer_select(int n, void* r, void* w, void* e, void* t){ (void)n;(void)r;(void)w;(void)e;(void)t; return 0; }
 
-/* tty helpers (lib/sh/shtty.c excluded): SecOS console is cooked-by-default */
-int ttgetattr(int fd, struct termios* t){ return tcgetattr(fd, t); }
-int ttsetattr(int fd, struct termios* t){ return tcsetattr(fd, 0, t); }
-struct termios* ttattr(int fd){ static struct termios t; return tcgetattr(fd,&t)==0 ? &t : (struct termios*)0; }
-int ttfd_cbreak(int fd, struct termios* t){ (void)fd; if(t) t->c_lflag &= ~ICANON; return 0; }
-int ttfd_noecho(int fd, struct termios* t){ (void)fd; if(t) t->c_lflag &= ~ECHO; return 0; }
-int ttfd_onechar(int fd, struct termios* t){ (void)fd; (void)t; return 0; }
-int ttfd_eightbit(int fd, struct termios* t){ (void)fd;(void)t; return 0; }
-int ttfd_nopflush(int fd, struct termios* t){ (void)fd;(void)t; return 0; }
-int ttfd_nottyeof(int fd, struct termios* t){ (void)fd;(void)t; return 0; }
-
 /* ---- bash's RNG (lib/sh/random.c excluded) ---- */
 static unsigned long g_rng = 0x2545F491;
 unsigned int get_urandom32(void){ g_rng = g_rng*6364136223846793005UL + 1442695040888963407UL; return (unsigned int)(g_rng>>33); }

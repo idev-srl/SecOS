@@ -672,7 +672,7 @@ void shell_run(void) {
         } else if (c == '\b') {
             if (pos > 0) {
                 pos--;
-                terminal_putchar('\b');
+                terminal_writestring("\b \b");   // BS is non-destructive (VT)
             }
         } else if (c >= 0x20 && c < 0x7f && pos < MAX_COMMAND_LEN - 1) {
             command[pos++] = c;
@@ -1638,7 +1638,7 @@ static int job_wait_foreground(uint32_t pgid, const uint32_t* pids, int npid){
 
 // Launch a (possibly piped) job: `cmd1 args | cmd2 | ...`, optionally in the
 // background (trailing &, stripped by the caller). 'line' is mutated in place.
-static uint8_t g_job_spawn_buf[1024*1024];   // [M39] 1 MB: fits GNU bash (548 KB)
+static uint8_t g_job_spawn_buf[2*1024*1024]; // 2 MB: GNU bash with readline is ~1.1 MB
 static void run_job(char* line, int background){
     // [M38] Output redirection: strip a trailing `> file` / `>> file` and remember
     // the target + append mode. Applied to the LAST pipeline stage's fd 1 (stdout).
@@ -1789,6 +1789,9 @@ static void sh_run(const char* a){
     if(!*a){ terminal_writestring("Usage: run <path> [args...]\n"); return; }
     char line[256]; int q=0; for(const char* s=a; *s && q<255; s++) line[q++]=*s; line[q]=0;
     run_job(line, 0);
+    // A program that died in raw mode (or bash, the login shell, on exit) must
+    // not leave the console without echo / line editing for the next one.
+    extern void tty_reset(void); tty_reset();
 }
 
 // [M31] Toggle kernel verbosity (the per-spawn [PROC]/[ELF]/[M5]/... debug noise).

@@ -376,7 +376,10 @@ void __assert_fail(const char* expr, const char* file, int line){
 /* ============================== <unistd.h> extras ====================== */
 unsigned int sleep(unsigned int s){ sleep_ticks(s*1000); return 0; }
 int usleep(unsigned long us){ unsigned t=(unsigned)(us/1000); if(!t)t=1; sleep_ticks(t); return 0; }
-int isatty(int fd){ return fd==0||fd==1||fd==2; }
+/* A terminal is whatever answers TCGETS (the console and its dups, /dev/tty);
+ * a redirected stdio fd (pipe, file) is not. */
+int ioctl(int fd, unsigned long request, void* arg);
+int isatty(int fd){ int t[9]; return ioctl(fd, 0x5401 /*TCGETS*/, t) == 0; }
 
 /* ============================ printf core ============================== */
 /* A sink-based formatter so printf/fprintf stream directly and snprintf bounds. */
@@ -615,3 +618,91 @@ int ferror(FILE* f){ return f->flags&8?1:0; }
 long ftell(FILE* f){ return lseek(f->fd,0,SEEK_CUR); }
 int  fseek(FILE* f, long off, int whence){ fflush(f); return lseek(f->fd,off,whence)<0?-1:0; }
 void perror(const char* s){ if(s&&*s){ fputs(s,stderr); fputs(": ",stderr); } fputs(strerror(errno),stderr); fputc('\n',stderr); fflush(stderr); }
+
+/* ========================= pseudo-terminals ============================= */
+/* Unix 98 ptys: /dev/ptmx hands out a master, /dev/pts/N is its slave. The
+ * kernel keeps a new slave locked until unlockpt(); there is no ownership to
+ * fix up (single user), so grantpt() only checks that fd is a master. */
+#include <pty.h>
+#include <utmp.h>
+#include <termios.h>
+
+int posix_openpt(int flags){ return open("/dev/ptmx", flags); }
+int grantpt(int fd){ unsigned n; return ioctl(fd, TIOCGPTN, &n) < 0 ? -1 : 0; }
+int unlockpt(int fd){ int unlock = 0; return ioctl(fd, TIOCSPTLCK, &unlock) < 0 ? -1 : 0; }
+int ptsname_r(int fd, char* buf, size_t len){
+    unsigned n;
+    if(!buf){ errno = EINVAL; return EINVAL; }
+    if(ioctl(fd, TIOCGPTN, &n) < 0) return errno;
+    int w = snprintf(buf, len, "/dev/pts/%u", n);
+    if(w < 0 || (size_t)w >= len){ errno = ERANGE; return ERANGE; }
+    return 0;
+}
+char* ptsname(int fd){
+    static char name[32];
+    return ptsname_r(fd, name, sizeof(name)) == 0 ? name : (char*)0;
+}
+
+int openpty(int* amaster, int* aslave, char* name,
+            const struct termios* termp, const struct winsize* winp){
+    char path[32];
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    if(m < 0) return -1;
+    if(grantpt(m) < 0 || unlockpt(m) < 0 || ptsname_r(m, path, sizeof(path)) != 0){
+        int e = errno; close(m); errno = e; return -1;
+    }
+    int s = open(path, O_RDWR | O_NOCTTY);
+    if(s < 0){ int e = errno; close(m); errno = e; return -1; }
+    if(termp) tcsetattr(s, TCSANOW, termp);
+    if(winp) ioctl(s, TIOCSWINSZ, (void*)winp);
+    if(name) strcpy(name, path);
+    *amaster = m; *aslave = s;
+    return 0;
+}
+
+int login_tty(int fd){
+    setsid();                              /* fails only for a group leader: go on */
+    if(ioctl(fd, TIOCSCTTY, (void*)0) < 0) return -1;
+    for(int i = 0; i < 3; i++) if(dup2(fd, i) < 0) return -1;
+    if(fd > 2) close(fd);
+    return 0;
+}
+
+int forkpty(int* amaster, char* name,
+            const struct termios* termp, const struct winsize* winp){
+    int m, s;
+    if(openpty(&m, &s, name, termp, winp) < 0) return -1;
+    int pid = fork();
+    if(pid < 0){ int e = errno; close(m); close(s); errno = e; return -1; }
+    if(pid == 0){
+        close(m);
+        if(login_tty(s) < 0) _exit(1);
+        return 0;
+    }
+    close(s);
+    *amaster = m;
+    return pid;
+}
+
+/* ttyname: a pty slave is found by matching st_ino against /dev/pts/N; any
+ * other terminal is the console. Weak, so a port's own stub still links. */
+__attribute__((weak)) int ttyname_r(int fd, char* buf, size_t len){
+    struct stat st, pst;
+    if(!isatty(fd)){ errno = ENOTTY; return ENOTTY; }
+    long r = secos_syscall(56 /*SYS_FSTAT*/, fd, (long)&st, 0, 0, 0);
+    const char* found = "/dev/console";
+    char path[32];
+    if(r == 0){
+        for(unsigned n = 0; n < 64; n++){
+            snprintf(path, sizeof(path), "/dev/pts/%u", n);
+            if(stat(path, &pst) == 0 && pst.st_ino == st.st_ino){ found = path; break; }
+        }
+    }
+    if(strlen(found) + 1 > len){ errno = ERANGE; return ERANGE; }
+    strcpy(buf, found);
+    return 0;
+}
+__attribute__((weak)) char* ttyname(int fd){
+    static char name[32];
+    return ttyname_r(fd, name, sizeof(name)) == 0 ? name : (char*)0;
+}

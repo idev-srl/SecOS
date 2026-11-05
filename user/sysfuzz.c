@@ -23,7 +23,13 @@
  *    a full one with our own reader); that file fd is never closed/dup2'd over;
  *  - msg_recv is preceded by a 1-byte msg_send on the same channel, so a valid
  *    channel is never empty (M17 blocks the caller on an empty channel);
- *  - sigreturn (which kills a caller outside a handler) is drawn rarely.
+ *  - sigreturn (which kills a caller outside a handler) is drawn rarely;
+ *  - ptys: each batch opens a pty pair (/dev/ptmx + its slave) O_NONBLOCK and
+ *    read/write/ioctl hit both ends; O_NONBLOCK is re-asserted before every
+ *    pty read/write (a fuzzed FIONBIO may clear it), and the child ignores the
+ *    terminal signals (^C/^Z/^\ in written bytes, SIGHUP on a fuzzed master
+ *    close, SIGTTIN/SIGTTOU) and never re-defaults them, so a batch can
+ *    neither stop nor block on its own terminal.
  *
  * Usage: sysfuzz [-s seed] [-b batches] [-c calls] [-r batch] [-v] [-F]
  *   -r N   replay only batch N verbosely (reproducer)
@@ -31,6 +37,8 @@
  */
 #include "libsecos.h"
 #include <stdio.h>
+#include <fcntl.h>
+#include <signal.h>
 
 /* Syscall numbers (mirror kernel/syscall.h; not exported to user headers). */
 #define SYS_YIELD 0
@@ -95,8 +103,13 @@
 #define SYS_REBOOT 59
 #define SYS_EXECVE 60
 #define SYS_FCNTL 61
+#define SYS_SETSID 85
+#define SYS_GETSID 86
 
 #define NSYS_KNOWN 62
+/* Syscalls numbered past the contiguous range, drawn as well. */
+static const long g_extra_sys[] = { SYS_SETSID, SYS_GETSID };
+#define NSYS_EXTRA ((long)(sizeof(g_extra_sys) / sizeof(g_extra_sys[0])))
 
 typedef unsigned long u64;
 
@@ -155,6 +168,7 @@ static long intpool(void){
 static const char* g_fzpaths[] = {
     "/tmp/fz","/tmp/fz/a","/tmp/fz/b","/tmp/fz/d","/tmp/fz/d/x","/tmp/fz/l",
     "/tmp/fz//a","/tmp/fz/","","  ","/tmp/fz/.","/tmp/fz/..",
+    "/dev/ptmx","/dev/pts/0","/dev/pts/1","/dev/pts","/dev/tty","/dev/pts/63","/dev/pts/x",
 };
 static u64 strptr(void){ return ptrpool(); }
 static u64 pathpool(void){
@@ -164,12 +178,30 @@ static u64 pathpool(void){
 
 static int g_verbose;
 static int g_ffd = -1; /* per-batch regular file: the only real fd read/write use */
+static int g_pm = -1, g_ps = -1; /* per-batch pty master/slave (O_NONBLOCK) */
+
+/* Terminal ioctls (Linux numbers) for the pty ends. */
+static const unsigned long g_ttyioc[] = {
+    0x5401 /*TCGETS*/, 0x5402 /*TCSETS*/, 0x5403 /*TCSETSW*/, 0x5404 /*TCSETSF*/,
+    0x5409 /*TCSBRK*/, 0x540A /*TCXONC*/, 0x540B /*TCFLSH*/, 0x540E /*TIOCSCTTY*/,
+    0x540F /*TIOCGPGRP*/, 0x5410 /*TIOCSPGRP*/, 0x5411 /*TIOCOUTQ*/, 0x5413 /*TIOCGWINSZ*/,
+    0x5414 /*TIOCSWINSZ*/, 0x541B /*FIONREAD*/, 0x5421 /*FIONBIO*/, 0x5422 /*TIOCNOTTY*/,
+    0x5429 /*TIOCGSID*/, 0x80045430 /*TIOCGPTN*/, 0x40045431 /*TIOCSPTLCK*/,
+    0x80045439 /*TIOCGPTLCK*/, 0x5420 /*TIOCPKT*/, 0x5441 /*TIOCGPTPEER*/,
+};
+#define N_TTYIOC (sizeof(g_ttyioc) / sizeof(g_ttyioc[0]))
+static int pty_fd(void){ return rn(2) ? g_pm : g_ps; }
+static void pty_nonblock(int fd){ int one = 1; if(fd >= 0) sc(SYS_IOCTL, fd, 0x5421, (long)&one, 0, 0); }
+/* Signals the batch must never take the default action for (stop/terminate on
+ * its own pty): ignored at batch start, never re-defaulted by sigaction. */
+static int tty_sig(long s){ return s==1||s==2||s==3||s==20||s==21||s==22; }
 static const char* sysname(long n);
 
 static void one_call(void){
     long n;
-    if(rn(20)==0) n = (long)(NSYS_KNOWN + rn(2000));
-    else          n = (long)rn(NSYS_KNOWN);
+    if(rn(20)==0)      n = (long)(NSYS_KNOWN + rn(2000));
+    else if(rn(15)==0) n = g_extra_sys[rn(NSYS_EXTRA)];
+    else               n = (long)rn(NSYS_KNOWN);
 
     if(n==SYS_EXIT){ n=SYS_GETPID; }
     if(n==SYS_FORK && rn(4)!=0){ n=SYS_GETTICKS; }
@@ -187,9 +219,10 @@ static void one_call(void){
     case SYS_WRITE: case SYS_READ:
         /* Never the TTY or a fuzzer-made pipe (they block): the batch file,
          * or an invalid fd. Pointer and length stay fully fuzzed. */
-        switch(rn(4)){
+        switch(rn(6)){
         case 0: a0=-1-(long)rn(200); break;
         case 1: a0=64+(long)rn(1000); break;
+        case 2: case 3: a0=pty_fd(); pty_nonblock((int)a0); break;   /* never blocks */
         default:a0=g_ffd; break;
         }
         a1=(long)strptr(); a2=(long)lenpool();
@@ -225,8 +258,15 @@ static void one_call(void){
     case SYS_GETCWD: a0=(long)strptr(); a1=(long)lenpool(); break;
     case SYS_DUP: a0=intpool(); break;
     case SYS_DUP2: a0=intpool(); a1=10+(long)rn(16); if(a1==g_ffd) a1=26; break;
-    case SYS_IOCTL: a0=intpool(); a1=(long)intpool(); a2=(long)strptr(); break;
+    case SYS_IOCTL:
+        if(rn(2)){                       /* a terminal request on a pty end */
+            a0=pty_fd(); a1=(long)g_ttyioc[rn(N_TTYIOC)];
+            a2 = rn(3) ? (long)strptr() : (long)rn(3);
+        } else { a0=intpool(); a1=(long)intpool(); a2=(long)strptr(); }
+        break;
+    case SYS_GETSID: a0 = rn(2) ? 0 : intpool(); break;
     case SYS_PIPE: a0=(long)strptr(); a1=rn(3)==0 ? 0x80000 : (long)rn(2); break;
+    case SYS_SIGACTION: a0=(long)rn(34); if(tty_sig(a0)) a0=10; a1=(long)strptr(); a2=(long)strptr(); break;
     case SYS_EXECVE: {
         /* Bad/odd path, argv and envp pointers. No pool path is an ELF (the
          * fixtures are empty files / dirs), so a call can only fail: -ENOENT,
@@ -243,7 +283,6 @@ static void one_call(void){
         a1=(long)rn(6); if(rn(4)==0) a1=1030 /*F_DUPFD_CLOEXEC*/;
         a2=intpool();
         break;
-    case SYS_SIGACTION: a0=(long)rn(34); a1=(long)strptr(); a2=(long)strptr(); break;
     case SYS_SIGPROCMASK: a0=intpool(); a1=(long)strptr(); a2=(long)strptr(); break;
     case SYS_KILL: a0=(long)getpid(); a1=0; break;
     case SYS_SETPGID: a0=0; a1=0; break;
@@ -294,6 +333,20 @@ static void batch_file(void){
     unlink("/tmp/fz/w");
     creat_file("/tmp/fz/w");
     g_ffd = open("/tmp/fz/w", O_RDWR);
+    /* A fresh pty pair per batch (the previous one goes with its child). */
+    if(g_pm>=0) close(g_pm);
+    if(g_ps>=0) close(g_ps);
+    g_pm = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_NONBLOCK);
+    g_ps = -1;
+    if(g_pm >= 0){
+        int unlock = 0; unsigned n = 0;
+        sc(SYS_IOCTL, g_pm, 0x40045431 /*TIOCSPTLCK*/, (long)&unlock, 0, 0);
+        if(sc(SYS_IOCTL, g_pm, 0x80045430 /*TIOCGPTN*/, (long)&n, 0, 0) == 0){
+            char nm[32]; snprintf(nm, sizeof(nm), "/dev/pts/%u", n);
+            g_ps = open(nm, O_RDWR | O_NOCTTY | O_NONBLOCK);
+        }
+    }
+    for(int s = 1; s < 32; s++) if(tty_sig(s)) signal(s, SIG_IGN);
 }
 
 static int g_names_ready;
@@ -318,7 +371,13 @@ static void init_names(void){
     g_names[60]="execve";g_names[61]="fcntl";
     g_names_ready=1;
 }
-static const char* sysname(long n){ if(!g_names_ready) init_names(); if(n>=0&&n<NSYS_KNOWN) return g_names[n]; return "oor"; }
+static const char* sysname(long n){
+    if(!g_names_ready) init_names();
+    if(n>=0&&n<NSYS_KNOWN) return g_names[n];
+    if(n==SYS_SETSID) return "setsid";
+    if(n==SYS_GETSID) return "getsid";
+    return "oor";
+}
 
 static long atou(const char* s){ long v=0; int neg=0; if(*s=='-'){neg=1;s++;} while(*s>='0'&&*s<='9'){v=v*10+(*s-'0');s++;} return neg?-v:v; }
 

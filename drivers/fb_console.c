@@ -11,6 +11,7 @@
 #include "fb.h"
 #include "vmm.h" // phys_to_virt
 #include "timer.h" // timer callback registration for blink
+#include "vt.h"    // escape-sequence interpreter + cell grid
 #include <stddef.h>
 #include <stdint.h>
 #if ENABLE_FB
@@ -114,24 +115,16 @@ static const uint8_t font8x16[95][16] = {
  /* 0x7E '~' */ {0x00,0,0x32,0x4C,0,0,0,0,0,0,0,0,0,0,0,0},
 };
 
+
 static int fb_enabled = 0;
 static uint32_t fb_width, fb_height, fb_pitch;
 static uint64_t fb_phys_addr = 0;
-static uint8_t current_fg = VGA_COLOR_LIGHT_GREEN;
-static uint8_t current_bg = VGA_COLOR_BLACK;
-static uint32_t cursor_x = 0, cursor_y = 0;
 static const uint32_t glyph_w = 8, glyph_h = 16;
-static int cursor_visible = 1; // logical state
-static int cursor_blink_phase = 0; // 0 shown, 1 hidden (inverted)
+static int cursor_blink_phase = 0; // 0 shown, 1 hidden
 static uint32_t blink_counter = 0; // measured in ticks
 static uint32_t blink_interval_ticks = 0; // derived from timer frequency (~500ms)
 static int cursor_blink_enabled = 0;
-// Set while fb_console_putc() is mutating the console (cursor position, glyphs,
-// scroll). The blink tick runs from the timer IRQ and must not draw the cursor
-// while the position is transiently out of range (e.g. cursor_y == rows during a
-// scroll, or cursor_x == cells_per_row before the wrap) — it skips that tick.
-static volatile int fb_console_busy = 0;
-static void fb_console_cursor_toggle(void);
+static void fb_console_flush_if_auto(void);
 // Double buffering. Rendering + scrolling go to `dbuf` (normal RAM, fast); the
 // flush copies only the dirty rectangle to the framebuffer (write-only, 64-bit
 // words). This avoids reading VRAM (catastrophically slow over the bus on real
@@ -142,11 +135,11 @@ static int dbuf_auto_flush = 0; // automatic flush flag
 // Dirty rectangle (pixels): [dx0,dx1) x [dy0,dy1). Empty when dx1<=dx0.
 static int dx0, dy0, dx1, dy1;
 static void dirty_reset(void){ dx0 = (int)fb_width; dy0 = (int)fb_height; dx1 = 0; dy1 = 0; }
-static inline void dirty_mark(int x, int y){
-    if(x<dx0)dx0=x; if(y<dy0)dy0=y; if(x+1>dx1)dx1=x+1; if(y+1>dy1)dy1=y+1;
+static inline void dirty_rect(int x, int y, int w, int h){
+    if(x<dx0)dx0=x; if(y<dy0)dy0=y; if(x+w>dx1)dx1=x+w; if(y+h>dy1)dy1=y+h;
 }
 static inline void dirty_all(void){ dx0=0; dy0=0; dx1=(int)fb_width; dy1=(int)fb_height; }
-// (Scaling removed)
+static inline uint8_t* fb_target(void){ return (dbuf_enabled && dbuf) ? dbuf : (uint8_t*)(uint64_t)fb_phys_addr; }
 
 // VGA 16-color palette -> RGB
 static uint32_t vga_palette[16] = {
@@ -164,6 +157,130 @@ static uint32_t blend(uint32_t a,uint32_t b,float t){
     return (rr<<16)|(rg<<8)|rb;
 }
 
+/* ---- glyphs -------------------------------------------------------------- */
+// Fill out[16] with the bitmap of glyph code g (bit n = pixel column n, the
+// font's LSB-left encoding). Covers ASCII, the CP437 box-drawing subset and the
+// extra vt glyphs (ellipsis, middle dot, degree, block, shade, check, unknown).
+static void glyph_rows(uint8_t g, uint8_t out[16]){
+    for(int i=0;i<16;i++) out[i]=0;
+    if(g >= 0x20 && g <= 0x7E){ for(int i=0;i<16;i++) out[i]=font8x16[g-32][i]; return; }
+    // Box drawing: arms Left/Right/Up/Down meeting in the cell centre.
+    enum { L=1, R=2, U=4, D=8 };
+    int arms = 0;
+    switch(g){
+    case 0xC4: arms=L|R; break;       case 0xB3: arms=U|D; break;
+    case 0xDA: arms=R|D; break;       case 0xBF: arms=L|D; break;
+    case 0xC0: arms=R|U; break;       case 0xD9: arms=L|U; break;
+    case 0xC3: arms=U|D|R; break;     case 0xB4: arms=U|D|L; break;
+    case 0xC2: arms=L|R|D; break;     case 0xC1: arms=L|R|U; break;
+    case 0xC5: arms=L|R|U|D; break;
+    default: break;
+    }
+    if(arms){
+        uint8_t h = (uint8_t)(((arms&L)?0x1F:0) | ((arms&R)?0xF8:0));
+        out[7] |= h; out[8] |= h;
+        for(int r=0;r<16;r++){
+            if(((arms&U) && r<=8) || ((arms&D) && r>=7)) out[r] |= 0x18;
+        }
+        return;
+    }
+    switch(g){
+    case VT_G_ELLIPSIS: out[11]=out[12]=0x92; return;
+    case VT_G_MIDDOT:   out[7]=out[8]=0x18; return;
+    case VT_G_DEGREE:   out[1]=0x1C; out[2]=0x22; out[3]=0x22; out[4]=0x1C; return;
+    case VT_G_BLOCK:    for(int i=0;i<16;i++) out[i]=0xFF; return;
+    case VT_G_SHADE:    for(int i=0;i<16;i++) out[i]=(i&1)?0xAA:0x55; return;
+    case VT_G_CHECK:
+        out[3]=0x80; out[4]=0xC0; out[5]=0x60; out[6]=0x30; out[7]=0x19; out[8]=0x0F; out[9]=0x06; return;
+    default: break;
+    }
+    // Unknown code point: one hollow box per character.
+    out[2]=0x7E; for(int r=3;r<12;r++) out[r]=0x42; out[12]=0x7E;
+}
+
+// Render one cell. Rows are written whole into the target buffer; the cell is
+// clipped against the framebuffer (vt coordinates are already in range, the
+// check guards a geometry change underneath us).
+static void fb_draw_cell_px(int x, int y, const vt_cell_t* c, int with_cursor){
+    if(!fb_enabled || x < 0 || y < 0) return;
+    uint32_t gx = (uint32_t)x * glyph_w, gy = (uint32_t)y * glyph_h;
+    if(gx + glyph_w > fb_width || gy + glyph_h > fb_height) return;
+    uint8_t rows[16]; glyph_rows(c->ch, rows);
+    if(c->attr & VT_ATTR_UL) rows[15] = 0xFF;
+    uint32_t fg = vga_palette[c->fg & 0xF], bg = vga_palette[c->bg & 0xF];
+    uint8_t* target = fb_target();
+    for(uint32_t r=0; r<glyph_h; r++){
+        uint32_t* row = (uint32_t*)(target + (size_t)(gy + r) * fb_pitch) + gx;
+        uint8_t line = rows[r];
+        int cur = with_cursor && r >= glyph_h - 2;   // 2-pixel underline cursor
+        for(uint32_t col=0; col<glyph_w; col++)
+            row[col] = (cur || ((line >> col) & 1)) ? fg : bg;
+    }
+    if(dbuf_enabled && dbuf) dirty_rect((int)gx, (int)gy, (int)glyph_w, (int)glyph_h);
+}
+
+/* ---- vt backend ---------------------------------------------------------- */
+static void fbvt_draw_cell(int x, int y, const vt_cell_t* c){ fb_draw_cell_px(x, y, c, 0); }
+
+static void fb_console_clear_logo_area(void);
+void fb_console_draw_logo(void);
+// Fast scroll: move whole pixel rows of the text band [top, bot] in the target
+// buffer (RAM back buffer when enabled, never read from VRAM otherwise).
+static int fbvt_scroll(int top, int bot, int n){
+    if(!fb_enabled) return -1;
+    int cols, rows; vt_get_size(&cols, &rows);
+    (void)cols;
+    if(top < 0 || bot >= rows || top >= bot) return -1;
+    if((size_t)(bot + 1) * glyph_h > fb_height) return -1;
+    int full = (top == 0) && (bot == rows - 1) && !vt_app_owns_screen();
+    int k = n > 0 ? n : -n;
+    if(k <= 0 || k > bot - top) return -1;
+    uint8_t* target = fb_target();
+    size_t line_bytes = (size_t)fb_pitch * glyph_h;
+    size_t span = (size_t)(bot - top + 1 - k) * line_bytes;   // bytes that move
+    uint8_t* region = target + (size_t)top * line_bytes;
+    if(full) fb_console_clear_logo_area();     // don't drag the logo along
+    if(n > 0){
+        uint8_t* dst = region; uint8_t* src = region + (size_t)k * line_bytes;
+        size_t i=0; for(; i+8<=span; i+=8) *(uint64_t*)(dst+i) = *(uint64_t*)(src+i);
+        for(; i<span; i++) dst[i] = src[i];
+    } else {
+        uint8_t* dst = region + (size_t)k * line_bytes; uint8_t* src = region;
+        size_t i = span;
+        while(i >= 8){ i -= 8; *(uint64_t*)(dst+i) = *(uint64_t*)(src+i); }
+        while(i > 0){ i--; dst[i] = src[i]; }
+    }
+    if(dbuf_enabled && dbuf) dirty_rect(0, top * (int)glyph_h, (int)fb_width, (bot - top + 1) * (int)glyph_h);
+    if(full) fb_console_draw_logo();
+    return 0;
+}
+
+static void fbvt_cursor(int x, int y, int on){
+    const vt_cell_t* c = vt_cell_at(x, y);
+    if(!c) return;
+    if(on && !cursor_blink_enabled) on = 0;
+    fb_draw_cell_px(x, y, c, on);
+    if(on){ cursor_blink_phase = 0; blink_counter = 0; }
+}
+
+static void fbvt_flush(void){ fb_console_flush_if_auto(); }
+
+static int fbvt_clear_all(uint8_t bg){
+    if(!fb_enabled) return -1;
+    uint32_t rgb = vga_palette[bg & 0xF];
+    uint8_t* target = fb_target();
+    for(uint32_t y=0; y<fb_height; y++){
+        uint32_t* row = (uint32_t*)(target + (size_t)y * fb_pitch);
+        for(uint32_t x=0; x<fb_width; x++) row[x] = rgb;
+    }
+    if(dbuf_enabled && dbuf) dirty_all();
+    return 0;
+}
+
+static const vt_ops_t fb_vt_ops = {
+    fbvt_draw_cell, fbvt_scroll, fbvt_cursor, fbvt_flush, fbvt_clear_all
+};
+
 int fb_console_init(void){
     framebuffer_info_t info; if(!fb_get_info(&info)) return -1; if (info.bpp != 32) return -1;
     // If virt_addr unset but physical address is high, attempt mapping: physmap may already cover.
@@ -175,67 +292,20 @@ int fb_console_init(void){
         info.virt_addr = tentative;
     }
     fb_width = info.width; fb_height = info.height; fb_pitch = info.pitch; fb_phys_addr = (info.virt_addr ? info.virt_addr : info.addr);
-    fb_enabled = 1; fb_clear(0x000000); cursor_x=0; cursor_y=0;
+    fb_enabled = 1; fb_clear(0x000000);
     // Drop the double buffer (a re-init may change geometry). Free it first — the
     // caller (boot / clear) re-enables it; otherwise the console falls back to slow
     // direct-VRAM rendering (scroll reads VRAM). Previously this leaked dbuf.
     if(dbuf){ extern void kfree(void* p); kfree(dbuf); }
     dbuf=NULL; dbuf_enabled=0;
+    // The cell grid + escape-sequence interpreter (drivers/vt.c).
+    vt_attach(&fb_vt_ops, (int)(fb_width / glyph_w), (int)(fb_height / glyph_h));
     // Draw SecOS logo on top-right
-    extern void fb_console_draw_logo(void); fb_console_draw_logo();
+    fb_console_draw_logo();
     // Set a more legible default color (white on black)
     extern void terminal_setcolor(uint8_t color);
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
     return 0;
-}
-
-// Pixel origin of the cursor cell, or -1 if the cell is not fully on-screen.
-// The cursor underline is drawn with raw row writes (no per-pixel clipping), so
-// an out-of-range cursor (cursor_x == cells_per_row right after the last column
-// of a line, or cursor_y == rows mid-scroll) would write past the end of the
-// framebuffer / RAM back buffer — on the last text row that is past the end of
-// the dbuf heap block, clobbering the next heap block header and whatever the
-// heap later hands out there (observed: a live PML4 overwritten via a corrupted
-// free-block size).
-static int fb_console_cursor_cell(uint32_t* gx, uint32_t* gy){
-    uint32_t x = cursor_x * glyph_w, y = cursor_y * glyph_h;
-    if (x + glyph_w > fb_width || y + glyph_h > fb_height) return -1;
-    *gx = x; *gy = y;
-    return 0;
-}
-
-// Internal helper to draw blinking cursor underline
-static void fb_console_draw_cursor(void){
-    if(!fb_enabled || !cursor_blink_enabled) return;
-    uint32_t cell_w = glyph_w;
-    uint32_t cell_h = glyph_h;
-    uint32_t gx, gy;
-    if (fb_console_cursor_cell(&gx, &gy) != 0) return;
-    uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
-    uint8_t* target = (dbuf_enabled && dbuf)? dbuf : base;
-    uint32_t* row; uint32_t fg_rgb = vga_palette[current_fg & 0xF];
-    uint32_t blink_h = 2; if(blink_h>cell_h) blink_h=cell_h; // underline thickness
-    for(uint32_t y=0;y<blink_h;y++){
-        row=(uint32_t*)(target + (gy + cell_h - 1 - y) * fb_pitch);
-        for(uint32_t x=0;x<cell_w;x++) row[gx + x] = fg_rgb;
-    }
-    if(dbuf_enabled && !dbuf_auto_flush) fb_console_flush();
-}
-static void fb_console_clear_cursor(void){
-    if(!fb_enabled) return;
-    uint32_t cell_w = glyph_w;
-    uint32_t cell_h = glyph_h;
-    uint32_t gx, gy;
-    if (fb_console_cursor_cell(&gx, &gy) != 0) return;
-    uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
-    uint8_t* target = (dbuf_enabled && dbuf)? dbuf : base;
-    uint32_t* row; uint32_t bg_rgb = vga_palette[current_bg & 0xF];
-    uint32_t blink_h = 2; if(blink_h>cell_h) blink_h=cell_h;
-    for(uint32_t y=0;y<blink_h;y++){
-        row=(uint32_t*)(target + (gy + cell_h - 1 - y) * fb_pitch);
-        for(uint32_t x=0;x<cell_w;x++) row[gx + x] = bg_rgb;
-    }
-    if(dbuf_enabled && !dbuf_auto_flush) fb_console_flush();
 }
 
 // Simple stylized SecOS logo (5 letters) rendered top-right
@@ -362,15 +432,19 @@ static void fb_console_draw_logo_glow(void){
 // Timer tick callback
 static void fb_console_tick(void){
     if(!cursor_blink_enabled || !fb_enabled) return;
-    if(fb_console_busy) return;   // putc mid-update: cursor position may be transient
+    if(vt_busy()) return;   // output in progress: the cursor position may be transient
     blink_counter++;
-    // Update glow slowly every 5 ticks independent of cursor blink
-    if(logo_glow_enabled && (blink_counter % 5)==0){ logo_glow_phase++; fb_console_draw_logo_glow(); }
+    // Update glow slowly every 5 ticks independent of cursor blink (not while a
+    // full-screen program owns the screen: it would paint over its text).
+    if(logo_glow_enabled && !vt_app_owns_screen() && (blink_counter % 5)==0){ logo_glow_phase++; fb_console_draw_logo_glow(); }
     if (blink_counter >= blink_interval_ticks){
         blink_counter = 0;
-    // Toggle visibility: erase then redraw
-        if(cursor_blink_phase==0){ fb_console_clear_cursor(); cursor_blink_phase=1; }
-        else { fb_console_draw_cursor(); cursor_blink_phase=0; }
+        int x, y; int vis = vt_get_cursor(&x, &y);
+        const vt_cell_t* c = vt_cell_at(x, y);
+        if(!c) return;
+        if(cursor_blink_phase==0 || !vis){ fb_draw_cell_px(x, y, c, 0); cursor_blink_phase=1; }
+        else { fb_draw_cell_px(x, y, c, 1); cursor_blink_phase=0; }
+        if(dbuf_enabled) fb_console_flush();
     }
 }
 
@@ -381,229 +455,28 @@ int fb_console_enable_cursor_blink(uint32_t timer_freq){
     blink_interval_ticks = (timer_freq / 2); // ~500ms
     if (blink_interval_ticks==0) blink_interval_ticks=1;
     if (timer_register_tick_callback(fb_console_tick)!=0) return -1;
-    cursor_blink_enabled = 1; blink_counter=0; cursor_blink_phase=0; fb_console_draw_cursor();
+    cursor_blink_enabled = 1; blink_counter=0; cursor_blink_phase=0;
+    { int x, y; if(vt_get_cursor(&x, &y)) fbvt_cursor(x, y, 1); }
+    fb_console_flush_if_auto();
     return 0;
 }
 
-void fb_console_disable_cursor_blink(void){ if(!cursor_blink_enabled) return; cursor_blink_enabled=0; fb_console_clear_cursor(); }
-
-void fb_console_set_color(uint8_t fg, uint8_t bg){ current_fg=fg; current_bg=bg; }
-static void fb_console_flush_if_auto(void){ if(dbuf_enabled && dbuf_auto_flush) fb_console_flush(); }
-// Scaling helpers removed
-
-static void putpixel_raw(int x,int y,uint32_t rgb){ if(x<0||y<0||x>=(int)fb_width||y>=(int)fb_height) return; if(!fb_enabled) return; uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr; if(dbuf_enabled && dbuf){ uint32_t* row=(uint32_t*)(dbuf + y*fb_pitch); row[x]=rgb; dirty_mark(x,y); } else { uint32_t* row=(uint32_t*)(base + y*fb_pitch); row[x]=rgb; } }
-static void putpixel(int x,int y,uint32_t rgb){ putpixel_raw(x,y,rgb); }
-
-static void draw_glyph(char c, uint32_t gx, uint32_t gy){
-    // Basic support for CP437 box-drawing chars: ─ (0xC4), │ (0xB3), ┌ (0xDA), ┐ (0xBF), └ (0xC0), ┘ (0xD9), ├ (0xC3), ┤ (0xB4), ┬ (0xC2), ┴ (0xC1), ┼ (0xC5)
-    // They may arrive as bytes >126 if shell allows extended 8-bit input; drawn manually.
-    uint32_t fg_rgb = vga_palette[current_fg & 0xF];
-    uint32_t bg_rgb = vga_palette[current_bg & 0xF];
-    unsigned char uc = (unsigned char)c;
-    if (uc >= 0xB3) {
-        switch(uc) {
-            case 0xC4: { // ─ horizontal line
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        // Linea centrale spessore 2 pixel (rows 7 e 8)
-                        if (row==7 || row==8) rgb = fg_rgb;
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xB3: { // │ vertical line
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if (col==3 || col==4) rgb = fg_rgb; // col centrale spessore 2
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xDA: { // ┌ top-left corner
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if ((row==7 || row==8) && col < glyph_w/2) rgb = fg_rgb; // tratto orizzontale metà
-                        if ((col==3 || col==4) && row < glyph_h/2) rgb = fg_rgb; // tratto verticale metà
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xBF: { // ┐ top-right corner
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if ((row==7 || row==8) && col >= glyph_w/2) rgb = fg_rgb;
-                        if ((col==3 || col==4) && row < glyph_h/2) rgb = fg_rgb;
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xC0: { // └ bottom-left corner
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if ((row==7 || row==8) && col < glyph_w/2) rgb = fg_rgb;
-                        if ((col==3 || col==4) && row >= glyph_h/2) rgb = fg_rgb;
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xD9: { // ┘ bottom-right corner
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if ((row==7 || row==8) && col >= glyph_w/2) rgb = fg_rgb;
-                        if ((col==3 || col==4) && row >= glyph_h/2) rgb = fg_rgb;
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xC3: { // ├ left junction
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if (col==3 || col==4) rgb = fg_rgb; // verticale piena
-                        if ((row==7 || row==8) && col >= glyph_w/2) rgb = fg_rgb; // orizzontale da metà
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xB4: { // ┤ right junction
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if (col==3 || col==4) rgb = fg_rgb;
-                        if ((row==7 || row==8) && col < glyph_w/2) rgb = fg_rgb;
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xC2: { // ┬ top junction
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if ((row==7 || row==8)) rgb = fg_rgb; // orizzontale completa
-                        if ((col==3 || col==4) && row < glyph_h/2) rgb = fg_rgb; // verticale metà
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xC1: { // ┴ bottom junction
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if ((row==7 || row==8)) rgb = fg_rgb;
-                        if ((col==3 || col==4) && row >= glyph_h/2) rgb = fg_rgb;
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            case 0xC5: { // ┼ full junction
-                for(uint32_t row=0; row<glyph_h; row++) {
-                    for(uint32_t col=0; col<glyph_w; col++) {
-                        uint32_t rgb = bg_rgb;
-                        if ((row==7 || row==8) || (col==3 || col==4)) rgb = fg_rgb;
-                        putpixel(gx+col, gy+row, rgb);
-                    }
-                }
-                return; }
-            default: break; // others >126 unsupported
-        }
-    }
-    if(c < 32 || c > 126) c='?';
-    const uint8_t* glyph = font8x16[c-32];
-    // Detect if glyph is completely empty (incomplete font) except for space
-    int empty = 1;
-    if (c == ' ') empty = 0; // space legitimately empty
-    else {
-        for (int i=0;i<16;i++) { if (glyph[i] != 0) { empty = 0; break; } }
-    }
-    if (empty) {
-    // Draw placeholder 8x16 box with border
-        for(uint32_t row=0; row<glyph_h; row++) {
-            for(uint32_t col=0; col<glyph_w; col++) {
-                int border = (row==0 || row==glyph_h-1 || col==0 || col==glyph_w-1);
-                putpixel(gx+col, gy+row, border ? fg_rgb : bg_rgb);
-            }
-        }
-        return;
-    }
-    for(uint32_t row=0; row<glyph_h; row++) {
-        uint8_t line = glyph[row];
-    // Interpret LSB-left (bit0 left pixel) to avoid visual inversion given current font encoding
-        for(uint32_t col=0; col<glyph_w; col++) {
-            uint32_t bit_on = (line >> col) & 1;
-            putpixel(gx+col, gy+row, bit_on ? fg_rgb : bg_rgb);
-        }
-    }
-}
-
-static void scroll_if_needed(void){
-    uint32_t cell_h = glyph_h;
-    if ((cursor_y+1) * cell_h <= fb_height) return;
-    uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
-    uint8_t* target = dbuf_enabled && dbuf ? dbuf : base;
-    size_t line_bytes = fb_pitch * cell_h;
-    // First: clear logo area to avoid phantom copy upward
-    fb_console_clear_logo_area();
-    size_t copy_bytes = fb_pitch * (fb_height - cell_h);
-    // Scroll up in the back buffer (RAM) with 64-bit words — never touches VRAM.
-    { size_t i=0; for(; i+8<=copy_bytes; i+=8) *(uint64_t*)(target+i)=*(uint64_t*)(target+i+line_bytes);
-      for(; i<copy_bytes; i++) target[i]=target[i+line_bytes]; }
-    // Clear last row
-    for(uint32_t y=fb_height - cell_h; y<fb_height; y++) {
-        uint32_t* row=(uint32_t*)(target + y*fb_pitch);
-        for(uint32_t x=0;x<fb_width;x++) row[x]=0x000000; }
-    cursor_y--;
-    fb_console_draw_logo(); // redraw in original position
-    if(dbuf_enabled) dirty_all();               // whole screen shifted
-    if(dbuf_enabled && !dbuf_auto_flush) fb_console_flush();
-}
-
-static void fb_console_putc_locked(char c);
-void fb_console_putc(char c){
-    if(!fb_enabled){ return; }
-    fb_console_busy++;            // counter: nests if an IRQ path also prints
-    fb_console_putc_locked(c);
-    fb_console_busy--;
-}
-
-static void fb_console_putc_locked(char c){
-    if(c=='\n'){
-        if(cursor_blink_enabled && cursor_blink_phase==0){ fb_console_clear_cursor(); }
-        cursor_x=0; cursor_y++; scroll_if_needed();
-        if(cursor_blink_enabled){ fb_console_draw_cursor(); cursor_blink_phase=0; }
-        fb_console_flush_if_auto();
-        return;
-    }
-    if(c=='\b'){
-        if(cursor_blink_enabled && cursor_blink_phase==0){ fb_console_clear_cursor(); }
-        if(cursor_x>0){ cursor_x--; }
-    else if(cursor_y>0){ cursor_y--; cursor_x = (fb_width / glyph_w) - 1; }
-    uint32_t gx = cursor_x * glyph_w; uint32_t gy = cursor_y * glyph_h;
-        uint32_t bg_rgb = vga_palette[current_bg & 0xF];
-        for(uint32_t row=0; row<glyph_h; row++) {
-            for(uint32_t col=0; col<glyph_w; col++) putpixel(gx+col, gy+row, bg_rgb);
-        }
-        if(cursor_blink_enabled){ fb_console_draw_cursor(); cursor_blink_phase=0; }
-        fb_console_flush_if_auto();
-        return;
-    }
-    uint32_t cells_per_row = fb_width / glyph_w;
-    if(cursor_x >= cells_per_row){ cursor_x=0; cursor_y++; scroll_if_needed(); }
-    draw_glyph(c, cursor_x*glyph_w, cursor_y*glyph_h);
-    cursor_x++;
-    // Wrap BEFORE drawing the cursor: at cursor_x == cells_per_row the cursor cell
-    // is off the right edge (it used to be drawn there, spilling 8 pixels into the
-    // next row — past the end of the buffer on the last text row).
-    if(cursor_x >= cells_per_row){ cursor_x=0; cursor_y++; scroll_if_needed(); }
-    if(cursor_blink_enabled){ fb_console_draw_cursor(); cursor_blink_phase=0; }
+void fb_console_disable_cursor_blink(void){
+    if(!cursor_blink_enabled) return;
+    cursor_blink_enabled=0;
+    int x, y; vt_get_cursor(&x, &y); fbvt_cursor(x, y, 0);
     fb_console_flush_if_auto();
 }
-void fb_console_write(const char* s){ while(*s) fb_console_putc(*s++); }
+
+void fb_console_set_color(uint8_t fg, uint8_t bg){ vt_set_colors(fg, bg); }
+static void fb_console_flush_if_auto(void){ if(dbuf_enabled && dbuf_auto_flush) fb_console_flush(); }
+
+void fb_console_putc(char c){
+    if(!fb_enabled){ return; }
+    vt_putc(c);
+}
+void fb_console_write(const char* s){ size_t n=0; while(s[n]) n++; if(fb_enabled) vt_write(s, n); }
+void fb_console_write_n(const char* s, size_t n){ if(fb_enabled) vt_write(s, n); }
 
 // Double buffer API
 int fb_console_enable_dbuf(void){

@@ -367,3 +367,19 @@ static void wake_pipe_cb(process_t* p, void* u) {
 void sched_wake_pipe(void* pp) {
     process_foreach(wake_pipe_cb, pp);
 }
+
+// Wake processes blocked on pty 'pt' (a slave reader waiting for input, a
+// master reader waiting for output, a writer on either side waiting for room)
+// or blocked polling any pty (wait_pty == PTY_WAIT_ANY, see pty.h). Like the
+// pipe wake, the woken task re-runs its syscall and re-checks, so a spurious
+// wake just re-blocks.
+static void wake_pty_cb(process_t* p, void* u) {
+    if (p->state == PROC_BLOCKED && p->wait_pty &&
+        (p->wait_pty == u || p->wait_pty == (void*)1 /* PTY_WAIT_ANY */)) {
+        p->wait_pty = 0;
+        p->state = PROC_READY;
+    }
+}
+void sched_wake_pty(void* pt) {
+    process_foreach(wake_pty_cb, pt);
+}

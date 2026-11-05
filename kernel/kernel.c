@@ -1317,6 +1317,8 @@ static void m24_run_demo(void) {
 #include "../crypto/user_sysfuzz_elf.h"
 #include "../crypto/user_uaccess_elf.h"
 #include "../crypto/user_abi_test_elf.h"
+#include "../crypto/user_ttytest_elf.h"
+#include "../crypto/user_ptytest_elf.h"
 static void coreutils_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1326,7 +1328,7 @@ static void coreutils_install(void) {
     static const char* names[] = {
         "coreutils","echo","cat","wc","head","tail","rev","nl","yes","seq",
         "ls","mkdir","rm","touch","cp","basename","dirname","stat",
-        "true","false","uname","sleep","clear","hexdump","uptime","help", 0
+        "true","false","uname","sleep","clear","hexdump","uptime","help","tty", 0
     };
     int ok = 0;
     for (int i = 0; names[i]; i++) {
@@ -1348,6 +1350,11 @@ static void coreutils_install(void) {
     vfs_create("/bin/uaccess_test", user_uaccess_elf, user_uaccess_elf_len);
     // [abi] wait-status / DF-on-entry / PROT_NONE regression test
     vfs_create("/bin/abi_test", user_abi_test_elf, user_abi_test_elf_len);
+    // [tty] termios / raw mode / VMIN-VTIME / winsize regression test
+    vfs_create("/bin/ttytest", user_ttytest_elf, user_ttytest_elf_len);
+    // [pty] pseudo-terminal regression test; also /bin/script (bash on a pty)
+    vfs_create("/bin/ptytest", user_ptytest_elf, user_ptytest_elf_len);
+    vfs_create("/bin/script", user_ptytest_elf, user_ptytest_elf_len);
 }
 extern void shell_init(void);
 extern void shell_run(void);
@@ -1376,7 +1383,34 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
           if (vfs_create("/bin/bash", user_bash_elf, user_bash_elf_len) == 0)
               debugcon_writestring("[M39] installed GNU bash to /bin/bash\n");
           else debugcon_writestring("[M39] FAIL: could not install /bin/bash\n");
-      } }
+      }
+      // Line-editing defaults (only when absent: a persistent root keeps its
+      // own). TERM selects the built-in termcap entry of the console (any
+      // value but "dumb"); readline's inputrc adds the Home/End/Delete
+      // variants other terminals send (serial host terminals, VT220 style).
+      static const char bashrc[] =
+          "# /etc/bash.bashrc - read by every interactive bash (SecOS)\n"
+          "# bash sets TERM=dumb when it is unset: pick the console entry instead.\n"
+          "case \"$TERM\" in \"\"|dumb) export TERM=linux ;; esac\n";
+      static const char inputrc[] =
+          "# /etc/inputrc - GNU readline defaults (SecOS console)\n"
+          "set enable-bracketed-paste off\n"
+          "set bell-style none\n"
+          "\"\\e[1~\": beginning-of-line\n"
+          "\"\\e[4~\": end-of-line\n"
+          "\"\\e[7~\": beginning-of-line\n"
+          "\"\\e[8~\": end-of-line\n"
+          "\"\\e[H\": beginning-of-line\n"
+          "\"\\e[F\": end-of-line\n"
+          "\"\\eOH\": beginning-of-line\n"
+          "\"\\eOF\": end-of-line\n"
+          "\"\\e[3~\": delete-char\n"
+          "\"\\e[2~\": overwrite-mode\n"
+          "\"\\e[1;5C\": forward-word\n"
+          "\"\\e[1;5D\": backward-word\n";
+      if (!vfs_lookup("/etc/bash.bashrc")) vfs_create("/etc/bash.bashrc", bashrc, sizeof(bashrc) - 1);
+      if (!vfs_lookup("/etc/inputrc")) vfs_create("/etc/inputrc", inputrc, sizeof(inputrc) - 1);
+    }
 #endif
     // Orderly shutdown commands (one signed multi-call program, SYS_REBOOT).
     { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
@@ -1547,6 +1581,7 @@ static void kernel_main_phase2(void) {
     }
     timer_init(1000);
     keyboard_init();
+    { extern void tty_init(void); tty_init(); }   // console termios defaults + vt reply hook
 
     // [M28-2] Retire the 8259 PIC + PIT IRQ0 onto the LAPIC timer + IOAPIC when
     // ACPI gave us a MADT/IOAPIC. timer_init() above already programmed the PIT

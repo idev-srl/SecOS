@@ -302,13 +302,21 @@ uint64_t syscall_handler(trapframe_t* tf) {
         ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
         // A TTY read interrupted by a stop (Ctrl-Z, SIGTTIN for a background
         // reader, kill -STOP) restarts after SIGCONT instead of failing EINTR.
-        if (ret == (uint64_t)(int64_t)(-4) && cur && num == SYS_READ)
+        // Same for a pty write stopped by SIGTTOU (TOSTOP).
+        if (ret == (uint64_t)(int64_t)(-4) && cur)
             stop_and_restart_if_pending(cur, tf);
         if (ret == (uint64_t)(int64_t)(-2) && cur) {
             int fd = (int)tf->rdi;
             if (sig_interrupted(cur, tf)) {
                 cur->wait_tty = 0;
+                cur->wait_pty = NULL;
                 ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR
+            } else if (cur->wait_pty) {
+                // Pty read/write that cannot progress yet: sleep until the
+                // other side (sched_wake_pty) or the tty tick re-runs it.
+                tf->rip -= 2;
+                sched_block_current(tf);                // NORETURN
+                ret = 0;
             } else if (num == SYS_READ && cur->wait_tty) {
                 // Console read with no input yet: sleep until tty_wake_readers()
                 // (timer tick) sees input, then re-run the read.

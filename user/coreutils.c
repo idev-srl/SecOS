@@ -13,6 +13,7 @@ static const struct { const char* name; int (*fn)(int, char**); } applets[] = {
     {"true", applet_true}, {"false", applet_false}, {"uname", applet_uname},
     {"sleep", applet_sleep}, {"clear", applet_clear}, {"hexdump", applet_hexdump},
     {"uptime", applet_uptime}, {"help", applet_help}, {"coreutils", applet_help},
+    {"tty", applet_tty},
     {0, 0}
 };
 

@@ -27,7 +27,7 @@ void     signal_set_foreground_pgid(uint32_t pgid) { g_foreground_pgid = pgid; }
 uint32_t signal_get_foreground_pgid(void) { return g_foreground_pgid; }
 
 // ---- disposition helpers ----
-static int sig_default_ignore(int s) { return s == SIGCHLD || s == SIGCONT; }
+static int sig_default_ignore(int s) { return s == SIGCHLD || s == SIGCONT || s == SIGURG || s == SIGWINCH; }
 static int sig_default_stop(int s) {
     return s == SIGSTOP || s == SIGTSTP || s == SIGTTIN || s == SIGTTOU;
 }
@@ -130,6 +130,7 @@ int signal_post(process_t* p, int sig) {
         // sleep_until is kept: a stop restarts SYS_SLEEP with its original
         // deadline (the EINTR path clears it itself).
         p->wait_pid = -1; p->recv_chan = -1; p->wait_pipe = NULL; p->wait_tty = 0;
+        p->wait_pty = NULL;
         p->state = PROC_READY;
     }
     return 0;

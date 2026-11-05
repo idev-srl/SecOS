@@ -1092,6 +1092,110 @@ check "recovery shell takes over after the exec'd program exits" $?
 ! grep -q "\[EXC\]" "$BXLOG"; check "no CPU exception ([EXC]) during bash execve run" $?
 
 # ============================================================================
+# ---- Line editing: console termios (raw mode) + bash readline over serial ----
+# ============================================================================
+# (a) /bin/ttytest drives the console TTY through raw mode: three VMIN=1 single
+#     byte reads, ESC [ A arriving whole (FIONREAD), Ctrl-C as data with ISIG
+#     off, a VMIN=0/VTIME timeout, TIOCGWINSZ, restore, and a canonical read
+#     with an erase. Each input below answers one TT-*-READY prompt.
+# (b) bash's GNU readline: Up arrow re-runs the previous line, Left arrow /
+#     Home / Delete / Ctrl-A/D/K/W/U edit the line, Tab completes a file name
+#     (and double Tab lists the candidates), Ctrl-R searches the history, and
+#     the bind builtin exists. Every marker only appears once bash evaluated
+#     the EDITED line (the typed text never contains the expanded value).
+LELOG=/tmp/secos_selftest_lineedit.log
+echo "[selftest] Running console termios + bash readline editing (mb2, serial, 110s)..."
+: > "$LELOG"
+( sleep 25
+  printf '  /bin/ttytest\r'; sleep 3
+  printf 'abc'; sleep 2
+  printf '\033[A'; sleep 2
+  printf '\003'; sleep 3
+  printf 'xy\177z\r'; sleep 3
+  printf '  n=0\r'; sleep 2
+  printf '  n=$((n+1)); echo LE1-$n\r'; sleep 3
+  printf '\033[A\r'; sleep 3
+  printf '  echo LE2-$((6*))\033[D\033[D7\r'; sleep 3
+  printf '  echo LE3-$(/bin/unam\t -s)\r'; sleep 3
+  printf '  /bin/ba\t\t\t'; sleep 3
+  printf '\025  echo LE4-$((2*2))\r'; sleep 3
+  printf 'XX  echo LE5-$((5*5))\001\004\004\r'; sleep 3
+  printf '\022n+1'; sleep 2
+  printf '\r'; sleep 3
+  printf '   LE7-$((3+4))\033[Hecho\r'; sleep 3
+  printf '  echo LE8-$((9+1))X\033[D\033[3~\r'; sleep 3
+  printf '  bind -q beginning-of-line; echo LE9-$((4*2))\r'; sleep 3
+  printf '  echo LE10-$((5+5))JUNK\033[D\033[D\033[D\033[D\013\r'; sleep 3
+  printf '  echo LE11-$((2+9)) junkword\027\r'; sleep 3
+  printf '  echo LE12-$TERM\r'; sleep 3
+  printf '  echo LE-$((6*7))-END\r'; sleep 4 ) | \
+    timeout 110 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$LELOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "TT-WINSZ-OK" "$LELOG"; check "tty: TIOCGWINSZ reports the console size" $?
+grep -q "TT-RAW-OK" "$LELOG"; check "tty: raw mode (ICANON/ECHO off, VMIN=1) single-byte reads" $?
+grep -q "TT-ESC-OK" "$LELOG"; check "tty: ESC [ A arrives whole (FIONREAD after the ESC)" $?
+grep -q "TT-ISIG-OK" "$LELOG"; check "tty: ISIG off delivers Ctrl-C as a byte" $?
+grep -q "TT-VTIME-OK" "$LELOG"; check "tty: VMIN=0/VTIME read times out with 0" $?
+grep -q "TT-RESTORE-OK" "$LELOG"; check "tty: saved termios restored (ICANON|ECHO|ISIG)" $?
+grep -q "TT-CANON-OK" "$LELOG"; check "tty: canonical read with DEL erase -> one edited line" $?
+grep -q "TT-DONE 8/8" "$LELOG"; check "tty: ttytest 8/8" $?
+grep -q "LE1-1" "$LELOG" && grep -q "LE1-2" "$LELOG"; check "readline: Up arrow + Enter re-runs the previous command" $?
+grep -q "LE2-42" "$LELOG"; check "readline: Left arrow moves the cursor for a mid-line insert" $?
+grep -q "LE3-SecOS" "$LELOG"; check "readline: Tab completes /bin/unam -> /bin/uname" $?
+grep -Eq "basename +bash" "$LELOG"; check "readline: repeated Tab lists /bin/ba* (bash, basename)" $?
+grep -q "LE4-4" "$LELOG"; check "readline: Ctrl-U kills the line" $?
+grep -q "LE5-25" "$LELOG"; check "readline: Ctrl-A + Ctrl-D edit the start of the line" $?
+grep -q "LE1-3" "$LELOG"; check "readline: Ctrl-R reverse search finds and runs a history line" $?
+grep -q "LE7-7" "$LELOG"; check "readline: Home key (ESC [ H) moves to the start" $?
+grep -q "LE8-10" "$LELOG"; check "readline: Delete key (ESC [ 3 ~) deletes under the cursor" $?
+grep -q "can be invoked via" "$LELOG" && grep -q "LE9-8" "$LELOG"; check "readline: bind builtin available" $?
+grep -q "LE10-10" "$LELOG"; check "readline: Ctrl-K kills to end of line" $?
+grep -q "LE11-11" "$LELOG"; check "readline: Ctrl-W kills the previous word" $?
+grep -q "LE12-linux" "$LELOG"; check "bash: TERM set for the console (/etc/bash.bashrc)" $?
+grep -q "LE-42-END" "$LELOG"; check "bash responsive after the line-editing session" $?
+! grep -q "\[EXC\]" "$LELOG"; check "no CPU exception ([EXC]) during the line-editing session" $?
+
+# ============================================================================
+# ---- Pseudo-terminals: /dev/ptmx + /dev/pts, sessions, ctty, bash on a pty ----
+# ============================================================================
+# (a) /bin/ptytest (signed): posix_openpt/unlockpt/ptsname, a locked slave is
+#     refused; forkpty child = new session with the slave as controlling tty
+#     (ttyname, /dev/tty, tcgetpgrp); canonical I/O through the master with
+#     ICRNL/ONLCR/echo; ^C written to the master -> SIGINT; TIOCSWINSZ ->
+#     exactly one SIGWINCH; raw mode on the slave; master close -> SIGHUP and
+#     slave EIO; child exit -> master EIO; 100 openpty/close + 20 forkpty
+#     cycles reuse slot 0 (no leak); bash -c 'tty' prints /dev/pts/N; an
+#     interactive bash on a pty runs a line, ^C ends `sleep 100`, exits.
+# (b) /bin/script runs an interactive bash on a pty and relays the console to
+#     it (raw console, both directions); the inner bash's `tty` is /dev/pts/0,
+#     the outer one is back on /dev/console afterwards.
+# (c) the fuzzer also hammers pty ends (open/read/write/ioctl, setsid/getsid).
+PTYLOG=/tmp/secos_selftest_pty.log
+echo "[selftest] Running pseudo-terminal tests + script relay (mb2, serial, 110s)..."
+: > "$PTYLOG"
+( sleep 25
+  printf '  /bin/ptytest\r'; sleep 40
+  printf '  script\r'; sleep 6
+  printf 'echo SCRIPT-$((6*7)); tty\r'; sleep 3
+  printf 'exit\r'; sleep 4
+  printf '  echo PTY-AFTER-$((1+1)); tty\r'; sleep 3
+  printf '  /bin/sysfuzz -s 4242 -b 30 -c 200 > /dev/null; /bin/echo FZPTY""-42\r'; sleep 25 ) | \
+    timeout 110 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$PTYLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+for t in OPEN SESSION CANON SIGINT WINCH RAW HUP EOF CYCLE BASH IBASH; do
+    grep -q "PT-$t-OK" "$PTYLOG"; check "pty: $t" $?
+done
+grep -q "PT-DONE 11/11" "$PTYLOG"; check "pty: ptytest 11/11" $?
+grep -q "^SCRIPT-42" "$PTYLOG" && grep -q "^/dev/pts/0" "$PTYLOG"; check "pty: script runs bash on /dev/pts/0 and relays the console" $?
+grep -q "Script done (shell status 0)" "$PTYLOG"; check "pty: script ends when its shell exits" $?
+grep -q "^PTY-AFTER-2" "$PTYLOG" && grep -q "^/dev/console" "$PTYLOG"; check "pty: console bash responsive on /dev/console afterwards" $?
+grep -q "^FZPTY-42" "$PTYLOG"; check "pty: fuzzing pty ends + setsid/getsid leaves the system usable" $?
+! grep -q "ring0\|\[PANIC\]" "$PTYLOG"; check "no kernel panic/ring-0 fault during the pty tests" $?
+! grep -q "\[EXC\].*ring0" "$PTYLOG"; check "no ring-0 CPU exception during the pty tests" $?
+
+# ============================================================================
 # ---- Orderly poweroff / reboot from bash (SYS_REBOOT) ----
 # ============================================================================
 # (a) poweroff: write a file to an ext4 data disk, start a background job,
