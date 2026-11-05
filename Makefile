@@ -126,13 +126,6 @@ ATH9K_HW = drivers/ath9k_port/ath9k_hw.o
 OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE) $(ATH9K_HW)
 DEPS     = $(OBJS_C:%.o=%.d)
 -include $(DEPS)
-# Feature-flag tracking: .cflags_extra holds the last CFLAGS_EXTRA (demo gates,
-# -DSECOS_* toggles) and is rewritten only when it changes, so switching
-# `make iso CFLAGS_EXTRA=-DFOO=1` <-> `make iso` rebuilds the C objects instead
-# of linking objects compiled with the previous flags.
-CFLAGS_STAMP = .cflags_extra
-$(shell printf '%s\n' '$(CFLAGS_EXTRA)' | cmp -s - $(CFLAGS_STAMP) || printf '%s\n' '$(CFLAGS_EXTRA)' > $(CFLAGS_STAMP))
-$(OBJS_C): $(CFLAGS_STAMP)
 
 # Keep `make` (no target) building the kernel: the rule below would otherwise be
 # the first target in the file and become the default goal.
@@ -531,7 +524,7 @@ run-vnc: iso
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
-	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(CFLAGS_STAMP) $(KERNEL)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)

@@ -180,9 +180,12 @@ robustness and the paused real-hardware bring-up — see below.
 
 ## 🧹 Build / tooling tech debt
 
-- [x] **Makefile: header-dep tracking** — kernel objects use `-MMD -MP`, and a
-      `.cflags_extra` stamp rebuilds them when `CFLAGS_EXTRA` changes.
+- [x] **Makefile: header-dep tracking** — kernel objects use `-MMD -MP`;
       `make check-user-progs` flags stale committed `crypto/user_*_elf.h`.
+- [ ] **Makefile: `-D` (CFLAGS_EXTRA) changes still need `make clean`.** A flags
+      stamp is easy, but `tools/selftest.sh` M25/M30 rely on the sticky
+      behaviour (`make CFLAGS_EXTRA=…` then `smoke.sh`'s plain `make iso`) —
+      fix those callers first.
 - [ ] **`isodir/boot/grub/grub.cfg` is tracked but `make clean` deletes it** —
       consider untracking it (recurring papercut).
 - [ ] **Prebuilt `drivers/ath9k_port/ath9k_hw.o` is committed** (`git add -f`) —
@@ -191,8 +194,7 @@ robustness and the paused real-hardware bring-up — see below.
 ---
 
 ## ⚠️ Process reminders (don't relearn the hard way)
-- **Embedded programs are committed artifacts** — after a libc/ABI change run
-  `make user-progs` (+ `port-bash`/`port-lua`) and commit; `make check-user-progs`.
+- **`make clean` after any `.h` or `-D` change** — Makefile ignores those.
 - **NIC RX only works in the shell/idle context** — test networking from the shell.
 - **Don't build concurrently with `tools/selftest.sh`** (shared build dir + /tmp logs).
 - **Never `pkill -f "qemu-system"`** in a command that also launches qemu.
