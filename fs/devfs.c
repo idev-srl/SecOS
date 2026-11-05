@@ -78,7 +78,10 @@ static void devfs_build(void) {
     add("tty", DEV_TTY, NULL);
     add("ptmx", DEV_PTMX, NULL);
     add("kmsg", DEV_KMSG, NULL);                 // kernel log, one record per read()
-    if (fbdev_present()) add("fb0", DEV_FB, NULL);   // [M40] linear framebuffer
+    // [M40] linear framebuffer. Always in the table (the table may be built
+    // before the boot path set the framebuffer up, e.g. under UEFI); lookups
+    // and listings hide it while fbdev_present() is false.
+    add("fb0", DEV_FB, NULL);
     int n = block_count();
     for (int i = 0; i < n; i++) {
         block_dev_t* b = block_get(i);
@@ -111,7 +114,11 @@ static int find_node(const char* rel) {
     if (!rel || rel[0] != '/') return -2;
     if (rel[1] == 0) return -1;             // root dir
     const char* name = rel + 1;
-    for (int i=0;i<g_nnodes;i++) if (seq(g_nodes[i].name, name)) return i;
+    for (int i=0;i<g_nnodes;i++) {
+        if (!seq(g_nodes[i].name, name)) continue;
+        if (g_nodes[i].kind == DEV_FB && !fbdev_present()) return -2;
+        return i;
+    }
     return -2;                              // not found
 }
 
@@ -132,7 +139,10 @@ static int devfs_readdir(const char* dir, vfs_iter_cb cb, void* user) {
     if (dir && seq(dir, "/pts")) return pty_devfs_readdir(cb, user);
     if (dir && seq(dir, "/input")) return input_devfs_readdir(dir, (input_iter_cb)cb, user);
     if (!(dir && dir[0]=='/' && dir[1]==0)) return -1;   // only the root dir, /pts and /input list
-    for (int i=0;i<g_nnodes;i++) cb(fill_inode(i), user);
+    for (int i=0;i<g_nnodes;i++) {
+        if (g_nodes[i].kind == DEV_FB && !fbdev_present()) continue;
+        cb(fill_inode(i), user);
+    }
     cb(pty_devfs_lookup("/pts"), user);
     input_devfs_readdir("/", (input_iter_cb)cb, user);
     return 0;
