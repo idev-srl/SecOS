@@ -44,6 +44,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/select.h>
+#include <termios.h>
+#include <sys/stat.h>
 
 /* ---- types ---- */
 typedef unsigned long sigset_t;
@@ -356,63 +358,166 @@ int   isascii(int c);
 int   setpgrp(void);
 int   tcsendbreak(int fd, int dur);
 
-/* ---- termios flags (Linux values; the SecOS TTY honours ICANON/ECHO/ISIG) ---- */
+/* ---- termios: Linux values. A <termios.h> that already has the full Linux
+ * set (feat/pty) wins; each name is only defined when missing. ---- */
+#ifndef VINTR
 #define VINTR 0
+#endif
+#ifndef VQUIT
 #define VQUIT 1
+#endif
+#ifndef VERASE
 #define VERASE 2
+#endif
+#ifndef VKILL
 #define VKILL 3
+#endif
+#ifndef VEOF
 #define VEOF 4
+#endif
+#ifndef VSWTC
 #define VSWTC 7
+#endif
+#ifndef VSTART
 #define VSTART 8
+#endif
+#ifndef VSTOP
 #define VSTOP 9
+#endif
+#ifndef VSUSP
 #define VSUSP 10
+#endif
+#ifndef VEOL
 #define VEOL 11
+#endif
+#ifndef VREPRINT
 #define VREPRINT 12
+#endif
+#ifndef VDISCARD
 #define VDISCARD 13
+#endif
+#ifndef VWERASE
 #define VWERASE 14
+#endif
+#ifndef VLNEXT
 #define VLNEXT 15
+#endif
+#ifndef VEOL2
 #define VEOL2 16
+#endif
+#ifndef IGNBRK
 #define IGNBRK 0000001
+#endif
+#ifndef BRKINT
 #define BRKINT 0000002
+#endif
+#ifndef IGNPAR
 #define IGNPAR 0000004
+#endif
+#ifndef PARMRK
 #define PARMRK 0000010
+#endif
+#ifndef INPCK
 #define INPCK  0000020
+#endif
+#ifndef ISTRIP
 #define ISTRIP 0000040
+#endif
+#ifndef INLCR
 #define INLCR  0000100
+#endif
+#ifndef IGNCR
 #define IGNCR  0000200
+#endif
+#ifndef ICRNL
 #define ICRNL  0000400
+#endif
+#ifndef IUCLC
 #define IUCLC  0001000
+#endif
+#ifndef IXON
 #define IXON   0002000
+#endif
+#ifndef IXANY
 #define IXANY  0004000
+#endif
+#ifndef IXOFF
 #define IXOFF  0010000
+#endif
+#ifndef IMAXBEL
 #define IMAXBEL 0020000
+#endif
+#ifndef IUTF8
 #define IUTF8  0040000
+#endif
+#ifndef OPOST
 #define OPOST  0000001
+#endif
+#ifndef OLCUC
 #define OLCUC  0000002
+#endif
+#ifndef ONLCR
 #define ONLCR  0000004
+#endif
+#ifndef OCRNL
 #define OCRNL  0000010
+#endif
+#ifndef ONOCR
 #define ONOCR  0000020
+#endif
+#ifndef ONLRET
 #define ONLRET 0000040
+#endif
+#ifndef CS7
 #define CS7    0000040
+#endif
+#ifndef CS8
 #define CS8    0000060
+#endif
+#ifndef CSIZE
 #define CSIZE  0000060
+#endif
+#ifndef PARENB
 #define PARENB 0000400
+#endif
+#ifndef PARODD
 #define PARODD 0001000
+#endif
+#ifndef ECHOE
 #define ECHOE  0000020
+#endif
+#ifndef ECHOK
 #define ECHOK  0000040
+#endif
+#ifndef ECHONL
 #define ECHONL 0000100
+#endif
+#ifndef NOFLSH
 #define NOFLSH 0000200
+#endif
+#ifndef TOSTOP
 #define TOSTOP 0000400
+#endif
+#ifndef ECHOCTL
 #define ECHOCTL 0001000
+#endif
+#ifndef ECHOKE
 #define ECHOKE 0004000
+#endif
+#ifndef IEXTEN
 #define IEXTEN 0100000
+#endif
+#ifndef PENDIN
 #define PENDIN 0040000
+#endif
+#ifndef XCASE
 #define XCASE  0000004
+#endif
 typedef unsigned int speed_t;
-speed_t cfgetospeed(const void* t);
-speed_t cfgetispeed(const void* t);
-int cfsetospeed(void* t, speed_t s);
-int cfsetispeed(void* t, speed_t s);
+speed_t cfgetospeed(const struct termios* t);
+speed_t cfgetispeed(const struct termios* t);
+int cfsetospeed(struct termios* t, speed_t s);
+int cfsetispeed(struct termios* t, speed_t s);
 
 /* PTY interface (kernel side pending: see docs/SSH.md). Until /dev/ptmx exists
  * these fail with ENOSYS/ENOENT and Dropbear refuses the pty-req cleanly. */

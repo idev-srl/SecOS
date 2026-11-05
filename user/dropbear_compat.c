@@ -480,10 +480,10 @@ W char* ptsname(int fd){
     return name;
 }
 W int tcsendbreak(int fd, int dur){ (void)fd; (void)dur; return 0; }
-W speed_t cfgetospeed(const void* t){ (void)t; return 38400; }
-W speed_t cfgetispeed(const void* t){ (void)t; return 38400; }
-W int cfsetospeed(void* t, speed_t s){ (void)t; (void)s; return 0; }
-W int cfsetispeed(void* t, speed_t s){ (void)t; (void)s; return 0; }
+W speed_t cfgetospeed(const struct termios* t){ (void)t; return 38400; }
+W speed_t cfgetispeed(const struct termios* t){ (void)t; return 38400; }
+W int cfsetospeed(struct termios* t, speed_t s){ (void)t; (void)s; return 0; }
+W int cfsetispeed(struct termios* t, speed_t s){ (void)t; (void)s; return 0; }
 W char* ttyname(int fd){ (void)fd; return 0; }
 
 /* ===================== time (TODO(integration): move to libc) ===================== */
