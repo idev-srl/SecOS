@@ -1013,6 +1013,72 @@ grep -q "LJ9-hi" "$LJLOG"; check "lua script reads stdin through io.read" $?
 grep -q "LJ-42-END" "$LJLOG"; check "bash responsive after the job-control sequence" $?
 ! grep -q "\[EXC\]" "$LJLOG"; check "no CPU exception ([EXC]) during lua/job-control run" $?
 
+# ============================================================================
+# ---- Orderly poweroff / reboot from bash (SYS_REBOOT) ----
+# ============================================================================
+# (a) poweroff: write a file to an ext4 data disk, start a background job,
+#     poweroff. QEMU must exit by itself (ACPI S5, rc 0, not killed by timeout
+#     -> 124), the kernel must log TERM -> sync -> unmount -> poweroff, and on
+#     the host the file must be there and the volume e2fsck-clean.
+# (b) reboot: QEMU runs WITHOUT -no-reboot; the boot banner must appear twice.
+# (c) poweroff under UEFI/OVMF (q35): QEMU must exit by itself.
+# The feeder exits right after the command, so a QEMU that does not power off
+# is caught by `timeout` (124).
+PWLOG=/tmp/secos_selftest_power.log
+PWDISK=/tmp/secos_selftest_power_disk.img
+PWSTAGE=/tmp/secos_selftest_power_stage
+echo "[selftest] Running orderly poweroff from bash with an ext4 disk (mb2, serial, 60s)..."
+rm -rf "$PWSTAGE"; mkdir -p "$PWSTAGE"; echo hi > "$PWSTAGE/hello.txt"
+dd if=/dev/zero of="$PWDISK" bs=1M count=64 status=none
+mkfs.ext4 -q -F -O ^metadata_csum -L SECOSDATA -d "$PWSTAGE" "$PWDISK"
+: > "$PWLOG"
+( sleep 25; printf '  echo POWER-SYNC-OK > /mnt/pw.txt; sleep 30 &\r'; sleep 3
+  printf '  poweroff\r'; sleep 1 ) | \
+    timeout 60 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -drive file="$PWDISK",if=virtio,format=raw \
+        -debugcon file:"$PWLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+pw_rc=$?
+[[ $pw_rc -eq 0 ]]; check "poweroff: QEMU exits by itself via ACPI S5 (rc=$pw_rc, 124 = hung)" $?
+grep -q "\[POWER\] poweroff/reboot/halt/shutdown installed to /bin" "$PWLOG"; check "poweroff/reboot/halt/shutdown installed to /bin" $?
+grep -q "\[POWER\] poweroff requested by pid=" "$PWLOG"; check "poweroff: SYS_REBOOT reached from bash" $?
+grep -q "\[POWER\] synced 0x0000000000000001 filesystem(s)" "$PWLOG"; check "poweroff: the ext4 /mnt was synced" $?
+grep -q "\[POWER\] unmounted" "$PWLOG" && grep -q "\[POWER\] powering off" "$PWLOG"; check "poweroff: unmount, then ACPI power-off" $?
+[[ "$(debugfs -R 'cat /pw.txt' "$PWDISK" 2>/dev/null)" == "POWER-SYNC-OK" ]]; check "poweroff: file written just before poweroff is on the ext4 disk" $?
+e2fsck -fn "$PWDISK" >/dev/null 2>&1; check "poweroff: ext4 data disk e2fsck-clean afterwards" $?
+! grep -q "\[EXC\]" "$PWLOG"; check "no CPU exception ([EXC]) during poweroff" $?
+
+RBLOG=/tmp/secos_selftest_reboot.log
+echo "[selftest] Running reboot from bash (mb2, serial, reboot allowed, 75s)..."
+: > "$RBLOG"
+( sleep 25; printf '  reboot\r'; sleep 45 ) | \
+    timeout 75 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$RBLOG" -global isa-debugcon.iobase=0xe9 \
+        -display none -serial stdio >/dev/null 2>&1
+grep -q "\[POWER\] restarting" "$RBLOG"; check "reboot: orderly restart path taken" $?
+[[ "$(grep -c "SECoS build" "$RBLOG")" -ge 2 ]]; check "reboot: the system came back up (boot banner twice)" $?
+
+OVMF_PW=""
+for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
+         /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2-ovmf/OVMF_CODE.fd; do
+    [[ -f "$f" ]] && { OVMF_PW="$f"; break; }
+done
+if [[ -n "$OVMF_PW" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
+    UPLOG=/tmp/secos_selftest_power_uefi.log
+    echo "[selftest] Running poweroff under UEFI/OVMF (q35, serial, 75s)..."
+    : > "$UPLOG"
+    ( sleep 45; printf '  poweroff\r'; sleep 1 ) | \
+        timeout 75 qemu-system-x86_64 -machine q35,accel=tcg -m 256M -bios "$OVMF_PW" \
+            -drive format=raw,file=fat:rw:dist/ \
+            -debugcon file:"$UPLOG" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -net none -serial stdio >/dev/null 2>&1
+    up_rc=$?
+    grep -q "\[POWER\] powering off" "$UPLOG"; check "UEFI: poweroff from bash reaches ACPI power-off" $?
+    [[ $up_rc -eq 0 ]]; check "UEFI: QEMU exits by itself after poweroff (rc=$up_rc)" $?
+else
+    echo "  [SKIP] UEFI poweroff (OVMF missing or make uefi failed)"
+fi
+
 # ---- M39: UEFI secure boot (loader Ed25519-verifies kernel.elf before jumping) ----
 OVMF=""
 for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
