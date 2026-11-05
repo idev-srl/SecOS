@@ -2102,11 +2102,24 @@ void cpu_enable_mitigations(void) {
 #ifdef SECOS_SMAP
     if (smap) { g_smap_enabled = 1; __asm__ volatile("clac"); }
 #endif
+    // CR0.WP: make ring-0 writes honour read-only PTEs. Without it a kernel
+    // write into a user page (copy_to_user from read()/stat()) silently ignored
+    // the RO bit: it scribbled on PROT_NONE / mprotect(RO) pages and, worse, on
+    // a copy-on-write frame still shared with the fork parent (no COW fault ->
+    // the child's read() modified the parent's memory). With WP set the write
+    // faults, and the #PF handler COW-copies or the uaccess fixup returns
+    // -EFAULT. It also enforces RO kernel sections against ring-0 writes.
+    {
+        uint64_t cr0;
+        __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+        cr0 |= (1UL << 16);                   // CR0.WP
+        __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
+    }
     debugcon_writestring("[M36] mitigations: SMEP=");
     debugcon_writestring(smep ? "on" : "n/a");
     debugcon_writestring(" SMAP=");
     debugcon_writestring(g_smap_enabled ? "on" : (smap ? "available(opt-in)" : "n/a"));
-    debugcon_writestring(" stack-canary=on\n");
+    debugcon_writestring(" stack-canary=on WP=on\n");
 }
 
 // [M37] Measured boot. Compute a SHA-256 over the immutable kernel image

@@ -394,11 +394,15 @@ void vmm_protect_kernel_sections(void) {
     uint64_t img_hi = (rw_hi + two_mb - 1) & ~(two_mb - 1);
     for (uint64_t v = img_lo; v < img_hi; v += PAGE_SIZE) {
         int is_text = (v >= txt_lo && v < txt_hi);
-        int is_rw   = (v >= rw_lo  && v < rw_hi);
+        // The tail past _bss_end (up to the 2 MB boundary) is RW/NX, not R/NX:
+        // the PMM places its frame bitmap + COW refcount array at _kernel_end,
+        // so it is live writable kernel data. It was only "writable" before
+        // because CR0.WP was clear (ring-0 writes ignored the RO bit).
+        int is_rw   = (v >= rw_lo  && v < img_hi);
         uint64_t clear = 0, set = 0;
         if (is_text) { clear = VMM_FLAG_RW | VMM_FLAG_NOEXEC; }       // RX
         else if (is_rw) { clear = 0; set = VMM_FLAG_RW | VMM_FLAG_NOEXEC; } // RW/NX
-        else { clear = VMM_FLAG_RW; set = VMM_FLAG_NOEXEC; }          // R/NX (rodata+gaps+note+tail)
+        else { clear = VMM_FLAG_RW; set = VMM_FLAG_NOEXEC; }          // R/NX (rodata+gaps+note)
         kset_flags(v, clear, set);
     }
 
