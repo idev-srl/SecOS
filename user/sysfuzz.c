@@ -327,16 +327,16 @@ int main(int argc, char** argv){
             _exit((int)(batch_seed%100));
         } else if(pid>0){
             int st = waitpid(pid);
-            if(st>=128){
+            if(st>=0 && WIFSIGNALED(st)){
                 /* A ring-3 kill of the fuzz child is acceptable (deliberate bad
                  * memory access). Report it so it can be reproduced in-process
                  * with:  sysfuzz -s <seed> -r <batch> -v -F  (prints an FZ> line
                  * before each call, so the last one names the offender even if it
                  * then PANICS the kernel). We do NOT replay in the parent — that
                  * would re-run the same fault and kill the fuzzer itself. */
-                printf("[sysfuzz] batch %ld (seed=%lu) child KILLED status=%d (repro: -r %ld -v -F)\n",b,batch_seed,st,b);
+                printf("[sysfuzz] batch %ld (seed=%lu) child KILLED sig=%d (repro: -r %ld -v -F)\n",b,batch_seed,WTERMSIG(st),b);
             } else {
-                printf("[sysfuzz] batch %ld ok (status=%d)\n",b,st);
+                printf("[sysfuzz] batch %ld ok (status=%d)\n",b,WEXITSTATUS(st));
             }
         } else {
             printf("[sysfuzz] fork failed at batch %ld\n",b);

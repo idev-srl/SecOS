@@ -177,6 +177,30 @@ void kernel_panic(const char* message, const char* file, uint32_t line) {
 }
 
 // Handler per eccezioni CPU (unica definizione corretta)
+// Map a CPU exception vector to the POSIX signal a ring-3 fault terminates the
+// process with (Linux conventions), so wait() reports e.g. "Segmentation fault"
+// for a #PF instead of a raw vector number.
+static int exc_to_signal(uint64_t vec) {
+    switch (vec) {
+    case 0:  return 8;   /* #DE divide error        -> SIGFPE  */
+    case 1:  return 5;   /* #DB debug               -> SIGTRAP */
+    case 3:  return 5;   /* #BP breakpoint          -> SIGTRAP */
+    case 4:  return 11;  /* #OF overflow (into)     -> SIGSEGV */
+    case 5:  return 11;  /* #BR bound range         -> SIGSEGV */
+    case 6:  return 4;   /* #UD invalid opcode      -> SIGILL  */
+    case 7:  return 8;   /* #NM device n/a          -> SIGFPE  */
+    case 10: return 11;  /* #TS invalid TSS         -> SIGSEGV */
+    case 11: return 7;   /* #NP segment not present -> SIGBUS  */
+    case 12: return 7;   /* #SS stack-segment fault -> SIGBUS  */
+    case 13: return 11;  /* #GP general protection  -> SIGSEGV */
+    case 14: return 11;  /* #PF page fault          -> SIGSEGV */
+    case 16: return 8;   /* #MF x87 FP error        -> SIGFPE  */
+    case 17: return 7;   /* #AC alignment check     -> SIGBUS  */
+    case 19: return 8;   /* #XM SIMD FP exception   -> SIGFPE  */
+    default: return 11;  /* anything else           -> SIGSEGV */
+    }
+}
+
 void exception_handler(struct registers* regs) {
     __asm__ volatile("cli");
 
@@ -244,8 +268,8 @@ void exception_handler(struct registers* regs) {
             if (cur) {
                 debugcon_writestring("[EXC] ring3 fault -> kill pid=");
                 debugcon_print_hex(cur->pid); debugcon_writestring("\n");
-                extern void sched_kill_current(int reason) __attribute__((noreturn));
-                sched_kill_current((int)int_no); // NORETURN: switches to next task
+                extern void sched_kill_current(int sig) __attribute__((noreturn));
+                sched_kill_current(exc_to_signal(int_no)); // NORETURN: switches to next task
             }
         }
 

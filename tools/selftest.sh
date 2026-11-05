@@ -947,18 +947,23 @@ echo "[selftest] Running bash exit-status/signal + stat regressions (mb2, serial
   printf '  sleep 10 & kill -TERM $!; wait $!; echo UB3-$?\r'; sleep 4
   printf '  stat /bin/bash && echo UB4-$((2+2))\r'; sleep 5
   printf '  echo UB6-$(head -c 32 /dev/zero | wc -c)\r'; sleep 4
+  printf '  /bin/abi_test segv; echo UB7-$?\r'; sleep 4
   printf '  for i in 1 2 3; do sleep 1 & done\r'; sleep 6
   printf '  echo UB5-$((6*7))\r'; sleep 4 ) | \
     timeout 85 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$UBLOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >/dev/null 2>&1
 grep -q "UB1-142" "$UBLOG"; check "bash survives bash -c 'exit 142' and reports \$? = 142" $?
+! grep -q "Signal 14" "$UBLOG"; check "exit 142 is reported as an exit, not as a signal (POSIX wait status)" $?
+grep -q "UB7-139" "$UBLOG"; check "a ring-3 #PF kill is reported as SIGSEGV (\$? = 139)" $?
 grep -q "UB2-137" "$UBLOG"; check "bash survives kill -9 of a child (\$? = 137)" $?
 grep -q "UB3-143" "$UBLOG"; check "bash survives SIGTERM of a child (\$? = 143)" $?
 grep -q "File: /bin/bash" "$UBLOG" && grep -q "UB4-4" "$UBLOG"; check "coreutils stat /bin/bash works (stat ABI)" $?
 grep -q "UB6-32" "$UBLOG"; check "stdio flushed at exit (head -c 32 /dev/zero | wc -c -> 32)" $?
 grep -q "UB5-42" "$UBLOG"; check "bash survives SIGCHLDs while idle at the prompt (tty -EINTR)" $?
-! grep -q "\[EXC\]" "$UBLOG"; check "no CPU exception ([EXC]) during exit-status/stat regressions" $?
+# Exactly one CPU exception: the deliberate ring-3 #PF of `abi_test segv` (UB7).
+[[ "$(grep -c "\[EXC\] int=" "$UBLOG")" -eq 1 ]] && ! grep -q "\[EXC\].*ring0" "$UBLOG"
+check "no unexpected CPU exception ([EXC]) during exit-status/stat regressions" $?
 
 # ---- M39: UEFI secure boot (loader Ed25519-verifies kernel.elf before jumping) ----
 OVMF=""
@@ -1068,10 +1073,11 @@ if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
     echo "[selftest] UACCESS BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     exit 2
 fi
-echo "[selftest] Running uaccess gate (mb2, serial, 50s)..."
+echo "[selftest] Running uaccess + ABI gate (mb2, serial, 60s)..."
 : > "$UALOG"
-( sleep 25; printf '  /bin/uaccess_test; echo UA-$((6*7))-END\r'; sleep 15 ) | \
-    timeout 50 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+( sleep 25; printf '  /bin/uaccess_test; echo UA-$((6*7))-END\r'; sleep 15
+  printf '  /bin/abi_test; echo ABI-$((6*7))-END\r'; sleep 10 ) | \
+    timeout 60 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$UALOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >/dev/null 2>&1
 grep -q "\[UA-TEST\] DONE pass=[0-9]* fail=0" "$UALOG"; check "UACCESS every bad-pointer case returns an error (DONE fail=0)" $?
@@ -1084,6 +1090,13 @@ grep -q "\[UA-TEST\] kernel-write-to-cow-page OK" "$UALOG"; check "UACCESS kerne
 grep -q "\[UA-TEST\] sigframe-from-pf-path OK" "$UALOG"; check "UACCESS sigframe from the #PF return path (nested #PF)" $?
 ! grep -q "\[UA-TEST\] .* FAIL" "$UALOG"; check "UACCESS no case failed" $?
 ! grep -q "ring0" "$UALOG"; check "UACCESS no ring-0 CPU fault" $?
+# ABI regression test (user/abi_test.c), same boot: POSIX wait status.
+grep -q "\[ABI-TEST\] DONE pass=[0-9]* fail=0" "$UALOG"; check "ABI every case passes (DONE fail=0)" $?
+grep -q "ABI-42-END" "$UALOG"; check "ABI shell survives the test (sentinel reached)" $?
+grep -q "\[ABI-TEST\] wait-exit-142-not-signal OK" "$UALOG"; check "ABI exit(142) -> WIFEXITED, WEXITSTATUS=142" $?
+grep -q "\[ABI-TEST\] wait-pf-is-sigsegv OK" "$UALOG"; check "ABI ring-3 #PF -> WIFSIGNALED, WTERMSIG=SIGSEGV" $?
+grep -q "\[ABI-TEST\] wait-de-is-sigfpe OK" "$UALOG"; check "ABI ring-3 #DE -> SIGFPE" $?
+! grep -q "\[ABI-TEST\] .* FAIL" "$UALOG"; check "ABI no case failed" $?
 ! grep -q "\[PANIC\]" "$UALOG"; check "UACCESS no kernel panic" $?
 
 echo "[selftest] ---"

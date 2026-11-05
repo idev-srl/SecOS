@@ -67,7 +67,18 @@ long    msg_recv(int chan, void* buf, long len);         /* blocks if empty (M17
 /* [M16] process control */
 int     spawn(const char* path, char* const argv[]);     /* signed child + argv -> pid, or <0 */
 #ifndef SECOS_BASH_PORT
-int     waitpid(int pid);                                /* block until child exits -> status */
+int     waitpid(int pid);                                /* block until child exits -> wait status */
+#endif
+/* POSIX/Linux wait-status decoding (the kernel returns this encoding from
+ * SYS_WAIT / SYS_WAITANY): exit -> (st&0xff)<<8, killed -> signo (low 7 bits). */
+#ifndef WIFEXITED
+#define WIFEXITED(s)   (((s) & 0x7f) == 0)
+#define WEXITSTATUS(s) (((s) >> 8) & 0xff)
+#define WIFSIGNALED(s) (((signed char)(((s) & 0x7f) + 1) >> 1) > 0)
+#define WTERMSIG(s)    ((s) & 0x7f)
+#define WIFSTOPPED(s)  (((s) & 0xff) == 0x7f)
+#define WSTOPSIG(s)    (((s) >> 8) & 0xff)
+#define WCOREDUMP(s)   ((s) & 0x80)
 #endif
 /* [M17] blocking sleep */
 void    sleep_ticks(unsigned ticks);

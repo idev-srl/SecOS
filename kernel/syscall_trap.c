@@ -67,7 +67,7 @@ uint64_t syscall_handler(trapframe_t* tf) {
     // [M8] SYS_EXIT: terminate the caller. Marks it ZOMBIE and switches away;
     // does NOT return (the task is reaped later from the idle/scheduler context).
     if (num == SYS_EXIT) {
-        if (cur) cur->exit_code = (int)tf->rdi; // [M16] carry the user exit status
+        if (cur) cur->exit_code = W_EXITCODE(tf->rdi); // [M16] POSIX status: (st&0xff)<<8
         sched_exit_current(tf);
         return 0; // not reached when a switch occurs
     }

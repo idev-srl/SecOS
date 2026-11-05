@@ -18,7 +18,7 @@
 extern process_t* sched_get_current(void);
 extern process_t* process_find_by_pid(uint32_t pid);
 extern void process_foreach(void (*cb)(process_t*, void*), void* user);
-extern void sched_kill_current(int reason) __attribute__((noreturn));
+extern void sched_kill_current(int sig) __attribute__((noreturn));
 extern void sched_stop_current(trapframe_t* tf) __attribute__((noreturn));
 
 // ---- foreground process group (console job control) ----

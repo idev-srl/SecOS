@@ -34,7 +34,10 @@ int main(void) {
         for (int i = 0; i < n; i++) {
             if (svcs[i].pid < 0) continue;
             int status = waitpid(svcs[i].pid);          /* block until it exits */
-            printf("[init] %s (pid=%d) exited status=%d\n", svcs[i].path, svcs[i].pid, status);
+            if (WIFSIGNALED(status))
+                printf("[init] %s (pid=%d) killed by signal %d\n", svcs[i].path, svcs[i].pid, WTERMSIG(status));
+            else
+                printf("[init] %s (pid=%d) exited status=%d\n", svcs[i].path, svcs[i].pid, WEXITSTATUS(status));
             if (svcs[i].restarts < svcs[i].max_restarts) {
                 svcs[i].restarts++;
                 if (start(&svcs[i]) > 0)

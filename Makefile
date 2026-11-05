@@ -367,6 +367,11 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/uaccess_test.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/uaccess_test.o
 	python3 tools/secos-sign user/uaccess_test.elf --dev
 	python3 tools/elf2h.py user/uaccess_test.elf user_uaccess_elf crypto/user_uaccess_elf.h
+	# [abi] kernel/user ABI regression test: wait status, DF on entry, PROT_NONE
+	$(CC) $(USER_CFLAGS) -c user/abi_test.c    -o user/abi_test.o
+	$(LD) --gc-sections -T user/user.ld -o user/abi_test.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/abi_test.o
+	python3 tools/secos-sign user/abi_test.elf --dev
+	python3 tools/elf2h.py user/abi_test.elf user_abi_test_elf crypto/user_abi_test_elf.h
 	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig -> crypto/*.h"
 
 # Staleness guard for the committed embedded programs: rebuild + re-sign them

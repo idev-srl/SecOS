@@ -228,18 +228,20 @@ void sched_exit_current(trapframe_t* tf) {
 // switch to the next runnable task — the same mechanism as a SYS_EXIT, but
 // driven by the exception handler. NEVER returns. If there is no killable
 // current (idle/none), the fault is unrecoverable and we halt (a kernel bug).
-void sched_kill_current(int reason) {
+// 'sig' is the terminating signal number (a ring-3 CPU fault is mapped to its
+// signal by the exception handler: #PF/#GP -> SIGSEGV, #DE -> SIGFPE, ...).
+void sched_kill_current(int sig) {
     if (!current || current == idle_task) {
         debugcon_writestring("[KILL] no killable process -> halt\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
     debugcon_writestring("[KILL] pid=");
     debugcon_print_hex(current->pid);
-    debugcon_writestring(" reason=");
-    debugcon_print_hex((uint64_t)reason);
+    debugcon_writestring(" sig=");
+    debugcon_print_hex((uint64_t)sig);
     debugcon_writestring("\n");
-    // Encode the fault as a signal-style status (128 + vector), à la POSIX.
-    current->exit_code = 128 + (reason & 0x7F);
+    // POSIX "killed by signal" wait status (no core dumps -> core flag clear).
+    current->exit_code = W_SIGNALED(sig);
     process_release_pipes(current);    // close pipe ends now: readers see EOF before wait()
     current->state = PROC_ZOMBIE;
     notify_parent_sigchld(current);                       // [M30] SIGCHLD to parent

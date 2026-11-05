@@ -1245,6 +1245,7 @@ static void m24_run_demo(void) {
 #include "../crypto/user_svc_elf.h"
 #include "../crypto/user_sysfuzz_elf.h"
 #include "../crypto/user_uaccess_elf.h"
+#include "../crypto/user_abi_test_elf.h"
 static void coreutils_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1274,6 +1275,8 @@ static void coreutils_install(void) {
     vfs_create("/bin/sysfuzz", user_sysfuzz_elf, user_sysfuzz_elf_len);
     // [uaccess] bad-user-pointer regression test (-EFAULT, never a ring-0 fault)
     vfs_create("/bin/uaccess_test", user_uaccess_elf, user_uaccess_elf_len);
+    // [abi] wait-status / DF-on-entry / PROT_NONE regression test
+    vfs_create("/bin/abi_test", user_abi_test_elf, user_abi_test_elf_len);
 }
 extern void shell_init(void);
 extern void shell_run(void);
