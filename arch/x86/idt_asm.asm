@@ -114,6 +114,7 @@ isr_common:
     push r13
     push r14
     push r15
+    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     
     ; Passa il puntatore alla struttura registers
     mov rdi, rsp
@@ -176,6 +177,7 @@ isr_timer:
     push r13
     push r14
     push r15
+    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
 
     ; rdi = &trapframe (points at r15).  On a preemptive switch the C handler
     ; sends EOI itself and does NOT return (it iretq's into the next task);
@@ -232,6 +234,7 @@ isr_keyboard:
     push r13
     push r14
     push r15
+    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     
     ; Chiama il gestore C
     call keyboard_handler
@@ -282,6 +285,7 @@ isr_xhci:
     push r13
     push r14
     push r15
+    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     call xhci_irq_handler        ; drains/acks; LAPIC EOI done in C
     pop r15
     pop r14
@@ -318,6 +322,7 @@ isr_nvme:
     push r13
     push r14
     push r15
+    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     call nvme_irq_handler        ; drains/acks; LAPIC EOI done in C
     pop r15
     pop r14
@@ -357,6 +362,7 @@ isr_net:
     push r13
     push r14
     push r15
+    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     call net_irq_handler         ; acks NIC, drains ring; LAPIC EOI done in C
     pop r15
     pop r14

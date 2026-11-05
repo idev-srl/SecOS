@@ -1090,12 +1090,17 @@ grep -q "\[UA-TEST\] kernel-write-to-cow-page OK" "$UALOG"; check "UACCESS kerne
 grep -q "\[UA-TEST\] sigframe-from-pf-path OK" "$UALOG"; check "UACCESS sigframe from the #PF return path (nested #PF)" $?
 ! grep -q "\[UA-TEST\] .* FAIL" "$UALOG"; check "UACCESS no case failed" $?
 ! grep -q "ring0" "$UALOG"; check "UACCESS no ring-0 CPU fault" $?
-# ABI regression test (user/abi_test.c), same boot: POSIX wait status.
+# ABI regression test (user/abi_test.c), same boot: POSIX wait status, DF=1 on
+# kernel entry (every entry stub must cld), PROT_NONE.
 grep -q "\[ABI-TEST\] DONE pass=[0-9]* fail=0" "$UALOG"; check "ABI every case passes (DONE fail=0)" $?
 grep -q "ABI-42-END" "$UALOG"; check "ABI shell survives the test (sentinel reached)" $?
 grep -q "\[ABI-TEST\] wait-exit-142-not-signal OK" "$UALOG"; check "ABI exit(142) -> WIFEXITED, WEXITSTATUS=142" $?
 grep -q "\[ABI-TEST\] wait-pf-is-sigsegv OK" "$UALOG"; check "ABI ring-3 #PF -> WIFSIGNALED, WTERMSIG=SIGSEGV" $?
 grep -q "\[ABI-TEST\] wait-de-is-sigfpe OK" "$UALOG"; check "ABI ring-3 #DE -> SIGFPE" $?
+grep -q "\[ABI-TEST\] df-fork-child-ok OK" "$UALOG"; check "ABI fork() entered with DF=1 copies correctly (cld on entry)" $?
+grep -q "\[ABI-TEST\] df-pipe-write-read OK" "$UALOG" && grep -q "\[ABI-TEST\] df-stat OK" "$UALOG"
+check "ABI write/read/stat entered with DF=1 return correct data" $?
+grep -q "\[ABI-TEST\] df-signal-handler-entry-df0 OK" "$UALOG"; check "ABI signal handler starts with DF=0" $?
 ! grep -q "\[ABI-TEST\] .* FAIL" "$UALOG"; check "ABI no case failed" $?
 ! grep -q "\[PANIC\]" "$UALOG"; check "UACCESS no kernel panic" $?
 

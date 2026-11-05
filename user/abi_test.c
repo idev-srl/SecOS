@@ -5,6 +5,11 @@
  *    exit(142) is WIFEXITED/142 (not "killed by signal 14") and ring-3 CPU
  *    faults are reported as the matching signal (#PF -> SIGSEGV, #DE -> SIGFPE,
  *    #UD -> SIGILL).
+ *  - DF on entry: ring 3 may enter the kernel with EFLAGS.DF=1 (`std`); every
+ *    entry stub must `cld` (the kernel's compiler-generated rep movs/stos in
+ *    fork/sigframe copies, memcpy, ... assume DF=0). Syscalls issued with DF=1
+ *    must still copy correctly, the user's DF must survive the round trip, and
+ *    a signal handler must start with DF=0.
  *
  * Output: one "[ABI-TEST] <name> OK|FAIL" line per case, then
  * "[ABI-TEST] DONE pass=<n> fail=<m>". stdout is mirrored to debugcon.
@@ -80,9 +85,117 @@ static void test_wait_status(void) {
     }
 }
 
+/* ---------------- DF=1 on kernel entry ---------------- */
+#define SYS_READ_   3
+#define SYS_WRITE_  2
+#define SYS_GETTICKS_ 10
+#define SYS_FORK_  18
+#define SYS_STAT_  20
+#define SYS_PIPE_  31
+#define SYS_KILL_  46
+#define EFL_DF 0x400UL
+
+/* Issue a syscall with DF=1 (the asm block sets it right before `int 0x80`
+ * and clears it right after, so no compiled C code runs with DF=1). *flags
+ * gets RFLAGS as seen on return, before the cld. */
+static long sc_df(long n, long a0, long a1, long a2, unsigned long* flags) {
+    long ret; unsigned long fl;
+    __asm__ volatile("std\n\tint $0x80\n\tpushfq\n\tpop %1\n\tcld"
+                     : "=a"(ret), "=r"(fl)
+                     : "0"(n), "D"(a0), "S"(a1), "d"(a2), "c"(0L)
+                     : "memory", "cc");
+    if (flags) *flags = fl;
+    return ret;
+}
+static unsigned long read_flags(void) {
+    unsigned long f; __asm__ volatile("pushfq\n\tpop %0" : "=r"(f)); return f;
+}
+
+static volatile unsigned long g_handler_flags;
+static volatile int g_handler_ran;
+static void on_usr1(int sig) { (void)sig; g_handler_flags = read_flags(); g_handler_ran = 1; }
+
+static void test_df(void) {
+    unsigned long fl = 0;
+    int ok_df = 1;
+
+    /* pipe + write + read with DF=1: the bytes must arrive intact, in order. */
+    {
+        int fds[2] = { -1, -1 };
+        long r = sc_df(SYS_PIPE_, (long)fds, 0, 0, &fl); ok_df &= !!(fl & EFL_DF);
+        static char out[200], in[200];
+        for (int i = 0; i < 200; i++) { out[i] = (char)('A' + i % 26); in[i] = 0; }
+        long w = r == 0 ? sc_df(SYS_WRITE_, fds[1], (long)out, 200, &fl) : -1; ok_df &= !!(fl & EFL_DF);
+        long n = w == 200 ? sc_df(SYS_READ_, fds[0], (long)in, 200, &fl) : -1; ok_df &= !!(fl & EFL_DF);
+        int same = n == 200;
+        for (int i = 0; same && i < 200; i++) same = in[i] == out[i];
+        check("df-pipe-write-read", same, n);
+        if (fds[0] >= 0) close(fds[0]);
+        if (fds[1] >= 0) close(fds[1]);
+    }
+    /* write to the console with DF=1 (copy_from_user + console path). */
+    {
+        static const char msg[] = "[ABI-TEST] df-console-write-text\n";
+        long w = sc_df(SYS_WRITE_, 1, (long)msg, sizeof(msg) - 1, &fl); ok_df &= !!(fl & EFL_DF);
+        check("df-console-write", w == (long)(sizeof(msg) - 1), w);
+    }
+    /* stat with DF=1 must fill the same struct as a normal stat. */
+    {
+        struct stat a, b;
+        char* pa = (char*)&a; char* pb = (char*)&b;
+        for (unsigned i = 0; i < sizeof(a); i++) { pa[i] = 0; pb[i] = (char)0x5a; }
+        int r1 = stat("/bin/abi_test", &a);
+        long r2 = sc_df(SYS_STAT_, (long)"/bin/abi_test", (long)&b, 0, &fl); ok_df &= !!(fl & EFL_DF);
+        int same = r1 == 0 && r2 == 0 && a.st_size > 0 && a.st_size == b.st_size && a.st_mode == b.st_mode;
+        check("df-stat", same, r2);
+    }
+    /* fork with DF=1: the kernel copies the PCB/trapframe (rep movsq); the
+     * child must see the parent's memory and both must keep running. */
+    {
+        static char pat[4096];
+        for (int i = 0; i < 4096; i++) pat[i] = (char)(i * 7);
+        long pid = sc_df(SYS_FORK_, 0, 0, 0, &fl);
+        if (pid == 0) {
+            int good = (fl & EFL_DF) != 0;
+            for (int i = 0; good && i < 4096; i++) good = pat[i] == (char)(i * 7);
+            _exit(good ? 42 : 1);
+        }
+        ok_df &= !!(fl & EFL_DF);
+        int st = pid > 0 ? waitpid((int)pid) : -1;
+        expect_exit("df-fork-child-ok", st, 42);
+    }
+    /* signal raised with DF=1: the handler starts with DF=0 (ABI) and the
+     * interrupted DF=1 is restored by sigreturn. */
+    {
+        signal(10 /*SIGUSR1*/, on_usr1);
+        g_handler_ran = 0; g_handler_flags = EFL_DF;
+        sc_df(SYS_KILL_, getpid(), 10, 0, &fl);
+        check("df-signal-handler-entry-df0", g_handler_ran && !(g_handler_flags & EFL_DF), (long)g_handler_flags);
+        check("df-restored-after-sigreturn", (fl & EFL_DF) != 0, (long)fl);
+        signal(10, (sighandler_t)0);
+    }
+    /* Stay in ring 3 with DF=1 across many timer ticks (isr_timer + scheduler
+     * run with the interrupted DF=1): the kernel must keep working. */
+    {
+        unsigned long t0 = getticks(), t = t0;
+        long spins = 0;
+        while (t - t0 < 20 && spins < 2000000) {
+            t = (unsigned long)sc_df(SYS_GETTICKS_, 0, 0, 0, &fl);
+            ok_df &= !!(fl & EFL_DF);
+            __asm__ volatile("std\n\t"
+                             "mov $20000, %%ecx\n\t1: dec %%ecx\n\tjnz 1b\n\t"
+                             "cld" ::: "rcx", "cc");
+            spins++;
+        }
+        check("df-timer-ticks-with-df1", t - t0 >= 20, (long)(t - t0));
+    }
+    check("df-user-df-preserved-across-syscalls", ok_df, 0);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "segv") == 0) { die_segv(); return 1; }
     test_wait_status();
+    test_df();
     put("[ABI-TEST] DONE pass="); putnum(g_pass);
     put(" fail="); putnum(g_fail); put("\n");
     return g_fail ? 1 : 0;

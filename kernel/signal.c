@@ -148,6 +148,8 @@ void signal_dispatch(trapframe_t* tf) {
         tf->rsp = ret_slot;                      // rsp%16==8 at entry (ABI)
         tf->rdi = (uint64_t)sig;                 // first arg: signum
         tf->rax = 0;
+        tf->rflags &= ~0x400ULL;                 // DF=0 at handler entry (SysV ABI;
+                                                 // sigreturn restores the saved DF)
         debugcon_writestring("[SIG] deliver sig=");
         debugcon_print_hex((uint64_t)sig);
         debugcon_writestring(" pid=");

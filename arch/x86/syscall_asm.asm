@@ -34,6 +34,7 @@ syscall_entry:
     push r13
     push r14
     push r15
+    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
 
     ; Pass trapframe pointer to C handler
     mov rdi, rsp
