@@ -522,6 +522,9 @@ int ksys_getdents(const char* path, void* ubuf, int buflen){
     extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*);
     static char kbuf[16384];                 // up to 64 entries
     struct gd_ctx g = { kbuf, sizeof(kbuf), 0 };
+    // cwd-relative + normalized: bash's glob and readline's filename completion
+    // open "." and "dir/" (trailing slash), which vfs_readdir does not accept.
+    char rp[256]; proc_resolve_path(sched_get_current(), path, rp, sizeof(rp)); path = rp;
     if(vfs_readdir(path, gd_cb, &g) != 0) return -1;
     int n = g.len < buflen ? g.len : buflen;
     if(n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0) return -1;
