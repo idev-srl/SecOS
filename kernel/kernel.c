@@ -1291,6 +1291,12 @@ extern void shell_run_line(const char* line);
 #include "../crypto/user_lua_elf.h"      // [M34] installed to /bin/lua at boot
 #endif
 #include "../crypto/user_power_elf.h"    // /bin/{poweroff,reboot,halt,shutdown}
+// Dropbear SSH (tools/port-dropbear.sh): signed multi-call binary installed to
+// /bin/dropbearmulti (`dropbearmulti dropbear|dropbearkey|dbclient ...`).
+// Not started automatically. -DSECOS_NO_DROPBEAR drops it. See docs/SSH.md.
+#ifndef SECOS_NO_DROPBEAR
+#include "../crypto/user_dropbear_elf.h"
+#endif
 static uint8_t   m10_idle_stack[32768] __attribute__((aligned(16)));
 static process_t m10_idle;
 static trapframe_t m10_idle_tf;
@@ -1323,6 +1329,16 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
           if (vfs_create("/bin/lua", user_lua_elf, user_lua_elf_len) == 0)
               debugcon_writestring("[M34] installed lua to /bin/lua\n");
           else debugcon_writestring("[M34] FAIL: could not install /bin/lua\n");
+      } }
+#endif
+#ifndef SECOS_NO_DROPBEAR
+    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
+      extern int vfs_mkdir(const char*);
+      if (!vfs_lookup("/etc/dropbear")) vfs_mkdir("/etc/dropbear");
+      if (!vfs_lookup("/bin/dropbearmulti")) {
+          if (vfs_create("/bin/dropbearmulti", user_dropbear_elf, user_dropbear_elf_len) == 0)
+              debugcon_writestring("[SSH] installed dropbear to /bin/dropbearmulti\n");
+          else debugcon_writestring("[SSH] FAIL: could not install /bin/dropbearmulti\n");
       } }
 #endif
 #if ENABLE_FB
