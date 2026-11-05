@@ -2,11 +2,14 @@
 #ifndef _FCNTL_H
 #define _FCNTL_H
 #include "libsecos.h"   /* O_RDONLY/O_WRONLY/O_RDWR + open() */
-/* SecOS has no creation flags yet; define them as no-ops for source compat. */
+/* Creation flags honoured by SYS_OPEN (O_CREAT/O_TRUNC/O_APPEND/O_EXCL). */
 #ifndef O_CREAT
 #define O_CREAT  0x40
 #define O_TRUNC  0x200
 #define O_APPEND 0x400
+#endif
+#ifndef O_EXCL
+#define O_EXCL   0x80     /* with O_CREAT: fail with EEXIST if it exists */
 #endif
 #define O_NONBLOCK 0x800
 #define O_CLOEXEC  0x80000

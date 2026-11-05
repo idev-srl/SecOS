@@ -13,7 +13,7 @@ long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4);
 ssize_t write(int fd, const void* buf, size_t len);
 ssize_t read(int fd, void* buf, size_t len);
 #ifndef SECOS_BASH_PORT
-int     open(const char* path, int flags);
+int     open(const char* path, int flags, ...);   /* mode (O_CREAT) & ~umask */
 #endif
 int     close(int fd);
 /* [M23/M26] file positioning + stat. Layout mirrors struct secos_stat; both sides
