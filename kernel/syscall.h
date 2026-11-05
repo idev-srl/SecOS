@@ -69,6 +69,9 @@
 #define SYS_GETPGID     57 // getpgid(pid) -> process group id (pid 0 = caller) / -ESRCH
 #define SYS_SIGSUSPEND  58 // sigsuspend(mask) -> -EINTR once a signal was delivered
 #define SYS_REBOOT      59 // reboot(cmd): orderly poweroff(1)/restart(2)/halt(3); returns only on error
+// Sessions + pseudo-terminals (numbers 85-89 are reserved for the pty work).
+#define SYS_SETSID      85 // setsid() -> new session id / -EPERM (already a group leader)
+#define SYS_GETSID      86 // getsid(pid) -> session id (pid 0 = caller) / -ESRCH
 // Note: execve is emulated in libc (spawn+waitpid+_exit) — no kernel syscall.
 
 // [M24] socket types

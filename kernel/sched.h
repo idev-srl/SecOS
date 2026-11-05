@@ -21,6 +21,7 @@ void sched_wake_parent_waitany(uint32_t ppid); // [M39] wake a waitpid(-1) block
 void sched_wake_sleepers(uint64_t now);    // [M17] wake elapsed SYS_SLEEP blockers
 void sched_wake_chan(int chan);            // [M17] wake SYS_MSG_RECV blockers on chan
 void sched_wake_pipe(void* pp);            // [M25] wake pipe read/write blockers on pp
+void sched_wake_pty(void* pty);            // wake pty read/write/poll blockers on pty
 void sched_reap_zombies(void);             // free ZOMBIE processes (not current)
 int  sched_count_alive_user(void);         // user processes not yet ZOMBIE
 

@@ -19,6 +19,8 @@
 #include "pipe.h"             // [M25] anonymous pipes
 #include "cap.h"              // [M35] generalized capability checks
 #include "heap.h"             // kmalloc for read()/write() bounce buffers
+#include "pty.h"              // pseudo-terminals, sessions, controlling terminal
+#include "tty.h"
 
 extern uint64_t timer_get_ticks(void);
 
@@ -69,6 +71,7 @@ static void spawn_inherit_stdio(process_t* parent, process_t* child){
         if(!parent->fds[i].used) continue;
         child->fds[i]=parent->fds[i];
         if(child->fds[i].is_pipe) pipe_ref((pipe_t*)child->fds[i].inode, child->fds[i].pipe_w);
+        else pty_ref(child->fds[i].inode);                 // a pty end: one more holder
     }
 }
 
@@ -84,8 +87,10 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     // Job control: libc's execve is emulated as spawn+wait+_exit, so the spawned
     // program must stay in the caller's process group, otherwise a job's real
     // program escapes `kill -STOP %1`, Ctrl-C/Ctrl-Z (foreground pgid) and SIGTTIN.
+    // Same for the session and controlling terminal (a program run by a shell
+    // on a pty must see that pty as /dev/tty and its job-control terminal).
     { process_t* sp = sched_get_current();
-      if (sp && sp->pid != 0) p->pgid = sp->pgid; }
+      if (sp && sp->pid != 0) { p->pgid = sp->pgid; pty_inherit_ctty(p, sp); } }
     p->state = PROC_READY;
     return (int)p->pid;
 }
@@ -307,13 +312,17 @@ int ksys_open(const char* path, int flags){
     if(!ino && (flags & 0x40)){ if(vfs_create(path,"",0)==0) ino=vfs_lookup(path); }   // O_CREAT
     if(!ino) return -2;   // [M39] -ENOENT so libc can set errno (bash rcfile probing)
     if((flags & 0x200) && ino->size){ vfs_truncate(path,0); ino=vfs_lookup(path); if(!ino) return -1; } // O_TRUNC
-    int fd=fd_alloc(c); if(fd<0) return -1;
+    // /dev/ptmx -> a new pty master, /dev/tty -> the controlling terminal,
+    // /dev/pts/N -> that slave (may become the session's controlling tty).
+    int pr = pty_open_hook(c, &ino, flags); if(pr<0) return pr;
+    int fd=fd_alloc(c); if(fd<0){ pty_unref(ino); return -1; }
     c->fds[fd].inode=ino; c->fds[fd].flags=flags;
     c->fds[fd].offset = (flags & 0x400) ? ino->size : 0;    // O_APPEND -> seek to end
     return fd;
 }
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
     if(c->fds[fd].is_pipe){ pipe_unref((pipe_t*)c->fds[fd].inode, c->fds[fd].pipe_w); c->fds[fd].is_pipe=0; }  // [M25] drop end, may signal EOF/EPIPE
+    else { void* ino=c->fds[fd].inode; c->fds[fd].inode=NULL; c->fds[fd].used=0; pty_unref(ino); return 0; }  // a pty end may hang up
     c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
 // [uaccess] read()/write() never touch the user buffer directly: data moves
 // through a kernel bounce buffer and copy_to/from_user, so an unmapped or
@@ -356,7 +365,16 @@ int ksys_read(int fd, void* ubuf, int len){ extern process_t* sched_get_current(
         if(r>0 && copy_to_user(ubuf, u.small, (size_t)r)!=0) return -EFAULT;
         return r;
     }
-    vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino->ops||!ino->ops->read) return -1;
+    vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode;
+    if(pty_is_inode(ino)){                                  // pty master/slave: one chunk
+        int want = len < 4096 ? len : 4096;
+        if(uio_get(&u, want)!=0) return -1;
+        int r = pty_read(ino, u.p, want, (c->fds[fd].flags & 0x800) != 0);  // O_NONBLOCK
+        if(r>0 && copy_to_user(ubuf, u.p, (size_t)r)!=0) r = -EFAULT;
+        uio_put(&u);
+        return r;                                           // -2: blocks (wait_pty)
+    }
+    if(!ino->ops||!ino->ops->read) return -1;
     if(uio_get(&u, len)!=0) return -1;
     // [M20] Read through the unified page cache so file read() and file-backed
     // mmap see the same pages (coherent). [M23] Virtual FSes (devfs/procfs/sysfs)
@@ -382,8 +400,25 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
     if(!is_pipe && !is_file && fd!=1 && fd!=2) return -1;
     if(is_pipe && !c->fds[fd].pipe_w) return -1;            // [M25] write end only
     vfs_inode_t* ino = is_file ? (vfs_inode_t*)c->fds[fd].inode : 0;
-    if(ino && (!ino->ops||!ino->ops->write)) return -1;
     uio_buf_t u;
+    if(ino && pty_is_inode(ino)){
+        // A pty end: as much as fits, chunk by chunk. Once something was
+        // written, stop at the first "full" instead of blocking (short write).
+        int nb = (c->fds[fd].flags & 0x800) != 0;          // O_NONBLOCK
+        if(uio_get(&u, len)!=0) return -1;
+        int done=0, err=0;
+        while(done < len){
+            int want = (len-done) < u.cap ? (len-done) : u.cap;
+            if(copy_from_user(u.p, (const uint8_t*)ubuf+done, (size_t)want)!=0){ if(done==0) err=-EFAULT; break; }
+            int r = pty_write(ino, u.p, want, nb || done>0);
+            if(r<=0){ if(done==0) err=r; break; }       // -2: blocks (wait_pty)
+            done += r;
+            if(r < want) break;
+        }
+        uio_put(&u);
+        return done ? done : err;
+    }
+    if(ino && (!ino->ops||!ino->ops->write)) return -1;
     if(is_pipe){
         // [M30] A redirected pipe end takes precedence over the console. One
         // chunk per call (the pipe is 4 KB; a short write is POSIX-legal and
@@ -427,6 +462,7 @@ long ksys_lseek(int fd, long offset, int whence){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32||!c->fds[fd].used) return -1;
     vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1;
+    if(c->fds[fd].is_pipe || pty_is_inode(ino)) return -29;   // -ESPIPE: a stream
     long base;
     switch(whence){
         case SEEK_SET: base=0; break;
@@ -584,10 +620,14 @@ int ksys_dup2(int oldfd, int newfd){
     if(oldfd<0||oldfd>=32||newfd<0||newfd>=32) return -1;
     if(!c->fds[oldfd].used) return -1;
     if(oldfd==newfd) return newfd;
-    if(c->fds[newfd].used && c->fds[newfd].is_pipe)             // close the old newfd target
-        pipe_unref((pipe_t*)c->fds[newfd].inode, c->fds[newfd].pipe_w);
+    // Take the new reference before dropping the old target, so dup2 of a pty
+    // fd over another fd of the same pty never transiently hits zero.
+    if(c->fds[oldfd].is_pipe) pipe_ref((pipe_t*)c->fds[oldfd].inode, c->fds[oldfd].pipe_w);
+    else pty_ref(c->fds[oldfd].inode);
+    struct proc_fd_entry old = c->fds[newfd];
     c->fds[newfd]=c->fds[oldfd]; c->fds[newfd].used=1;
-    if(c->fds[newfd].is_pipe) pipe_ref((pipe_t*)c->fds[newfd].inode, c->fds[newfd].pipe_w);
+    if(old.used && old.is_pipe) pipe_unref((pipe_t*)old.inode, old.pipe_w);   // close the old newfd target
+    else if(old.used) pty_unref(old.inode);
     return newfd;
 }
 int ksys_dup(int oldfd){
@@ -596,6 +636,7 @@ int ksys_dup(int oldfd){
     int n=fd_alloc(c); if(n<0) return -1;
     c->fds[n]=c->fds[oldfd]; c->fds[n].used=1;
     if(c->fds[n].is_pipe) pipe_ref((pipe_t*)c->fds[n].inode, c->fds[n].pipe_w);
+    else pty_ref(c->fds[n].inode);
     return n;
 }
 int ksys_chdir(const char* upath){
@@ -642,6 +683,17 @@ int ksys_fstat(int fd, struct secos_stat* st){
 int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
+    // FIONBIO (ioctl form of fcntl O_NONBLOCK) on a terminal fd.
+    #define FD_SET_NONBLOCK() do { int v_; \
+        if(copy_from_user(&v_,(void*)arg,sizeof(v_))!=0) return -EFAULT; \
+        if(v_) c->fds[fd].flags |= 0x800; else c->fds[fd].flags &= ~0x800u; return 0; } while(0)
+    // A pty end: everything (termios, winsize, job control, sessions, ptmx
+    // requests) goes to kernel/pty.c, against that pty's own line discipline.
+    if(c->fds[fd].used && !c->fds[fd].is_pipe && pty_is_inode(c->fds[fd].inode)){
+        if(cmd == TTY_FIONBIO) FD_SET_NONBLOCK();
+        int r = pty_ioctl(c, c->fds[fd].inode, cmd, arg);
+        return r == -515 ? -22 : r;             // unknown request: -EINVAL
+    }
     // The console TTY: fds 0/1/2 when not redirected, any dup of a console fd
     // (inode==NULL, not a pipe), and an open /dev/tty or /dev/console. bash
     // keeps its terminal fd as dup(2) moved to a high fd and does
@@ -653,10 +705,21 @@ int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
     switch(cmd){
     case TIOCGSID_: {
         if(!is_tty) return -25;                 // -ENOTTY
-        int sid = (int)c->pgid;
+        int sid = (int)c->sid;
         if(copy_to_user((void*)arg,&sid,sizeof(sid))!=0) return -EFAULT;
         return 0;
     }
+    // Sessions: the console is the controlling terminal of every session that
+    // has not detached from it (setsid/TIOCNOTTY) or acquired a pty.
+    case TTY_TIOCSCTTY:
+        if(!is_tty) return -25;
+        return pty_console_sctty(c);
+    case TTY_TIOCNOTTY:
+        if(!is_tty) return -25;
+        return pty_console_notty(c);
+    case TTY_FIONBIO:
+        if(!is_tty) return -25;
+        FD_SET_NONBLOCK();
     // Job control: the console's foreground process group is the kernel's
     // foreground_pgid (Ctrl-C/Ctrl-Z target, SIGTTIN check in tty_read). With
     // no foreground group set, the caller's own group is reported (so a shell
@@ -1013,6 +1076,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         extern long ksys_getpgid(int);
         return (uint64_t)(int64_t)ksys_getpgid((int)a0);
     }
+    // Sessions (pseudo-terminal support).
+    case SYS_SETSID:  return (uint64_t)(int64_t)ksys_setsid();
+    case SYS_GETSID:  return (uint64_t)(int64_t)ksys_getsid((int)a0);
+
     case SYS_FSTAT: {
         struct secos_stat kst;
         if(!user_range_valid((void*)a1, sizeof(kst))) return (uint64_t)(int64_t)-EFAULT;
