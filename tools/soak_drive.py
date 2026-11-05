@@ -6,7 +6,7 @@
 # a long, seeded, realistic session over the serial console: coreutils, loops,
 # background jobs, file I/O in /tmp (ramfs), /proc and /dev reads, and (when
 # available) the signed syscall fuzzer. Every logical step ends with a unique
-# sentinel `echo OK-<n>` that must appear in the output — a missing sentinel,
+# sentinel `echo OK-$((<n>))` whose expansion OK-<n> must appear in the output — a missing sentinel,
 # a CPU exception/panic/kill, a heap-corruption marker, or a stall all FAIL.
 #
 # Invoked by tools/soak.sh, which assembles the QEMU argv. Not meant to be run
@@ -136,7 +136,11 @@ def main():
     while i < n:
         cmd, expect = gen_command(r, st)
         sentinel = f"OK-{i}"
-        line = f"{cmd}; echo {sentinel}"
+        # The TTY echoes the typed line, so the sentinel must only appear once
+        # bash has *expanded* it: `echo OK-$((i))` echoes as "OK-$((i))" and
+        # prints "OK-i". (A literal `echo OK-i` matched its own echo, so the
+        # driver never waited for a command to finish and typed ahead.)
+        line = f"{cmd}; echo OK-$(({i}))"
         sent.append((i, line, expect))
         with lock: since = len(buf)
         try:
@@ -169,9 +173,11 @@ def main():
     # optional: run the signed syscall fuzzer at the end (safe mode, bounded)
     if o["fuzz"]:
         with lock: since=len(buf)
-        p.stdin.write(b"/bin/sysfuzz -s %d -b 10 -c 120 -S; echo FUZZDONE\r" % (o["seed"] & 0xffff))
+        p.stdin.write(b"/bin/sysfuzz -s %d -b 10 -c 120 -S; echo FUZZ\"\"DONE\r" % (o["seed"] & 0xffff))
         p.stdin.flush()
-        wait_for("FUZZDONE", 60, since=since)
+        if not wait_for("FUZZDONE", 120, since=since):
+            print("[soak] FAIL: syscall fuzzer did not finish")
+            bundle(o, sent, tail(), "fuzz-stall"); p.kill(); sys.exit(1)
         crash = check_crash()
         if crash:
             print(f"[soak] FAIL: fuzzer tripped kernel fault {crash!r}")
