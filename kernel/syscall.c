@@ -101,6 +101,14 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     // on a pty must see that pty as /dev/tty and its job-control terminal).
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0) { p->pgid = sp->pgid; pty_inherit_ctty(p, sp); } }
+    // A spawned program starts in its spawner's cwd and umask, as a fork+exec
+    // child would: without this `cd /tmp; tar cf a.tar f1` ran tar in "/".
+    { process_t* sp = sched_get_current();
+      if (sp && sp->pid != 0) p->ki.umask = sp->ki.umask;
+      if (sp && sp->pid != 0 && sp->cwd[0]) {
+          int i = 0; for (; sp->cwd[i] && i < (int)sizeof(p->cwd) - 1; i++) p->cwd[i] = sp->cwd[i];
+          p->cwd[i] = 0;
+      } }
     p->state = PROC_READY;
     return (int)p->pid;
 }
@@ -653,7 +661,7 @@ static void gd_cb(const vfs_inode_t* child, void* user){
 }
 int ksys_getdents(const char* path, void* ubuf, int buflen){
     extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*);
-    static char kbuf[16384];                 // up to 64 entries
+    static char kbuf[65536];                 // up to 256 entries (BusyBox fills /bin)
     struct gd_ctx g = { kbuf, sizeof(kbuf), 0 };
     // cwd-relative + normalized: bash's glob and readline's filename completion
     // open "." and "dir/" (trailing slash), which vfs_readdir does not accept.

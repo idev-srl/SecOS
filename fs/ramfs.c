@@ -24,10 +24,13 @@ static const char* path_after(const char* full,const char* parent){ // assume pa
 }
 
 static int ramfs_add_common(const char* name, const void* data, size_t size, unsigned flags){
-    if(ramfs_count >= RAMFS_MAX_FILES) return -1;
     if(!name || !*name || str_len(name) >= RAMFS_NAME_MAX) return -1;
     for(size_t i=0;i<ramfs_count;i++) if(str_eq(ramfs_table[i].name, name)) return -1; // dup
-    ramfs_entry_t* e = &ramfs_table[ramfs_count++];
+    // Reuse a slot freed by ramfs_remove() before growing the table.
+    ramfs_entry_t* e = NULL;
+    for(size_t i=0;i<ramfs_count;i++) if(!ramfs_table[i].name[0]){ e = &ramfs_table[i]; break; }
+    int appended = 0;
+    if(!e){ if(ramfs_count >= RAMFS_MAX_FILES) return -1; e = &ramfs_table[ramfs_count++]; appended = 1; }
     str_copy(e->name, name, RAMFS_NAME_MAX);
     e->flags = flags;
     if(size==0){ // avoid kmalloc(0) for directories or initial empty file
@@ -41,7 +44,7 @@ static int ramfs_add_common(const char* name, const void* data, size_t size, uns
     } else {
     // copy into heap (mutable file)
         e->data = (uint8_t*)kmalloc(size);
-        if(!e->data){ ramfs_count--; return -1; }
+        if(!e->data){ e->name[0] = 0; if(appended) ramfs_count--; return -1; }
         for(size_t i=0;i<size;i++) e->data[i] = ((const uint8_t*)data)[i];
         e->size = size;
     }
@@ -90,17 +93,23 @@ int ramfs_remove(const char* name){
             if(ramfs_table[i].flags & 1) return -1; // immutable entry not removable
             // free buffer
             if(ramfs_table[i].data) kfree(ramfs_table[i].data);
-            // shift remaining
-            for(size_t j=i+1;j<ramfs_count;j++) ramfs_table[j-1]=ramfs_table[j];
-            ramfs_count--;
+            // Leave a free slot instead of shifting the table: open VFS inodes keep
+            // a pointer to their entry (fs_data), and shifting re-pointed every open
+            // file behind the removed one at its neighbour (gzip's output landed in
+            // another file after it unlinked its input).
+            ramfs_table[i].name[0] = 0;
+            ramfs_table[i].data = NULL;
+            ramfs_table[i].size = 0;
+            ramfs_table[i].flags = 0;
+            if(i + 1 == ramfs_count) ramfs_count--;
             return 0;
         }
     }
     return -1; // not found
 }
 
-const ramfs_entry_t* ramfs_find(const char* name){ if(!name) return NULL; for(size_t i=0;i<ramfs_count;i++) if(str_eq(ramfs_table[i].name,name)) return &ramfs_table[i]; return NULL; }
-size_t ramfs_list(const ramfs_entry_t** out_array, size_t max){ size_t n = (ramfs_count < max)? ramfs_count : max; for(size_t i=0;i<n;i++) out_array[i]=&ramfs_table[i]; return n; }
+const ramfs_entry_t* ramfs_find(const char* name){ if(!name || !*name) return NULL; for(size_t i=0;i<ramfs_count;i++) if(str_eq(ramfs_table[i].name,name)) return &ramfs_table[i]; return NULL; }
+size_t ramfs_list(const ramfs_entry_t** out_array, size_t max){ size_t n=0; for(size_t i=0;i<ramfs_count && n<max;i++) if(ramfs_table[i].name[0]) out_array[n++]=&ramfs_table[i]; return n; }
 int ramfs_is_dir(const char* path){
     if(!path || path[0]==0 || (path[0]=='/' && path[1]==0)) return 1; // treat root as directory
     const ramfs_entry_t* e=ramfs_find(path); if(!e) return -1; return (e->flags & 2)?1:0;
@@ -111,6 +120,7 @@ size_t ramfs_list_path(const char* path, const ramfs_entry_t** out_array, size_t
     size_t count=0;
     for(size_t i=0;i<ramfs_count && count<max;i++){
         const char* name = ramfs_table[i].name;
+        if(!name[0]) continue;   // free slot
     if(root){ // must not contain '/'
             const char* slash = 0; for(size_t k=0; name[k]; k++){ if(name[k]=='/'){ slash=&name[k]; break; } }
             if(!slash){ out_array[count++]=&ramfs_table[i]; }

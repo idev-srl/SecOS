@@ -13,36 +13,33 @@
 static vfs_inode_t inode_cache[RAMFS_MAX_FILES+4];
 static size_t inode_cache_used = 0;
 
-static void inode_fill_path(vfs_inode_t* ino, const ramfs_entry_t* e){
-    size_t k=0; const char* src=e->name; if(!src[0]){ ino->path[0]='/'; ino->path[1]=0; return; }
-    ino->path[k++]='/'; for(size_t i=0; src[i] && k<sizeof(ino->path)-1; i++) ino->path[k++]=src[i]; ino->path[k]=0;
-}
 static int inode_is_dead(const vfs_inode_t* ino){ return ino->fs_data==NULL && !(ino->path[0]=='/' && ino->path[1]==0); }
 
-// The cache points into ramfs_table, which ramfs_remove() compacts: after a
-// removal the gone entry's inode is marked dead (reads fail, slot reusable) and
-// every inode of a later entry is moved down one slot with it, so open fds and
-// cached lookups keep naming the same file.
+// Removal leaves a free ramfs slot that a later creation reuses (ramfs.c), so
+// an inode must not stay bound to its entry once the file is gone: an fd still
+// open on a removed file would otherwise read and write whatever file takes the
+// slot next. The gone entry's inode is marked dead (fs_data=NULL: reads/writes
+// fail); a fresh lookup of the reused slot gets its own inode.
 static void cache_fix_after_remove(const ramfs_entry_t* gone){
     for(size_t i=0;i<inode_cache_used;i++){
-        const ramfs_entry_t* e=(const ramfs_entry_t*)inode_cache[i].fs_data;
-        if(!e) continue;
-        if(e==gone){ inode_cache[i].fs_data=NULL; inode_cache[i].path[0]='?'; inode_cache[i].path[1]=0; }
-        else if(e>gone) inode_cache[i].fs_data=(void*)(e-1);
+        if(inode_cache[i].fs_data==(const void*)gone){
+            inode_cache[i].fs_data=NULL; inode_cache[i].path[0]='?'; inode_cache[i].path[1]=0;
+        }
     }
 }
 
 static vfs_inode_t* inode_from_entry(const ramfs_entry_t* e){ if(!e) return NULL; // search cache
     // [M38] refresh the cached size on every lookup (a prior write may have grown
-    // the entry) so e.g. `>>` append seeks to the real end of file; the path too
-    // (a rename changes the entry's name in place).
-    for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e){ inode_cache[i].size = e->size; inode_fill_path(&inode_cache[i], e); return &inode_cache[i]; } }
+    // the entry) so e.g. `>>` append seeks to the real end of file; path and type
+    // too (a rename changes the entry's name in place).
     vfs_inode_t* ino = NULL;
-    for(size_t i=0;i<inode_cache_used;i++) if(inode_is_dead(&inode_cache[i])){ ino=&inode_cache[i]; break; }
-    if(!ino){
-        if(inode_cache_used >= sizeof(inode_cache)/sizeof(inode_cache[0])) return NULL;
+    for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e){ ino = &inode_cache[i]; break; } }
+    if(!ino && inode_cache_used < sizeof(inode_cache)/sizeof(inode_cache[0]))
         ino = &inode_cache[inode_cache_used++];
-    }
+    // Cache full: recycle a dead inode. Fresh slots go first so a dead inode an
+    // fd may still hold is recycled as late as possible.
+    if(!ino) for(size_t i=0;i<inode_cache_used;i++) if(inode_is_dead(&inode_cache[i])){ ino=&inode_cache[i]; break; }
+    if(!ino) return NULL;
     // Path already absolute in ramfs_entry_t.name (without leading '/')
     // Build canonical path with leading '/' (root = "/")
     size_t k=0; const char* src=e->name; if(!src[0]){ ino->path[0]='/'; ino->path[1]=0; } else {

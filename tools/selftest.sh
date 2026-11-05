@@ -1196,6 +1196,61 @@ grep -q "^FZPTY-42" "$PTYLOG"; check "pty: fuzzing pty ends + setsid/getsid leav
 ! grep -q "\[EXC\].*ring0" "$PTYLOG"; check "no ring-0 CPU exception during the pty tests" $?
 
 # ============================================================================
+# ---- BusyBox 1.36.1 userland (built from source, signed, applet stubs) ----
+# ============================================================================
+# /bin/busybox + one signed stub per applet are installed at boot; bash runs
+# them like any program. One representative command per applet family; each
+# BBn marker only appears once expanded (the TTY echo shows the raw text). vi
+# and less are driven in command mode only: the console TTY is cooked and drops
+# control bytes (ESC), see docs/BUSYBOX_PORT.md.
+BBLOG=/tmp/secos_selftest_busybox.log
+echo "[selftest] Running BusyBox userland (mb2, serial input, 150s)..."
+: > "$BBLOG"
+( sleep 25
+  printf '  echo BB1-$(echo hello world | busybox sed s/world/secos/)\r'; sleep 4
+  printf "  echo BB2-\$(printf 'b\\\\na\\\\nc\\\\n' | sort | head -1)\r"; sleep 4
+  printf "  echo BB3-\$(seq 1 10 | awk '{s+=\$1} END{print s}')\r"; sleep 4
+  printf "  echo BB4-\$(find /bin -name 'b*' | wc -l)\r"; sleep 5
+  printf "  echo BB5-\$(printf 'x\\\\ny\\\\nx\\\\n' | grep -c x)\r"; sleep 4
+  printf '  cd /tmp && echo tarok > t1 && tar cf t.tar t1 && gzip t.tar && rm t1 && gunzip t.tar.gz && tar xf t.tar && echo BB6-$(cat t1)\r'; sleep 10
+  printf '  echo BB7-$(echo -n abc | sha256sum | cut -c1-16)\r'; sleep 4
+  printf '  echo H4sIAAAAAAAAA3MqLa50yq9QSE8sSVUoSKzMyU9M4QIAm1kjZBUAAAA= | base64 -d | zcat | sed s/^/BB8-/\r'; sleep 5
+  printf '  echo BB9-$(echo bzok | bzip2 | bzcat)\r'; sleep 5
+  printf '  echo hello > /tmp/v.txt; vi /tmp/v.txt\r'; sleep 4
+  printf ':s/hello/edited by vi/\r'; sleep 2
+  printf ':wq\r'; sleep 3
+  printf '  echo BB10-$(cat /tmp/v.txt)\r'; sleep 4
+  printf '  seq 1 100 > /tmp/s; less /tmp/s\r'; sleep 4
+  printf 'q\r'; sleep 3
+  printf '  echo BB11-$?\r'; sleep 3
+  printf '  echo BB12-$(busybox --list | wc -l)-$(uname)\r'; sleep 4
+  printf '  mkdir -p /tmp/d/e && touch /tmp/d/e/x && echo BB13-$(ls /tmp/d/e) && rm -r /tmp/d && test ! -e /tmp/d && echo BB14-gone\r'; sleep 8
+  printf '  timeout 2 sleep 9; echo BB15-$?\r'; sleep 6
+  printf '  echo BB16-$(cp -r /etc /tmp/e2 2>&1 | wc -l)-$(ls /tmp/e2 | wc -l)\r'; sleep 6
+  printf '  echo BB-$((6*7))-END\r'; sleep 3 ) | \
+    timeout 150 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$BBLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "\[BB\] installed BusyBox to /bin/busybox" "$BBLOG"; check "BusyBox installed to /bin/busybox with its applet stubs" $?
+grep -q "BB1-hello secos" "$BBLOG"; check "busybox sed s/world/secos/" $?
+grep -q "BB2-a$" "$BBLOG"; check "sort | head -1 (BusyBox sort/head)" $?
+grep -q "BB3-55" "$BBLOG"; check "awk sums seq 1 10 -> 55" $?
+grep -Eq "BB4-[5-9]$" "$BBLOG"; check "find /bin -name 'b*' | wc -l" $?
+grep -q "BB5-2$" "$BBLOG"; check "grep -c" $?
+grep -q "BB6-tarok" "$BBLOG"; check "tar + gzip round trip in /tmp (cwd-relative, unlink while open)" $?
+grep -q "BB7-ba7816bf8f01cfea" "$BBLOG"; check "sha256sum of 'abc' matches the host value" $?
+grep -q "BB8-BusyBox gate payload" "$BBLOG"; check "base64 -d | zcat of a host-made gzip stream" $?
+grep -q "BB9-bzok" "$BBLOG"; check "bzip2 | bzcat round trip" $?
+grep -q "BB10-edited by vi" "$BBLOG"; check "vi starts, edits (ex :s), writes and quits (:wq)" $?
+grep -q "BB11-0" "$BBLOG"; check "less starts and quits with q" $?
+grep -Eq "BB12-1[0-9][0-9]-SecOS" "$BBLOG"; check "busybox --list + uname reports SecOS" $?
+grep -q "BB13-x" "$BBLOG" && grep -q "BB14-gone" "$BBLOG"; check "mkdir -p / touch / ls / rm -r" $?
+grep -q "BB15-143" "$BBLOG"; check "timeout 2 sleep 9 -> 143 (SIGTERM forwarded through the stubs)" $?
+grep -q "BB16-0-2" "$BBLOG"; check "cp -r /etc on the ramfs root: no 'can't preserve' warnings" $?
+grep -q "BB-42-END" "$BBLOG"; check "bash responsive after the BusyBox sequence" $?
+! grep -q "\[EXC\]" "$BBLOG"; check "no CPU exception ([EXC]) during the BusyBox run" $?
+
+# ============================================================================
 # ---- Orderly poweroff / reboot from bash (SYS_REBOOT) ----
 # ============================================================================
 # (a) poweroff: write a file to an ext4 data disk, start a background job,
