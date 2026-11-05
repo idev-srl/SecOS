@@ -673,6 +673,81 @@ int get_nprocs(void){
     return n ? n : 1;
 }
 int get_nprocs_conf(void){ return get_nprocs(); }
+int getloadavg(double* la, int n){
+    struct sysinfo si;
+    if(n < 0 || sysinfo(&si) != 0) return -1;
+    for(int i = 0; i < n && i < 3; i++) la[i] = (double)si.loads[i] / (double)(1UL << SI_LOAD_SHIFT);
+    return n < 3 ? n : 3;
+}
+
+#include <unistd.h>
+/* sysconf / pathconf. CPUs and memory come from the kernel (/proc/stat,
+ * SYS_SYSINFO); the rest are SecOS's fixed limits. */
+long sysconf(int name){
+    struct sysinfo si;
+    switch(name){
+    case _SC_ARG_MAX:         return 128 * 1024;          /* SYS_EXECVE argv+envp */
+    case _SC_CHILD_MAX:       return 32;                  /* process table */
+    case _SC_CLK_TCK:         return 100;                 /* /proc/<pid>/stat ticks */
+    case _SC_NGROUPS_MAX:     return 32;
+    case _SC_OPEN_MAX:        return 32;                  /* per-process fd table */
+    case _SC_PAGESIZE:        return 4096;
+    case _SC_LINE_MAX:        return 2048;
+    case _SC_LOGIN_NAME_MAX:  return 256;
+    case _SC_TTY_NAME_MAX:    return 32;
+    case _SC_SYMLOOP_MAX:     return 40;                  /* kernel path walk */
+    case _SC_HOST_NAME_MAX:   return 64;
+    case _SC_NPROCESSORS_CONF: case _SC_NPROCESSORS_ONLN: return get_nprocs();
+    case _SC_PHYS_PAGES:      return sysinfo(&si) == 0 ? (long)(si.totalram * si.mem_unit / 4096) : -1;
+    case _SC_AVPHYS_PAGES:    return sysinfo(&si) == 0 ? (long)(si.freeram * si.mem_unit / 4096) : -1;
+    default: errno = EINVAL; return -1;
+    }
+}
+long pathconf(const char* path, int name){
+    (void)path;
+    switch(name){
+    case _PC_LINK_MAX: return 65000;
+    case _PC_NAME_MAX: return 255;
+    case _PC_PATH_MAX: return 4096;
+    case _PC_PIPE_BUF: return 4096;                       /* kernel/pipe.c ring */
+    case _PC_VDISABLE: return 0;
+    default: errno = EINVAL; return -1;
+    }
+}
+long fpathconf(int fd, int name){ (void)fd; return pathconf("/", name); }
+
+/* strsignal: the glibc descriptions (bash prints them for jobs: "Stopped
+ * (signal)", "Terminated", ...), "Signal N" past the known set. */
+static const char* const g_sigdesc[32] = {
+    "Signal 0", "Hangup", "Interrupt", "Quit", "Illegal instruction", "Trace/breakpoint trap",
+    "Aborted", "Bus error", "Floating point exception", "Killed", "User defined signal 1",
+    "Segmentation fault", "User defined signal 2", "Broken pipe", "Alarm clock", "Terminated",
+    "Stack fault", "Child exited", "Continued", "Stopped (signal)", "Stopped", "Stopped (tty input)",
+    "Stopped (tty output)", "Urgent I/O condition", "CPU time limit exceeded", "File size limit exceeded",
+    "Virtual timer expired", "Profiling timer expired", "Window changed", "I/O possible",
+    "Power failure", "Bad system call" };
+char* strsignal(int sig){
+    static char buf[24];
+    if(sig >= 0 && sig < 32) return (char*)g_sigdesc[sig];
+    snprintf(buf, sizeof(buf), "Signal %d", sig);
+    return buf;
+}
+
+/* system(): /bin/bash -c cmd in a fork+execve child (bash is the POSIX shell).
+ * Returns the wait status; SIGINT/SIGQUIT are not blocked (no sigaction mask). */
+int system(const char* cmd){
+    if(!cmd) return 1;                                    /* a shell is available */
+    int pid = fork();
+    if(pid < 0) return -1;
+    if(pid == 0){
+        char* argv[] = { (char*)"bash", (char*)"-c", (char*)cmd, 0 };
+        execve("/bin/bash", argv, environ);
+        _exit(127);
+    }
+    int st;
+    while((st = waitpid(pid)) == -4){ }                   /* retry on EINTR */
+    return st < 0 ? -1 : st;                              /* POSIX wait status */
+}
 
 /* ============================== <assert.h> ============================= */
 void __assert_fail(const char* expr, const char* file, int line){
@@ -791,7 +866,16 @@ static int fmt_core(sink_t* s, const char* fmt, va_list ap){
         int prec=-1; if(*fmt=='.'){ fmt++; prec=0; if(*fmt=='*'){ prec=va_arg(ap,int); fmt++; }
                                     else while(isdigit(*fmt)){ prec=prec*10+(*fmt-'0'); fmt++; } }
         /* length */
-        int lng=0; while(*fmt=='l'){ lng++; fmt++; } if(*fmt=='z'){ lng=2; fmt++; } else if(*fmt=='h'){ fmt++; }
+        /* hh/h narrow the converted value; l/ll/z/j/t/q are 64-bit; L is long
+         * double for the floating conversions (bash's printf uses %Lf). */
+        int lng=0, half=0, ldbl=0;
+        for(;;){
+            if(*fmt=='l'){ lng++; fmt++; }
+            else if(*fmt=='z'||*fmt=='j'||*fmt=='t'||*fmt=='q'){ lng=2; fmt++; }
+            else if(*fmt=='h'){ half++; fmt++; }
+            else if(*fmt=='L'){ ldbl=1; lng=2; fmt++; }
+            else break;
+        }
 
         char conv=*fmt;
         const char* str=0; char tmp[2]; int neg=0; unsigned long uv=0; int base=10; int upper=0; const char* prefix=0;
@@ -801,16 +885,21 @@ static int fmt_core(sink_t* s, const char* fmt, va_list ap){
             case '%': tmp[0]='%'; tmp[1]=0; str=tmp; break;
             case 'd': case 'i': {
                 long v = lng? va_arg(ap,long) : (long)va_arg(ap,int);
+                if(!lng && half==1) v=(short)v; else if(!lng && half>=2) v=(signed char)v;
                 if(v<0){ neg=1; uv=(unsigned long)(-v); } else uv=(unsigned long)v;
                 goto numconv;
             }
-            case 'u': uv = lng? va_arg(ap,unsigned long) : (unsigned long)va_arg(ap,unsigned); goto numconv;
-            case 'o': base=8; uv = lng? va_arg(ap,unsigned long):(unsigned long)va_arg(ap,unsigned); if(alt)prefix="0"; goto numconv;
-            case 'x': base=16; uv = lng? va_arg(ap,unsigned long):(unsigned long)va_arg(ap,unsigned); if(alt&&uv)prefix="0x"; goto numconv;
-            case 'X': base=16; upper=1; uv = lng? va_arg(ap,unsigned long):(unsigned long)va_arg(ap,unsigned); if(alt&&uv)prefix="0X"; goto numconv;
+#define FMT_UARG() (lng? va_arg(ap,unsigned long) : half==1 ? (unsigned long)(unsigned short)va_arg(ap,unsigned) \
+                   : half>=2 ? (unsigned long)(unsigned char)va_arg(ap,unsigned) : (unsigned long)va_arg(ap,unsigned))
+            case 'u': uv = FMT_UARG(); goto numconv;
+            case 'o': base=8; uv = FMT_UARG(); if(alt)prefix="0"; goto numconv;
+            case 'x': base=16; uv = FMT_UARG(); if(alt&&uv)prefix="0x"; goto numconv;
+            case 'X': base=16; upper=1; uv = FMT_UARG(); if(alt&&uv)prefix="0X"; goto numconv;
+#undef FMT_UARG
             case 'p': base=16; uv=(unsigned long)va_arg(ap,void*); prefix="0x"; goto numconv;
             case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
-                emit_double(s, va_arg(ap,double), (conv=='a'||conv=='A')?'g':conv, prec, width, left, zero, plus, space, alt);
+                emit_double(s, ldbl ? (double)va_arg(ap,long double) : va_arg(ap,double),
+                            (conv=='a'||conv=='A')?'g':conv, prec, width, left, zero, plus, space, alt);
                 continue;
             default: emitc(s,'%'); if(conv) emitc(s,conv); continue;
             numconv: {

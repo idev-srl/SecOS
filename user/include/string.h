@@ -29,5 +29,6 @@ char*  strpbrk(const char* s, const char* accept);
 size_t strspn(const char* s, const char* accept);
 size_t strcspn(const char* s, const char* reject);
 char*  strerror(int errnum);
+char*  strsignal(int sig);
 
 #endif

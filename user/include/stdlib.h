@@ -38,6 +38,8 @@ extern char** environ;
 
 void   exit(int code) __attribute__((noreturn));
 void   abort(void) __attribute__((noreturn));
+int    system(const char* cmd);                 /* /bin/bash -c cmd; wait status */
+int    getloadavg(double* loadavg, int nelem);
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
