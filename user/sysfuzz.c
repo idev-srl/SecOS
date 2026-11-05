@@ -93,8 +93,10 @@
 #define SYS_GETPGID 57
 #define SYS_SIGSUSPEND 58
 #define SYS_REBOOT 59
+#define SYS_EXECVE 60
+#define SYS_FCNTL 61
 
-#define NSYS_KNOWN 60
+#define NSYS_KNOWN 62
 
 typedef unsigned long u64;
 
@@ -218,7 +220,23 @@ static void one_call(void){
     case SYS_DUP: a0=intpool(); break;
     case SYS_DUP2: a0=intpool(); a1=10+(long)rn(16); if(a1==g_ffd) a1=26; break;
     case SYS_IOCTL: a0=intpool(); a1=(long)intpool(); a2=(long)strptr(); break;
-    case SYS_PIPE: a0=(long)strptr(); break;
+    case SYS_PIPE: a0=(long)strptr(); a1=rn(3)==0 ? 0x80000 : (long)rn(2); break;
+    case SYS_EXECVE: {
+        /* Bad/odd path, argv and envp pointers. No pool path is an ELF (the
+         * fixtures are empty files / dirs), so a call can only fail: -ENOENT,
+         * -EACCES, -ENOEXEC, -EFAULT, -E2BIG. A vector of fuzzed string pointers
+         * exercises the per-string copy-in. */
+        static u64 vec[2][5];
+        for(int v=0; v<2; v++){ for(int k=0;k<4;k++) vec[v][k]=ptrpool(); vec[v][rn(5)]=0; vec[v][4]=0; }
+        a0=(long)pathpool();
+        a1=rn(2) ? (long)vec[0] : (long)ptrpool();
+        a2=rn(2) ? (long)vec[1] : (long)ptrpool();
+        break; }
+    case SYS_FCNTL:
+        a0=rn(2) ? (long)g_ffd : intpool();
+        a1=(long)rn(6); if(rn(4)==0) a1=1030 /*F_DUPFD_CLOEXEC*/;
+        a2=intpool();
+        break;
     case SYS_SIGACTION: a0=(long)rn(34); a1=(long)strptr(); a2=(long)strptr(); break;
     case SYS_SIGPROCMASK: a0=intpool(); a1=(long)strptr(); a2=(long)strptr(); break;
     case SYS_KILL: a0=(long)getpid(); a1=0; break;
@@ -291,6 +309,7 @@ static void init_names(void){
     g_names[48]="setpgid";g_names[49]="dup2";g_names[50]="dup";g_names[51]="chdir";
     g_names[52]="getcwd";g_names[53]="ioctl";g_names[54]="getppid";g_names[55]="waitany";
     g_names[56]="fstat";g_names[57]="getpgid";g_names[58]="sigsuspend";g_names[59]="reboot";
+    g_names[60]="execve";g_names[61]="fcntl";
     g_names_ready=1;
 }
 static const char* sysname(long n){ if(!g_names_ready) init_names(); if(n>=0&&n<NSYS_KNOWN) return g_names[n]; return "oor"; }
