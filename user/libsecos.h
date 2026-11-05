@@ -100,6 +100,12 @@ int     kill(int pid, int sig);
 int     raise(int sig);
 int     sigprocmask(int how, const unsigned long* set, unsigned long* oldset);
 int     setpgid(int pid, int pgid);
+int     getpgid(int pid);                                /* 0 = caller */
+int     getpgrp(void);
+int     killpg(int pgrp, int sig);                       /* == kill(-pgrp, sig) */
+int     setsid(void);                                    /* no sessions: become a group leader */
+int     getsid(int pid);
+int     sigsuspend(const unsigned long* mask);           /* always -1/EINTR */
 
 /* [M25] anonymous pipe: fds[0]=read end, fds[1]=write end. 0 on success, -1 on error. */
 int     pipe(int fds[2]);

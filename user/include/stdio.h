@@ -57,5 +57,7 @@ int   ferror(FILE* f);
 long  ftell(FILE* f);
 int   fseek(FILE* f, long off, int whence);
 void  perror(const char* s);
+int   remove(const char* path);
+int   rename(const char* from, const char* to);   /* copy + unlink (not atomic) */
 
 #endif

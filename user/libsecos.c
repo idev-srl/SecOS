@@ -90,12 +90,31 @@ sighandler_t signal(int sig, sighandler_t handler){
     long r = secos_syscall(SYS_SIGACTION, sig, (long)handler, (long)__sigreturn, 0, 0);
     return (r == 0) ? handler : (sighandler_t)(long)-1; /* SIG_ERR */
 }
-int kill(int pid, int sig){ return (int)secos_syscall(SYS_KILL, pid, sig, 0, 0, 0); }
+int kill(int pid, int sig){ return (int)__se(secos_syscall(SYS_KILL, pid, sig, 0, 0, 0)); }
 int raise(int sig){ return (int)secos_syscall(SYS_KILL, getpid(), sig, 0, 0, 0); }
 int sigprocmask(int how, const unsigned long* set, unsigned long* oldset){
     return (int)secos_syscall(SYS_SIGPROCMASK, how, set ? (long)*set : 0, (long)oldset, 0, 0);
 }
-int setpgid(int pid, int pgid){ return (int)secos_syscall(SYS_SETPGID, pid, pgid, 0, 0, 0); }
+int setpgid(int pid, int pgid){ return (int)__se(secos_syscall(SYS_SETPGID, pid, pgid, 0, 0, 0)); }
+/* Job control: process-group queries (SYS_GETPGID 57) and group signalling.
+ * There are no sessions on SecOS (one console): setsid() just makes the caller
+ * a process-group leader and getsid() reports the group. */
+int getpgid(int pid){ return (int)__se(secos_syscall(57 /*SYS_GETPGID*/, pid, 0, 0, 0, 0)); }
+int getpgrp(void){ return getpgid(0); }
+int killpg(int pgrp, int sig){
+    if(pgrp <= 1){ errno = EINVAL; return -1; }
+    return kill(-pgrp, sig);
+}
+int setsid(void){ if(setpgid(0, 0) < 0) return -1; return getpid(); }
+int getsid(int pid){ return getpgid(pid); }
+/* sigsuspend (SYS_SIGSUSPEND 58): atomically install 'mask' and block until a
+ * signal is delivered; the previous mask is restored after the handler ran.
+ * Always returns -1/EINTR, as POSIX requires. */
+int sigsuspend(const unsigned long* mask){
+    long r = secos_syscall(58 /*SYS_SIGSUSPEND*/, mask ? (long)*mask : 0, 0, 0, 0, 0);
+    if(r >= 0) r = -EINTR;
+    return (int)__se(r);
+}
 
 size_t strlen(const char* s) { size_t n = 0; while (s[n]) n++; return n; }
 int puts(const char* s) { write(1, s, strlen(s)); write(1, "\n", 1); return 0; }
@@ -160,6 +179,22 @@ int  creat_file(const char* path){ return (int)secos_syscall(41 /*SYS_CREATE*/, 
 int  mkdir(const char* path, unsigned mode){ (void)mode; return (int)secos_syscall(42 /*SYS_MKDIR*/, (long)path, 0, 0, 0, 0); }
 int  unlink(const char* path){ return (int)secos_syscall(43 /*SYS_UNLINK*/, (long)path, 0, 0, 0, 0); }
 int  rmdir(const char* path){ return unlink(path); }
+/* <stdio.h> remove/rename. There is no rename syscall yet, so rename() of a
+ * regular file is copy + unlink (not atomic); used by bash's history file and
+ * lua's os.rename. */
+int  remove(const char* path){ return unlink(path) == 0 ? 0 : -1; }
+int  rename(const char* from, const char* to){
+    int in = open(from, O_RDONLY);
+    if(in < 0){ errno = ENOENT; return -1; }
+    int out = open(to, O_WRONLY | 0x40 | 0x200 /*O_CREAT|O_TRUNC*/);
+    if(out < 0){ close(in); errno = EACCES; return -1; }
+    char b[512]; long r; int ok = 1;
+    while((r = read(in, b, sizeof(b))) > 0)
+        if(write(out, b, (size_t)r) != r){ ok = 0; break; }
+    close(in); close(out);
+    if(!ok || r < 0){ errno = EIO; return -1; }
+    return unlink(from) == 0 ? 0 : -1;
+}
 
 /* [M39] POSIX shell-from-source foundation: fd duplication, cwd, terminal ioctl,
  * exec. These bring the libc surface close to what a real shell (bash/dash) and

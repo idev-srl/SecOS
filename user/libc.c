@@ -77,6 +77,15 @@ char* strerror(int e){
     switch(e){
         case 0: return "Success";
         case ENOENT: return "No such file or directory";
+        case EPERM:  return "Operation not permitted";
+        case ESRCH:  return "No such process";
+        case EINTR:  return "Interrupted system call";
+        case EIO:    return "Input/output error";
+        case ECHILD: return "No child processes";
+        case EAGAIN: return "Resource temporarily unavailable";
+        case ENOTTY: return "Inappropriate ioctl for device";
+        case ENOTDIR:return "Not a directory";
+        case EISDIR: return "Is a directory";
         case EBADF:  return "Bad file descriptor";
         case ENOMEM: return "Out of memory";
         case EACCES: return "Permission denied";
