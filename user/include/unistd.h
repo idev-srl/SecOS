@@ -13,6 +13,8 @@
 unsigned int sleep(unsigned int seconds);   /* whole-second sleep (via SYS_SLEEP) */
 int   usleep(unsigned long usec);
 int   isatty(int fd);
+char* ttyname(int fd);                      /* "/dev/pts/N", "/dev/console" or NULL */
+int   ttyname_r(int fd, char* buf, size_t len);
 
 /* [M39] single-user identity (signature is the trust boundary; everyone is root) */
 int   getuid(void);

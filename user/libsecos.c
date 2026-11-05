@@ -97,8 +97,10 @@ int sigprocmask(int how, const unsigned long* set, unsigned long* oldset){
 }
 int setpgid(int pid, int pgid){ return (int)__se(secos_syscall(SYS_SETPGID, pid, pgid, 0, 0, 0)); }
 /* Job control: process-group queries (SYS_GETPGID 57) and group signalling.
- * There are no sessions on SecOS (one console): setsid() just makes the caller
- * a process-group leader and getsid() reports the group. */
+ * Sessions (SYS_SETSID 85 / SYS_GETSID 86): setsid() starts a new session with
+ * no controlling terminal (EPERM for a process-group leader, as POSIX says);
+ * the first pty slave its leader opens without O_NOCTTY, or TIOCSCTTY,
+ * becomes its controlling terminal. */
 int getpgid(int pid){ return (int)__se(secos_syscall(57 /*SYS_GETPGID*/, pid, 0, 0, 0, 0)); }
 int getpgrp(void){ return getpgid(0); }
 /* Orderly shutdown (SYS_REBOOT 59): terminate all processes, sync + unmount
@@ -108,8 +110,8 @@ int killpg(int pgrp, int sig){
     if(pgrp <= 1){ errno = EINVAL; return -1; }
     return kill(-pgrp, sig);
 }
-int setsid(void){ if(setpgid(0, 0) < 0) return -1; return getpid(); }
-int getsid(int pid){ return getpgid(pid); }
+int setsid(void){ return (int)__se(secos_syscall(85 /*SYS_SETSID*/, 0, 0, 0, 0, 0)); }
+int getsid(int pid){ return (int)__se(secos_syscall(86 /*SYS_GETSID*/, pid, 0, 0, 0, 0)); }
 /* sigsuspend (SYS_SIGSUSPEND 58): atomically install 'mask' and block until a
  * signal is delivered; the previous mask is restored after the handler ran.
  * Always returns -1/EINTR, as POSIX requires. */

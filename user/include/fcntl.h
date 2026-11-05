@@ -8,6 +8,7 @@
 #define O_TRUNC  0x200
 #define O_APPEND 0x400
 #endif
+#define O_NOCTTY   0x100
 #define O_NONBLOCK 0x800
 #define O_CLOEXEC  0x80000
 

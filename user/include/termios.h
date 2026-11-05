@@ -157,6 +157,10 @@ struct termios {
 #define TIOCINQ    FIONREAD
 #define TIOCNOTTY  0x5422
 #define TIOCGSID   0x5429
+#define FIONBIO    0x5421
+#define TIOCGPTN   0x80045430   /* pty master: slave number (unsigned int *) */
+#define TIOCSPTLCK 0x40045431   /* pty master: lock (!=0) / unlock (0) the slave (int *) */
+#define TIOCGPTLCK 0x80045439   /* pty master: lock state (int *) */
 
 struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };
 

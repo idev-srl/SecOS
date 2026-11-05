@@ -42,4 +42,11 @@ void   abort(void) __attribute__((noreturn));
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 
+/* Pseudo-terminals (Unix 98): open /dev/ptmx, unlock the slave, name it. */
+int    posix_openpt(int flags);
+int    grantpt(int fd);
+int    unlockpt(int fd);
+char*  ptsname(int fd);
+int    ptsname_r(int fd, char* buf, size_t len);
+
 #endif

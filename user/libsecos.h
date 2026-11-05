@@ -114,7 +114,7 @@ int     setpgid(int pid, int pgid);
 int     getpgid(int pid);                                /* 0 = caller */
 int     getpgrp(void);
 int     killpg(int pgrp, int sig);                       /* == kill(-pgrp, sig) */
-int     setsid(void);                                    /* no sessions: become a group leader */
+int     setsid(void);                                    /* new session, no controlling tty */
 int     getsid(int pid);
 int     sigsuspend(const unsigned long* mask);           /* always -1/EINTR */
 #define SECOS_REBOOT_POWEROFF 1                          /* secos_reboot() commands */
