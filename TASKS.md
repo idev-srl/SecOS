@@ -23,7 +23,7 @@ resumed only when hardware testing restarts.
 2. **bash / shell usability:** done on `integ/phase2` (real `execve`, raw termios +
    readline, ptys + sessions, `poll`/`select`, per-pid `/proc`, mid-path symlinks,
    BusyBox userland, Dropbear SSH with pty sessions).
-3. **Kernel robustness:** buddy heap, `MAP_SHARED`, PID-1 init in boot, package
+3. **Kernel robustness:** buddy heap, `MAP_SHARED`, ~~PID-1 init in boot~~ (done, M40), package
    keyring + revocation.
 4. **More source ports:** sqlite, dash.
 5. **Security depth:** SMAP by default, kernel KASLR.
@@ -118,7 +118,11 @@ robustness and the paused real-hardware bring-up — see below.
 - [ ] **Buddy / free-list heap** — `mm/heap.c` is still a single-lock first-fit list.
 - [ ] **`MAP_SHARED` + shared read-only text** — retire the M14 per-process pinned ELF
       image via the M20 page cache (cross-core use needs TLB shootdown).
-- [ ] **PID-1 init wired into boot** — `/bin/init` is run on demand today (boot launches bash).
+- [x] **PID-1 init wired into boot** (M40, `docs/devlog/M40-init.md`): `/bin/init` is PID 1,
+      reads `/etc/inittab`, takes a DHCP lease via `SYS_NETCTL` (95), supervises Dropbear,
+      respawns the console bash, reaps orphans, orderly poweroff; keys baked with
+      `make iso SSH_AUTHORIZED_KEYS=...`. Follow-ups: DHCP lease renewal, service
+      dependencies beyond file order, per-service caps/limits.
 - [ ] **Package keyring + revocation** — `kernel/pkg.c` verifies against the single
       `secos_trusted_pubkey`; the M35 key-revocation list (`mm/elf_sign.c`) covers ELFs only.
 - [ ] Dependency ordering for packages/services.
