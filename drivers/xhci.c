@@ -181,15 +181,53 @@ static int evt_poll(xhci_trb_t* out) {
     return 1;
 }
 
-// Wait for an event of a given TRB type (port-change events are consumed).
+// [M40] Completions of non-blocking interrupt transfers (xhci_submit, several
+// HID devices armed at once) can surface while another wait drains the single
+// event ring. They are parked here, keyed by (slot, DCI), instead of being
+// dropped or mistaken for the waiter's own completion.
+#define XHCI_STASH 16
+static xhci_trb_t g_stash[XHCI_STASH];
+static uint8_t    g_stash_used[XHCI_STASH];
+static uint32_t   g_async[256];            // per slot: DCIs with an xhci_submit outstanding
+
+static inline int ev_slot(const xhci_trb_t* e) { return (int)((e->d[3] >> 24) & 0xFF); }
+static inline int ev_dci(const xhci_trb_t* e)  { return (int)((e->d[3] >> 16) & 0x1F); }
+static inline uint32_t ev_type(const xhci_trb_t* e) { return (e->d[3] >> 10) & 0x3F; }
+
+static void stash_put(const xhci_trb_t* e) {
+    for (int i = 0; i < XHCI_STASH; i++) {
+        if (!g_stash_used[i]) { g_stash[i] = *e; g_stash_used[i] = 1; return; }
+    }
+}
+static int stash_take(int slot, int dci, xhci_trb_t* out) {
+    for (int i = 0; i < XHCI_STASH; i++) {
+        if (g_stash_used[i] && ev_slot(&g_stash[i]) == slot && ev_dci(&g_stash[i]) == dci) {
+            *out = g_stash[i]; g_stash_used[i] = 0; return 1;
+        }
+    }
+    return 0;
+}
+// A transfer event that is not what the current waiter wants: keep it if an
+// asynchronous submit is waiting for it, else drop it (stray / port events).
+static void evt_park(const xhci_trb_t* e) {
+    if (ev_type(e) != TRB_XFER_EVENT) return;
+    int slot = ev_slot(e), dci = ev_dci(e);
+    if ((g_async[slot] >> dci) & 1u) stash_put(e);
+}
+
+// Wait for an event of a given TRB type; for a transfer event, the one of
+// endpoint (slot, dci). Other events are parked (evt_park) or consumed.
 // Returns 1 on match (event in *out), 0 on timeout.
-static int evt_wait(uint32_t want_type, xhci_trb_t* out) {
+static int evt_wait(uint32_t want_type, int slot, int dci, xhci_trb_t* out) {
     for (volatile uint64_t i = 0; i < 20000000ull; i++) {
         xhci_trb_t ev;
         if (evt_poll(&ev)) {
-            uint32_t type = (ev.d[3] >> 10) & 0x3F;
-            if (type == want_type) { *out = ev; return 1; }
-            // else: port status change or stray event — keep draining.
+            uint32_t type = ev_type(&ev);
+            if (type == want_type &&
+                (want_type != TRB_XFER_EVENT || (ev_slot(&ev) == slot && ev_dci(&ev) == dci))) {
+                *out = ev; return 1;
+            }
+            evt_park(&ev);   // someone else's completion, port status change, stray
             i = 0;
         }
     }
@@ -202,7 +240,7 @@ static int cmd_run(uint32_t p0, uint32_t p1, uint32_t st, uint32_t ctrl, int* sl
     ring_push(&g_cmd_ring, p0, p1, st, ctrl);
     ring_db(0, 0);
     xhci_trb_t ev;
-    if (!evt_wait(TRB_CMD_COMPLETE, &ev)) return -1;
+    if (!evt_wait(TRB_CMD_COMPLETE, 0, 0, &ev)) return -1;
     if (slot_out) *slot_out = (int)((ev.d[3] >> 24) & 0xFF);
     return (int)((ev.d[2] >> 24) & 0xFF);   // completion code
 }
@@ -225,7 +263,7 @@ int xhci_control(usb_device_t* d, const void* setup, void* data, int len) {
     ring_db(d->slot_id, 1);   // EP0 doorbell, DCI 1
 
     xhci_trb_t ev;
-    if (!evt_wait(TRB_XFER_EVENT, &ev)) { g_last_cc = -1; return -1; }
+    if (!evt_wait(TRB_XFER_EVENT, d->slot_id, 1, &ev)) { g_last_cc = -1; return -1; }
     int cc = (ev.d[2] >> 24) & 0xFF;
     g_last_cc = cc;
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) return -1;
@@ -294,7 +332,7 @@ int xhci_configure_endpoints(usb_device_t* d, const usb_endpoint_t* eps, int n) 
     return (cc == CC_SUCCESS) ? 0 : -1;
 }
 
-int xhci_submit(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
+static int submit_raw(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
     uint8_t dci = ep_dci(ep_addr);
     xhci_ring_t* r = NULL;
     for (int i = 0; i < d->n_epr; i++) if (d->epr[i].dci == dci) { r = &d->epr[i]; break; }
@@ -306,14 +344,24 @@ int xhci_submit(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
     return 0;
 }
 
+int xhci_submit(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
+    int r = submit_raw(d, ep_addr, data, len);
+    if (r == 0) g_async[d->slot_id & 0xFF] |= (1u << ep_dci(ep_addr));
+    return r;
+}
+
 int xhci_poll_transfer(usb_device_t* d, uint8_t ep_addr, int len, int* bytes) {
     uint8_t dci = ep_dci(ep_addr);
     xhci_trb_t ev;
-    if (!evt_poll(&ev)) return 0;
-    if (((ev.d[3] >> 10) & 0x3F) != TRB_XFER_EVENT) return 0;
-    int slot = (ev.d[3] >> 24) & 0xFF;
-    int eid  = (ev.d[3] >> 16) & 0x1F;
-    if (slot != d->slot_id || eid != (int)dci) return 0;   // not ours — drop
+    int found = stash_take(d->slot_id, dci, &ev);
+    while (!found && evt_poll(&ev)) {
+        if (ev_type(&ev) == TRB_XFER_EVENT && ev_slot(&ev) == d->slot_id && ev_dci(&ev) == (int)dci)
+            found = 1;
+        else
+            evt_park(&ev);   // another armed endpoint's completion: keep it for its poller
+    }
+    if (!found) return 0;
+    g_async[d->slot_id & 0xFF] &= ~(1u << dci);
     int cc = (ev.d[2] >> 24) & 0xFF;
     g_last_cc = cc;
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) { *bytes = -1; return 1; }
@@ -322,9 +370,9 @@ int xhci_poll_transfer(usb_device_t* d, uint8_t ep_addr, int len, int* bytes) {
 }
 
 int xhci_transfer(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
-    if (xhci_submit(d, ep_addr, data, len) < 0) return -1;
+    if (submit_raw(d, ep_addr, data, len) < 0) return -1;
     xhci_trb_t ev;
-    if (!evt_wait(TRB_XFER_EVENT, &ev)) { g_last_cc = -1; return -1; }
+    if (!evt_wait(TRB_XFER_EVENT, d->slot_id, ep_dci(ep_addr), &ev)) { g_last_cc = -1; return -1; }
     int cc = (ev.d[2] >> 24) & 0xFF;
     g_last_cc = cc;
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) return -1;
