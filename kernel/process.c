@@ -127,7 +127,11 @@ int process_has_children(uint32_t ppid) {
     int n = 0;
     for (int i=0;i<MAX_PROCESSES;i++) {
         process_t* p = proc_table[i];
-        if (p && p->ppid == ppid) { n++; break; }
+        // A zombie whose status was already collected is no longer a child the
+        // caller can wait for (it only awaits the reaper). Counting it made
+        // waitpid(-1) block forever instead of returning ECHILD after the last
+        // child was collected (bash `cmd & wait`).
+        if (p && p->ppid == ppid && !(p->state == PROC_ZOMBIE && p->collected)) { n++; break; }
     }
     spin_unlock_irqrestore(&proc_lock, fl);
     return n;
