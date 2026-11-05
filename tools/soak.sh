@@ -22,6 +22,7 @@
 #   tools/soak.sh --fuzz          # also run the signed syscall fuzzer (full mode)
 #   tools/soak.sh --no-cmdsub     # disable $(...) command substitution (default on)
 #   tools/soak.sh --no-pipes      # disable pipelines (default on)
+#   tools/soak.sh --no-edit       # type lines plainly (default: some use readline editing keys)
 #   tools/soak.sh --log PATH      # debugcon+serial log path (default /tmp/soak.log)
 #
 # Exit: 0 = PASS (session completed, no kernel fault), 1 = FAIL (see log + .repro).
@@ -31,7 +32,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 LONG=0; SEED=$RANDOM; ITERS=250; MEM=256M; SMP=1; DISK=0; FUZZ=0; CMDSUB=1
-LOG=/tmp/soak.log; SETTLE=28; STALL=25; PIPES=1
+LOG=/tmp/soak.log; SETTLE=28; STALL=25; PIPES=1; EDIT=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --long)   LONG=1 ;;
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --no-cmdsub) CMDSUB=0 ;;
         --pipes)  PIPES=1 ;;
         --no-pipes) PIPES=0 ;;
+        --no-edit) EDIT=0 ;;
         --log)    shift; LOG=$1 ;;
         --settle) shift; SETTLE=$1 ;;
         --stall)  shift; STALL=$1 ;;
@@ -79,6 +81,7 @@ OPTS=(--seed "$SEED" --iters "$ITERS" --settle "$SETTLE" --stall "$STALL"
 [[ $FUZZ   -eq 1 ]] && OPTS+=(--fuzz)
 [[ $CMDSUB -eq 0 ]] && OPTS+=(--no-cmdsub)
 [[ $PIPES  -eq 0 ]] && OPTS+=(--no-pipes)
+[[ $EDIT   -eq 0 ]] && OPTS+=(--no-edit)
 
 python3 tools/soak_drive.py "${OPTS[@]}" -- "${QEMU[@]}"
 rc=$?
