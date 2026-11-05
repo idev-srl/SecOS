@@ -933,6 +933,7 @@ int vmm_space_destroy(vmm_space_t* space) {
                 for (int ti = 0; ti < 512; ti++) {
                     uint64_t pte = pt[ti];
                     if (!vmm_pte_has_frame(pte)) continue;  // present or PROT_NONE-parked
+                    if (pte & VMM_FLAG_DEVICE) continue;    // [M40] device memory: not PMM-owned
                     void* lf = (void*)(pte & ADDRESS_MASK); // [M19] COW-aware free
                     if (!pmm_unref_frame(lf)) pmm_free_frame(lf);
                     n_pages++;
@@ -1033,6 +1034,13 @@ vmm_space_t* vmm_fork_space(vmm_space_t* parent) {
                     if (!vmm_pte_has_frame(pte)) continue;
                     uint64_t va = ((uint64_t)pi << 30) | ((uint64_t)di << 21) | ((uint64_t)ti << 12);
                     uint64_t phys  = pte & ADDRESS_MASK;
+                    if (pte & VMM_FLAG_DEVICE) {
+                        // [M40] Device memory (framebuffer): the mapping is shared
+                        // by nature. Copy the PTE as-is: no refcount, no COW.
+                        uint64_t* cpt = get_pt_space(child, va, 1, VMM_FLAG_USER | VMM_FLAG_RW);
+                        if (cpt) cpt[ti] = pte;
+                        continue;
+                    }
                     if (!(pte & VMM_FLAG_PRESENT)) {
                         // PROT_NONE-parked: share the frame, park it in the child
                         // too. It holds no RW, so nothing to COW-protect now; a
@@ -1235,6 +1243,7 @@ int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
     uint64_t entry = pt[pt_i];
     pt[pt_i] = 0;
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    if (entry & VMM_FLAG_DEVICE) return 0;   // [M40] device memory: nothing to free
     // Free physical frame — [M19] only when this was the last COW reference.
     void* frame = (void*)(entry & ADDRESS_MASK);
     if (!pmm_unref_frame(frame)) pmm_free_frame(frame);
@@ -1257,7 +1266,16 @@ int vmm_protect_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
     uint64_t old = pt[pt_i];
     if (!vmm_pte_has_frame(old)) return -3;
     uint64_t phys = old & ADDRESS_MASK;
-    if (flags & VMM_FLAG_PROTNONE) {
+    if (old & VMM_FLAG_DEVICE) {
+        // [M40] Device memory keeps its DEVICE/caching bits and is never COW;
+        // it is never executable either (the caller refuses PROT_EXEC on it).
+        uint64_t keep = old & (VMM_FLAG_DEVICE | VMM_FLAG_PWT | VMM_FLAG_PCD);
+        if (flags & VMM_FLAG_PROTNONE)
+            pt[pt_i] = phys | keep | VMM_FLAG_PROTNONE | VMM_FLAG_NOEXEC;
+        else
+            pt[pt_i] = phys | keep | VMM_FLAG_PRESENT | VMM_FLAG_USER | VMM_FLAG_NOEXEC |
+                       (flags & VMM_FLAG_RW);
+    } else if (flags & VMM_FLAG_PROTNONE) {
         // Park: not present (no user or kernel access), frame kept for a later
         // mprotect back. COW is moot while parked (no RW, no access at all).
         pt[pt_i] = phys | VMM_FLAG_PROTNONE | VMM_FLAG_NOEXEC;

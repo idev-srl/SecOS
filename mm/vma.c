@@ -42,6 +42,16 @@ int vma_add(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags,
     v->file_len = file_len;
     v->file_inode = 0;          // [M20] not a page-cache mapping
     v->file_voff = 0;
+    v->phys_base = 0;
+    return 0;
+}
+
+int vma_add_phys(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags, uint64_t phys) {
+    if ((start & 0xFFF) || (end & 0xFFF) || (phys & 0xFFF) || end <= start) return -1;
+    if (vma_add(s, start, end, flags, VMA_TYPE_PHYS, 0, 0, 0, 0) != 0) return -1;
+    vma_t* v = vma_find_mut(s, start);
+    if (!v) return -1;
+    v->phys_base = phys;
     return 0;
 }
 
@@ -86,7 +96,9 @@ int vma_split(vma_set_t* s, vma_t* v, uint64_t addr) {
     vma_t hi = *v;                              // copy before vma_add may reuse a slot
     uint64_t d = addr - v->start;
     hi.start = addr;
-    if (hi.type == VMA_TYPE_FILE && hi.file_inode) {
+    if (hi.type == VMA_TYPE_PHYS) {
+        hi.phys_base += d;                      // device memory: shift the physical base
+    } else if (hi.type == VMA_TYPE_FILE && hi.file_inode) {
         hi.file_voff += d;                      // page-cache backing: shift the file offset
     } else if (hi.type == VMA_TYPE_FILE) {
         // Image backing: content sits at region offsets [file_pad, file_pad+file_len).
@@ -110,6 +122,7 @@ int vma_split(vma_set_t* s, vma_t* v, uint64_t addr) {
     if (!n) return -1;
     n->file_inode = hi.file_inode;
     n->file_voff = hi.file_voff;
+    n->phys_base = hi.phys_base;
     v->end = addr;
     return 0;
 }
@@ -138,6 +151,16 @@ int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr) {
     uint64_t pg = addr & ~0xFFFULL;
     if (pg < v->start || pg >= v->end) return -2;
     if (v->flags & VMM_FLAG_PROTNONE) return -4;   // reserved, inaccessible
+
+    if (v->type == VMA_TYPE_PHYS) {
+        // [M40] Device memory: map the backing physical page directly (no frame
+        // allocation). DEVICE keeps the PMM away from it; PWT selects PAT slot 1
+        // (Write-Combining once fb_apply_wc/vmm_pat_init ran). Never executable:
+        // the VMA flags already carry NX (mmap/mprotect refuse PROT_EXEC here).
+        uint64_t phys = v->phys_base + (pg - v->start);
+        return vmm_map_in_space(space, pg, phys,
+                                v->flags | VMM_FLAG_DEVICE | VMM_FLAG_PWT | VMM_FLAG_NOEXEC);
+    }
 
     void* frame = pmm_alloc_frame();
     if (!frame) return -3;

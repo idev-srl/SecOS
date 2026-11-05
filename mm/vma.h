@@ -22,6 +22,7 @@ struct vfs_inode;
 #define VMA_MAX        64
 #define VMA_TYPE_ANON  0
 #define VMA_TYPE_FILE  1
+#define VMA_TYPE_PHYS  2    // [M40] device memory (framebuffer): phys_base + (va - start), shared
 #define VMA_TYPE_NONE  255  // [M18] tombstone: a removed slot (kept so indices are stable)
 
 typedef struct vma {
@@ -40,6 +41,9 @@ typedef struct vma {
     // bytes from pagecache_get_phys(file_inode, file_voff + (pg - start)).
     struct vfs_inode* file_inode;
     uint64_t file_voff;    // file offset corresponding to 'start'
+    // [M40] VMA_TYPE_PHYS: physical address mapped at 'start'. The frames are
+    // device memory, not PMM-owned: never allocated, refcounted or freed.
+    uint64_t phys_base;
 } vma_t;
 
 typedef struct vma_set {
@@ -72,6 +76,10 @@ uint64_t vma_total_bytes(const vma_set_t* s);
 // offset mapped at 'start'. Returns 0/-1.
 int vma_add_file(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags,
                  struct vfs_inode* inode, uint64_t voff);
+
+// [M40] Register a device-memory region (VMA_TYPE_PHYS): [start, end) maps the
+// physical range starting at 'phys' (page-aligned). Returns 0/-1.
+int vma_add_phys(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags, uint64_t phys);
 
 // Materialize the page containing 'addr' in 'space' according to VMA 'v':
 // allocate a frame, fill it (file content + zero / pure zero), map it.
