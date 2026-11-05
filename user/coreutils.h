@@ -35,5 +35,6 @@ int applet_clear(int, char**);
 int applet_hexdump(int, char**);
 int applet_uptime(int, char**);
 int applet_help(int, char**);
+int applet_tty(int, char**);
 
 #endif

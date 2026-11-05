@@ -69,6 +69,19 @@ int applet_true(int argc, char** argv)
     return 0;
 }
 
+/* tty [-s]: print the terminal on stdin ("not a tty", exit 1, otherwise). */
+int applet_tty(int argc, char** argv)
+{
+    int silent = argc > 1 && strcmp(argv[1], "-s") == 0;
+    char* name = ttyname(0);
+    if (!name) {
+        if (!silent) printf("not a tty\n");
+        return 1;
+    }
+    if (!silent) printf("%s\n", name);
+    return 0;
+}
+
 int applet_false(int argc, char** argv)
 {
     (void)argc; (void)argv;

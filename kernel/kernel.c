@@ -1256,7 +1256,7 @@ static void coreutils_install(void) {
     static const char* names[] = {
         "coreutils","echo","cat","wc","head","tail","rev","nl","yes","seq",
         "ls","mkdir","rm","touch","cp","basename","dirname","stat",
-        "true","false","uname","sleep","clear","hexdump","uptime","help", 0
+        "true","false","uname","sleep","clear","hexdump","uptime","help","tty", 0
     };
     int ok = 0;
     for (int i = 0; names[i]; i++) {
