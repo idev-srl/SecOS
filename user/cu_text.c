@@ -240,16 +240,32 @@ static void head_stream(FILE* f, long n) {
     (void)had_char;
 }
 
+/* Print the first n bytes of f (head -c N). */
+static void head_bytes(FILE* f, long n) {
+    int c;
+    while (n-- > 0 && (c = fgetc(f)) != EOF)
+        fputc(c, stdout);
+}
+
 int applet_head(int argc, char** argv) {
     long n = 10;
+    long nbytes = -1;   /* >= 0: byte mode (-c N) */
     int i = 1;
     /* leading options */
-    while (i < argc && argv[i][0] == '-' && argv[i][1] != '\0')
+    while (i < argc && argv[i][0] == '-' && argv[i][1] != '\0') {
+        if (argv[i][1] == 'c') {
+            const char* v = argv[i][2] ? argv[i] + 2 : (i + 1 < argc ? argv[++i] : "0");
+            nbytes = strtol(v, (char**)0, 10);
+            if (nbytes < 0) nbytes = 0;
+            i++;
+            continue;
+        }
         n = parse_count_opt(argc, argv, &i, n);
+    }
 
     int nfiles = argc - i;
     if (nfiles <= 0) {
-        head_stream(stdin, n);
+        if (nbytes >= 0) head_bytes(stdin, nbytes); else head_stream(stdin, n);
         return 0;
     }
 
@@ -268,7 +284,7 @@ int applet_head(int argc, char** argv) {
             printf("==> %s <==\n", argv[i]);
         }
         first = 0;
-        head_stream(f, n);
+        if (nbytes >= 0) head_bytes(f, nbytes); else head_stream(f, n);
         if (!is_stdin)
             fclose(f);
     }
