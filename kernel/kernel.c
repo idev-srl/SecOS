@@ -1476,6 +1476,7 @@ static void kernel_main_phase2(void) {
     }
     timer_init(1000);
     keyboard_init();
+    { extern void tty_init(void); tty_init(); }   // console termios defaults + vt reply hook
 
     // [M28-2] Retire the 8259 PIC + PIT IRQ0 onto the LAPIC timer + IOAPIC when
     // ACPI gave us a MADT/IOAPIC. timer_init() above already programmed the PIT

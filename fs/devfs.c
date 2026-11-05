@@ -121,6 +121,14 @@ static uint64_t rng_next(void) {
 
 static int blk_byte_io(block_dev_t* b, size_t off, void* buf, size_t len, int write);
 
+/* Is this inode /dev/tty or /dev/console? (termios ioctls apply to it.) */
+int devfs_is_console(void* p) {
+    vfs_inode_t* inode = (vfs_inode_t*)p;
+    if (!inode || !inode->fs_data) return 0;
+    struct dev_node* d = (struct dev_node*)inode->fs_data;
+    return (d >= g_nodes && d < g_nodes + DEVFS_MAX && d->kind == DEV_CONSOLE);
+}
+
 static int devfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
     if (!inode || !inode->fs_data) return -1;
     struct dev_node* d = (struct dev_node*)inode->fs_data;
@@ -133,9 +141,10 @@ static int devfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
             for (size_t i=0;i<len;i++) out[i] = (uint8_t)rng_next();
             return (int)len;
         }
-        case DEV_CONSOLE: {                                        // [M25] cooked TTY line read
-            extern int tty_read(void* buf, int len);
-            return tty_read(buf, (int)len);
+        case DEV_CONSOLE: {                                        // [M25] console TTY read
+            // -2 = would block: SYS_READ blocks the caller (wait_tty) and re-runs.
+            extern int tty_read_try(void* buf, int len);
+            return tty_read_try(buf, (int)(len > 4096 ? 4096 : len));
         }
         case DEV_BLOCK: return blk_byte_io(d->blk, off, buf, len, 0);
     }
@@ -150,7 +159,7 @@ static int devfs_write(vfs_inode_t* inode, size_t off, const void* buf, size_t l
         case DEV_NULL: case DEV_ZERO: return (int)len;            // sink
         case DEV_FULL: return -1;                                 // ENOSPC
         case DEV_RANDOM: return (int)len;                         // reseed ignored
-        case DEV_CONSOLE: for (size_t i=0;i<len;i++) terminal_putchar((char)in[i]); return (int)len;
+        case DEV_CONSOLE: { extern int tty_write(const void*, int); return tty_write(in, (int)len); }
         case DEV_BLOCK: return blk_byte_io(d->blk, off, (void*)(uintptr_t)buf, len, 1);
     }
     return -1;

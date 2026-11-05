@@ -326,7 +326,10 @@ void __assert_fail(const char* expr, const char* file, int line){
 /* ============================== <unistd.h> extras ====================== */
 unsigned int sleep(unsigned int s){ sleep_ticks(s*1000); return 0; }
 int usleep(unsigned long us){ unsigned t=(unsigned)(us/1000); if(!t)t=1; sleep_ticks(t); return 0; }
-int isatty(int fd){ return fd==0||fd==1||fd==2; }
+/* A terminal is whatever answers TCGETS (the console and its dups, /dev/tty);
+ * a redirected stdio fd (pipe, file) is not. */
+int ioctl(int fd, unsigned long request, void* arg);
+int isatty(int fd){ int t[9]; return ioctl(fd, 0x5401 /*TCGETS*/, t) == 0; }
 
 /* ============================ printf core ============================== */
 /* A sink-based formatter so printf/fprintf stream directly and snprintf bounds. */

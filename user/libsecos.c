@@ -215,19 +215,35 @@ char* getcwd(char* buf, unsigned long size){
     return buf;
 }
 int ioctl(int fd, unsigned long request, void* arg){
-    return (int)secos_syscall(53 /*SYS_IOCTL*/, fd, (long)request, (long)arg, 0, 0);
+    return (int)__se(secos_syscall(53 /*SYS_IOCTL*/, fd, (long)request, (long)arg, 0, 0));
 }
 int getppid(void){ return (int)secos_syscall(54 /*SYS_GETPPID*/, 0, 0, 0, 0, 0); }
 
 /* termios over ioctl. struct termios layout must match the kernel's. */
-int tcgetattr(int fd, struct termios* t){ return ioctl(fd, 0x5401 /*TCGETS*/, t); }
-int tcsetattr(int fd, int how, const struct termios* t){ (void)how; return ioctl(fd, 0x5402 /*TCSETS*/, (void*)t); }
+int tcgetattr(int fd, struct termios* t){ return ioctl(fd, TCGETS, t); }
+int tcsetattr(int fd, int how, const struct termios* t){
+    unsigned long req = how == TCSADRAIN ? TCSETSW : how == TCSAFLUSH ? TCSETSF : TCSETS;
+    return ioctl(fd, req, (void*)t);
+}
 void cfmakeraw(struct termios* t){
     if(!t) return;
-    t->c_iflag = 0; t->c_oflag = 0;
-    t->c_lflag &= ~(0x0002u /*ICANON*/ | 0x0008u /*ECHO*/ | 0x0001u /*ISIG*/);
-    t->c_cc[4] = 1; /*VMIN*/ t->c_cc[5] = 0; /*VTIME*/
+    t->c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    t->c_oflag &= ~OPOST;
+    t->c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    t->c_cflag &= ~(CSIZE | PARENB);
+    t->c_cflag |= CS8;
+    t->c_cc[VMIN] = 1; t->c_cc[VTIME] = 0;
 }
+speed_t cfgetospeed(const struct termios* t){ return t->c_cflag & CBAUD; }
+speed_t cfgetispeed(const struct termios* t){ return t->c_cflag & CBAUD; }
+int cfsetospeed(struct termios* t, speed_t s){ if(s & ~CBAUD) return -1; t->c_cflag = (t->c_cflag & ~CBAUD) | s; return 0; }
+int cfsetispeed(struct termios* t, speed_t s){ return s ? cfsetospeed(t, s) : 0; }
+int cfsetspeed(struct termios* t, speed_t s){ return cfsetospeed(t, s); }
+int tcflush(int fd, int queue){ return ioctl(fd, TCFLSH, (void*)(long)queue); }
+int tcdrain(int fd){ return ioctl(fd, TCSBRK, (void*)1L); }
+int tcflow(int fd, int action){ return ioctl(fd, TCXONC, (void*)(long)action); }
+int tcsendbreak(int fd, int duration){ (void)duration; return ioctl(fd, TCSBRK, (void*)0L); }
+int tcgetsid(int fd){ int sid = -1; if(ioctl(fd, TIOCGSID, &sid) < 0) return -1; return sid; }
 int tcgetpgrp(int fd){ int pg = -1; ioctl(fd, 0x540F /*TIOCGPGRP*/, &pg); return pg; }
 int tcsetpgrp(int fd, int pgrp){ return ioctl(fd, 0x5410 /*TIOCSPGRP*/, &pgrp); }
 

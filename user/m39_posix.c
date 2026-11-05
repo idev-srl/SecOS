@@ -53,14 +53,14 @@ int main(void){
     } else put("[M39] pipe FAIL\n");
 
     /* termios get/set (raw mode toggle) */
-    struct termios t;
+    struct termios t, saved;
     if(tcgetattr(1, &t)==0){
+        saved = t;
         cfmakeraw(&t);
         if(tcsetattr(1, TCSANOW, &t)==0) put("[M39] termios get/set OK\n");
         else put("[M39] tcsetattr FAIL\n");
-        /* restore canonical+echo so the console stays usable */
-        t.c_lflag |= (ICANON | ECHO);
-        tcsetattr(1, TCSANOW, &t);
+        /* restore the original settings so the console stays usable */
+        tcsetattr(1, TCSANOW, &saved);
     } else put("[M39] tcgetattr FAIL\n");
 
     /* single-user identity */

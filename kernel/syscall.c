@@ -408,8 +408,11 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
             r=ino->ops->write(ino, off, u.p, (size_t)want);
             if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); }
         } else {
-            // [M9] fd 1 (stdout) / 2 (stderr) with no redirection -> console.
-            for(int i=0;i<want;i++){ terminal_putchar((char)u.p[i]); debugcon_putchar((char)u.p[i]); }
+            // [M9] fd 1 (stdout) / 2 (stderr) with no redirection -> console,
+            // through the TTY's termios output processing (OPOST/ONLCR).
+            extern int tty_write(const void* buf, int len);
+            tty_write(u.p, want);
+            for(int i=0;i<want;i++) debugcon_putchar((char)u.p[i]);
             r = want;
         }
         if(r<=0){ if(done==0) err=r; break; }
@@ -626,50 +629,29 @@ int ksys_fstat(int fd, struct secos_stat* st){
     return 0;
 }
 
-/* Minimal termios/ioctl so termios-using programs (a shell, line editors) run.
- * struct secos_termios mirrors the libc layout. We model the console TTY as a
- * cooked terminal; TCSETS is accepted (and toggles echo/canon globally). */
-struct secos_termios { uint32_t c_iflag, c_oflag, c_cflag, c_lflag; uint8_t c_cc[20]; };
-struct secos_winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
-#define TCGETS_     0x5401
-#define TCSETS_     0x5402
-#define TCSETSW_    0x5403
-#define TCSETSF_    0x5404
-#define TIOCGWINSZ_ 0x5413
+/* Terminal ioctls. termios, window size and the input-queue requests are the
+ * console TTY's (kernel/tty.c, which really applies them: canonical/raw mode,
+ * echo, ISIG, VMIN/VTIME, ...); the job-control requests live here, next to
+ * the process-group checks. */
 #define TIOCGPGRP_  0x540F
 #define TIOCSPGRP_  0x5410
-#define ICANON_ 0x0002
-#define ECHO_   0x0008
-int g_tty_canon = 1, g_tty_echo = 1;   // [M39] honored by kernel/tty.c
+#define TIOCGSID_   0x5429
 int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
-    // The console TTY: fds 0/1/2 when not redirected, and any dup of a console
-    // fd (inode==NULL, not a pipe). bash keeps its terminal fd as dup(2) moved
-    // to a high fd and does tcgetpgrp/tcsetpgrp on it.
+    // The console TTY: fds 0/1/2 when not redirected, any dup of a console fd
+    // (inode==NULL, not a pipe), and an open /dev/tty or /dev/console. bash
+    // keeps its terminal fd as dup(2) moved to a high fd and does
+    // tcgetpgrp/tcsetpgrp on it.
+    extern int devfs_is_console(void* inode);
     int is_tty = (fd<=2 && !c->fds[fd].used) ||
-                 (c->fds[fd].used && !c->fds[fd].inode && !c->fds[fd].is_pipe);
+                 (c->fds[fd].used && !c->fds[fd].inode && !c->fds[fd].is_pipe) ||
+                 (c->fds[fd].used && !c->fds[fd].is_pipe && devfs_is_console(c->fds[fd].inode));
     switch(cmd){
-    case TCGETS_: {
-        if(!is_tty) return -1;
-        struct secos_termios t; for(unsigned i=0;i<sizeof(t);i++) ((uint8_t*)&t)[i]=0;
-        t.c_lflag = (g_tty_canon?ICANON_:0) | (g_tty_echo?ECHO_:0);
-        t.c_cc[4]=1; t.c_cc[5]=0;                               // VMIN=1, VTIME=0
-        if(copy_to_user((void*)arg, &t, sizeof(t))!=0) return -1;
-        return 0;
-    }
-    case TCSETS_: case TCSETSW_: case TCSETSF_: {
-        if(!is_tty) return -1;
-        struct secos_termios t;
-        if(copy_from_user(&t, (void*)arg, sizeof(t))!=0) return -1;
-        g_tty_canon = (t.c_lflag & ICANON_) ? 1 : 0;
-        g_tty_echo  = (t.c_lflag & ECHO_)   ? 1 : 0;
-        return 0;
-    }
-    case TIOCGWINSZ_: {
-        if(!is_tty) return -1;
-        struct secos_winsize w; w.ws_row=25; w.ws_col=80; w.ws_xpixel=0; w.ws_ypixel=0;
-        if(copy_to_user((void*)arg, &w, sizeof(w))!=0) return -1;
+    case TIOCGSID_: {
+        if(!is_tty) return -25;                 // -ENOTTY
+        int sid = (int)c->pgid;
+        if(copy_to_user((void*)arg,&sid,sizeof(sid))!=0) return -EFAULT;
         return 0;
     }
     // Job control: the console's foreground process group is the kernel's
@@ -695,7 +677,12 @@ int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
         signal_set_foreground_pgid((uint32_t)pg);
         return 0;
     }
-    default: return -1;
+    default: {
+        if(!is_tty) return -25;                 // -ENOTTY
+        extern int tty_ioctl(uint64_t cmd, uint64_t arg);
+        int r = tty_ioctl(cmd, arg);
+        return r == -515 ? -22 : r;             // unknown request: -EINVAL
+    }
     }
 }
 
