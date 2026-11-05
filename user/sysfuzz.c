@@ -90,8 +90,11 @@
 #define SYS_GETPPID 54
 #define SYS_WAITANY 55
 #define SYS_FSTAT 56
+#define SYS_GETPGID 57
+#define SYS_SIGSUSPEND 58
+#define SYS_REBOOT 59
 
-#define NSYS_KNOWN 57
+#define NSYS_KNOWN 60
 
 typedef unsigned long u64;
 
@@ -166,6 +169,10 @@ static void one_call(void){
      * caller (a ring-3 kill, kernel-safe per M30): keep it, but rare, so most
      * batches run to the end. */
     if(n==SYS_SIGRETURN && rn(8)!=0) n=SYS_GETTICKS;
+    /* sigsuspend sleeps until a signal arrives (none will): never. reboot would
+     * shut the machine down: never (its argument checks are trivial). */
+    if(n==SYS_SIGSUSPEND) n=SYS_GETTICKS;
+    if(n==SYS_REBOOT) n=SYS_GETPID;
 
     long a0,a1,a2,a3,a4; a0=a1=a2=a3=a4=0;
     switch(n){
@@ -283,7 +290,7 @@ static void init_names(void){
     g_names[44]="sigaction";g_names[45]="sigreturn";g_names[46]="kill";g_names[47]="sigprocmask";
     g_names[48]="setpgid";g_names[49]="dup2";g_names[50]="dup";g_names[51]="chdir";
     g_names[52]="getcwd";g_names[53]="ioctl";g_names[54]="getppid";g_names[55]="waitany";
-    g_names[56]="fstat";
+    g_names[56]="fstat";g_names[57]="getpgid";g_names[58]="sigsuspend";g_names[59]="reboot";
     g_names_ready=1;
 }
 static const char* sysname(long n){ if(!g_names_ready) init_names(); if(n>=0&&n<NSYS_KNOWN) return g_names[n]; return "oor"; }
