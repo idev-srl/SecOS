@@ -75,9 +75,20 @@ int     remove(const char* path)                   __asm__("sbb_remove");
 int     execvp(const char* file, char* const argv[]) __asm__("sbb_execvp");
 int     execve(const char* path, char* const argv[], char* const envp[]) __asm__("sbb_execve");
 int     execv(const char* path, char* const argv[]) __asm__("sbb_execv");
+int     execvpe(const char* file, char* const argv[], char* const envp[]) __asm__("sbb_execvpe");
+int     execl(const char* path, const char* arg, ...)  __asm__("sbb_execl");
+int     execlp(const char* file, const char* arg, ...) __asm__("sbb_execlp");
+int     execle(const char* path, const char* arg, ...) __asm__("sbb_execle");
 void    exit(int code) __asm__("bbio_exit") __attribute__((noreturn));
 int     puts(const char* s)                        __asm__("bbio_puts");
 char*   strerror(int errnum)                       __asm__("sbb_strerror");
+/* libc has these too; BusyBox's versions know this layer's socket table
+ * (poll/readv/writev) or the node name in /etc/hostname (uname). */
+struct pollfd; struct iovec; struct utsname;
+int     poll(struct pollfd* fds, unsigned long n, int timeout) __asm__("sbb_poll");
+long    readv(int fd, const struct iovec* v, int n)  __asm__("sbb_readv");
+long    writev(int fd, const struct iovec* v, int n) __asm__("sbb_writev");
+int     uname(struct utsname* u)                   __asm__("sbb_uname");
 /* libc opendir reads at most 64 entries and does not resolve the cwd */
 #define opendir  sbb_opendir
 #define readdir  sbb_readdir
@@ -109,6 +120,8 @@ int main(int argc, char** argv) __asm__("sbb_main");
 #define open(...)                   sbb_open(__VA_ARGS__)
 #define ioctl(...)                  sbb_ioctl(__VA_ARGS__)
 #define signal(s, h)                sbb_signal(s, h)
+#define select(...)                 sbb_select(__VA_ARGS__)
+#define pselect(...)                sbb_pselect(__VA_ARGS__)
 /* BusyBox has its own spawn(char**) (libbb); SecOS libc's spawn(path, argv)
  * keeps its link name, BusyBox's is renamed. */
 #define spawn                       sbb_bb_spawn

@@ -17,40 +17,14 @@
 #define SEEK_HOLE 4
 #endif
 
-/* sysconf / pathconf names (Linux numbering) */
-#define _SC_ARG_MAX        0
-#define _SC_CHILD_MAX      1
-#define _SC_CLK_TCK        2
-#define _SC_NGROUPS_MAX    3
-#define _SC_OPEN_MAX       4
-#define _SC_PAGESIZE       30
-#define _SC_PAGE_SIZE      30
-#define _SC_NPROCESSORS_CONF 83
-#define _SC_NPROCESSORS_ONLN 84
-#define _SC_PHYS_PAGES     85
-#define _SC_AVPHYS_PAGES   86
-#define _SC_LINE_MAX       43
-#define _SC_HOST_NAME_MAX  180
-#define _SC_LOGIN_NAME_MAX 71
-#define _SC_TTY_NAME_MAX   72
-#define _SC_SYMLOOP_MAX    173
-#define _PC_LINK_MAX       0
-#define _PC_NAME_MAX       3
-#define _PC_PATH_MAX       4
-#define _PC_PIPE_BUF       5
-#define _PC_VDISABLE       8
+/* sysconf / pathconf names: libc <unistd.h>. */
 #define _POSIX_VDISABLE    '\0'
 #define _POSIX_VERSION     200809L
 #define _POSIX2_VERSION    200809L
 
-long    sysconf(int name);
-long    pathconf(const char* path, int name);
-long    fpathconf(int fd, int name);
-int     access(const char* path, int mode);
 int     faccessat(int dirfd, const char* path, int mode, int flags);
 int     eaccess(const char* path, int mode);
 int     euidaccess(const char* path, int mode);
-int     link(const char* oldp, const char* newp);
 int     linkat(int od, const char* oldp, int nd, const char* newp, int fl);
 int     unlinkat(int dirfd, const char* path, int flags);
 int     symlinkat(const char* target, int dirfd, const char* linkpath);
@@ -58,12 +32,6 @@ ssize_t readlinkat(int dirfd, const char* path, char* buf, size_t len);
 int     fchdir(int fd);
 int     fchown(int fd, uid_t u, gid_t g);
 int     lchown(const char* path, uid_t u, gid_t g);
-int     fsync(int fd);
-int     fdatasync(int fd);
-void    sync(void);
-int     syncfs(int fd);
-int     truncate(const char* path, off_t len);
-int     ftruncate(int fd, off_t len);
 ssize_t pread(int fd, void* buf, size_t n, off_t off);
 ssize_t pwrite(int fd, const void* buf, size_t n, off_t off);
 int     pipe2(int fds[2], int flags);
@@ -83,8 +51,6 @@ int     getdomainname(char* name, size_t len);
 int     setdomainname(const char* name, size_t len);
 char*   getlogin(void);
 int     getlogin_r(char* buf, size_t len);
-char*   ttyname(int fd);
-int     ttyname_r(int fd, char* buf, size_t len);
 char*   getpass(const char* prompt);
 char*   crypt(const char* key, const char* salt);
 int     setpgrp(void);
