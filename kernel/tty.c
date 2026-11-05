@@ -514,5 +514,13 @@ int tty_ioctl(uint64_t cmd, uint64_t arg) {
     }
 }
 
+/* Back to the boot defaults (cooked, echo, ISIG) with empty queues: the
+ * kernel shell calls it when a foreground program it ran has finished. */
+void tty_reset(void) {
+    tio_defaults();
+    flush_input();
+    g_flush_req = 0; g_intr_noproc = 0; g_vtime_pid = 0;
+}
+
 /* Current termios (for the self-test / debugging). */
 void tty_get_termios(struct tty_termios* out) { tio_ensure(); *out = g_tio; }

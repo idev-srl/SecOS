@@ -101,5 +101,6 @@ int  tty_isig_for(char c);                   /* IRQ: signal for this byte, or 0 
 void tty_note_isig(int sig);
 void tty_wake_readers(uint64_t now);
 void tty_get_termios(struct tty_termios* out);
+void tty_reset(void);                        /* boot defaults, queues flushed */
 
 #endif
