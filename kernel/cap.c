@@ -19,6 +19,7 @@ const char* cap_name(uint32_t cap) {
         case CAP_IPC:      return "IPC";
         case CAP_SIGNAL:   return "SIGNAL";
         case CAP_TIME:     return "TIME";
+        case CAP_POWER:    return "POWER";
         default:           return "?";
     }
 }

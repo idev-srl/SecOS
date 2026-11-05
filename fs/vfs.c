@@ -88,6 +88,37 @@ int vfs_unmount(const char* mount_point){
     return -1;
 }
 
+// Orderly shutdown: flush every mounted filesystem. Disk FSes are write-through
+// today (block drivers are polled/synchronous; ext2/ext4 commits + checkpoints
+// each metadata transaction), so ->sync only has to close anything still open.
+// The sync callbacks run without g_mount_lock (they do block I/O).
+int vfs_sync_all(void){
+    const vfs_fs_ops_t* ops[VFS_MAX_MOUNTS]; int n = 0, done = 0;
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
+    for(int i=0;i<g_mount_count;i++){
+        int dup = 0;                                 // one FS instance may be mounted twice
+        for(int j=0;j<n;j++) if(ops[j]==g_mounts[i].ops) dup = 1;
+        if(!dup) ops[n++] = g_mounts[i].ops;
+    }
+    spin_unlock_irqrestore(&g_mount_lock, fl);
+    for(int i=0;i<n;i++) if(ops[i]->sync && ops[i]->sync()==0) done++;
+    return done;
+}
+
+int vfs_unmount_all(void){
+    int n = 0;
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
+    int w = 0;
+    for(int i=0;i<g_mount_count;i++){
+        const char* mp = g_mounts[i].mount_point;
+        if(mp[0]=='/' && mp[1]==0) g_mounts[w++] = g_mounts[i];   // keep the root
+        else n++;
+    }
+    g_mount_count = w;
+    spin_unlock_irqrestore(&g_mount_lock, fl);
+    return n;
+}
+
 // Resolve an absolute path to its owning mount and the mount-relative path.
 // rel (size rel_sz) receives the relative path rooted at '/'. Returns the
 // mount, or NULL if none matches.

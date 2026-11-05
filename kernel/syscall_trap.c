@@ -19,6 +19,7 @@
 #include "kverbose.h"
 #include "cap.h"
 #include "user_copy.h"
+#include "power.h"
 
 #ifdef SYSCALL_DEBUG
 #include "terminal.h"
@@ -218,6 +219,24 @@ uint64_t syscall_handler(trapframe_t* tf) {
                 tf->rip -= 2;                         // re-run on wake (any signal_post)
                 sched_block_current(tf);              // NORETURN
                 ret = 0;
+            }
+        }
+    }
+    // SYS_REBOOT(cmd): orderly poweroff/restart/halt (kernel/power.c). The
+    // shutdown waits for the other processes to exit, so the caller sleeps and
+    // re-runs the syscall (state kept in its PCB) until the final phase, which
+    // never returns. A confined manifest needs CAP_POWER.
+    else if (num == SYS_REBOOT) {
+        if (!cap_check(cur, CAP_POWER, num, "reboot")) {
+            ret = (uint64_t)(int64_t)-1;                // EPERM
+        } else {
+            long r = power_syscall_step(cur, (int)tf->rdi);
+            if (r == 1 && cur) {
+                tf->rip -= 2;                           // re-run after the poll interval
+                sched_block_current(tf);                // NORETURN
+                ret = 0;
+            } else {
+                ret = (uint64_t)(int64_t)r;
             }
         }
     }

@@ -23,6 +23,7 @@ typedef enum {
     CAP_IPC     = (1u<<9),
     CAP_SIGNAL  = (1u<<10),
     CAP_TIME    = (1u<<11),
+    CAP_POWER   = (1u<<12),   /* SYS_REBOOT: a confined program must declare it */
 } cap_t;
 
 /* True if `p` is allowed capability `cap`. Ambient (not enforcing) => always

@@ -914,11 +914,19 @@ static int e2j_setattr(const char* p, const vfs_attr_t* a, unsigned v){ jt_begin
 static int e2j_symlink(const char* t, const char* l){ jt_begin(); int r=e2_symlink(t,l); return jt_finish(r, r==0); }
 static int e2j_write(vfs_inode_t* v, size_t off, const void* d, size_t l){ jt_begin(); int r=e2_write(v,off,d,l); return jt_finish(r, r>=0); }
 
+/* Orderly shutdown / sync. Every mutating op already runs as one committed and
+ * checkpointed transaction (or writes directly on a journal-less volume), so
+ * only a transaction left open by an interrupted op needs committing here. */
+static int e2_sync(void){
+    if(g_jt_active) jt_commit();
+    return 0;
+}
+
 static vfs_fs_ops_t ext2_ops = {
     .lookup=e2_lookup, .readdir=e2_readdir, .read=e2_read, .write=e2j_write,
     .create=e2j_create, .mkdir=e2j_mkdir, .remove=e2j_remove, .rename=e2j_rename,
     .truncate=e2j_truncate, .setattr=e2j_setattr,
-    .readlink=e2_readlink, .symlink=e2j_symlink
+    .readlink=e2_readlink, .symlink=e2j_symlink, .sync=e2_sync
 };
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */

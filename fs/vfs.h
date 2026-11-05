@@ -82,6 +82,9 @@ typedef struct vfs_fs_ops {
     int (*readlink)(const char* path, char* buf, size_t len);
     // [M26] Create a symlink at linkpath pointing to target. Returns 0/-1.
     int (*symlink)(const char* target, const char* linkpath);
+    // Flush anything this FS still holds in memory to its device (orderly
+    // shutdown, sync). NULL = write-through, nothing to flush. Returns 0/-1.
+    int (*sync)(void);
 } vfs_fs_ops_t;
 
 // Mount record (single root for now)
@@ -101,6 +104,10 @@ int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name);
 int vfs_mount(const char* mount_point, const vfs_fs_ops_t* ops, const char* fs_name);
 // Unmount the filesystem at the given mount point. Returns 0 success.
 int vfs_unmount(const char* mount_point);
+// Sync every mounted filesystem (ops->sync). Returns how many were synced.
+int vfs_sync_all(void);
+// Unmount every mount except the root "/" (shutdown). Returns how many.
+int vfs_unmount_all(void);
 // Lookup inode by absolute path
 vfs_inode_t* vfs_lookup(const char* path);
 // [M26] Lookup following a final-component symlink (bounded). Used by stat/open.

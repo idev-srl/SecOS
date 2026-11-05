@@ -519,10 +519,14 @@ static int fat32_rename(const char* oldp, const char* newp){
     return dent_write_back(&loc);
 }
 
+/* FAT and directory updates are written through to the device as they happen
+ * (no cached FAT sectors), so there is nothing left to flush at shutdown. */
+static int fat32_sync(void){ return 0; }
+
 static vfs_fs_ops_t fat32_ops = {
     .lookup=fat32_lookup, .readdir=fat32_readdir, .read=fat32_read, .write=fat32_write,
     .create=fat32_create, .mkdir=fat32_mkdir, .remove=fat32_remove, .rename=fat32_rename,
-    .truncate=fat32_truncate
+    .truncate=fat32_truncate, .sync=fat32_sync
 };
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */

@@ -387,7 +387,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     { extern void signal_init_proc(process_t*); signal_init_proc(p); }
     p->pgid = p->pid; p->ppid = 0; p->spawner_pid = 0;
     p->stop_report = 0; p->cont_report = 0; p->stop_sig = 0;
-    p->wait_tty = 0;
+    p->wait_tty = 0; p->power_phase = 0; p->power_deadline = 0;
     p->sigsusp_active = 0; p->sigsusp_saved = 0;
     p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
     // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases
@@ -620,7 +620,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->sig_pending = 0;
     c->ppid = parent->pid; c->pgid = parent->pgid; c->spawner_pid = 0;
     c->stop_report = 0; c->cont_report = 0; c->stop_sig = 0;
-    c->wait_tty = 0;
+    c->wait_tty = 0; c->power_phase = 0; c->power_deadline = 0;
     c->sigsusp_active = 0; c->sigsusp_saved = 0;
     c->state = PROC_BLOCKED;                   // not runnable until fully built
 

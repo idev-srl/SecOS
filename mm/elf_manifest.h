@@ -40,11 +40,12 @@
 #define MANIFEST_FLAG_CAP_IPC               (1u<<9) // msg_send/recv, pipe
 #define MANIFEST_FLAG_CAP_SIGNAL            (1u<<10)// kill/signal other processes
 #define MANIFEST_FLAG_CAP_TIME              (1u<<11)// getticks/sleep
+#define MANIFEST_FLAG_CAP_POWER             (1u<<12)// poweroff/reboot/halt (SYS_REBOOT)
 // CAP_NET (bit 4) is the network capability and folds into the same model.
 #define MANIFEST_CAP_MASK \
     (MANIFEST_FLAG_CAP_NET | MANIFEST_FLAG_CAP_FS_READ | MANIFEST_FLAG_CAP_FS_WRITE | \
      MANIFEST_FLAG_CAP_PROC | MANIFEST_FLAG_CAP_IPC | MANIFEST_FLAG_CAP_SIGNAL | \
-     MANIFEST_FLAG_CAP_TIME)
+     MANIFEST_FLAG_CAP_TIME | MANIFEST_FLAG_CAP_POWER)
 
 // Manifest versions
 #define MANIFEST_VERSION_BASE    1u   // version/flags/max_mem/entry_hint (24-byte desc)

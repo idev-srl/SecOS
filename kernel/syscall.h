@@ -68,6 +68,7 @@
 #define SYS_FSTAT       56 // fstat(fd, statbuf) -> stat the fd's inode (correct file type)
 #define SYS_GETPGID     57 // getpgid(pid) -> process group id (pid 0 = caller) / -ESRCH
 #define SYS_SIGSUSPEND  58 // sigsuspend(mask) -> -EINTR once a signal was delivered
+#define SYS_REBOOT      59 // reboot(cmd): orderly poweroff(1)/restart(2)/halt(3); returns only on error
 // Note: execve is emulated in libc (spawn+waitpid+_exit) — no kernel syscall.
 
 // [M24] socket types
