@@ -174,16 +174,21 @@ static const char* ap(const char* p, char* out, size_t n) {
     return out;
 }
 #define AP(p) ap((p), (char[PATH_MAX]){ 0 }, PATH_MAX)
+/* chmod/chown/utimes on a filesystem without POSIX metadata (the ramfs root,
+ * FAT32) fail with a bare -1 from the VFS. Such a filesystem has nothing to
+ * store, so report success instead of making cp -p / mv / tar print a
+ * "can't preserve ..." warning per file. A real error (-errno) is kept. */
+static int meta_rc(long r) { return r == -1 ? 0 : (int)se(r, EPERM); }
 
 int chmod(const char* p, unsigned m) {
     if (!path_exists(p)) { errno = ENOENT; return -1; }
-    return (int)se(sys_chmod(AP(p), m & 07777), EPERM);
+    return meta_rc(sys_chmod(AP(p), m & 07777));
 }
 int fchmod(int fd, mode_t m) { (void)fd; (void)m; return 0; }
 int fchmodat(int d, const char* p, mode_t m, int f) { (void)d; (void)f; return chmod(p, m); }
 int chown(const char* p, unsigned u, unsigned g) {
     if (!path_exists(p)) { errno = ENOENT; return -1; }
-    return (int)se(sys_chown(AP(p), u, g), EPERM);
+    return meta_rc(sys_chown(AP(p), u, g));
 }
 int lchown(const char* p, uid_t u, gid_t g) { return chown(p, u, g); }
 int fchown(int fd, uid_t u, gid_t g) { (void)fd; (void)u; (void)g; return 0; }
@@ -329,7 +334,7 @@ int utimes(const char* p, const struct timeval tv[2]) {
     if (tv) { a = (unsigned long)tv[0].tv_sec; m = (unsigned long)tv[1].tv_sec; }
     else a = m = (unsigned long)time(NULL);
     if (!path_exists(p)) { errno = ENOENT; return -1; }
-    return (int)se(sys_utimes(AP(p), a, m), EPERM);
+    return meta_rc(sys_utimes(AP(p), a, m));
 }
 int lutimes(const char* p, const struct timeval tv[2]) { return utimes(p, tv); }
 int futimes(int fd, const struct timeval tv[2]) { (void)fd; (void)tv; return 0; }
@@ -343,7 +348,7 @@ int utimensat(int d, const char* p, const struct timespec ts[2], int fl) {
         a = ts[0].tv_nsec == UTIME_OMIT ? st.st_atime : ts[0].tv_nsec == UTIME_NOW ? (unsigned long)now : (unsigned long)ts[0].tv_sec;
         m = ts[1].tv_nsec == UTIME_OMIT ? st.st_mtime : ts[1].tv_nsec == UTIME_NOW ? (unsigned long)now : (unsigned long)ts[1].tv_sec;
     }
-    return (int)se(sys_utimes(AP(p), a, m), EPERM);
+    return meta_rc(sys_utimes(AP(p), a, m));
 }
 int futimens(int fd, const struct timespec ts[2]) { (void)fd; (void)ts; return 0; }
 /* No truncate syscall yet: only "to zero" is possible (reopen with O_TRUNC).
