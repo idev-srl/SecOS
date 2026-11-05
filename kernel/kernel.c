@@ -1242,6 +1242,7 @@ static void m24_run_demo(void) {
 #include "../crypto/user_coreutils_elf.h"
 #include "../crypto/user_init_elf.h"
 #include "../crypto/user_svc_elf.h"
+#include "../crypto/user_uaccess_elf.h"
 static void coreutils_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1267,6 +1268,8 @@ static void coreutils_install(void) {
     vfs_create("/bin/init", user_init_elf, user_init_elf_len);
     vfs_create("/bin/svc",  user_svc_elf,  user_svc_elf_len);
     debugcon_writestring("[M32] init + svc installed to /bin\n");
+    // [uaccess] bad-user-pointer regression test (-EFAULT, never a ring-0 fault)
+    vfs_create("/bin/uaccess_test", user_uaccess_elf, user_uaccess_elf_len);
 }
 extern void shell_init(void);
 extern void shell_run(void);
