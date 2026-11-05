@@ -90,6 +90,75 @@ struct tty_winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
 #define TTY_TIOCSWINSZ 0x5414
 #define TTY_FIONREAD   0x541B
 #define TTY_TIOCNOTTY  0x5422
+#define TTY_FIONBIO    0x5421
+#define TTY_TIOCGSID   0x5429
+#define TTY_TIOCGPTN   0x80045430   /* pty master: slave index (unsigned int) */
+#define TTY_TIOCSPTLCK 0x40045431   /* pty master: lock (!=0) / unlock (0) the slave */
+#define TTY_TIOCGPTLCK 0x80045439   /* pty master: lock state */
+
+/* ---- line discipline instance ------------------------------------------------
+ * One struct tty per terminal: the console (tty_console()) and the slave side of
+ * every pseudo-terminal (kernel/pty.c). The same n_tty-style code (termios input
+ * and output processing, canonical editing, ISIG, VMIN/VTIME, job control)
+ * serves all of them; only the byte source and sink differ:
+ *   console: input pulled from the keyboard/serial ring, output to the VT;
+ *   pty:     input pushed by master writes, output into the master's ring.
+ */
+#define TTY_LINE 1024
+#define TQ_SIZE  4096
+struct tty;
+struct tty_sig { uint32_t id; int sig; int to_pid; };
+#define TTY_PSIG_MAX 8
+/* Output sink: `n` bytes; `onlcr` asks for NL -> CR NL (OPOST|ONLCR). */
+typedef void (*tty_out_fn)(struct tty* t, const char* s, int n, int onlcr);
+
+struct tty {
+    struct tty_termios tio;
+    struct tty_winsize ws;          /* pty: the size; console: TIOCSWINSZ override */
+    uint8_t  line[TTY_LINE];        /* canonical line being edited */
+    int      n, lnext;
+    uint16_t q[TQ_SIZE];            /* read queue (TQ_* flags, see tty.c) */
+    int      qh, qt;
+    volatile int flush_req;         /* ISIG from the IRQ: flush before the next op */
+    volatile int intr_noproc;       /* console VINTR with no foreground group */
+    uint64_t last_rx, vtime_start;  /* VTIME bookkeeping */
+    uint32_t vtime_pid;
+    tty_out_fn out;
+    int      is_console;
+    /* Job control. The console's foreground group is signal.c's
+     * foreground_pgid (the keyboard IRQ targets it); a pty keeps its own. */
+    uint32_t fg_pgrp;               /* foreground process group (0 = none) */
+    uint32_t session;               /* session this is the controlling tty of (0 = none) */
+    int      hungup;                /* pty master gone: read drains then EIO, write EIO */
+    /* Signals raised while a pty lock is held, posted once it is dropped. */
+    int      psig_n;
+    struct tty_sig psig[TTY_PSIG_MAX];
+    void*    owner;                 /* pty_t* for a pty slave, NULL for the console */
+};
+
+/* tty_ldisc_read modes */
+#define TTY_RD_SPIN     0           /* kernel caller: wait in place for input */
+#define TTY_RD_BLOCK    1           /* syscall: return -2 with the wait armed */
+#define TTY_RD_NONBLOCK 2           /* O_NONBLOCK: -EAGAIN */
+
+struct process;
+struct tty* tty_console(void);
+void tty_instance_init(struct tty* t, tty_out_fn out, void* owner); /* pty defaults */
+void tty_input_byte(struct tty* t, uint8_t c);       /* one byte through input processing */
+int  tty_input_room(struct tty* t);                  /* bytes input can still accept */
+int  tty_ldisc_read(struct tty* t, void* buf, int len, int mode);
+int  tty_ldisc_readable(struct tty* t);              /* bytes a read() could take now */
+int  tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg); /* -515: not a ldisc ioctl */
+int  tty_onlcr(struct tty* t);                       /* OPOST && ONLCR */
+uint32_t tty_fg(struct tty* t);                      /* foreground process group */
+void tty_set_fg(struct tty* t, uint32_t pgrp);
+void tty_emit_sig(struct tty* t, uint32_t id, int sig, int to_pid);
+int  tty_take_sigs(struct tty* t, struct tty_sig* out); /* under the lock: move them out */
+void tty_post_sigs(const struct tty_sig* s, int n);   /* then post with no lock held */
+/* Job control for a pty: is `cur` a background member of this terminal's
+ * session? Returns 0 (go ahead) or -EINTR (sig posted to its group) / -EIO
+ * (sig blocked or ignored; TTOU: ignored => 0 per POSIX). */
+int  tty_bg_check(struct tty* t, struct process* cur, int sig);
 
 void tty_init(void);
 int  tty_read(void* buf, int len);           /* spins (kernel callers) */

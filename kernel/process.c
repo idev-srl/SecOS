@@ -388,6 +388,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->pgid = p->pid; p->ppid = 0; p->spawner_pid = 0;
     p->stop_report = 0; p->cont_report = 0; p->stop_sig = 0;
     p->wait_tty = 0; p->power_phase = 0; p->power_deadline = 0;
+    p->wait_pty = NULL; p->sid = p->pid; p->ctty = NULL; p->ctty_detached = 0;  // own session, console
     p->sigsusp_active = 0; p->sigsusp_saved = 0;
     p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
     // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases

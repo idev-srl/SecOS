@@ -130,6 +130,7 @@ int signal_post(process_t* p, int sig) {
         // sleep_until is kept: a stop restarts SYS_SLEEP with its original
         // deadline (the EINTR path clears it itself).
         p->wait_pid = -1; p->recv_chan = -1; p->wait_pipe = NULL; p->wait_tty = 0;
+        p->wait_pty = NULL;
         p->state = PROC_READY;
     }
     return 0;
