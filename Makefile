@@ -31,6 +31,12 @@ GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo NOHASH)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
 		  -fstack-protector-strong $(INCLUDES) \
 		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(CFLAGS_EXTRA)
+# Header dependency tracking: every kernel object also depends on the headers it
+# includes (gcc writes foo.d next to foo.o). Without it, changing only a header
+# (e.g. a regenerated embedded program crypto/user_*_elf.h) left the objects that
+# #include it stale, so `make iso` silently shipped the old programs.
+DEPFLAGS = -MMD -MP
+CFLAGS  += $(DEPFLAGS)
 LDFLAGS = -n -T linker.ld
 
 SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.asm $(ARCH_DIR)/context_switch_asm.asm
@@ -118,6 +124,8 @@ KERNEL_NOTE = $(BOOT_DIR)/kernel_note.o
 # the Linux-compat shim; prebuilt + committed so the kernel build needs no network).
 ATH9K_HW = drivers/ath9k_port/ath9k_hw.o
 OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE) $(ATH9K_HW)
+DEPS     = $(OBJS_C:%.o=%.d)
+-include $(DEPS)
 
 # Keep `make` (no target) building the kernel: the rule below would otherwise be
 # the first target in the file and become the default goal.
@@ -355,6 +363,18 @@ user-progs:
 	python3 tools/elf2h.py user/sysfuzz.elf user_sysfuzz_elf crypto/user_sysfuzz_elf.h
 	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig -> crypto/*.h"
 
+# Staleness guard for the committed embedded programs: rebuild + re-sign them
+# (deterministic: same sources -> byte-identical headers) and fail if any
+# crypto/user_*_elf.h differs from the committed one, i.e. someone changed the
+# libc / an ABI struct / a program without regenerating. Needs python3
+# 'cryptography'. Does not cover port-bash / port-lua (network / long builds).
+.PHONY: check-user-progs
+check-user-progs: user-progs
+	@git diff --quiet -- 'crypto/user_*_elf.h' 'crypto/user_*_spkg.h' || { \
+	  echo "check-user-progs: STALE embedded programs (regenerated, commit them):"; \
+	  git diff --stat -- 'crypto/user_*_elf.h' 'crypto/user_*_spkg.h'; exit 1; }
+	@echo "check-user-progs: embedded programs match their sources"
+
 # [M34] Port of lua 5.4.7 FROM SOURCE (third_party/lua), signed + embedded.
 # Compiles the lua core + the OS-independent standard libs (base/table/string/
 # math/coroutine/utf8) against the SecOS libc/libm/setjmp, links a freestanding
@@ -504,7 +524,7 @@ run-vnc: iso
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
-	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(KERNEL)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)

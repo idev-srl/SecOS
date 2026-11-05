@@ -30,3 +30,6 @@ user/*.spkg
 # the signed embedded header crypto/user_lua_elf.h is committed)
 user/luaobj/
 user/lua.elf
+
+# gcc -MMD header dependency files
+*.d
