@@ -209,6 +209,7 @@ void sched_exit_current(trapframe_t* tf) {
     debugcon_print_hex(current->pid);
     debugcon_writestring("\n");
     // [M16] exit_code was set by the SYS_EXIT handler from the user's status.
+    process_release_pipes(current);    // close pipe ends now: readers see EOF before wait()
     current->state = PROC_ZOMBIE;
     notify_parent_sigchld(current);                       // [M30] SIGCHLD to parent
     // [M16/M39] Deliver the status to a blocked waiter; if one collected it, this
@@ -239,6 +240,7 @@ void sched_kill_current(int reason) {
     debugcon_writestring("\n");
     // Encode the fault as a signal-style status (128 + vector), à la POSIX.
     current->exit_code = 128 + (reason & 0x7F);
+    process_release_pipes(current);    // close pipe ends now: readers see EOF before wait()
     current->state = PROC_ZOMBIE;
     notify_parent_sigchld(current);                       // [M30] SIGCHLD to parent
     if (sched_wake_waitpid(current->pid, current->exit_code) > 0) current->collected = 1;

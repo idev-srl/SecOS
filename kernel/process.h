@@ -107,5 +107,6 @@ process_t* process_find_by_pid(uint32_t pid);
 void process_foreach(void (*cb)(process_t*, void*), void* user);
 process_t* process_reap_one(uint32_t affinity); // [M29] detach+return one ZOMBIE
 int process_destroy(process_t* p);
+void process_release_pipes(process_t* p); // drop pipe ends at exit (EOF to peers)
 
 #endif // PROCESS_H

@@ -625,6 +625,24 @@ void process_print(const process_t* p) {
     terminal_writestring("\n");
 }
 
+// Drop every pipe end the process still holds. Called when a process exits
+// (SYS_EXIT or a fatal signal/fault), not only when its zombie is reaped: a
+// zombie is kept until the parent wait()s, so a write end held until reap means
+// a parent that reads to EOF before waiting (bash command substitution `$(...)`)
+// never sees EOF and deadlocks. Idempotent: released slots are cleared.
+void process_release_pipes(process_t* p) {
+    extern void pipe_unref(void*, int);
+    if (!p) return;
+    for (int i = 0; i < 32; i++) {
+        if (p->fds[i].used && p->fds[i].is_pipe) {
+            void* pp = p->fds[i].inode;
+            int   w  = p->fds[i].pipe_w;
+            p->fds[i].is_pipe = 0; p->fds[i].used = 0; p->fds[i].inode = NULL;
+            pipe_unref(pp, w);
+        }
+    }
+}
+
 int process_destroy(process_t* p) {
     if (!p) return -1;
     // [M11] Drop any driver bindings first: the registry holds a process_t*; a
@@ -635,13 +653,9 @@ int process_destroy(process_t* p) {
     extern void socket_owner_cleanup(uint32_t pid);
     socket_owner_cleanup(p->pid);
     // [M25] Drop any still-open pipe ends so the peer observes EOF/EPIPE and the
-    // pipe object is freed once both ends are gone.
-    { extern void pipe_unref(void*, int);
-      for (int i = 0; i < 32; i++)
-          if (p->fds[i].used && p->fds[i].is_pipe) {
-              pipe_unref(p->fds[i].inode, p->fds[i].pipe_w);
-              p->fds[i].is_pipe = 0; p->fds[i].used = 0;
-          } }
+    // pipe object is freed once both ends are gone. Normally already done at exit
+    // (process_release_pipes); this catches processes destroyed without exiting.
+    process_release_pipes(p);
     extern int elf_unload_process(process_t* p);
     elf_unload_process(p);                       // unmap + free user page frames, zero PTEs
     if (p->manifest) { kfree(p->manifest); p->manifest = NULL; }
