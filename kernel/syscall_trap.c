@@ -126,6 +126,17 @@ uint64_t syscall_handler(trapframe_t* tf) {
         }
     }
     else
+    // SYS_EXECVE(path, argv, envp): replace the caller's image in place. On
+    // success the trapframe now enters the new image (rax=0); on failure the
+    // old image continues with -errno. Needs CAP_PROC when confined (like spawn).
+    if (num == SYS_EXECVE) {
+        if (!cap_check(cur, CAP_PROC, num, "execve")) {
+            ret = (uint64_t)(int64_t)-1;                // EPERM
+        } else {
+            ret = (uint64_t)ksys_execve(tf, tf->rdi, tf->rsi, tf->rdx);
+        }
+    }
+    else
     // [M16] SYS_WAIT: blocking wait for a child, returning its exit status.
     // If the child is still running, block the caller (rewind rip so the syscall
     // re-runs on wake) instead of busy-polling. A woken waiter finds its result

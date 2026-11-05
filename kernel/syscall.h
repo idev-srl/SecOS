@@ -69,7 +69,8 @@
 #define SYS_GETPGID     57 // getpgid(pid) -> process group id (pid 0 = caller) / -ESRCH
 #define SYS_SIGSUSPEND  58 // sigsuspend(mask) -> -EINTR once a signal was delivered
 #define SYS_REBOOT      59 // reboot(cmd): orderly poweroff(1)/restart(2)/halt(3); returns only on error
-// Note: execve is emulated in libc (spawn+waitpid+_exit) — no kernel syscall.
+#define SYS_EXECVE      60 // execve(path, argv, envp): replace the caller's image in place; returns only on error (-errno)
+#define SYS_FCNTL       61 // fcntl(fd, cmd, arg): F_DUPFD[_CLOEXEC] / F_GETFD / F_SETFD / F_GETFL / F_SETFL
 
 // [M24] socket types
 #define SOCK_STREAM 1   // TCP
@@ -144,6 +145,11 @@ int ksys_read(int fd, void* buf, int len);
 int ksys_getpid(void);
 void ksys_exit(int status);
 int ksys_spawn(const char* path);   // returns pid (>0) or -1 (no args)
+struct trapframe;
+// execve: path/argv/envp are user pointers (copied in here); 0 on success (tf
+// rewritten to the new image), -errno with the caller untouched on failure.
+long ksys_execve(struct trapframe* tf, uint64_t upath, uint64_t uargv, uint64_t uenvp);
+int ksys_fcntl(int fd, int cmd, long arg);
 int ksys_spawn_argv(const char* path, int argc, const char* const argv[]); // [M16]
 int ksys_wait(int pid);             // returns 0 when pid has exited, -1 if unknown (poll)
 // [M18] dynamic memory
