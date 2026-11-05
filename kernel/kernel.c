@@ -874,6 +874,77 @@ static void m19_run_demo(void) {
 }
 #endif /* M19_FORK_DEMO */
 
+// ---- In-place execve demo (gated; off by default) ----
+// Installs the signed /bin/exectest plus a tampered copy (one flipped byte), an
+// unsigned build and a text script, then runs exectest: failed execs must leave
+// the caller running, a successful exec keeps pid/fds/mask and drops cloexec fds
+// and caught handlers, and 200 fork+exec cycles must not leak PMM frames.
+// [EXECVE] markers on debugcon (see tools/selftest.sh "execve" section).
+#ifndef EXECVE_DEMO
+#define EXECVE_DEMO 0
+#endif
+#if EXECVE_DEMO
+#include "trapframe.h"
+#include "../crypto/user_exectest_elf.h"
+#include "../crypto/user_exectest_unsigned_elf.h"
+
+static uint8_t execve_idle_stack[16384] __attribute__((aligned(16)));
+static int execve_step = 0, execve_done = 0;
+
+static void execve_install(void) {
+    if (vfs_create("/bin/exectest", user_exectest_elf, user_exectest_elf_len) != 0)
+        debugcon_writestring("[EXECVE] WARN: install /bin/exectest failed\n");
+    uint8_t* t = (uint8_t*)kmalloc(user_exectest_elf_len);
+    if (t) {
+        for (unsigned i = 0; i < user_exectest_elf_len; i++) t[i] = user_exectest_elf[i];
+        t[user_exectest_elf_len / 2] ^= 0x01;           // one flipped byte: signature breaks
+        vfs_create("/bin/exectest_tampered", t, user_exectest_elf_len);
+        kfree(t);
+    }
+    vfs_create("/bin/exectest_unsigned", user_exectest_unsigned_elf, user_exectest_unsigned_elf_len);
+    static const char script[] = "#!/bin/bash\necho script\n";
+    vfs_create("/bin/exectest_script", script, sizeof(script) - 1);
+    debugcon_writestring("[EXECVE] test binaries installed\n");
+}
+
+__attribute__((noreturn)) static void execve_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (execve_step == 0) {
+            execve_step = 1;
+            execve_install();
+            static const char* const argv[] = { "exectest", 0 };
+            process_t* p = process_create_from_elf_args(user_exectest_elf, user_exectest_elf_len, 1, argv);
+            if (p) { p->state = PROC_READY; debugcon_writestring("[EXECVE] spawned exectest\n"); }
+            else   debugcon_writestring("[EXECVE] FAIL: exectest not loaded\n");
+        } else if (execve_step == 1 && sched_count_alive_user() == 0 && !execve_done) {
+            execve_done = 1;
+            debugcon_writestring("[EXECVE] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void execve_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[EXECVE] in-place execve demo\n");
+    static process_t  idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(execve_idle_stack + sizeof(execve_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)execve_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    debugcon_writestring("[EXECVE] entering scheduler\n");
+    arch_iret_to_tf(&idle_tf);
+}
+#endif /* EXECVE_DEMO */
+
 // ---- [M25] Anonymous pipes demo (gated; off by default) ----
 #ifndef M25_PIPE_DEMO
 #define M25_PIPE_DEMO 0
@@ -1946,6 +2017,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M19_FORK_DEMO
     m19_run_demo(); // fork/COW demo — does not return
+#endif
+#if EXECVE_DEMO
+    execve_run_demo(); // in-place execve demo — does not return
 #endif
 #if M20_MMAP_DEMO
     m20_run_demo(); // page cache demo — does not return
