@@ -1278,6 +1278,45 @@ static void coreutils_install(void) {
     // [abi] wait-status / DF-on-entry / PROT_NONE regression test
     vfs_create("/bin/abi_test", user_abi_test_elf, user_abi_test_elf_len);
 }
+// BusyBox 1.36.1 from source (tools/port-busybox.sh): the signed multi-call
+// binary goes to /bin/busybox and a tiny signed stub (user/bbstub.c, re-execs
+// /bin/busybox with the same argv) is installed under every applet name, since
+// the ramfs root has no symlinks and SYS_SPAWN does not follow them. BusyBox
+// replaces the SecOS coreutils of the same name; /bin/help, /bin/coreutils and
+// /bin/bash (GNU bash) stay. -DSECOS_NO_BUSYBOX drops it.
+#ifndef SECOS_NO_BUSYBOX
+#include "../crypto/user_busybox_elf.h"
+#include "../crypto/user_bbstub_elf.h"
+#include "busybox_applets.h"
+static void busybox_install(void) {
+    extern vfs_inode_t* vfs_lookup(const char*);
+    extern int vfs_create(const char*, const void*, size_t);
+    extern int vfs_remove(const char*);
+    if (vfs_lookup("/bin/busybox")) {          // already installed (persistent root)
+        debugcon_writestring("[BB] busybox already in /bin\n"); return;
+    }
+    if (vfs_create("/bin/busybox", user_busybox_elf, user_busybox_elf_len) != 0) {
+        debugcon_writestring("[BB] FAIL: could not install /bin/busybox\n"); return;
+    }
+    int ok = 0;
+    for (int i = 0; busybox_applets[i]; i++) {
+        char path[64]; int p = 0;
+        const char* pre = "/bin/"; for (int k = 0; pre[k]; k++) path[p++] = pre[k];
+        for (int k = 0; busybox_applets[i][k] && p < 63; k++) path[p++] = busybox_applets[i][k];
+        path[p] = 0;
+        if (vfs_lookup(path)) vfs_remove(path);  // BusyBox wins over a same-named coreutils applet
+        if (vfs_create(path, user_bbstub_elf, user_bbstub_elf_len) == 0) ok++;
+    }
+    debugcon_writestring("[BB] installed BusyBox to /bin/busybox (applets=");
+    debugcon_print_hex(ok); debugcon_writestring(")\n");
+    // Single-user account database for id/whoami/ls -l/ps/tar (BusyBox parses
+    // /etc/passwd + /etc/group itself). Everything runs as root.
+    static const char pw[] = "root:x:0:0:root:/root:/bin/bash\n";
+    static const char gr[] = "root:x:0:\n";
+    if (!vfs_lookup("/etc/passwd")) vfs_create("/etc/passwd", pw, sizeof(pw) - 1);
+    if (!vfs_lookup("/etc/group"))  vfs_create("/etc/group", gr, sizeof(gr) - 1);
+}
+#endif
 extern void shell_init(void);
 extern void shell_run(void);
 extern void shell_run_line(const char* line);
@@ -1298,6 +1337,9 @@ static trapframe_t m10_idle_tf;
 __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
     shell_init();
     coreutils_install();   // [M31] populate /bin with the signed coreutils applets
+#ifndef SECOS_NO_BUSYBOX
+    busybox_install();     // BusyBox userland: /bin/busybox + one stub per applet
+#endif
 #ifndef SECOS_NO_BASH
     // [M39] Install GNU bash to /bin/bash (idempotent).
     { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);

@@ -434,6 +434,16 @@ port-bash:
 	bash tools/port-bash.sh
 	@echo "port-bash: GNU bash 5.2 built from source, signed -> crypto/user_bash_elf.h"
 
+# BusyBox 1.36.1 from source (GPL-2.0, fetched + SHA-256-verified into
+# /tmp/secos-busybox, never vendored): configured from user/busybox.config,
+# compiled against the SecOS libc + user/busybox-include + user/busybox_compat.c,
+# signed -> crypto/user_busybox_elf.h + the applet stub crypto/user_bbstub_elf.h
+# + kernel/busybox_applets.h. Needs network (first run) + python3 'cryptography'.
+.PHONY: port-busybox
+port-busybox:
+	bash tools/port-busybox.sh
+	@echo "port-busybox: BusyBox 1.36.1 built from source, signed -> crypto/user_busybox_elf.h"
+
 # --- Test disk images (virtio-blk) ---
 # A small FAT32 data disk with a known test file. Used by the storage smoke
 # tests; attach with -drive file=$(DISK_IMG),if=virtio,format=raw.
