@@ -29,6 +29,10 @@ typedef int sig_atomic_t;
 #define SIGTSTP  20
 #define SIGTTIN  21
 #define SIGTTOU  22
+/* Number of signal slots (valid signals are 1..NSIG-1); the kernel keeps
+ * sig_handler[32]. Without it bash defaulted NSIG to 64 and its trap-name
+ * table (signames.h) no longer lined up DEBUG/ERR/RETURN. */
+#define NSIG     32
 
 /* Handler dispositions (must match the kernel's signal.h). */
 #define SIG_DFL  ((sighandler_t)0)

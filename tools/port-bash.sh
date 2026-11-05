@@ -48,6 +48,25 @@ if 'SecOS port overrides' not in s:
     open(f,'w').write(s)
 PY
 
+echo "[port-bash] 2b/6 rebuild signames.h for SecOS NSIG=32"
+# The native build's signames.h lists the host's 65 Linux signals, but bash's
+# trap code indexes signal_names[NSIG + {0,1,2}] for DEBUG/ERR/RETURN with the
+# SecOS NSIG (user/include/signal.h). Keep signals 0..31 (same numbering as
+# Linux) followed by the three pseudo-signals and the terminator.
+python3 - "$WORK/signames.h" <<'PY'
+import re, sys
+f = sys.argv[1]; s = open(f).read()
+if 'SecOS NSIG=32' not in s:
+    body = s[s.index('{') + 1 : s.index('};')]
+    names = re.findall(r'"([^"]*)"', body)
+    keep = names[:32] + ['DEBUG', 'ERR', 'RETURN']
+    assert len(names) > 32 and names[-3:] == ['DEBUG', 'ERR', 'RETURN'], names[-3:]
+    arr = ''.join('    "%s",\n' % n for n in keep) + '    (char *)0x0\n'
+    s = s[: s.index('{') + 1] + '\n' + arr + s[s.index('};'):]
+    s = s.replace('/* A translation list', '/* SecOS NSIG=32 */\n/* A translation list', 1)
+    open(f, 'w').write(s)
+PY
+
 echo "[port-bash] 3/6 regenerate builtin .c from .def"
 ( cd builtins && for d in *.def; do ./mkbuiltins -D . "$d" >/dev/null 2>&1; done )
 
