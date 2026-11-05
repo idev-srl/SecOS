@@ -243,6 +243,15 @@ installer looks up hundreds of files. The pool now grows in kmalloc'd chunks of
 64, with one slot per on-disk inode that is never reused while mounted (up to
 32768 distinct inodes per mount). A remount reuses the chunks.
 
+## Bug fixed on the way: O_APPEND writes after fork overwrote each other
+
+`/var/log/sshd.log` lost lines. Dropbear and each forked session child share
+the log through inherited fds, but the kernel seeked to end of file only at
+`open(O_APPEND)`. After that, each fd wrote at its own private offset, so
+children overwrote each other's lines. `ksys_write` now moves an `O_APPEND` fd
+to the current end of file before every write. It looks the size up fresh,
+because ramfs keeps the size in its entry and not in the fd's inode.
+
 ## Testing
 
 `tools/selftest.sh`, **INIT gate** (end of the file; host port 23000–23999, never
