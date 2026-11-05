@@ -65,10 +65,7 @@ echo "[port-dropbear] 3/5 cross-compile against SecOS libc"
 rm -rf "$OBJ"; mkdir -p "$OBJ"/{db,ltc,ltm}
 fail=0
 cc1() { gcc "${DFLAGS[@]}" "$@" || fail=1; }
-# Dropbear's own sources get the O_NONBLOCK-aware read/write/fcntl wrappers
-# (DB_PORT_IO_WRAP); libtomcrypt calls prng_descriptor[].read() members, so the
-# function-like macros must not reach it.
-for o in $DB_OBJS;  do c="$WORK/src/${o%.o}.c";        cc1 -DDB_PORT_IO_WRAP -c "$c" -o "$OBJ/db/$(basename "$o")"; done
+for o in $DB_OBJS;  do c="$WORK/src/${o%.o}.c";        cc1 -c "$c" -o "$OBJ/db/$(basename "$o")"; done
 for o in $LTC_OBJS; do c="$WORK/libtomcrypt/${o%.o}.c"; cc1 -c "$c" -o "$OBJ/ltc/$(echo "${o%.o}" | tr / _).o"; done
 for o in $LTM_OBJS; do c="$WORK/libtommath/${o%.o}.c";  cc1 -c "$c" -o "$OBJ/ltm/$(basename "$o")"; done
 [ "$fail" = 0 ] || { echo "[port-dropbear] compile FAILED"; exit 1; }

@@ -243,84 +243,8 @@ W const char* gai_strerror(int err){
     }
 }
 
-/* ===================== poll / select (TODO(integration): move to libc) ===================== */
-W int poll(struct pollfd* fds, nfds_t n, int timeout_ms){
-    long r = secos_syscall(SYS_POLL_, (long)fds, (long)n, timeout_ms, 0, 0);
-    if(sc_missing(r)){                   /* kernel without SYS_POLL: say so once */
-        static int warned;
-        if(!warned){
-            static const char m[] = "dropbear: this SecOS kernel has no poll() (SYS_POLL 78); "
-                                    "the SSH server needs it\n";
-            warned = 1; (write)(2, m, sizeof(m) - 1);
-        }
-        r = -ENOSYS;
-    }
-    return (int)sc_ret(r);
-}
-W int select(int nfds, fd_set* rs, fd_set* ws, fd_set* es, struct timeval* tv){
-    struct pollfd p[FD_SETSIZE];
-    int n = 0;
-    if(nfds < 0 || nfds > FD_SETSIZE){ errno = EINVAL; return -1; }
-    for(int fd = 0; fd < nfds; fd++){
-        short ev = 0;
-        if(rs && FD_ISSET(fd, rs)) ev |= POLLIN;
-        if(ws && FD_ISSET(fd, ws)) ev |= POLLOUT;
-        if(es && FD_ISSET(fd, es)) ev |= POLLPRI;
-        if(ev){ p[n].fd = fd; p[n].events = ev; p[n].revents = 0; n++; }
-    }
-    int timeout = -1;
-    if(tv){
-        long ms = tv->tv_sec * 1000L + (tv->tv_usec + 999) / 1000;
-        timeout = ms > 0x7fffffffL ? 0x7fffffff : (int)ms;
-    }
-    int r = poll(p, (nfds_t)n, timeout);
-    if(r < 0) return -1;
-    if(rs) FD_ZERO(rs);
-    if(ws) FD_ZERO(ws);
-    if(es) FD_ZERO(es);
-    int count = 0;
-    for(int i = 0; i < n; i++){
-        short re = p[i].revents;
-        if(re & POLLNVAL){ errno = EBADF; return -1; }
-        if(rs && (p[i].events & POLLIN) && (re & (POLLIN|POLLHUP|POLLERR))){ FD_SET(p[i].fd, rs); count++; }
-        if(ws && (p[i].events & POLLOUT) && (re & (POLLOUT|POLLHUP|POLLERR))){ FD_SET(p[i].fd, ws); count++; }
-        if(es && (p[i].events & POLLPRI) && (re & POLLPRI)){ FD_SET(p[i].fd, es); count++; }
-    }
-    return count;
-}
-
-/* ===================== O_NONBLOCK emulation (see dropbear_port.h) ===================== */
-static unsigned char g_nonblock[FD_SETSIZE];      /* copied by fork with the image */
-static int nb_ready(int fd, short ev){
-    struct pollfd p; p.fd = fd; p.events = ev; p.revents = 0;
-    int r = poll(&p, 1, 0);
-    if(r < 0) return errno == ENOSYS ? 1 : -1;     /* no poll: behave as before */
-    return r > 0 && (p.revents & (ev | POLLHUP | POLLERR | POLLNVAL));
-}
-int db_fcntl(int fd, int cmd, ...){
-    va_list ap; va_start(ap, cmd); long arg = va_arg(ap, long); va_end(ap);
-    int r = (fcntl)(fd, cmd, arg);
-    if(fd >= 0 && fd < FD_SETSIZE){
-        if(cmd == F_SETFL){ g_nonblock[fd] = (arg & O_NONBLOCK) ? 1 : 0; if(r < 0) r = 0; }
-        else if(cmd == F_GETFL && r >= 0 && g_nonblock[fd]) r |= O_NONBLOCK;
-        else if((cmd == F_DUPFD) && r >= 0 && r < FD_SETSIZE) g_nonblock[r] = 0;
-    }
-    return r;
-}
-ssize_t db_read(int fd, void* buf, size_t n){
-    if(fd >= 0 && fd < FD_SETSIZE && g_nonblock[fd]){
-        int k = nb_ready(fd, POLLIN);
-        if(k == 0){ errno = EAGAIN; return -1; }
-    }
-    return (read)(fd, buf, n);
-}
-ssize_t db_write(int fd, const void* buf, size_t n){
-    if(fd >= 0 && fd < FD_SETSIZE && g_nonblock[fd]){
-        int k = nb_ready(fd, POLLOUT);
-        if(k == 0){ errno = EAGAIN; return -1; }
-    }
-    return (write)(fd, buf, n);
-}
+/* poll / select / pselect and O_NONBLOCK: libc + the kernel (SYS_POLL; pipes and
+ * sockets return -EAGAIN when O_NONBLOCK is set). */
 
 /* ===================== I/O ===================== */
 W ssize_t writev(int fd, const struct iovec* iov, int cnt){
@@ -442,19 +366,9 @@ W int gethostname(char* name, size_t len){
  * runs as. Any other user name does not exist (Dropbear rejects it before
  * looking at keys). The password field is locked: password auth is compiled
  * out anyway (DROPBEAR_SVR_PASSWORD_AUTH 0). */
-static struct passwd g_root = { "root", "!", 0, 0, "SecOS root", "/root", "/bin/bash" };
-struct passwd* getpwnam(const char* n){ return (n && !strcmp(n, "root")) ? &g_root : 0; }
-struct passwd* getpwuid(int u){ return u == 0 ? &g_root : 0; }
-struct passwd* getpwent(void){ return 0; }
-void setpwent(void){}
-void endpwent(void){}
-static char* g_root_mem[] = { "root", 0 };
-static struct group g_rootgrp = { "root", "!", 0, g_root_mem };
-struct group* getgrnam(const char* n){ return (n && !strcmp(n, "root")) ? &g_rootgrp : 0; }
-struct group* getgrgid(int g){ return g == 0 ? &g_rootgrp : 0; }
-struct group* getgrent(void){ return 0; }
-void setgrent(void){}
-void endgrent(void){}
+/* getpwnam/getpwuid/getgr*: libc (/etc/passwd + /etc/group, shared with
+ * BusyBox). Dropbear runs non-multiuser, so only the account it runs as
+ * (root) can authenticate whatever the files list. */
 /* Valid login shells (there is no /etc/shells): the account's own shell. */
 static const char* const g_shells[] = { "/bin/bash", 0 };
 static int g_shell_i;

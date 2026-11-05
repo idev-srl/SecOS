@@ -237,22 +237,7 @@ struct tm {
 #endif
 #define SOL_TCP 6
 
-/* ---- O_NONBLOCK in user space ----
- * Dropbear drains its signal self-pipe with `while (read(p, &x, 1) > 0)` and
- * relies on O_NONBLOCK everywhere. The SecOS kernel does not honour O_NONBLOCK
- * on pipes yet (and has no fcntl syscall before SYS_FCNTL), so a read on an
- * empty pipe blocks forever. db_fcntl() records O_NONBLOCK per fd (and still
- * forwards to the libc fcntl); db_read()/db_write() on such an fd first
- * poll() with a zero timeout and return EAGAIN when it is not ready.
- * TODO(integration): drop once the kernel returns -EAGAIN for O_NONBLOCK pipes. */
-int     db_fcntl(int fd, int cmd, ...);
-ssize_t db_read(int fd, void* buf, size_t n);
-ssize_t db_write(int fd, const void* buf, size_t n);
-#ifdef DB_PORT_IO_WRAP
-#define fcntl(...)    db_fcntl(__VA_ARGS__)
-#define read(f,b,n)   db_read(f,b,n)
-#define write(f,b,n)  db_write(f,b,n)
-#endif
+/* O_NONBLOCK: the kernel honours it on pipes and sockets (-EAGAIN). */
 
 /* ---- POSIX functions with SecOS-incompatible prototypes ---- */
 int open(const char* path, int flags, ...);
