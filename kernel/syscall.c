@@ -56,6 +56,21 @@ static uint8_t g_spawn_buf[1024*1024];   // [M39] 1 MB: fits GNU bash (548 KB) &
 // [M16] Spawn with argv. The single static load buffer is safe because kernel
 // code is non-preemptible (preemption fires only on a ring-3 timer tick) and
 // process_create_from_elf_args copies/pins the image before returning.
+// [M39] A spawned child inherits the caller's stdio (fds 0/1/2), as a fork+execve child would. libc emulates execve as
+// spawn+wait+_exit, so without this a command run by bash with its stdout
+// redirected into a pipe (`$(cmd)`, `a | b`) or a file wrote to the console
+// instead. Only 0/1/2 are inherited: there is no FD_CLOEXEC yet, so passing
+// higher fds would leak the caller's private pipe ends into the child and could
+// keep a pipe's write end alive (no EOF). Pipe ends gain a reference.
+static void spawn_inherit_stdio(process_t* parent, process_t* child){
+    if(!parent || !child) return;
+    for(int i=0;i<3;i++){
+        if(!parent->fds[i].used) continue;
+        child->fds[i]=parent->fds[i];
+        if(child->fds[i].is_pipe) pipe_ref((pipe_t*)child->fds[i].inode, child->fds[i].pipe_w);
+    }
+}
+
 int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     extern int vfs_read_all(const char*, void*, size_t);
     if(!path) return -1;
@@ -63,6 +78,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     if(n <= 0) return -1;
     process_t* p = process_create_from_elf_args(g_spawn_buf, (size_t)n, argc, argv);
     if(!p) return -1;
+    spawn_inherit_stdio(sched_get_current(), p);   // before READY: never runs without them
     p->state = PROC_READY;
     return (int)p->pid;
 }
