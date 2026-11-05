@@ -32,6 +32,9 @@ extern process_t* sched_get_current(void);
 static char g_line[TTY_LINE];   /* assembled line (incl. trailing '\n') */
 static int  g_len = 0;          /* bytes assembled and ready to deliver  */
 static int  g_pos = 0;          /* bytes already delivered to the reader */
+static int  g_asm = 0;          /* bytes of the line being typed (not yet complete) */
+
+#define TTY_EINTR (-4)          /* -EINTR: libc maps it to errno=EINTR */
 
 /* Returns 0 and stores a char in *out, or -1 if interrupted by a pending signal
  * (so the read() returns EINTR and the signal can be delivered). [M30] */
@@ -46,7 +49,11 @@ static int tty_getchar_blocking(char* out) {
 }
 
 /* Cooked line read. Returns >0 bytes (up to len), 0 on EOF (Ctrl-D on an empty
- * line), or -1 when the line was interrupted (Ctrl-C). */
+ * line), or -EINTR when a signal is pending or the line was cancelled (Ctrl-C).
+ * A signal interruption keeps the partially typed line (g_asm) so the re-issued
+ * read() continues it. It used to return -1 (errno EPERM) and drop the partial
+ * line: bash treats a non-EINTR read error on stdin as EOF, so a SIGCHLD from a
+ * background job landing while the user typed made the login shell exit. */
 int tty_read(void* buf, int len) {
     if (len <= 0) return -1;
     char* out = (char*)buf;
@@ -58,11 +65,14 @@ int tty_read(void* buf, int len) {
         return n;
     }
 
-    /* Assemble a fresh line. */
-    int n = 0;
+    /* Assemble a line (resuming one interrupted by a signal). */
+    int n = g_asm;
     for (;;) {
         char c;
-        if (tty_getchar_blocking(&c) != 0) return -1;   /* [M30] interrupted */
+        if (tty_getchar_blocking(&c) != 0) {             /* [M30] interrupted */
+            g_asm = n;                                   /* resume on re-read */
+            return TTY_EINTR;
+        }
         if (c == '\n' || c == '\r') {
             terminal_putchar('\n');
             if (n < TTY_LINE) g_line[n++] = '\n';   /* keep the newline (POSIX) */
@@ -70,17 +80,18 @@ int tty_read(void* buf, int len) {
         } else if (c == '\b' || c == 0x7f) {        /* backspace / DEL */
             if (n > 0) { n--; terminal_writestring("\b \b"); }
         } else if (c == 0x04) {                      /* Ctrl-D */
-            if (n == 0) return 0;                    /* EOF on an empty line */
+            if (n == 0) { g_asm = 0; return 0; }     /* EOF on an empty line */
             break;                                   /* else deliver the partial line */
         } else if (c == 0x03) {                      /* Ctrl-C */
             terminal_writestring("^C\n");
-            return -1;                               /* interrupt the read */
+            g_asm = 0;                               /* the line is discarded */
+            return TTY_EINTR;                        /* interrupt the read */
         } else if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7f) {
             if (n < TTY_LINE - 1) { g_line[n++] = c; terminal_putchar(c); }
         }
     }
 
-    g_len = n; g_pos = 0;
+    g_len = n; g_pos = 0; g_asm = 0;
     int m = 0;
     while (g_pos < g_len && m < len) out[m++] = g_line[g_pos++];
     return m;
