@@ -16,7 +16,9 @@ ssize_t read(int fd, void* buf, size_t len);
 int     open(const char* path, int flags);
 #endif
 int     close(int fd);
-/* [M23/M26] file positioning + stat. Layout mirrors struct secos_stat. */
+/* [M23/M26] file positioning + stat. Layout mirrors struct secos_stat; both sides
+ * are pinned to kernel/secos_abi.h. */
+#include "../kernel/secos_abi.h"
 struct stat {
     unsigned long st_size;
     unsigned st_mode;          /* full POSIX mode (S_IFMT | perms) */
@@ -29,6 +31,7 @@ struct stat {
     unsigned long st_dev, st_ino, st_rdev;
     long st_blksize, st_blocks;
 };
+SECOS_ABI_CHECK_STAT(struct stat);   /* must match kernel struct secos_stat */
 #define S_IFMT  0xF000
 #define S_IFREG 0x8000
 #define S_IFDIR 0x4000

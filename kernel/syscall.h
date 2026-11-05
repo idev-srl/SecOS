@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "secos_abi.h"
 
 // Syscall numbers (phase 1)
 #define SYS_YIELD   0
@@ -119,6 +120,7 @@ struct secos_stat {
     int64_t  st_blksize;// preferred I/O block size   (offset 72)  [M39]
     int64_t  st_blocks; // 512-byte blocks allocated  (offset 80)  [M39]
 };
+SECOS_ABI_CHECK_STAT(struct secos_stat);   // must match user/libsecos.h struct stat
 
 // [M26] POSIX mode helpers (S_IFMT mask + type bits; perms in the low 12 bits).
 #define S_IFMT   0xF000
