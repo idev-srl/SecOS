@@ -430,6 +430,14 @@ int pmm_unref_frame(void* addr) {
     return r;
 }
 
+int pmm_frame_shared(void* addr) {
+    uint64_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
+    uint64_t fl = spin_lock_irqsave(&pmm_lock);
+    int r = (frame < total_frames && frame_refs && frame_refs[frame] > 0);
+    spin_unlock_irqrestore(&pmm_lock, fl);
+    return r;
+}
+
 // Get total memory (sum of regions)
 uint64_t pmm_get_total_memory(void) {
     return total_memory;

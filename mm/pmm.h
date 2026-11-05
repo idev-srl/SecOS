@@ -35,6 +35,7 @@ void pmm_free_contiguous(void* addr, size_t count);
 void pmm_free_frame(void* addr);
 void pmm_share_frame(void* addr);   // [M19] COW: add a reference
 int  pmm_unref_frame(void* addr);   // [M19] COW: drop a reference; 1=still shared, 0=free it
+int  pmm_frame_shared(void* addr);  // 1 if more than one mapping references the frame
 
 // Memory info accessors
 uint64_t pmm_get_total_memory(void);

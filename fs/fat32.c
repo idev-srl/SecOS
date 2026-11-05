@@ -529,17 +529,35 @@ static vfs_fs_ops_t fat32_ops = {
 int fat32_mount(const char* dev_name, const char* mount_point){
     block_dev_t* dev = block_find(dev_name);
     if(!dev) return -1;
+    // Probe into locals: a rejected device must not clobber the geometry (or
+    // g_dev) of a volume that is already mounted.
+    static uint8_t bs[SECSZ];
+    if(block_read(dev, 0, bs, 1)!=1) return -1;
+    uint16_t bps   = rd16(bs+11);
+    uint8_t  spc   = bs[13];
+    uint16_t rsvd  = rd16(bs+14);
+    uint8_t  nfats = bs[16];
+    uint32_t spf   = rd32(bs+36);
+    uint32_t root  = rd32(bs+44);
+    uint32_t total_sectors = rd32(bs+32);
+    if(bps!=SECSZ || spc==0 || nfats==0 || spf==0) return -1;
+    if(bs[510]!=0x55 || bs[511]!=0xAA) return -1;
+    // Only FAT32: a FAT12/16 BPB has a fixed root directory (BPB_RootEntCnt != 0)
+    // and a 16-bit FAT size (BPB_FATSz16 != 0), and offsets 36/44 are not
+    // BPB_FATSz32/BPB_RootClus there. Mounting one with FAT32 geometry read
+    // garbage (and would have written garbage): QEMU's vvfat ESP (FAT16) used
+    // in the UEFI smoke test was mounted at /mnt and failed the M10 readback.
+    if(rd16(bs+17)!=0 || rd16(bs+22)!=0 || rd16(bs+19)!=0) return -1;
+    if(total_sectors==0 || root<2) return -1;
+    if((uint64_t)rsvd + (uint64_t)nfats*spf >= total_sectors) return -1;
     g_dev = dev;
-    if(sec_read(0, g_sec)!=0) return -1;
-    g_bytes_per_sec = rd16(g_sec+11);
-    g_sec_per_clus  = g_sec[13];
-    g_reserved      = rd16(g_sec+14);
-    g_num_fats      = g_sec[16];
-    g_sec_per_fat   = rd32(g_sec+36);
-    g_root_clus     = rd32(g_sec+44);
-    uint32_t total_sectors = rd32(g_sec+32);
-    if(g_bytes_per_sec!=SECSZ || g_sec_per_clus==0 || g_num_fats==0 || g_sec_per_fat==0) return -1;
-    if(g_sec[510]!=0x55 || g_sec[511]!=0xAA) return -1;
+    for(int i=0;i<SECSZ;i++) g_sec[i]=bs[i];
+    g_bytes_per_sec = bps;
+    g_sec_per_clus  = spc;
+    g_reserved      = rsvd;
+    g_num_fats      = nfats;
+    g_sec_per_fat   = spf;
+    g_root_clus     = root;
     g_fat_start  = g_reserved;
     g_data_start = g_reserved + g_num_fats*g_sec_per_fat;
     uint32_t data_sectors = total_sectors - g_data_start;

@@ -238,8 +238,17 @@ int execve(const char* path, char* const argv[], char* const envp[]){
     (void)envp;
     int pid = spawn(path, (char* const*)argv);
     if(pid < 0) return -1;
-    int st = waitpid(pid);
-    _exit(st & 0xff);
+    int st;
+    while((st = waitpid(pid)) == -4 /*-EINTR*/){ }   /* a handled signal: keep waiting */
+    if(st < 0) _exit(127);
+    if(WIFSIGNALED(st)){
+        /* Propagate the death-by-signal: re-raise it with the default action so
+         * our own waiter sees the same wait status, not an exit code. */
+        signal(WTERMSIG(st), (sighandler_t)0 /*SIG_DFL*/);
+        kill(getpid(), WTERMSIG(st));
+        _exit(128 + WTERMSIG(st));   /* fallback if the signal did not kill us */
+    }
+    _exit(WEXITSTATUS(st));
     return -1; /* unreached */
 }
 int execv(const char* path, char* const argv[]){ return execve(path, argv, environ); }

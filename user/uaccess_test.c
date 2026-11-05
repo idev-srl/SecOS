@@ -173,7 +173,7 @@ int main(void) {
             _exit(r == 4 && cowbuf[1] == 'E' ? 42 : 1);
         }
         int st = pid > 0 ? waitpid(pid) : -1;
-        check("kernel-write-to-cow-page", st == 42 && cowbuf[0] == 'p', st);
+        check("kernel-write-to-cow-page", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 42 && cowbuf[0] == 'p', st);
     }
 
 

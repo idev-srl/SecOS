@@ -24,6 +24,7 @@ int main(void) {
 
     /* parent: wait for the child, then confirm its own buffer is untouched. */
     int st = waitpid(pid);
+    st = WIFEXITED(st) ? WEXITSTATUS(st) : 0;   /* 0 = killed: never prints 7 */
     char m[40]; int i = 0;
     const char* p = "[m19] parent: child status=";
     while (*p) m[i++] = *p++;

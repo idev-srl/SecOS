@@ -13,7 +13,7 @@ void sched_yield_from_syscall(trapframe_t* tf); // [M7] cooperative yield from I
 // [M8] process lifecycle + idle/preemption
 void sched_set_idle(process_t* idle);     // register the kernel idle task
 void sched_exit_current(trapframe_t* tf);  // SYS_EXIT: zombie + switch away (no return)
-void sched_kill_current(int reason) __attribute__((noreturn)); // [M15] fault -> kill + switch away
+void sched_kill_current(int sig) __attribute__((noreturn)); // [M15] fault -> kill + switch away
 void sched_block_current(trapframe_t* tf); // [M16/M17] block caller (re-runs syscall on wake)
 void sched_stop_current(trapframe_t* tf) __attribute__((noreturn)); // [M30] SIGSTOP/SIGTSTP
 int  sched_wake_waitpid(uint32_t pid, int code); // [M16] wake a SYS_WAIT blocker -> #woken

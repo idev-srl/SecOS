@@ -18,13 +18,11 @@ static void* zmem(void* d, int c, unsigned long n){ char* p=d; while(n--) *p++=(
 
 /* ---- process wait: POSIX 3-arg over SecOS SYS_WAIT / SYS_WAITANY ---- */
 extern int errno;
-static int enc_status(long code){
-    /* Job-control reports are already POSIX: stopped = (sig<<8)|0x7f,
-     * continued = 0xffff (SYS_WAITANY with WUNTRACED / WCONTINUED). */
-    if((code > 0xff && (code & 0xff) == 0x7f) || code == 0xffff) return (int)code;
-    return (code >= 128) ? (int)((code-128) & 0x7f)     /* WIFSIGNALED / WTERMSIG */
-                         : (int)((code & 0xff) << 8);   /* WIFEXITED / WEXITSTATUS */
-}
+/* The kernel returns the POSIX/Linux wait-status encoding end to end: exit ->
+ * (st&0xff)<<8, killed by sig -> signo, stopped -> (sig<<8)|0x7f and
+ * continued -> 0xffff (SYS_WAITANY with WUNTRACED / WCONTINUED), so a child
+ * that exits 142 is not confused with one killed by signal 14. */
+static int enc_status(long code){ return (int)(code & 0xffff); }
 int bash_waitpid(pid_t pid, int* status, int options){
     if(pid == (pid_t)-1){                 /* wait for ANY child (bash's wait_for loop) */
         int code = 0;

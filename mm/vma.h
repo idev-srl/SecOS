@@ -59,6 +59,10 @@ const vma_t* vma_find(const vma_set_t* s, uint64_t addr);
 vma_t* vma_find_mut(vma_set_t* s, uint64_t addr);
 // [M18] Mark a slot as a tombstone (removed). Indices of other slots are stable.
 void vma_remove(vma_set_t* s, vma_t* v);
+// Split 'v' at page-aligned 'addr' (v->start < addr < v->end): 'v' keeps
+// [start, addr) and a new slot gets [addr, end) with the same type/flags and
+// its backing (image window / page-cache offset) rebased. 0, or -1 if full.
+int vma_split(vma_set_t* s, vma_t* v, uint64_t addr);
 // [M18] Does any live VMA overlap [start,end)?
 int vma_overlaps(const vma_set_t* s, uint64_t start, uint64_t end);
 // [M18] Sum of live VMA sizes (reserved virtual footprint, for max_mem checks).

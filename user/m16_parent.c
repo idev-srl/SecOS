@@ -8,9 +8,11 @@ int main(void) {
     int pid = spawn("/m16_child.elf", av);
     if (pid < 0) { puts("[parent] spawn FAILED"); return 1; }
     int st = waitpid(pid); /* blocks until the child exits */
+    st = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
     char m[40]; int i = 0;
     const char* p = "[parent] child status=";
     while (*p) m[i++] = *p++;
+    if (st < 0) { m[i++] = '?'; m[i++] = '\n'; write(1, m, i); return 1; }
     if (st >= 100) m[i++] = (char)('0' + (st / 100) % 10);
     if (st >= 10)  m[i++] = (char)('0' + (st / 10) % 10);
     m[i++] = (char)('0' + st % 10);

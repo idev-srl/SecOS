@@ -115,6 +115,11 @@ int ksys_msg_recv_try(int chan, void* ubuf, int len){
 // All operate on the current process's VMA set; pages are demand-faulted (the
 // M14 #PF path), so these calls only manipulate VMAs + already-present PTEs.
 static uint64_t m18_prot_to_flags(int prot){
+    // PROT_NONE: reserved but inaccessible. Never demand-faulted; present pages
+    // are parked not-present (vmm_protect_in_space) so neither ring 3 nor the
+    // kernel's uaccess can touch them (user -> SIGSEGV, syscall -> -EFAULT).
+    if (!(prot & (PROT_READ | PROT_WRITE | PROT_EXEC)))
+        return VMM_FLAG_PROTNONE | VMM_FLAG_NOEXEC;
     uint64_t f = VMM_FLAG_USER;
     if (prot & PROT_WRITE) f |= VMM_FLAG_RW;
     if (!(prot & PROT_EXEC)) f |= VMM_FLAG_NOEXEC; // NX unless EXEC requested
@@ -144,15 +149,21 @@ uint64_t ksys_brk(uint64_t new_brk){
     if (new_brk > old) {                            // grow
         if (c->mem_limit && vma_total_bytes(&c->vmas) + (new_brk - old) > c->mem_limit)
             return old;                             // would exceed signed mem limit
-        vma_t* h = vma_find_mut(&c->vmas, c->brk_start);
-        if (h) h->end = new_brk;
-        else if (vma_add(&c->vmas, c->brk_start, new_brk,
-                         VMM_FLAG_USER|VMM_FLAG_RW|VMM_FLAG_NOEXEC, VMA_TYPE_ANON,0,0,0,0) != 0)
+        // Extend the heap's LAST piece (mprotect may have split the heap) when
+        // it is plain RW anon; otherwise add a fresh RW piece for [old, new).
+        const uint64_t hf = VMM_FLAG_USER|VMM_FLAG_RW|VMM_FLAG_NOEXEC;
+        vma_t* h = (old > c->brk_start) ? vma_find_mut(&c->vmas, old - 1) : 0;
+        if (h && h->end == old && h->type == VMA_TYPE_ANON && h->flags == hf) h->end = new_brk;
+        else if (vma_add(&c->vmas, old, new_brk, hf, VMA_TYPE_ANON,0,0,0,0) != 0)
             return old;
     } else {                                        // shrink
         for (uint64_t va = new_brk; va < old; va += 0x1000) vmm_unmap_in_space(c->space, va);
-        vma_t* h = vma_find_mut(&c->vmas, c->brk_start);
-        if (h) { if (new_brk <= c->brk_start) vma_remove(&c->vmas, h); else h->end = new_brk; }
+        for (uint32_t i = 0; i < c->vmas.count; i++) {   // trim every heap piece
+            vma_t* v = &c->vmas.v[i];
+            if (v->type == VMA_TYPE_NONE || v->end <= new_brk || v->start >= old) continue;
+            if (v->start < c->brk_start) continue;       // not a heap piece
+            if (v->start >= new_brk) vma_remove(&c->vmas, v); else v->end = new_brk;
+        }
     }
     c->brk_cur = new_brk;
     return new_brk;
@@ -223,11 +234,24 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
     uint64_t end = addr + len;
     if (!vma_overlaps(&c->vmas, addr, end)) return -1;          // must be backed
     uint64_t newf = m18_prot_to_flags(prot);
+    // Split VMAs straddling either boundary so the new protection applies to
+    // exactly [addr, end): pages demand-faulted later take the VMA's flags, so a
+    // partial mprotect must not leave them with the old protection (e.g. a
+    // PROT_NONE guard page inside a larger mapping).
     for (uint32_t i = 0; i < c->vmas.count; i++) {
         vma_t* v = &c->vmas.v[i];
         if (v->type == VMA_TYPE_NONE) continue;
-        if (addr <= v->start && end >= v->end && addr < v->end && v->start < end)
-            v->flags = newf;                                     // whole VMA in range
+        if (v->start < addr && addr < v->end && vma_split(&c->vmas, v, addr) != 0) return -1;
+    }
+    for (uint32_t i = 0; i < c->vmas.count; i++) {
+        vma_t* v = &c->vmas.v[i];
+        if (v->type == VMA_TYPE_NONE) continue;
+        if (v->start < end && end < v->end && vma_split(&c->vmas, v, end) != 0) return -1;
+    }
+    for (uint32_t i = 0; i < c->vmas.count; i++) {
+        vma_t* v = &c->vmas.v[i];
+        if (v->type == VMA_TYPE_NONE) continue;
+        if (addr <= v->start && v->end <= end) v->flags = newf;  // now wholly in range
     }
     // Re-protect present PTEs, VMA intersections only (see ksys_munmap).
     for (uint32_t i = 0; i < c->vmas.count; i++) {
@@ -532,9 +556,14 @@ int ksys_mount(const char* dev, const char* target, const char* fstype){
     if(isauto){ if(fat32_mount(dev,target)==0) return 0; return ext2_mount(dev,target); }
     return -1;                                            // unknown fstype
 }
+void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
 int ksys_umount(const char* target){
     extern int vfs_unmount(const char*);
-    return vfs_unmount(target);
+    // Normalize like every other path syscall ("/mnt/", "/mnt/.", relative
+    // paths, "" -> cwd), so "/" cannot be reached under another spelling.
+    char abs[256];
+    proc_resolve_path(sched_get_current(), target, abs, sizeof(abs));
+    return vfs_unmount(abs);
 }
 
 // [M26] Copy a NUL-terminated user string into a kernel buffer (bounded,

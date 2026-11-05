@@ -905,13 +905,16 @@ grep -q "CS9-42" "$CSLOG"; check "bash still responsive after the substitution l
 # ============================================================================
 # ---- stress: ring-3 syscall fuzzer (full mode, fixed seed) ----
 FUZZLOG=/tmp/secos_selftest_sysfuzz.log
-echo "[selftest] Running ring-3 syscall fuzzer (full mode, mb2, serial, 60s)..."
+echo "[selftest] Running ring-3 syscall fuzzer (full mode, mb2, serial, 80s)..."
 : > "$FUZZLOG"
-( sleep 25; printf '  /bin/sysfuzz -s 777 -b 12 -c 150; echo FUZZEND\r'; sleep 33 ) | \
-    timeout 65 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+( sleep 25; printf '  /bin/sysfuzz -s 777 -b 12 -c 150; echo FUZZEND\r'; sleep 28
+  printf '  /bin/sysfuzz -s 33 -b 24 -c 120 > /dev/null; /bin/echo FZALIVE""-42\r'; sleep 15 ) | \
+    timeout 80 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$FUZZLOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >/dev/null 2>&1
 grep -q "\[sysfuzz\] DONE ok" "$FUZZLOG"; check "syscall fuzzer (full mode) ran every syscall to completion" $?
+# seed 33 batch 23 once umount()ed "/" -> empty namespace, every later exec failed.
+grep -q "^FZALIVE-42" "$FUZZLOG"; check "system still execs /bin programs after fuzzing (root not unmountable)" $?
 ! grep -q "ring0" "$FUZZLOG"; check "no ring-0 CPU fault during full-mode syscall fuzzing" $?
 ! grep -q "\[PANIC\]" "$FUZZLOG"; check "no kernel panic during full-mode syscall fuzzing" $?
 
@@ -947,18 +950,23 @@ echo "[selftest] Running bash exit-status/signal + stat regressions (mb2, serial
   printf '  sleep 10 & kill -TERM $!; wait $!; echo UB3-$?\r'; sleep 4
   printf '  stat /bin/bash && echo UB4-$((2+2))\r'; sleep 5
   printf '  echo UB6-$(head -c 32 /dev/zero | wc -c)\r'; sleep 4
+  printf '  /bin/abi_test segv; echo UB7-$?\r'; sleep 4
   printf '  for i in 1 2 3; do sleep 1 & done\r'; sleep 6
   printf '  echo UB5-$((6*7))\r'; sleep 4 ) | \
     timeout 85 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$UBLOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >/dev/null 2>&1
 grep -q "UB1-142" "$UBLOG"; check "bash survives bash -c 'exit 142' and reports \$? = 142" $?
+! grep -q "Signal 14" "$UBLOG"; check "exit 142 is reported as an exit, not as a signal (POSIX wait status)" $?
+grep -q "UB7-139" "$UBLOG"; check "a ring-3 #PF kill is reported as SIGSEGV (\$? = 139)" $?
 grep -q "UB2-137" "$UBLOG"; check "bash survives kill -9 of a child (\$? = 137)" $?
 grep -q "UB3-143" "$UBLOG"; check "bash survives SIGTERM of a child (\$? = 143)" $?
 grep -q "File: /bin/bash" "$UBLOG" && grep -q "UB4-4" "$UBLOG"; check "coreutils stat /bin/bash works (stat ABI)" $?
 grep -q "UB6-32" "$UBLOG"; check "stdio flushed at exit (head -c 32 /dev/zero | wc -c -> 32)" $?
 grep -q "UB5-42" "$UBLOG"; check "bash survives SIGCHLDs while idle at the prompt (tty -EINTR)" $?
-! grep -q "\[EXC\]" "$UBLOG"; check "no CPU exception ([EXC]) during exit-status/stat regressions" $?
+# Exactly one CPU exception: the deliberate ring-3 #PF of `abi_test segv` (UB7).
+[[ "$(grep -c "\[EXC\] int=" "$UBLOG")" -eq 1 ]] && ! grep -q "\[EXC\].*ring0" "$UBLOG"
+check "no unexpected CPU exception ([EXC]) during exit-status/stat regressions" $?
 
 # ============================================================================
 # ---- lua in /bin + bash job control (jobs/fg/bg/%n/wait/kill/disown) ----
@@ -1029,6 +1037,8 @@ if [[ -n "$OVMF" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
     ! cmp -s dist/kernel.elf "$SB/esp_bad/kernel.elf"; check "M39 secure boot: tampered kernel differs from the signed one" $?
     grep -aq "\[SECURE BOOT\] kernel signature OK" "$SB/ser_good.log"; check "M39 secure boot: signed kernel verified by the UEFI loader" $?
     grep -q "SECoS build" "$SB/dbg_good.log"; check "M39 secure boot: verified kernel boots" $?
+    # The ESP is QEMU's vvfat (FAT16): it must not be mistaken for a FAT32 /mnt.
+    ! grep -q "\[M10\] disk write+readback: FAIL" "$SB/dbg_good.log"; check "UEFI boot: FAT16 ESP not mounted as FAT32 (no M10 readback FAIL)" $?
     grep -aq "\[SECURE BOOT\] kernel signature INVALID - refusing to boot" "$SB/ser_bad.log"; check "M39 secure boot: one flipped byte -> kernel refused" $?
     ! grep -q "SECoS build" "$SB/dbg_bad.log"; check "M39 secure boot: tampered kernel never runs" $?
 else
@@ -1113,10 +1123,11 @@ if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
     echo "[selftest] UACCESS BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     exit 2
 fi
-echo "[selftest] Running uaccess gate (mb2, serial, 50s)..."
+echo "[selftest] Running uaccess + ABI gate (mb2, serial, 60s)..."
 : > "$UALOG"
-( sleep 25; printf '  /bin/uaccess_test; echo UA-$((6*7))-END\r'; sleep 15 ) | \
-    timeout 50 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+( sleep 25; printf '  /bin/uaccess_test; echo UA-$((6*7))-END\r'; sleep 15
+  printf '  /bin/abi_test; echo ABI-$((6*7))-END\r'; sleep 10 ) | \
+    timeout 60 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$UALOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >/dev/null 2>&1
 grep -q "\[UA-TEST\] DONE pass=[0-9]* fail=0" "$UALOG"; check "UACCESS every bad-pointer case returns an error (DONE fail=0)" $?
@@ -1129,6 +1140,24 @@ grep -q "\[UA-TEST\] kernel-write-to-cow-page OK" "$UALOG"; check "UACCESS kerne
 grep -q "\[UA-TEST\] sigframe-from-pf-path OK" "$UALOG"; check "UACCESS sigframe from the #PF return path (nested #PF)" $?
 ! grep -q "\[UA-TEST\] .* FAIL" "$UALOG"; check "UACCESS no case failed" $?
 ! grep -q "ring0" "$UALOG"; check "UACCESS no ring-0 CPU fault" $?
+# ABI regression test (user/abi_test.c), same boot: POSIX wait status, DF=1 on
+# kernel entry (every entry stub must cld), PROT_NONE.
+grep -q "\[ABI-TEST\] DONE pass=[0-9]* fail=0" "$UALOG"; check "ABI every case passes (DONE fail=0)" $?
+grep -q "ABI-42-END" "$UALOG"; check "ABI shell survives the test (sentinel reached)" $?
+grep -q "\[ABI-TEST\] wait-exit-142-not-signal OK" "$UALOG"; check "ABI exit(142) -> WIFEXITED, WEXITSTATUS=142" $?
+grep -q "\[ABI-TEST\] wait-pf-is-sigsegv OK" "$UALOG"; check "ABI ring-3 #PF -> WIFSIGNALED, WTERMSIG=SIGSEGV" $?
+grep -q "\[ABI-TEST\] wait-de-is-sigfpe OK" "$UALOG"; check "ABI ring-3 #DE -> SIGFPE" $?
+grep -q "\[ABI-TEST\] df-fork-child-ok OK" "$UALOG"; check "ABI fork() entered with DF=1 copies correctly (cld on entry)" $?
+grep -q "\[ABI-TEST\] df-pipe-write-read OK" "$UALOG" && grep -q "\[ABI-TEST\] df-stat OK" "$UALOG"
+check "ABI write/read/stat entered with DF=1 return correct data" $?
+grep -q "\[ABI-TEST\] df-signal-handler-entry-df0 OK" "$UALOG"; check "ABI signal handler starts with DF=0" $?
+grep -q "\[ABI-TEST\] pn-user-read-sigsegv OK" "$UALOG"; check "ABI ring-3 read of a PROT_NONE page -> SIGSEGV" $?
+grep -q "\[ABI-TEST\] pn-fresh-read-sigsegv OK" "$UALOG"; check "ABI PROT_NONE page is never demand-faulted in" $?
+grep -q "\[ABI-TEST\] pn-kernel-copy-from-efault OK" "$UALOG"; check "ABI kernel copy from a PROT_NONE page -> -EFAULT" $?
+grep -q "\[ABI-TEST\] pn-mprotect-back-keeps-data OK" "$UALOG"; check "ABI mprotect PROT_NONE -> RW restores the page + contents" $?
+grep -q "\[ABI-TEST\] pn-split-guard-sigsegv OK" "$UALOG"; check "ABI partial mprotect splits the VMA (PROT_NONE guard page)" $?
+grep -q "\[ABI-TEST\] pn-fork-parent-copy-isolated OK" "$UALOG"; check "ABI PROT_NONE page shared by fork stays COW-isolated" $?
+! grep -q "\[ABI-TEST\] .* FAIL" "$UALOG"; check "ABI no case failed" $?
 ! grep -q "\[PANIC\]" "$UALOG"; check "UACCESS no kernel panic" $?
 
 echo "[selftest] ---"

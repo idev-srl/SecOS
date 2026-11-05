@@ -16,6 +16,16 @@
 // [M11] Process privilege type. A "driver" is a Ring-3 process granted
 // capability-mediated hardware access (SYS_DRIVER). The claim is rooted in the
 // signed `.note.secos` manifest — see mm/elf_manifest.h / docs/DRIVER_SPACE.md.
+// POSIX/Linux wait-status encoding, end to end (kernel exit_code == the value
+// SYS_WAIT/SYS_WAITANY hand to user space == what WIFEXITED & co. decode):
+//   normal exit  : (status & 0xff) << 8           (low 7 bits 0)
+//   killed by sig: sig & 0x7f  [| 0x80 core flag]  (never 0 or 0x7f)
+//   stopped      : (sig << 8) | 0x7f
+// A single number can no longer mean both "exited 128+N" and "killed by N".
+#define W_EXITCODE(st)   ((int)(((unsigned)(st) & 0xffu) << 8))
+#define W_SIGNALED(sig)  ((int)((unsigned)(sig) & 0x7fu))
+#define W_STOPCODE(sig)  ((int)((((unsigned)(sig) & 0xffu) << 8) | 0x7fu))
+
 #define PROC_TYPE_USER    0
 #define PROC_TYPE_DRIVER  1
 
@@ -61,7 +71,7 @@ typedef struct process {
     uint64_t  brk_cur;
     uint64_t  mmap_next;
     uint64_t  mem_limit;
-    int      exit_code;      // [M15] 0=normal (SYS_EXIT); 128+vec=killed by fault
+    int      exit_code;      // POSIX wait status: W_EXITCODE(st,0) or W_SIGNALED(sig)
     uint8_t  collected;      // [M39] zombie collected by parent's wait() -> reapable
     // [M16/M17] Blocking state. While PROC_BLOCKED, exactly one wait condition is
     // armed; the matching wake (child exit / timer tick / channel send) flips the

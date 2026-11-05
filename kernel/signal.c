@@ -18,7 +18,7 @@
 extern process_t* sched_get_current(void);
 extern process_t* process_find_by_pid(uint32_t pid);
 extern void process_foreach(void (*cb)(process_t*, void*), void* user);
-extern void sched_kill_current(int reason) __attribute__((noreturn));
+extern void sched_kill_current(int sig) __attribute__((noreturn));
 extern void sched_stop_current(trapframe_t* tf) __attribute__((noreturn));
 
 // ---- foreground process group (console job control) ----
@@ -227,6 +227,8 @@ void signal_dispatch(trapframe_t* tf) {
         tf->rsp = ret_slot;                      // rsp%16==8 at entry (ABI)
         tf->rdi = (uint64_t)sig;                 // first arg: signum
         tf->rax = 0;
+        tf->rflags &= ~0x400ULL;                 // DF=0 at handler entry (SysV ABI;
+                                                 // sigreturn restores the saved DF)
         debugcon_writestring("[SIG] deliver sig=");
         debugcon_print_hex((uint64_t)sig);
         debugcon_writestring(" pid=");
