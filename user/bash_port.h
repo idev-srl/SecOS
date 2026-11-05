@@ -143,6 +143,7 @@ int fstat(int fd, struct stat* st);
 int fchmod(int fd, int mode);
 int strcoll(const char* a, const char* b);
 char* strsignal(int sig);
+char* strcasestr(const char* hay, const char* needle);
 long double strtold(const char* s, char** e);
 void srandom(unsigned int seed);
 char* mktemp(char* tmpl);

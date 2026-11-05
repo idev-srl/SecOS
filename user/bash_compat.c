@@ -6,6 +6,7 @@
 #include "libsecos.h"
 #include "termios.h"
 #include <fcntl.h>
+#include <signal.h>
 #include <pwd.h>
 #include <grp.h>
 #include <sys/resource.h>
@@ -18,12 +19,16 @@ static void* zmem(void* d, int c, unsigned long n){ char* p=d; while(n--) *p++=(
 /* ---- process wait: POSIX 3-arg over SecOS SYS_WAIT / SYS_WAITANY ---- */
 extern int errno;
 static int enc_status(long code){
+    /* Job-control reports are already POSIX: stopped = (sig<<8)|0x7f,
+     * continued = 0xffff (SYS_WAITANY with WUNTRACED / WCONTINUED). */
+    if((code > 0xff && (code & 0xff) == 0x7f) || code == 0xffff) return (int)code;
     return (code >= 128) ? (int)((code-128) & 0x7f)     /* WIFSIGNALED / WTERMSIG */
                          : (int)((code & 0xff) << 8);   /* WIFEXITED / WEXITSTATUS */
 }
 int bash_waitpid(pid_t pid, int* status, int options){
     if(pid == (pid_t)-1){                 /* wait for ANY child (bash's wait_for loop) */
         int code = 0;
+        /* options: WNOHANG(1) | WUNTRACED(2) | WCONTINUED(8), as Linux */
         long got = secos_syscall(55 /*SYS_WAITANY*/, (long)&code, (long)options, 0,0,0);
         if(got == -10){ errno = ECHILD; return -1; }    /* no children */
         if(got == 0)   return 0;                        /* WNOHANG, none reaped yet */
@@ -38,9 +43,19 @@ int bash_waitpid(pid_t pid, int* status, int options){
 }
 
 /* ---- signals: map POSIX sigaction onto SecOS signal()/sigprocmask ---- */
+/* The kernel does not hand back the previous disposition, so keep a shadow
+ * table (inherited by fork with the address space; a spawned program starts
+ * with all-default dispositions, matching a zeroed table). bash saves and
+ * restores handlers through `old` (e.g. SIGTTIN/SIGTTOU/SIGTSTP around job
+ * control), so reporting SIG_DFL for everything broke the restore. */
+static void (*g_sigdisp[NSIG])(int);
 int sigaction(int sig, const struct sigaction* act, struct sigaction* old){
-    if(old) zmem(old, 0, sizeof(*old));
-    if(act) signal(sig, act->sa_handler);
+    if(sig <= 0 || sig >= NSIG){ errno = EINVAL; return -1; }
+    if(old){ zmem(old, 0, sizeof(*old)); old->sa_handler = g_sigdisp[sig]; }
+    if(act){
+        if(signal(sig, act->sa_handler) == SIG_ERR){ errno = EINVAL; return -1; }
+        g_sigdisp[sig] = act->sa_handler;
+    }
     return 0;
 }
 int sigemptyset(sigset_t* s){ if(s) *s=0; return 0; }
@@ -48,7 +63,6 @@ int sigfillset(sigset_t* s){ if(s) *s=~0UL; return 0; }
 int sigaddset(sigset_t* s, int n){ if(s) *s |= (1UL<<(n&63)); return 0; }
 int sigdelset(sigset_t* s, int n){ if(s) *s &= ~(1UL<<(n&63)); return 0; }
 int sigismember(const sigset_t* s, int n){ return s ? (int)((*s>>(n&63))&1) : 0; }
-int sigsuspend(const sigset_t* m){ (void)m; return -1; }
 int siginterrupt(int s, int f){ (void)s; (void)f; return 0; }
 
 /* ---- single-user identity database ---- */
@@ -103,7 +117,18 @@ char* mkdtemp(char* t){ fill_template(t); return mkdir(t,0700)==0 ? t : (char*)0
 
 /* ---- string / number ---- */
 void bcopy(const void* s, void* d, unsigned long n){ const char* a=s; char* b=d; if(b<a) while(n--) *b++=*a++; else { a+=n; b+=n; while(n--) *--b=*--a; } }
-char* strsignal(int s){ static char buf[24]; const char* d="Signal "; int i=0; for(; d[i]; i++) buf[i]=d[i]; if(s<0) s=0; if(s>=100) buf[i++]='0'+(s/100)%10; if(s>=10) buf[i++]='0'+(s/10)%10; buf[i++]='0'+s%10; buf[i]=0; return buf; }
+/* strsignal: the glibc descriptions bash prints for jobs ("Stopped (signal)",
+ * "Terminated", ...), falling back to "Signal N". */
+static const char* const g_sigdesc[32] = {
+    0, "Hangup", "Interrupt", "Quit", "Illegal instruction", "Trace/breakpoint trap",
+    "Aborted", "Bus error", "Floating point exception", "Killed", "User defined signal 1",
+    "Segmentation fault", "User defined signal 2", "Broken pipe", "Alarm clock", "Terminated",
+    "Stack fault", "Child exited", "Continued", "Stopped (signal)", "Stopped",
+    "Stopped (tty input)", "Stopped (tty output)", 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+static char* strsignal_num(int s);
+char* strsignal(int s){ if(s > 0 && s < 32 && g_sigdesc[s]) return (char*)g_sigdesc[s]; return strsignal_num(s); }
+static char* strsignal_num(int s){ static char buf[24]; const char* d="Signal "; int i=0; for(; d[i]; i++) buf[i]=d[i]; if(s<0) s=0; if(s>=100) buf[i++]='0'+(s/100)%10; if(s>=10) buf[i++]='0'+(s/10)%10; buf[i++]='0'+s%10; buf[i]=0; return buf; }
 void srandom(unsigned int seed){ extern void srand(unsigned); srand(seed); }
 long double strtold(const char* s, char** e){ extern double strtod(const char*,char**); return (long double)strtod(s,e); }
 unsigned long strtoumax(const char* s, char** e, int b){ extern unsigned long long strtoull(const char*,char**,int); return (unsigned long)strtoull(s,e,b); }
@@ -158,3 +183,33 @@ int setreuid(int r,int e){ (void)r;(void)e; return 0; }
 int setregid(int r,int e){ (void)r;(void)e; return 0; }
 long sysconf(int name){ (void)name; return -1; }
 int access(const char* p, int mode){ (void)mode; struct stat st; return stat(p,&st)==0 ? 0 : -1; }
+
+/* asprintf (brace expansion {01..10}): format into a malloc'd string. */
+#include <stdarg.h>
+int asprintf(char** out, const char* fmt, ...){
+    extern int vsnprintf(char*, unsigned long, const char*, va_list);
+    va_list ap; va_start(ap, fmt);
+    char tmp[1];
+    va_list ap2; va_copy(ap2, ap);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if(n < 0){ va_end(ap2); *out = (char*)0; return -1; }
+    char* b = (char*)malloc((unsigned long)n + 1);
+    if(!b){ va_end(ap2); *out = (char*)0; return -1; }
+    vsnprintf(b, (unsigned long)n + 1, fmt, ap2);
+    va_end(ap2);
+    *out = b;
+    return n;
+}
+
+/* strcasestr (help builtin): case-insensitive substring search, ASCII. */
+static int lc(int c){ return (c>='A' && c<='Z') ? c+32 : c; }
+char* strcasestr(const char* h, const char* n){
+    if(!*n) return (char*)h;
+    for(; *h; h++){
+        const char* a=h; const char* b=n;
+        while(*a && *b && lc((unsigned char)*a)==lc((unsigned char)*b)){ a++; b++; }
+        if(!*b) return (char*)h;
+    }
+    return (char*)0;
+}

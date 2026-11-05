@@ -27,15 +27,37 @@ if [ ! -d "$WORK" ]; then
     mkdir -p "$(dirname "$WORK")"; ( cd "$(dirname "$WORK")"; wget -q "$URL"; tar xzf "$BV.tar.gz" )
 fi
 cd "$WORK"
-[ -f config.h ] || ./configure --disable-nls --without-bash-malloc --enable-minimal-config \
-    --disable-history --disable-readline --disable-progcomp --disable-net-redirections >/dev/null 2>&1
+# Feature set: start from the minimal config (no readline/bash-malloc/NLS) and
+# turn on everything SecOS can back: job control (jobs/fg/bg/%n/disown/suspend),
+# aliases, history (fc/history, no ! expansion), help, arrays, brace expansion,
+# [[ ]], (( )), for ((;;)), pushd/popd/dirs, select, time, extglob, case-mod.
+# Process substitution stays off (needs /dev/fd or FIFOs).
+CONF_OPTS="--disable-nls --without-bash-malloc --enable-minimal-config \
+    --enable-job-control --enable-alias --enable-history --disable-bang-history \
+    --enable-help-builtin --enable-array-variables --enable-brace-expansion \
+    --enable-cond-command --enable-dparen-arithmetic --enable-arith-for-command \
+    --enable-directory-stack --enable-select --enable-command-timing \
+    --enable-extended-glob --enable-casemod-attributes --enable-casemod-expansions \
+    --enable-prompt-string-decoding --enable-disabled-builtins \
+    --disable-readline --disable-progcomp --disable-net-redirections"
+# A tree configured with different options (e.g. an older minimal-config work
+# dir) is reconfigured + rebuilt from scratch.
+if [ -f config.h ] && [ "$(cat .secos-conf 2>/dev/null)" != "$CONF_OPTS" ]; then
+    echo "[port-bash]     configure options changed -> reconfigure"
+    make distclean >/dev/null 2>&1 || true; rm -f config.h bash
+fi
+[ -f config.h ] || { ./configure $CONF_OPTS >/dev/null 2>&1; echo "$CONF_OPTS" > .secos-conf; }
 [ -f bash ] || make >/dev/null 2>&1            # native build = generates y.tab.c, version.h, etc.
 
 echo "[port-bash] 2/6 patch config.h for SecOS (disable wide-char/regex/select/locale/union-wait)"
 python3 - "$WORK/config.h" <<'PY'
 import sys
 f=sys.argv[1]; s=open(f).read()
-if 'SecOS port overrides' not in s:
+if 'SecOS port overrides v2' not in s:
+    # Drop an older override block (work dirs patched by a previous port run).
+    if '/* SecOS port overrides' in s:
+        head = s.split('/* SecOS port overrides')[0]
+        s = head + '#include "config-bot.h"' + s.split('#include "config-bot.h"', 1)[1]
     ov='\n'.join('#undef '+m for m in (
       'HAVE_MBSTATE_T HAVE_MBRTOWC HAVE_MBSRTOWCS HAVE_WCWIDTH HAVE_WCHAR_H HAVE_WCTYPE_H '
       'HAVE_WCSDUP HAVE_WCSCMP HAVE_LANGINFO_H HAVE_NL_LANGINFO HAVE_LANGINFO_CODESET '
@@ -43,8 +65,8 @@ if 'SecOS port overrides' not in s:
       'HAVE_PSELECT HAVE_DEV_FD HAVE_DEV_STDIN HAVE_STRUCT_STAT_ST_ATIM '
       'HAVE_STRUCT_STAT_ST_ATIMESPEC HAVE_STRUCT_STAT_ST_ATIM_TV_NSEC HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC '
       'HAVE_STRUCT_DIRENT_D_INO HAVE_STRUCT_DIRENT_D_FILENO HAVE_DLOPEN HAVE_DLFCN_H '
-      'HAVE_UNION_WAIT HAVE_TERMIO_H').split())
-    s=s.replace('#include "config-bot.h"', '/* SecOS port overrides */\n'+ov+'\n#include "config-bot.h"',1)
+      'HAVE_UNION_WAIT HAVE_TERMIO_H HAVE_FNMATCH').split())
+    s=s.replace('#include "config-bot.h"', '/* SecOS port overrides v2 */\n'+ov+'\n#include "config-bot.h"',1)
     open(f,'w').write(s)
 PY
 
@@ -67,6 +89,19 @@ if 'SecOS NSIG=32' not in s:
     open(f, 'w').write(s)
 PY
 
+echo "[port-bash] 2c/6 fix ALIAS without HANDLE_MULTIBYTE (upstream build bug)"
+# parse.y's END_ALIAS path touches shell_input_line_property, which only exists
+# with HANDLE_MULTIBYTE (we disable multibyte). The branch is dead then
+# (last_shell_getc_is_singlebyte is constant 1), so guard the statement.
+python3 - "$WORK/y.tab.c" <<'PY'
+import sys
+f = sys.argv[1]; s = open(f).read()
+old = "#else\n\t  shell_input_line_property[shell_input_line_index - 1] = 1;\n#endif"
+new = ("#elif defined (HANDLE_MULTIBYTE)\n\t  shell_input_line_property[shell_input_line_index - 1] = 1;\n#endif")
+if old in s:
+    open(f, 'w').write(s.replace(old, new, 1))
+PY
+
 echo "[port-bash] 3/6 regenerate builtin .c from .def"
 ( cd builtins && for d in *.def; do ./mkbuiltins -D . "$d" >/dev/null 2>&1; done )
 
@@ -76,8 +111,12 @@ top=$(sed -n '/-o bash /p' <(make -n bash 2>/dev/null) | grep -oE '[a-z_0-9.]+\.
 [ -n "$top" ] || top=$(ls *.c | grep -vE 'mksyntax|mksignames|buildversion|bashversion')
 for c in $top; do bn=$(basename "$c"); case " $EXCLUDE " in *" $bn "*) continue;; esac
   [ -f "$c" ] && gcc "${BFLAGS[@]}" -c "$c" -o "$OBJ/$bn.o"; done
-for d in builtins lib/sh lib/glob lib/tilde; do for o in "$d"/*.o; do c="${o%.o}.c"; [ -f "$c" ] || continue
+# lib/readline: with readline off only libhistory is built there; take just the
+# history sources (its shell.c/xmalloc.c/xfree.c duplicate bash's own helpers).
+HISTSRC="history.c histexpand.c histfile.c histsearch.c"
+for d in builtins lib/sh lib/glob lib/tilde lib/readline; do for o in "$d"/*.o; do c="${o%.o}.c"; [ -f "$c" ] || continue
   bn=$(basename "$c"); case " $EXCLUDE " in *" $bn "*) continue;; esac
+  if [ "$d" = lib/readline ]; then case " $HISTSRC " in *" $bn "*) ;; *) continue;; esac; fi
   gcc "${BFLAGS[@]}" -I"$WORK/$d" -c "$c" -o "$OBJ/${d//\//_}_$bn.o"; done; done
 
 echo "[port-bash] 5/6 compile SecOS shim + link"
@@ -88,6 +127,7 @@ ld --gc-sections -T "$ROOT/user/user.ld" -o "$ROOT/user/bash.elf" \
    "$ROOT/user/libsecos.o" "$ROOT/user/libc.o" "$ROOT/user/libm.o"
 
 echo "[port-bash] 6/6 sign + embed -> crypto/user_bash_elf.h"
+cd "$ROOT"   # run python from the repo (a pyenv-local interpreter has 'cryptography')
 python3 "$ROOT/tools/secos-sign" "$ROOT/user/bash.elf" --dev
 python3 "$ROOT/tools/elf2h.py" "$ROOT/user/bash.elf" user_bash_elf "$ROOT/crypto/user_bash_elf.h"
 echo "[port-bash] DONE: $(ls -la "$ROOT/user/bash.elf" | awk '{print $5}') bytes -> crypto/user_bash_elf.h"

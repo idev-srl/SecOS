@@ -2,6 +2,8 @@
 #define _PORT_SYS_WAIT_H
 #define WNOHANG 1
 #define WUNTRACED 2
+#define WCONTINUED 8
+#define WIFCONTINUED(s) ((s)==0xffff)
 #define WIFEXITED(s)   (((s)&0x7f)==0)
 #define WEXITSTATUS(s) (((s)>>8)&0xff)
 #define WIFSIGNALED(s) (((signed char)(((s)&0x7f)+1)>>1)>0)

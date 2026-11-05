@@ -11,7 +11,10 @@ typedef unsigned long rlim_t;
 #define RLIMIT_AS 9
 #define RLIM_NLIMITS 16
 struct rlimit { rlim_t rlim_cur; rlim_t rlim_max; };
-struct rusage { long ru_utime, ru_stime; long ru_maxrss; };
+#include <sys/time.h>          /* struct timeval */
+#define RUSAGE_SELF      0
+#define RUSAGE_CHILDREN (-1)
+struct rusage { struct timeval ru_utime, ru_stime; long ru_maxrss; };
 int getrlimit(int, struct rlimit*);
 int setrlimit(int, const struct rlimit*);
 int getrusage(int, struct rusage*);
