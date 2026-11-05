@@ -1079,6 +1079,45 @@ grep -q "LE-42-END" "$LELOG"; check "bash responsive after the line-editing sess
 ! grep -q "\[EXC\]" "$LELOG"; check "no CPU exception ([EXC]) during the line-editing session" $?
 
 # ============================================================================
+# ---- Pseudo-terminals: /dev/ptmx + /dev/pts, sessions, ctty, bash on a pty ----
+# ============================================================================
+# (a) /bin/ptytest (signed): posix_openpt/unlockpt/ptsname, a locked slave is
+#     refused; forkpty child = new session with the slave as controlling tty
+#     (ttyname, /dev/tty, tcgetpgrp); canonical I/O through the master with
+#     ICRNL/ONLCR/echo; ^C written to the master -> SIGINT; TIOCSWINSZ ->
+#     exactly one SIGWINCH; raw mode on the slave; master close -> SIGHUP and
+#     slave EIO; child exit -> master EIO; 100 openpty/close + 20 forkpty
+#     cycles reuse slot 0 (no leak); bash -c 'tty' prints /dev/pts/N; an
+#     interactive bash on a pty runs a line, ^C ends `sleep 100`, exits.
+# (b) /bin/script runs an interactive bash on a pty and relays the console to
+#     it (raw console, both directions); the inner bash's `tty` is /dev/pts/0,
+#     the outer one is back on /dev/console afterwards.
+# (c) the fuzzer also hammers pty ends (open/read/write/ioctl, setsid/getsid).
+PTYLOG=/tmp/secos_selftest_pty.log
+echo "[selftest] Running pseudo-terminal tests + script relay (mb2, serial, 110s)..."
+: > "$PTYLOG"
+( sleep 25
+  printf '  /bin/ptytest\r'; sleep 40
+  printf '  script\r'; sleep 6
+  printf 'echo SCRIPT-$((6*7)); tty\r'; sleep 3
+  printf 'exit\r'; sleep 4
+  printf '  echo PTY-AFTER-$((1+1)); tty\r'; sleep 3
+  printf '  /bin/sysfuzz -s 4242 -b 30 -c 200 > /dev/null; /bin/echo FZPTY""-42\r'; sleep 25 ) | \
+    timeout 110 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$PTYLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+for t in OPEN SESSION CANON SIGINT WINCH RAW HUP EOF CYCLE BASH IBASH; do
+    grep -q "PT-$t-OK" "$PTYLOG"; check "pty: $t" $?
+done
+grep -q "PT-DONE 11/11" "$PTYLOG"; check "pty: ptytest 11/11" $?
+grep -q "^SCRIPT-42" "$PTYLOG" && grep -q "^/dev/pts/0" "$PTYLOG"; check "pty: script runs bash on /dev/pts/0 and relays the console" $?
+grep -q "Script done (shell status 0)" "$PTYLOG"; check "pty: script ends when its shell exits" $?
+grep -q "^PTY-AFTER-2" "$PTYLOG" && grep -q "^/dev/console" "$PTYLOG"; check "pty: console bash responsive on /dev/console afterwards" $?
+grep -q "^FZPTY-42" "$PTYLOG"; check "pty: fuzzing pty ends + setsid/getsid leaves the system usable" $?
+! grep -q "ring0\|\[PANIC\]" "$PTYLOG"; check "no kernel panic/ring-0 fault during the pty tests" $?
+! grep -q "\[EXC\].*ring0" "$PTYLOG"; check "no ring-0 CPU exception during the pty tests" $?
+
+# ============================================================================
 # ---- Orderly poweroff / reboot from bash (SYS_REBOOT) ----
 # ============================================================================
 # (a) poweroff: write a file to an ext4 data disk, start a background job,
