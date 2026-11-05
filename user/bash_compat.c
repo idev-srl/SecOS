@@ -97,7 +97,6 @@ int setvbuf(void* f, char* b, int m, unsigned long s){ (void)f;(void)b;(void)m;(
 int fpurge(void* f){ (void)f; return 0; }
 int getdtablesize(void){ return 32; }
 int gethostname(char* n, unsigned long l){ const char* h="secos"; unsigned long i=0; for(; h[i] && i<l-1; i++) n[i]=h[i]; if(l) n[i]=0; return 0; }
-char* ttyname(int fd){ return isatty(fd) ? (char*)"/dev/tty" : (char*)0; }
 int eaccess(const char* p, int mode){ (void)mode; struct stat st; return stat(p,&st)==0 ? 0 : -1; }
 
 /* ---- temp files ---- */
@@ -109,18 +108,7 @@ char* mkdtemp(char* t){ fill_template(t); return mkdir(t,0700)==0 ? t : (char*)0
 
 /* ---- string / number ---- */
 void bcopy(const void* s, void* d, unsigned long n){ const char* a=s; char* b=d; if(b<a) while(n--) *b++=*a++; else { a+=n; b+=n; while(n--) *--b=*--a; } }
-/* strsignal: the glibc descriptions bash prints for jobs ("Stopped (signal)",
- * "Terminated", ...), falling back to "Signal N". */
-static const char* const g_sigdesc[32] = {
-    0, "Hangup", "Interrupt", "Quit", "Illegal instruction", "Trace/breakpoint trap",
-    "Aborted", "Bus error", "Floating point exception", "Killed", "User defined signal 1",
-    "Segmentation fault", "User defined signal 2", "Broken pipe", "Alarm clock", "Terminated",
-    "Stack fault", "Child exited", "Continued", "Stopped (signal)", "Stopped",
-    "Stopped (tty input)", "Stopped (tty output)", 0, 0, 0, 0, 0, 0, 0, 0, 0
-};
-static char* strsignal_num(int s);
-char* strsignal(int s){ if(s > 0 && s < 32 && g_sigdesc[s]) return (char*)g_sigdesc[s]; return strsignal_num(s); }
-static char* strsignal_num(int s){ static char buf[24]; const char* d="Signal "; int i=0; for(; d[i]; i++) buf[i]=d[i]; if(s<0) s=0; if(s>=100) buf[i++]='0'+(s/100)%10; if(s>=10) buf[i++]='0'+(s/10)%10; buf[i++]='0'+s%10; buf[i]=0; return buf; }
+/* strsignal, sysconf: libc. */
 void srandom(unsigned int seed){ extern void srand(unsigned); srand(seed); }
 long double strtold(const char* s, char** e){ extern double strtod(const char*,char**); return (long double)strtod(s,e); }
 unsigned long strtoumax(const char* s, char** e, int b){ extern unsigned long long strtoull(const char*,char**,int); return (unsigned long)strtoull(s,e,b); }
@@ -146,7 +134,6 @@ char* singlequote_translations = (char*)"";
 int mailstat(const char* p, struct stat* st){ (void)p;(void)st; return -1; }
 int isnetconn(int fd){ (void)fd; return 0; }
 const char* fnx_fromfs(char* s, unsigned long n){ (void)n; return s; }
-int shtimer_select(int n, void* r, void* w, void* e, void* t){ (void)n;(void)r;(void)w;(void)e;(void)t; return 0; }
 
 /* ---- bash's RNG (lib/sh/random.c excluded) ---- */
 static unsigned long g_rng = 0x2545F491;
@@ -162,7 +149,6 @@ int setresuid(int r,int e,int s){ (void)r;(void)e;(void)s; return 0; }
 int setresgid(int r,int e,int s){ (void)r;(void)e;(void)s; return 0; }
 int setreuid(int r,int e){ (void)r;(void)e; return 0; }
 int setregid(int r,int e){ (void)r;(void)e; return 0; }
-long sysconf(int name){ (void)name; return -1; }
 /* access(): the SecOS libc (SYS_ACCESS). */
 
 /* asprintf (brace expansion {01..10}): format into a malloc'd string. */

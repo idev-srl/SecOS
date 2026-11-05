@@ -52,11 +52,11 @@ fi
 [ -f config.h ] || { ./configure $CONF_OPTS >/dev/null 2>&1; echo "$CONF_OPTS" > .secos-conf; }
 [ -f bash ] || make >/dev/null 2>&1            # native build = generates y.tab.c, version.h, etc.
 
-echo "[port-bash] 2/6 patch config.h for SecOS (disable wide-char/regex/select/locale/union-wait)"
+echo "[port-bash] 2/6 patch config.h for SecOS (disable wide-char/regex/pselect/locale/union-wait)"
 python3 - "$WORK/config.h" <<'PY'
 import sys
 f=sys.argv[1]; s=open(f).read()
-if 'SecOS port overrides v4' not in s:
+if 'SecOS port overrides v5' not in s:
     # Drop an older override block (work dirs patched by a previous port run).
     if '/* SecOS port overrides' in s:
         head = s.split('/* SecOS port overrides')[0]
@@ -64,13 +64,13 @@ if 'SecOS port overrides v4' not in s:
     ov='\n'.join('#undef '+m for m in (
       'HAVE_MBSTATE_T HAVE_MBRTOWC HAVE_MBSRTOWCS HAVE_WCWIDTH HAVE_WCHAR_H HAVE_WCTYPE_H '
       'HAVE_WCSDUP HAVE_WCSCMP HAVE_LANGINFO_H HAVE_NL_LANGINFO HAVE_LANGINFO_CODESET '
-      'HAVE_REGCOMP HAVE_REGEX_H HAVE_POSIX_REGEXP HAVE_SELECT HAVE_SYS_SELECT_H HAVE_LOCALE_H '
+      'HAVE_REGCOMP HAVE_REGEX_H HAVE_POSIX_REGEXP HAVE_LOCALE_H '
       'HAVE_PSELECT HAVE_DEV_FD HAVE_DEV_STDIN HAVE_STRUCT_STAT_ST_ATIM '
       'HAVE_STRUCT_STAT_ST_ATIMESPEC HAVE_STRUCT_STAT_ST_ATIM_TV_NSEC HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC '
       'HAVE_STRUCT_DIRENT_D_INO HAVE_STRUCT_DIRENT_D_FILENO HAVE_DLOPEN HAVE_DLFCN_H '
       'HAVE_UNION_WAIT HAVE_TERMIO_H HAVE_FNMATCH '
       'HAVE_NETDB_H HAVE_GETSERVENT HAVE_GETPWENT HAVE_SETPWENT HAVE_ENDPWENT HAVE_SETLOCALE').split())
-    s=s.replace('#include "config-bot.h"', '/* SecOS port overrides v4 */\n'+ov+'\n#include "config-bot.h"',1)
+    s=s.replace('#include "config-bot.h"', '/* SecOS port overrides v5 */\n'+ov+'\n#include "config-bot.h"',1)
     open(f,'w').write(s)
 PY
 
@@ -115,7 +115,10 @@ f = sys.argv[1]; s = open(f).read()
 n = re.sub(r'#define BRACKETED_PASTE_DEFAULT\s+1', '#define BRACKETED_PASTE_DEFAULT 0', s)
 if n != s: open(f, 'w').write(n)
 PY
-# Without select() readline takes its SIGALRM timeout path, whose upstream
+# select() exists (libc over SYS_POLL): readline waits for the rest of an
+# escape sequence (keyseq-timeout) and bash's `read -t` with select. pselect
+# stays off (libc's is not atomic with the mask). The SIGALRM timeout path is
+# then unused, but its upstream
 # timerset(&it.it_value, ...) expands to &it.it_value->tv_sec (does not build).
 python3 - "$WORK/lib/readline/input.c" <<'PY'
 import sys

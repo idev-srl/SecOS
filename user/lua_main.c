@@ -66,16 +66,7 @@ char* tmpnam(char* s) {
     snprintf(d, L_tmpnam, "/tmp/lua_%u_%u", (unsigned)getpid(), seq++);
     return d;
 }
-/* os.execute: run the command through /bin/bash -c (signed, from the VFS). */
-int system(const char* cmd) {
-    if (!cmd) return 1;                           /* a shell is available */
-    char* argv[] = { (char*)"bash", (char*)"-c", (char*)cmd, NULL };
-    int pid = spawn("/bin/bash", argv);
-    if (pid < 0) return -1;
-    int st;
-    while ((st = waitpid(pid)) == -4) { }          /* retry on EINTR */
-    return st < 0 ? -1 : st;                       /* POSIX wait status */
-}
+/* os.execute: libc system() (/bin/bash -c in a fork+execve child). */
 /* difftime/gmtime/localtime/mktime/strftime (UTC) come from the SecOS libc. */
 
 static void open_safe_libs(lua_State* L) {
