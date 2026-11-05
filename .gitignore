@@ -33,3 +33,4 @@ user/lua.elf
 
 # gcc -MMD header dependency files
 *.d
+.cflags_extra
