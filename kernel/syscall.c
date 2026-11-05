@@ -403,7 +403,7 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
             int r = (len <= PIPE_BUF) ? pipe_write(pp, u.p, want)        // atomic
                                       : pipe_write_some(pp, u.p, want);  // may split
             if(r == -2){ c->pipe_wdone = done; err = -2; break; }       // block; resume at done
-            if(r <= 0){ err = r; break; }                               // EPIPE
+            if(r <= 0){ err = (r == -1) ? -EPIPE : r; break; }           // no reader left
             done += r;
         }
         uio_put(&u);

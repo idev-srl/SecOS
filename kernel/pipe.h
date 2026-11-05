@@ -19,6 +19,9 @@ typedef struct pipe pipe_t;
 /* POSIX PIPE_BUF: a write of <= PIPE_BUF bytes is atomic (all or would-block,
  * never split). Equal to the ring size, so such a write always fits eventually. */
 #define PIPE_BUF 4096
+#ifndef EPIPE
+#define EPIPE 32        /* write() with no reader left (returned as -EPIPE) */
+#endif
 
 pipe_t* pipe_alloc(void);                          /* readers=writers=1, or NULL */
 int  pipe_read(pipe_t* p, void* buf, int len);     /* >0 bytes; 0 EOF; -2 would-block */
