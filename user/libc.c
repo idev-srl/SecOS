@@ -363,10 +363,12 @@ int execle(const char* path, const char* arg, ...){
 /* ============================== <dirent.h> ============================= */
 #include <dirent.h>
 DIR* opendir(const char* path){
+    /* The kernel returns up to 256 entries of 256 bytes (SYS_GETDENTS); /bin
+     * holds well over 64 once BusyBox is installed. */
     DIR* d = malloc(sizeof(DIR)); if(!d) return 0;
-    d->buf = malloc(16384);
+    d->buf = malloc(65536);
     if(!d->buf){ free(d); return 0; }
-    long n = getdents(path, d->buf, 16384);
+    long n = getdents(path, d->buf, 65536);
     if(n < 0){ free(d->buf); free(d); return 0; }
     d->len = (int)n; d->pos = 0;
     return d;
