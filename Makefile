@@ -348,6 +348,11 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/m35_caps.elf user/crt0.o user/note_confined.o user/libsecos.o user/libc.o user/m35_caps.o
 	python3 tools/secos-sign user/m35_caps.elf --dev
 	python3 tools/elf2h.py user/m35_caps.elf user_m35caps_elf crypto/user_m35caps_elf.h
+	# [stress] seeded ring-3 syscall fuzzer (tools/soak.sh + selftest fuzz gate)
+	$(CC) $(USER_CFLAGS) -c user/sysfuzz.c     -o user/sysfuzz.o
+	$(LD) --gc-sections -T user/user.ld -o user/sysfuzz.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/sysfuzz.o
+	python3 tools/secos-sign user/sysfuzz.elf --dev
+	python3 tools/elf2h.py user/sysfuzz.elf user_sysfuzz_elf crypto/user_sysfuzz_elf.h
 	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig -> crypto/*.h"
 
 # [M34] Port of lua 5.4.7 FROM SOURCE (third_party/lua), signed + embedded.
