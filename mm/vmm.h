@@ -138,14 +138,20 @@ void vmm_setup_kernel_guard_pages(void);
 
 #define M2_IST_PAGES        2   // pages per IST usable region (8 KB)
 
+// End of the fixed M2 stacks (boot kernel stack + IST1..3 and their guards).
+#define M2_FIXED_STACKS_END    (M2_IST3_GUARD_HI + 0x1000ULL)
+
 // ---- M5: per-process guarded kernel stacks ----
 // Each slot gets: [guard_lo(1 page)] [usable(16 pages)] [guard_hi(1 page)]
-// Region grows downward from top of the first 2MB PT block.
+// Region grows downward from the top of the second 2MB PT block. (It used to
+// start at the top of the FIRST block, which only fits 26 slots above the fixed
+// M2 stacks: slot 26 landed on IST3, its vmm_map failed and the kernel halted
+// once 27 processes coexisted — see the static assert in vmm.c.)
 // Slot index is bounded [0..M5_MAX_KSTACK_SLOTS-1], derived from proc_table index.
 #define M5_KSTACK_PAGES        16
 #define M5_KSTACK_SLOT_PAGES   (M5_KSTACK_PAGES + 2)   // 18 pages per slot
 #define M5_KSTACK_SLOT_SIZE    (M5_KSTACK_SLOT_PAGES * 0x1000ULL)
-#define M5_KSTACK_REGION_TOP   (M2_STACK_REGION_BASE + 0x200000ULL) // top of first 2MB block
+#define M5_KSTACK_REGION_TOP   (M2_STACK_REGION_BASE + 0x400000ULL) // top of 2nd 2MB block
 #define M5_MAX_KSTACK_SLOTS    32  // must match MAX_PROCESSES
 
 // Allocate guarded per-process kernel stack for a bounded slot index.

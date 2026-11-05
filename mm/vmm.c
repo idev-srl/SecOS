@@ -652,6 +652,11 @@ uint64_t vmm_alloc_ist_stack(uint64_t guard_lo, uint64_t base, uint64_t top,
 
 // ---- M5: per-process guarded kernel stacks (slot-based) ----
 
+// Every per-process kernel stack slot must lie above the fixed M2 stacks.
+typedef char m5_kstack_slots_fit_above_m2_stacks[
+    (M5_KSTACK_REGION_TOP - (uint64_t)M5_MAX_KSTACK_SLOTS * M5_KSTACK_SLOT_SIZE
+         >= M2_FIXED_STACKS_END) ? 1 : -1];
+
 static uint64_t m5_kstack_slot_top(uint32_t slot) {
     return M5_KSTACK_REGION_TOP - ((uint64_t)slot * M5_KSTACK_SLOT_SIZE);
 }
@@ -680,7 +685,7 @@ uint64_t vmm_alloc_kernel_stack_for_slot(uint32_t slot) {
     uint64_t top  = m5_kstack_rsp_top(slot);
 
     // Runtime assertion: region must stay within M2 stack 2MB block
-    if (ghi >= M5_KSTACK_REGION_TOP || glo < M2_STACK_REGION_BASE) {
+    if (ghi >= M5_KSTACK_REGION_TOP || glo < M2_FIXED_STACKS_END) {
         terminal_writestring("[M5][PANIC] kstack slot ");
         m2_print_hex((uint64_t)slot);
         terminal_writestring(" outside M2 region\n");
