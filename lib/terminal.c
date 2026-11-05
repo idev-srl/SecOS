@@ -49,6 +49,15 @@ static unsigned char vga_glyph(uint8_t g){
 	case VT_G_BLOCK:    return 0xDB;
 	case VT_G_SHADE:    return 0xB1;
 	case VT_G_CHECK:    return 0xFB;     /* square-root sign */
+	/* [M40] accented letters: CP437 where it has them, else the base letter */
+	case VT_G_A_GRAVE:  return 0x85;  case VT_G_E_GRAVE: return 0x8A;
+	case VT_G_E_ACUTE:  return 0x82;  case VT_G_I_GRAVE: return 0x8D;
+	case VT_G_O_GRAVE:  return 0x95;  case VT_G_U_GRAVE: return 0x97;
+	case VT_G_CA_GRAVE: return 'A';   case VT_G_CE_GRAVE: return 'E';
+	case VT_G_CE_ACUTE: return 0x90;  case VT_G_CI_GRAVE: return 'I';
+	case VT_G_CO_GRAVE: return 'O';   case VT_G_CU_GRAVE: return 'U';
+	case VT_G_C_CEDIL:  return 0x87;  case VT_G_SECTION: return 0x15;
+	case VT_G_POUND:    return 0x9C;  case VT_G_EURO:    return 'E';
 	default: return g;                   /* ASCII + CP437 box codes map 1:1 */
 	}
 }

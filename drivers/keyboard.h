@@ -42,5 +42,11 @@ int  keyboard_key_bytes(int key, int mods, char out[8]);
 // before each command. Lets `cat /dev/random` etc. be interrupted.
 int  keyboard_break_pending(void);
 void keyboard_clear_break(void);
+/* [M40] One key event (Linux key code, 1 = press / 2 = repeat / 0 = release)
+ * from any keyboard into the console: modifiers, keymap, ISIG, byte ring. */
+void keyboard_key_event(int keycode, int value);
+void keyboard_register_input(void);    /* PS/2 keyboard -> /dev/input/eventN */
+const char* keyboard_keymap_name(void);
+int  keyboard_set_keymap(const char* name);  /* 0, or -1 for an unknown layout */
 
 #endif

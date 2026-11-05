@@ -12,6 +12,11 @@
  * are synthesized; block devices (sda/nvme0n1/usb0/vda...) are byte-addressed
  * over the registered block_dev_t. A pure namespace: no create/mkdir/remove.
  *
+ * GUI (M40): /dev/fb0 is the framebuffer (drivers/fbdev.c) and
+ * /dev/input/eventN the evdev input devices (drivers/input.c). Unlike the rest
+ * of /dev they are NOT ambient: opening them needs CAP_INPUT / CAP_DISPLAY in
+ * the opener's signed manifest (devfs_open_hook).
+ *
  * Terminals: /dev/console is the console; /dev/tty is the opener's controlling
  * terminal (the console, or a pty slave - ksys_open asks kernel/pty.c to
  * substitute it); /dev/ptmx allocates a pseudo-terminal and /dev/pts/N are the
@@ -22,6 +27,10 @@
 #include "terminal.h"
 #include "keyboard.h"
 #include "pty.h"
+#include "input.h"
+#include "fbdev.h"
+#include "cap.h"
+#include "process.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -29,7 +38,7 @@ extern uint64_t timer_get_ticks(void);
 
 enum dev_kind { DEV_NULL, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_CONSOLE, DEV_BLOCK,
                 DEV_TTY /* controlling terminal */, DEV_PTMX /* pty multiplexer */,
-                DEV_KMSG /* kernel log */ };
+                DEV_KMSG /* kernel log */, DEV_FB /* [M40] framebuffer */ };
 
 struct dev_node {
     char name[16];
@@ -69,6 +78,7 @@ static void devfs_build(void) {
     add("tty", DEV_TTY, NULL);
     add("ptmx", DEV_PTMX, NULL);
     add("kmsg", DEV_KMSG, NULL);                 // kernel log, one record per read()
+    if (fbdev_present()) add("fb0", DEV_FB, NULL);   // [M40] linear framebuffer
     int n = block_count();
     for (int i = 0; i < n; i++) {
         block_dev_t* b = block_get(i);
@@ -109,6 +119,8 @@ static vfs_inode_t* devfs_lookup(const char* rel) {
     devfs_build();
     vfs_inode_t* pt = pty_devfs_lookup(rel);           /* /pts, /pts/N */
     if (pt) return pt;
+    vfs_inode_t* in = input_devfs_lookup(rel);         /* /input, /input/eventN */
+    if (in) return in;
     int i = find_node(rel);
     if (i == -2) return NULL;
     return fill_inode(i);
@@ -118,9 +130,11 @@ static int devfs_readdir(const char* dir, vfs_iter_cb cb, void* user) {
     devfs_build();
     if (!cb) return -1;
     if (dir && seq(dir, "/pts")) return pty_devfs_readdir(cb, user);
-    if (!(dir && dir[0]=='/' && dir[1]==0)) return -1;   // only the root dir and /pts list
+    if (dir && seq(dir, "/input")) return input_devfs_readdir(dir, (input_iter_cb)cb, user);
+    if (!(dir && dir[0]=='/' && dir[1]==0)) return -1;   // only the root dir, /pts and /input list
     for (int i=0;i<g_nnodes;i++) cb(fill_inode(i), user);
     cb(pty_devfs_lookup("/pts"), user);
+    input_devfs_readdir("/", (input_iter_cb)cb, user);
     return 0;
 }
 
@@ -146,6 +160,18 @@ static int devfs_kind_is(void* p, enum dev_kind k) {
 /* /dev/tty (resolved per opener) and /dev/ptmx (a new pty per open). */
 int devfs_is_devtty(void* p) { return devfs_kind_is(p, DEV_TTY); }
 int devfs_is_ptmx(void* p) { return devfs_kind_is(p, DEV_PTMX); }
+int devfs_is_fb(void* p) { return devfs_kind_is(p, DEV_FB); }
+
+/* [M40] open() of a GUI device: /dev/fb0 needs CAP_DISPLAY, /dev/input/eventN
+ * CAP_INPUT (and gets a per-open evdev client). 0 = allowed / not a GUI node,
+ * <0 = -errno. */
+int devfs_open_hook(void* cp, vfs_inode_t** ino, int flags) {
+    process_t* c = (process_t*)cp;
+    if (!ino || !*ino) return 0;
+    if (devfs_is_fb(*ino))
+        return cap_check_explicit(c, CAP_DISPLAY, 4 /*SYS_OPEN*/, "fb0-open") ? 0 : -13;
+    return input_open_hook(c, ino, flags);
+}
 
 static int devfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
     if (!inode || !inode->fs_data) return -1;
@@ -167,6 +193,7 @@ static int devfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
             return tty_read_try(buf, (int)(len > 4096 ? 4096 : len));
         }
         case DEV_BLOCK: return blk_byte_io(d->blk, off, buf, len, 0);
+        case DEV_FB: return fbdev_read(off, buf, len);
         case DEV_KMSG: {
             extern int klog_kmsg_read(uint64_t off, char* out, size_t len);
             return klog_kmsg_read(off, (char*)buf, len);
@@ -187,6 +214,7 @@ static int devfs_write(vfs_inode_t* inode, size_t off, const void* buf, size_t l
         case DEV_TTY:
         case DEV_CONSOLE: { extern int tty_write(const void*, int); return tty_write(in, (int)len); }
         case DEV_BLOCK: return blk_byte_io(d->blk, off, (void*)(uintptr_t)buf, len, 1);
+        case DEV_FB: return fbdev_write(off, buf, len);
         case DEV_KMSG: {                                          // userspace -> kernel log
             extern void klog_putc(char c);
             for (size_t i=0;i<len && i<512;i++) klog_putc((char)in[i]);

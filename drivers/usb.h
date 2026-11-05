@@ -28,6 +28,9 @@ int usb_get_descriptor(usb_device_t* d, uint8_t type, uint8_t index, void* buf, 
 int usb_set_configuration(usb_device_t* d, uint8_t cfg);
 int usb_control_out(usb_device_t* d, uint8_t bmReqType, uint8_t bReq,
                     uint16_t wValue, uint16_t wIndex);
+// [M40] Control IN with a data stage into `buf` (a DMA-able kernel buffer).
+int usb_control_in(usb_device_t* d, uint8_t bmReqType, uint8_t bReq,
+                   uint16_t wValue, uint16_t wIndex, void* buf, int len);
 
 // Called by xhci_enumerate() once a device is addressed: read descriptors,
 // select a configuration and bind a class driver.
@@ -44,7 +47,7 @@ void usb_msc_attach(usb_device_t* d, const usb_endpoint_t* eps, int n, uint8_t i
 // Power + reset downstream ports and enumerate any attached devices through xHCI.
 void usb_hub_attach(usb_device_t* d, const usb_endpoint_t* eps, int n, uint8_t iface);
 
-// Polled from the timer tick: drain pending HID keyboard reports.
+// Polled from the input wait paths (never an ISR): drain pending HID reports.
 void usb_hid_poll(void);
 
 #endif // USB_H

@@ -1362,6 +1362,23 @@ static void coreutils_install(void) {
     // [pipe] blocking-pipe integrity test (PIPE_BUF atomicity, full writes, EINTR/EPIPE)
     vfs_create("/bin/pipe_test", user_pipe_test_elf, user_pipe_test_elf_len);
 }
+// [M40] GUI kernel interfaces: the fb/evdev demo (signed CAP_INPUT|CAP_DISPLAY),
+// the selftest program and its capability-less twin, and loadkeys. Installed
+// when missing, so a persistent root picks them up too.
+#include "../crypto/user_fbdemo_elf.h"
+#include "../crypto/user_guitest_elf.h"
+#include "../crypto/user_guitest_nocap_elf.h"
+#include "../crypto/user_loadkeys_elf.h"
+static void gui_install(void) {
+    extern int vfs_create(const char*, const void*, size_t);
+    extern vfs_inode_t* vfs_lookup(const char*);
+    if (!vfs_lookup("/bin/fbdemo")) vfs_create("/bin/fbdemo", user_fbdemo_elf, user_fbdemo_elf_len);
+    if (!vfs_lookup("/bin/guitest")) vfs_create("/bin/guitest", user_guitest_elf, user_guitest_elf_len);
+    if (!vfs_lookup("/bin/guitest_nocap"))
+        vfs_create("/bin/guitest_nocap", user_guitest_nocap_elf, user_guitest_nocap_elf_len);
+    if (!vfs_lookup("/bin/loadkeys")) vfs_create("/bin/loadkeys", user_loadkeys_elf, user_loadkeys_elf_len);
+    debugcon_writestring("[M40] fbdemo + guitest + loadkeys installed to /bin\n");
+}
 // BusyBox 1.36.1 from source (tools/port-busybox.sh): the signed multi-call
 // binary goes to /bin/busybox and a tiny signed stub (user/bbstub.c, re-execs
 // /bin/busybox with the same argv) is installed under every applet name, since
@@ -1427,6 +1444,7 @@ static trapframe_t m10_idle_tf;
 __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
     shell_init();
     coreutils_install();   // [M31] populate /bin with the signed coreutils applets
+    gui_install();         // [M40] /bin/fbdemo, /bin/guitest, /bin/loadkeys
 #ifndef SECOS_NO_BUSYBOX
     busybox_install();     // BusyBox userland: /bin/busybox + one stub per applet
 #endif
@@ -1677,6 +1695,21 @@ static void kernel_main_phase2(void) {
         }
     }
 #endif /* SECOS_NO_APIC */
+
+    // [M40] Input: the PS/2 keyboard becomes /dev/input/event0, then the PS/2
+    // mouse (IRQ12, routed like IRQ1: IOAPIC in APIC mode, slave 8259 otherwise).
+    // USB HID keyboards/mice/tablets register later from usb_init().
+    {
+        extern void keyboard_register_input(void);
+        extern const char* keyboard_keymap_name(void);
+        extern int ps2mouse_init(void);
+        extern void irq_enable_aux(void);
+        keyboard_register_input();
+        if (ps2mouse_init() == 0) irq_enable_aux();
+        debugcon_writestring("[KBD] keymap ");
+        debugcon_writestring(keyboard_keymap_name());
+        debugcon_writestring("\n");
+    }
 
     // [M28-3] TSC timekeeping: calibrate rdtsc against PIT channel 2 (independent
     // of the 8259/APIC) for a monotonic nanosecond clock. The 1 kHz scheduler tick

@@ -24,6 +24,8 @@ typedef enum {
     CAP_SIGNAL  = (1u<<10),
     CAP_TIME    = (1u<<11),
     CAP_POWER   = (1u<<12),   /* SYS_REBOOT: a confined program must declare it */
+    CAP_INPUT   = (1u<<13),   /* [M40] explicit: open /dev/input/eventN */
+    CAP_DISPLAY = (1u<<14),   /* [M40] explicit: open /dev/fb0, KD_GRAPHICS */
 } cap_t;
 
 /* True if `p` is allowed capability `cap`. Ambient (not enforcing) => always
@@ -34,6 +36,11 @@ int cap_allowed(const struct process* p, uint32_t cap);
  * grant only when confined), 0 if denied (always audited). `syscall_num` and
  * `name` are recorded for the audit trail. */
 int cap_check(const struct process* p, uint32_t cap, uint64_t syscall_num, const char* name);
+
+/* [M40] Explicit capability (CAP_INPUT, CAP_DISPLAY): allowed only when the
+ * signed manifest declares the bit, even for an ambient (unconfined) process.
+ * Kernel context (no process / pid 0) is always allowed. Denials are audited. */
+int cap_check_explicit(const struct process* p, uint32_t cap, uint64_t syscall_num, const char* name);
 
 /* Audit record + query API (a queryable [AUDIT] log). */
 typedef struct {

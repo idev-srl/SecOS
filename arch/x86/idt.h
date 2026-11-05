@@ -67,6 +67,7 @@ extern void isr31(void);
 // IRQ handlers
 extern void isr_timer(void);
 extern void isr_keyboard(void);
+extern void isr_mouse(void);      // [M40] PS/2 mouse IRQ12
 extern void isr_stub(void);
 
 // MSI/MSI-X interrupt stubs — IMPLEMENTED BUT NOT YET TESTED / not enabled by

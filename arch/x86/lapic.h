@@ -65,4 +65,8 @@ void lapic_timer_start_this_cpu(uint32_t hz);
  * the scheduler's preempt path so the EOI source tracks the active mode. */
 void irq_eoi(void);
 
+/* [M40] PS/2 mouse IRQ12 (vector 0x2C): unmask/route it, and its EOI. */
+void irq_enable_aux(void);
+void irq_eoi_aux(void);
+
 #endif /* LAPIC_H */

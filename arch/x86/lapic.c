@@ -43,6 +43,7 @@
  * (ISA IRQ1) keeps vector 0x21 routed through the IOAPIC instead of the PIC. */
 #define VEC_TIMER    0x20
 #define VEC_KEYBOARD 0x21
+#define VEC_MOUSE    0x2C   /* [M40] ISA IRQ12 (PS/2 AUX), same vector as the PIC mapping */
 
 /* Spurious vector to install when we enable the LAPIC. 0xFF is conventional. */
 #define LAPIC_SPURIOUS_VECTOR 0xFF
@@ -258,6 +259,23 @@ int apic_switchover(uint32_t hz) {
     __asm__ volatile ("sti");
     debugcon_writestring("[APIC] mode active (PIC masked, LAPIC timer + IOAPIC)\n");
     return 0;
+}
+
+/* [M40] PS/2 AUX (mouse) on ISA IRQ12, vector 0x2C: routed through the IOAPIC
+ * like the keyboard in APIC mode, else unmasked on the slave 8259 (+ the
+ * cascade line on the master). */
+void irq_enable_aux(void) {
+    if (g_apic_mode) {
+        ioapic_route_irq(12, VEC_MOUSE, (uint8_t)acpi_get()->bsp_lapic_id);
+    } else {
+        outb(0xA1, (uint8_t)(inb(0xA1) & ~(1u << 4)));   /* IRQ12 = slave line 4 */
+        outb(0x21, (uint8_t)(inb(0x21) & ~(1u << 2)));   /* cascade (IRQ2) */
+    }
+}
+/* End-of-interrupt for IRQ12: LAPIC, or slave + master 8259. */
+void irq_eoi_aux(void) {
+    if (g_apic_mode) g_lapic[LAPIC_REG_EOI / 4] = 0;
+    else { outb(0xA0, 0x20); outb(0x20, 0x20); }
 }
 
 /* ============================ M29: SMP IPIs / per-CPU ===================== */

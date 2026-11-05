@@ -36,6 +36,7 @@ extern uint64_t tsc_hz(void);
 extern void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
 extern int  socket_poll(uint32_t pid, int fd);
 #include "pty.h"     /* pty_poll / tty_console_poll / PTY_WAIT_ANY */
+#include "input.h"   /* [M40] evdev clients */
 extern int  devfs_is_console(void* inode);
 extern int  keyboard_has_char(void);
 extern void process_foreach(void (*cb)(process_t*, void*), void* user);
@@ -436,11 +437,16 @@ struct k_pollfd { int32_t fd; int16_t events, revents; };
  * caller knows which wake-up sources to arm before it blocks. */
 #define PW_CONSOLE 1
 #define PW_PTY     2
+#define PW_INPUT   4    /* [M40] evdev: re-poll every 2 ms (USB HID is polled) */
 static int ki_fd_revents(process_t* c, int fd, int events, int* watch) {
     if (fd < 0 || fd >= 32) return POLLNVAL;
     struct proc_fd_entry* e = &c->fds[fd];
     if (e->used && e->is_sock) return socket_poll(c->pid, e->is_sock - 1);
     if (e->used && e->is_pipe) return pipe_poll((pipe_t*)e->inode, e->pipe_w);
+    if (e->used && e->inode && input_is_client(e->inode)) {   /* [M40] evdev */
+        *watch |= PW_INPUT;
+        return input_poll(e->inode);
+    }
     if (e->used && e->inode && pty_is_inode(e->inode)) {
         *watch |= PW_PTY;
         int r = pty_poll(e->inode, events | POLLIN | POLLOUT);
@@ -499,7 +505,7 @@ static uint64_t sys_poll(process_t* c, trapframe_t* tf, uint64_t ufds, uint64_t 
     /* Sleep until the deadline, a pipe event, or at most 10 ms (to re-check
      * the console and sockets, whose input arrives from interrupts). */
     uint64_t t = timer_get_ticks();
-    uint64_t wake = t + 10;
+    uint64_t wake = t + ((watch & PW_INPUT) ? 2 : 10);
     if (c->ki.poll_deadline != ~0ull) {
         uint64_t left_ms = (c->ki.poll_deadline - now + 999999ull) / 1000000ull;
         if (t + left_ms < wake) wake = t + (left_ms ? left_ms : 1);

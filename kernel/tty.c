@@ -51,6 +51,9 @@
 #include "signal.h"
 #include "tty.h"
 #include "../mm/user_copy.h"
+#include "fbdev.h"      // [M40] KDSETMODE console handoff, KDSKBLAYOUT
+#include "keyboard.h"   // [M40] keymap selection
+#include "debugcon.h"
 
 extern int  keyboard_getc_raw(void);
 extern bool keyboard_input_pending_noirq(void);
@@ -59,7 +62,6 @@ extern process_t* process_find_by_pid(uint32_t pid);
 extern uint64_t timer_get_ticks(void);
 extern uint32_t timer_get_frequency(void);
 extern void vt_set_reply_hook(void (*hook)(const char* s, int n));
-extern void debugcon_putchar(char c);
 
 #define TTY_EINTR (-4)          /* -EINTR: libc maps it to errno=EINTR */
 #define TTY_EIO   (-5)          /* -EIO: background read with SIGTTIN blocked/ignored, hangup */
@@ -646,8 +648,36 @@ int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) {
     }
 }
 
-/* Console ioctl entry (termios, window size, queues). */
+/* [M40] Console-only requests: graphics handoff (KDSETMODE/KDGETMODE, see
+ * drivers/fbdev.c) and the keyboard layout (KDSKBLAYOUT/KDGKBLAYOUT). */
+static int console_kd_ioctl(uint64_t cmd, uint64_t arg) {
+    if (cmd == KDSKBLAYOUT) {
+        char name[16];
+        int i = 0;
+        for (; i < 15; i++) {
+            if (copy_from_user(&name[i], (const char*)arg + i, 1)) return -14;
+            if (!name[i]) break;
+        }
+        name[i] = 0;
+        if (keyboard_set_keymap(name) != 0) return -22;          /* unknown layout */
+        debugcon_writestring("[KBD] keymap ");
+        debugcon_writestring(keyboard_keymap_name());
+        debugcon_writestring("\n");
+        return 0;
+    }
+    if (cmd == KDGKBLAYOUT) {
+        char name[16] = { 0 };
+        const char* n = keyboard_keymap_name();
+        for (int i = 0; n[i] && i < 15; i++) name[i] = n[i];
+        return k_copy_to((void*)arg, name, sizeof(name));
+    }
+    return vtcon_ioctl(cmd, arg);                                /* -515 if not KD* */
+}
+
+/* Console ioctl entry (termios, window size, queues, console mode, keymap). */
 int tty_ioctl(uint64_t cmd, uint64_t arg) {
+    int r = console_kd_ioctl(cmd, arg);
+    if (r != -515) return r;
     return tty_ldisc_ioctl(tty_console(), cmd, arg);
 }
 

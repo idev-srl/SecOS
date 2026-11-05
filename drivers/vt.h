@@ -29,6 +29,24 @@
 #define VT_G_BLOCK     0x84
 #define VT_G_SHADE     0x85
 #define VT_G_CHECK     0x86
+/* [M40] Italian keyboard letters + symbols (drawn by the fb console font, mapped
+ * to CP437 by the VGA backend). */
+#define VT_G_A_GRAVE   0x90   /* a-grave   U+00E0 */
+#define VT_G_E_GRAVE   0x91   /* e-grave   U+00E8 */
+#define VT_G_E_ACUTE   0x92   /* e-acute   U+00E9 */
+#define VT_G_I_GRAVE   0x93   /* i-grave   U+00EC */
+#define VT_G_O_GRAVE   0x94   /* o-grave   U+00F2 */
+#define VT_G_U_GRAVE   0x95   /* u-grave   U+00F9 */
+#define VT_G_CA_GRAVE  0x96   /* A-grave   U+00C0 */
+#define VT_G_CE_GRAVE  0x97   /* E-grave   U+00C8 */
+#define VT_G_CE_ACUTE  0x98   /* E-acute   U+00C9 */
+#define VT_G_CI_GRAVE  0x99   /* I-grave   U+00CC */
+#define VT_G_CO_GRAVE  0x9A   /* O-grave   U+00D2 */
+#define VT_G_CU_GRAVE  0x9B   /* U-grave   U+00D9 */
+#define VT_G_C_CEDIL   0x9C   /* c-cedilla U+00E7 */
+#define VT_G_SECTION   0x9D   /* section   U+00A7 */
+#define VT_G_POUND     0x9E   /* pound     U+00A3 */
+#define VT_G_EURO      0x9F   /* euro      U+20AC */
 
 #define VT_ATTR_UL     0x01   /* underline */
 

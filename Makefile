@@ -28,9 +28,13 @@ ASFLAGS = -f elf64
 BUILD_TS := $(shell if [ -n "$$SOURCE_DATE_EPOCH" ]; then date -u -d @$$SOURCE_DATE_EPOCH +%Y%m%d%H%M%S; else date -u +%Y%m%d%H%M%S; fi)
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo NOHASH)
 # Nota: CONFIG_MULTIBOOT e CONFIG_UEFI sono ora definiti in config.h (dual-boot support)
+# [M40] Boot keyboard layout (drivers/keymap.c): `make iso KEYMAP=it`. The code
+# default is "us"; switch at runtime with `loadkeys it|us`.
+KEYMAP ?=
+KEYMAP_DEF := $(if $(KEYMAP),-DSECOS_KEYMAP_DEFAULT='"$(KEYMAP)"',)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
 		  -fstack-protector-strong $(INCLUDES) \
-		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(CFLAGS_EXTRA)
+		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(CFLAGS_EXTRA)
 # Header dependency tracking: every kernel object also depends on the headers it
 # includes (gcc writes foo.d next to foo.o). Without it, changing only a header
 # (e.g. a regenerated embedded program crypto/user_*_elf.h) left the objects that
@@ -51,6 +55,8 @@ SRC_C   = \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c $(DRIVERS_DIR)/vt.c \
+	$(DRIVERS_DIR)/input.c $(DRIVERS_DIR)/keymap.c $(DRIVERS_DIR)/ps2mouse.c \
+	$(DRIVERS_DIR)/fbdev.c \
 	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
 	$(DRIVERS_DIR)/ahci.c $(DRIVERS_DIR)/nvme.c \
 	$(DRIVERS_DIR)/xhci.c $(DRIVERS_DIR)/usb.c \
@@ -180,6 +186,12 @@ $(KERNEL_DIR)/%.o: $(KERNEL_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(ARCH_DIR)/%.o: $(ARCH_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
+# [M40] drivers/keymap.o bakes in KEYMAP: rebuild it whenever the value changes.
+# The stamp is rewritten (at parse time) only when its content would change.
+KEYMAP_STAMP := .keymap.stamp
+$(shell echo '$(KEYMAP)' | cmp -s - $(KEYMAP_STAMP) 2>/dev/null || echo '$(KEYMAP)' > $(KEYMAP_STAMP))
+$(DRIVERS_DIR)/keymap.o: $(KEYMAP_STAMP)
+
 $(DRIVERS_DIR)/%.o: $(DRIVERS_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(MM_DIR)/%.o: $(MM_DIR)/%.c
@@ -624,7 +636,7 @@ run-vnc: iso
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
-	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)

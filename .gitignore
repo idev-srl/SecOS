@@ -33,3 +33,6 @@ user/lua.elf
 
 # gcc -MMD header dependency files
 *.d
+
+# [M40] KEYMAP build stamp
+.keymap.stamp

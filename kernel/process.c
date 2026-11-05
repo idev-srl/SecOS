@@ -19,6 +19,8 @@
 #include "percpu.h"     // [M29] smp_online_count for CPU affinity
 #include "user_copy.h"  // EFAULT
 #include "pty.h"        // pty fd / controlling-terminal references
+#include "input.h"      // [M40] evdev client references
+#include "fbdev.h"      // [M40] graphics-owner exit -> text console
 
 #define MAX_PROCESSES 32
 static process_t* proc_table[MAX_PROCESSES];
@@ -704,6 +706,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
             socket_unref(p->fds[i].is_sock - 1);
         } else {
             pty_unref(p->fds[i].inode);            // a pty end: drop this holder
+            input_obj_unref(p->fds[i].inode);      // [M40] an evdev client
         }
         p->fds[i].used = 0; p->fds[i].inode = NULL; p->fds[i].is_pipe = 0;
         p->fds[i].pipe_w = 0; p->fds[i].cloexec = 0; p->fds[i].is_sock = 0; p->fds[i].offset = 0; p->fds[i].flags = 0;
@@ -813,7 +816,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
           if (!c->fds[i].used) continue;
           if (c->fds[i].is_pipe) pipe_ref(c->fds[i].inode, c->fds[i].pipe_w);
           else if (c->fds[i].is_sock) socket_ref(c->fds[i].is_sock - 1);
-          else pty_ref(c->fds[i].inode);
+          else { pty_ref(c->fds[i].inode); input_obj_ref(c->fds[i].inode); }
       }
       pty_ctty_ref(c->ctty); }
 
@@ -870,9 +873,14 @@ void process_release_pipes(process_t* p) {
             void* ino = p->fds[i].inode;
             p->fds[i].used = 0; p->fds[i].inode = NULL;
             pty_unref(ino);
+        } else if (p->fds[i].used && input_is_client(p->fds[i].inode)) {
+            void* ino = p->fds[i].inode;           // [M40] evdev client (drops a grab)
+            p->fds[i].used = 0; p->fds[i].inode = NULL;
+            input_obj_unref(ino);
         }
     }
     pty_proc_exit(p);
+    vtcon_proc_exit(p);                            // [M40] graphics owner gone: text console back
 }
 
 int process_destroy(process_t* p) {

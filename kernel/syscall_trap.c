@@ -376,6 +376,12 @@ uint64_t syscall_handler(trapframe_t* tf) {
                 tf->rip -= 2;
                 sched_block_current(tf);                // NORETURN
                 ret = 0;
+            } else if (num == SYS_READ && cur->sleep_until) {
+                // [M40] evdev read with no event yet: the device asked for a
+                // timed re-poll (USB HID has no interrupt). Sleep, then re-run.
+                tf->rip -= 2;
+                sched_block_current(tf);                // NORETURN
+                ret = 0;
             } else if (pipe_fd) {
                 cur->wait_pipe = cur->fds[fd].inode;
                 // SMP: the peer on another CPU can queue data / free room and
@@ -398,6 +404,10 @@ uint64_t syscall_handler(trapframe_t* tf) {
     else if (num >= SYS_CLOCK_GETTIME && num <= SYS_SYSINFO) {
         extern int kiface_syscall(trapframe_t*, uint64_t, uint64_t*);
         kiface_syscall(tf, num, &ret);
+    }
+    else if (num == SYS_MMAP) {
+        // [M40] mmap takes a 6th argument (file offset, r9) for device maps.
+        ret = ksys_mmap6(tf->rdi, tf->rsi, (int)tf->rdx, (int)tf->rcx, (int)tf->r8, tf->r9);
     }
     else {
         ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
