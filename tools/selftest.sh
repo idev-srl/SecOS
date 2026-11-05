@@ -989,6 +989,8 @@ if [[ -n "$OVMF" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
     ! cmp -s dist/kernel.elf "$SB/esp_bad/kernel.elf"; check "M39 secure boot: tampered kernel differs from the signed one" $?
     grep -aq "\[SECURE BOOT\] kernel signature OK" "$SB/ser_good.log"; check "M39 secure boot: signed kernel verified by the UEFI loader" $?
     grep -q "SECoS build" "$SB/dbg_good.log"; check "M39 secure boot: verified kernel boots" $?
+    # The ESP is QEMU's vvfat (FAT16): it must not be mistaken for a FAT32 /mnt.
+    ! grep -q "\[M10\] disk write+readback: FAIL" "$SB/dbg_good.log"; check "UEFI boot: FAT16 ESP not mounted as FAT32 (no M10 readback FAIL)" $?
     grep -aq "\[SECURE BOOT\] kernel signature INVALID - refusing to boot" "$SB/ser_bad.log"; check "M39 secure boot: one flipped byte -> kernel refused" $?
     ! grep -q "SECoS build" "$SB/dbg_bad.log"; check "M39 secure boot: tampered kernel never runs" $?
 else
