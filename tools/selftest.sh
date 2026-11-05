@@ -837,6 +837,61 @@ LONGLINE=$(printf 'W%.0s' $(seq 1 150))
 grep -q "BURST-42-OK" "$BURSTLOG"; check "bash survives long wrapped lines + 24 fork/exec commands (fb cursor overflow regression)" $?
 ! grep -q "\[EXC\]" "$BURSTLOG"; check "no CPU exception ([EXC]) during long-line + fork burst" $?
 
+# ---- Regression: bash command substitution, pipelines, background wait ----
+# `$(...)` and plain pipelines used to hang forever under bash:
+#  - an exiting child kept its pipe write end until its zombie was reaped, and
+#    bash reads a substitution pipe to EOF *before* wait()ing -> no EOF;
+#  - an exec'd (spawned) program didn't inherit bash's dup2'd stdio, so
+#    `$(uname)` / `seq | wc` wrote to the console instead of the pipe;
+#  - zombies were only reaped from idle, so a busy loop piled them up until the
+#    27th process's kernel stack overlapped IST3 and the kernel halted;
+#  - waitpid(-1) counted collected zombies as children -> `cmd & wait` hung.
+# Each CSn marker only appears once expanded (the TTY echo shows the raw text);
+# output may follow the "# " prompt on the same line, so markers are unanchored.
+# The two 50-iteration loops (builtin + exec'd substitutions) would exhaust the
+# 16-entry pipe table / 32-entry process table on any per-use leak, and MemFree
+# must not drift between them.
+CSLOG=/tmp/secos_selftest_cmdsubst.log
+echo "[selftest] Running bash command substitution + pipelines (mb2, serial input, 120s)..."
+: > "$CSLOG"
+( sleep 25
+  printf '  echo CS1-$(echo SUB)\r'; sleep 3
+  printf '  x=$(echo hi); echo CS2-$x\r'; sleep 3
+  printf '  echo CS3-$(echo $(echo deep))\r'; sleep 3
+  printf '  echo CS4-`uname`\r'; sleep 3
+  printf '  echo CS5-$(seq 1 3 | wc -l)\r'; sleep 3
+  printf '  for i in $(seq 1 3); do echo CS6-$i; done\r'; sleep 3
+  printf '  seq 1 50 | wc\r'; sleep 3
+  printf '  echo CS10-$(ls /bin | wc -l)\r'; sleep 3
+  printf '  seq 1 100 | head -5 | wc -l; echo CS11-$(seq 1 100 | head -5 | wc -l)\r'; sleep 4
+  printf '  for i in $(seq 1 6); do sleep 1 & done; wait; echo CS12-$((6*7))\r'; sleep 8
+  printf '  for i in $(seq 1 50); do x=$(echo s$i); y=$(uname); done; echo CS7-$x-$y\r'; sleep 10
+  printf '  cat /proc/meminfo\r'; sleep 3
+  printf '  for i in $(seq 1 50); do x=$(echo t$i); y=$(uname); done; echo CS8-$x-$y\r'; sleep 10
+  printf '  cat /proc/meminfo\r'; sleep 3
+  printf '  echo CS9-$((6*7))\r'; sleep 3 ) | \
+    timeout 120 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$CSLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >/dev/null 2>&1
+grep -q "CS1-SUB" "$CSLOG"; check "bash \$(echo SUB) expands (no pipe-EOF hang)" $?
+grep -q "CS2-hi" "$CSLOG"; check "bash x=\$(echo hi); echo \$x" $?
+grep -q "CS3-deep" "$CSLOG"; check "bash nested \$(echo \$(echo deep))" $?
+grep -q "CS4-SecOS" "$CSLOG"; check "bash backticks capture an exec'd program (\`uname\`)" $?
+grep -q "CS5-3$" "$CSLOG"; check "bash \$(seq 1 3 | wc -l) -> 3" $?
+[[ "$(grep -Ec '(^|# )CS6-[123]$' "$CSLOG")" -eq 3 ]]; check "bash for i in \$(seq 1 3) iterates 3 times" $?
+grep -Eq "(^|# ) +50 +50 +141$" "$CSLOG"; check "bash pipeline seq 1 50 | wc -> 50 50 141" $?
+grep -Eq "CS10-[1-9][0-9]*$" "$CSLOG"; check "bash \$(ls /bin | wc -l) counts /bin entries" $?
+grep -q "CS11-5$" "$CSLOG"; check "bash 3-stage seq 1 100 | head -5 | wc -l -> 5 (early reader exit)" $?
+grep -q "CS12-42" "$CSLOG"; check "bash 6 background jobs + wait returns (no ECHILD hang)" $?
+grep -q "CS7-s50-SecOS" "$CSLOG"; check "bash 50x builtin + exec'd substitutions (no pipe/process-table leak)" $?
+grep -q "CS8-t50-SecOS" "$CSLOG"; check "bash another 50x substitutions" $?
+mf=( $(grep -o "^MemFree: *[0-9]*" "$CSLOG" | awk '{print $2}') )
+mf_drift=999999
+[[ ${#mf[@]} -ge 2 ]] && mf_drift=$(( mf[0] - mf[1] ))
+[[ $mf_drift -lt 256 ]]; check "no memory leak across 50 substitutions (MemFree ${mf[0]:-?} -> ${mf[1]:-?} kB)" $?
+grep -q "CS9-42" "$CSLOG"; check "bash still responsive after the substitution loops" $?
+! grep -q "\[EXC\]" "$CSLOG"; check "no CPU exception ([EXC]) during command substitution / pipelines" $?
+
 # ---- M39: UEFI secure boot (loader Ed25519-verifies kernel.elf before jumping) ----
 OVMF=""
 for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
