@@ -108,7 +108,15 @@ void idt_init(void) {
     idt_set_gate(11, (uint64_t)isr11, 0x08, 0x8E);
     idt_set_gate(12, (uint64_t)isr12, 0x08, 0x8E);
     idt_set_gate_ist(13, (uint64_t)isr13, 0x08, 0x8E, 3);  // General Protection Fault with IST3
-    idt_set_gate_ist(14, (uint64_t)isr14, 0x08, 0x8E, 2);  // Page Fault with IST2
+    // Page Fault: NO IST (the Linux model). #PF must be re-entrant: the #PF
+    // return path delivers signals (isr_common -> signal_dispatch), and writing
+    // a sigframe onto a not-yet-faulted user stack page takes a nested #PF from
+    // inside the first one; user accesses in syscalls may fault too. On an IST
+    // stack every nested #PF restarts at the same IST top and overwrites the
+    // outer frame (a ring-0 #GP/garbage rip). On the current stack (RSP0 from
+    // ring 3) nesting is safe. A kernel-stack overflow — #PF that cannot push
+    // its frame on the guard page — escalates to #DF, which keeps IST1.
+    idt_set_gate(14, (uint64_t)isr14, 0x08, 0x8E);
     idt_set_gate(15, (uint64_t)isr15, 0x08, 0x8E);
     idt_set_gate(16, (uint64_t)isr16, 0x08, 0x8E);
     idt_set_gate(17, (uint64_t)isr17, 0x08, 0x8E);
