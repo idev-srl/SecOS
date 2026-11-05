@@ -45,6 +45,20 @@ typedef struct vfs_attr {
     uint64_t atime, mtime;
 } vfs_attr_t;
 
+// statfs(2) result (Linux struct statfs fields, in units of frsize/bsize).
+typedef struct vfs_statfs {
+    uint64_t type;     // f_type magic (EXT2_SUPER_MAGIC 0xEF53, MSDOS 0x4d44, ...)
+    uint64_t bsize;    // optimal transfer block size
+    uint64_t blocks;   // total data blocks (frsize units)
+    uint64_t bfree;    // free blocks
+    uint64_t bavail;   // free blocks available to unprivileged users
+    uint64_t files;    // total inodes
+    uint64_t ffree;    // free inodes
+    uint64_t namelen;  // maximum filename length
+    uint64_t frsize;   // fragment size (== bsize here)
+    uint64_t flags;    // ST_* mount flags
+} vfs_statfs_t;
+
 // Directory iteration callback
 typedef void (*vfs_iter_cb)(const vfs_inode_t* child, void* user);
 
@@ -85,6 +99,15 @@ typedef struct vfs_fs_ops {
     // Flush anything this FS still holds in memory to its device (orderly
     // shutdown, sync). NULL = write-through, nothing to flush. Returns 0/-1.
     int (*sync)(void);
+    // Hard link: give the existing non-directory at old_path the extra name
+    // new_path (same FS). NULL = no hard links (link() fails with EPERM).
+    int (*link)(const char* old_path, const char* new_path);
+    // Fill filesystem usage for statfs(). NULL = the VFS reports zero counts
+    // with the f_type magic derived from the mount's fs name.
+    int (*statfs)(vfs_statfs_t* st);
+    // Mount-table info for /proc/mounts: backing device name + filesystem type
+    // ("ext4", "vfat", ...). NULL = virtual FS (the mount's fs name is used).
+    int (*mntinfo)(const char** source, const char** fstype);
 } vfs_fs_ops_t;
 
 // Mount record (single root for now)
@@ -110,8 +133,25 @@ int vfs_sync_all(void);
 int vfs_unmount_all(void);
 // Lookup inode by absolute path
 vfs_inode_t* vfs_lookup(const char* path);
-// [M26] Lookup following a final-component symlink (bounded). Used by stat/open.
+// Lookup following symlinks in every component, the final one included
+// (bounded hop count). Used by stat/open/chdir.
 vfs_inode_t* vfs_lookup_follow(const char* path);
+// Lookup with symlinks followed in intermediate components; the final one only
+// when `follow`. On failure returns NULL and *err = -ENOENT/-ENOTDIR/-ELOOP/...
+vfs_inode_t* vfs_lookup_ex(const char* path, int follow, int* err);
+// Canonicalize an absolute path (".", "..", symlinks resolved). 0 or -errno.
+int vfs_walk(const char* path, char* out, size_t outsz, int follow_final);
+// rmdir: remove an empty directory (-ENOTDIR/-ENOTEMPTY/-EBUSY). 0 or -errno.
+int vfs_rmdir(const char* path);
+// Hard link old -> new (same FS; -EXDEV/-EEXIST/-EPERM). 0 or -errno.
+int vfs_link(const char* oldp, const char* newp);
+// statfs() of the filesystem holding `path` / behind `ops`. 0 or -errno.
+int vfs_statfs(const char* path, vfs_statfs_t* st);
+int vfs_statfs_ops(const vfs_fs_ops_t* ops, vfs_statfs_t* st);
+// Mount point of the filesystem behind `ops` (NULL if not mounted).
+const char* vfs_mount_point_of(const vfs_fs_ops_t* ops);
+// Flush one filesystem (fsync of a file on it). 0/-1.
+int vfs_sync_ops(const vfs_fs_ops_t* ops);
 // Iterate directory children
 int vfs_readdir(const char* path, vfs_iter_cb cb, void* user);
 // Read whole file convenience (returns size or -1 if too small)
@@ -124,7 +164,8 @@ int vfs_write(const char* path, size_t offset, const void* data, size_t len);
 int vfs_mkdir(const char* path);
 // Remove
 int vfs_remove(const char* path);
-// Rename
+// Rename (atomic within one FS, replaces an existing target; -EXDEV across
+// mounts). 0 or -errno.
 int vfs_rename(const char* oldp, const char* newp);
 // Truncate
 int vfs_truncate(const char* path, size_t new_size);
@@ -137,3 +178,4 @@ int vfs_symlink(const char* target, const char* linkpath);
 // [M23] Mount-table introspection (for /proc/mounts, df, etc.).
 int vfs_mount_count(void);
 int vfs_mount_info(int i, const char** mount_point, const char** fs_name);
+const vfs_fs_ops_t* vfs_mount_ops_at(int i);
