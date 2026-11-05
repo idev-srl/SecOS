@@ -1069,7 +1069,7 @@ echo "[selftest] Running bash over the real execve (mb2, serial input, 70s)..."
 ( sleep 25
   printf "  bash -c 'exec echo BX1-\$((40+2))'\r"; sleep 4
   printf "  (exec bash -c 'echo \$\$ > /tmp/bxpid') & wait; [[ \$(cat /tmp/bxpid) == \$! ]] && echo BX2-same-\$((1+1))\r"; sleep 5
-  printf '  sleep 30 & p=$!; printf -v h %%016X $p; kill -STOP $p; sleep 1; j=$(jobs -l); [[ $j == *$p*Stopped* ]] && echo BX3-$h-stopped; kill -9 $p; wait\r'; sleep 5
+  printf '  sleep 30 & p=$!; printf -v h %%016X $p; sleep 1; kill -STOP $p; sleep 1; j=$(jobs -l); [[ $j == *$p*Stopped* ]] && echo BX3-$h-stopped; kill -9 $p; wait\r'; sleep 5
   printf '  bash -c "exec /bin/nonexist" 2>/dev/null; echo BX4-rc-$?\r'; sleep 4
   printf '  printf "echo BX5-\\$((2+3))\\n" > /tmp/bx.sh; bash -c /tmp/bx.sh\r'; sleep 4
   printf '  BXV=bar$((40+2)) bash -c "echo BX6-\\$BXV"\r'; sleep 4
@@ -1226,7 +1226,7 @@ echo "[selftest] Running BusyBox userland (mb2, serial input, 150s)..."
   printf '  echo BB12-$(busybox --list | wc -l)-$(uname)\r'; sleep 4
   printf '  mkdir -p /tmp/d/e && touch /tmp/d/e/x && echo BB13-$(ls /tmp/d/e) && rm -r /tmp/d && test ! -e /tmp/d && echo BB14-gone\r'; sleep 8
   printf '  timeout 2 sleep 9; echo BB15-$?\r'; sleep 6
-  printf '  echo BB16-$(cp -r /etc /tmp/e2 2>&1 | wc -l)-$(ls /tmp/e2 | wc -l)\r'; sleep 6
+  printf '  echo BB16-$(cp -r /etc /tmp/e2 2>&1 | wc -l)-$(ls /tmp/e2 | wc -l)-$(ls /etc | wc -l)\r'; sleep 6
   printf '  echo BB-$((6*7))-END\r'; sleep 3 ) | \
     timeout 150 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$BBLOG" -global isa-debugcon.iobase=0xe9 \
@@ -1246,7 +1246,7 @@ grep -q "BB11-0" "$BBLOG"; check "less starts and quits with q" $?
 grep -Eq "BB12-1[0-9][0-9]-SecOS" "$BBLOG"; check "busybox --list + uname reports SecOS" $?
 grep -q "BB13-x" "$BBLOG" && grep -q "BB14-gone" "$BBLOG"; check "mkdir -p / touch / ls / rm -r" $?
 grep -q "BB15-143" "$BBLOG"; check "timeout 2 sleep 9 -> 143 (SIGTERM forwarded through the stubs)" $?
-grep -q "BB16-0-2" "$BBLOG"; check "cp -r /etc on the ramfs root: no 'can't preserve' warnings" $?
+grep -Eq "BB16-0-([0-9]+)-\1\b" "$BBLOG"; check "cp -r /etc on the ramfs root: no 'can't preserve' warnings" $?
 grep -q "BB-42-END" "$BBLOG"; check "bash responsive after the BusyBox sequence" $?
 ! grep -q "\[EXC\]" "$BBLOG"; check "no CPU exception ([EXC]) during the BusyBox run" $?
 
