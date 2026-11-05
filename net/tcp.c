@@ -186,6 +186,16 @@ tcp_conn_t* tcp_accept_ready(tcp_conn_t* lc){
     return NULL;
 }
 
+// poll(): is an established, not-yet-accepted child waiting on listener lc?
+int tcp_accept_pending(const tcp_conn_t* lc){
+    if(!lc) return 0;
+    for(int i=0;i<TCP_MAX_CONN;i++){
+        const struct tcp_conn* c=&g_conns[i];
+        if(c->used && c->listener==lc && !c->accepted && c->state==TCP_ESTABLISHED) return 1;
+    }
+    return 0;
+}
+
 int tcp_write(tcp_conn_t* c, const void* data, uint32_t len){
     if(!c||(c->state!=TCP_ESTABLISHED && c->state!=TCP_CLOSE_WAIT)) return -1;
     uint32_t space = TCP_TXBUF - c->tx_len;

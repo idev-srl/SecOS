@@ -77,6 +77,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/power.c \
 	$(KERNEL_DIR)/kclock.c \
 	$(KERNEL_DIR)/klog.c \
+	$(KERNEL_DIR)/kiface.c \
 	$(KERNEL_DIR)/smp.c \
 	$(KERNEL_DIR)/pkg.c \
 	$(KERNEL_DIR)/selftest.c \

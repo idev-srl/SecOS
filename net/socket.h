@@ -18,5 +18,6 @@ int  socket_accept(uint32_t pid, int fd);
 int  socket_send(uint32_t pid, int fd, const void* buf, int len);
 int  socket_sendto(uint32_t pid, int fd, const void* buf, int len, uint32_t ip, uint16_t port);
 int  socket_recv(uint32_t pid, int fd, void* buf, int len, uint32_t* src_ip, uint16_t* src_port);
+int  socket_poll(uint32_t pid, int fd);  /* poll() readiness bits */
 
 #endif /* NET_SOCKET_H */

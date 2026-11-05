@@ -35,6 +35,7 @@ int         tcp_read(tcp_conn_t* c, void* buf, uint32_t len);           /* bytes
 int         tcp_start_close(tcp_conn_t* c);              /* begin orderly shutdown */
 tcp_state_t tcp_get_state(const tcp_conn_t* c);
 int         tcp_rx_available(const tcp_conn_t* c);       /* buffered receive bytes */
+int         tcp_accept_pending(const tcp_conn_t* lc);    /* poll: an accept() would not block */
 
 /* ---- blocking convenience (shell tcptest) ---- */
 tcp_conn_t* tcp_connect(net_dev_t* dev, uint32_t dip, uint16_t dport);   /* NULL on fail */

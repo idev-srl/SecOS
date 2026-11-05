@@ -71,6 +71,24 @@
 #define SYS_REBOOT      59 // reboot(cmd): orderly poweroff(1)/restart(2)/halt(3); returns only on error
 // Note: execve is emulated in libc (spawn+waitpid+_exit) — no kernel syscall.
 
+// Kernel interfaces for standard userland tools (kernel/kiface.c; semantics +
+// Linux struct layouts in kernel/kiface.c). Errors are -errno (Linux values).
+#define SYS_CLOCK_GETTIME 65 // clock_gettime(clockid, struct timespec*)
+#define SYS_CLOCK_SETTIME 66 // clock_settime(CLOCK_REALTIME, const timespec*)  [CAP_TIME]
+#define SYS_NANOSLEEP     67 // nanosleep(const timespec* req, timespec* rem)    (blocks)
+#define SYS_SYSLOG        68 // syslog(type, buf, len) — klogctl actions 0..10
+#define SYS_STATFS        69 // statfs(path, struct statfs*, fd): path NULL -> fstatfs(fd)
+#define SYS_SYNC          70 // sync(fd): fd < 0 -> sync(), else fsync/fdatasync(fd)
+#define SYS_RENAME        71 // rename(old, new) — atomic in one FS, -EXDEV across
+#define SYS_LINK          72 // link(old, new) — hard link (ext2/ext4)
+#define SYS_TRUNCATE      73 // truncate(path, len, fd): path NULL -> ftruncate(fd, len)
+#define SYS_RMDIR         74 // rmdir(path) — empty directory only
+#define SYS_ACCESS        75 // access(path, mode) — F_OK/R_OK/W_OK/X_OK
+#define SYS_UMASK         76 // umask(mask) -> previous mask
+#define SYS_UNAME         77 // uname(struct utsname*)
+#define SYS_POLL          78 // poll(struct pollfd*, nfds, timeout_ms)              (blocks)
+#define SYS_SYSINFO       79 // sysinfo(struct sysinfo*)
+
 // [M24] socket types
 #define SOCK_STREAM 1   // TCP
 #define SOCK_DGRAM  2   // UDP

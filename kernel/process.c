@@ -494,6 +494,8 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     // the std-stream paths are keyed on the fd number.
     p->fds[0].used=1; p->fds[1].used=1; p->fds[2].used=1;
     p->wait_pipe=NULL; // [M25]
+    { extern void kiface_proc_init(process_t*, int, const char* const*);
+      kiface_proc_init(p, argc, argv); }   // procfs identity, umask, CPU accounting
     if (proc_add(p)!=0) {
         terminal_writestring("[PROC] table full\n");
         if (p->manifest) kfree(p->manifest);
@@ -623,6 +625,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->wait_tty = 0; c->power_phase = 0; c->power_deadline = 0;
     c->sigsusp_active = 0; c->sigsusp_saved = 0;
     c->state = PROC_BLOCKED;                   // not runnable until fully built
+    { extern void kiface_proc_fork(process_t*); kiface_proc_fork(c); }
 
     // [M25] The child inherits the parent's open pipe ends (fds were shallow
     // copied) — bump each inherited end's refcount so EOF/EPIPE accounting stays

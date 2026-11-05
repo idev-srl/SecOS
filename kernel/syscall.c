@@ -296,22 +296,32 @@ void proc_resolve_path(process_t* c, const char* in, char* out, int outsz){
     out[o]=0;
 }
 
-int ksys_open(const char* path, int flags){
-    extern vfs_inode_t* vfs_lookup(const char*);
+// open() follows symlinks in every path component (final one included), honours
+// O_EXCL (0x80) with O_CREAT, and creates with mode & ~umask (0 = 0666).
+int ksys_open_mode(const char* path, int flags, uint32_t mode){
     extern int vfs_create(const char*, const void*, size_t);
     extern int vfs_truncate(const char*, size_t);
     extern process_t* sched_get_current(void);
+    extern void kiface_apply_create_mode(const char*, uint32_t, int);
     process_t* c=sched_get_current(); if(!c) return -1;
     char rp[256]; proc_resolve_path(c, path, rp, sizeof(rp)); path = rp;  // [M39] cwd-relative
-    vfs_inode_t* ino=vfs_lookup(path);
-    if(!ino && (flags & 0x40)){ if(vfs_create(path,"",0)==0) ino=vfs_lookup(path); }   // O_CREAT
-    if(!ino) return -2;   // [M39] -ENOENT so libc can set errno (bash rcfile probing)
-    if((flags & 0x200) && ino->size){ vfs_truncate(path,0); ino=vfs_lookup(path); if(!ino) return -1; } // O_TRUNC
+    int lerr=0;
+    vfs_inode_t* ino=vfs_lookup_ex(path, 1, &lerr);
+    if(ino && (flags & 0x40) && (flags & 0x80)) return -17;                  // O_EXCL: -EEXIST
+    if(!ino && (flags & 0x40) && (lerr==0 || lerr==-2)){                     // O_CREAT
+        if(vfs_create(path,"",0)==0){ kiface_apply_create_mode(path, mode, 0); ino=vfs_lookup_follow(path); }
+    }
+    if(!ino) return lerr ? lerr : -2;   // [M39] -ENOENT so libc can set errno (bash rcfile probing)
+    if((flags & 0x200) && ino->size){                                        // O_TRUNC
+        vfs_truncate(path,0); ino=vfs_lookup_follow(path); if(!ino) return -1;
+        pagecache_invalidate(ino, 0, 1ULL<<62);
+    }
     int fd=fd_alloc(c); if(fd<0) return -1;
     c->fds[fd].inode=ino; c->fds[fd].flags=flags;
     c->fds[fd].offset = (flags & 0x400) ? ino->size : 0;    // O_APPEND -> seek to end
     return fd;
 }
+int ksys_open(const char* path, int flags){ return ksys_open_mode(path, flags, 0); }
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
     if(c->fds[fd].is_pipe){ pipe_unref((pipe_t*)c->fds[fd].inode, c->fds[fd].pipe_w); c->fds[fd].is_pipe=0; }  // [M25] drop end, may signal EOF/EPIPE
     c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
@@ -409,7 +419,7 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
             if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); }
         } else {
             // [M9] fd 1 (stdout) / 2 (stderr) with no redirection -> console.
-            for(int i=0;i<want;i++){ terminal_putchar((char)u.p[i]); debugcon_putchar((char)u.p[i]); }
+            for(int i=0;i<want;i++){ terminal_putchar((char)u.p[i]); debugcon_putchar_raw((char)u.p[i]); }
             r = want;
         }
         if(r<=0){ if(done==0) err=r; break; }
@@ -461,9 +471,9 @@ static void stat_fill(const vfs_inode_t* ino, struct secos_stat* st){
 }
 
 int ksys_stat(const char* path, struct secos_stat* st){
-    extern vfs_inode_t* vfs_lookup_follow(const char*);   // [M26] follows final symlink
     char rp[256]; proc_resolve_path(sched_get_current(), path, rp, sizeof(rp)); path = rp; // [M39] cwd-relative
-    vfs_inode_t* ino=vfs_lookup_follow(path); if(!ino) return -2;  // -ENOENT
+    int e=0; vfs_inode_t* ino=vfs_lookup_ex(path, 1, &e);   // symlinks followed in every component
+    if(!ino) return e ? e : -2;                             // -ENOENT / -ENOTDIR / -ELOOP
     stat_fill(ino, st);
     return 0;
 }
@@ -472,9 +482,9 @@ int ksys_stat(const char* path, struct secos_stat* st){
 // not auto-follow symlinks (the inode keeps type VFS_NODE_SYMLINK), so lstat is
 // the plain lookup; stat() resolution of symlinks is layered in vfs (M26-3).
 int ksys_lstat(const char* path, struct secos_stat* st){
-    extern vfs_inode_t* vfs_lookup(const char*);
     char rp[256]; proc_resolve_path(sched_get_current(), path, rp, sizeof(rp)); path = rp; // [M39] cwd-relative
-    vfs_inode_t* ino=vfs_lookup(path); if(!ino) return -2;  // -ENOENT
+    int e=0; vfs_inode_t* ino=vfs_lookup_ex(path, 0, &e);   // intermediate symlinks followed, final not
+    if(!ino) return e ? e : -2;
     stat_fill(ino, st);
     return 0;
 }
@@ -534,6 +544,9 @@ int ksys_mkdir(const char* path){
 }
 int ksys_unlink(const char* path){
     extern int vfs_remove(const char*);
+    // Drop the cached pages first: the FS may hand this inode slot (or inode
+    // number) to the next file created.
+    { vfs_inode_t* ino = vfs_lookup(path); if(ino && ino->type == VFS_NODE_FILE) pagecache_invalidate(ino, 0, 1ULL<<62); }
     return vfs_remove(path);
 }
 
@@ -718,7 +731,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         char kp[256];
         long sl = strncpy_from_user(kp, (const char*)a0, sizeof(kp));
         if (sl < 0) return (uint64_t)(int64_t)sl;      /* -EFAULT / -ENAMETOOLONG */
-        return (uint64_t)ksys_open(kp, (int)a1);
+        return (uint64_t)(int64_t)ksys_open_mode(kp, (int)a1, (uint32_t)a2);
     }
 
     case SYS_READ: {
@@ -834,21 +847,25 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     }
     case SYS_CHMOD: {
         CAP_GATE(CAP_FS_WRITE, "chmod");  // [M35]
-        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kp[256]; proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp));   // cwd-relative
         return (uint64_t)(int64_t)ksys_chmod(kp, (uint32_t)a1);
     }
     case SYS_CHOWN: {
         CAP_GATE(CAP_FS_WRITE, "chown");  // [M35]
-        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kp[256]; proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp));   // cwd-relative
         return (uint64_t)(int64_t)ksys_chown(kp, (uint32_t)a1, (uint32_t)a2);
     }
     case SYS_UTIMES: {
         CAP_GATE(CAP_FS_WRITE, "utimes"); // [M35]
-        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kp[256]; proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp));   // cwd-relative
         return (uint64_t)(int64_t)ksys_utimes(kp, (uint64_t)a1, (uint64_t)a2);
     }
     case SYS_READLINK: {
-        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kp[256]; proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp));   // cwd-relative
         int len = (int)a2; if (len <= 0 || len > 4096 || !user_range_valid((void*)a1, (size_t)len)) return (uint64_t)(int64_t)-EFAULT;
         char kbuf[256]; int klen = len < (int)sizeof(kbuf) ? len : (int)sizeof(kbuf);
         int n = ksys_readlink(kp, kbuf, klen);
@@ -861,7 +878,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         char ktarget[256], klink[256];
         if (copy_user_str((const char*)a0, ktarget, sizeof(ktarget)) != 0) return (uint64_t)(int64_t)-EFAULT;
         if (copy_user_str((const char*)a1, klink, sizeof(klink)) != 0) return (uint64_t)(int64_t)-EFAULT;
-        return (uint64_t)(int64_t)ksys_symlink(ktarget, klink);
+        char kl[256]; proc_resolve_path(sched_get_current(), klink, kl, sizeof(kl));   // cwd-relative
+        return (uint64_t)(int64_t)ksys_symlink(ktarget, kl);
     }
     case SYS_MOUNT: {
         CAP_GATE(CAP_FS_WRITE, "mount");  // [M35]
@@ -879,26 +897,33 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_GETDENTS: {
         CAP_GATE(CAP_FS_READ, "getdents"); // [M35]
         extern int ksys_getdents(const char*, void*, int);
-        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kp[256]; proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp));   // cwd-relative
         int len = (int)a2; if (len <= 0 || len > (1<<20) || !user_range_valid((void*)a1, (size_t)len)) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_getdents(kp, (void*)a1, len);
     }
     case SYS_CREATE: {
         CAP_GATE(CAP_FS_WRITE, "create"); // [M35]
         extern int ksys_create(const char*);
-        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kp[256]; proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp));   // cwd-relative
         return (uint64_t)(int64_t)ksys_create(kp);
     }
     case SYS_MKDIR: {
         CAP_GATE(CAP_FS_WRITE, "mkdir");  // [M35]
         extern int ksys_mkdir(const char*);
+        extern void kiface_apply_create_mode(const char*, uint32_t, int);
         char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
-        return (uint64_t)(int64_t)ksys_mkdir(kp);
+        char ab[256]; proc_resolve_path(sched_get_current(), kp, ab, sizeof(ab));   // cwd-relative
+        int r = ksys_mkdir(ab);
+        if (r == 0) kiface_apply_create_mode(ab, (uint32_t)a1, 1);   // mode & ~umask
+        return (uint64_t)(int64_t)r;
     }
     case SYS_UNLINK: {
         CAP_GATE(CAP_FS_WRITE, "unlink"); // [M35]
         extern int ksys_unlink(const char*);
-        char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
+        char kp[256]; proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp));   // cwd-relative
         return (uint64_t)(int64_t)ksys_unlink(kp);
     }
 

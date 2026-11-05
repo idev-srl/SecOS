@@ -153,3 +153,11 @@ void tty_wake_readers(uint64_t now) {
     if ((now % TTY_POLL_TICKS) != 0 && !keyboard_input_pending_noirq()) return;
     process_foreach(tty_wake_cb, 0);
 }
+
+/* poll(): would a console read() return without blocking? True when part of a
+ * delivered line is still unread or keyboard/serial input is pending (in cooked
+ * mode the read then assembles the line). */
+int tty_poll_ready(void) {
+    if (g_pos < g_len) return 1;
+    return keyboard_has_char() ? 1 : 0;
+}

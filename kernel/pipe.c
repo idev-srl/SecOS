@@ -106,3 +106,22 @@ void pipe_unref(pipe_t* p, int writer) {
     spin_unlock_irqrestore(&g_pipe_lock, fl);
     sched_wake_pipe(p);                     /* peer may now observe EOF / EPIPE */
 }
+
+/* poll(): readiness of one end, as POLLIN(1)/POLLOUT(4)/POLLERR(8)/POLLHUP(0x10)
+ * bits. Read end: data buffered -> POLLIN; every writer gone -> POLLHUP (a
+ * read() then returns EOF, so POLLIN too). Write end: space left -> POLLOUT;
+ * every reader gone -> POLLERR (a write() would raise SIGPIPE/EPIPE). */
+int pipe_poll(pipe_t* p, int writer) {
+    if (!p) return 0x20;                                  /* POLLNVAL */
+    int r = 0;
+    uint64_t fl = spin_lock_irqsave(&g_pipe_lock);
+    if (writer) {
+        if (p->readers == 0) r |= 0x08;
+        else if (p->len < PIPE_SIZE) r |= 0x04;
+    } else {
+        if (p->len > 0) r |= 0x01;
+        if (p->writers == 0) r |= 0x01 | 0x10;
+    }
+    spin_unlock_irqrestore(&g_pipe_lock, fl);
+    return r;
+}

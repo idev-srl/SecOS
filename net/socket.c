@@ -220,3 +220,21 @@ int socket_recv(uint32_t pid, int fd, void* buf, int len, uint32_t* src_ip, uint
     }
     return 0;
 }
+
+// poll(): readiness bits (POLLIN 1, POLLOUT 4, POLLERR 8, POLLHUP 0x10, POLLNVAL
+// 0x20) of socket `fd` owned by `pid`. Non-blocking; RX keeps arriving from the
+// NIC interrupt / timer tick, so a poll() sleeper just re-checks.
+int socket_poll(uint32_t pid, int fd){
+    struct sock* s = sk(fd);
+    if (!s || s->owner != pid) return 0x20;
+    if (s->type == SOCK_DGRAM) return (s->dq_count > 0 ? 0x01 : 0) | 0x04;
+    if (s->listening) return tcp_accept_pending(s->tcp) ? 0x01 : 0;
+    if (!s->tcp) return 0x10;
+    int r = 0;
+    tcp_state_t st = tcp_get_state(s->tcp);
+    if (tcp_rx_available(s->tcp) > 0) r |= 0x01;
+    if (st == TCP_ESTABLISHED || st == TCP_CLOSE_WAIT) r |= 0x04;
+    if (st == TCP_CLOSE_WAIT || st == TCP_CLOSED || st == TCP_TIME_WAIT ||
+        st == TCP_LAST_ACK || st == TCP_CLOSING) r |= 0x01 | 0x10;   /* EOF readable */
+    return r;
+}

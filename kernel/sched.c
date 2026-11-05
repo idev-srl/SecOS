@@ -68,6 +68,7 @@ int sched_add_process(process_t* p) { (void)p; return 0; }
 // ---- low-level switch: load target space + kernel stack, iretq into it ----
 static void switch_to(process_t* next) __attribute__((noreturn));
 static void switch_to(process_t* next) {
+    { extern void kiface_count_switch(void); kiface_count_switch(); }   // /proc/stat ctxt
     current = next;
     next->state = PROC_RUNNING;
     // [M29] Observability: a user task running on an application processor proves
@@ -101,6 +102,8 @@ extern void irq_eoi(void);
 // ---- [M8] preemptive tick ----
 void sched_on_timer_tick(trapframe_t* tf) {
     if (current) current->cpu_ticks++;
+    { extern void kiface_account_tick(process_t*, int, int);         // /proc CPU times
+      kiface_account_tick(current, (tf->cs & 3) == 3, current == idle_task); }
     // [M17] Wake any sleepers whose deadline elapsed (independent of preemption).
     { extern uint64_t timer_get_ticks(void); sched_wake_sleepers(timer_get_ticks());
       extern void tty_wake_readers(uint64_t); tty_wake_readers(timer_get_ticks()); }  // blocked console readers
@@ -284,6 +287,7 @@ void sched_block_current(trapframe_t* tf) {
     if (!current || current == idle_task) return;
     save_tf(current, tf);
     current->state = PROC_BLOCKED;
+    current->ki.nvcsw++;
     process_t* next = pick_user(current);
     if (!next) next = idle_task;
     switch_to(next);                   // NORETURN in practice
@@ -361,6 +365,11 @@ void sched_wake_chan(int chan) {
 static void wake_pipe_cb(process_t* p, void* u) {
     if (p->state == PROC_BLOCKED && p->wait_pipe == u) {
         p->wait_pipe = 0;
+        p->state = PROC_READY;
+    }
+    // A poll() sleeper re-checks every fd it watches on any pipe activity.
+    if (p->state == PROC_BLOCKED && p->ki.poll_wait) {
+        p->ki.poll_wait = 0;
         p->state = PROC_READY;
     }
 }

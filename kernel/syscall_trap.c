@@ -312,6 +312,13 @@ uint64_t syscall_handler(trapframe_t* tf) {
             }
         }
     }
+    // Syscalls 65..79 (clocks, nanosleep, syslog, statfs, sync, rename, link,
+    // truncate, rmdir, access, umask, uname, poll, sysinfo): kernel/kiface.c.
+    // nanosleep and poll may block (rip rewound like SYS_SLEEP).
+    else if (num >= SYS_CLOCK_GETTIME && num <= SYS_SYSINFO) {
+        extern int kiface_syscall(trapframe_t*, uint64_t, uint64_t*);
+        kiface_syscall(tf, num, &ret);
+    }
     else {
         ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
     }
