@@ -1590,7 +1590,12 @@ else
       sshq "$SSHDIR/o4" -i "$SSHDIR/id" -o IdentitiesOnly=yes nobody@localhost 'echo SSH-NOUSER-RAN'
       sshq "$SSHDIR/o5" -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive root@localhost true
       sshq "$SSHDIR/o6" -i "$SSHDIR/id" -o IdentitiesOnly=yes root@localhost 'seq 1 500 > /tmp/s; wc -l < /tmp/s'
-      sshq "$SSHDIR/o7" -tt -i "$SSHDIR/id" -o IdentitiesOnly=yes root@localhost 'tty; stty size; echo PTY-$((6*7))'
+      # A pty session needs an open stdin: on client EOF Dropbear closes the
+      # pty master (upstream behaviour), hanging the shell up. Drive it from a
+      # host pty (tools/ssh_winch.py) like an interactive user.
+      timeout 40 python3 tools/ssh_winch.py 25 -p "$SSHPORT" -tt -i "$SSHDIR/id" -o IdentitiesOnly=yes \
+          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR \
+          root@localhost 'tty; stty size; echo PTY-$((6*7))' >"$SSHDIR/o7" 2>&1; echo "RC=$?" >>"$SSHDIR/o7"
       timeout 40 python3 tools/ssh_winch.py 30 -p "$SSHPORT" -tt -i "$SSHDIR/id" -o IdentitiesOnly=yes \
           -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR \
           root@localhost 'stty size; trap "stty size; echo WINCH-GOT" WINCH; echo WINCH-READY; sleep 4; echo WINCH-END' \
@@ -1615,7 +1620,7 @@ else
         grep -q "Permission denied (publickey)" "$SSHDIR/o5" && ! grep -qi "password" <(grep -v "^RC=" "$SSHDIR/o5" | grep -v "PreferredAuthentications")
         check "SSH password authentication not offered (publickey only)" $?
         grep -q "^500" "$SSHDIR/o6"; check "SSH sequential sessions keep working (6th session, file I/O)" $?
-        grep -q "^/dev/pts/[0-9]" "$SSHDIR/o7" && grep -Eq "^[0-9]+ [0-9]+" "$SSHDIR/o7" && grep -q "^PTY-42" "$SSHDIR/o7"
+        grep -q "^/dev/pts/[0-9]" "$SSHDIR/o7" && grep -q "^30 90" "$SSHDIR/o7" && grep -q "^PTY-42" "$SSHDIR/o7"
         check "SSH -tt: the session runs on a pty (tty = /dev/pts/N, stty size)" $?
         grep -q "^30 90" "$SSHDIR/o8"; check "SSH pty-req carries the client window size (30x90)" $?
         grep -q "^40 100" "$SSHDIR/o8" && grep -q "WINCH-GOT" "$SSHDIR/o8"
