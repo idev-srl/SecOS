@@ -2,7 +2,7 @@
 
 _Snapshot: realigned to the commit history through `ae2be37` (M39 + ath9k RX
 bring-up). Last full self-test **182/182** (at `e66a57f`)._
-_Last updated: 2026-11-04._
+_Last updated: 2026-11-06 (M40 GUI kernel interfaces on `feat/gui-input`)._
 
 This file tracks what is **done** vs **open**, and the planned order of work. The
 narrative handoff lives in `next_session.md`; the long-term plan in
@@ -113,6 +113,18 @@ robustness and the paused real-hardware bring-up — see below.
 - [ ] **Serial input drops the first char of a line** under bash in QEMU (PS/2 is fine) —
       cosmetic, but hurts serial-driven tests.
 - [ ] pthreads subset (on M19 COW/fork), fuller stdio/locale.
+
+### GUI (Phase 2b: compositor + LVGL terminal on a PTY)
+- [x] **Kernel half (M40, `feat/gui-input`)**: PS/2 mouse (IRQ12 via IOAPIC), USB HID
+      mouse + `usb-tablet` (report-descriptor parser), `/dev/input/eventN` (Linux evdev:
+      EVIOCG*, grab, SYN_DROPPED, poll/O_NONBLOCK), `/dev/fb0` (fbdev ioctls + shared NX
+      device mmap), `KDSETMODE` console handoff with auto-restore on exit/crash, keymaps
+      `us`/`it` (`loadkeys`, `make KEYMAP=it`), explicit `CAP_INPUT`/`CAP_DISPLAY`
+      manifest bits. API contract: `docs/GUI_INPUT.md`; devlog `docs/devlog/M40-gui-input.md`.
+- [ ] Compositor (owns fb0 + input via EVIOCGRAB) + graphical terminal on a pty, LVGL widgets.
+- [ ] USB keyboard host-side autorepeat; keyboard LEDs (Caps/Num Lock).
+- [ ] fb0 double buffering / page flip (`yres_virtual > yres`), vsync; mode setting.
+- [ ] VT switching (several consoles / graphics sessions).
 
 ### Kernel robustness
 - [ ] **Buddy / free-list heap** — `mm/heap.c` is still a single-lock first-fit list.
