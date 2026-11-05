@@ -21,6 +21,7 @@
 #include "heap.h"             // kmalloc for read()/write() bounce buffers
 
 extern uint64_t timer_get_ticks(void);
+void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
 
 // [M35] Capability gate: deny (EPERM=-1) + audit if a confined process lacks the
 // capability. Ambient (unconfined) processes always pass. `num` is the in-scope
@@ -34,9 +35,10 @@ extern uint64_t timer_get_ticks(void);
 #define SPAWN_MAX_ARGS 8
 #define SPAWN_ARG_LEN  128
 
-static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; return i; } } return -1; }
+static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; return i; } } return -1; }
 
 // [M25] pipe(): allocate a pipe object and two fds (read end + write end).
+// pipe2(O_CLOEXEC) marks both ends close-on-exec (ksys_pipe2).
 int ksys_pipe(int kfds[2]){
     extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
     pipe_t* p = pipe_alloc(); if(!p) return -1;
@@ -45,6 +47,13 @@ int ksys_pipe(int kfds[2]){
     c->fds[rfd].inode=p; c->fds[rfd].is_pipe=1; c->fds[rfd].pipe_w=0;  // read end
     c->fds[wfd].inode=p; c->fds[wfd].is_pipe=1; c->fds[wfd].pipe_w=1;  // write end
     kfds[0]=rfd; kfds[1]=wfd;
+    return 0;
+}
+#define K_O_CLOEXEC 0x80000   // Linux value (user/include/fcntl.h)
+static int ksys_pipe2(int kfds[2], int flags){
+    if(flags & ~K_O_CLOEXEC & ~0x800 /*O_NONBLOCK: accepted, ignored*/) return -22; // -EINVAL
+    int r=ksys_pipe(kfds); if(r!=0) return r;
+    if(flags & K_O_CLOEXEC){ process_t* c=sched_get_current(); c->fds[kfds[0]].cloexec=1; c->fds[kfds[1]].cloexec=1; }
     return 0;
 }
 
@@ -57,17 +66,17 @@ static uint8_t g_spawn_buf[1024*1024];   // [M39] 1 MB: fits GNU bash (548 KB) &
 // [M16] Spawn with argv. The single static load buffer is safe because kernel
 // code is non-preemptible (preemption fires only on a ring-3 timer tick) and
 // process_create_from_elf_args copies/pins the image before returning.
-// [M39] A spawned child inherits the caller's stdio (fds 0/1/2), as a fork+execve child would. libc emulates execve as
-// spawn+wait+_exit, so without this a command run by bash with its stdout
-// redirected into a pipe (`$(cmd)`, `a | b`) or a file wrote to the console
-// instead. Only 0/1/2 are inherited: there is no FD_CLOEXEC yet, so passing
-// higher fds would leak the caller's private pipe ends into the child and could
-// keep a pipe's write end alive (no EOF). Pipe ends gain a reference.
+// [M39] A spawned child inherits the caller's stdio (fds 0/1/2), like a
+// fork+execve child would, so a spawned command whose caller redirected stdout
+// into a pipe or a file writes there and not to the console. Only 0/1/2 are
+// passed (spawn is not fork: the caller's other fds stay private), always without
+// FD_CLOEXEC. Pipe ends gain a reference.
 static void spawn_inherit_stdio(process_t* parent, process_t* child){
     if(!parent || !child) return;
     for(int i=0;i<3;i++){
         if(!parent->fds[i].used) continue;
         child->fds[i]=parent->fds[i];
+        child->fds[i].cloexec=0;
         if(child->fds[i].is_pipe) pipe_ref((pipe_t*)child->fds[i].inode, child->fds[i].pipe_w);
     }
 }
@@ -81,15 +90,81 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     if(!p) return -1;
     spawn_inherit_stdio(sched_get_current(), p);   // before READY: never runs without them
     p->spawner_pid = sched_get_current() ? sched_get_current()->pid : 0; // SYS_WAIT ownership
-    // Job control: libc's execve is emulated as spawn+wait+_exit, so the spawned
-    // program must stay in the caller's process group, otherwise a job's real
-    // program escapes `kill -STOP %1`, Ctrl-C/Ctrl-Z (foreground pgid) and SIGTTIN.
+    // Job control: a spawned program joins its spawner's process group, so a
+    // job started through SYS_SPAWN (libc spawn(), the kernel shell) is reached
+    // by `kill -STOP %1`, Ctrl-C/Ctrl-Z (foreground pgid) and SIGTTIN. (libc's
+    // execve is the real in-place SYS_EXECVE, which keeps pid and pgid anyway.)
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0) p->pgid = sp->pgid; }
     p->state = PROC_READY;
     return (int)p->pid;
 }
 int ksys_spawn(const char* path){ return ksys_spawn_argv(path, 0, (const char* const*)0); }
+
+// ---- execve: in-place image replacement ----
+// Bounds: all argv+envp strings together (incl. NULs) <= EXEC_ARG_MAX, at most
+// EXEC_MAX_STRS strings, image <= EXEC_MAX_IMAGE. Over-limit -> -E2BIG / -ENOMEM.
+#define EXEC_ARG_MAX   (128 * 1024)
+#define EXEC_MAX_STRS  2048
+#define EXEC_MAX_IMAGE (16u * 1024u * 1024u)
+
+// Append the strings of a NULL-terminated user char* array to blob. Every user
+// access goes through copy_from_user / strncpy_from_user (fault-tolerant).
+static int exec_copy_strv(uint64_t uvec, char* blob, uint64_t* used, int* count){
+    *count = 0;
+    if(!uvec) return 0;                                   // NULL array == empty
+    for(int i=0;;i++){
+        uint64_t us = 0;
+        if(copy_from_user(&us, (const void*)(uvec + (uint64_t)i*8u), sizeof(us)) != 0) return -EFAULT;
+        if(!us) return 0;
+        if(i >= EXEC_MAX_STRS) return -E2BIG;
+        uint64_t room = EXEC_ARG_MAX - *used;
+        if(room == 0) return -E2BIG;
+        long l = strncpy_from_user(blob + *used, (const char*)us, (size_t)room);
+        if(l == -ENAMETOOLONG) return -E2BIG;
+        if(l < 0) return -EFAULT;
+        *used += (uint64_t)l + 1u;
+        (*count)++;
+    }
+}
+
+long ksys_execve(struct trapframe* tf, uint64_t upath, uint64_t uargv, uint64_t uenvp){
+    process_t* c = sched_get_current();
+    if(!c || !tf) return -1;
+    char kpath[256];
+    long sl = strncpy_from_user(kpath, (const char*)upath, sizeof(kpath));
+    if(sl < 0) return sl;                                 // -EFAULT / -ENAMETOOLONG
+    if(sl == 0) return -ENOENT;
+    char* blob = (char*)kmalloc(EXEC_ARG_MAX);
+    if(!blob) return -ENOMEM;
+    uint64_t used = 0; int argc = 0, envc = 0;
+    long r = exec_copy_strv(uargv, blob, &used, &argc);
+    if(r == 0) r = exec_copy_strv(uenvp, blob, &used, &envc);
+    if(r != 0){ kfree(blob); return r; }
+
+    char rp[256]; proc_resolve_path(c, kpath, rp, sizeof(rp));   // cwd-relative
+    extern vfs_inode_t* vfs_lookup_follow(const char*);
+    vfs_inode_t* ino = vfs_lookup_follow(rp);
+    if(!ino){ kfree(blob); return -ENOENT; }
+    if(ino->type != VFS_NODE_FILE || !ino->ops || !ino->ops->read){ kfree(blob); return -EACCES; }
+    size_t size = ino->size;
+    if(size == 0){ kfree(blob); return -ENOEXEC; }
+    if(size > EXEC_MAX_IMAGE){ kfree(blob); return -ENOMEM; }
+    // Private buffer (not the shared static spawn buffer: another CPU may be
+    // spawning concurrently). It becomes the pinned image on success.
+    uint8_t* img = (uint8_t*)kmalloc(size);
+    if(!img){ kfree(blob); return -ENOMEM; }
+    if(ino->ops->read(ino, 0, img, size) < 0){ kfree(img); kfree(blob); return -EACCES; }
+    debugcon_writestring("[EXEC] execve pid="); debugcon_print_hex(c->pid);
+    debugcon_writestring(" path="); debugcon_writestring(rp); debugcon_writestring("\n");
+    r = process_exec(c, tf, img, size, blob, used, argc, envc);   // owns img
+    kfree(blob);
+    if(r != 0){
+        debugcon_writestring("[EXEC] execve failed rc="); debugcon_print_hex((uint64_t)(-r));
+        debugcon_writestring(" (caller continues)\n");
+    }
+    return r;
+}
 
 // Poll variant (used by the kernel shell): 0 if the pid has exited (ZOMBIE) or
 // is gone; 1 if still running. User processes use the blocking SYS_WAIT instead.
@@ -312,6 +387,8 @@ int ksys_open(const char* path, int flags){
     int fd=fd_alloc(c); if(fd<0) return -1;
     c->fds[fd].inode=ino; c->fds[fd].flags=flags;
     c->fds[fd].offset = (flags & 0x400) ? ino->size : 0;    // O_APPEND -> seek to end
+    c->fds[fd].cloexec = (flags & K_O_CLOEXEC) ? 1 : 0;     // O_CLOEXEC
+    c->fds[fd].flags = flags & ~K_O_CLOEXEC;                // F_GETFL: status flags only
     return fd;
 }
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
@@ -582,7 +659,7 @@ int ksys_dup2(int oldfd, int newfd){
     if(oldfd==newfd) return newfd;
     if(c->fds[newfd].used && c->fds[newfd].is_pipe)             // close the old newfd target
         pipe_unref((pipe_t*)c->fds[newfd].inode, c->fds[newfd].pipe_w);
-    c->fds[newfd]=c->fds[oldfd]; c->fds[newfd].used=1;
+    c->fds[newfd]=c->fds[oldfd]; c->fds[newfd].used=1; c->fds[newfd].cloexec=0; // POSIX: dup clears FD_CLOEXEC
     if(c->fds[newfd].is_pipe) pipe_ref((pipe_t*)c->fds[newfd].inode, c->fds[newfd].pipe_w);
     return newfd;
 }
@@ -590,9 +667,43 @@ int ksys_dup(int oldfd){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(oldfd<0||oldfd>=32||!c->fds[oldfd].used) return -1;
     int n=fd_alloc(c); if(n<0) return -1;
-    c->fds[n]=c->fds[oldfd]; c->fds[n].used=1;
+    c->fds[n]=c->fds[oldfd]; c->fds[n].used=1; c->fds[n].cloexec=0;
     if(c->fds[n].is_pipe) pipe_ref((pipe_t*)c->fds[n].inode, c->fds[n].pipe_w);
     return n;
+}
+// fcntl(fd, cmd, arg): descriptor flags (FD_CLOEXEC), status flags, and
+// F_DUPFD / F_DUPFD_CLOEXEC honouring the minimum fd 'arg' (bash parks saved
+// descriptors at fd >= 10 with close-on-exec).
+#define K_F_DUPFD 0
+#define K_F_GETFD 1
+#define K_F_SETFD 2
+#define K_F_GETFL 3
+#define K_F_SETFL 4
+#define K_F_DUPFD_CLOEXEC 1030
+int ksys_fcntl(int fd, int cmd, long arg){
+    process_t* c=sched_get_current(); if(!c) return -9;
+    if(fd<0||fd>=32||!c->fds[fd].used) return -9;            // -EBADF
+    switch(cmd){
+    case K_F_DUPFD: case K_F_DUPFD_CLOEXEC: {
+        if(arg<0||arg>=32) return -22;                       // -EINVAL
+        int n=-1; for(int i=(int)arg;i<32;i++) if(!c->fds[i].used){ n=i; break; }
+        if(n<0) return -24;                                  // -EMFILE
+        c->fds[n]=c->fds[fd]; c->fds[n].used=1;
+        c->fds[n].cloexec = (cmd==K_F_DUPFD_CLOEXEC) ? 1 : 0;
+        if(c->fds[n].is_pipe) pipe_ref((pipe_t*)c->fds[n].inode, c->fds[n].pipe_w);
+        return n;
+    }
+    case K_F_GETFD: return c->fds[fd].cloexec ? 1 : 0;      // FD_CLOEXEC = 1
+    case K_F_SETFD: c->fds[fd].cloexec = (arg & 1) ? 1 : 0; return 0;
+    case K_F_GETFL:
+        if(c->fds[fd].is_pipe) return c->fds[fd].pipe_w ? 1 /*O_WRONLY*/ : 0 /*O_RDONLY*/;
+        if(fd<3 && !c->fds[fd].inode) return 2;              // console stdio: O_RDWR
+        return (int)(c->fds[fd].flags & ~K_O_CLOEXEC);
+    case K_F_SETFL:                                          // only O_APPEND/O_NONBLOCK change
+        c->fds[fd].flags = (c->fds[fd].flags & ~(0x400u|0x800u)) | ((uint32_t)arg & (0x400u|0x800u));
+        return 0;
+    default: return -22;
+    }
 }
 int ksys_chdir(const char* upath){
     process_t* c=sched_get_current(); if(!c) return -1;
@@ -821,7 +932,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         CAP_GATE(CAP_IPC, "pipe");       // [M35]
         /* [M25] pipe(int fds[2]): kernel-side alloc, then copy the two fds out. */
         int kfds[2];
-        int r = ksys_pipe(kfds);
+        int r = ksys_pipe2(kfds, (int)a1);   // a1 = pipe2() flags (0 for pipe())
         if (r != 0) return (uint64_t)(int64_t)r;
         if (copy_to_user((void*)a0, kfds, sizeof(kfds)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return 0;
@@ -1021,6 +1132,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_GETCWD:  return (uint64_t)(int64_t)ksys_getcwd((char*)a0, (int)a1);
     case SYS_IOCTL:   return (uint64_t)(int64_t)ksys_ioctl((int)a0, a1, a2);
     case SYS_GETPPID: return (uint64_t)ksys_getppid();
+    case SYS_FCNTL:   return (uint64_t)(int64_t)ksys_fcntl((int)a0, (int)a1, (long)a2);
     case SYS_GETPGID: {                       // job control (bash getpgrp/getpgid)
         extern long ksys_getpgid(int);
         return (uint64_t)(int64_t)ksys_getpgid((int)a0);

@@ -26,6 +26,23 @@
 #define W_SIGNALED(sig)  ((int)((unsigned)(sig) & 0x7fu))
 #define W_STOPCODE(sig)  ((int)((((unsigned)(sig) & 0xffu) << 8) | 0x7fu))
 
+// errno values returned (negated) by process_exec / SYS_EXECVE.
+#ifndef ENOENT
+#define ENOENT   2
+#endif
+#ifndef E2BIG
+#define E2BIG    7
+#endif
+#ifndef ENOEXEC
+#define ENOEXEC  8
+#endif
+#ifndef ENOMEM
+#define ENOMEM  12
+#endif
+#ifndef EACCES
+#define EACCES  13
+#endif
+
 #define PROC_TYPE_USER    0
 #define PROC_TYPE_DRIVER  1
 
@@ -117,7 +134,9 @@ typedef struct process {
     // Simple file descriptor table
     // [M25] When is_pipe, `inode` holds a pipe_t* and pipe_w selects the end
     // (1 = write end, 0 = read end). Otherwise `inode` is a vfs_inode_t*.
-    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; } fds[32];
+    // cloexec: FD_CLOEXEC — the fd is closed by a successful execve() (fcntl
+    // F_SETFD, O_CLOEXEC on open, pipe2(O_CLOEXEC), F_DUPFD_CLOEXEC).
+    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; int cloexec; } fds[32];
 } process_t;
 
 int process_init_system(void); // initialize process table
@@ -125,6 +144,14 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size);
 process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
                                         int argc, const char* const argv[]); // [M16]
 process_t* process_fork(process_t* parent, trapframe_t* tf); // [M19] COW fork
+// In-place execve: replace p's user image with the signed ELF 'image' (kmalloc'd,
+// ownership transferred; freed on failure). 'blob' holds argc argv strings then
+// envc envp strings, each NUL-terminated, 'blen' bytes total. Builds and
+// validates the new address space first; on any failure returns -errno with p
+// untouched. On success p (== current, 'tf' its live syscall trapframe) resumes
+// at the new entry point when the syscall returns. Returns 0 / -errno.
+int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
+                 const char* blob, uint64_t blen, int argc, int envc);
 void process_print(const process_t* p);
 process_t* process_get_last(void);
 process_t* process_find_by_pid(uint32_t pid);

@@ -341,6 +341,47 @@ grep -q "\[m19\] parent: child status=7" "$M19LOG"; check "M19 parent reads chil
 grep -q "\[M19\] DONE" "$M19LOG"; check "M19 demo completed ([M19] DONE)" $?
 ! grep -q "\[EXC\]" "$M19LOG"; check "no CPU exception ([EXC]) during M19 run" $?
 
+# ---- execve: in-place image replacement (SYS_EXECVE) ----
+# user/exectest.c (installed as /bin/exectest with tampered/unsigned/script
+# twins) checks the failure paths (caller continues), what a successful exec
+# keeps (pid, parent link, argv/envp, plain fds, mask, pending signals) and
+# drops (FD_CLOEXEC fds, caught handlers), and 200 fork+exec cycles with a
+# stable PMM free count.
+EXLOG=/tmp/secos_selftest_execve.log
+echo "[selftest] Building execve image (EXECVE_DEMO=1, signing enforced)..."
+make clean >/dev/null 2>&1 || true
+if ! make CFLAGS_EXTRA=-DEXECVE_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] EXECVE BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+echo "[selftest] Running execve (mb2, 45s)..."
+tools/smoke.sh --mb2 --timeout 45 --log "$EXLOG" >/dev/null 2>&1 || true
+for t in "nonexistent path -> ENOENT, caller continues" \
+         "tampered ELF refused (EACCES), caller continues" \
+         "unsigned ELF refused (EACCES), caller continues" \
+         "non-ELF file -> ENOEXEC, caller continues" \
+         "directory -> EACCES" \
+         "bad path pointer -> EFAULT" "bad argv pointer -> EFAULT" \
+         "bad argv\[1\] string -> EFAULT" "kernel envp pointer -> EFAULT" \
+         "pid unchanged after failed execs" \
+         "fcntl F_SETFD/F_GETFD" "fcntl F_DUPFD honours the minimum fd" "pipe2(O_CLOEXEC)" \
+         "argv delivered to new image" "pid unchanged across exec" \
+         "envp delivered (getenv)" "envp delivered to main" \
+         "plain fd survives exec" "O_CLOEXEC fd closed by exec" \
+         "FD_CLOEXEC (F_SETFD) fd closed by exec" "pipe2(O_CLOEXEC) end closed by exec" \
+         "pre-exec child collected by the new image" \
+         "caught handler reset to SIG_DFL" "ignored signal stays ignored" \
+         "signal mask preserved" "pending signal preserved across exec" \
+         "200 fork+exec cycles all exit 0" \
+         "no memory leak across 200 fork+exec (|delta| <= 64 kB)"; do
+    grep -q "\[EXECVE\] $t OK" "$EXLOG"; check "execve: $t" $?
+done
+grep -q "\[EXEC\] pid=0x0000000000000001 entry=" "$EXLOG"; check "execve: in-place exec kept pid 1 ([EXEC] marker)" $?
+! grep -q "\[EXECVE\] .* FAIL" "$EXLOG"; check "execve: no FAIL marker" $?
+grep -q "\[EXECVE\] DONE-USER" "$EXLOG" && grep -q "\[EXECVE\] DONE$" "$EXLOG"
+check "execve demo completed ([EXECVE] DONE)" $?
+! grep -q "\[EXC\]" "$EXLOG"; check "no CPU exception ([EXC]) during execve run" $?
+
 # ---- M20: unified page cache + file-backed mmap ----
 M20LOG=/tmp/secos_selftest_m20.log
 echo "[selftest] Building M20 image (M20_MMAP_DEMO=1, signing enforced)..."
@@ -1012,6 +1053,43 @@ grep -q "LJ8-0" "$LJLOG"; check "bash: fg resumes a stopped job and waits for it
 grep -q "LJ9-hi" "$LJLOG"; check "lua script reads stdin through io.read" $?
 grep -q "LJ-42-END" "$LJLOG"; check "bash responsive after the job-control sequence" $?
 ! grep -q "\[EXC\]" "$LJLOG"; check "no CPU exception ([EXC]) during lua/job-control run" $?
+
+# ============================================================================
+# ---- bash over the real execve: pids, exec replacing the shell, scripts ----
+# ============================================================================
+# bash's fork+execve now replaces the forked child in place, so $! is the pid
+# of the program itself (the kernel logs "[EXEC] execve pid=<p> path=..."),
+# `exec cmd` replaces bash (the kernel's recovery shell takes over when cmd
+# exits), a script without an ELF header gets ENOEXEC and bash runs it, and the
+# environment crosses exec. Markers only appear once expanded.
+BXLOG=/tmp/secos_selftest_bashexec.log
+BXSER=/tmp/secos_selftest_bashexec.serial
+echo "[selftest] Running bash over the real execve (mb2, serial input, 70s)..."
+: > "$BXLOG"
+( sleep 25
+  printf "  bash -c 'exec echo BX1-\$((40+2))'\r"; sleep 4
+  printf "  (exec bash -c 'echo \$\$ > /tmp/bxpid') & wait; [[ \$(cat /tmp/bxpid) == \$! ]] && echo BX2-same-\$((1+1))\r"; sleep 5
+  printf '  sleep 30 & p=$!; printf -v h %%016X $p; kill -STOP $p; sleep 1; j=$(jobs -l); [[ $j == *$p*Stopped* ]] && echo BX3-$h-stopped; kill -9 $p; wait\r'; sleep 5
+  printf '  bash -c "exec /bin/nonexist" 2>/dev/null; echo BX4-rc-$?\r'; sleep 4
+  printf '  printf "echo BX5-\\$((2+3))\\n" > /tmp/bx.sh; bash -c /tmp/bx.sh\r'; sleep 4
+  printf '  BXV=bar$((40+2)) bash -c "echo BX6-\\$BXV"\r'; sleep 4
+  printf '  exec /bin/echo BX7-$((3+4))\r'; sleep 5
+  printf '  uptime\r'; sleep 3 ) | \
+    timeout 70 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+        -debugcon file:"$BXLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio > "$BXSER" 2>&1
+grep -q "BX1-42" "$BXLOG"; check "bash -c 'exec echo' runs the exec'd program" $?
+grep -q "BX2-same-2" "$BXLOG"; check "bash: \$! is the exec'd program's own pid" $?
+BXH=$(grep -o "BX3-[0-9A-F]\{16\}-stopped" "$BXLOG" | head -1 | cut -d- -f2)
+[[ -n "$BXH" ]] && grep -q "\[EXEC\] execve pid=0x$BXH path=/bin/sleep" "$BXLOG"
+check "bash: kill -STOP \$! stops the real program (pid exec'd /bin/sleep)" $?
+grep -q "BX4-rc-127" "$BXLOG"; check "bash: exec of a missing file fails with 127" $?
+grep -q "BX5-5" "$BXLOG"; check "bash: a script (ENOEXEC) runs through bash" $?
+grep -q "BX6-bar42" "$BXLOG"; check "bash: environment crosses execve" $?
+grep -q "BX7-7" "$BXLOG"; check "bash: exec replaces the login shell" $?
+sed -n '/BX7-7/,$p' "$BXSER" | grep -q "secos:/"
+check "recovery shell takes over after the exec'd program exits" $?
+! grep -q "\[EXC\]" "$BXLOG"; check "no CPU exception ([EXC]) during bash execve run" $?
 
 # ============================================================================
 # ---- Orderly poweroff / reboot from bash (SYS_REBOOT) ----

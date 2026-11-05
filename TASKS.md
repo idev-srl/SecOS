@@ -20,7 +20,7 @@ resumed only when hardware testing restarts.
 ### Planned order (QEMU-validatable)
 1. **Selftest coverage M34–M39 + docs realignment** (in progress — this file,
    `ROADMAP_TO_COMPLETE_OS.md`, `CLAUDE.md`, `docs/BASH_PORT.md`, `docs/devlog/M39.md`).
-2. **bash / shell usability:** real in-place `execve`, raw-mode termios in
+2. **bash / shell usability:** ~~real in-place `execve`~~ (done), raw-mode termios in
    `kernel/tty.c`, `poll`/`select`, `ioctl` coverage, mid-path symlink following
    (`fs/vfs.c`), per-pid `/proc/<pid>`.
 3. **Kernel robustness:** buddy heap, `MAP_SHARED`, PID-1 init in boot, package
@@ -95,8 +95,8 @@ robustness and the paused real-hardware bring-up — see below.
 ## 🟢 OPEN — QEMU-validatable (current focus)
 
 ### Shell / POSIX usability (bash)
-- [ ] **Real in-place `execve`** — today emulated as spawn+wait+exit (`user/libsecos.c`):
-      pid changes, env not inherited, job control under bash is approximate.
+- [x] **Real in-place `execve`** — `SYS_EXECVE` (60) + `FD_CLOEXEC`/`fcntl` (61) +
+      `pipe2`; libc's spawn+wait+exit emulation removed (`docs/BASH_PORT.md`).
 - [ ] **Raw-mode termios** — `TCSETS` sets `g_tty_canon`/`g_tty_echo`
       (`kernel/syscall.c`) but `kernel/tty.c` never consults them; console is always cooked.
       Prerequisite for readline in bash.

@@ -158,6 +158,11 @@ int   getppid(void);
 int   execve(const char* path, char* const argv[], char* const envp[]);
 int   execv(const char* path, char* const argv[]);
 int   execvp(const char* file, char* const argv[]);
+int   execvpe(const char* file, char* const argv[], char* const envp[]);
+int   execl(const char* path, const char* arg, ...);
+int   execlp(const char* file, const char* arg, ...);
+int   execle(const char* path, const char* arg, ...);   /* ..., NULL, char* const envp[] */
+int   pipe2(int fds[2], int flags);
 extern char** environ;
 
 /* tiny libc helpers */

@@ -377,7 +377,14 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/power.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/power.o
 	python3 tools/secos-sign user/power.elf --dev
 	python3 tools/elf2h.py user/power.elf user_power_elf crypto/user_power_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + power -> crypto/*.h"
+	# in-place execve test (EXECVE_DEMO): signed build + an unsigned twin
+	$(CC) $(USER_CFLAGS) -c user/exectest.c   -o user/exectest.o
+	$(LD) --gc-sections -T user/user.ld -o user/exectest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/exectest.o
+	cp user/exectest.elf user/exectest_unsigned.elf
+	python3 tools/secos-sign user/exectest.elf --dev
+	python3 tools/elf2h.py user/exectest.elf user_exectest_elf crypto/user_exectest_elf.h
+	python3 tools/elf2h.py user/exectest_unsigned.elf user_exectest_unsigned_elf crypto/user_exectest_unsigned_elf.h
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + power + exectest{,_unsigned} -> crypto/*.h"
 
 # Staleness guard for the committed embedded programs: rebuild + re-sign them
 # (deterministic: same sources -> byte-identical headers) and fail if any

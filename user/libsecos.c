@@ -147,6 +147,8 @@ int fork(void){ return (int)secos_syscall(SYS_FORK, 0, 0, 0, 0, 0); }
 
 /* [M25] anonymous pipe: fds[0]=read end, fds[1]=write end. Returns 0 or -1. */
 int pipe(int fds[2]){ return (int)secos_syscall(31 /*SYS_PIPE*/, (long)fds, 0, 0, 0, 0); }
+/* pipe2(fds, O_CLOEXEC): both ends close-on-exec. */
+int pipe2(int fds[2], int flags){ return (int)__se(secos_syscall(31 /*SYS_PIPE*/, (long)fds, flags, 0, 0, 0)); }
 
 /* [M26] VFS maturity: metadata + symlinks. */
 int lstat(const char* path, struct stat* st){ if(st) stzero(st); return (int)secos_syscall(37 /*SYS_LSTAT*/, (long)path, (long)st, 0, 0, 0); }
@@ -231,38 +233,42 @@ void cfmakeraw(struct termios* t){
 int tcgetpgrp(int fd){ int pg = -1; ioctl(fd, 0x540F /*TIOCGPGRP*/, &pg); return pg; }
 int tcsetpgrp(int fd, int pgrp){ return ioctl(fd, 0x5410 /*TIOCSPGRP*/, &pgrp); }
 
-/* execve emulated via spawn+wait+exit: run the signed program and exit with its
- * status. Semantically matches the shell fork()+execve() pattern (the parent's
- * waitpid on the forked child gets the command's status). The command runs as a
- * fresh signed process (no in-place image replacement), so envp is not inherited
- * across the boundary yet — a documented limitation of the emulation. */
+/* execve: the kernel replaces this process's image in place (SYS_EXECVE). pid,
+ * parent, process group, cwd and every fd not marked FD_CLOEXEC survive; caught
+ * signals revert to SIG_DFL. Returns only on failure, with errno set (ENOENT,
+ * EACCES: unsigned/tampered or not a regular file, ENOEXEC: not an ELF, E2BIG,
+ * EFAULT, ENOMEM) and the calling image untouched. */
 extern char** environ;
+char* getenv(const char* name);
 int execve(const char* path, char* const argv[], char* const envp[]){
-    (void)envp;
-    int pid = spawn(path, (char* const*)argv);
-    if(pid < 0) return -1;
-    int st;
-    while((st = waitpid(pid)) == -4 /*-EINTR*/){ }   /* a handled signal: keep waiting */
-    if(st < 0) _exit(127);
-    if(WIFSIGNALED(st)){
-        /* Propagate the death-by-signal: re-raise it with the default action so
-         * our own waiter sees the same wait status, not an exit code. */
-        signal(WTERMSIG(st), (sighandler_t)0 /*SIG_DFL*/);
-        kill(getpid(), WTERMSIG(st));
-        _exit(128 + WTERMSIG(st));   /* fallback if the signal did not kill us */
-    }
-    _exit(WEXITSTATUS(st));
-    return -1; /* unreached */
+    return (int)__se(secos_syscall(60 /*SYS_EXECVE*/, (long)path, (long)argv, (long)envp, 0, 0));
 }
 int execv(const char* path, char* const argv[]){ return execve(path, argv, environ); }
-int execvp(const char* file, char* const argv[]){
-    int has_slash = 0; for(const char* p=file; *p; p++) if(*p=='/'){ has_slash=1; break; }
-    if(has_slash) return execve(file, argv, environ);
-    char buf[160]; const char* dirs[] = { "/bin/", "/usr/bin/", 0 };
-    for(int d=0; dirs[d]; d++){
-        int k=0; for(const char* p=dirs[d]; *p && k<159; p++) buf[k++]=*p;
-        for(const char* p=file; *p && k<159; p++) buf[k++]=*p; buf[k]=0;
-        execve(buf, argv, environ); /* returns only on failure */
+/* PATH search (default "/bin:/usr/bin"). A name with a '/' is used as is. Keeps
+ * searching past ENOENT/ENOTDIR; reports EACCES if some candidate was refused
+ * and nothing ran (POSIX execvp). */
+int execvpe(const char* file, char* const argv[], char* const envp[]){
+    if(!file || !*file){ errno = ENOENT; return -1; }
+    for(const char* p=file; *p; p++) if(*p=='/') return execve(file, argv, envp);
+    const char* path = getenv("PATH");
+    if(!path || !*path) path = "/bin:/usr/bin";
+    int saw_eacces = 0;
+    char buf[256];
+    while(1){
+        const char* e = path; while(*e && *e != ':') e++;
+        int k = 0;
+        if(e == path) buf[k++] = '.';                      /* empty element = cwd */
+        for(const char* q=path; q<e && k<200; q++) buf[k++] = *q;
+        if(k < 254) buf[k++] = '/';
+        for(const char* q=file; *q && k<255; q++) buf[k++] = *q;
+        buf[k] = 0;
+        execve(buf, argv, envp);                           /* returns only on failure */
+        if(errno == EACCES) saw_eacces = 1;
+        else if(errno != ENOENT && errno != ENOTDIR) return -1;   /* real error: stop */
+        if(!*e) break;
+        path = e + 1;
     }
+    errno = saw_eacces ? EACCES : ENOENT;
     return -1;
 }
+int execvp(const char* file, char* const argv[]){ return execvpe(file, argv, environ); }
