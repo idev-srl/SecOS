@@ -1284,6 +1284,9 @@ extern void shell_run_line(const char* line);
 #ifndef SECOS_NO_BASH
 #include "../crypto/user_bash_elf.h"
 #endif
+#ifndef SECOS_NO_LUA
+#include "../crypto/user_lua_elf.h"      // [M34] installed to /bin/lua at boot
+#endif
 static uint8_t   m10_idle_stack[32768] __attribute__((aligned(16)));
 static process_t m10_idle;
 static trapframe_t m10_idle_tf;
@@ -1298,6 +1301,16 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
           if (vfs_create("/bin/bash", user_bash_elf, user_bash_elf_len) == 0)
               debugcon_writestring("[M39] installed GNU bash to /bin/bash\n");
           else debugcon_writestring("[M39] FAIL: could not install /bin/bash\n");
+      } }
+#endif
+#ifndef SECOS_NO_LUA
+    // [M34] Install the signed lua 5.4.7 interpreter to /bin/lua (idempotent, also
+    // on a persistent root populated before lua was installed by default).
+    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
+      if (!vfs_lookup("/bin/lua")) {
+          if (vfs_create("/bin/lua", user_lua_elf, user_lua_elf_len) == 0)
+              debugcon_writestring("[M34] installed lua to /bin/lua\n");
+          else debugcon_writestring("[M34] FAIL: could not install /bin/lua\n");
       } }
 #endif
 #if ENABLE_FB
