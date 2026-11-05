@@ -12,12 +12,20 @@
 #define O_CLOEXEC  0x80000
 
 /* [M39] fcntl commands (subset a shell needs). F_DUPFD via dup(); F_GETFL/F_SETFL
- * track the open flags; F_GETFD/F_SETFD/F_SETLK accepted as no-ops. */
+ * track the open flags; F_GETFD/F_SETFD carry FD_CLOEXEC (honoured by execve);
+ * the locking commands are accepted as no-ops. */
 #define F_DUPFD 0
 #define F_GETFD 1
 #define F_SETFD 2
 #define F_GETFL 3
 #define F_SETFL 4
 #define FD_CLOEXEC 1
+#define F_DUPFD_CLOEXEC 1030
+#ifndef F_GETLK
+#define F_GETLK  5
+#define F_SETLK  6
+#define F_SETLKW 7
+#endif
+int pipe2(int fds[2], int flags);
 int fcntl(int fd, int cmd, ...);
 #endif

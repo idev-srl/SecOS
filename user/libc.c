@@ -199,7 +199,8 @@ void* bsearch(const void* key, const void* base, size_t n, size_t sz, int(*cmp)(
     return 0;
 }
 /* [M39] In-process environment. environ is a NULL-terminated array of "KEY=VAL"
- * strings, starting empty (a process inherits none across the spawn-based exec).
+ * strings, seeded at startup from the envp execve() handed us (__libc_init_env,
+ * called by crt0; a spawned program starts empty).
  * getenv/setenv/unsetenv/putenv operate on it. Bounded (64 vars, static storage)
  * — enough for a shell's own variables. */
 #define ENV_MAX 64
@@ -207,6 +208,19 @@ void* bsearch(const void* key, const void* base, size_t n, size_t sz, int(*cmp)(
 static char  env_store[ENV_MAX][ENV_LEN];
 static char* env_ptrs[ENV_MAX + 1];
 char** environ = env_ptrs;
+
+/* crt0: copy the initial environment (kernel-built on our stack) into env_store
+ * so setenv's in-place rewrite never runs off the end of a stack string. */
+void __libc_init_env(char** envp){
+    int n = 0;
+    for(int i=0; envp && envp[i] && n < ENV_MAX; i++){
+        const char* src = envp[i]; size_t k = 0;
+        while(src[k] && k < ENV_LEN-1){ env_store[n][k] = src[k]; k++; }
+        env_store[n][k] = 0;
+        env_ptrs[n] = env_store[n]; n++;
+    }
+    env_ptrs[n] = 0;
+}
 
 static int env_name_eq(const char* entry, const char* name, size_t nlen){
     for(size_t i=0;i<nlen;i++) if(entry[i]!=name[i]) return 0;
@@ -229,7 +243,15 @@ int setenv(const char* name, const char* value, int overwrite){
         return 0;
     }
     if(n>=ENV_MAX) return -1;
-    char* e=env_store[n]; size_t k=0;
+    /* A storage slot no live entry uses (unsetenv shifts environ[], so slot n
+     * may still back another variable). */
+    int slot=-1;
+    for(int st=0; st<ENV_MAX && slot<0; st++){
+        int busy=0; for(int j=0; environ[j]; j++) if(environ[j]==env_store[st]){ busy=1; break; }
+        if(!busy) slot=st;
+    }
+    if(slot<0) return -1;
+    char* e=env_store[slot]; size_t k=0;
     for(size_t i=0; name[i] && k<ENV_LEN-1; i++) e[k++]=name[i];
     if(k<ENV_LEN-1) e[k++]='=';
     for(size_t i=0; value[i] && k<ENV_LEN-1; i++) e[k++]=value[i]; e[k]=0;
@@ -278,18 +300,46 @@ int gettimeofday(struct timeval* tv, void* tz){
     return 0;
 }
 
-/* fcntl: F_DUPFD via dup(); flags tracked loosely (enough for a shell). */
+/* fcntl: kernel-backed (SYS_FCNTL): F_DUPFD / F_DUPFD_CLOEXEC honour the minimum
+ * fd, F_GETFD / F_SETFD carry FD_CLOEXEC (closed by execve), F_GETFL / F_SETFL
+ * the status flags. Record-locking commands are accepted as no-ops. */
 int fcntl(int fd, int cmd, ...){
     va_list ap; va_start(ap, cmd);
-    long arg = va_arg(ap, long); va_end(ap); (void)arg;
-    switch(cmd){
-    case F_DUPFD: return dup(fd);     /* lowest free fd (>=arg not strictly honored) */
-    case F_GETFD: return 0;
-    case F_SETFD: return 0;
-    case F_GETFL: return O_RDWR;
-    case F_SETFL: return 0;
-    default: return -1;
+    long arg = va_arg(ap, long); va_end(ap);
+    if(cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) return 0;
+    long r = secos_syscall(61 /*SYS_FCNTL*/, fd, cmd, arg, 0, 0);
+    if(r < 0){ errno = (int)-r; return -1; }
+    return (int)r;
+}
+
+/* execl family: collect the variadic argv (bounded) and call execve/execvp. */
+#define EXECL_MAX 256
+static int execl_collect(const char* arg, va_list* ap, char** av){
+    int n = 0;
+    av[n++] = (char*)arg;
+    while(arg){
+        arg = va_arg(*ap, const char*);
+        if(n >= EXECL_MAX){ errno = E2BIG; return -1; }
+        av[n++] = (char*)arg;
     }
+    return 0;
+}
+int execl(const char* path, const char* arg, ...){
+    char* av[EXECL_MAX + 1]; va_list ap; va_start(ap, arg);
+    int r = execl_collect(arg, &ap, av); va_end(ap);
+    return r < 0 ? -1 : execve(path, av, environ);
+}
+int execlp(const char* file, const char* arg, ...){
+    char* av[EXECL_MAX + 1]; va_list ap; va_start(ap, arg);
+    int r = execl_collect(arg, &ap, av); va_end(ap);
+    return r < 0 ? -1 : execvp(file, av);
+}
+int execle(const char* path, const char* arg, ...){
+    char* av[EXECL_MAX + 1]; va_list ap; va_start(ap, arg);
+    int r = execl_collect(arg, &ap, av);
+    char* const* envp = r < 0 ? 0 : va_arg(ap, char* const*);
+    va_end(ap);
+    return r < 0 ? -1 : execve(path, av, envp);
 }
 
 /* ============================== <dirent.h> ============================= */
