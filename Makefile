@@ -548,6 +548,14 @@ run-disk: iso
 run-serial: iso
 	qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none -no-reboot
 
+# Serial console + an e1000 NIC with host port 2222 forwarded to guest :22, for
+# the Dropbear SSH server (docs/SSH.md). -cpu max gives the guest RDRAND/RDSEED
+# for the kernel RNG.
+.PHONY: run-ssh
+run-ssh: iso
+	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -cpu max -serial stdio -display none -no-reboot \
+		-netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0
+
 # Run with a VNC server on :0 (connect a VNC viewer to localhost:5900)
 .PHONY: run-vnc
 run-vnc: iso
