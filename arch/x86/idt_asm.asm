@@ -4,6 +4,18 @@
 ; SPDX-License-Identifier: MIT
 BITS 64
 
+; [M44] SMAP: RFLAGS.AC is NOT cleared by interrupt/exception/INT-n delivery, so
+; ring 3 could enter the kernel with AC=1 (popf) and disarm SMAP for the whole
+; handler. Every kernel entry clears it. `clac` is #UD on a CPU without SMAP,
+; hence the guard on g_smap_enabled (flags are already saved by the CPU).
+extern g_smap_enabled
+%macro SMAP_CLAC 0
+    cmp dword [rel g_smap_enabled], 0
+    je %%no_smap
+    clac
+%%no_smap:
+%endmacro
+
 section .text
 
 extern signal_dispatch          ; [M30] deliver pending signals on return to ring-3
@@ -114,6 +126,7 @@ isr_common:
     push r13
     push r14
     push r15
+    SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     
     ; Passa il puntatore alla struttura registers
@@ -177,6 +190,7 @@ isr_timer:
     push r13
     push r14
     push r15
+    SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
 
     ; rdi = &trapframe (points at r15).  On a preemptive switch the C handler
@@ -234,6 +248,7 @@ isr_keyboard:
     push r13
     push r14
     push r15
+    SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     
     ; Chiama il gestore C
@@ -281,6 +296,7 @@ isr_mouse:
     push r13
     push r14
     push r15
+    SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code
     call ps2mouse_handler
     call irq_eoi_aux    ; LAPIC EOI, or slave + master 8259
@@ -326,6 +342,7 @@ isr_xhci:
     push r13
     push r14
     push r15
+    SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     call xhci_irq_handler        ; drains/acks; LAPIC EOI done in C
     pop r15
@@ -363,6 +380,7 @@ isr_nvme:
     push r13
     push r14
     push r15
+    SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     call nvme_irq_handler        ; drains/acks; LAPIC EOI done in C
     pop r15
@@ -403,6 +421,7 @@ isr_net:
     push r13
     push r14
     push r15
+    SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     call net_irq_handler         ; acks NIC, drains ring; LAPIC EOI done in C
     pop r15

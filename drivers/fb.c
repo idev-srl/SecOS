@@ -22,7 +22,14 @@ void fb_apply_wc(void);   // forward: (re)apply framebuffer Write-Combining
 
 void fb_finalize_mapping(void) {
     if (!g_fb_ready) return;
-    if (!g_fb_phys_only) return;
+    if (!g_fb_phys_only) {
+        // [M44] A low framebuffer (< the old identity window) used to be
+        // addressed virt == phys. The identity map is retired after early boot:
+        // reach it through the physmap like any other (no WC retag here — the
+        // 2 MB physmap page may also hold RAM).
+        if (!g_fb.virt_addr) g_fb.virt_addr = phys_to_virt(g_fb.addr);
+        return;
+    }
     // Ensure physmap covers the entire framebuffer
     uint64_t fb_size = (uint64_t)g_fb.pitch * g_fb.height;
     uint64_t fb_end = g_fb.addr + fb_size;
@@ -51,7 +58,9 @@ void fb_apply_wc(void) {
 }
 
 int fb_init(uint32_t mb2_info) {
-    uint8_t* base = (uint8_t*)(uint64_t)mb2_info;
+    // [M44] The MB2 info block is physical; read it through the physmap (the
+    // boot identity map is gone by the time phase 2 initialises the console).
+    uint8_t* base = (uint8_t*)phys_to_virt((uint64_t)mb2_info);
     uint32_t total_size = *(uint32_t*)base;
     uint8_t* tags = base + 8;
     uint8_t* end = base + total_size;

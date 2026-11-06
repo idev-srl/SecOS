@@ -110,15 +110,15 @@ static int      g_ready;
 
 /* [M12] Higher-half: a kernel-image static's symbol address is a high VMA, not
  * its physical address. Translate to physical for the device (DMA descriptors,
- * queue PFN). The derived CPU pointers (g_desc/g_avail/g_used) then address the
- * low identity map, which the kernel keeps mapped (the DMA region is < 512 MB). */
+ * queue PFN). [M44] The CPU pointers (g_desc/g_avail/g_used) use the kernel
+ * VMA of the same buffer: the low identity map they used to address is gone. */
 static inline uint64_t phys_of(const void* p) { return kvirt_to_phys((uint64_t)(uintptr_t)p); }
 
 /* Round up to the next 4 KiB boundary. */
 static inline uint64_t align4k(uint64_t x) { return (x + 0xFFF) & ~0xFFFULL; }
 
 static void vq_layout(uint16_t qsz) {
-    uint64_t base = phys_of(g_vq_mem);
+    uint64_t base = (uint64_t)(uintptr_t)g_vq_mem;   /* page-aligned kernel VA */
     uint64_t desc_bytes  = (uint64_t)16 * qsz;
     uint64_t avail_bytes = 6 + (uint64_t)2 * qsz;           /* flags+idx+ring+used_event */
     g_desc  = (struct virtq_desc*)(uintptr_t)base;

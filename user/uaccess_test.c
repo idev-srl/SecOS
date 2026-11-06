@@ -46,10 +46,24 @@ static void putnum(long v) {
 static long sc(long n, long a0, long a1, long a2, long a3) {
     return secos_syscall(n, a0, a1, a2, a3, 0);
 }
+/* One write() per result line: a kernel trace line ([SCHED] preempt ...) on
+ * debugcon can otherwise land between the name and " OK" and break the
+ * selftest's grep. */
 static void check(const char* name, int ok, long got) {
-    put("[UA-TEST] "); put(name); put(ok ? " OK" : " FAIL");
-    if (!ok) { put(" got="); putnum(got); }
-    put("\n");
+    char line[160]; int n = 0;
+    const char* parts[3] = { "[UA-TEST] ", name, ok ? " OK" : " FAIL" };
+    for (int k = 0; k < 3; k++)
+        for (const char* s = parts[k]; *s && n < 100; s++) line[n++] = *s;
+    if (!ok) {
+        const char* g = " got="; while (*g) line[n++] = *g++;
+        char b[24]; int i = 23; int neg = got < 0; unsigned long u = neg ? -got : got;
+        b[i] = 0;
+        do { b[--i] = (char)('0' + u % 10); u /= 10; } while (u);
+        if (neg) b[--i] = '-';
+        for (const char* s = &b[i]; *s; s++) line[n++] = *s;
+    }
+    line[n++] = '\n';
+    write(1, line, n);
     if (ok) g_pass++; else g_fail++;
 }
 /* A syscall reporting -EFAULT through the raw ABI. */
@@ -125,6 +139,71 @@ int main(void) {
         /* a range straddling the window top (ends just inside user space) must
          * still be refused as a whole. */
         expect_efault("ident-straddle-min", sc(SYS_WRITE, 1, 0xFFFFF000UL, 0x4000, 0));
+    }
+
+    /* --- [M44] no low identity map in user address spaces, SMAP ---
+     * The identity map is gone from every user CR3 (and from the kernel's own
+     * tables after early boot); kernel-half pointers stay refused; a signal
+     * frame aimed at the old identity window is never written by the kernel;
+     * and entering the kernel with RFLAGS.AC=1 (which would disarm SMAP if the
+     * entry stubs did not clac) changes nothing for a correct syscall. */
+    {
+        /* mmap ignores address hints below the user window. */
+        char* m = (char*)mmap((void*)0x100000, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+        check("noident-mmap-hint-low-ignored",
+              m != (char*)-1 && (unsigned long)m >= 0x100000000UL, (long)m);
+        if (m != (char*)-1) munmap(m, PG);
+        /* Kernel-half pointers: the physmap (phys 1 MB) and the kernel image. */
+        expect_efault("noident-read-physmap-ptr", sc(SYS_WRITE, 1, (long)0xFFFF888000100000UL, 16, 0));
+        expect_efault("noident-read-kimage-ptr", sc(SYS_WRITE, 1, (long)0xFFFFFFFF80100000UL, 16, 0));
+        int kp[2];
+        if (pipe(kp) == 0) {
+            write(kp[1], "PWNED", 5);
+            expect_efault("noident-write-physmap-ptr",
+                          sc(SYS_READ, kp[0], (long)0xFFFF888000100000UL, 5, 0));
+            expect_efault("noident-write-kimage-ptr",
+                          sc(SYS_READ, kp[0], (long)0xFFFFFFFF80100000UL, 5, 0));
+            close(kp[0]); close(kp[1]);
+        }
+        /* A ring-3 load from the old identity window is a plain user fault. */
+        int pid = fork();
+        if (pid == 0) {
+            volatile char* lo = (volatile char*)0x100000;
+            char c = *lo;
+            _exit(c ? 3 : 4);
+        }
+        int st = pid > 0 ? waitpid(pid) : -1;
+        check("noident-ring3-load-0x100000-sigsegv",
+              st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == 11, st);
+        /* Signal delivery with rsp in the old identity window: the kernel must
+         * refuse to build the frame there (copy_to_user) and kill the child
+         * with the signal, never write physical memory. SIGCHLD (default:
+         * ignore) with a handler installed: being killed BY it proves the frame
+         * was refused rather than silently written. */
+        pid = fork();
+        if (pid == 0) {
+            signal(17 /*SIGCHLD*/, on_chld);
+            long me = getpid(), r;
+            __asm__ volatile("mov %%rsp, %%r12\n\t"
+                             "mov $0x100800, %%rsp\n\t"
+                             "int $0x80\n\t"
+                             "mov %%r12, %%rsp"
+                             : "=a"(r) : "0"(46L /*SYS_KILL*/), "D"(me), "S"(17L)
+                             : "r12", "memory");
+            _exit(5);                        /* reached only if no frame was due */
+        }
+        st = pid > 0 ? waitpid(pid) : -1;
+        check("noident-sigframe-low-rsp-killed",
+              st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == 17, st);
+        /* RFLAGS.AC=1 on entry: the kernel clears it (SMAP_CLAC) and the
+         * uaccess primitives still copy correctly. */
+        char sb[256];
+        unsigned long fl;
+        __asm__ volatile("pushfq; orq $0x40000, (%%rsp); popfq; pushfq; popq %0"
+                         : "=r"(fl) :: "cc", "memory");
+        long r = sc(SYS_STAT, (long)"/", (long)sb, 0, 0);
+        __asm__ volatile("pushfq; andq $~0x40000, (%%rsp); popfq" ::: "cc", "memory");
+        check("smap-entry-with-ac-set", r == 0 && (fl & 0x40000), r);
     }
 
     /* --- the three triggers found by the syscall fuzzer --- */

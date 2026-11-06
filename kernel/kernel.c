@@ -1537,7 +1537,37 @@ static void kernel_main_phase2(void) {
     vmm_audit_wx();
 #endif
 
+    // [M44] Retire the boot low identity map: from here on the kernel reaches
+    // physical memory only through the physmap and its high-half image. (The
+    // W^X audit above still inspected it, while it was live.)
+    vmm_drop_low_identity();
+
     heap_init();
+    {   // [M44] A user address space never carries a kernel lower-half mapping.
+        vmm_space_t* probe = vmm_space_create_user();
+        int n = probe ? vmm_space_low_kernel_entries(probe) : -1;
+        if (probe) vmm_space_destroy(probe);
+        debugcon_writestring(n == 0 ? "[IDMAP] user CR3 audit: no low kernel mappings (OK)\n"
+                                    : "[IDMAP] user CR3 audit: FAIL (low kernel mappings present)\n");
+    }
+#ifdef SMAP_VIOLATION_DEMO
+    {   // [M44] Selftest hook: a deliberate direct kernel read of a user page
+        // (AC=0, outside the uaccess primitives) must panic with [SMAP].
+        extern int g_smap_enabled;
+        vmm_space_t* sp = vmm_space_create_user();
+        if (g_smap_enabled && sp &&
+            vmm_alloc_page_in_space(sp, USER_CODE_BASE, VMM_FLAG_USER | VMM_FLAG_NOEXEC) == 0) {
+            debugcon_writestring("[SMAP-DEMO] direct kernel read of a user page...\n");
+            vmm_switch_space(sp);
+            volatile uint8_t v = *(volatile uint8_t*)USER_CODE_BASE;
+            (void)v;
+            vmm_switch_space(vmm_get_kernel_space());
+            debugcon_writestring("[SMAP-DEMO] FAIL: the access did not fault\n");
+        } else {
+            debugcon_writestring("[SMAP-DEMO] skipped: SMAP not enabled on this CPU\n");
+        }
+    }
+#endif
     sched_init();
     driver_registry_init();
     { extern void ipc_init(void); ipc_init(); }  // [M13] kernel IPC channels
@@ -2199,7 +2229,7 @@ static void kernel_main_phase2(void) {
             fb_finalize_mapping();
             framebuffer_info_t info;
             if (fb_get_info(&info)) {
-                uint64_t base = info.virt_addr ? info.virt_addr : info.addr;
+                uint64_t base = info.virt_addr;   // [M44] physmap VA (fb_finalize_mapping)
                 volatile uint32_t* p = (uint32_t*)base;
                 p[0]=0x0000FF; p[1]=0x00FF00; p[2]=0xFF0000;
                 if (terminal_try_enable_fb()) {
@@ -2317,15 +2347,16 @@ void cpu_enable_mitigations(void) {
     int smep = (b & (1u << 7))  ? 1 : 0;
     int smap = (b & (1u << 20)) ? 1 : 0;
     if (smep) cr4 |= (1UL << 20);             // CPUID.7:EBX.SMEP -> CR4.SMEP
-#ifdef SECOS_SMAP
-    /* SMAP is opt-in: enabling it system-wide requires every syscall that passes
-     * a user pointer into deep kernel code (e.g. SYS_OPEN -> vfs_lookup) to copy
-     * the buffer in first. The user_copy primitives already bracket their access
-     * with stac/clac; the full path audit is the remaining work. */
+#ifndef SECOS_NO_SMAP
+    /* [M44] SMAP is on by default whenever the CPU has it: a kernel access to a
+     * user page is legal only inside the uaccess primitives (mm/user_copy.c),
+     * which bracket it with stac/clac. Every kernel entry clears AC
+     * (SMAP_CLAC in arch/x86/*.asm), and a stray access panics with [SMAP]
+     * (kernel/panic.c). Opt out with -DSECOS_NO_SMAP. */
     if (smap) cr4 |= (1UL << 21);             // CPUID.7:EBX.SMAP -> CR4.SMAP
 #endif
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
-#ifdef SECOS_SMAP
+#ifndef SECOS_NO_SMAP
     if (smap) { g_smap_enabled = 1; __asm__ volatile("clac"); }
 #endif
     // CR0.WP: make ring-0 writes honour read-only PTEs. Without it a kernel
@@ -2344,8 +2375,15 @@ void cpu_enable_mitigations(void) {
     debugcon_writestring("[M36] mitigations: SMEP=");
     debugcon_writestring(smep ? "on" : "n/a");
     debugcon_writestring(" SMAP=");
-    debugcon_writestring(g_smap_enabled ? "on" : (smap ? "available(opt-in)" : "n/a"));
+    debugcon_writestring(g_smap_enabled ? "on" : (smap ? "off(SECOS_NO_SMAP)" : "n/a"));
     debugcon_writestring(" stack-canary=on WP=on\n");
+    static int smap_logged = 0;           // once (BSP); APs repeat the CR4 setup only
+    if (!smap_logged) {
+        smap_logged = 1;
+        debugcon_writestring(g_smap_enabled ? "[SMAP] enabled: kernel user access only via uaccess (stac/clac)\n"
+                             : (smap ? "[SMAP] supported but disabled (SECOS_NO_SMAP)\n"
+                                     : "[SMAP] not supported by this CPU (fallback: no SMAP)\n"));
+    }
 }
 
 // [M37] Measured boot. Compute a SHA-256 over the immutable kernel image
@@ -2442,6 +2480,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // Moved before tss_init so that vmm_map() in tss_init uses physmap-aware
     // page table walks.  Interrupts are disabled; no IDT/TSS needed yet.
     vmm_init_physmap();
+    // [M44] The VGA text buffer moves from the identity map to the physmap.
+    { extern void terminal_relocate_vga(void); terminal_relocate_vga(); }
 
     // Step 4: Allocate new kernel stack (16KB + guard pages) in dedicated VA region
     uint64_t new_rsp = vmm_alloc_kernel_stack();

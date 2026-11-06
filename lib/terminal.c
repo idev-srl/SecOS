@@ -12,11 +12,20 @@
 #include "fb_console.h"
 #include "serial.h"
 #include "vt.h"
+#include "vmm.h"   /* [M44] phys_to_virt for the VGA text buffer */
 #include <stddef.h>
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
 #define VGA_MEMORY 0xB8000
 static uint8_t terminal_color; static uint16_t* terminal_buffer;
+/* [M44] The VGA text buffer is physical 0xB8000. Before the physmap exists it
+ * is reached through the boot identity map; afterwards (the identity map is
+ * retired) only through the physmap. */
+static uint16_t* vga_mem(void){
+	if (vmm_physmap_ready()) return (uint16_t*)phys_to_virt(VGA_MEMORY);
+	return (uint16_t*)VGA_MEMORY;
+}
+void terminal_relocate_vga(void){ if (terminal_buffer) terminal_buffer = vga_mem(); }
 static inline void outb(uint16_t port,uint8_t value){ __asm__ volatile("outb %0, %1"::"a"(value),"Nd"(port)); }
 static void vga_set_hw_cursor(int x, int y){ uint16_t pos=(uint16_t)(y * VGA_WIDTH + x); outb(0x3D4,0x0F); outb(0x3D5,(uint8_t)(pos & 0xFF)); outb(0x3D4,0x0E); outb(0x3D5,(uint8_t)((pos>>8)&0xFF)); }
 static void enable_cursor(void){ outb(0x3D4,0x0A); outb(0x3D5,0x0E); outb(0x3D4,0x0B); outb(0x3D5,0x0F); }
@@ -97,7 +106,7 @@ void terminal_initialize(void){
 	}
 #endif
 	if (!use_fb_console) {
-		terminal_buffer=(uint16_t*)VGA_MEMORY;
+		terminal_buffer=vga_mem();
 		for(size_t y=0;y<VGA_HEIGHT;y++) for(size_t x=0;x<VGA_WIDTH;x++) terminal_buffer[y*VGA_WIDTH + x]= vga_entry(' ',terminal_color);
 		vt_set_colors(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 		vt_attach(&vga_vt_ops, VGA_WIDTH, VGA_HEIGHT);

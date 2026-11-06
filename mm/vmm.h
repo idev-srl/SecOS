@@ -60,14 +60,28 @@ static inline uint64_t virt_to_phys(uint64_t virt) { return (virt >= VMM_PHYSMAP
 // [M12] Translate any kernel-reachable virtual address to physical:
 //   - kernel image (>= KERNEL_VMA_BASE)  -> v - KERNEL_VMA_BASE
 //   - physmap      (>= VMM_PHYSMAP_BASE) -> v - VMM_PHYSMAP_BASE
-//   - otherwise (low identity)           -> v
+//   - otherwise                          -> page-table walk ([M44])
 // Used where a static/kernel pointer must be handed to hardware as a physical
 // address (e.g. virtio DMA descriptors).
+// [M44] Anything else (the M2/M5 kernel-stack region, ...) is resolved by a
+// page-table walk; there is no identity fallback any more (the low identity map
+// is retired after early boot), so a low pointer yields 0, never "itself".
+uint64_t vmm_kvirt_to_phys_slow(uint64_t v);
 static inline uint64_t kvirt_to_phys(uint64_t v) {
     if (v >= KERNEL_VMA_BASE)  return v - KERNEL_VMA_BASE;
-    if (v >= VMM_PHYSMAP_BASE) return v - VMM_PHYSMAP_BASE;
-    return v;
+    if (v >= VMM_PHYSMAP_BASE && v < VMM_PHYSMAP_BASE + (1ULL << 39)) return v - VMM_PHYSMAP_BASE;
+    return vmm_kvirt_to_phys_slow(v);
 }
+
+// [M44] 1 once vmm_init_physmap() ran (phys_to_virt is usable).
+int vmm_physmap_ready(void);
+// [M44] Unhook the boot low identity map from the kernel page tables.
+void vmm_drop_low_identity(void);
+// [M44] CR3 (phys, < 4 GB) for the SMP AP trampoline: kernel high half + boot
+// identity map. 0 if unavailable.
+uint64_t vmm_ap_trampoline_cr3(void);
+// [M44] Present lower-half entries outside the user window (must be 0).
+int vmm_space_low_kernel_entries(vmm_space_t* space);
 
 // Initialize VMM on current space (uses existing CR3)
 void vmm_init(void);

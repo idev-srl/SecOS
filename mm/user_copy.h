@@ -8,16 +8,18 @@
  *   Valid user address: [USER_ADDR_MIN, USER_ADDR_MAX)
  *   USER_ADDR_MIN = 0x0000000100000000 — the lowest address any user mapping can
  *     occupy (= vmm.h USER_CODE_BASE, 4 GB). This lower bound is a SECURITY GATE,
- *     not a nicety: every user address space keeps the kernel-only low identity
- *     map (physical 0..512 MB mapped virt==phys, supervisor) live in PML4[0] so
- *     the kernel can reach physical RAM while a user CR3 is loaded. Those pages
- *     are supervisor (ring 3 cannot touch them) but the kernel's OWN accesses in
- *     copy_from/to_user run with CPL 0 and WOULD succeed on them — so a user
- *     pointer below 4 GB handed to a syscall would let the kernel read/write real
- *     physical memory (the kernel image, page tables, …) on the caller's behalf.
- *     Rejecting everything below USER_ADDR_MIN closes that hole. The whole user
- *     layout (code @4 GB, data @8 GB, heap @10 GB, mmap @12 GB, stack @16 GB; see
- *     vmm.h) lives above it, so no legitimate access is lost.
+ *     not a nicety: until M44 every user address space kept the kernel-only low
+ *     identity map (physical 0..512 MB mapped virt==phys, supervisor) live in
+ *     PML4[0]. Those pages were supervisor (ring 3 could not touch them) but the
+ *     kernel's OWN accesses in copy_from/to_user run with CPL 0 and WOULD succeed
+ *     on them — so a user pointer below 4 GB handed to a syscall let the kernel
+ *     read/write real physical memory (the kernel image, page tables, …) on the
+ *     caller's behalf. [M44] User CR3s no longer contain the identity map (and
+ *     the kernel retires it after early boot), so such a pointer now just
+ *     faults; the floor stays as defence in depth (SMAP polices only USER pages,
+ *     not supervisor aliases). The whole user layout (code @4 GB, data @8 GB,
+ *     heap @10 GB, mmap @12 GB, stack @16 GB; see vmm.h) lives above it, so no
+ *     legitimate access is lost.
  *   USER_ADDR_MAX = 0x0000800000000000 — top of x86-64 user canonical range.
  *   NULL (0) is always rejected.
  *
@@ -44,6 +46,10 @@
  * (0..512 MB). Equals vmm.h USER_CODE_BASE (4 GB); kept as a literal so this
  * header stays dependency-free. See the range-policy note above. */
 #define USER_ADDR_MIN  0x0000000100000000ULL
+
+/* [M44] Set by cpu_enable_mitigations() when CR4.SMAP is on (the default when
+ * the CPU supports it; -DSECOS_NO_SMAP opts out). */
+extern int g_smap_enabled;
 
 /* POSIX EFAULT (14) returned on invalid user address. */
 #define EFAULT 14
