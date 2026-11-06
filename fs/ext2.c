@@ -1471,6 +1471,11 @@ static void jt_commit(void){
 }
 
 int ext2_mount(const char* dev_name, const char* mount_point){
+    /* One ext2/ext4 volume at a time (the driver state is global, and
+     * ext2_read_super re-points g_dev before it validates): a second mount,
+     * even a refused one, would hijack the attached volume, the persistent
+     * root included. */
+    if(vfs_mount_point_of(&ext2_ops)) return -1;
     if(ext2_read_super(block_find(dev_name))!=0) return -1;
     jbd2_recover();                                          /* [M27a] replay a dirty journal */
     if(ext2_read_super(block_find(dev_name))!=0) return -1;  /* re-read SB (recovery cleared flags) */
@@ -1483,6 +1488,7 @@ int ext2_mount(const char* dev_name, const char* mount_point){
  * (so a plain ext2 *data* disk is never silently grabbed as the root). Returns 0
  * if mounted as root, -1 otherwise (caller falls back to the ramfs root). */
 int ext2_mount_root(const char* dev_name){
+    if(vfs_mount_point_of(&ext2_ops)) return -1; /* single instance (see ext2_mount) */
     if(ext2_read_super(block_find(dev_name))!=0) return -1;
     jbd2_recover();                              /* [M27a] replay a dirty journal first */
     if(ext2_read_super(block_find(dev_name))!=0) return -1;

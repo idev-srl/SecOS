@@ -656,6 +656,9 @@ static vfs_fs_ops_t fat32_ops = {
 int fat32_mount(const char* dev_name, const char* mount_point){
     block_dev_t* dev = block_find(dev_name);
     if(!dev) return -1;
+    // One FAT32 volume at a time (the driver state is global): a second mount
+    // would re-point the attached volume's g_dev, geometry and inode pool.
+    if(vfs_mount_point_of(&fat32_ops)) return -1;
     // Probe into locals: a rejected device must not clobber the geometry (or
     // g_dev) of a volume that is already mounted.
     static uint8_t bs[SECSZ];
