@@ -106,6 +106,8 @@ SRC_C   = \
 	$(FS_DIR)/block.c \
 	$(FS_DIR)/partition.c \
 	$(FS_DIR)/fat32.c \
+	$(FS_DIR)/exfat.c \
+	$(FS_DIR)/exfat_test.c \
 	$(FS_DIR)/ext2.c \
 	$(FS_DIR)/ext2ramdev.c \
 	$(FS_DIR)/devfs.c \
@@ -626,6 +628,20 @@ disk-ext4:
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 status=none
 	mkfs.ext4 -q -O ^has_journal,^metadata_csum -L SECOSDATA -d /tmp/secos_diskstage $(DISK_IMG)
 	@echo "disk-ext4: $(DISK_IMG) (ext4 no-journal/no-csum, extents+64bit, 64MB, hello.txt)"
+
+# [M41] exFAT data disk built with the real host tools (exfatprogs mkfs.exfat
+# + exfat-fuse in an unprivileged user namespace; fetched on first use without
+# sudo, see tools/exfat-host.sh): long Unicode names, a 3 MiB file, two
+# fragmented files. `make disk-exfat-corrupt` builds the damaged-image suite.
+EXFAT_CORRUPT_DIR = exfat_corrupt
+.PHONY: disk-exfat disk-exfat-corrupt
+disk-exfat:
+	bash tools/exfat-host.sh mkgood $(DISK_IMG)
+	@echo "disk-exfat: $(DISK_IMG) (exFAT, 64MB, hello.txt + long-name/big/fragmented files)"
+disk-exfat-corrupt:
+	rm -rf $(EXFAT_CORRUPT_DIR)
+	bash tools/exfat-host.sh mkcorrupt $(EXFAT_CORRUPT_DIR)
+	@echo "disk-exfat-corrupt: $(EXFAT_CORRUPT_DIR)/{files,geo,csum1,csum2,upcase,rootcycle}.img"
 
 # [M27a] ext4 image with a DIRTY JBD2 journal: a committed transaction rewrites
 # /target.bin from OLD to NEW, pending replay. e2fsck-validated synthetic journal

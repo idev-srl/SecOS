@@ -807,14 +807,19 @@ int ksys_mount(const char* dev, const char* target, const char* fstype){
     extern void* block_find(const char* name);
     extern int fat32_mount(const char*, const char*);
     extern int ext2_mount(const char*, const char*);
+    extern int exfat_mount(const char*, const char*);
     if(!dev||!target||!fstype) return -1;
+    // Accept the devfs spelling ("/dev/vda") as well as the bare block name.
+    if(dev[0]=='/'&&dev[1]=='d'&&dev[2]=='e'&&dev[3]=='v'&&dev[4]=='/') dev += 5;
     if(!block_find(dev)) return -1;                       // no such device
     int isfat = str_eq2(fstype,"fat32")||str_eq2(fstype,"vfat");
     int isext = str_eq2(fstype,"ext2")||str_eq2(fstype,"ext4")||str_eq2(fstype,"extN");
+    int isexf = str_eq2(fstype,"exfat");
     int isauto= str_eq2(fstype,"auto")||fstype[0]==0;
     if(isfat) return fat32_mount(dev,target);
     if(isext) return ext2_mount(dev,target);
-    if(isauto){ if(fat32_mount(dev,target)==0) return 0; return ext2_mount(dev,target); }
+    if(isexf) return exfat_mount(dev,target);
+    if(isauto){ if(fat32_mount(dev,target)==0) return 0; if(ext2_mount(dev,target)==0) return 0; return exfat_mount(dev,target); }
     return -1;                                            // unknown fstype
 }
 void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
@@ -824,6 +829,15 @@ int ksys_umount(const char* target){
     // paths, "" -> cwd), so "/" cannot be reached under another spelling.
     char abs[256];
     proc_resolve_path(sched_get_current(), target, abs, sizeof(abs));
+    // Flush the filesystem before detaching it (exFAT clears VolumeDirty here,
+    // ext2/ext4 closes any open transaction), so a umount leaves it clean.
+    {
+        int n = vfs_mount_count();
+        for(int i=0;i<n;i++){
+            const char* mp=0; const char* fsn=0;
+            if(vfs_mount_info(i,&mp,&fsn)==0 && mp && str_eq2(mp,abs)){ vfs_sync_ops(vfs_mount_ops_at(i)); break; }
+        }
+    }
     return vfs_unmount(abs);
 }
 

@@ -1938,6 +1938,120 @@ else
     make iso >/tmp/secos_selftest_build.log 2>&1   # leave a plain default image behind
 fi
 
+# ---- M41: exFAT read-write (host-made image, SecOS writes, corrupt images) ----
+# The image is made by the real host tools (mkfs.exfat + exfat-fuse, fetched on
+# first use without sudo — tools/exfat-host.sh). SecOS reads the host files
+# (long Unicode names, 3 MiB + fragmented files), writes/mkdirs/unlinks/renames,
+# unmounts cleanly; then the host must find it fsck.exfat-clean, deepcheck-clean
+# and read every file back identically. A second boot attaches six damaged
+# images (AHCI x4 + NVMe + USB): each is refused or fails per object, no fault.
+M41LOG=/tmp/secos_selftest_m41.log
+M41CLOG=/tmp/secos_selftest_m41_corrupt.log
+M41ULOG=/tmp/secos_selftest_m41_user.log
+M41USER=/tmp/secos_selftest_m41_user.ser
+echo "[selftest] Building M41 image (M41_EXFAT_DEMO=1)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA=-DM41_EXFAT_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M41 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+if make disk-exfat >/tmp/secos_selftest_m41_disk.log 2>&1; then
+    echo "[selftest] Running M41 exFAT good-image suite (virtio, 25s)..."
+    : > "$M41LOG"
+    timeout 25 qemu-system-x86_64 -cdrom myos.iso -drive file=disk.img,if=virtio,format=raw -boot d \
+        -debugcon file:"$M41LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
+    grep -q "\[EXFAT\] mounted vda at /mnt (rw)" "$M41LOG"; check "M41 boot auto-mounts the exFAT disk at /mnt" $?
+    for t in "longname read" "case-insensitive lookup" "emoji (surrogate pair) name read" \
+             "big.bin 3MiB host file verify" "frag_a.bin fragmented host file verify" \
+             "create unicode file" "VolumeDirty set while mounted rw" "mkdir" "mkdir+rmdir" \
+             "rmdir non-empty refused" "unlink host file" "rename across dirs" "rename over existing target" \
+             "truncate shrink+grow (zero tail)" "write 2MiB file" "interleaved (fragmenting) writes" \
+             "write beyond VDL zero-fills gap" "directory grows past one cluster (80 creates, 40 unlinks)" \
+             "/proc/mounts lists exfat" "statfs type=exfat" "VolumeDirty cleared on clean unmount" \
+             "persistence after remount"; do
+        grep -qF "[M41] $t: OK" "$M41LOG"; check "M41 $t" $?
+    done
+    n_ok=$(grep -c "^\[M41\] .*: OK$" "$M41LOG" || true); n_bad=$(grep -c "^\[M41\] .*: FAIL$" "$M41LOG" || true)
+    [[ "$n_ok" -ge 38 && "$n_bad" -eq 0 ]]; check "M41 all in-kernel exFAT checks OK (ok=$n_ok fail=$n_bad)" $?
+    grep -q "\[M41\] DONE" "$M41LOG"; check "M41 good-image suite completed" $?
+    ! grep -q "\[EXC\]" "$M41LOG"; check "no CPU exception ([EXC]) during M41 good-image run" $?
+    tools/exfat-host.sh verify disk.img >/tmp/secos_selftest_m41_verify.log 2>&1
+    check "M41 host: fsck.exfat -n + deepcheck clean, VolumeDirty clear, all files read back identically" $?
+    if make disk-exfat-corrupt >/tmp/secos_selftest_m41_disk.log 2>&1; then
+        echo "[selftest] Running M41 exFAT corrupt-image suite (q35, 6 disks, 30s)..."
+        : > "$M41CLOG"
+        C=exfat_corrupt
+        timeout 30 qemu-system-x86_64 -machine q35 -m 256M -cdrom myos.iso -boot d \
+            -drive file=$C/files.img,format=raw,if=ide,index=0 \
+            -drive file=$C/csum1.img,format=raw,if=ide,index=1 \
+            -drive file=$C/csum2.img,format=raw,if=ide,index=3 \
+            -drive file=$C/upcase.img,format=raw,if=ide,index=4 \
+            -drive file=$C/rootcycle.img,if=none,id=nvm,format=raw -device nvme,serial=secos1,drive=nvm \
+            -device qemu-xhci,id=xhci -drive file=$C/geo.img,if=none,id=us,format=raw -device usb-storage,bus=xhci.0,drive=us \
+            -debugcon file:"$M41CLOG" -global isa-debugcon.iobase=0xe9 -no-reboot -no-shutdown -display none
+        sed -n '/dev=sda mount rc=0x0000000000000000/,/dev=sdb/p' "$M41CLOG" | grep -q "ok.txt read=0x0000000000000005"
+        check "M41 corrupt/files: volume mounts, intact file still reads" $?
+        grep -q "oob.txt read=0xFFFFFFFFFFFFFFFF" "$M41CLOG"; check "M41 corrupt/files: out-of-range cluster -> read error" $?
+        grep -q "cycle.bin read=0xFFFFFFFFFFFFFFFF" "$M41CLOG" && grep -q "cycle.bin write=0xFFFFFFFFFFFFFFFF" "$M41CLOG"
+        check "M41 corrupt/files: FAT cycle -> read/write error (no hang)" $?
+        grep -q "badsum.txt visible=0x0000000000000000" "$M41CLOG" && grep -q "badcnt.txt visible=0x0000000000000000" "$M41CLOG"
+        check "M41 corrupt/files: bad SetChecksum / SecondaryCount sets are skipped" $?
+        grep -q "loopdir readdir=0xFFFFFFFFFFFFFFFF" "$M41CLOG"; check "M41 corrupt/files: cyclic directory chain -> readdir error" $?
+        grep -q "main boot region invalid; using backup (read-only)" "$M41CLOG" && \
+            sed -n '/dev=sdb mount rc=0x0000000000000000/,/dev=sdc/p' "$M41CLOG" | grep -q "create rc=0xFFFFFFFFFFFFFFFF"
+        check "M41 corrupt/csum1: main checksum bad -> backup region, read-only" $?
+        grep -q "dev=sdc mount rc=0xFFFFFFFFFFFFFFFF" "$M41CLOG"; check "M41 corrupt/csum2: both boot checksums bad -> refused" $?
+        grep -q "dev=sdd mount rc=0xFFFFFFFFFFFFFFFF" "$M41CLOG" && grep -q "up-case table checksum mismatch" "$M41CLOG"
+        check "M41 corrupt/upcase: up-case checksum bad -> refused" $?
+        grep -q "dev=nvme0n1 mount rc=0xFFFFFFFFFFFFFFFF" "$M41CLOG" && grep -q "root directory chain corrupt or cyclic" "$M41CLOG"
+        check "M41 corrupt/rootcycle: cyclic root chain -> refused" $?
+        grep -q "dev=usb0 mount rc=0xFFFFFFFFFFFFFFFF" "$M41CLOG"; check "M41 corrupt/geo: impossible geometry -> refused" $?
+        grep -q "\[M41C\] DONE (kernel alive)" "$M41CLOG" && ! grep -q "\[EXC\]\|\[PANIC\]" "$M41CLOG"
+        check "M41 corrupt suite: kernel alive, no CPU exception or panic" $?
+        if make -C tools/exfat_fuzz >/dev/null 2>&1; then
+            echo "[selftest] Running exFAT host fuzz (ASan+UBSan, 3000 mutated images)..."
+            timeout 300 tools/exfat_fuzz/exfat_fuzz exfat_corrupt/base.img 3000 41 >/tmp/secos_selftest_m41_fuzz.log 2>&1
+            check "M41 host fuzz: 3000 mutated images, no crash/UB/hang" $?
+        else
+            echo "  [SKIP] M41 host fuzz (gcc with ASan/UBSan unavailable)"
+        fi
+    else
+        echo "  [FAIL] M41 corrupt image build (see /tmp/secos_selftest_m41_disk.log)"; FAIL=$((FAIL+1))
+    fi
+    # Userland: BusyBox mount/df/umount over the serial bash, default image.
+    make clean >/dev/null 2>&1 || true
+    if make iso >/tmp/secos_selftest_build.log 2>&1 && make disk-exfat >/tmp/secos_selftest_m41_disk.log 2>&1; then
+        echo "[selftest] Running M41 userland mount -t exfat over serial bash (60s)..."
+        : > "$M41ULOG"
+        ( sleep 28
+          printf '  umount /mnt; mkdir -p /x; mount -t exfat /dev/vda /x && echo MX1-$(cat /x/hello.txt)\r'; sleep 4
+          printf '  echo MX2-$(grep -c " /x exfat " /proc/mounts)\r'; sleep 3
+          printf '  df | grep /x | sed s/^/MX3-/\r'; sleep 3
+          printf '  cat /x/Relazione* | sed s/^/MX4-/\r'; sleep 3
+          printf '  echo from-bash > /x/bash_wrote.txt; mkdir /x/bdir && mv /x/bash_wrote.txt /x/bdir/ && echo MX5-$(cat /x/bdir/bash_wrote.txt)\r'; sleep 4
+          printf '  umount /x && echo MX6-$(grep -c exfat /proc/mounts)\r'; sleep 3
+          printf '  mount -t exfat /dev/vda /x && echo MX7-$(cat /x/bdir/bash_wrote.txt) && umount /x\r'; sleep 4
+        ) | timeout 60 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+            -drive file=disk.img,if=virtio,format=raw \
+            -debugcon file:"$M41ULOG" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -serial stdio >"$M41USER" 2>&1
+        grep -q "^MX1-hello from disk" "$M41USER"; check "M41 user: mount -t exfat /dev/vda /x (BusyBox, SYS_MOUNT)" $?
+        grep -q "^MX2-1" "$M41USER"; check "M41 user: /proc/mounts shows the exfat mount" $?
+        grep -q "^MX3-/dev/vda .* /x" "$M41USER"; check "M41 user: df lists the exfat mount" $?
+        grep -q "^MX4-Il documento" "$M41USER"; check "M41 user: bash reads a long Unicode name" $?
+        grep -q "^MX5-from-bash" "$M41USER" && grep -q "^MX6-0" "$M41USER" && grep -q "^MX7-from-bash" "$M41USER"
+        check "M41 user: write + mkdir + mv, umount, remount persists" $?
+        tools/exfat-host.sh fsck disk.img >/dev/null 2>&1 && python3 -I tools/exfat_img.py deepcheck disk.img >/dev/null 2>&1 \
+            && [[ "$(python3 -I tools/exfat_img.py dirty disk.img)" == "0" ]]
+        check "M41 user: image fsck/deepcheck-clean and VolumeDirty clear after umount" $?
+    else
+        echo "  [FAIL] M41 userland image build"; FAIL=$((FAIL+1))
+    fi
+else
+    echo "  [FAIL] M41 disk-exfat build (exfatprogs/exfat-fuse fetch failed? see /tmp/secos_selftest_m41_disk.log)"
+    FAIL=$((FAIL+1))
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
