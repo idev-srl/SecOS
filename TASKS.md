@@ -178,9 +178,11 @@ robustness and the paused real-hardware bring-up — see below.
          checksum, FAT + allocation bitmap, up-case table, directory entry sets with
          name hashes; validated host-side with `fsck.exfat` — **M41**, `fs/exfat.c`,
          `docs/devlog/M41-exfat.md` (open: one volume at a time, TexFAT RO, 4 KiB-sector
-         volumes untested; found on the way: `SYS_MOUNT` hands fat32/ext2 a stack
-         mount-point pointer, `fat32` page-cache staleness on inode-slot reuse,
-         constant `st_dev` breaks `df <path>`);
+         volumes untested). Found on the way and fixed (`fix/mount-hardening`,
+         `docs/devlog/M41-mount-hardening.md`): the VFS now owns mount-point strings
+         (SYS_MOUNT left a dangling stack pointer), fat32 slots are never recycled
+         (stale page-cache reads), per-mount `st_dev`/real `st_ino`, umount -EBUSY,
+         one fat32/ext2 instance at a time;
    - [ ] **NTFS read-only first, read-write later** — probably by porting Linux `ntfs3`
          (GPLv2) through a compat shim, as done for ath9k (`drivers/ath9k_port/`).
 4. [ ] **init / services hardening:** DHCP lease renewal, service dependencies beyond

@@ -222,17 +222,11 @@ All in QEMU, plus the host harness.
 - No locking beyond the block layer (like `fs/fat32.c`); SMP is off by
   default.
 - No POSIX owners or modes on exFAT: ReadOnly ↔ mode 0444, uid/gid ignored.
-- **`df <path>` reports `/` for any non-root mount.** `stat_fill`
-  (`kernel/syscall.c`) uses one constant `st_dev` for every file, so BusyBox
-  cannot match a path to its mount. This is system-wide, not exFAT-specific.
-  `df` without arguments works.
-- Found, not fixed (outside this milestone):
-  - `ksys_mount` passes the kernel stack buffer `ktgt` as the mount point;
-    `fat32_mount`/`ext2_mount` hand that pointer to `vfs_mount`, which
-    stores it, so after `mount -t vfat|ext2 ... /x` from userland the
-    mount-table entry dangles. exFAT copies its mount point.
-  - `fs/fat32.c` has the inode-pointer page-cache staleness that M41 fixed
-    for exFAT.
+- Found outside this milestone and fixed on `fix/mount-hardening`
+  (`docs/devlog/M41-mount-hardening.md`): `df <path>` reported `/` for every
+  mount (one constant `st_dev`); `ksys_mount` handed fat32/ext2 a stack
+  mount-point pointer that the VFS stored; `fs/fat32.c` served stale
+  page-cache data after inode-slot reuse.
 
 ## Files
 
