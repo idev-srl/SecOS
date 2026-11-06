@@ -1778,7 +1778,7 @@ for t in wm-ready term-open client-window client-sandbox-fds client-sandbox-noca
          term-focus-click client-focus-out pty-echo-42 no-key-leak-to-client job-ctrl-c job-ctrl-z job-fg \
          pty-winsize shortcut-next-window client-focus-in client-key client-button no-key-leak-to-term \
          launcher-terminal shortcut-terminal layout-it layout-it-symbols layout-us lvgl-sysmon-ready lvgl-sysmon-pixels \
-         lvgl-sysmon-click close-shortcut drag-move \
+         lvgl-sysmon-click close-shortcut drag-move resize-grip resize-winsize \
          exit-combo exit-message text-console-back bash-after-exit \
          wm2-ready hostile-oob hostile-len hostile-read hostile-early hostile-big hostile-no-oob-pixels \
          hostile-good-client-intact hostile-wm-alive exit-button \

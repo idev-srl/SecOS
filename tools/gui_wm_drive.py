@@ -352,6 +352,18 @@ button(False)
 check("drag-move", wait_for(r"SW-MOVED 1 %d,%d" % (tx + 100, ty + 50), 10, pos) is not None)
 time.sleep(1)
 
+# Resize it with the grip (bottom-right corner): 80x24 -> 60x18, and the shell
+# sees the new size (TIOCSWINSZ -> SIGWINCH -> stty size).
+gx, gy = tx + 100 + 650 - 5, ty + 50 + 419 - 5     # outer 650x419 for 80x24
+pos = len(logtext())
+move(gx, gy); button(True)
+for i in range(1, 5): move(gx - i * 40, gy - i * 24)
+button(False)
+check("resize-grip", wait_for(r"SW-RESIZE 1 60x18", 10, pos) is not None)
+time.sleep(1)
+type_keys("stty size")
+check("resize-winsize", wait_for(r"SW-TTY 1: 18 60", 15, pos) is not None)
+
 # Leave with Ctrl+Alt+Backspace: text console back, bash answers on it.
 pos = len(logtext())
 sendkey("ctrl-alt-backspace")
