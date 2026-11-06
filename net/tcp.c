@@ -20,17 +20,22 @@
  */
 #include "tcp.h"
 #include "debugcon.h"
+#include "heap.h"
 #include "../crypto/csprng.h"
 #include <stddef.h>
 
 extern uint64_t timer_get_ticks(void);
 
 #define IP_PROTO_TCP 6
-#define TCP_MAX_CONN 16
+/* [M47] 64 control blocks (was 16: a few parallel ssh sessions plus a server
+ * and its TIME-WAIT/orphaned closes exhausted the table). The buffers are no
+ * longer static: tcp_alloc() takes them from the kernel heap and conn_free()
+ * returns them, and a listener needs none. */
+#define TCP_MAX_CONN 64
 /* [M25] 64 KiB send/receive buffers. The advertised receive window is
  * min(TCP_RXBUF - rx_len, 65535) — 64 KiB is the largest window expressible
  * without the window-scaling option, so this raises the window/RTT throughput
- * ceiling ~8x over the old 8 KiB. (16 conns * 128 KiB ~= 2 MiB static BSS.) */
+ * ceiling ~8x over the old 8 KiB. */
 #define TCP_RXBUF    65536
 #define TCP_TXBUF    65536
 #define TCP_MSS      1460
@@ -57,8 +62,8 @@ struct tcp_conn {
     uint32_t     iss, snd_una, snd_nxt;
     uint32_t     rcv_nxt;
     uint16_t     snd_wnd;
-    uint8_t      tx[TCP_TXBUF]; uint32_t tx_len;   /* bytes from snd_una onward (unacked+unsent) */
-    uint8_t      rx[TCP_RXBUF]; uint32_t rx_head, rx_len;
+    uint8_t*     tx; uint32_t tx_len;   /* TCP_TXBUF bytes from snd_una onward (unacked+unsent) */
+    uint8_t*     rx; uint32_t rx_head, rx_len;   /* TCP_RXBUF ring */
     uint8_t      fin_pending;          /* user asked to close; send FIN after tx drains */
     uint8_t      fin_sent;             /* our FIN occupies a sequence number */
     uint8_t      reset;                /* peer RST / abort */
@@ -75,11 +80,19 @@ struct tcp_conn {
 
 static struct tcp_conn g_conns[TCP_MAX_CONN];
 
+/* Release a slot and its buffers. */
+static void conn_free(struct tcp_conn* c){
+    if (c->tx) { kfree(c->tx); c->tx = NULL; }
+    if (c->rx) { kfree(c->rx); c->rx = NULL; }
+    c->used = 0;
+    c->state = TCP_CLOSED;
+}
+
 /* A connection reached CLOSED: free the slot unless the socket layer still
  * owns it (an accepted child or an active-open conn stays until released). */
 static void conn_closed(struct tcp_conn* c){
     c->state = TCP_CLOSED;
-    if (c->orphan || (c->listener && !c->accepted)) c->used = 0;
+    if (c->orphan || (c->listener && !c->accepted)) conn_free(c);
 }
 static uint16_t g_eph = 49152;
 static uint8_t  g_seg[1600];           /* TX scratch (header + data) */
@@ -105,11 +118,14 @@ tcp_conn_t* tcp_alloc(void){
     for(int i=0;i<TCP_MAX_CONN;i++) if(!g_conns[i].used){
         struct tcp_conn* c=&g_conns[i];
         for(size_t k=0;k<sizeof(*c);k++) ((uint8_t*)c)[k]=0;
+        c->tx=(uint8_t*)kmalloc(TCP_TXBUF);
+        c->rx=(uint8_t*)kmalloc(TCP_RXBUF);
+        if(!c->tx || !c->rx){ conn_free(c); return NULL; }
         c->used=1; c->state=TCP_CLOSED; return c;
     }
     return NULL;
 }
-void tcp_free(tcp_conn_t* c){ if(c){ c->used=0; c->state=TCP_CLOSED; } }
+void tcp_free(tcp_conn_t* c){ if(c) conn_free(c); }
 
 tcp_state_t tcp_get_state(const tcp_conn_t* c){ return c?c->state:TCP_CLOSED; }
 int tcp_rx_available(const tcp_conn_t* c){ return c?(int)c->rx_len:0; }
@@ -212,6 +228,9 @@ int tcp_start_listen(tcp_conn_t* c, net_dev_t* dev, uint16_t port, int backlog){
             return -1;
     if(backlog<1) backlog=1;
     if(backlog>TCP_MAX_BACKLOG) backlog=TCP_MAX_BACKLOG;
+    /* A listener never carries data: give its buffers back. */
+    if(c->tx){ kfree(c->tx); c->tx=NULL; }
+    if(c->rx){ kfree(c->rx); c->rx=NULL; }
     c->dev=dev; c->local_port=port; c->state=TCP_LISTEN; c->backlog=backlog; return 0;
 }
 
@@ -435,7 +454,7 @@ void tcp_tick(void){
             if(now>=c->tw_deadline) conn_closed(c);
             continue;
         }
-        if(c->orphan && (c->state==TCP_CLOSED || now>=c->orphan_deadline)){ c->used=0; continue; }
+        if(c->orphan && (c->state==TCP_CLOSED || now>=c->orphan_deadline)){ conn_free(c); continue; }
         if(c->state==TCP_CLOSED) continue;
         if(c->state==TCP_SYN_SENT && c->syn_unsent){
             if(now>=c->syn_retry_at){
@@ -529,14 +548,14 @@ void tcp_release(tcp_conn_t* c){
             if(ch->used && ch->listener==c){
                 if(!ch->accepted){
                     if(ch->state!=TCP_CLOSED) tcp_xmit(ch, F_RST|F_ACK, NULL, 0, ch->snd_nxt);
-                    ch->used=0;
+                    conn_free(ch);
                 } else ch->listener=NULL;           /* accepted: owned by its socket now */
             }
         }
-        c->used=0; c->state=TCP_CLOSED;
+        conn_free(c);
         return;
     }
-    if(c->state==TCP_CLOSED || c->state==TCP_SYN_SENT || c->state==TCP_SYN_RCVD){ c->used=0; c->state=TCP_CLOSED; return; }
+    if(c->state==TCP_CLOSED || c->state==TCP_SYN_SENT || c->state==TCP_SYN_RCVD){ conn_free(c); return; }
     c->orphan=1; c->orphan_deadline=timer_get_ticks()+TCP_ORPHAN_MS;
     tcp_start_close(c);
 }

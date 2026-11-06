@@ -41,7 +41,7 @@ extern uint64_t timer_get_ticks(void);
 
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
-#define MAX_SOCK    32
+#define MAX_SOCK    64          /* [M47] was 32 */
 #define SOCK_DGRAM_MAX 1024
 #define SOCK_DQ     6
 
