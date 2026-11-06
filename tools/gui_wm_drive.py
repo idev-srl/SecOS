@@ -173,8 +173,20 @@ if args.demo:
     type_keys("top")
     time.sleep(4)
     mb = re.search(r"SW-PANEL System (\d+),(\d+),(\d+),(\d+)", logtext())
+    p0 = len(logtext())
     if mb: click(int(mb.group(1)) + 10, int(mb.group(2)) + 10)
-    time.sleep(5)
+    ms = wait_for(r"SW-CLIENT-WINDOW \d+ (\d+)x(\d+) at (-?\d+),(-?\d+)", 30, p0)
+    wait_for(r"SYSMON-READY", 30, p0)
+    time.sleep(6)
+    screendump("demo_sysmon")
+    if ms:
+        # LVGL tab bar: click "Processes" (middle third of the bar)
+        sx, sy, sw = int(ms.group(3)) + 1, int(ms.group(4)) + 26, int(ms.group(1))
+        click(sx + sw // 2, sy + 20)
+        time.sleep(3)
+        screendump("demo_sysmon_procs")
+        click(sx + sw // 6, sy + 20)
+        time.sleep(2)
     sendkey("ctrl-alt-c"); time.sleep(3)
     move(W // 2 + 40, H // 2 + 60)
     screendump("demo_desktop")
@@ -306,6 +318,31 @@ if m4:
     pos = len(logtext())
     type_keys("loadkeys us")
     check("layout-us", wait_for(r"SW-LAYOUT us", 15, pos) is not None)
+
+# LVGL client: the System launcher starts /bin/sysmon (LVGL 9.2). It must draw
+# a real UI (many distinct colours: anti-aliased text, arc, chart), react to a
+# click on its "Processes" tab, then close with Ctrl+Alt+W.
+mb = re.search(r"SW-PANEL System (\d+),(\d+),(\d+),(\d+)", logtext())
+pos = len(logtext())
+if mb: click(int(mb.group(1)) + 10, int(mb.group(2)) + 10)
+ms = wait_for(r"SW-CLIENT-WINDOW (\d+) (\d+)x(\d+) at (-?\d+),(-?\d+)", 30, pos)
+check("lvgl-sysmon-ready", wait_for(r"SYSMON-READY 500x400", 30, pos) is not None and ms is not None)
+if ms:
+    time.sleep(5)
+    sx, sy, sw, sh = int(ms.group(4)) + 1, int(ms.group(5)) + 26, int(ms.group(2)), int(ms.group(3))
+    img = screendump("lvgl_overview")
+    cols = set(pixel(img, x, y) for y in range(sy, sy + sh, 3) for x in range(sx, sx + sw, 3))
+    check("lvgl-sysmon-pixels", len(cols) > 40, "colours=%d" % len(cols))
+    area = [(x, y) for y in range(sy + 50, sy + 250, 4) for x in range(sx + 10, sx + sw - 10, 4)]
+    click(sx + sw // 2, sy + 20)                       # the "Processes" tab
+    time.sleep(3)
+    img2 = screendump("lvgl_processes")
+    diff = sum(1 for (x, y) in area if pixel(img, x, y) != pixel(img2, x, y))
+    check("lvgl-sysmon-click", diff > 300, "changed=%d/%d" % (diff, len(area)))
+    p2 = len(logtext())
+    sendkey("ctrl-alt-w")
+    check("close-shortcut", wait_for(r"SW-CLOSE %s\b" % ms.group(1), 10, p2) is not None)
+time.sleep(1)
 
 # Move a window by dragging its title bar.
 pos = len(logtext())
