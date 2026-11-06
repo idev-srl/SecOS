@@ -40,3 +40,4 @@ user/lua.elf
 .keymap.stamp
 .gui-autostart.stamp
 exfat_corrupt/
+tools/exfat_fuzz/exfat_fuzz
