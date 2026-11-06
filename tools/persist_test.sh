@@ -137,18 +137,39 @@ dumpf /etc/dropbear/dropbear_ed25519_host_key "$W/hk1"
 [[ -s "$W/hk1" ]]; ok "boot 1 SSH host key generated on the disk" $?
 [[ "$HK1" != none && -n "$HK1" ]]; ok "boot 1 ssh-keyscan gets the host key ($HK1)" $?
 
+# Make it look like a disk from before permission enforcement: every program
+# in /bin 0644, /tmp 0755. Give user files unusual modes that must survive.
+# (debugfs sif keeps mtime, so the programs still match the manifest.)
+debugfs -R "ls -p /bin" "$IMG" 2>/dev/null | awk -F/ '$3 ~ /^100/ {print $6}' >"$W/binfiles"
+NBIN=$(wc -l <"$W/binfiles")
+{ sed 's|.*|sif "/bin/&" mode 0100644|' "$W/binfiles"
+  echo 'sif /tmp mode 040755'
+  echo 'sif /root/notes.txt mode 0100604'
+  echo 'sif /home/alice mode 040750'; } >"$W/oldmodes.cmds"
+debugfs -w -f "$W/oldmodes.cmds" "$IMG" >/dev/null 2>&1
+[[ "$NBIN" -ge 25 ]] && debugfs -R "stat /bin/bash" "$IMG" 2>/dev/null | grep -q "Mode:  0644"
+ok "old-format disk simulated ($NBIN programs set to 0644, /tmp 0755)" $?
+
 # ---- 2. second boot, same image -------------------------------------------------
 echo "[persist] boot 2 (image A again)..."
 start_vm "$W/a.iso" p2
 waitfor "$PROMPT" 150
 send 'cat /root/notes.txt /home/alice/f.txt; loadkeys; grep -c ssh-ed25519 /root/.ssh/authorized_keys; tail -n1 /etc/inittab; echo M4-$((20+4))'
 waitfor '^M4-24' 30
+send "stat -c 'MODE %a %U:%G %n' /bin/bash /bin/busybox /bin/ls /tmp /root /root/notes.txt /home/alice /etc/shadow; echo M6-\$((20+6))"
+waitfor '^M6-26' 30
 waitfor 'started sshd' 60
 HK2=$(hostkey)
 send 'poweroff'
 stop_vm 90; rc=$?
-grep -aEq "\[SYSROOT\] persistent root: written=0 unchanged=[1-9][0-9]* linked=0 stale_removed=0 configs_created=0 modes_fixed=0 failed=0" "$W/p2.log"
-ok "boot 2 rewrites nothing (all system files unchanged)" $?
+grep -aEq "\[SYSROOT\] persistent root: written=0 unchanged=[1-9][0-9]* linked=0 stale_removed=0 configs_created=0 modes_fixed=$((NBIN+1)) failed=0" "$W/p2.log"
+ok "boot 2 rewrites nothing, fixes exactly the $NBIN program modes + /tmp" $?
+grep -aq "^MODE 755 root:root /bin/bash" "$W/p2.ser" && grep -aq "^MODE 755 root:root /bin/busybox" "$W/p2.ser" && \
+  grep -aq "^MODE 1777 root:root /tmp" "$W/p2.ser" && grep -aEq "^MODE 700 root:root /root.?$" "$W/p2.ser" && \
+  grep -aq "^MODE 600 root:root /etc/shadow" "$W/p2.ser"
+ok "boot 2 system modes standard (programs 0755, /tmp 1777, /root 0700, shadow 0600)" $?
+grep -aq "^MODE 604 root:root /root/notes.txt" "$W/p2.ser" && grep -aq "^MODE 750 root:root /home/alice" "$W/p2.ser"
+ok "boot 2 user file modes untouched (/root/notes.txt 0604, /home/alice 0750)" $?
 grep -aq "^persist-data" "$W/p2.ser" && grep -aq "^hello-alice" "$W/p2.ser"; ok "boot 2 files in /root and /home persisted" $?
 grep -aq "\[KEYMAP\] /etc/vconsole.conf: KEYMAP=it (applied)" "$W/p2.log" && grep -aq "^it" "$W/p2.ser"
 ok "boot 2 keyboard layout restored from /etc/vconsole.conf" $?
@@ -169,7 +190,7 @@ HK3=$(hostkey)
 send 'poweroff'
 stop_vm 90; rc=$?
 grep -aq "\[SYSROOT\] wrote /bin/sysroot_probe" "$W/p3.log" && \
-  grep -aEq "\[SYSROOT\] persistent root: written=1 unchanged=[1-9][0-9]* linked=0 .*failed=0" "$W/p3.log"
+  grep -aEq "\[SYSROOT\] persistent root: written=1 unchanged=[1-9][0-9]* linked=0 .* modes_fixed=0 failed=0" "$W/p3.log"
 ok "boot 3 rewrites exactly the changed program" $?
 grep -aq "\[child\] arg: one" "$W/p3.ser"; ok "boot 3 the upgraded program runs" $?
 grep -aq "\[SSH\] baked authorized_keys installed to /root/.ssh (added=1)" "$W/p3.log" && grep -aEq "^3.?$" "$W/p3.ser"
