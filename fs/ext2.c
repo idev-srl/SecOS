@@ -22,6 +22,7 @@
 #include "debugcon.h"
 #include "heap.h"
 #include "pagecache.h"
+#include "mntopts.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -98,8 +99,10 @@ static int  jt_finish(int r, int ok);                    /* fwd */
 static int g_blk_dead;
 static int g_crash_mode;             /* 0=none, 1=before commit block, 2=after publish */
 void ext2_test_set_crash(int mode){ g_crash_mode=mode; g_blk_dead=0; }
+static int g_ro;                     /* [M46] mounted read-only: nothing is written */
 static int blk_write_direct(uint32_t b, const uint8_t* buf){
     if(g_blk_dead) return 0;         /* write lost to the (simulated) crash */
+    if(g_ro) return -1;              /* never touch a read-only volume */
     return block_write(g_dev, (uint64_t)b*g_sec_per_blk, buf, g_sec_per_blk)==(int)g_sec_per_blk ? 0 : -1;
 }
 static int blk_write(uint32_t b, const uint8_t* buf){
@@ -1339,15 +1342,17 @@ static int e2_statfs(vfs_statfs_t* st){
 /* [M27b] Transaction wrappers: each mutating op runs as one journalled metadata
  * transaction (commit-then-checkpoint on success, atomic rollback on failure).
  * Read-only ops (lookup/readdir/read/readlink) are not wrapped. */
-static int e2j_create(const char* p, const void* d, size_t s){ jt_begin(); int r=e2_create(p,d,s); return jt_finish(r, r==0); }
-static int e2j_mkdir(const char* p){ jt_begin(); int r=e2_mkdir(p); return jt_finish(r, r==0); }
-static int e2j_remove(const char* p){ jt_begin(); int r=e2_remove(p); return jt_finish(r, r==0); }
-static int e2j_rename(const char* o,const char* n){ jt_begin(); int r=e2_rename(o,n); return jt_finish(r, r==0); }
-static int e2j_truncate(const char* p, size_t s){ jt_begin(); int r=e2_truncate(p,s); return jt_finish(r, r==0); }
-static int e2j_setattr(const char* p, const vfs_attr_t* a, unsigned v){ jt_begin(); int r=e2_setattr(p,a,v); return jt_finish(r, r==0); }
-static int e2j_symlink(const char* t, const char* l){ jt_begin(); int r=e2_symlink(t,l); return jt_finish(r, r==0); }
-static int e2j_link(const char* o, const char* n){ jt_begin(); int r=e2_link(o,n); return jt_finish(r, r==0); }
-static int e2j_write(vfs_inode_t* v, size_t off, const void* d, size_t l){ jt_begin(); int r=e2_write(v,off,d,l); return jt_finish(r, r>=0); }
+/* [M46] On a read-only mount every change is refused up front with -EROFS. */
+#define E2_RO_CHECK() do { if(g_ro) return -30; } while(0)
+static int e2j_create(const char* p, const void* d, size_t s){ E2_RO_CHECK(); jt_begin(); int r=e2_create(p,d,s); return jt_finish(r, r==0); }
+static int e2j_mkdir(const char* p){ E2_RO_CHECK(); jt_begin(); int r=e2_mkdir(p); return jt_finish(r, r==0); }
+static int e2j_remove(const char* p){ E2_RO_CHECK(); jt_begin(); int r=e2_remove(p); return jt_finish(r, r==0); }
+static int e2j_rename(const char* o,const char* n){ E2_RO_CHECK(); jt_begin(); int r=e2_rename(o,n); return jt_finish(r, r==0); }
+static int e2j_truncate(const char* p, size_t s){ E2_RO_CHECK(); jt_begin(); int r=e2_truncate(p,s); return jt_finish(r, r==0); }
+static int e2j_setattr(const char* p, const vfs_attr_t* a, unsigned v){ E2_RO_CHECK(); jt_begin(); int r=e2_setattr(p,a,v); return jt_finish(r, r==0); }
+static int e2j_symlink(const char* t, const char* l){ E2_RO_CHECK(); jt_begin(); int r=e2_symlink(t,l); return jt_finish(r, r==0); }
+static int e2j_link(const char* o, const char* n){ E2_RO_CHECK(); jt_begin(); int r=e2_link(o,n); return jt_finish(r, r==0); }
+static int e2j_write(vfs_inode_t* v, size_t off, const void* d, size_t l){ E2_RO_CHECK(); jt_begin(); int r=e2_write(v,off,d,l); return jt_finish(r, r>=0); }
 
 /* Orderly shutdown / sync. Every mutating op already runs as one committed and
  * checkpointed transaction (or writes directly on a journal-less volume), so
@@ -1355,6 +1360,7 @@ static int e2j_write(vfs_inode_t* v, size_t off, const void* d, size_t l){ jt_be
 static int g_jdirty;                 /* (defined with the journal code) */
 static void e2_sb_set_recover(int on);
 static int e2_sync(void){
+    if(g_ro) return 0;                   /* [M46] nothing was changed */
     if(g_jt_active) jt_commit();
     /* Every transaction is checkpointed and retired: the journal is empty, so
      * the volume is clean until the next transaction sets the flag again. */
@@ -1370,12 +1376,13 @@ static int e2_mntinfo(const char** src, const char** type){
     return 0;
 }
 
+static int e2_remount(int ro);
 static vfs_fs_ops_t ext2_ops = {
     .lookup=e2_lookup, .readdir=e2_readdir, .read=e2_read, .write=e2j_write,
     .create=e2j_create, .mkdir=e2j_mkdir, .remove=e2j_remove, .rename=e2j_rename,
     .truncate=e2j_truncate, .setattr=e2j_setattr,
     .readlink=e2_readlink, .symlink=e2j_symlink, .sync=e2_sync,
-    .link=e2j_link, .statfs=e2_statfs, .mntinfo=e2_mntinfo
+    .link=e2j_link, .statfs=e2_statfs, .mntinfo=e2_mntinfo, .remount=e2_remount
 };
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */
@@ -1815,13 +1822,59 @@ static void jt_commit(void){
  * at another device. */
 static int e2_busy(void){ return vfs_mount_point_of(&ext2_ops)!=NULL; }
 
+/* [M46] Options of the next ext2_mount (mount(2) data): "ro" / "rw" /
+ * "defaults", and "noload" / "norecovery" (ro only: do not replay the journal).
+ * Like Linux, a plain read-only mount still replays a dirty journal (the only
+ * write it makes): the committed transactions are part of the filesystem, and
+ * reading it without them would show a stale, possibly inconsistent tree.
+ * The FAT-style owner options (uid=, umask=, ...) are accepted and ignored:
+ * ext2/ext4 keep real owners. Returns 0, or -1 for a malformed list. */
+static int g_e2opt_ro, g_e2opt_noload;
+static int g_noload_dirty;           /* mounted noload with a journal left unreplayed */
+static int e2_opt_tok(const char** pp, const char* k){
+    const char* p = *pp;
+    while(*k){ if(*p != *k) return 0; p++; k++; }
+    if(*p && *p != ',') return 0;
+    *pp = p; return 1;
+}
+int ext2_set_mount_options(const char* opts){
+    char rest[128]; size_t n = 0;
+    int ro = 0, noload = 0;
+    const char* p = opts ? opts : "";
+    while(*p){
+        if(e2_opt_tok(&p, "noload") || e2_opt_tok(&p, "norecovery")) noload = 1;
+        else {                              /* anything else: the shared parser */
+            if(n) rest[n++] = ',';
+            while(*p && *p != ','){ if(n >= sizeof(rest) - 2) return -1; rest[n++] = *p++; }
+        }
+        if(*p == ',') p++;
+    }
+    rest[n] = 0;
+    mntopts_t o;
+    if(mntopts_parse(rest, &o) != 0) return -1;
+    ro = o.ro;
+    if(noload && !ro) return -1;            /* noload needs ro (Linux: same) */
+    g_e2opt_ro = ro; g_e2opt_noload = noload;
+    return 0;
+}
+
 /* Validate, replay the journal, re-validate and capture the journal geometry.
  * Returns 0, -1 (no ext superblock) or -3 (refused; g_reject says why). */
 static int e2_open_volume(const char* dev_name){
     block_dev_t* dev=block_find(dev_name);
+    g_ro = 0;                            /* reads/replay below must not be refused */
     int r=ext2_read_super(dev);
     if(r!=0) return r;
-    if(jbd2_recover()<0){ g_reject="journal recovery failed (corrupt journal)"; g_mounted=0; return -3; }  /* [M27a] */
+    g_noload_dirty = 0;
+    if(g_e2opt_noload){                  /* [M46] ro,noload: leave the journal alone */
+        uint8_t sbsec[1024];
+        if(block_read(g_dev, 2, sbsec, 2)==2 && (rd32(sbsec+96) & 0x4u)){
+            g_noload_dirty = 1;
+            debugcon_writestring("[EXT2] noload: journal NOT replayed (needs recovery; read-only view may be stale)\n");
+        }
+    } else if(jbd2_recover()<0){                         /* [M27a] */
+        g_reject="journal recovery failed (corrupt journal)"; g_mounted=0; return -3;
+    }
     r=ext2_read_super(dev);                              /* re-read SB (recovery cleared flags) */
     if(r!=0) return r;
     jt_init();                                           /* [M27b] capture journal geometry */
@@ -1833,7 +1886,13 @@ int ext2_mount(const char* dev_name, const char* mount_point){
     int r=e2_open_volume(dev_name);
     if(r==-3){ debugcon_writestring("[EXT2] refusing "); debugcon_writestring(dev_name);
                debugcon_writestring(": "); debugcon_writestring(g_reject); debugcon_writestring("\n"); }
+    int want_ro = g_e2opt_ro;
+    g_e2opt_ro = 0; g_e2opt_noload = 0;  /* options are for this mount only */
     if(r!=0) return -1;
+    /* [M46] -o ro, or a device without a write path: read-only from here on. */
+    g_ro = (want_ro || !g_dev || !g_dev->write) ? 1 : 0;
+    ext2_ops.flags = g_ro ? VFS_FS_RDONLY : 0;
+    if(g_ro) debugcon_writestring("[EXT2] mounted read-only\n");
     return vfs_mount(mount_point, &ext2_ops, "ext2");
 }
 
@@ -1844,16 +1903,42 @@ int ext2_mount(const char* dev_name, const char* mount_point){
  * filesystem, -2 for an ext volume without the marker (a data disk), and -3 for
  * an ext volume this driver refuses (unsupported features, bad checksums,
  * errors, corrupt journal: ext2_last_error() says why). Nothing is written
- * unless the volume passes validation; nothing is ever formatted. */
+ * unless the volume passes validation; nothing is ever formatted.
+ * [M46] The marker is looked up BEFORE the journal is replayed, so probing a
+ * data disk at boot writes nothing to it (its journal stays for the mount
+ * that actually uses it, e.g. a later `mount -o ro,noload`). The marker is
+ * made with the disk and never rewritten, so the unreplayed tree has it. */
 int ext2_mount_root(const char* dev_name){
     if(e2_busy()) return -1;
-    int r=e2_open_volume(dev_name);
+    g_ro=0; g_e2opt_noload=0;
+    int r=ext2_read_super(block_find(dev_name));
     if(r!=0) return r;
     g_vused=0;
     if(!e2_lookup("/.secosroot")) return -2;     /* ext2 but not a SecOS root */
+    g_vused=0;
+    r=e2_open_volume(dev_name);                  /* now replay + re-validate */
+    if(r!=0) return r;
     g_vused=0;
     return vfs_mount_root(&ext2_ops, "ext2")==0 ? 0 : -3;
 }
 
 /* Boot report: does the mounted volume carry metadata checksums? */
 int ext2_has_csum(void){ return g_mounted && g_csum; }
+
+/* [M46] mount -o remount,ro|rw. Every metadata transaction is committed and
+ * checkpointed when its operation returns, so going read-only only has to
+ * retire the journal (e2_sync). Going read-write needs a writable device and a
+ * replayed journal (a noload mount must be unmounted and mounted again). */
+static int e2_remount(int ro){
+    if(!g_mounted) return -22;
+    if(ro){
+        if(!g_ro) e2_sync();
+        g_ro = 1;
+    } else {
+        if(!g_dev || !g_dev->write || g_noload_dirty) return -30;
+        g_ro = 0;
+    }
+    ext2_ops.flags = g_ro ? VFS_FS_RDONLY : 0;
+    debugcon_writestring(g_ro ? "[EXT2] remounted read-only\n" : "[EXT2] remounted read-write\n");
+    return 0;
+}

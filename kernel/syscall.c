@@ -950,8 +950,44 @@ int ksys_unlink(const char* path){
 // "fat32"/"vfat" -> FAT32; "ext2"/"ext4"/"extN" -> ext driver; "exfat";
 // "ntfs" (read-only); "auto"/"" -> try them in that order. Root only [M43].
 // `opts` = mount(2) data: uid=,gid=,umask=,dmask=,fmask= for the FSes that
-// keep no owners (fs/mntopts.h).
+// keep no owners (fs/mntopts.h); "ro"/"rw" for every FS (NTFS is always ro);
+// ext2/ext4 also "noload" (ro without journal replay). [M46] A "remount"
+// token switches the volume already mounted at `target` between ro and rw
+// (FAT32, ext2/ext4: other FSes have no remount hook -> EINVAL).
 static int str_eq2(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
+// Remove every whole-word `tok` from the comma list `s` (in place); 1 if found.
+static int mnt_take_opt(char* s, const char* tok){
+    int found = 0; char* w = s; const char* r = s;
+    while(*r){
+        const char* e = r; while(*e && *e != ',') e++;
+        int n = (int)(e - r), k = 0;
+        while(tok[k] && k < n && r[k] == tok[k]) k++;
+        if(!tok[k] && k == n) found = 1;
+        else { if(w != s) *w++ = ','; for(int i = 0; i < n; i++) *w++ = r[i]; }
+        r = *e ? e + 1 : e;
+    }
+    *w = 0;
+    return found;
+}
+static int ksys_remount(const char* target, const char* opts){
+    char abs[256];
+    proc_resolve_path(sched_get_current(), target, abs, sizeof(abs));
+    const vfs_fs_ops_t* ops = NULL;
+    int n = vfs_mount_count();
+    for(int i=0;i<n;i++){
+        const char* mp=0; const char* fsn=0;
+        if(vfs_mount_info(i,&mp,&fsn)==0 && mp && str_eq2(mp,abs)){ ops = vfs_mount_ops_at(i); break; }
+    }
+    if(!ops) return -CRED_EINVAL;                         // not a mount point
+    char o[128]; int i = 0;
+    for(; opts[i] && i < (int)sizeof(o) - 1; i++) o[i] = opts[i];
+    o[i] = 0;
+    int ro = mnt_take_opt(o, "ro"), rw = mnt_take_opt(o, "rw");
+    mnt_take_opt(o, "defaults");
+    (void)rw;                                             // the other options are left as they are
+    if(!ops->remount) return -CRED_EINVAL;
+    return ops->remount(ro);
+}
 int ksys_mount_opts(const char* dev, const char* target, const char* fstype, const char* opts){
     extern void* block_find(const char* name);
     extern int fat32_mount(const char*, const char*);
@@ -960,6 +996,12 @@ int ksys_mount_opts(const char* dev, const char* target, const char* fstype, con
     extern int ntfs_mount(const char*, const char*);
     if(!dev||!target||!fstype) return -1;
     if(!cred_is_root(sched_get_current())) return -CRED_EPERM;   // [M43] root only
+    {   // [M46] mount -o remount,...: no device / fstype needed.
+        char o[128]; int i = 0;
+        for(; opts && opts[i] && i < (int)sizeof(o) - 1; i++) o[i] = opts[i];
+        o[i] = 0;
+        if(mnt_take_opt(o, "remount")) return ksys_remount(target, o);
+    }
     // Accept the devfs spelling ("/dev/vda") as well as the bare block name.
     if(dev[0]=='/'&&dev[1]=='d'&&dev[2]=='e'&&dev[3]=='v'&&dev[4]=='/') dev += 5;
     if(!block_find(dev)) return -1;                       // no such device
@@ -975,7 +1017,13 @@ int ksys_mount_opts(const char* dev, const char* target, const char* fstype, con
     int isntfs= str_eq2(fstype,"ntfs")||str_eq2(fstype,"ntfs3")||str_eq2(fstype,"ntfs-3g");  // [M42] read-only
     int isauto= str_eq2(fstype,"auto")||fstype[0]==0;
     extern int fat32_set_mount_options(const char* opts);
-    if(isext) return ext2_mount(dev,target);
+    extern int ext2_set_mount_options(const char* opts);
+    if(isext){                                            // [M46] ro / noload
+        if(ext2_set_mount_options(opts)!=0) return -CRED_EINVAL;
+        int er = ext2_mount(dev,target);
+        ext2_set_mount_options("");
+        return er;
+    }
     // Owner/mode options of FAT32/exFAT/NTFS (fs/mntopts.h); ext2/ext4 keep
     // real owners and ignore them. A malformed option list is -EINVAL.
     extern int exfat_set_mount_options(const char* opts);
@@ -986,12 +1034,13 @@ int ksys_mount_opts(const char* dev, const char* target, const char* fstype, con
     else if(isntfs){ if(ntfs_set_mount_options(opts)!=0) return -CRED_EINVAL; r = ntfs_mount(dev,target); }
     else if(isauto){
         if(fat32_set_mount_options(opts)==0 && fat32_mount(dev,target)==0) r = 0;
-        else if(ext2_mount(dev,target)==0) r = 0;
+        else if(ext2_set_mount_options(opts)==0 && ext2_mount(dev,target)==0) r = 0;
         else if(exfat_set_mount_options(opts)==0 && exfat_mount(dev,target)==0) r = 0;
         else if(ntfs_set_mount_options(opts)==0) r = ntfs_mount(dev,target);
     }
     // A refused mount must not leave its options for the next one.
     fat32_set_mount_options(""); exfat_set_mount_options(""); ntfs_set_mount_options("");
+    ext2_set_mount_options("");
     if(isfat || isexf || isntfs || isauto) return r;
     return -1;                                            // unknown fstype
 }

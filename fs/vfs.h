@@ -68,8 +68,9 @@ typedef void (*vfs_iter_cb)(const vfs_inode_t* child, void* user);
 // are generated/dynamic (devfs, procfs, sysfs) set VFS_FS_NOCACHE so reads go
 // straight to ->read() instead of through the unified page cache.
 #define VFS_FS_NOCACHE 0x1
-// Read-only filesystem (e.g. NTFS): open() for writing / O_TRUNC / O_CREAT
-// fails with -EROFS and /proc/mounts shows "ro".
+// Read-only filesystem (e.g. NTFS, or FAT32/ext2 mounted with -o ro): open()
+// for writing / O_TRUNC / O_CREAT fails with -EROFS and /proc/mounts shows
+// "ro". A driver that supports `mount -o ro` sets/clears it on its own ops.
 #define VFS_FS_RDONLY  0x2
 
 // Filesystem operations interface (per mounted FS root)
@@ -113,6 +114,9 @@ typedef struct vfs_fs_ops {
     // Mount-table info for /proc/mounts: backing device name + filesystem type
     // ("ext4", "vfat", ...). NULL = virtual FS (the mount's fs name is used).
     int (*mntinfo)(const char** source, const char** fstype);
+    // [M46] mount -o remount,ro|rw: switch the mounted volume. 0 or -errno
+    // (-EROFS: the device or the volume cannot be written). NULL = unsupported.
+    int (*remount)(int ro);
 } vfs_fs_ops_t;
 
 // Mount record (single root for now)
