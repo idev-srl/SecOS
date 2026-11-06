@@ -15,7 +15,7 @@
 #include <stddef.h>
 
 #define PIPE_SIZE PIPE_BUF
-#define PIPE_MAX  16
+#define PIPE_MAX  64      /* 16 ran out with four parallel ssh exec sessions (3 pipes each) */
 
 struct pipe {
     int      used;

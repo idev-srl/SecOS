@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: MIT
  *
  * Sends a single recursive A query to dev->dns and parses the first A answer.
- * Synchronous from the shell/idle context (same hlt-driven RX as DHCP). No
+ * Synchronous from the shell/idle context (same hlt-driven RX as DHCP); takes
+ * the stack lock for each step, never across the wait. No
  * caching, no CNAME chasing beyond what the resolver flattens, IPv4 only.
  */
 #include "udp.h"
@@ -19,8 +20,6 @@ struct dns_state {
     volatile int got;
     uint32_t ip;          /* resolved A record, network-order octets, 0 = none */
 };
-
-static uint8_t g_query[300];
 
 static uint32_t rd32be(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
@@ -97,30 +96,43 @@ int dns_resolve(net_dev_t* dev, const char* name, uint32_t* out_ip) {
     struct dns_state st;
     st.id = (uint16_t)(timer_get_ticks() ^ 0x5EC0); st.got = 0; st.ip = 0;
 
-    uint8_t* q = g_query;
+    uint8_t qbuf[300];                                /* [M47] per call, not a shared static */
+    uint8_t* q = qbuf;
     q[0]=(uint8_t)(st.id>>8); q[1]=(uint8_t)st.id;
     q[2]=0x01; q[3]=0x00;                             /* RD */
     q[4]=0; q[5]=1;                                   /* QDCOUNT=1 */
     q[6]=0; q[7]=0; q[8]=0; q[9]=0; q[10]=0; q[11]=0;
-    uint32_t n = encode_qname(name, q + 12, sizeof(g_query) - 12 - 4);
+    uint32_t n = encode_qname(name, q + 12, sizeof(qbuf) - 12 - 4);
     if (!n) return -1;
     uint32_t o = 12 + n;
     q[o++]=0; q[o++]=1;                               /* QTYPE = A */
     q[o++]=0; q[o++]=1;                               /* QCLASS = IN */
 
+    /* [M47] dns_cb runs on the RX path under the stack lock and writes 'st'
+     * (on this stack) until the port is unbound, so every access to 'st'
+     * besides the volatile 'got' poll is made under the lock too. */
+    uint64_t fl = net_lock();
     uint16_t port = udp_ephemeral_port();
-    if (udp_bind(port, dns_cb, &st) != 0) return -1;
+    int bound = udp_bind(port, dns_cb, &st);
+    net_unlock(fl);
+    if (bound != 0) return -1;
 
     int resolved = 0;
     for (int attempt = 0; attempt < 3 && !resolved; attempt++) {
+        fl = net_lock();
         st.got = 0;
-        udp_send(dev, dev->dns, port, 53, q, o);
+        udp_output(dev, dev->dns, port, 53, q, o);
+        net_unlock(fl);
         uint64_t deadline = timer_get_ticks() + 1500;
         while (timer_get_ticks() < deadline && !st.got)
             __asm__ volatile ("sti; hlt");
+        fl = net_lock();
         if (st.got && st.ip) resolved = 1;
+        net_unlock(fl);
     }
+    fl = net_lock();
     udp_unbind(port);
+    net_unlock(fl);
 
     if (!resolved) { debugcon_writestring("[DNS] no answer\n"); return -1; }
     *out_ip = st.ip;

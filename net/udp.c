@@ -7,14 +7,15 @@
  * A port-binding table over IPv4. udp_input() (called by ipv4_input via the weak
  * hook) demuxes by destination port to a bound callback; udp_send() prepends the
  * 8-byte header, computes the pseudo-header checksum, and hands the segment to
- * ipv4_send(). The stack is single-threaded (poll/shell context), so the TX
- * scratch and binding table need no locking.
+ * ipv4_send(). [M47] The binding table and the TX scratch are guarded by the
+ * stack lock: every function here expects it held except udp_send(), the
+ * locking wrapper for callers outside the stack (the kernel shell).
  */
 #include "udp.h"
 #include <stddef.h>
 
 #define IP_PROTO_UDP 17
-#define UDP_MAX_BIND 16
+#define UDP_MAX_BIND 64         /* [M47] was 16 (one per UDP socket) */
 
 struct udp_binding { uint16_t port; udp_recv_cb cb; void* ctx; int used; };
 static struct udp_binding g_bind[UDP_MAX_BIND];
@@ -25,6 +26,7 @@ static uint16_t g_ephemeral = 49152;          /* IANA dynamic range start */
 static uint8_t g_csbuf[12 + NET_FRAME_MAX];
 
 int udp_bind(uint16_t port, udp_recv_cb cb, void* ctx) {
+    NET_ASSERT_STACK_LOCKED();
     for (int i = 0; i < UDP_MAX_BIND; i++)
         if (g_bind[i].used && g_bind[i].port == port) return -2;
     for (int i = 0; i < UDP_MAX_BIND; i++)
@@ -70,8 +72,23 @@ void udp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len
     /* no listener: silently drop (ICMP port-unreachable is optional) */
 }
 
+int udp_bind_count(void) {
+    int n = 0;
+    for (int i = 0; i < UDP_MAX_BIND; i++) if (g_bind[i].used) n++;
+    return n;
+}
+
 int udp_send(net_dev_t* dev, uint32_t dst_ip, uint16_t src_port,
              uint16_t dst_port, const void* data, uint32_t len) {
+    uint64_t fl = net_lock();
+    int r = udp_output(dev, dst_ip, src_port, dst_port, data, len);
+    net_unlock(fl);
+    return r;
+}
+
+int udp_output(net_dev_t* dev, uint32_t dst_ip, uint16_t src_port,
+               uint16_t dst_port, const void* data, uint32_t len) {
+    NET_ASSERT_STACK_LOCKED();
     if (!dev) return -1;
     if (len > NET_FRAME_MAX - 12 - 8) return -1;
     uint16_t ulen = (uint16_t)(8 + len);

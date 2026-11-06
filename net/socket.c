@@ -14,9 +14,21 @@
  * Every operation here is non-blocking: "nothing to do yet" returns -EAGAIN and
  * the syscall layer (kernel/syscall_trap.c) turns that into a scheduler sleep +
  * re-run for a blocking descriptor, so a process waiting on the network no
- * longer spins in ring 0 and starves the CPU. tcp_connect() (active open) still
- * spins for its handshake. CAP_NET (signed manifest) is enforced by the syscall
- * dispatcher before socket creation and the socket-specific calls.
+ * longer spins in ring 0 and starves the CPU. [M47] connect() is non-blocking
+ * too: it returns -EINPROGRESS / -EALREADY while the handshake runs (the
+ * syscall layer sleeps + re-runs a blocking connect) and 0 once established.
+ * CAP_NET (signed manifest) is enforced by the syscall dispatcher before
+ * socket creation and the socket-specific calls.
+ *
+ * [M47] Locking: the socket table and every socket's state (including the UDP
+ * datagram ring the RX path fills) are guarded by the stack lock. Each
+ * socket_* entry point takes it for the whole operation; the buffers it is
+ * given are kernel bounce buffers (user copies happen in the syscall layer,
+ * outside the lock). A socket's slot is reused only after its last fd
+ * reference is dropped (socket_unref), and that release unbinds the UDP port
+ * and hands the TCP control block to tcp_release() under the same lock, so the
+ * RX path — which only reaches a socket through a UDP binding or a TCP control
+ * block, both under the lock — can never see a freed or recycled socket.
  */
 #include "socket.h"
 #include "tcp.h"
@@ -25,9 +37,11 @@
 #include "debugcon.h"
 #include <stddef.h>
 
+extern uint64_t timer_get_ticks(void);
+
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
-#define MAX_SOCK    32
+#define MAX_SOCK    64          /* [M47] was 32 */
 #define SOCK_DGRAM_MAX 1024
 #define SOCK_DQ     6
 
@@ -41,6 +55,11 @@
 #define E_ADDRINUSE   (-98)
 #define E_NETDOWN (-100)
 #define E_OPNOTSUPP (-95)
+#define E_ISCONN    (-106)
+#define E_TIMEDOUT  (-110)
+#define E_ALREADY   (-114)
+#define E_INPROGRESS (-115)
+#define SOCK_CONNECT_MS 20000      /* active open gives up after 20 s */
 
 struct dgram { uint32_t ip; uint16_t port; uint16_t len; uint8_t data[SOCK_DGRAM_MAX]; };
 
@@ -52,6 +71,8 @@ struct sock {
     /* TCP */
     tcp_conn_t* tcp;
     int      listening;
+    int      connecting;      /* active open started, not yet reported */
+    uint64_t conn_deadline;
     /* UDP */
     int      udp_bound;
     struct dgram dq[SOCK_DQ];
@@ -60,9 +81,16 @@ struct sock {
     uint16_t peer_port;
 };
 
-static struct sock g_sock[MAX_SOCK];
+static struct sock g_sock[MAX_SOCK];      /* [M47] stack lock */
+
+int sock_count_used(void){
+    int n = 0;
+    for (int i = 0; i < MAX_SOCK; i++) if (g_sock[i].used) n++;
+    return n;
+}
 
 static struct sock* sk(int idx){
+    NET_ASSERT_STACK_LOCKED();
     if (idx < 0 || idx >= MAX_SOCK || !g_sock[idx].used) return NULL;
     return &g_sock[idx];
 }
@@ -80,7 +108,7 @@ static void sock_udp_cb(void* ctx, net_dev_t* dev, uint32_t src_ip,
     s->dq_count++;
 }
 
-int socket_create(int type){
+static int l_create(int type){
     if (type != SOCK_STREAM && type != SOCK_DGRAM) return E_INVAL;
     for (int i = 0; i < MAX_SOCK; i++) if (!g_sock[i].used){
         struct sock* s = &g_sock[i];
@@ -97,8 +125,8 @@ static void sock_release(struct sock* s){
     s->used = 0;
 }
 
-void socket_ref(int idx){ struct sock* s = sk(idx); if (s) s->refs++; }
-void socket_unref(int idx){
+static void l_ref(int idx){ struct sock* s = sk(idx); if (s) s->refs++; }
+static void l_unref(int idx){
     struct sock* s = sk(idx);
     if (!s) return;
     if (--s->refs <= 0) sock_release(s);
@@ -112,7 +140,7 @@ static int udp_autobind(struct sock* s){
     return 0;
 }
 
-int socket_bind(int idx, uint16_t port){
+static int l_bind(int idx, uint16_t port){
     struct sock* s = sk(idx);
     if (!s) return E_BADF;
     if (s->type == SOCK_DGRAM){
@@ -127,7 +155,7 @@ int socket_bind(int idx, uint16_t port){
     return 0;
 }
 
-int socket_connect(int idx, uint32_t ip, uint16_t port){
+static int l_connect(int idx, uint32_t ip, uint16_t port){
     struct sock* s = sk(idx);
     if (!s) return E_BADF;
     net_dev_t* dev = net_primary();
@@ -136,12 +164,32 @@ int socket_connect(int idx, uint32_t ip, uint16_t port){
         s->peer_ip = ip; s->peer_port = port;
         return udp_autobind(s);
     }
-    if (s->tcp) return E_INVAL;
-    s->tcp = tcp_connect(dev, ip, port);            /* blocking handshake (spins) */
-    return s->tcp ? 0 : E_CONNREFUSED;
+    if (s->listening) return E_INVAL;
+    if (!s->tcp) {
+        /* Start the handshake; the caller re-runs connect() to collect it. */
+        s->tcp = tcp_alloc();
+        if (!s->tcp) return E_NOBUFS;
+        if (tcp_start_connect(s->tcp, dev, ip, port) != 0) {
+            tcp_free(s->tcp); s->tcp = NULL;
+            return E_CONNREFUSED;
+        }
+        s->connecting = 1;
+        s->conn_deadline = timer_get_ticks() + SOCK_CONNECT_MS;
+        return E_INPROGRESS;
+    }
+    if (!s->connecting) return E_ISCONN;
+    tcp_state_t st = tcp_get_state(s->tcp);
+    if (st == TCP_ESTABLISHED || st == TCP_CLOSE_WAIT) { s->connecting = 0; return 0; }
+    int reset = tcp_was_reset(s->tcp) || st == TCP_CLOSED;
+    if (reset || timer_get_ticks() >= s->conn_deadline) {
+        tcp_release(s->tcp); s->tcp = NULL;
+        s->connecting = 0;
+        return reset ? E_CONNREFUSED : E_TIMEDOUT;
+    }
+    return E_ALREADY;
 }
 
-int socket_listen(int idx, int backlog){
+static int l_listen(int idx, int backlog){
     struct sock* s = sk(idx);
     if (!s || s->type != SOCK_STREAM) return E_OPNOTSUPP;
     if (s->listening) return 0;
@@ -156,11 +204,11 @@ int socket_listen(int idx, int backlog){
 }
 
 // Non-blocking: a new socket index, or -EAGAIN when no connection is pending.
-int socket_accept(int idx){
+static int l_accept(int idx){
     struct sock* s = sk(idx);
     if (!s || !s->listening) return E_INVAL;
     if (!tcp_accept_pending(s->tcp)) return E_AGAIN;
-    int nidx = socket_create(SOCK_STREAM);
+    int nidx = l_create(SOCK_STREAM);
     if (nidx < 0) return nidx;                      /* leave the child queued */
     tcp_conn_t* ch = tcp_accept_ready(s->tcp);
     if (!ch){ g_sock[nidx].used = 0; return E_AGAIN; }
@@ -170,7 +218,7 @@ int socket_accept(int idx){
 
 // Non-blocking: bytes queued (may be short), -EAGAIN when the send buffer is
 // full, -EPIPE once the connection can no longer carry data.
-int socket_send(int idx, const void* buf, int len){
+static int l_send(int idx, const void* buf, int len){
     struct sock* s = sk(idx);
     if (!s || len < 0) return E_BADF;
     net_dev_t* dev = net_primary();
@@ -186,21 +234,21 @@ int socket_send(int idx, const void* buf, int len){
     }
     if (!s->peer_ip) return E_NOTCONN;
     int r = udp_autobind(s); if (r) return r;
-    return udp_send(dev, s->peer_ip, s->port, s->peer_port, buf, (uint32_t)len) == 0 ? len : E_NOBUFS;
+    return udp_output(dev, s->peer_ip, s->port, s->peer_port, buf, (uint32_t)len) == 0 ? len : E_NOBUFS;
 }
 
-int socket_sendto(int idx, const void* buf, int len, uint32_t ip, uint16_t port){
+static int l_sendto(int idx, const void* buf, int len, uint32_t ip, uint16_t port){
     struct sock* s = sk(idx);
     if (!s || s->type != SOCK_DGRAM || len < 0) return E_INVAL;
     net_dev_t* dev = net_primary();
     if (!dev) return E_NETDOWN;
     int r = udp_autobind(s); if (r) return r;
-    return udp_send(dev, ip, s->port, port, buf, (uint32_t)len) == 0 ? len : E_NOBUFS;
+    return udp_output(dev, ip, s->port, port, buf, (uint32_t)len) == 0 ? len : E_NOBUFS;
 }
 
 // Non-blocking receive. TCP: stream bytes, 0 = EOF (peer closed and drained, or
 // reset). UDP: one datagram, filling *src_ip/*src_port. -EAGAIN = nothing yet.
-int socket_recv(int idx, void* buf, int len, uint32_t* src_ip, uint16_t* src_port){
+static int l_recv(int idx, void* buf, int len, uint32_t* src_ip, uint16_t* src_port){
     struct sock* s = sk(idx);
     if (!s || len <= 0) return E_INVAL;
     if (s->type == SOCK_STREAM){
@@ -225,7 +273,7 @@ int socket_recv(int idx, void* buf, int len, uint32_t* src_ip, uint16_t* src_por
 
 // Readiness for poll()/select(): Linux revents bits, never blocks. `pid` is
 // unused (kept for the kiface poll hook signature; access is via the fd table).
-int socket_poll(uint32_t pid, int idx){
+static int l_poll(uint32_t pid, int idx){
     (void)pid;
     struct sock* s = sk(idx);
     if (!s) return SOCK_POLLNVAL;
@@ -237,6 +285,7 @@ int socket_poll(uint32_t pid, int idx){
     if (!s->tcp) return 0;
     if (s->listening) return tcp_accept_pending(s->tcp) ? SOCK_POLLIN : 0;
     tcp_state_t st = tcp_get_state(s->tcp);
+    if (st == TCP_SYN_SENT) return 0;               /* connect() still running */
     if (tcp_rx_available(s->tcp) > 0) ev |= SOCK_POLLIN;
     if (st == TCP_ESTABLISHED || st == TCP_CLOSE_WAIT){
         if (tcp_tx_space(s->tcp) > 0) ev |= SOCK_POLLOUT;
@@ -250,7 +299,7 @@ int socket_poll(uint32_t pid, int idx){
 }
 
 // getsockname (peer=0) / getpeername (peer=1).
-int socket_name(int idx, int peer, uint32_t* ip, uint16_t* port){
+static int l_name(int idx, int peer, uint32_t* ip, uint16_t* port){
     struct sock* s = sk(idx);
     if (!s) return E_BADF;
     *ip = 0; *port = 0;
@@ -270,3 +319,41 @@ int socket_name(int idx, int peer, uint32_t* ip, uint16_t* port){
     return 0;
 }
 
+
+/* ---- [M47] public entry points: each takes the stack lock for the call ---- */
+int socket_create(int type){
+    uint64_t fl = net_lock(); int r = l_create(type); net_unlock(fl); return r;
+}
+void socket_ref(int idx){
+    uint64_t fl = net_lock(); l_ref(idx); net_unlock(fl);
+}
+void socket_unref(int idx){
+    uint64_t fl = net_lock(); l_unref(idx); net_unlock(fl);
+}
+int socket_bind(int idx, uint16_t port){
+    uint64_t fl = net_lock(); int r = l_bind(idx, port); net_unlock(fl); return r;
+}
+int socket_connect(int idx, uint32_t ip, uint16_t port){
+    uint64_t fl = net_lock(); int r = l_connect(idx, ip, port); net_unlock(fl); return r;
+}
+int socket_listen(int idx, int backlog){
+    uint64_t fl = net_lock(); int r = l_listen(idx, backlog); net_unlock(fl); return r;
+}
+int socket_accept(int idx){
+    uint64_t fl = net_lock(); int r = l_accept(idx); net_unlock(fl); return r;
+}
+int socket_send(int idx, const void* buf, int len){
+    uint64_t fl = net_lock(); int r = l_send(idx, buf, len); net_unlock(fl); return r;
+}
+int socket_sendto(int idx, const void* buf, int len, uint32_t ip, uint16_t port){
+    uint64_t fl = net_lock(); int r = l_sendto(idx, buf, len, ip, port); net_unlock(fl); return r;
+}
+int socket_recv(int idx, void* buf, int len, uint32_t* src_ip, uint16_t* src_port){
+    uint64_t fl = net_lock(); int r = l_recv(idx, buf, len, src_ip, src_port); net_unlock(fl); return r;
+}
+int socket_poll(uint32_t pid, int idx){
+    uint64_t fl = net_lock(); int r = l_poll(pid, idx); net_unlock(fl); return r;
+}
+int socket_name(int idx, int peer, uint32_t* ip, uint16_t* port){
+    uint64_t fl = net_lock(); int r = l_name(idx, peer, ip, port); net_unlock(fl); return r;
+}

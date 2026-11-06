@@ -12,7 +12,7 @@
 #define IP_PROTO_UDP  17
 #define IP_PROTO_TCP  6
 
-static uint16_t g_ip_id = 1;
+static uint16_t g_ip_id = 1;                 /* [M47] both guarded by the stack lock */
 static uint8_t  g_ipbuf[NET_FRAME_MAX];
 
 extern void udp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len) __attribute__((weak));
@@ -38,6 +38,7 @@ void ipv4_input(net_dev_t* dev, const uint8_t* frame, uint32_t len, const uint8_
 }
 
 int ipv4_send(net_dev_t* dev, uint32_t dst_ip, uint8_t proto, const void* payload, uint32_t len) {
+    NET_ASSERT_STACK_LOCKED();
     if (!dev || len > NET_MTU - 20) return -1;
     uint8_t dmac[6];
     // Limited broadcast (255.255.255.255) and the subnet directed broadcast go to

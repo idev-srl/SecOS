@@ -2536,6 +2536,58 @@ else
     check "MUPORTS gate build" 1
 fi
 
+# ============================================================================
+# NETSMP GATE [M47]: network stack locking under SMP. An image built with
+# -DSECOS_SMP_AT_BOOT -DSECOS_LOCKDEP_LITE (lock-order checker on) and a baked
+# throwaway SSH key is driven by tools/net_stress_drive.py three times in
+# parallel: -smp 4 with e1000e (MSI-X NAPI RX), -smp 4 with e1000 (polled RX)
+# and -smp 1 with e1000e. Each run: /bin/netstress client workers (forked,
+# spread over the CPUs) doing TCP echo round trips, firehose connections
+# closed while data arrives, UDP floods and DNS lookups against host peers;
+# /bin/netstress server accepting parallel host connections, a third of them
+# reset mid-transfer; two more ssh sessions in parallel. The socket table, TCP
+# control blocks, UDP bindings and MemFree are compared before/after each
+# round (no leak), and the debugcon log must be free of [LOCKDEP], panics and
+# CPU exceptions. Host ports are random (never 2222/8000).
+# ============================================================================
+if ! command -v ssh >/dev/null 2>&1 || ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "  [SKIP] NETSMP gate (host has no ssh / ssh-keygen)"
+else
+    echo "[selftest] NETSMP gate: net stack stress, -smp 4/1, lockdep (mb2, ~250s)..."
+    NSDIR=$(mktemp -d /tmp/secos_selftest_netsmp.XXXXXX)
+    ssh-keygen -q -t ed25519 -N '' -C secos-netsmp-selftest -f "$NSDIR/id"
+    make clean >/dev/null 2>&1 || true
+    if make iso CFLAGS_EXTRA="-DSECOS_SMP_AT_BOOT -DSECOS_LOCKDEP_LITE" \
+            SSH_AUTHORIZED_KEYS="$NSDIR/id.pub" >/tmp/secos_selftest_build.log 2>&1; then
+        cp myos.iso "$NSDIR/netsmp.iso"
+        for cfg in "smp4-msix 4 e1000e" "smp4-poll 4 e1000" "smp1-msix 1 e1000e"; do
+            set -- $cfg
+            timeout 600 python3 tools/net_stress_drive.py --iso "$NSDIR/netsmp.iso" --smp "$2" --nic "$3" \
+                --key "$NSDIR/id" --log "$NSDIR/$1.log" --out "$NSDIR/$1.out" >/dev/null 2>&1 &
+        done
+        wait
+        for run in smp4-msix smp4-poll smp1-msix; do
+            while IFS= read -r l; do
+                case "$l" in
+                    "[NSD] RESULT "*|"[NSD] stats "*|"[NSD] host "*|"[NSD] sshd.log"*) ;;
+                    "[NSD] "*" OK"*)   n=${l#\[NSD\] }; check "NETSMP $run ${n%% OK*}" 0 ;;
+                    "[NSD] "*" FAIL"*) n=${l#\[NSD\] }; check "NETSMP $run ${n%% FAIL*}" 1; echo "    $l" | cut -c1-300 ;;
+                esac
+            done <"$NSDIR/$run.out"
+            grep -q "^\[NSD\] RESULT " "$NSDIR/$run.out"; check "NETSMP $run driver ran to completion" $?
+            ! grep -aq "\[LOCKDEP\]\|PANIC\|\[EXC\]" "$NSDIR/$run.log"
+            check "NETSMP $run no lockdep violation, panic or CPU exception" $?
+        done
+        grep -aq "\[NET\] MSI-X NAPI armed" "$NSDIR/smp4-msix.log"; check "NETSMP e1000e RX runs on MSI-X NAPI" $?
+        grep -aq "\[SMP\] online cpus=0x0000000000000004" "$NSDIR/smp4-msix.log"; check "NETSMP four CPUs online" $?
+        for f in "$NSDIR"/*.out; do cp "$f" "/tmp/secos_selftest_netsmp_$(basename "$f")"; done
+    else
+        echo "[selftest] NETSMP BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+        check "NETSMP gate build" 1
+    fi
+    rm -rf "$NSDIR"
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

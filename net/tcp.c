@@ -9,20 +9,33 @@
  * from net_tick(). Out-of-order segments are dropped and re-ACKed (the peer
  * retransmits) — correct, if not fast. Good enough for a client doing an HTTP
  * GET and a tiny echo server.
+ *
+ * [M47] Locking: the connection table, every control block, the retransmit /
+ * TIME-WAIT timers and the TX scratch (g_seg, g_cs) are guarded by the stack
+ * lock (net/net_lock.h). tcp_input/tcp_tick run under it from the RX path and
+ * the tick; the non-blocking core is called by the socket layer with it held;
+ * the blocking shell helpers at the bottom take it per step and never across a
+ * wait. A control block owned by a socket is freed only by tcp_release() (the
+ * socket's last close) or, once orphaned, by tcp_tick() — never by the RX path.
  */
 #include "tcp.h"
 #include "debugcon.h"
+#include "heap.h"
 #include "../crypto/csprng.h"
 #include <stddef.h>
 
 extern uint64_t timer_get_ticks(void);
 
 #define IP_PROTO_TCP 6
-#define TCP_MAX_CONN 16
+/* [M47] 64 control blocks (was 16: a few parallel ssh sessions plus a server
+ * and its TIME-WAIT/orphaned closes exhausted the table). The buffers are no
+ * longer static: tcp_alloc() takes them from the kernel heap and conn_free()
+ * returns them, and a listener needs none. */
+#define TCP_MAX_CONN 64
 /* [M25] 64 KiB send/receive buffers. The advertised receive window is
  * min(TCP_RXBUF - rx_len, 65535) — 64 KiB is the largest window expressible
  * without the window-scaling option, so this raises the window/RTT throughput
- * ceiling ~8x over the old 8 KiB. (16 conns * 128 KiB ~= 2 MiB static BSS.) */
+ * ceiling ~8x over the old 8 KiB. */
 #define TCP_RXBUF    65536
 #define TCP_TXBUF    65536
 #define TCP_MSS      1460
@@ -31,6 +44,7 @@ extern uint64_t timer_get_ticks(void);
 #define TCP_TIMEWAIT 2000          /* ~2 s linger */
 #define TCP_MAX_BACKLOG 4          /* per-listener queued children (16-entry table) */
 #define TCP_ORPHAN_MS 10000        /* a released conn gets this long to finish FIN */
+#define TCP_ARP_RETRY 20           /* SYN not sent yet (ARP pending): retry every 20 ms */
 
 /* flags */
 #define F_FIN 0x01
@@ -48,8 +62,8 @@ struct tcp_conn {
     uint32_t     iss, snd_una, snd_nxt;
     uint32_t     rcv_nxt;
     uint16_t     snd_wnd;
-    uint8_t      tx[TCP_TXBUF]; uint32_t tx_len;   /* bytes from snd_una onward (unacked+unsent) */
-    uint8_t      rx[TCP_RXBUF]; uint32_t rx_head, rx_len;
+    uint8_t*     tx; uint32_t tx_len;   /* TCP_TXBUF bytes from snd_una onward (unacked+unsent) */
+    uint8_t*     rx; uint32_t rx_head, rx_len;   /* TCP_RXBUF ring */
     uint8_t      fin_pending;          /* user asked to close; send FIN after tx drains */
     uint8_t      fin_sent;             /* our FIN occupies a sequence number */
     uint8_t      reset;                /* peer RST / abort */
@@ -59,17 +73,28 @@ struct tcp_conn {
     uint8_t      accepted;             /* child handed out by tcp_accept_ready */
     uint8_t      orphan;               /* socket released it: free once closed */
     uint64_t     orphan_deadline;      /* hard limit for an orphan's FIN handshake */
+    uint8_t      syn_unsent;           /* SYN_SENT but the SYN never left (ARP miss) */
+    uint64_t     syn_retry_at;
     int          backlog;              /* LISTEN: max not-yet-accepted children */
 };
 
 static struct tcp_conn g_conns[TCP_MAX_CONN];
 
+/* Release a slot and its buffers. */
+static void conn_free(struct tcp_conn* c){
+    if (c->tx) { kfree(c->tx); c->tx = NULL; }
+    if (c->rx) { kfree(c->rx); c->rx = NULL; }
+    c->used = 0;
+    c->state = TCP_CLOSED;
+}
+
 /* A connection reached CLOSED: free the slot unless the socket layer still
  * owns it (an accepted child or an active-open conn stays until released). */
 static void conn_closed(struct tcp_conn* c){
     c->state = TCP_CLOSED;
-    if (c->orphan || (c->listener && !c->accepted)) c->used = 0;
+    if (c->orphan || (c->listener && !c->accepted)) conn_free(c);
 }
+static void conn_abort(struct tcp_conn* c);
 static uint16_t g_eph = 49152;
 static uint8_t  g_seg[1600];           /* TX scratch (header + data) */
 static uint8_t  g_cs[12 + 1600];       /* pseudo-header + segment for checksum */
@@ -89,21 +114,60 @@ static uint16_t eph_port(void){
     return 0;
 }
 
-tcp_conn_t* tcp_alloc(void){
-    for(int i=0;i<TCP_MAX_CONN;i++) if(!g_conns[i].used){
+static uint64_t g_alloc_full, g_alloc_nomem;
+static uint32_t g_peak;
+uint32_t tcp_peak(void){ return g_peak; }
+
+/* Table full: recycle the orphaned TIME-WAIT connection closest to expiry
+ * (nobody holds a pointer to an orphan; its 2 s linger only absorbs stray
+ * retransmissions). Returns a freed slot index or -1. */
+static int reclaim_time_wait(void){
+    int best=-1;
+    for(int i=0;i<TCP_MAX_CONN;i++){
         struct tcp_conn* c=&g_conns[i];
-        for(size_t k=0;k<sizeof(*c);k++) ((uint8_t*)c)[k]=0;
-        c->used=1; c->state=TCP_CLOSED; return c;
+        if(c->used && c->orphan && c->state==TCP_TIME_WAIT &&
+           (best<0 || c->tw_deadline < g_conns[best].tw_deadline)) best=i;
     }
+    if(best>=0) conn_free(&g_conns[best]);
+    return best;
+}
+
+tcp_conn_t* tcp_alloc(void){
+    NET_ASSERT_STACK_LOCKED();
+    int slot=-1;
+    for(int i=0;i<TCP_MAX_CONN;i++) if(!g_conns[i].used){ slot=i; break; }
+    if(slot<0) slot=reclaim_time_wait();
+    if(slot>=0){
+        struct tcp_conn* c=&g_conns[slot];
+        for(size_t k=0;k<sizeof(*c);k++) ((uint8_t*)c)[k]=0;
+        c->tx=(uint8_t*)kmalloc(TCP_TXBUF);
+        c->rx=(uint8_t*)kmalloc(TCP_RXBUF);
+        if(!c->tx || !c->rx){ conn_free(c); g_alloc_nomem++; return NULL; }
+        c->used=1; c->state=TCP_CLOSED;
+        uint32_t u=0, o=0; tcp_count(&u, &o);
+        if(u>g_peak) g_peak=u;
+        return c;
+    }
+    g_alloc_full++;
     return NULL;
 }
-void tcp_free(tcp_conn_t* c){ if(c){ c->used=0; c->state=TCP_CLOSED; } }
+void tcp_free(tcp_conn_t* c){ if(c) conn_free(c); }
 
 tcp_state_t tcp_get_state(const tcp_conn_t* c){ return c?c->state:TCP_CLOSED; }
 int tcp_rx_available(const tcp_conn_t* c){ return c?(int)c->rx_len:0; }
 
+void tcp_alloc_failures(uint64_t* full, uint64_t* nomem){ *full=g_alloc_full; *nomem=g_alloc_nomem; }
+
+void tcp_count(uint32_t* used, uint32_t* orphans){
+    uint32_t u=0, o=0;
+    for(int i=0;i<TCP_MAX_CONN;i++) if(g_conns[i].used){ u++; if(g_conns[i].orphan) o++; }
+    *used=u; *orphans=o;
+}
+
 // ---- segment transmit ----
-static void tcp_xmit(struct tcp_conn* c, uint8_t flags, const uint8_t* data, uint32_t dlen, uint32_t seq){
+// Returns ipv4_send()'s result: <0 when the segment did not leave (ARP miss).
+static int tcp_xmit(struct tcp_conn* c, uint8_t flags, const uint8_t* data, uint32_t dlen, uint32_t seq){
+    NET_ASSERT_STACK_LOCKED();
     uint32_t hdr = 20;
     uint8_t* s = g_seg;
     s[0]=(uint8_t)(c->local_port>>8);  s[1]=(uint8_t)c->local_port;
@@ -135,7 +199,7 @@ static void tcp_xmit(struct tcp_conn* c, uint8_t flags, const uint8_t* data, uin
     uint16_t csum = net_checksum(g_cs, 12+seglen);
     s[16]=(uint8_t)(csum>>8); s[17]=(uint8_t)csum;
 
-    ipv4_send(c->dev, c->remote_ip, IP_PROTO_TCP, s, seglen);
+    return ipv4_send(c->dev, c->remote_ip, IP_PROTO_TCP, s, seglen);
 }
 
 static void arm_rto(struct tcp_conn* c){ c->rto_deadline = timer_get_ticks()+TCP_RTO; c->retries=0; }
@@ -176,7 +240,10 @@ int tcp_start_connect(tcp_conn_t* c, net_dev_t* dev, uint32_t dip, uint16_t dpor
     c->iss = csprng_u32();                          /* unpredictable ISN (blind injection) */
     c->snd_una=c->iss; c->snd_nxt=c->iss; c->rcv_nxt=0;
     c->state=TCP_SYN_SENT;
-    tcp_xmit(c, F_SYN, NULL, 0, c->iss);
+    /* A SYN dropped on an ARP miss is retried every TCP_ARP_RETRY ms by
+     * tcp_tick (the ARP request is out) instead of waiting a full RTO. */
+    c->syn_unsent = tcp_xmit(c, F_SYN, NULL, 0, c->iss) < 0;
+    c->syn_retry_at = timer_get_ticks() + TCP_ARP_RETRY;
     c->snd_nxt = c->iss + 1;
     arm_rto(c);
     return 0;
@@ -189,6 +256,9 @@ int tcp_start_listen(tcp_conn_t* c, net_dev_t* dev, uint16_t port, int backlog){
             return -1;
     if(backlog<1) backlog=1;
     if(backlog>TCP_MAX_BACKLOG) backlog=TCP_MAX_BACKLOG;
+    /* A listener never carries data: give its buffers back. */
+    if(c->tx){ kfree(c->tx); c->tx=NULL; }
+    if(c->rx){ kfree(c->rx); c->rx=NULL; }
     c->dev=dev; c->local_port=port; c->state=TCP_LISTEN; c->backlog=backlog; return 0;
 }
 
@@ -284,6 +354,7 @@ static uint32_t rx_accept(struct tcp_conn* c, const uint8_t* data, uint32_t len)
 }
 
 void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len){
+    NET_ASSERT_STACK_LOCKED();
     if(len<20) return;
     uint16_t sport=(uint16_t)((seg[0]<<8)|seg[1]);
     uint16_t dport=(uint16_t)((seg[2]<<8)|seg[3]);
@@ -376,6 +447,13 @@ void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len
         }
     }
 
+    /* New data for a connection nobody can read any more: abort (RFC 1122
+     * 4.2.2.13) instead of buffering it until the orphan times out. */
+    if(c->orphan && plen>0 && (c->state==TCP_FIN_WAIT_1 || c->state==TCP_FIN_WAIT_2)){
+        conn_abort(c);
+        return;
+    }
+
     /* In-order data. */
     int did_ack=0;
     if(plen>0 && (c->state==TCP_ESTABLISHED || c->state==TCP_FIN_WAIT_1 || c->state==TCP_FIN_WAIT_2)){
@@ -402,6 +480,7 @@ void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len
 }
 
 void tcp_tick(void){
+    NET_ASSERT_STACK_LOCKED();
     uint64_t now=timer_get_ticks();
     for(int i=0;i<TCP_MAX_CONN;i++){
         struct tcp_conn* c=&g_conns[i];
@@ -410,8 +489,15 @@ void tcp_tick(void){
             if(now>=c->tw_deadline) conn_closed(c);
             continue;
         }
-        if(c->orphan && (c->state==TCP_CLOSED || now>=c->orphan_deadline)){ c->used=0; continue; }
+        if(c->orphan && (c->state==TCP_CLOSED || now>=c->orphan_deadline)){ conn_free(c); continue; }
         if(c->state==TCP_CLOSED) continue;
+        if(c->state==TCP_SYN_SENT && c->syn_unsent){
+            if(now>=c->syn_retry_at){
+                if(tcp_xmit(c, F_SYN, NULL, 0, c->iss)==0){ c->syn_unsent=0; arm_rto(c); }
+                else c->syn_retry_at = now + TCP_ARP_RETRY;
+            }
+            continue;
+        }
         if(c->rto_deadline && now>=c->rto_deadline && c->snd_una!=c->snd_nxt){
             if(++c->retries>TCP_MAX_RETX){ c->reset=1; conn_closed(c); continue; }
             /* Retransmit the oldest unacked unit. */
@@ -434,29 +520,28 @@ void tcp_tick(void){
     }
 }
 
-// ---- blocking convenience ----
+// ---- blocking convenience (kernel shell) ----
+// [M47] Each step takes the stack lock; the hlt waits run without it. The
+// first SYN no longer needs an ARP warm-up: tcp_tick retries it every
+// TCP_ARP_RETRY ms until the next hop resolves.
 tcp_conn_t* tcp_connect(net_dev_t* dev, uint32_t dip, uint16_t dport){
-    // Warm the next-hop ARP first (gateway for off-subnet) so the very first SYN
-    // goes out instead of being dropped on a pending ARP — otherwise a fresh
-    // destination could report "connect failed" until a retransmit happened.
-    if(dev){
-        uint32_t nh = (dev->netmask && (dip & dev->netmask)==(dev->ip & dev->netmask)) ? dip : dev->gateway;
-        uint8_t mac[6];
-        if(arp_resolve(dev, nh, mac)!=0){
-            uint64_t adl=timer_get_ticks()+1000;
-            while(timer_get_ticks()<adl && arp_lookup(nh, mac)!=0) __asm__ volatile("sti; hlt");
-        }
-    }
+    uint64_t fl=net_lock();
     tcp_conn_t* c=tcp_alloc();
+    if(c && tcp_start_connect(c, dev, dip, dport)!=0){ tcp_free(c); c=NULL; }
+    net_unlock(fl);
     if(!c) return NULL;
-    if(tcp_start_connect(c, dev, dip, dport)!=0){ tcp_free(c); return NULL; }
     uint64_t deadline=timer_get_ticks()+8000;
     while(timer_get_ticks()<deadline){
-        if(c->state==TCP_ESTABLISHED) return c;
-        if(c->reset || c->state==TCP_CLOSED) break;
+        fl=net_lock();
+        tcp_state_t st=c->state; int rst=c->reset;
+        net_unlock(fl);
+        if(st==TCP_ESTABLISHED) return c;
+        if(rst || st==TCP_CLOSED) break;
         __asm__ volatile("sti; hlt");
     }
+    fl=net_lock();
     tcp_free(c);
+    net_unlock(fl);
     return NULL;
 }
 
@@ -464,7 +549,9 @@ int tcp_send_all(tcp_conn_t* c, const void* data, uint32_t len){
     const uint8_t* p=(const uint8_t*)data; uint32_t off=0;
     uint64_t deadline=timer_get_ticks()+8000;
     while(off<len && timer_get_ticks()<deadline){
+        uint64_t fl=net_lock();
         int n=tcp_write(c, p+off, len-off);
+        net_unlock(fl);
         if(n<0) return -1;
         off+=(uint32_t)n;
         if(off<len) __asm__ volatile("sti; hlt");   /* tx buffer full: let ACKs drain it */
@@ -475,7 +562,9 @@ int tcp_send_all(tcp_conn_t* c, const void* data, uint32_t len){
 int tcp_recv_block(tcp_conn_t* c, void* buf, uint32_t len, uint32_t ms){
     uint64_t deadline=timer_get_ticks()+ms;
     while(timer_get_ticks()<deadline){
+        uint64_t fl=net_lock();
         int n=tcp_read(c, buf, len);
+        net_unlock(fl);
         if(n>0) return n;
         if(n<0) return 0;                            /* peer closed, drained = EOF */
         __asm__ volatile("sti; hlt");
@@ -483,9 +572,18 @@ int tcp_recv_block(tcp_conn_t* c, void* buf, uint32_t len, uint32_t ms){
     return 0;
 }
 
+/* Abort: RST the peer and free the slot at once. */
+static void conn_abort(struct tcp_conn* c){
+    tcp_xmit(c, F_RST|F_ACK, NULL, 0, c->snd_nxt);
+    conn_free(c);
+}
+
 /* Non-blocking close for the socket layer: start the orderly FIN handshake and
  * hand the slot to tcp_tick(), which frees it once CLOSED/TIME-WAIT is over (or
- * after TCP_ORPHAN_MS). A LISTEN conn also drops its not-yet-accepted children. */
+ * after TCP_ORPHAN_MS). A LISTEN conn also drops its not-yet-accepted children.
+ * Closing with unread received data aborts with RST instead (RFC 1122
+ * 4.2.2.13, what Linux does): the data can never be read, and a peer that keeps
+ * sending would otherwise pin the orphan for the full TCP_ORPHAN_MS. */
 void tcp_release(tcp_conn_t* c){
     if(!c || !c->used) return;
     if(c->state==TCP_LISTEN){
@@ -494,14 +592,15 @@ void tcp_release(tcp_conn_t* c){
             if(ch->used && ch->listener==c){
                 if(!ch->accepted){
                     if(ch->state!=TCP_CLOSED) tcp_xmit(ch, F_RST|F_ACK, NULL, 0, ch->snd_nxt);
-                    ch->used=0;
+                    conn_free(ch);
                 } else ch->listener=NULL;           /* accepted: owned by its socket now */
             }
         }
-        c->used=0; c->state=TCP_CLOSED;
+        conn_free(c);
         return;
     }
-    if(c->state==TCP_CLOSED || c->state==TCP_SYN_SENT || c->state==TCP_SYN_RCVD){ c->used=0; c->state=TCP_CLOSED; return; }
+    if(c->state==TCP_CLOSED || c->state==TCP_SYN_SENT || c->state==TCP_SYN_RCVD){ conn_free(c); return; }
+    if(c->rx_len>0 && c->state!=TCP_TIME_WAIT){ conn_abort(c); return; }
     c->orphan=1; c->orphan_deadline=timer_get_ticks()+TCP_ORPHAN_MS;
     tcp_start_close(c);
 }
@@ -514,11 +613,18 @@ void tcp_get_addrs(const tcp_conn_t* c, uint32_t* lip, uint16_t* lport, uint32_t
 
 void tcp_close(tcp_conn_t* c){
     if(!c) return;
+    uint64_t fl=net_lock();
     tcp_start_close(c);
+    net_unlock(fl);
     uint64_t deadline=timer_get_ticks()+4000;
     while(timer_get_ticks()<deadline){
-        if(c->state==TCP_CLOSED || c->state==TCP_TIME_WAIT) break;
+        fl=net_lock();
+        tcp_state_t st=c->state;
+        net_unlock(fl);
+        if(st==TCP_CLOSED || st==TCP_TIME_WAIT) break;
         __asm__ volatile("sti; hlt");
     }
+    fl=net_lock();
     tcp_free(c);
+    net_unlock(fl);
 }

@@ -13,7 +13,7 @@
 #define ICMP_ECHO_REPLY   0
 
 static volatile uint32_t g_echo_replies = 0;   // counter for the ping self-test
-static uint8_t g_icmpbuf[NET_FRAME_MAX];
+static uint8_t g_icmpbuf[NET_FRAME_MAX];       /* [M47] stack lock */
 
 uint32_t icmp_echo_replies(void) { return g_echo_replies; }
 

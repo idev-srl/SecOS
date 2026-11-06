@@ -137,6 +137,7 @@ SRC_C   = \
 	$(DRIVERS_DIR)/vmxnet3.c \
 	$(DRIVERS_DIR)/igc.c \
 	$(NET_DIR)/net_core.c \
+	$(NET_DIR)/net_lock.c \
 	$(NET_DIR)/eth.c \
 	$(NET_DIR)/arp.c \
 	$(NET_DIR)/ipv4.c \
@@ -498,6 +499,11 @@ user-progs: libcrypt
 	$(LD) --gc-sections -T user/user.ld -o user/pipe_test.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/pipe_test.o
 	python3 tools/secos-sign user/pipe_test.elf --dev
 	python3 tools/elf2h.py user/pipe_test.elf user_pipe_test_elf crypto/user_pipe_test_elf.h
+	# [M47] network stack stress test (CAP_NET manifest): parallel TCP/UDP/DNS + stats
+	$(CC) $(USER_CFLAGS) -c user/netstress.c   -o user/netstress.o
+	$(LD) --gc-sections -T user/user.ld -o user/netstress.elf user/crt0.o user/note_net.o user/libsecos.o user/libc.o user/netstress.o
+	python3 tools/secos-sign user/netstress.elf --dev
+	python3 tools/elf2h.py user/netstress.elf user_netstress_elf crypto/user_netstress_elf.h
 	$(CC) $(USER_CFLAGS) -c user/power.c       -o user/power.o
 	$(LD) --gc-sections -T user/user.ld -o user/power.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/power.o
 	python3 tools/secos-sign user/power.elf --dev

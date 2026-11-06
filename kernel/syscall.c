@@ -1448,8 +1448,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
      * ordinary fd (fds[fd].is_sock = socket index + 1): read/write/close/dup/
      * fork/poll work on it. The calls below are non-blocking at this level;
      * -EAGAIN on a blocking fd is turned into a sleep + re-run by
-     * kernel/syscall_trap.c (no ring-0 spinning). connect() still spins for
-     * the TCP handshake. */
+     * kernel/syscall_trap.c (no ring-0 spinning); so are connect()'s
+     * -EINPROGRESS/-EALREADY while the TCP handshake runs [M47]. */
     case SYS_SOCKET: case SYS_CONNECT: case SYS_BIND: case SYS_LISTEN:
     case SYS_ACCEPT: case SYS_SEND: case SYS_RECV: case SYS_SENDTO:
     case SYS_RECVFROM: case SYS_SOCKCLOSE: case SYS_SOCKNAME: {

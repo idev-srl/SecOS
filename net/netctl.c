@@ -14,6 +14,10 @@
  *   netctl(NETCTL_SET,   idx, const ifinfo*) -> 0, sets ip/netmask/gateway/dns
  *   netctl(NETCTL_DHCP_START, idx, 0)        -> 0 / -EBUSY / -ENODEV
  *   netctl(NETCTL_DHCP_POLL,  idx, 0)        -> 0 running, 1 bound, -ETIMEDOUT
+ *   netctl(NETCTL_STATS, 0, netstats*)       -> 0, stack occupancy + counters
+ *
+ * [M47] The interface config is read and written under the stack lock (the RX
+ * path reads it per frame); user copies happen outside it, on a kernel copy.
  *
  * Errors are -errno. The caller needs CAP_NET in its signed manifest (EPERM
  * otherwise, audited like the socket calls).
@@ -41,6 +45,12 @@ long ksys_netctl(uint64_t op, uint64_t idx, uint64_t arg) {
         return -1;                                              /* -EPERM */
     }
     if (op == NETCTL_COUNT) return net_dev_count();
+    if (op == NETCTL_STATS) {
+        struct secos_netstats st;
+        net_get_stats(&st);
+        if (copy_to_user((void*)arg, &st, sizeof(st)) != 0) return -14;   /* -EFAULT */
+        return 0;
+    }
     net_dev_t* d = nc_dev(idx);
     if (!d) return -19;                                         /* -ENODEV */
     switch (op) {
@@ -49,9 +59,12 @@ long ksys_netctl(uint64_t op, uint64_t idx, uint64_t arg) {
         for (size_t i = 0; i < sizeof(k); i++) ((uint8_t*)&k)[i] = 0;
         for (int i = 0; i < 15 && d->name[i]; i++) k.name[i] = d->name[i];
         for (int i = 0; i < 6; i++) k.mac[i] = d->mac[i];
+        int lease = dhcp_has_lease(d);
+        uint64_t fl = net_lock();
         k.ip = d->ip; k.netmask = d->netmask; k.gateway = d->gateway; k.dns = d->dns;
-        k.flags = (d->link_up ? NETCTL_F_LINK : 0) | (dhcp_has_lease(d) ? NETCTL_F_DHCP : 0)
-                | (d->ip ? NETCTL_F_UP : 0);
+        net_unlock(fl);
+        k.flags = (d->link_up ? NETCTL_F_LINK : 0) | (lease ? NETCTL_F_DHCP : 0)
+                | (k.ip ? NETCTL_F_UP : 0);
         k.irq_mode = (uint32_t)d->irq_mode;
         if (copy_to_user((void*)arg, &k, sizeof(k)) != 0) return -14;   /* -EFAULT */
         return 0;
@@ -60,9 +73,11 @@ long ksys_netctl(uint64_t op, uint64_t idx, uint64_t arg) {
         if (!cred_is_root(c)) return -1;                        /* [M43] -EPERM: root only */
         struct secos_ifinfo k;
         if (copy_from_user(&k, (const void*)arg, sizeof(k)) != 0) return -14;
-        int ph = dhcp_poll(d);
-        if (ph == DHCP_PH_DISCOVER || ph == DHCP_PH_REQUEST) return -16;  /* -EBUSY */
+        uint64_t fl = net_lock();
+        int ph = dhcp_poll_locked(d);
+        if (ph == DHCP_PH_DISCOVER || ph == DHCP_PH_REQUEST) { net_unlock(fl); return -16; }  /* -EBUSY */
         d->ip = k.ip; d->netmask = k.netmask; d->gateway = k.gateway; d->dns = k.dns;
+        net_unlock(fl);
         debugcon_writestring("[NET] netctl: static config ip="); debugcon_print_hex(d->ip);
         debugcon_writestring("\n");
         return 0;

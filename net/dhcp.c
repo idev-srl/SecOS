@@ -140,7 +140,7 @@ static net_dev_t* g_lease_dev;   /* the NIC whose address came from a DHCP ACK *
 
 static void dhcp_send(uint8_t msg) {
     uint32_t n = dhcp_build(g_dh.dev, &g_dh.st, msg);
-    udp_send(g_dh.dev, 0xFFFFFFFFu, 68, 67, g_pkt, n);
+    udp_output(g_dh.dev, 0xFFFFFFFFu, 68, 67, g_pkt, n);
     g_dh.deadline = timer_get_ticks() + DHCP_STEP_MS;
 }
 
@@ -177,7 +177,9 @@ static void dhcp_finish(int ok) {
     debugcon_writestring("\n");
 }
 
-int dhcp_start(net_dev_t* dev) {
+/* [M47] g_dh, g_pkt and g_lease_dev are guarded by the stack lock; the UDP
+ * callback already runs under it, the entry points below take it. */
+static int dhcp_start_locked(net_dev_t* dev) {
     if (!dev) return -19;                                       /* -ENODEV */
     uint64_t now = timer_get_ticks();
     int busy = (g_dh.phase == DHCP_PH_DISCOVER || g_dh.phase == DHCP_PH_REQUEST);
@@ -208,7 +210,15 @@ int dhcp_start(net_dev_t* dev) {
     return 0;
 }
 
-int dhcp_poll(net_dev_t* dev) {
+int dhcp_start(net_dev_t* dev) {
+    uint64_t fl = net_lock();
+    int r = dhcp_start_locked(dev);
+    net_unlock(fl);
+    return r;
+}
+
+int dhcp_poll_locked(net_dev_t* dev) {
+    NET_ASSERT_STACK_LOCKED();
     if (dev && dev != g_dh.dev) return DHCP_PH_IDLE;
     uint64_t now = timer_get_ticks();
     if (g_dh.phase == DHCP_PH_DISCOVER) {
@@ -230,7 +240,19 @@ int dhcp_poll(net_dev_t* dev) {
     return g_dh.phase;
 }
 
-int dhcp_has_lease(const net_dev_t* dev) { return dev && g_lease_dev == dev; }
+int dhcp_poll(net_dev_t* dev) {
+    uint64_t fl = net_lock();
+    int r = dhcp_poll_locked(dev);
+    net_unlock(fl);
+    return r;
+}
+
+int dhcp_has_lease(const net_dev_t* dev) {
+    uint64_t fl = net_lock();
+    int r = dev && g_lease_dev == dev;
+    net_unlock(fl);
+    return r;
+}
 
 int dhcp_configure(net_dev_t* dev) {
     if (dhcp_start(dev) < 0) return -1;

@@ -10,6 +10,7 @@
  * timer-tick polling). Holds the one's-complement checksum helper.
  */
 #include "net.h"
+#include "netctl.h"
 #include "debugcon.h"
 #include <stddef.h>
 
@@ -20,9 +21,16 @@ static int        g_ndev;
 static net_dev_t* g_poll[NET_MAX_DEV];   /* devices serviced from the timer tick */
 static int        g_npoll;
 
+/* [M47] counters (stack lock, except rx_rekicks which is a racy statistic) */
+static uint64_t g_rx_frames, g_tx_frames, g_tx_errors;
+static volatile uint64_t g_rx_rekicks;
+
 int net_register_dev(net_dev_t* dev) {
     if (!dev || g_ndev >= NET_MAX_DEV) return -1;
     for (int i = 0; i < g_ndev; i++) if (g_devs[i] == dev) return 0;
+    netlk_init(&dev->rx_lock, NETLK_RX, "nic-rx");
+    netlk_init(&dev->tx_lock, NETLK_TX, "nic-tx");
+    dev->rx_kick = 0;
     // Name eth0, eth1, ...
     dev->name[0]='e'; dev->name[1]='t'; dev->name[2]='h';
     dev->name[3]=(char)('0'+g_ndev); dev->name[4]=0;
@@ -35,7 +43,43 @@ net_dev_t* net_primary(void) { return g_ndev ? g_devs[0] : NULL; }
 
 void net_rx(net_dev_t* dev, const void* frame, uint32_t len) {
     if (!dev || !frame || len < 14 || len > NET_FRAME_MAX) return;
+    uint64_t fl = net_lock();
+    g_rx_frames++;
     eth_input(dev, (const uint8_t*)frame, len);
+    net_unlock(fl);
+}
+
+// [M47] RX drain. The MSI-X ISR, the timer-tick backstop and (with SMP) any
+// CPU may ask for a drain at the same time; only one runs dev->poll(). A CPU
+// that finds the ring busy leaves rx_kick set, and the draining CPU re-checks
+// it after its pass and again after dropping the lock, so a frame that landed
+// during a drain is never left behind until the next tick.
+void net_dev_poll(net_dev_t* dev) {
+    if (!dev || !dev->poll) return;
+    dev->rx_kick = 1;
+    for (;;) {
+        uint64_t fl;
+        if (!netlk_try(&dev->rx_lock, &fl)) { g_rx_rekicks++; return; }
+        while (dev->rx_kick) {
+            dev->rx_kick = 0;
+            __sync_synchronize();
+            dev->poll(dev);
+        }
+        netlk_release(&dev->rx_lock, fl);
+        __sync_synchronize();
+        if (!dev->rx_kick) return;
+    }
+}
+
+// [M47] The one place frames reach a driver: serialises the TX ring.
+int net_dev_xmit(net_dev_t* dev, const void* frame, uint32_t len) {
+    NET_ASSERT_STACK_LOCKED();
+    if (!dev || !dev->transmit) return -1;
+    uint64_t fl = netlk_acquire(&dev->tx_lock);
+    int r = dev->transmit(dev, frame, len);
+    netlk_release(&dev->tx_lock, fl);
+    if (r < 0) g_tx_errors++; else g_tx_frames++;
+    return r;
 }
 
 // [M24] The MSI-X-wired NIC (NAPI). At most one is driven by interrupts; any
@@ -90,8 +134,10 @@ void net_irq_handler(void) {
     g_net_irq_count++;
     net_dev_t* d = g_irq_dev;
     if (d) {
+        // Ack unconditionally (a cause left set may stop the NIC from raising
+        // the next MSI), then drain — or hand the drain to the CPU already in it.
         if (d->irq_ack) d->irq_ack(d);
-        if (d->poll) d->poll(d);
+        net_dev_poll(d);
     }
     extern void lapic_eoi(void);
     lapic_eoi();
@@ -99,11 +145,38 @@ void net_irq_handler(void) {
 
 extern void tcp_tick(void) __attribute__((weak));
 
+// Timer tick (IRQ context). [M47] One CPU at a time: protocol timers must not
+// run twice per tick if several CPUs deliver the tick callback.
+static net_spinlock_t g_tick_lock = { SPINLOCK_INIT, NETLK_TICK, "net-tick" };
 void net_tick(void) {
+    uint64_t tfl;
+    if (!netlk_try(&g_tick_lock, &tfl)) return;     /* another CPU runs this tick */
     for (int i = 0; i < g_npoll; i++)
-        if (g_poll[i] && g_poll[i]->poll) g_poll[i]->poll(g_poll[i]);
+        if (g_poll[i]) net_dev_poll(g_poll[i]);
+    uint64_t fl = net_lock();
     arp_tick();
     if (tcp_tick) tcp_tick();
+    net_unlock(fl);
+    netlk_release(&g_tick_lock, tfl);
+}
+
+extern int sock_count_used(void);
+extern void tcp_count(uint32_t* used, uint32_t* orphans);
+extern void tcp_alloc_failures(uint64_t* full, uint64_t* nomem);
+extern int udp_bind_count(void);
+void net_get_stats(struct secos_netstats* st) {
+    uint64_t fl = net_lock();
+    st->sockets = (uint32_t)sock_count_used();
+    tcp_count(&st->tcp_conns, &st->tcp_orphans);
+    st->udp_binds = (uint32_t)udp_bind_count();
+    st->arp_entries = (uint32_t)arp_entries();
+    { extern uint32_t tcp_peak(void); st->tcp_peak = tcp_peak(); }
+    st->rx_frames = g_rx_frames;
+    st->tx_frames = g_tx_frames;
+    st->tx_errors = g_tx_errors;
+    st->rx_rekicks = g_rx_rekicks;
+    tcp_alloc_failures(&st->tcp_full, &st->tcp_nomem);
+    net_unlock(fl);
 }
 
 // One's-complement Internet checksum (RFC 1071).
@@ -143,6 +216,24 @@ uint64_t net_tsc_per_us(void) {
     return cached;
 }
 
+// [M47] Shell-side helpers: one locked step each, so the hlt waits between
+// them never hold the stack lock.
+static int lk_arp_lookup(uint32_t ip, uint8_t mac[6]) {
+    uint64_t fl = net_lock(); int r = arp_lookup(ip, mac); net_unlock(fl); return r;
+}
+static void lk_arp_request(net_dev_t* d, uint32_t ip) {
+    uint64_t fl = net_lock(); arp_request(d, ip); net_unlock(fl);
+}
+static int lk_echo(net_dev_t* d, uint32_t ip, uint16_t id, uint16_t seq) {
+    uint64_t fl = net_lock(); int r = icmp_send_echo(d, ip, id, seq); net_unlock(fl); return r;
+}
+static uint32_t lk_nexthop(net_dev_t* d, uint32_t dst_ip) {
+    uint64_t fl = net_lock();
+    uint32_t nh = (d->netmask && (dst_ip & d->netmask) == (d->ip & d->netmask)) ? dst_ip : d->gateway;
+    net_unlock(fl);
+    return nh;
+}
+
 int net_ping_rtt(uint32_t dst_ip, uint16_t seq, uint64_t* rtt_tsc) {
     net_dev_t* d = net_primary();
     if (!d) return -1;
@@ -153,18 +244,18 @@ int net_ping_rtt(uint32_t dst_ip, uint16_t seq, uint64_t* rtt_tsc) {
     // on the local subnet): off-subnet -> gateway, on-subnet -> the dst itself.
     // This mirrors ipv4_send()'s routing — without it, pinging any external IP
     // ARPed the unreachable destination and timed out before sending the echo.
-    uint32_t nexthop = (d->netmask && (dst_ip & d->netmask) == (d->ip & d->netmask)) ? dst_ip : d->gateway;
-    if (arp_lookup(nexthop, mac) != 0) {
-        arp_request(d, nexthop);
+    uint32_t nexthop = lk_nexthop(d, dst_ip);
+    if (lk_arp_lookup(nexthop, mac) != 0) {
+        lk_arp_request(d, nexthop);
         uint64_t adl = timer_get_ticks() + 1000;
-        while (timer_get_ticks() < adl && arp_lookup(nexthop, mac) != 0)
+        while (timer_get_ticks() < adl && lk_arp_lookup(nexthop, mac) != 0)
             __asm__ volatile("sti; hlt");
-        if (arp_lookup(nexthop, mac) != 0) return -1;
+        if (lk_arp_lookup(nexthop, mac) != 0) return -1;
     }
     uint32_t before = icmp_echo_replies();
     uint64_t deadline = timer_get_ticks() + 2000;        // 2 s safety timeout
     uint64_t t0 = rdtsc();
-    icmp_send_echo(d, dst_ip, 0x1234, seq);
+    lk_echo(d, dst_ip, 0x1234, seq);
     // Wait via hlt: the reply is drained by the MSI-X interrupt (net_irq_handler)
     // or the timer-tick poll, both of which bump icmp_echo_replies(). hlt yields
     // the CPU so the host/NIC delivers the RX DMA — no tight RDT hammering (which
@@ -226,16 +317,16 @@ int net_ping_test(uint32_t dst_ip) {
     __asm__ volatile ("sti");
 
     // Next hop (gateway for off-subnet), not the destination — see net_ping_rtt().
-    uint32_t nexthop = (d->netmask && (dst_ip & d->netmask) == (d->ip & d->netmask)) ? dst_ip : d->gateway;
-    arp_request(d, nexthop);
+    uint32_t nexthop = lk_nexthop(d, dst_ip);
+    lk_arp_request(d, nexthop);
     uint64_t deadline = timer_get_ticks() + 1000;       // ~1 s at 1 kHz
-    while (timer_get_ticks() < deadline && arp_lookup(nexthop, mac) != 0)
+    while (timer_get_ticks() < deadline && lk_arp_lookup(nexthop, mac) != 0)
         __asm__ volatile ("hlt");
-    if (arp_lookup(nexthop, mac) != 0) { debugcon_writestring("[NET] ARP timeout (no peer)\n"); return -1; }
+    if (lk_arp_lookup(nexthop, mac) != 0) { debugcon_writestring("[NET] ARP timeout (no peer)\n"); return -1; }
     debugcon_writestring("[NET] ARP resolved\n");
 
     uint32_t before = icmp_echo_replies();
-    icmp_send_echo(d, dst_ip, 1, 1);
+    lk_echo(d, dst_ip, 1, 1);
     deadline = timer_get_ticks() + 1000;
     while (timer_get_ticks() < deadline && icmp_echo_replies() == before)
         __asm__ volatile ("hlt");
