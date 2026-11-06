@@ -1071,7 +1071,7 @@ echo "[selftest] Running bash over the real execve (mb2, serial input, 70s)..."
   printf "  (exec bash -c 'echo \$\$ > /tmp/bxpid') & wait; [[ \$(cat /tmp/bxpid) == \$! ]] && echo BX2-same-\$((1+1))\r"; sleep 5
   printf '  sleep 30 & p=$!; printf -v h %%016X $p; sleep 1; kill -STOP $p; sleep 1; j=$(jobs -l); [[ $j == *$p*Stopped* ]] && echo BX3-$h-stopped; kill -9 $p; wait\r'; sleep 5
   printf '  bash -c "exec /bin/nonexist" 2>/dev/null; echo BX4-rc-$?\r'; sleep 4
-  printf '  printf "echo BX5-\\$((2+3))\\n" > /tmp/bx.sh; bash -c /tmp/bx.sh\r'; sleep 4
+  printf '  printf "echo BX5-\\$((2+3))\\n" > /tmp/bx.sh; chmod +x /tmp/bx.sh; bash -c /tmp/bx.sh\r'; sleep 4
   printf '  BXV=bar$((40+2)) bash -c "echo BX6-\\$BXV"\r'; sleep 4
   printf '  exec /bin/echo BX7-$((3+4))\r'; sleep 5
   printf '  uptime\r'; sleep 3 ) | \
