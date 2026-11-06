@@ -234,7 +234,8 @@ static uint64_t vmm_build_kernel_pml4_identity_512mb(void) {
     uint64_t pdt_phys  = (uint64_t)pmm_alloc_frame();
     uint64_t pdt_lo_phys = (uint64_t)pmm_alloc_frame();    // [M36] separate low-identity PDT (NX)
     uint64_t pdpt_hi_phys = (uint64_t)pmm_alloc_frame();   // [M12] high-half PDPT
-    if (!pml4_phys || !pdpt_phys || !pdt_phys || !pdt_lo_phys || !pdpt_hi_phys) {
+    uint64_t pdt2_phys = (uint64_t)pmm_alloc_frame();      // [M45] 2nd high PDT (slid window)
+    if (!pml4_phys || !pdpt_phys || !pdt_phys || !pdt_lo_phys || !pdpt_hi_phys || !pdt2_phys) {
         terminal_writestring("[ERR] M1.1: PMM alloc failed for kernel page tables\n");
         return 0;
     }
@@ -243,6 +244,7 @@ static uint64_t vmm_build_kernel_pml4_identity_512mb(void) {
     zero_frame(pdt_phys);
     zero_frame(pdt_lo_phys);
     zero_frame(pdpt_hi_phys);
+    zero_frame(pdt2_phys);
 
     // Identity cast: frames are within 0–512MB, bootloader tables are still active
     uint64_t* pml4    = (uint64_t*)pml4_phys;
@@ -250,6 +252,7 @@ static uint64_t vmm_build_kernel_pml4_identity_512mb(void) {
     uint64_t* pdt     = (uint64_t*)pdt_phys;
     uint64_t* pdt_lo  = (uint64_t*)pdt_lo_phys;
     uint64_t* pdpt_hi = (uint64_t*)pdpt_hi_phys;
+    uint64_t* pdt2    = (uint64_t*)pdt2_phys;
 
     // Low identity 0–512MB (PML4[0] -> PDPT[0] -> PDT_LO, 2MB pages). Still needed
     // during early init (frames addressed by physical == virtual), for virtio DMA
@@ -264,15 +267,21 @@ static uint64_t vmm_build_kernel_pml4_identity_512mb(void) {
         if (i != 0) flags |= VMM_FLAG_NOEXEC;        // keep 0–2MB executable (AP trampoline)
         pdt_lo[i] = ((uint64_t)i << 21) | flags;
     }
-    // The high-half page directory (kernel image) stays executable.
-    for (int i = 0; i < 256; i++) {
-        pdt[i] = ((uint64_t)i << 21) | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS;
+    // [M12] High half: phys 0..512MB at kernel_vma_base() via PML4[511], so the
+    // kernel image (phys < 512MB) is reachable at its runtime VMA. The kernel
+    // runs here after this PML4 is loaded. [M45] With KASLR the base is
+    // KERNEL_VMA_BASE + slide (2 MiB-aligned, window inside the top 2 GiB), so
+    // the window can straddle PDPT[510] and PDPT[511]: one PDT for each. The
+    // window stays executable here; vmm_protect_kernel_sections applies W^X.
+    uint64_t hbase = kernel_vma_base();
+    for (uint64_t i = 0; i < 256; i++) {
+        uint64_t va = hbase + (i << 21);
+        uint64_t* hpdt = (((va >> 30) & 0x1FF) == 510) ? pdt : pdt2;
+        hpdt[(va >> 21) & 0x1FF] = (i << 21) | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS;
     }
-    // [M12] High half: KERNEL_VMA_BASE (0xFFFFFFFF80000000) = PML4[511] -> PDPT[510]
-    // -> the SAME 512MB page-directory, so the kernel image (phys < 512MB) is
-    // reachable at its link VMA. The kernel runs here after this PML4 is loaded.
     pml4[511]     = pdpt_hi_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW;
     pdpt_hi[510]  = pdt_phys     | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    pdpt_hi[511]  = pdt2_phys    | VMM_FLAG_PRESENT | VMM_FLAG_RW;
     return pml4_phys;
 }
 
@@ -412,7 +421,7 @@ void vmm_protect_kernel_sections(void) {
     {
         uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
         uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
-        uint64_t base = 0xFFFFFFFF80000000ULL; // KERNEL_VMA
+        uint64_t base = kernel_vma_base();      // [M45] runtime (slid) base
         for (uint64_t off = 0; off < (512ULL << 20); off += (2ULL << 20)) {
             uint64_t va = base + off;
             int i4 = (va >> 39) & 0x1FF, i3 = (va >> 30) & 0x1FF, i2 = (va >> 21) & 0x1FF;
@@ -437,7 +446,7 @@ void vmm_protect_kernel_sections(void) {
 void vmm_audit_wx(void) {
     uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
     uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
-    uint64_t base = 0xFFFFFFFF80000000ULL;
+    uint64_t base = kernel_vma_base();          // [M45] runtime (slid) base
     uint64_t violations = 0, checked = 0, first_bad = 0;
     for (uint64_t off = 0; off < (512ULL << 20); off += (2ULL << 20)) {
         uint64_t va = base + off;

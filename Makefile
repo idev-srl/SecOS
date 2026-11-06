@@ -104,6 +104,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/klog.c \
 	$(KERNEL_DIR)/kiface.c \
 	$(KERNEL_DIR)/smp.c \
+	$(KERNEL_DIR)/kaslr.c \
 	$(KERNEL_DIR)/pkg.c \
 	$(KERNEL_DIR)/selftest.c \
 	user/testdriver.c \
@@ -159,7 +160,10 @@ KERNEL_NOTE = $(BOOT_DIR)/kernel_note.o
 # [M39] ported upstream ath9k_hw WiFi driver (built by tools/port-ath9k.sh against
 # the Linux-compat shim; prebuilt + committed so the kernel build needs no network).
 ATH9K_HW = drivers/ath9k_port/ath9k_hw.o
-OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE) $(ATH9K_HW)
+# [M45] KASLR core (boot/kaslr_core.c): runs from the LOW .boot section before
+# the high half is mapped, so every allocated section gets a ".boot" prefix.
+KASLR_CORE = $(BOOT_DIR)/kaslr_core.o
+OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE) $(KASLR_CORE) $(ATH9K_HW)
 DEPS     = $(OBJS_C:%.o=%.d)
 -include $(DEPS)
 
@@ -198,6 +202,18 @@ $(BOOT_DIR)/ap_trampoline.o: $(BOOT_DIR)/ap_trampoline.asm
 
 $(BOOT_DIR)/%.o: $(BOOT_DIR)/%.asm
 	$(AS) $(ASFLAGS) $< -o $@
+
+# [M45] KASLR core for the Multiboot2 path: kernel flags, but no stack
+# protector / unwind tables / jump tables / synthesized memset (none of which
+# could be reached from the low .boot section), then every allocated section is
+# renamed .boot.* so linker.ld places it in .boot. A reference to a high-half
+# symbol would fail the link (truncated PC32): the intended tripwire.
+KASLR_CORE_CFLAGS = $(filter-out -fstack-protector-strong,$(CFLAGS)) -fno-stack-protector \
+	-fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables -fno-tree-loop-distribute-patterns
+$(BOOT_DIR)/kaslr_core.o: $(BOOT_DIR)/kaslr_core.c $(BOOT_DIR)/kaslr.h $(KASLR_TOOL)
+	$(CC) $(KASLR_CORE_CFLAGS) -c $< -o $(BOOT_DIR)/kaslr_core.raw.o
+	objcopy --remove-section=.note.gnu.property --prefix-alloc-sections=.boot $(BOOT_DIR)/kaslr_core.raw.o $@
+	python3 $(KASLR_TOOL) boot-only $@
 
 # [secure-boot] GAS-assembled kernel signing note (data only; minimal flags).
 $(BOOT_DIR)/kernel_note.o: $(BOOT_DIR)/kernel_note.S
@@ -264,14 +280,34 @@ $(ROOT_PWHASH_H): FORCE
 	@tools/gen-root-pwhash.sh $@
 $(KERNEL_DIR)/sysroot.o: $(ROOT_PWHASH_H)
 
-$(KERNEL): $(OBJS)
-	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+# [M45] KASLR: two-pass link. Pass 1 (--emit-relocs) gives the relocations;
+# tools/kaslr-relocs.py turns the absolute high-half ones into the compact table
+# (boot/kaslr.h), which is linked back as section .kaslr (after .data, before
+# .bss, so nothing it describes moves). Pass 2 is re-extracted and must match;
+# the final link is pass 2 without the .rela sections. -DSECOS_NO_KASLR in
+# CFLAGS_EXTRA marks the table disabled (both relocators then use slide 0).
+KASLR_TOOL  = tools/kaslr-relocs.py
+KASLR_BIN   = build/kaslr_relocs.bin
+KASLR_OBJ   = build/kaslr_relocs.o
+KASLR_FLAGS = $(if $(findstring SECOS_NO_KASLR,$(CFLAGS_EXTRA)),--disabled,)
+$(KERNEL): $(OBJS) linker.ld $(KASLR_TOOL)
+	@mkdir -p build
+	$(LD) $(LDFLAGS) --emit-relocs -o build/kernel.pass1.elf $(OBJS)
+	python3 $(KASLR_TOOL) extract build/kernel.pass1.elf $(KASLR_BIN) $(KASLR_FLAGS)
+	cd build && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
+		--rename-section .data=.kaslr,alloc,load,readonly,data,contents \
+		kaslr_relocs.bin kaslr_relocs.o
+	$(LD) $(LDFLAGS) --emit-relocs -o build/kernel.pass2.elf $(OBJS) $(KASLR_OBJ)
+	python3 $(KASLR_TOOL) check build/kernel.pass2.elf $(KASLR_BIN)
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(KASLR_OBJ)
 	@# [secure-boot] Sign kernel.bin in place (deterministic dev key → reproducible).
 	@# The UEFI loader Ed25519-verifies this before jumping. MB2/GRUB ignores the
 	@# note, so an unsigned kernel (no python3 cryptography) still boots via ISO/CI.
 	@python3 tools/secos-sign $@ --dev || echo "[secure-boot] WARNING: kernel signing skipped (need python3 'cryptography'); UEFI secure boot will REFUSE this kernel."
 
-# Create bootable ISO image
+# Create bootable ISO image. KERNEL_CMDLINE is passed on the multiboot2 line
+# (e.g. `make iso KERNEL_CMDLINE=nokaslr` disables KASLR for that image).
+KERNEL_CMDLINE ?=
 iso: $(KERNEL)
 	mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/kernel.bin
@@ -284,7 +320,7 @@ iso: $(KERNEL)
 	echo 'terminal_output gfxterm' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '' >> $(ISODIR)/boot/grub/grub.cfg
 	echo 'menuentry "SecOS x64" {' >> $(ISODIR)/boot/grub/grub.cfg
-	echo '    multiboot2 /boot/kernel.bin' >> $(ISODIR)/boot/grub/grub.cfg
+	echo '    multiboot2 /boot/kernel.bin$(if $(strip $(KERNEL_CMDLINE)), $(strip $(KERNEL_CMDLINE)))' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue --output=$(ISO) $(ISODIR) 2>&1 | tee grub-mkrescue.log
 	@echo "ISO creata: $(ISO)"
@@ -891,7 +927,8 @@ run-vnc: iso $(ROOT_DEP)
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
 	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP) $(CONSOLE_STAMP)
-	rm -f $(BOOT_DIR)/ap_trampoline.bin
+	rm -f $(BOOT_DIR)/ap_trampoline.bin $(BOOT_DIR)/kaslr_core.raw.o
+	rm -f build/kernel.pass1.elf build/kernel.pass2.elf $(KASLR_BIN) $(KASLR_OBJ)
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)
 
@@ -909,7 +946,7 @@ UEFI_HELLO_SRC = uefi/hello.c
 UEFI_OBJS = $(UEFI_SRC:%.c=%.o)
 # Freestanding crypto compiled with the UEFI flags (distinct object names so they
 # never collide with the kernel's crypto/*.o).
-UEFI_CRYPTO_OBJS = uefi/u_sha256.o uefi/u_sha512.o uefi/u_ed25519.o
+UEFI_CRYPTO_OBJS = uefi/u_sha256.o uefi/u_sha512.o uefi/u_ed25519.o uefi/u_kaslr_core.o
 UEFI_HELLO_OBJS = $(UEFI_HELLO_SRC:%.c=%.o)
 UEFI_HELLO_APP = $(EFI_BOOT_DIR)/HELLO.EFI
 UEFI_CFLAGS = -ffreestanding -fshort-wchar -O2 -mno-red-zone -m64 -fno-stack-protector -fPIE -fno-omit-frame-pointer -fno-asynchronous-unwind-tables -fno-unwind-tables -fcf-protection=none -mno-sse -mno-mmx $(INCLUDES) -DCONFIG_UEFI
@@ -918,7 +955,7 @@ UEFI_CFLAGS += -DSECOS_SECURE_BOOT
 endif
 UEFI_CRT0 = uefi/crt0.o
 
-uefi/%.o: uefi/%.c uefi/efi.h
+uefi/%.o: uefi/%.c uefi/efi.h $(BOOT_DIR)/kaslr.h
 	$(CC) $(UEFI_CFLAGS) -c $< -o $@
 
 # [secure-boot] crypto for the loader (same sources as the kernel, UEFI flags).
@@ -928,6 +965,9 @@ uefi/u_sha512.o: $(CRYPTO_DIR)/sha512.c
 	$(CC) $(UEFI_CFLAGS) -c $< -o $@
 uefi/u_ed25519.o: $(CRYPTO_DIR)/ed25519.c
 	$(CC) $(UEFI_CFLAGS) -c $< -o $@
+# [M45] the shared KASLR core (relocation, entropy, window mapping).
+uefi/u_kaslr_core.o: $(BOOT_DIR)/kaslr_core.c $(BOOT_DIR)/kaslr.h
+	$(CC) $(UEFI_CFLAGS) -fno-tree-loop-distribute-patterns -c $< -o $@
 
 uefi/crt0.o: uefi/crt0.s
 	$(CC) -c $< -o $@

@@ -3,12 +3,16 @@
 ; Author: Luigi De Astis <l.deastis@idev-srl.com>
 ; SPDX-License-Identifier: MIT
 ;
-; The kernel runs at the canonical high half KERNEL_VMA = 0xFFFFFFFF80000000.
-; This file's low .boot.* sections run at their physical load address (identity)
-; to perform the 32-bit Multiboot2 -> long-mode transition, build page tables
-; that map BOTH the low identity (0-512MB) and the high half, then jump to the
-; high-half kernel entry. The UEFI path enters at _uefi_start (already 64-bit;
-; the external loader has mapped the high half) and joins the same flow.
+; The kernel is linked at the canonical high half KERNEL_VMA = 0xFFFFFFFF80000000
+; and runs at KERNEL_VMA + slide, where the slide is a random 2 MiB multiple
+; (KASLR, M45, boot/kaslr.h). This file's low .boot.* sections run at their
+; physical load address (identity) to perform the 32-bit Multiboot2 -> long-mode
+; transition and build the low identity map (0-512MB); the 64-bit low trampoline
+; then calls the KASLR core (boot/kaslr_core.c, also in .boot) which picks the
+; slide, applies the relocation table and maps the high-half window at the slid
+; base, and finally jumps to the (relocated) high-half kernel entry. The UEFI
+; path enters at _uefi_start (already 64-bit; the external loader has already
+; relocated the image and mapped the slid high half) and joins the same flow.
 BITS 32
 
 KERNEL_VMA equ 0xFFFFFFFF80000000
@@ -39,7 +43,9 @@ align 4096
 pml4:     resb 4096
 pdpt_low: resb 4096          ; PML4[0]   -> identity 0-512MB
 pdt:      resb 4096          ; shared 512MB page-directory (2MB pages)
-pdpt_hi:  resb 4096          ; PML4[511] -> high half (0xFFFFFFFF80000000)
+pdpt_hi:  resb 4096          ; PML4[511] -> high half (0xFFFFFFFF80000000 + slide)
+pdt_hi_a: resb 4096          ; [M45] pdpt_hi[510] -> window part below 0xFFFFFFFFC0000000
+pdt_hi_b: resb 4096          ; [M45] pdpt_hi[511] -> window part above it
 align 16
 boot_stack_bottom:
     resb 4096
@@ -65,6 +71,8 @@ gdt_pointer:
 section .boot.text progbits alloc exec nowrite align=16
 global _start
 extern kernel_main
+extern kaslr_boot_mb2        ; boot/kaslr_core.c (low .boot section)
+extern _kaslr_phys           ; linker.ld: physical address of the .kaslr table
 
 _start:
     cli
@@ -125,14 +133,11 @@ _start:
     or eax, 0x3
     mov [pdpt_low], eax
 
-    ; PML4[511] -> pdpt_hi ; pdpt_hi[510] -> pdt  (high half)
-    ; 0xFFFFFFFF80000000: PML4 idx 511 (off 0xFF8), PDPT idx 510 (off 0xFF0).
+    ; PML4[511] -> pdpt_hi (high half). Its entries 510/511 are filled in
+    ; long_mode_low once the KASLR slide is known (kaslr_map_window).
     mov eax, pdpt_hi
     or eax, 0x3
     mov [pml4 + 511*8], eax
-    mov eax, pdt
-    or eax, 0x3
-    mov [pdpt_hi + 510*8], eax
 
     ; Fill the shared 512MB page-directory with 256 * 2MB pages.
     xor ebx, ebx
@@ -180,9 +185,10 @@ _start:
     mov byte [0xb8004], al
     jmp .error
 
-; 64-bit trampoline still executing at the low identity address. Set up the
-; SysV args for kernel_main, then jump to the high-half entry (indirect, so the
-; full 64-bit target address is reachable).
+; 64-bit trampoline still executing at the low identity address. Pick the KASLR
+; slide + relocate the image + map the slid high half, then set up the SysV args
+; for kernel_main and jump to the high-half entry (indirect, so the full 64-bit
+; target address is reachable).
 BITS 64
 long_mode_low:
     mov ax, 0x10
@@ -191,6 +197,21 @@ long_mode_low:
     mov fs, ax
     mov gs, ax
     mov ss, ax
+    mov rsp, boot_stack_top
+    ; [M45] kaslr_boot_mb2(magic, info, table, pdpt_hi, pdt_hi_a, pdt_hi_b)
+    mov edi, dword [mb_magic]
+    mov esi, dword [mb_info]
+    mov rdx, _kaslr_phys
+    mov rcx, pdpt_hi
+    mov r8, pdt_hi_a
+    mov r9, pdt_hi_b
+    call kaslr_boot_mb2
+    ; Reload CR3: flushes the TLB for the new high-half window and is a
+    ; serializing instruction, so the relocated immediate of the
+    ; `mov rax, long_mode_high` below (patched by the relocator) is the one
+    ; executed.
+    mov rax, cr3
+    mov cr3, rax
     mov eax, dword [mb_magic]
     mov rdi, rax               ; arg0 = multiboot magic
     mov eax, dword [mb_info]
