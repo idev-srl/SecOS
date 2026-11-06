@@ -95,12 +95,21 @@ static int perm_ids(uint32_t uid, uint32_t gid, const struct proc_cred* cr,
     return ((bits & (uint32_t)mask) == (uint32_t)mask) ? 0 : -CRED_EACCES;
 }
 
+/* Linux inode_permission(): asking to write a file, directory or symlink of a
+ * read-only filesystem fails with EROFS before any DAC check, root included
+ * (so a write to an NTFS volume reports EROFS, not EACCES). */
+static int ro_fs(const vfs_inode_t* ino){
+    return ino && ino->ops && (ino->ops->flags & VFS_FS_RDONLY);
+}
+
 int cred_inode_perm(const process_t* c, const vfs_inode_t* ino, int mask){
     if(cred_is_kernel(c) || !ino) return 0;
+    if((mask & MAY_WRITE) && ro_fs(ino)) return -CRED_EROFS;
     return perm_ids(c->cred.euid, c->cred.egid, &c->cred, ino, mask);
 }
 int cred_inode_perm_real(const process_t* c, const vfs_inode_t* ino, int mask){
     if(cred_is_kernel(c) || !ino) return 0;
+    if((mask & MAY_WRITE) && ro_fs(ino)) return -CRED_EROFS;
     return perm_ids(c->cred.ruid, c->cred.rgid, &c->cred, ino, mask);
 }
 
@@ -198,6 +207,7 @@ void cred_apply_new(const process_t* c, const char* canon, uint32_t mode, int is
 int cred_chmod(const process_t* c, const char* canon, uint32_t mode){
     vfs_inode_t* ino = vfs_lookup(canon);
     if(!ino) return -CRED_ENOENT;
+    if(!cred_is_kernel(c) && ro_fs(ino)) return -CRED_EROFS;
     if(!cred_is_owner(c, ino)) return -CRED_EPERM;
     uint32_t m = mode & 07777u;
     if(!cred_is_root(c) && (m & S_ISGID_) && ino->type != VFS_NODE_DIR && !cred_in_group(c, ino->gid))
@@ -210,6 +220,7 @@ int cred_chmod(const process_t* c, const char* canon, uint32_t mode){
 int cred_chown(const process_t* c, const char* canon, uint32_t uid, uint32_t gid){
     vfs_inode_t* ino = vfs_lookup(canon);
     if(!ino) return -CRED_ENOENT;
+    if(!cred_is_kernel(c) && ro_fs(ino)) return -CRED_EROFS;
     uint32_t ouid = ino->uid, ogid = ino->gid, omode = cred_inode_mode(ino);
     int is_dir = ino->type == VFS_NODE_DIR;
     int chu = uid != CRED_UNCHANGED && uid != ouid;
@@ -237,6 +248,7 @@ int cred_chown(const process_t* c, const char* canon, uint32_t uid, uint32_t gid
 int cred_utimes(const process_t* c, const char* canon, uint64_t at, uint64_t mt){
     vfs_inode_t* ino = vfs_lookup(canon);
     if(!ino) return -CRED_ENOENT;
+    if(!cred_is_kernel(c) && ro_fs(ino)) return -CRED_EROFS;
     int now = (at == UTIME_NOW_SENTINEL && mt == UTIME_NOW_SENTINEL);
     if(!cred_is_owner(c, ino)){
         if(!now) return -CRED_EPERM;

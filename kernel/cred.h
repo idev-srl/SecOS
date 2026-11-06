@@ -48,6 +48,7 @@ struct proc_cred {
 #define CRED_EEXIST 17
 #define CRED_ENOTDIR 20
 #define CRED_EINVAL 22
+#define CRED_EROFS  30
 
 struct process;
 struct vfs_inode;
