@@ -1823,7 +1823,9 @@ static void kernel_main_phase2(void) {
                 // No primary superblock. A backup superblock (group 1) with the
                 // SECOSROOT label means a damaged system disk, not a blank one.
                 static uint8_t bs[1024];
-                static const uint64_t bk[] = { 262146ull /* 4 KiB blocks */, 16386ull /* 1 KiB */ };
+                // Group 1 starts at block 32768 (4 KiB) or 8193 (1 KiB); a backup
+                // superblock sits at offset 0 of that block.
+                static const uint64_t bk[] = { 262144ull /* 4 KiB blocks */, 16386ull /* 1 KiB */ };
                 for (unsigned k = 0; k < 2 && !why; k++) {
                     if (bd->sector_count <= bk[k] + 2 || block_read(bd, bk[k], bs, 2) != 2) continue;
                     if (bs[56] == 0x53 && bs[57] == 0xEF && bs[120]=='S' && bs[121]=='E' && bs[122]=='C' &&
