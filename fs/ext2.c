@@ -925,7 +925,9 @@ static vfs_inode_t* e2_lookup(const char* path){
         uint16_t m=rd16(in+0);
         v->mode=m;
         if((m&S_IFMT)==0xA000) v->type=VFS_NODE_SYMLINK;   // S_IFLNK
-        v->uid=rd16(in+2); v->gid=rd16(in+24);
+        // [M42] 32-bit ids: osd2 l_i_uid_high@120 / l_i_gid_high@122 (Linux layout).
+        v->uid=(uint32_t)rd16(in+2) | ((uint32_t)rd16(in+120)<<16);
+        v->gid=(uint32_t)rd16(in+24) | ((uint32_t)rd16(in+122)<<16);
         v->atime=rd32(in+8); v->ctime=rd32(in+12); v->mtime=rd32(in+16);
         v->nlink=rd16(in+26);
     }
@@ -983,8 +985,8 @@ static int e2_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
     if(!ino) return -1;
     uint8_t in[256]; if(inode_read(ino,in)!=0) return -1;
     if(valid&VFS_ATTR_MODE){ uint16_t old=rd16(in+0); wr16(in+0,(uint16_t)((old&S_IFMT)|(a->mode&0x0FFF))); }
-    if(valid&VFS_ATTR_UID)   wr16(in+2,  (uint16_t)a->uid);
-    if(valid&VFS_ATTR_GID)   wr16(in+24, (uint16_t)a->gid);
+    if(valid&VFS_ATTR_UID){  wr16(in+2,  (uint16_t)a->uid); wr16(in+120, (uint16_t)(a->uid>>16)); }
+    if(valid&VFS_ATTR_GID){  wr16(in+24, (uint16_t)a->gid); wr16(in+122, (uint16_t)(a->gid>>16)); }
     if(valid&VFS_ATTR_ATIME) wr32(in+8,  (uint32_t)a->atime);
     if(valid&VFS_ATTR_MTIME) wr32(in+16, (uint32_t)a->mtime);
     e2_stamp(in,0,1,0);                                   /* ctime: attributes changed */

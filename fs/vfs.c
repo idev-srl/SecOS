@@ -156,6 +156,14 @@ static vfs_mount_t* vfs_resolve(const char* path, char* rel, size_t rel_sz){
     return best;
 }
 
+// Mount point of the filesystem that holds `path` ("/" for the root FS), or
+// NULL. (kernel/cred.c: set-id bits are honoured on the root filesystem only.)
+const char* vfs_mount_point_for(const char* path){
+    char rel[256];
+    vfs_mount_t* m = vfs_resolve(path, rel, sizeof(rel));
+    return m ? m->mount_point : NULL;
+}
+
 vfs_inode_t* vfs_lookup(const char* path){
     char rel[256];
     vfs_mount_t* m = vfs_resolve(path, rel, sizeof(rel));
@@ -203,6 +211,16 @@ static int vfs_copy(char* d, const char* s, size_t cap){
 }
 
 int vfs_walk(const char* path, char* out, size_t outsz, int follow_final){
+    return vfs_walk_checked(path, out, outsz, follow_final, NULL, NULL);
+}
+
+// The walk proper. `search` (may be NULL) is asked for every directory the walk
+// descends through -- the root at each (re)start and every intermediate
+// component, including the directories met while following a symlink -- and a
+// non-zero return (-errno) aborts the resolution with that error. This is the
+// "search (x) permission on every path component" rule (kernel/cred.c).
+int vfs_walk_checked(const char* path, char* out, size_t outsz, int follow_final,
+                     vfs_search_cb search, void* ctx){
     char todo[VFS_PATH];      // what is still to be resolved (absolute)
     char res[VFS_PATH];       // canonical prefix resolved so far ("" = root)
     if(!path || path[0]!='/') return -2;                       // ENOENT
@@ -210,6 +228,11 @@ int vfs_walk(const char* path, char* out, size_t outsz, int follow_final){
     int hops = 0;
 restart:
     res[0]=0;
+    if(search){
+        vfs_inode_t* r = vfs_lookup("/");
+        int e = r ? search(ctx, r) : 0;
+        if(e) return e;
+    }
     {
         size_t rl=0, i=0;
         while(todo[i]){
@@ -257,6 +280,10 @@ restart:
                 goto restart;
             }
             if(!last && ino->type!=VFS_NODE_DIR) return -20;     // ENOTDIR
+            if(!last && search){                                 // descending into it
+                int se = search(ctx, ino);
+                if(se) return se;
+            }
         }
     }
     if(res[0]==0){ res[0]='/'; res[1]=0; }
@@ -409,14 +436,24 @@ int vfs_truncate(const char* path, size_t new_size){
 
 // [M26] Attribute / symlink routing (NULL-checked: FSes that don't implement the
 // op return -1 instead of crashing — chmod on a read-only virtual FS is a no-op).
+static int vfs_setattr_at(const char* cp, const vfs_attr_t* a, unsigned valid);
 int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
     char cp[VFS_PATH]; int e=vfs_walk(path, cp, sizeof(cp), 1); if(e) return e;   // chmod follows
+    return vfs_setattr_at(cp, a, valid);
+}
+// [M42] Same without following a final symlink (lchown; kernel/cred.c hands
+// over paths it has already resolved).
+int vfs_lsetattr(const char* path, const vfs_attr_t* a, unsigned valid){
+    char cp[VFS_PATH]; int e=vfs_canon_entry(path, cp, sizeof(cp)); if(e) return e;
+    return vfs_setattr_at(cp, a, valid);
+}
+static int vfs_setattr_at(const char* cp, const vfs_attr_t* a, unsigned valid){
     char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops) return -1;
     if(m->ops->setattr) return m->ops->setattr(rel, a, valid);
     // A filesystem with no on-disk metadata (ramfs, devfs incl. /dev/pts, the
     // virtual ones): keep the change on the in-memory inode, like devtmpfs, so
     // chmod/chown succeed (sshd/login chmod the pty slave) and stat shows them.
-    vfs_inode_t* ino=vfs_lookup_follow(cp); if(!ino) return -2;
+    vfs_inode_t* ino=vfs_lookup(cp); if(!ino) return -2;
     if(valid & VFS_ATTR_MODE){
         uint32_t t = ino->mode & 0170000u;
         if(!t) t = ino->type==VFS_NODE_DIR ? 0040000u : ino->type==VFS_NODE_SYMLINK ? 0120000u : 0100000u;
