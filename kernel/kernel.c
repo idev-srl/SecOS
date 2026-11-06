@@ -1550,6 +1550,24 @@ static void kernel_main_phase2(void) {
         debugcon_writestring(n == 0 ? "[IDMAP] user CR3 audit: no low kernel mappings (OK)\n"
                                     : "[IDMAP] user CR3 audit: FAIL (low kernel mappings present)\n");
     }
+#ifdef SMAP_VIOLATION_DEMO
+    {   // [M44] Selftest hook: a deliberate direct kernel read of a user page
+        // (AC=0, outside the uaccess primitives) must panic with [SMAP].
+        extern int g_smap_enabled;
+        vmm_space_t* sp = vmm_space_create_user();
+        if (g_smap_enabled && sp &&
+            vmm_alloc_page_in_space(sp, USER_CODE_BASE, VMM_FLAG_USER | VMM_FLAG_NOEXEC) == 0) {
+            debugcon_writestring("[SMAP-DEMO] direct kernel read of a user page...\n");
+            vmm_switch_space(sp);
+            volatile uint8_t v = *(volatile uint8_t*)USER_CODE_BASE;
+            (void)v;
+            vmm_switch_space(vmm_get_kernel_space());
+            debugcon_writestring("[SMAP-DEMO] FAIL: the access did not fault\n");
+        } else {
+            debugcon_writestring("[SMAP-DEMO] skipped: SMAP not enabled on this CPU\n");
+        }
+    }
+#endif
     sched_init();
     driver_registry_init();
     { extern void ipc_init(void); ipc_init(); }  // [M13] kernel IPC channels

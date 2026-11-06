@@ -843,6 +843,23 @@ grep -q "\[WPA2\] PTK derivation (KCK|KEK|TK) OK" "$MLLOG"; check "M39 WPA2 PTK 
 grep -q "\[WPA2\] 4-way handshake supplicant KAT PASS" "$MLLOG"; check "M39 synthetic WPA2 4-way handshake KAT" $?
 grep -q "\[CRYPTO\] --- all PASS ---" "$MLLOG"; check "M38/M39 boot crypto suite all PASS" $?
 ! grep -q "\[EXC\]" "$MLLOG"; check "no CPU exception ([EXC]) during default -cpu Haswell boot" $?
+# [M44] Haswell has SMEP but no SMAP: the kernel must fall back cleanly. The
+# low identity map is retired after early boot and absent from user CR3s.
+grep -q "\[SMAP\] not supported by this CPU (fallback: no SMAP)" "$MLLOG"; check "M44 SMAP fallback on a CPU without SMAP (-cpu Haswell)" $?
+grep -q "\[IDMAP\] low identity map removed from the kernel page tables" "$MLLOG"; check "M44 low identity map removed from the kernel page tables" $?
+grep -q "\[IDMAP\] user CR3 audit: no low kernel mappings (OK)" "$MLLOG"; check "M44 user CR3 carries no low kernel mapping" $?
+! objdump -d kernel.bin 2>/dev/null | grep -q "%gs:0x28"; check "M44 stack canary not read from %gs:0x28 (global guard)" $?
+# [M44] SMAP on by default: the same image on -cpu max (SMAP present), single
+# and multi core (-smp 4 brings the APs up only with SECOS_SMP_AT_BOOT; the
+# M29 gates cover that build).
+SMAPLOG=/tmp/secos_selftest_smap.log
+echo "[selftest] Running default image (mb2, -cpu max for SMAP, 35s)..."
+run_iso "$SMAPLOG" 35 -cpu max
+grep -q "\[SMAP\] enabled: kernel user access only via uaccess" "$SMAPLOG"; check "M44 SMAP enabled by default (-cpu max)" $?
+grep -q "\[M36\] mitigations: SMEP=on SMAP=on" "$SMAPLOG"; check "M44 SMEP+SMAP both on (-cpu max)" $?
+grep -q "\[IDMAP\] user CR3 audit: no low kernel mappings (OK)" "$SMAPLOG"; check "M44 user CR3 audit OK under SMAP" $?
+grep -q "\[INIT\]\|\[init\]" "$SMAPLOG"; check "M44 boot reaches init under SMAP" $?
+! grep -q "\[EXC\]\|\[PANIC\]\|\[SMAP\] violation" "$SMAPLOG"; check "no exception / SMAP violation during the -cpu max boot" $?
 
 # ---- M39: boot into GNU bash (built from source) + run a command over serial ----
 # The default image installs the signed bash to /bin/bash and launches it as the
@@ -1424,6 +1441,22 @@ grep -q "\[HEAP\] heapcheck: OK" "$HDBGLOG"; check "HEAP debug: shell heapcheck 
 # from the #PF return path onto a fresh stack page (nested #PF, needs #PF off
 # IST). Rebuilds a plain image: the heap section above left a debug build.
 # ============================================================================
+# [M44] SMAP violation: an image that deliberately reads a user page from ring 0
+# with RFLAGS.AC=0 (outside the uaccess primitives) must panic with a clear
+# [SMAP] line on a CPU with SMAP, and skip the probe on one without.
+SVLOG=/tmp/secos_selftest_smapviol.log
+echo "[selftest] Building SMAP violation image (SMAP_VIOLATION_DEMO)..."
+build_demo SMAPVIOL "-DSMAP_VIOLATION_DEMO"
+echo "[selftest] Running SMAP violation image (mb2, -cpu max, 20s)..."
+run_iso "$SVLOG" 20 -cpu max
+grep -q "\[SMAP-DEMO\] direct kernel read of a user page" "$SVLOG"; check "M44 SMAP violation probe ran (-cpu max)" $?
+grep -q "\[SMAP\] violation: ring-0 read of user address cr2=0x0000000100000000" "$SVLOG"; check "M44 direct kernel read of a user page -> [SMAP] violation" $?
+grep -q "\[PANIC\] SMAP violation" "$SVLOG"; check "M44 SMAP violation panics the kernel (no silent retry)" $?
+! grep -q "\[SMAP-DEMO\] FAIL" "$SVLOG"; check "M44 the stray access never completed" $?
+run_iso "$SVLOG.nosmap" 20
+grep -q "\[SMAP-DEMO\] skipped: SMAP not enabled" "$SVLOG.nosmap"; check "M44 no SMAP CPU: probe skipped, kernel keeps running" $?
+! grep -q "\[PANIC\]" "$SVLOG.nosmap"; check "M44 no panic on a CPU without SMAP" $?
+
 UALOG=/tmp/secos_selftest_uaccess.log
 echo "[selftest] Building plain image for the uaccess gate..."
 make clean >/dev/null 2>&1 || true
@@ -1438,7 +1471,7 @@ UASER=/tmp/secos_selftest_uaccess_serial.log
 ( sleep 25; printf '  /bin/uaccess_test; echo UA-$((6*7))-END\r'; sleep 20
   printf '  cat /proc/version; echo VER-$((6*7))-END\r'; sleep 5
   printf '  /bin/abi_test; echo ABI-$((6*7))-END\r'; sleep 30 ) | \
-    timeout 100 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+    timeout 100 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M -cpu max \
         -debugcon file:"$UALOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >"$UASER" 2>&1
 grep -q "\[UA-TEST\] DONE pass=[0-9]* fail=0" "$UALOG"; check "UACCESS every bad-pointer case returns an error (DONE fail=0)" $?
@@ -1448,6 +1481,18 @@ grep -q "UA-42-END" "$UALOG"; check "UACCESS shell survives the test (sentinel r
 grep -q "\[UA-TEST\] ident-read-0x100000 OK" "$UALOG"; check "UACCESS read via identity alias 0x100000 -> -EFAULT" $?
 grep -q "\[UA-TEST\] ident-write-0x100000 OK" "$UALOG"; check "UACCESS WRITE via identity alias 0x100000 -> -EFAULT (no kernel overwrite)" $?
 grep -q "\[UA-TEST\] ident-straddle-min OK" "$UALOG"; check "UACCESS range straddling the user-window base -> -EFAULT" $?
+# [M44] (gate runs on -cpu max: SMAP on) no identity map in user CR3s, kernel-half
+# pointers refused, no sigframe written through a low rsp, AC=1 on entry harmless.
+grep -q "\[SMAP\] enabled" "$UALOG"; check "UACCESS gate runs with SMAP enabled (-cpu max)" $?
+grep -q "\[UA-TEST\] noident-mmap-hint-low-ignored OK" "$UALOG"; check "UACCESS mmap hint in the old identity window is ignored" $?
+grep -q "\[UA-TEST\] noident-read-physmap-ptr OK" "$UALOG" && grep -q "\[UA-TEST\] noident-write-physmap-ptr OK" "$UALOG"
+check "UACCESS physmap pointers -> -EFAULT (read + write)" $?
+grep -q "\[UA-TEST\] noident-read-kimage-ptr OK" "$UALOG" && grep -q "\[UA-TEST\] noident-write-kimage-ptr OK" "$UALOG"
+check "UACCESS kernel-image pointers -> -EFAULT (read + write)" $?
+grep -q "\[UA-TEST\] noident-ring3-load-0x100000-sigsegv OK" "$UALOG"; check "UACCESS ring-3 load from 0x100000 -> SIGSEGV (not present)" $?
+grep -q "\[UA-TEST\] noident-sigframe-low-rsp-killed OK" "$UALOG"; check "UACCESS sigframe aimed at the old identity window is refused" $?
+grep -q "\[UA-TEST\] smap-entry-with-ac-set OK" "$UALOG"; check "UACCESS syscall entered with RFLAGS.AC=1 works (entry clac)" $?
+! grep -q "\[SMAP\] violation" "$UALOG"; check "UACCESS no SMAP violation" $?
 grep -q "SecOS version" "$UASER" && grep -q "VER-42-END" "$UASER"
 check "UACCESS kernel .rodata intact after the test (/proc/version readable)" $?
 grep -q "\[UA-TEST\] spawn-wild-path OK" "$UALOG"; check "UACCESS spawn(0xDEADBEEF) -> -EFAULT" $?
