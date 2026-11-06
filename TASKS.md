@@ -121,7 +121,20 @@ robustness and the paused real-hardware bring-up — see below.
       device mmap), `KDSETMODE` console handoff with auto-restore on exit/crash, keymaps
       `us`/`it` (`loadkeys`, `make KEYMAP=it`), explicit `CAP_INPUT`/`CAP_DISPLAY`
       manifest bits. API contract: `docs/GUI_INPUT.md`; devlog `docs/devlog/M40-gui-input.md`.
-- [ ] Compositor (owns fb0 + input via EVIOCGRAB) + graphical terminal on a pty, LVGL widgets.
+- [x] **Compositor + graphical terminal + LVGL (`feat/compositor`)**: `/bin/secwm` =
+      `/bin/startgui` (fb0 + EVIOCGRAB, damage compositing, panel/launcher, windows),
+      terminals = bash on locked ptys with job control, SWP client protocol over pipes
+      with a confined-manifest client sandbox, LVGL 9.2.2 `/bin/sysmon`. `docs/GUI.md`,
+      selftest "GUI compositor gate".
+- [ ] GUI: wire `startgui --auto` into the PID-1 init (`console::once:`), see `docs/GUI.md`.
+- [ ] GUI: clipboard (compositor-mediated, explicit user action only), terminal text selection.
+- [ ] GUI: shared-memory buffers for clients (memfd-style object passed at spawn, syscalls
+      90-94) if a client needs more than pipe bandwidth.
+- [ ] GUI: mouse reporting in the terminal (`?1000/?1006`) for `vi`/`less` mouse support;
+      wide (CJK) characters; blinking cursor.
+- [ ] GUI: software key autorepeat for USB keyboards (no host-side repeat yet).
+- [ ] GUI: client windows resizable (a CONFIGURE round trip); keyboard window move.
+- [ ] `/proc/meminfo` under UEFI reports MemFree/MemAvailable > MemTotal (PMM accounting).
 - [ ] USB keyboard host-side autorepeat; keyboard LEDs (Caps/Num Lock).
 - [ ] fb0 double buffering / page flip (`yres_virtual > yres`), vsync; mode setting.
 - [ ] VT switching (several consoles / graphics sessions).

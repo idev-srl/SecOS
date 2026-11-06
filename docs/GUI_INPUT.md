@@ -1,7 +1,8 @@
 # GUI kernel interfaces: framebuffer, input, console handoff, keymaps
 
 This is the API contract for a SecOS compositor (and for the LVGL fbdev/evdev
-drivers on top of it). Every interface follows the Linux ABI where that is
+drivers on top of it). The compositor built on it, `secwm`, is described in
+`docs/GUI.md`. Every interface follows the Linux ABI where that is
 practical, so stock fbdev and evdev code compiles against `user/include/linux/*`
 and runs unchanged. Milestone devlog: `docs/devlog/M40-gui-input.md`.
 
