@@ -227,7 +227,6 @@ static int gd_write(uint32_t group, const uint8_t* gd){
     return blk_write(blk, g_mb);
 }
 static uint32_t gd_inode_table(uint32_t group){ uint8_t gd[64]; return gd_read(group,gd)==0?rd32(gd+8):0; }
-static uint32_t gd_block_bitmap(uint32_t group){ uint8_t gd[64]; return gd_read(group,gd)==0?rd32(gd+0):0; }
 static uint32_t gd_inode_bitmap(uint32_t group){ uint8_t gd[64]; return gd_read(group,gd)==0?rd32(gd+4):0; }
 
 /* ── Inode read/write (inode buffer is g_inode_size bytes) ───────────────── */

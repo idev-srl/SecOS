@@ -32,7 +32,8 @@ if [[ -e "$img" ]]; then
     echo "  size on disk: $(du -h "$img" | cut -f1) (apparent $(du -h --apparent-size "$img" | cut -f1))"
     if command -v debugfs >/dev/null 2>&1; then
         for d in /root /home /etc /etc/dropbear /var/log; do
-            list=$(debugfs -R "ls $d" "$img" 2>/dev/null | tr -s ' \n' ' ' | sed 's/([0-9]*)//g; s/  */ /g' || true)
+            # ls -p: /inode/mode/uid/gid/name/size/ per entry
+            list=$(debugfs -R "ls -p $d" "$img" 2>/dev/null | awk -F/ '$6!="." && $6!=".." && $6!="" {printf "%s ", $6}' || true)
             [[ -n "$list" ]] && echo "  $d: $list"
         done
     fi
