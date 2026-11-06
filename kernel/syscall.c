@@ -745,13 +745,11 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
             // through the TTY's termios output processing (OPOST/ONLCR).
             extern int tty_write(const void* buf, int len);
             tty_write(u.p, want);
-            // Not a kernel message: skip klog. One chunk at a time under the
-            // debugcon line lock (irqs off), so a scheduler/kernel line printed
-            // from an interrupt cannot land in the middle of the user's line.
-            { extern uint64_t debugcon_line_lock(void); extern void debugcon_line_unlock(uint64_t);
-              uint64_t df = debugcon_line_lock();
-              for(int i=0;i<want;i++) debugcon_putchar_raw((char)u.p[i]);
-              debugcon_line_unlock(df); }
+            // Not a kernel message: skip klog. Mirrored in whole lines
+            // (kernel/klog.c), so a scheduler/kernel line printed between two
+            // write() calls of one user line cannot land in the middle of it.
+            { extern void debugcon_user_write(const char*, int);
+              debugcon_user_write((const char*)u.p, want); }
             r = want;
         }
         if(r<=0){ if(done==0) err=r; break; }

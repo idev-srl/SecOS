@@ -35,6 +35,17 @@
 /* Capture one byte (called from debugcon_putchar). Safe in any context. */
 void klog_putc(char c);
 
+/* [M46] Mirror user console output (fd 1/2 to the console) to the debugcon in
+ * whole lines. A program often builds one line from several write() calls; a
+ * kernel line printed between them (a [SCHED] preempt, an [AUDIT]) used to
+ * land in the middle of it. Bytes are held until '\n' (or a full buffer) and
+ * the line goes out in one piece under the debugcon line lock, so kernel
+ * lines only ever appear between user lines. An unterminated tail (a shell
+ * prompt) is flushed by the timer tick after DEBUGCON_USER_HOLD_TICKS. */
+#define DEBUGCON_USER_HOLD_TICKS 200
+void debugcon_user_write(const char* buf, int len);
+void debugcon_user_tick(uint64_t now_ticks);
+
 /* Snapshot window [*start, *end) of absolute stream positions holding whole
  * records. from_clear: start at the CLEAR mark (READ_ALL), else at the oldest
  * byte still in the ring. */
