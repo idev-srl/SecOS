@@ -116,21 +116,25 @@ void terminal_initialize(void){
 
 /* Kernel output: '\n' means "new line" (CR+LF) for every kernel caller. */
 void terminal_putchar(char c){
+	uint64_t lf = con_lock();   // [M48] serial mirror + vt in one piece
 	// Mirror every character to COM1 so the console is usable headless
 	// (no-op until serial_init() runs; harmless when no -serial is attached).
 	serial_putchar(c);
 	if (c == '\n') {
 		static const char crlf[2] = { '\r', '\n' };
 		vt_write(crlf, 2);
+		con_unlock(lf);
 		return;
 	}
 	vt_putc(c);
+	con_unlock(lf);
 }
 
 /* User (TTY) output: bytes go to the emulator as-is, except that with
  * OPOST|ONLCR a '\n' becomes CR+LF (termios output processing). The serial
  * mirror follows the same rule so a host terminal sees identical bytes. */
 void terminal_write_tty(const char* s, size_t n, int onlcr){
+	uint64_t lf = con_lock();   // [M48] one write() comes out whole
 	char buf[256]; size_t k = 0;
 	for (size_t i = 0; i < n; i++) {
 		char c = s[i];
@@ -139,12 +143,17 @@ void terminal_write_tty(const char* s, size_t n, int onlcr){
 		if (k >= sizeof(buf) - 2) { vt_write(buf, k); k = 0; }
 	}
 	if (k) vt_write(buf, k);
+	con_unlock(lf);
 }
 
-void terminal_write(const char* data,size_t size){ for(size_t i=0;i<size;i++) terminal_putchar(data[i]); }
+void terminal_write(const char* data,size_t size){
+	uint64_t lf = con_lock();   // [M48] a kernel string is never split by another CPU
+	for(size_t i=0;i<size;i++) terminal_putchar(data[i]);
+	con_unlock(lf);
+}
 static size_t strlen(const char* s){ size_t l=0; while(s[l]) l++; return l; }
 void terminal_writestring(const char* data){ terminal_write(data,strlen(data)); }
-void print_hex(uint64_t value){ char hc[]="0123456789ABCDEF"; char buf[17]; buf[16]='\0'; for(int i=15;i>=0;i--){ buf[i]=hc[value & 0xF]; value >>=4; } terminal_writestring("0x"); terminal_writestring(buf); }
+void print_hex(uint64_t value){ char hc[]="0123456789ABCDEF"; char buf[19]; buf[0]='0'; buf[1]='x'; buf[18]='\0'; for(int i=17;i>=2;i--){ buf[i]=hc[value & 0xF]; value >>=4; } terminal_writestring(buf); }
 
 void print_dec(uint64_t v){ char tmp[32]; int i=0; if(v==0){ terminal_putchar('0'); return; } while(v>0){ tmp[i++]='0'+(v%10); v/=10; } while(i>0){ terminal_putchar(tmp[--i]); } }
 

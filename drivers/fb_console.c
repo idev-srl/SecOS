@@ -471,9 +471,16 @@ static void fb_console_draw_logo_glow(void){
 }
 
 // Timer tick callback
+static void fb_console_tick_locked(void);
 static void fb_console_tick(void){
     if(!cursor_blink_enabled || !fb_enabled || fb_gfx) return;
     if(vt_busy()) return;   // output in progress: the cursor position may be transient
+    uint64_t lf;            // [M48] another CPU may be writing: skip this blink
+    if(!con_trylock(&lf)) return;
+    fb_console_tick_locked();
+    con_unlock(lf);
+}
+static void fb_console_tick_locked(void){
     blink_counter++;
     // Update glow slowly every 5 ticks independent of cursor blink (not while a
     // full-screen program owns the screen: it would paint over its text).

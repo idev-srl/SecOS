@@ -31,6 +31,8 @@
  * "cursor_x == cols" state that once let the cursor draw past the back buffer.
  */
 #include "vt.h"
+#include "percpu.h"     /* [M48] console lock owner */
+#include "spinlock.h"   /* cpu_relax_poll */
 
 static const vt_ops_t* g_ops;
 static int g_cols, g_rows;
@@ -662,8 +664,50 @@ static void feed(uint8_t c) {
     else put_glyph(cp437_fallback(c));
 }
 
+/* ---- [M48] console lock ------------------------------------------------------
+ * The emulator state (grid, cursor, escape parser) and the backends are shared
+ * by every CPU: two CPUs feeding it at once corrupt the parser and can push the
+ * cursor outside the grid. con_lock() serializes all output (terminal.c takes
+ * it around a whole kernel string or TTY write, so those also come out in one
+ * piece on the serial mirror). It is recursive per CPU (an exception or panic
+ * path on the CPU that holds it must still print) and bounded: a CPU that died
+ * holding it must not silence the others, so after a long spin the caller
+ * proceeds unlocked. Interrupts are off while it is held. */
+static volatile uint32_t g_con_owner;      /* CPU index + 1, 0 = free */
+static uint32_t g_con_depth;
+#define CON_NOT_HELD (1ULL << 63)          /* never set in RFLAGS */
+uint64_t con_lock(void) {
+    uint64_t fl;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
+    if (g_cpu_count <= 1) { g_con_depth++; return fl; }
+    uint32_t me = this_cpu()->index + 1;
+    if (g_con_owner == me) { g_con_depth++; return fl; }
+    for (uint32_t i = 0; i < 50000000u; i++) {
+        if (__sync_bool_compare_and_swap(&g_con_owner, 0, me)) { g_con_depth = 1; return fl; }
+        cpu_relax_poll();
+    }
+    return fl | CON_NOT_HELD;
+}
+void con_unlock(uint64_t fl) {
+    if (!(fl & CON_NOT_HELD) && g_con_depth && --g_con_depth == 0 && g_cpu_count > 1)
+        __sync_lock_release(&g_con_owner);
+    fl &= ~CON_NOT_HELD;
+    __asm__ volatile ("push %0; popfq" :: "r"(fl) : "memory", "cc");
+}
+/* Non-blocking variant for the cursor-blink tick: 1 = taken. */
+int con_trylock(uint64_t* fl) {
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(*fl) :: "memory");
+    if (g_cpu_count <= 1) { g_con_depth++; return 1; }
+    uint32_t me = this_cpu()->index + 1;
+    if (g_con_owner == me) { g_con_depth++; return 1; }
+    if (__sync_bool_compare_and_swap(&g_con_owner, 0, me)) { g_con_depth = 1; return 1; }
+    __asm__ volatile ("push %0; popfq" :: "r"(*fl) : "memory", "cc");
+    return 0;
+}
+
 /* ---- public entry points --------------------------------------------------- */
 void vt_attach(const vt_ops_t* ops, int cols, int rows) {
+    uint64_t lf = con_lock();
     g_busy++;
     if (cols > VT_MAX_COLS) cols = VT_MAX_COLS;
     if (rows > VT_MAX_ROWS) rows = VT_MAX_ROWS;
@@ -676,10 +720,12 @@ void vt_attach(const vt_ops_t* ops, int cols, int rows) {
     for (int y = 0; y < g_rows; y++)
         for (int x = 0; x < g_cols; x++) g_grid[y][x] = b;
     g_busy--;
+    con_unlock(lf);
 }
 
 void vt_putc(char c) {
     if (!g_ops) return;
+    uint64_t lf = con_lock();
     g_busy++;
     cursor_hide();
     feed((uint8_t)c);
@@ -687,10 +733,12 @@ void vt_putc(char c) {
     cursor_show();
     if (g_ops->flush) g_ops->flush();
     g_busy--;
+    con_unlock(lf);
 }
 
 void vt_write(const char* s, size_t n) {
     if (!g_ops || !s) return;
+    uint64_t lf = con_lock();
     g_busy++;
     cursor_hide();
     for (size_t i = 0; i < n; i++) feed((uint8_t)s[i]);
@@ -698,4 +746,5 @@ void vt_write(const char* s, size_t n) {
     cursor_show();
     if (g_ops->flush) g_ops->flush();
     g_busy--;
+    con_unlock(lf);
 }

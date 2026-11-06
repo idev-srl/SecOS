@@ -80,6 +80,11 @@ void vt_attach(const vt_ops_t* ops, int cols, int rows);
 int  vt_active(void);
 
 /* Feed output bytes (UTF-8 + escape sequences). */
+/* [M48] Console lock (recursive per CPU, bounded, IRQs off while held): wraps
+ * every vt mutation; take it around a multi-call sequence to keep it whole. */
+uint64_t con_lock(void);
+void con_unlock(uint64_t flags);
+int  con_trylock(uint64_t* flags);
 void vt_putc(char c);
 void vt_write(const char* s, size_t n);
 
