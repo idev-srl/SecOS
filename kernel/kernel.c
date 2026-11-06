@@ -2310,6 +2310,11 @@ static void kernel_main_phase2(void) {
     // vda, or the corrupt-image suite when AHCI disks are attached.
     { extern void exfat_selftest(void); exfat_selftest(); }
 #endif
+#if M42_NTFS_DEMO
+    // [M42] NTFS read-only self-test: the host-made image on vda (walk +
+    // hashes, EROFS), or the corrupt-image suite when AHCI disks are attached.
+    { extern void ntfs_selftest(void); ntfs_selftest(); }
+#endif
     // [M24] Networking: probe NICs (e1000/e1000e/vmxnet3/igc), bring up the stack
     // with a static IP. Use the shell `ping` / `netinfo` commands to exercise it.
     { extern int net_init(void); net_init(); }
