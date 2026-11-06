@@ -181,8 +181,24 @@ robustness and the paused real-hardware bring-up — see below.
          volumes untested; found on the way: `SYS_MOUNT` hands fat32/ext2 a stack
          mount-point pointer, `fat32` page-cache staleness on inode-slot reuse,
          constant `st_dev` breaks `df <path>`);
-   - [ ] **NTFS read-only first, read-write later** — probably by porting Linux `ntfs3`
-         (GPLv2) through a compat shim, as done for ath9k (`drivers/ath9k_port/`).
+   - [x] **NTFS read-only** — **M42**, `fs/ntfs.c`, written from public docs (no GPL
+         code), `docs/devlog/M42-ntfs.md`: run lists, `$ATTRIBUTE_LIST`, `$UpCase`
+         lookups, B+ tree directories, sparse + LZNT1 files, symlinks/junctions,
+         EFS -> EACCES, EROFS on writes, up to 4 volumes; kernel listing == ntfs-3g's,
+         ~63k fuzzed images clean (open: ADS not exposed, WOF/dedup files -EIO,
+         `$LogFile` ignored, fragmented-`$MFT` path untested);
+   - [ ] **NTFS read-write** — needs, on top of M42: cluster allocation in `$Bitmap`
+         and MFT record allocation in `$MFT:$BITMAP` (+ `$MFT` growth / extension
+         records and attribute-list maintenance); run-list encoding; resident <->
+         non-resident conversion; `$I30` B+ tree insert/delete with node split/merge
+         and `$BITMAP` upkeep; `$FILE_NAME` duplicates in the parent index kept in
+         sync; `$STANDARD_INFORMATION` + security ids (`$Secure`) for new files;
+         `$MFTMirr` updates; the `$LogFile` (at minimum refuse to write unless it is
+         clean, then reset it and set/clear the `$Volume` dirty flag as Windows and
+         ntfs-3g do); writing compressed and sparse files (or refusing); `SYS_MOUNT`
+         needs a flags argument so `-o ro`/`rw` reach the driver; validate every
+         image on the host (`ntfsfix -n`, ideally Windows chkdsk). Keep it
+         clean-room (public docs only), as for M42.
 4. [ ] **init / services hardening:** DHCP lease renewal, service dependencies beyond
    file order, per-service caps/limits, a GUI session that survives a console logout.
 5. [ ] **Signed packages**: package keyring + revocation (see Kernel robustness).
