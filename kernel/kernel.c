@@ -1433,7 +1433,7 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
     // it left behind and give the console to the kernel shell.
     { extern vfs_inode_t* vfs_lookup(const char*);
       if (!vfs_lookup("/bin/init")) {
-          terminal_writestring("init: /bin/init not found; falling back to bash\n");
+          terminal_writestring("init: /bin/init not found; falling back to the console login/bash\n");
           debugcon_writestring("[INIT] /bin/init missing; fallback to bash\n");
       } else {
           terminal_writestring("Starting /bin/init (PID 1)...\n");
@@ -1449,6 +1449,25 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
               debugcon_writestring("[INIT] PID 1 died; fallback to the kernel shell\n");
               init_kill_orphans();
               shell_run();
+          }
+      } }
+#endif
+#if !defined(SECOS_NO_BASH) && !defined(SECOS_CONSOLE_ROOT)
+    // [M43] No working init: do not hand out an unauthenticated root shell.
+    // Run the signed /bin/login on the console instead, again after every
+    // logout. Only when login is missing or refused (signature) does the boot
+    // fall through to the bash below (and CONSOLE=root builds keep that bash).
+    { extern vfs_inode_t* vfs_lookup(const char*);
+      if (vfs_lookup("/bin/login")) {
+          static const char* const lav[] = { "login", 0 };
+          debugcon_writestring("[INIT] console fallback: /bin/login\n");
+          for (;;) {
+              int r = shell_exec_foreground("/bin/login", 1, lav, 0, 0);
+              if (r < 0) {
+                  terminal_writestring("login: /bin/login could not be started; falling back to bash\n");
+                  debugcon_writestring("[INIT] FAIL: /bin/login refused; fallback to bash\n");
+                  break;
+              }
           }
       } }
 #endif
