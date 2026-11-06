@@ -1375,6 +1375,7 @@ static void coreutils_install(void) {
 #include "../crypto/user_secwm_elf.h"
 #include "../crypto/user_sysinfo_elf.h"
 #include "../crypto/user_swptest_elf.h"
+#include "../crypto/user_sysmon_elf.h"   // LVGL 9.2 system monitor (make port-lvgl)
 static void gui_install(void) {
     extern int vfs_create(const char*, const void*, size_t);
     extern vfs_inode_t* vfs_lookup(const char*);
@@ -1388,10 +1389,11 @@ static void gui_install(void) {
     if (!vfs_lookup("/bin/startgui")) vfs_create("/bin/startgui", user_secwm_elf, user_secwm_elf_len);
     if (!vfs_lookup("/bin/sysinfo")) vfs_create("/bin/sysinfo", user_sysinfo_elf, user_sysinfo_elf_len);
     if (!vfs_lookup("/bin/swptest")) vfs_create("/bin/swptest", user_swptest_elf, user_swptest_elf_len);
+    if (!vfs_lookup("/bin/sysmon")) vfs_create("/bin/sysmon", user_sysmon_elf, user_sysmon_elf_len);
 #ifdef SECOS_GUI_AUTOSTART
     if (!vfs_lookup("/etc/gui-autostart")) vfs_create("/etc/gui-autostart", "1\n", 2);
 #endif
-    debugcon_writestring("[GUI] secwm + startgui + sysinfo + swptest installed to /bin\n");
+    debugcon_writestring("[GUI] secwm + startgui + sysmon + sysinfo + swptest installed to /bin\n");
 }
 // BusyBox 1.36.1 from source (tools/port-busybox.sh): the signed multi-call
 // binary goes to /bin/busybox and a tiny signed stub (user/bbstub.c, re-execs

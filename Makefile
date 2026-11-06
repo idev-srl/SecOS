@@ -541,6 +541,15 @@ port-bash:
 # compiled against the SecOS libc + user/busybox-include + user/busybox_compat.c,
 # signed -> crypto/user_busybox_elf.h + the applet stub crypto/user_bbstub_elf.h
 # + kernel/busybox_applets.h. Needs network (first run) + python3 'cryptography'.
+# LVGL 9.2.2 (MIT) from source: tools/port-lvgl.sh fetches the pinned release
+# (SHA-256 checked), compiles it with user/lvgl/lv_conf.h and links the LVGL
+# system monitor (user/lvgl/sysmon.c, an SWP client of secwm, confined
+# manifest) -> crypto/user_sysmon_elf.h, installed as /bin/sysmon.
+.PHONY: port-lvgl
+port-lvgl:
+	bash tools/port-lvgl.sh
+	@echo "port-lvgl: LVGL $(shell sed -n 's/^LV=//p' tools/port-lvgl.sh) built from source, sysmon signed -> crypto/user_sysmon_elf.h"
+
 .PHONY: port-busybox
 port-busybox:
 	bash tools/port-busybox.sh

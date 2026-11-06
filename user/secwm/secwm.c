@@ -645,6 +645,11 @@ static win_t* spawn_client(const char* cmd) {
     return w;
 }
 
+/* The System launcher: the LVGL monitor when installed, else the plain one. */
+static void open_system(void) {
+    spawn_client(access("/bin/sysmon", 0) == 0 ? "/bin/sysmon" : "/bin/sysinfo");
+}
+
 /* ---- SWP: client protocol (all input untrusted) ------------------------- */
 static void send_ev(client_t* c, uint32_t type, const void* p, uint32_t len) {
     uint8_t b[8 + 64];
@@ -1041,7 +1046,7 @@ static void key_event(int code, int value) {
         case KEY_N: focus_next(); return;
         case KEY_W: if (focus) close_win_request(focus); return;
         case KEY_C: open_clock(); return;
-        case KEY_S: spawn_client("/bin/sysinfo"); return;
+        case KEY_S: open_system(); return;
         default: break;
         }
     }
@@ -1146,7 +1151,7 @@ static void button_event(int btn, int value) {
             switch (pbtn[i].action) {
             case ACT_TERM: open_terminal(); break;
             case ACT_CLOCK: open_clock(); break;
-            case ACT_SYSINFO: spawn_client("/bin/sysinfo"); break;
+            case ACT_SYSINFO: open_system(); break;
             case ACT_EXIT: quit_gui(); break;
             case ACT_TASK:
                 if (pbtn[i].w && pbtn[i].w->used && pbtn[i].w->visible) { raise_win(pbtn[i].w); set_focus(pbtn[i].w); }
