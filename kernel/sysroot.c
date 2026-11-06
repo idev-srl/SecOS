@@ -88,6 +88,16 @@ extern int vfs_read_all(const char*, void*, size_t);
 #endif
 #include "../crypto/user_netcfg_elf.h"
 #include "../build/authorized_keys.h"
+// [M43] Multi-user tools: login/su/sudo/passwd (SETID manifest, root 04755),
+// usertools (useradd & co., id, whoami, groups).
+#include "../crypto/user_login_elf.h"
+#include "../crypto/user_su_elf.h"
+#include "../crypto/user_sudo_elf.h"
+#include "../crypto/user_passwd_elf.h"
+#include "../crypto/user_usertools_elf.h"
+// make ROOT_PASSWORD=... / ROOT_PASSWORD_HASH=...: SECOS_ROOT_PWHASH is the
+// SHA-512 crypt hash computed on the build host ("" when not set).
+#include "../build/root_pwhash.h"
 #if defined(SECOS_SYSROOT_TEST)
 // Selftest hook (tools/selftest.sh, persistent-root gate): /bin/sysroot_probe
 // is one signed program in build 1 and another in build 2, to prove that an
@@ -155,6 +165,9 @@ static void sf_add(int kind, const char* path, const void* data, size_t len, con
 }
 static void bin_path(char* out, const char* name){ sr_cpy(out, "/bin/", 64); sr_cat(out, name, 64); }
 static void sf_bin(const char* name, const void* d, size_t n){ char p[64]; bin_path(p,name); sf_add(SF_BIN,p,d,n,0,0,0755); }
+/* [M43] A set-user-id root program. The bit takes effect only because the
+ * program's signed manifest carries MANIFEST_FLAG_SETID (kernel/cred.c). */
+static void sf_bin_setuid(const char* name, const void* d, size_t n){ char p[64]; bin_path(p,name); sf_add(SF_BIN,p,d,n,0,0,04755); }
 /* An alias is a symlink on disk (its mode is the target's) and a copy of the
  * program on ramfs, which gets the program's 0755. */
 static void sf_alias(const char* name, const char* target, const void* d, size_t n, int fl){
@@ -173,6 +186,7 @@ static const struct { const char* p; uint16_t mode; uint8_t flags; } g_dirs[] = 
     { "/bin",           0755,  SD_CREATE },
     { "/etc",           0755,  SD_CREATE },
     { "/etc/dropbear",  0700,  SD_CREATE },   /* the SSH host key */
+    { "/etc/skel",      0755,  SD_CREATE },   /* copied into new homes (useradd) */
     { "/usr",           0755,  SD_CREATE },
     { "/usr/bin",       0755,  0 },
     { "/usr/local",     0755,  0 },
@@ -206,28 +220,38 @@ static const char g_default_passwd[] = "root:x:0:0:root:/root:/bin/bash\n";
 
 /* ---- default configuration (SF_CONF: created only when missing) ------------ */
 #ifndef SECOS_NO_INIT
-// The default /etc/inittab: network, supervised sshd, console bash, and the GUI
+// The default /etc/inittab: network, supervised sshd, console login (or root bash), and the GUI
 // hook (`startgui --auto` is a no-op unless /etc/gui-autostart, or the build
 // default on /proc/cmdline when the file is absent, enables it). Format:
 // docs/devlog/M40-init.md.
-static const char g_default_inittab[] =
-    "# /etc/inittab - SecOS init (PID 1). One entry per line:\n"
-    "#   <id>:<action>:<command> [args...]\n"
-    "# id       short name, used in messages and for /var/log/<id>.log\n"
-    "# action   sysinit   run at boot in file order and wait for it\n"
-    "#          respawn   own session, output to /var/log/<id>.log, restarted\n"
-    "#                    with backoff (1 s doubling to 30 s) when it exits\n"
-    "#          console   respawn on the console as session leader with the\n"
-    "#                    console as controlling tty and foreground group\n"
-    "#          once      start at boot, never restarted\n"
-    "#          shutdown  run (and waited for) when the system goes down\n"
-    "# The command is split on blanks and run directly (no shell, no quoting).\n"
-    "net:sysinit:/bin/ifup -t 10\n"
-    "sshd:respawn:/bin/dropbearmulti dropbear -F -R -p 22\n"
-    "console:console:/bin/bash -i\n"
-    "# GUI at boot: on when /etc/gui-autostart says 1 (0 = off); without the\n"
-    "# file, the build default (make GUI_AUTOSTART=1) decides. docs/GUI.md.\n"
-    "gui:once:/bin/startgui --auto\n";
+#define INITTAB_TEXT(console_line) \
+    "# /etc/inittab - SecOS init (PID 1). One entry per line:\n" \
+    "#   <id>:<action>:<command> [args...]\n" \
+    "# id       short name, used in messages and for /var/log/<id>.log\n" \
+    "# action   sysinit   run at boot in file order and wait for it\n" \
+    "#          respawn   own session, output to /var/log/<id>.log, restarted\n" \
+    "#                    with backoff (1 s doubling to 30 s) when it exits\n" \
+    "#          console   respawn on the console as session leader with the\n" \
+    "#                    console as controlling tty and foreground group\n" \
+    "#          once      start at boot, never restarted\n" \
+    "#          shutdown  run (and waited for) when the system goes down\n" \
+    "# The command is split on blanks and run directly (no shell, no quoting).\n" \
+    "net:sysinit:/bin/ifup -t 10\n" \
+    "sshd:respawn:/bin/dropbearmulti dropbear -F -R -p 22\n" \
+    console_line \
+    "# GUI at boot: on when /etc/gui-autostart says 1 (0 = off); without the\n" \
+    "# file, the build default (make GUI_AUTOSTART=1) decides. docs/GUI.md.\n" \
+    "gui:once:/bin/startgui --auto\n"
+// [M43] The console runs /bin/login (getty-style, docs/USERS.md); a build with
+// CONSOLE=root (-DSECOS_CONSOLE_ROOT, what the selftest uses) keeps the root
+// bash of before. The text before M43 is exactly the root variant.
+static const char g_inittab_login[] = INITTAB_TEXT("console:console:/bin/login\n");
+static const char g_inittab_root[]  = INITTAB_TEXT("console:console:/bin/bash -i\n");
+#ifdef SECOS_CONSOLE_ROOT
+#define g_default_inittab g_inittab_root
+#else
+#define g_default_inittab g_inittab_login
+#endif
 #endif
 #ifndef SECOS_NO_BASH
 static const char g_bashrc[] =
@@ -254,6 +278,25 @@ static const char g_inputrc[] =
     "\"\\e[1;5C\": forward-word\n"
     "\"\\e[1;5D\": backward-word\n";
 #endif
+
+// [M43] Login shells (login, su -, sudo -i) read /etc/profile; new homes get
+// /etc/skel. Created only when missing, like every SF_CONF.
+static const char g_profile[] =
+    "# /etc/profile - read by login shells (SecOS)\n"
+    "export PATH=\"${PATH:-/usr/local/bin:/usr/bin:/bin}\"\n"
+    "umask 022\n"
+    "# Interactive bash: the system-wide settings too.\n"
+    "if [ -n \"$BASH_VERSION\" ] && [ -n \"$PS1\" ] && [ -f /etc/bash.bashrc ]; then\n"
+    "    . /etc/bash.bashrc\n"
+    "fi\n";
+static const char g_skel_profile[] =
+    "# ~/.profile - read by login shells\n"
+    "if [ -n \"$BASH_VERSION\" ] && [ -f \"$HOME/.bashrc\" ]; then\n"
+    "    . \"$HOME/.bashrc\"\n"
+    "fi\n";
+static const char g_skel_bashrc[] =
+    "# ~/.bashrc - read by interactive bash\n"
+    "PS1='\\u@\\h:\\w\\$ '\n";
 
 static const char* default_group(void){
     static char buf[256];
@@ -346,6 +389,20 @@ static void build_table(void){
 #endif
     // Interface configuration (SYS_NETCTL); its ifconfig replaces BusyBox's,
     // which needs SIOCGIF* ioctls SecOS does not have.
+    // [M43] Accounts. login/su/sudo/passwd are the only set-uid programs.
+    // usertools comes after BusyBox so its id/whoami win (they read the real
+    // ids; BusyBox's applets of the same name are replaced).
+    sf_bin_setuid("login", user_login_elf, user_login_elf_len);
+    sf_bin_setuid("su", user_su_elf, user_su_elf_len);
+    sf_bin_setuid("sudo", user_sudo_elf, user_sudo_elf_len);
+    sf_bin_setuid("passwd", user_passwd_elf, user_passwd_elf_len);
+    sf_bin("usertools", user_usertools_elf, user_usertools_elf_len);
+    { static const char* const ut[] = { "useradd","userdel","usermod","groupadd","groupdel","chpasswd",
+                                        "id","whoami","groups", 0 };
+      for(int i=0; ut[i]; i++) sf_alias(ut[i], "usertools", user_usertools_elf, user_usertools_elf_len, 0); }
+    sf_conf("/etc/profile", g_profile);
+    sf_conf("/etc/skel/.profile", g_skel_profile);
+    sf_conf("/etc/skel/.bashrc", g_skel_bashrc);
     sf_bin("netcfg", user_netcfg_elf, user_netcfg_elf_len);
     sf_alias("ifup", "netcfg", user_netcfg_elf, user_netcfg_elf_len, 0);
     sf_alias("ifdown", "netcfg", user_netcfg_elf, user_netcfg_elf_len, 0);
@@ -687,6 +744,57 @@ static void ensure_groups(void){
     }
 }
 
+/* [M43] /etc/inittab is the administrator's once it exists, except while it is
+ * still one of the kernel's own default texts, unmodified: then it follows the
+ * console policy of the running build (login, or root bash with CONSOLE=root),
+ * so switching the build switches an untouched system too. */
+static void update_default_inittab(void){
+#ifndef SECOS_NO_INIT
+    const char* want = g_default_inittab;
+    const char* other = (want == g_inittab_login) ? g_inittab_root : g_inittab_login;
+    if(file_equals("/etc/inittab", want, sr_len(want))) return;
+    if(!file_equals("/etc/inittab", other, sr_len(other))) return;
+    if(install_file("/etc/inittab", (const uint8_t*)want, sr_len(want), 0644)==0){
+        debugcon_writestring(want == g_inittab_login ? "[SYSROOT] default /etc/inittab: console login\n"
+                                                     : "[SYSROOT] default /etc/inittab: root console (CONSOLE=root)\n");
+    } else g_st.failed++;
+#endif
+}
+
+/* [M43] make ROOT_PASSWORD=...: give root the hash computed on the build host,
+ * but only while root's password is still the never-set "!" of a fresh
+ * /etc/shadow; a password set (or locked) on the system is never overridden.
+ * The plain password is not in the image, only its SHA-512 crypt hash. */
+static void apply_root_password(void){
+    static const char h[] = SECOS_ROOT_PWHASH;
+    if(!h[0]) return;
+    static char buf[16384], out[16384];
+    int n=vfs_read_all("/etc/shadow", buf, sizeof(buf)-1);
+    if(n<0){ debugcon_writestring("[SYSROOT] FAIL: no /etc/shadow for ROOT_PASSWORD\n"); return; }
+    buf[n]=0;
+    int ls=-1;                                           /* start of the root line */
+    for(int p=0; p<n; ){
+        if(sr_eqn(buf+p, "root:", 5)){ ls=p; break; }
+        while(p<n && buf[p]!='\n') p++;
+        p++;
+    }
+    if(ls<0){ debugcon_writestring("[SYSROOT] FAIL: no root entry in /etc/shadow\n"); return; }
+    int f1=ls+5, f2=f1; while(f2<n && buf[f2]!=':' && buf[f2]!='\n') f2++;
+    if(!(f2==f1+1 && buf[f1]=='!')){
+        debugcon_writestring("[SYSROOT] root password already set on the system: ROOT_PASSWORD not applied\n");
+        return;
+    }
+    size_t hl=sr_len(h), o=0;
+    if((size_t)n + hl + 2 >= sizeof(out)) return;
+    for(int i=0;i<f1;i++) out[o++]=buf[i];
+    for(size_t i=0;i<hl;i++) out[o++]=h[i];
+    for(int i=f2;i<n;i++) out[o++]=buf[i];
+    if(install_file("/etc/shadow", (const uint8_t*)out, o, 0600)==0)
+        debugcon_writestring("[SYSROOT] root password set from the build (ROOT_PASSWORD)\n");
+    else { g_st.failed++; debugcon_writestring("[SYSROOT] FAIL: could not set the root password\n"); }
+    for(size_t i=0;i<o;i++) out[i]=0;
+}
+
 static int present(const char* p){ return vfs_lookup(p)!=0; }
 
 /* The per-component markers the selftests assert on (same text as before). */
@@ -724,6 +832,12 @@ static void report_components(void){
     debugcon_writestring(present("/bin/dropbearmulti") ? "[SSH] installed dropbear to /bin/dropbearmulti\n"
                                                        : "[SSH] FAIL: could not install /bin/dropbearmulti\n");
 #endif
+    { vfs_inode_t* su=vfs_lookup("/bin/su");
+      int setuid_ok = su && (su->mode & 04000) && su->uid==0;
+      debugcon_writestring(present("/bin/login") && setuid_ok && present("/bin/sudo") && present("/bin/passwd") &&
+                           present("/bin/useradd") && present("/bin/id")
+                           ? "[USERS] login/su/sudo/passwd (set-uid) + useradd/userdel/usermod/groupadd/groupdel/chpasswd/id/whoami/groups installed to /bin\n"
+                           : "[USERS] FAIL: could not install the account tools\n"); }
     debugcon_writestring(present("/bin/netcfg") && present("/bin/ifup") && present("/bin/ifdown") && present("/bin/ifconfig")
                          ? "[NET] netcfg/ifup/ifdown/ifconfig installed to /bin\n"
                          : "[NET] FAIL: could not install netcfg\n");
@@ -739,6 +853,8 @@ void sysroot_provision(void){
     build_table();
     if(g_persistent) provision_disk(); else provision_ramfs();
     ensure_groups();
+    apply_root_password();
+    update_default_inittab();
     // Release stamp of the running kernel (kernel-owned).
     write_if_changed("/etc/secos-release",
         "NAME=SecOS\nVERSION=0.1.0-dev\nBUILD_TS=" BUILD_TS "\nGIT_HASH=" GIT_HASH "\n");

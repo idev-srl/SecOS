@@ -492,6 +492,11 @@ static int gen_key(uint64_t key){
 #else
         sb_str(&s," secos.gui_autostart=0");
 #endif
+#ifdef SECOS_CONSOLE_ROOT
+        sb_str(&s," secos.console=root");                /* [M43] make CONSOLE=root */
+#else
+        sb_str(&s," secos.console=login");
+#endif
         sb_putc(&s,'\n'); break; }
     case PK_SELF: { process_t* c=sched_get_current(); if(!c||!c->pid) return -1; sb_u64(&s,c->pid); break; }
     case PK_PID_STAT: gen_pid_stat(&s); break;
