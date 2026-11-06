@@ -167,20 +167,19 @@ robustness and the paused real-hardware bring-up — see below.
          with the errors flag is refused, repair it with host `e2fsck`);
    - [ ] extent trees deeper than one level (writes), htree insert without dropping the
          index (and its csum tails).
-2. [ ] **Real multi-user management.** Model: **the code signature still decides
-   *which code* may run; the uid decides *who* may access which files.** This
-   **revises the M26 decision** "POSIX metadata stored & exposed, not enforced":
-   - [ ] enforce uid/gid + file modes (owner/group/other rwx, directory x/w, sticky
-         `/tmp`) in the VFS; uid 0 (root) is exempt; per-process uid/gid/euid +
-         supplementary groups, inherited across fork/exec; `setuid`/`setgid` syscalls
-         (root only);
-   - [ ] `login` with salted, hashed passwords in `/etc/shadow` (mode 0600; a slow KDF,
-         e.g. PBKDF2-SHA-512 on the in-kernel/libc crypto, or yescrypt/bcrypt);
-         `useradd`, `passwd`, `su` (sudo optional);
-   - [ ] a home directory per user (`/home/<user>`, `/root` for root);
-   - [ ] SSH logs in as the matching user (Dropbear multi-user mode,
-         `~user/.ssh/authorized_keys`) instead of always root;
-   - [ ] init's console runs `login` (or a getty) instead of a root bash, opt-out for dev.
+2. [x] **Real multi-user management** (M43, `docs/devlog/M43-multiuser.md`, `docs/USERS.md`).
+   The code signature decides *which code* runs; the uid decides *who* it acts for
+   (**revises M26**: modes are enforced now).
+   - [x] uid/gid/euid/suid + supplementary groups, syscalls 100-109, VFS permission checks,
+         sticky `/tmp`, device node modes; set-id only with `MANIFEST_FLAG_SETID`;
+   - [x] `login` (+ first-boot setup, `ROOT_PASSWORD`), `su`, `sudo` (wheel), `passwd`,
+         `useradd/userdel/usermod/groupadd/groupdel/chpasswd/id/whoami/groups`; SHA-512 crypt;
+   - [x] `/home/<user>` 0700 from `/etc/skel`; init's console runs `login` (`CONSOLE=root` opt-out);
+   - [x] secwm runs as the logged-in user (video/input groups);
+   - [ ] SSH logs in as the matching user (Dropbear multi-user mode, `~user/.ssh/authorized_keys`)
+         — `feat/multiuser-ports`; also bash/BusyBox uid stubs (`\u` in PS1 shows root);
+   - [ ] a hostile multi-user selftest gate (a user probing every boundary, exact errnos);
+   - [ ] the kernel's missing/unsigned-init fallback is still an unauthenticated root bash.
 3. [ ] **More filesystems:**
    - [ ] **exFAT read-write** (the specification is public since 2019): boot-sector
          checksum, FAT + allocation bitmap, up-case table, directory entry sets with
