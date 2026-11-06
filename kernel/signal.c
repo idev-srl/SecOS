@@ -14,6 +14,8 @@
 #include "sched.h"
 #include "debugcon.h"
 #include "../mm/user_copy.h"
+#include "cred.h"
+#define INT32_MIN_ (-2147483647 - 1)
 
 extern process_t* sched_get_current(void);
 extern process_t* process_find_by_pid(uint32_t pid);
@@ -141,11 +143,19 @@ int signal_post(process_t* p, int sig) {
 // Collect the group under proc_lock, post outside it: signal_post may look up
 // the parent (SIGCONT -> SIGCHLD), which takes proc_lock again.
 #define PG_MAX 64
-struct pg_ctx { uint32_t pgid; int n; process_t* t[PG_MAX]; uint32_t skip; int all; };
+// sender != NULL: kill(2) from a process -- only targets it may signal are
+// collected (kernel/cred.c: cred_may_signal); NULL = kernel-originated (Ctrl-C).
+struct pg_ctx { uint32_t pgid; int n; process_t* t[PG_MAX]; uint32_t skip; int all; process_t* sender; int sig; int denied; };
 static void pg_cb(process_t* p, void* u) {
     struct pg_ctx* c = (struct pg_ctx*)u;
     if (p->state == PROC_ZOMBIE || c->n >= PG_MAX) return;
-    if (c->all ? (p->pid != 0 && p->pid != c->skip) : (p->pgid == c->pgid)) c->t[c->n++] = p;
+    if (!(c->all ? (p->pid != 0 && p->pid != c->skip) : (p->pgid == c->pgid))) return;
+    if (c->sender && !cred_may_signal(c->sender, p, c->sig)) {   // [M42]
+        c->denied++;
+        return;
+    }
+    if (c->all && c->sender && p->pid == 1 && !cred_is_root(c->sender)) return;
+    c->t[c->n++] = p;
 }
 static int post_collected(struct pg_ctx* c, int sig) {
     int n = 0;
@@ -154,15 +164,27 @@ static int post_collected(struct pg_ctx* c, int sig) {
 }
 int signal_post_pgid(uint32_t pgid, int sig) {
     if (pgid == 0) return 0;
-    struct pg_ctx c; c.pgid = pgid; c.n = 0; c.skip = 0; c.all = 0;
+    struct pg_ctx c; c.pgid = pgid; c.n = 0; c.skip = 0; c.all = 0; c.sender = NULL; c.sig = sig; c.denied = 0;
     process_foreach(pg_cb, &c);
     return post_collected(&c, sig);
 }
 // kill(-1, sig): every user process except the caller (POSIX "all processes
 // the caller may signal"; single-user system).
 static int signal_post_all(uint32_t except, int sig) {
-    struct pg_ctx c; c.pgid = 0; c.n = 0; c.skip = except; c.all = 1;
+    struct pg_ctx c; c.pgid = 0; c.n = 0; c.skip = except; c.all = 1; c.sender = NULL; c.sig = sig; c.denied = 0;
     process_foreach(pg_cb, &c);
+    return post_collected(&c, sig);
+}
+// [M42] kill(-1 / -pgid) from `sender`: post to the targets it may signal.
+// Returns the number signalled; *denied counts the ones refused (EPERM when
+// nothing could be signalled but something matched).
+static int signal_post_checked(process_t* sender, uint32_t pgid, int all, int sig, int* denied) {
+    struct pg_ctx c; c.pgid = pgid; c.n = 0; c.skip = sender ? sender->pid : 0; c.all = all;
+    c.sender = sender; c.sig = sig; c.denied = 0;
+    if (!all) c.skip = 0;
+    process_foreach(pg_cb, &c);
+    *denied = c.denied;
+    if (sig == 0) return c.n;                        // existence/permission probe only
     return post_collected(&c, sig);
 }
 
@@ -285,22 +307,21 @@ int signal_pgid_exists(uint32_t pgid) {
 long ksys_kill(int pid, int sig) {
     if (sig < 0 || sig >= NSIG) return -22;
     process_t* cur = sched_get_current();
+    // [M42] Credential rules (kernel/cred.c): root, or the sender's real or
+    // effective uid matches the target's real or saved uid (SIGCONT also within
+    // the session). -EPERM(1) when every match was refused.
     if (pid <= 0) {
         if (!cur) return -3;
-        if (pid == -1) {
-            if (sig == 0) return 0;
-            return signal_post_all(cur->pid, sig) > 0 ? 0 : -3;
-        }
+        if (pid == INT32_MIN_) return -3;
         uint32_t g = (pid == 0) ? cur->pgid : (uint32_t)(-pid);
-        if (sig == 0) {                                  // existence check only
-            struct pg_exists e = { g, 0 };
-            process_foreach(pg_exists_cb, &e);
-            return e.n > 0 ? 0 : -3;
-        }
-        return signal_post_pgid(g, sig) > 0 ? 0 : -3;
+        int denied = 0;
+        int n = signal_post_checked(cur, pid == -1 ? 0 : g, pid == -1, sig, &denied);
+        if (n > 0) return 0;
+        return denied ? -1 : -3;
     }
     process_t* t = process_find_by_pid((uint32_t)pid);
     if (!t) return -3;
+    if (t->state != PROC_ZOMBIE && !cred_may_signal(cur, t, sig)) return -1;   // -EPERM
     if (sig == 0 || t->state == PROC_ZOMBIE) return 0;   // exists (a zombie until reaped)
     return signal_post(t, sig) == 0 ? 0 : -3;
 }
@@ -312,7 +333,13 @@ long ksys_setpgid(int pid, int pgid) {
     process_t* cur = sched_get_current();
     if (!cur) return -1;
     process_t* t = (pid == 0) ? cur : process_find_by_pid((uint32_t)pid);
-    if (!t) return -1;
+    if (!t) return -3;                                   // -ESRCH
+    // [M42] POSIX: only the caller itself or one of its children (fork or
+    // spawn), in the caller's session; a root caller may move anything (the
+    // kernel shell builds pipelines that way).
+    if (t != cur && !cred_is_root(cur) &&
+        !((t->ppid == cur->pid || t->spawner_pid == cur->pid) && t->sid == cur->sid)) return -3;
+    if (pgid < 0) return -22;                            // -EINVAL
     t->pgid = (pgid == 0) ? t->pid : (uint32_t)pgid;
     return 0;
 }

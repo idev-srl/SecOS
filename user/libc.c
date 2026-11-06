@@ -287,17 +287,54 @@ int putenv(char* s){
 }
 void abort(void){ write(2,"abort\n",6); _exit(134); }
 
-/* [M39] Single-user identity + misc POSIX stubs that source ports (a shell, many
- * utilities) reference. SecOS's trust model is the signature, not uid — so every
- * signed process runs as uid/gid 0 (root). These are correct for that model. */
-int getuid(void){ return 0; }
-int geteuid(void){ return 0; }
-int getgid(void){ return 0; }
-int getegid(void){ return 0; }
-int setuid(int u){ (void)u; return 0; }
-int setgid(int g){ (void)g; return 0; }
-int setgroups(unsigned n, const int* g){ (void)n; (void)g; return 0; }
-int getgroups(int n, int* g){ (void)n; (void)g; return 0; }
+/* [M42] Real credentials (kernel/cred.c, syscalls 100-109). The code signature
+ * decides which code runs; these ids decide who it acts for. setreuid/seteuid
+ * and friends are built on setresuid with the POSIX semantics; the kernel
+ * enforces who may change what. */
+static long id_sc(long r){ if(r < 0){ errno = (int)-r; return -1; } return r; }
+int getuid(void){ return (int)secos_syscall(100, 0, 0, 0, 0, 0); }
+int geteuid(void){ return (int)secos_syscall(101, 0, 0, 0, 0, 0); }
+int getgid(void){ return (int)secos_syscall(102, 0, 0, 0, 0, 0); }
+int getegid(void){ return (int)secos_syscall(103, 0, 0, 0, 0, 0); }
+int setuid(int u){ return (int)id_sc(secos_syscall(104, (long)(unsigned)u, 0, 0, 0, 0)); }
+int setgid(int g){ return (int)id_sc(secos_syscall(105, (long)(unsigned)g, 0, 0, 0, 0)); }
+int setresuid(int r, int e, int s){ return (int)id_sc(secos_syscall(106, (long)(unsigned)r, (long)(unsigned)e, (long)(unsigned)s, 0, 0)); }
+int setresgid(int r, int e, int s){ return (int)id_sc(secos_syscall(107, (long)(unsigned)r, (long)(unsigned)e, (long)(unsigned)s, 0, 0)); }
+int getresuid(int* r, int* e, int* s){
+    unsigned v[3]; if(id_sc(secos_syscall(100, (long)v, 0, 0, 0, 0)) < 0) return -1;
+    if(r) *r = (int)v[0];
+    if(e) *e = (int)v[1];
+    if(s) *s = (int)v[2];
+    return 0;
+}
+int getresgid(int* r, int* e, int* s){
+    unsigned v[3]; if(id_sc(secos_syscall(102, (long)v, 0, 0, 0, 0)) < 0) return -1;
+    if(r) *r = (int)v[0];
+    if(e) *e = (int)v[1];
+    if(s) *s = (int)v[2];
+    return 0;
+}
+/* setreuid(r, e): the saved id follows the new effective id when the real id
+ * is set, or the effective id is set to something other than the old real id. */
+int setreuid(int r, int e){
+    int s = -1, oldr = getuid();
+    if(r != -1 || (e != -1 && e != oldr)) s = (e != -1) ? e : geteuid();
+    return setresuid(r, e, s);
+}
+int setregid(int r, int e){
+    int s = -1, oldr = getgid();
+    if(r != -1 || (e != -1 && e != oldr)) s = (e != -1) ? e : getegid();
+    return setresgid(r, e, s);
+}
+int seteuid(int e){ if(e == -1){ errno = EINVAL; return -1; } return setresuid(-1, e, -1); }
+int setegid(int e){ if(e == -1){ errno = EINVAL; return -1; } return setresgid(-1, e, -1); }
+int setgroups(unsigned n, const int* g){ return (int)id_sc(secos_syscall(109, (long)n, (long)g, 0, 0, 0)); }
+int getgroups(int n, int* g){ return (int)id_sc(secos_syscall(108, (long)n, (long)g, 0, 0, 0)); }
+/* fchmod/fchown/lchown/futimes: SYS_CHMOD/SYS_CHOWN/SYS_UTIMES with a NULL
+ * path take the fd as their last argument; chown's flag 1 = do not follow. */
+int fchmod(int fd, unsigned m){ return (int)id_sc(secos_syscall(32, 0, (long)m, (long)fd, 0, 0)); }
+int fchown(int fd, unsigned u, unsigned g){ return (int)id_sc(secos_syscall(33, 0, (long)u, (long)g, (long)fd, 0)); }
+int lchown(const char* p, unsigned u, unsigned g){ return (int)id_sc(secos_syscall(33, (long)p, (long)u, (long)g, 0, 1)); }
 /* umask() is the kernel's (SYS_UMASK, libsecos.c): it applies to open/mkdir. */
 
 /* Wall clock (CLOCK_REALTIME = RTC anchored to the TSC, UTC). */
@@ -1133,31 +1170,37 @@ __attribute__((weak)) char* ttyname(int fd){
     return ttyname_r(fd, name, sizeof(name)) == 0 ? name : (char*)0;
 }
 
-/* ============================ <pwd.h> / <grp.h> ============================
- * One account database for every port: /etc/passwd and /etc/group (written at
- * boot; BusyBox's own libpwdgrp parses the same files and overrides these weak
- * definitions), with a built-in root entry when a file is missing. Identity is
- * informational on SecOS: the signature is the trust boundary. */
+/* ============================ <pwd.h> / <grp.h> / <shadow.h> ===============
+ * One account database for every port: /etc/passwd, /etc/group and (root
+ * only, mode 0600) /etc/shadow. BusyBox's own libpwdgrp parses the same files
+ * and overrides the weak definitions. A built-in root entry stands in when
+ * /etc/passwd or /etc/group is missing (informational only: it has no
+ * password, so nothing can authenticate as it). Each file has its own buffer,
+ * so walking the groups while holding a passwd entry is safe. [M42] */
 #include <pwd.h>
 #include <grp.h>
-static char g_pwbuf[2048];
-static int  g_pwpos = -1, g_grpos = -1;
-static long db_load(const char* path){
-    int fd = open(path, O_RDONLY);
+#include <shadow.h>
+#define DB_CAP 16384
+struct db { char buf[DB_CAP]; int pos; };
+static struct db g_pwdb = { {0}, -1 }, g_grdb = { {0}, -1 }, g_spdb = { {0}, -1 };
+static long db_load(struct db* d, const char* path){
+    d->pos = -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if(fd < 0) return -1;
     long n = 0, r;
-    while(n < (long)sizeof(g_pwbuf) - 1 && (r = read(fd, g_pwbuf + n, sizeof(g_pwbuf) - 1 - (size_t)n)) > 0) n += r;
+    while(n < DB_CAP - 1 && (r = read(fd, d->buf + n, (size_t)(DB_CAP - 1 - n))) > 0) n += r;
     close(fd);
-    g_pwbuf[n] = 0;
+    d->buf[n] = 0;
+    d->pos = 0;
     return n;
 }
-/* Split the line at *pos into ':'-separated fields (in place); returns the count. */
-static int db_next(int* pos, char** f, int nf){
+/* Split the next line into ':'-separated fields (in place); returns the count. */
+static int db_next(struct db* d, char** f, int nf){
     for(;;){
-        if(*pos < 0 || !g_pwbuf[*pos]) return 0;
-        char* l = g_pwbuf + *pos;
+        if(d->pos < 0 || !d->buf[d->pos]) return 0;
+        char* l = d->buf + d->pos;
         char* e = strchr(l, '\n');
-        if(e){ *e = 0; *pos = (int)(e + 1 - g_pwbuf); } else *pos = (int)(l + strlen(l) - g_pwbuf);
+        if(e){ *e = 0; d->pos = (int)(e + 1 - d->buf); } else d->pos = (int)(l + strlen(l) - d->buf);
         if(!*l || *l == '#') continue;
         int n = 0; f[n++] = l;
         for(char* c = l; *c && n < nf; c++) if(*c == ':'){ *c = 0; f[n++] = c + 1; }
@@ -1167,12 +1210,12 @@ static int db_next(int* pos, char** f, int nf){
 }
 static struct passwd g_pwent;
 static struct passwd g_pwroot = { (char*)"root", (char*)"x", 0, 0, (char*)"root", (char*)"/root", (char*)"/bin/bash" };
-__attribute__((weak)) void setpwent(void){ g_pwpos = db_load("/etc/passwd") < 0 ? -1 : 0; }
-__attribute__((weak)) void endpwent(void){ g_pwpos = -1; }
+__attribute__((weak)) void setpwent(void){ db_load(&g_pwdb, "/etc/passwd"); }
+__attribute__((weak)) void endpwent(void){ g_pwdb.pos = -1; }
 __attribute__((weak)) struct passwd* getpwent(void){
     char* f[7];
-    if(g_pwpos < 0) return 0;
-    if(db_next(&g_pwpos, f, 7) < 7) return 0;
+    if(g_pwdb.pos < 0) return 0;
+    if(db_next(&g_pwdb, f, 7) < 7) return 0;
     g_pwent.pw_name = f[0]; g_pwent.pw_passwd = f[1]; g_pwent.pw_uid = atoi(f[2]); g_pwent.pw_gid = atoi(f[3]);
     g_pwent.pw_gecos = f[4]; g_pwent.pw_dir = f[5]; g_pwent.pw_shell = f[6];
     return &g_pwent;
@@ -1180,7 +1223,7 @@ __attribute__((weak)) struct passwd* getpwent(void){
 static struct passwd* pw_find(const char* name, int uid){
     struct passwd* p;
     setpwent();
-    int have = g_pwpos >= 0;
+    int have = g_pwdb.pos >= 0;
     while((p = getpwent()) != 0)
         if(name ? !strcmp(p->pw_name, name) : p->pw_uid == uid){ endpwent(); return p; }
     endpwent();
@@ -1191,25 +1234,25 @@ __attribute__((weak)) struct passwd* getpwnam(const char* n){ return n ? pw_find
 __attribute__((weak)) struct passwd* getpwuid(int u){ return pw_find(0, u); }
 
 static struct group g_grent;
-static char* g_grmem[16];
+static char* g_grmem[64];
 static char* g_grroot_mem[] = { (char*)"root", 0 };
 static struct group g_grroot = { (char*)"root", (char*)"x", 0, g_grroot_mem };
-__attribute__((weak)) void setgrent(void){ g_grpos = db_load("/etc/group") < 0 ? -1 : 0; }
-__attribute__((weak)) void endgrent(void){ g_grpos = -1; }
+__attribute__((weak)) void setgrent(void){ db_load(&g_grdb, "/etc/group"); }
+__attribute__((weak)) void endgrent(void){ g_grdb.pos = -1; }
 __attribute__((weak)) struct group* getgrent(void){
     char* f[4];
-    if(g_grpos < 0) return 0;
-    if(db_next(&g_grpos, f, 4) < 3) return 0;
+    if(g_grdb.pos < 0) return 0;
+    if(db_next(&g_grdb, f, 4) < 3) return 0;
     g_grent.gr_name = f[0]; g_grent.gr_passwd = f[1]; g_grent.gr_gid = atoi(f[2]);
     int n = 0;
-    if(f[3] && *f[3]){ char* m = f[3]; g_grmem[n++] = m; for(; *m && n < 15; m++) if(*m == ','){ *m = 0; g_grmem[n++] = m + 1; } }
+    if(f[3] && *f[3]){ char* m = f[3]; g_grmem[n++] = m; for(; *m && n < 63; m++) if(*m == ','){ *m = 0; g_grmem[n++] = m + 1; } }
     g_grmem[n] = 0; g_grent.gr_mem = g_grmem;
     return &g_grent;
 }
 static struct group* gr_find(const char* name, int gid){
     struct group* g;
     setgrent();
-    int have = g_grpos >= 0;
+    int have = g_grdb.pos >= 0;
     while((g = getgrent()) != 0)
         if(name ? !strcmp(g->gr_name, name) : g->gr_gid == gid){ endgrent(); return g; }
     endgrent();
@@ -1218,3 +1261,83 @@ static struct group* gr_find(const char* name, int gid){
 }
 __attribute__((weak)) struct group* getgrnam(const char* n){ return n ? gr_find(n, 0) : 0; }
 __attribute__((weak)) struct group* getgrgid(int g){ return gr_find(0, g); }
+
+/* The groups `user` belongs to: `group` (its primary group) first, then every
+ * /etc/group entry listing it. Linux semantics for *ngroups. */
+__attribute__((weak)) int getgrouplist(const char* user, int group, int* groups, int* ngroups){
+    int n = 0, cap = *ngroups, ok = 1;
+    if(n < cap) groups[n] = group;
+    n++;
+    struct group* g;
+    setgrent();
+    while((g = getgrent()) != 0){
+        if(g->gr_gid == group) continue;
+        for(char** m = g->gr_mem; m && *m; m++) if(!strcmp(*m, user)){
+            int dup = 0;
+            for(int i = 0; i < n && i < cap; i++) if(groups[i] == g->gr_gid) dup = 1;
+            if(!dup){ if(n < cap) groups[n] = g->gr_gid; n++; }
+            break;
+        }
+    }
+    endgrent();
+    if(n > cap) ok = 0;
+    *ngroups = n;
+    return ok ? n : -1;
+}
+__attribute__((weak)) int initgroups(const char* user, int group){
+    int g[32], n = 32;
+    if(getgrouplist(user, group, g, &n) < 0) n = 32;      /* more than fit: the first 32 */
+    return setgroups((unsigned)n, g);
+}
+
+static struct spwd g_spent;
+__attribute__((weak)) void setspent(void){ db_load(&g_spdb, "/etc/shadow"); }
+__attribute__((weak)) void endspent(void){ g_spdb.pos = -1; }
+static long sp_num(const char* s){ return (s && *s) ? atol(s) : -1; }
+__attribute__((weak)) struct spwd* getspent(void){
+    char* f[9];
+    if(g_spdb.pos < 0) return 0;
+    if(db_next(&g_spdb, f, 9) < 2) return 0;
+    g_spent.sp_namp = f[0]; g_spent.sp_pwdp = f[1];
+    g_spent.sp_lstchg = sp_num(f[2]); g_spent.sp_min = sp_num(f[3]); g_spent.sp_max = sp_num(f[4]);
+    g_spent.sp_warn = sp_num(f[5]); g_spent.sp_inact = sp_num(f[6]); g_spent.sp_expire = sp_num(f[7]);
+    g_spent.sp_flag = 0;
+    return &g_spent;
+}
+__attribute__((weak)) struct spwd* getspnam(const char* name){
+    struct spwd* s;
+    if(!name) return 0;
+    setspent();
+    if(g_spdb.pos < 0){ endspent(); return 0; }           /* not root, or no /etc/shadow */
+    while((s = getspent()) != 0) if(!strcmp(s->sp_namp, name)){ endspent(); return s; }
+    endspent();
+    errno = ENOENT;
+    return 0;
+}
+
+/* getpass(): prompt on the controlling terminal and read one line with echo
+ * off (ICANON kept, so the line editing keys still work), then restore. */
+__attribute__((weak)) char* getpass(const char* prompt){
+    static char buf[256];
+    int fd = open("/dev/tty", O_RDWR | O_CLOEXEC), own = fd >= 0;
+    if(fd < 0) fd = 0;
+    struct termios t, old;
+    int have = tcgetattr(fd, &old) == 0;
+    if(have){ t = old; t.c_lflag &= ~(tcflag_t)(ECHO | ECHOE | ECHOK | ECHONL); tcsetattr(fd, TCSAFLUSH, &t); }
+    if(prompt) write(own ? fd : 2, prompt, strlen(prompt));
+    size_t n = 0;
+    long r = 0;
+    for(;;){
+        char c;
+        r = read(fd, &c, 1);
+        if(r <= 0) break;                                  /* EOF / error: what we have */
+        if(c == '\n' || c == '\r') break;
+        if(n < sizeof(buf) - 1) buf[n++] = c;
+    }
+    buf[n] = 0;
+    if(have) tcsetattr(fd, TCSAFLUSH, &old);
+    write(own ? fd : 2, "\n", 1);
+    if(own) close(fd);
+    if(r < 0 && n == 0) return 0;
+    return buf;
+}

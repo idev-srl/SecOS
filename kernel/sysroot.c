@@ -28,9 +28,17 @@
  *
  *   Both: /etc/secos-release and /VERSION describe the running build
  *   (rewritten only when they differ); baked SSH keys are appended to
- *   /root/.ssh/authorized_keys when missing (user-added lines are kept).
- *   /root, /home, /var, /tmp and /etc/dropbear (the SSH host key) are never
- *   touched.
+ *   /root/.ssh/authorized_keys when missing (user-added lines are kept);
+ *   the standard system groups are appended to /etc/group when missing.
+ *   The contents of /root, /home, /var, /tmp and /etc/dropbear (the SSH host
+ *   key) are never touched.
+ *
+ *   Ownership and modes (M42 enforces them; exec needs an x bit even for root):
+ *   every table entry carries its mode/uid/gid (programs root:root 0755,
+ *   configuration 0644, /etc/shadow 0600), applied when the file is written.
+ *   Programs and the system directories (g_dirs) are also corrected at every
+ *   boot when they are wrong, e.g. on a disk made before the modes existed.
+ *   Configuration files keep whatever mode they have once created.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -124,6 +132,8 @@ typedef struct {
     size_t         len;
     const char*    target;   /* ALIAS: symlink target, relative to the link's dir */
     uint8_t        kind, flags;
+    uint16_t       mode;     /* permission bits (07777) of the installed file */
+    uint32_t       uid, gid; /* its owner */
 } sysfile_t;
 #define SF_MAX 320
 static sysfile_t g_sf[SF_MAX];
@@ -131,7 +141,8 @@ static int g_nsf;
 
 /* Add or replace (same path: the later entry wins, e.g. BusyBox over the
  * coreutils applet of the same name, netcfg's ifconfig over BusyBox's). */
-static void sf_add(int kind, const char* path, const void* data, size_t len, const char* target, int flags){
+static void sf_add(int kind, const char* path, const void* data, size_t len, const char* target, int flags,
+                   uint16_t mode){
     sysfile_t* e = 0;
     for(int i=0;i<g_nsf;i++) if(sr_eq(g_sf[i].path, path)){ e=&g_sf[i]; break; }
     if(!e){
@@ -140,13 +151,58 @@ static void sf_add(int kind, const char* path, const void* data, size_t len, con
     }
     sr_cpy(e->path, path, sizeof(e->path));
     e->data=(const uint8_t*)data; e->len=len; e->target=target; e->kind=(uint8_t)kind; e->flags=(uint8_t)flags;
+    e->mode=mode; e->uid=0; e->gid=0;        /* every system file is root:root */
 }
 static void bin_path(char* out, const char* name){ sr_cpy(out, "/bin/", 64); sr_cat(out, name, 64); }
-static void sf_bin(const char* name, const void* d, size_t n){ char p[64]; bin_path(p,name); sf_add(SF_BIN,p,d,n,0,0); }
+static void sf_bin(const char* name, const void* d, size_t n){ char p[64]; bin_path(p,name); sf_add(SF_BIN,p,d,n,0,0,0755); }
+/* An alias is a symlink on disk (its mode is the target's) and a copy of the
+ * program on ramfs, which gets the program's 0755. */
 static void sf_alias(const char* name, const char* target, const void* d, size_t n, int fl){
-    char p[64]; bin_path(p,name); sf_add(SF_ALIAS,p,d,n,target,fl);
+    char p[64]; bin_path(p,name); sf_add(SF_ALIAS,p,d,n,target,fl,0755);
 }
-static void sf_conf(const char* path, const char* text){ sf_add(SF_CONF,path,text,sr_len(text),0,0); }
+static void sf_conf_mode(const char* path, const char* text, uint16_t mode){ sf_add(SF_CONF,path,text,sr_len(text),0,0,mode); }
+static void sf_conf(const char* path, const char* text){ sf_conf_mode(path, text, 0644); }
+
+/* System directories: created when missing (SD_CREATE) and given this owner
+ * and mode at every boot when they differ. Only the directories themselves:
+ * what users keep inside /root, /home, /var and /tmp is never changed. The
+ * virtual filesystems (/dev, /proc, /sys) set their own modes. */
+#define SD_CREATE 0x1
+static const struct { const char* p; uint16_t mode; uint8_t flags; } g_dirs[] = {
+    { "/",              0755,  0 },
+    { "/bin",           0755,  SD_CREATE },
+    { "/etc",           0755,  SD_CREATE },
+    { "/etc/dropbear",  0700,  SD_CREATE },   /* the SSH host key */
+    { "/usr",           0755,  SD_CREATE },
+    { "/usr/bin",       0755,  0 },
+    { "/usr/local",     0755,  0 },
+    { "/usr/local/bin", 0755,  0 },
+    { "/lib",           0755,  0 },
+    { "/opt",           0755,  0 },
+    { "/mnt",           0755,  0 },
+    { "/var",           0755,  SD_CREATE },
+    { "/var/log",       0755,  SD_CREATE },
+    { "/var/lib",       0755,  SD_CREATE },
+    { "/var/lib/secos", 0755,  SD_CREATE },
+    { "/var/tmp",       01777, SD_CREATE },
+    { "/root",          0700,  SD_CREATE },
+    { "/home",          0755,  SD_CREATE },
+    { "/tmp",           01777, SD_CREATE },
+};
+
+/* Standard system groups (Debian gids, the ones kernel/cred.h, devfs, pty and
+ * the input nodes use): the default /etc/group, and appended to an existing
+ * one when neither the name nor the gid is there yet. */
+static const struct { const char* name; const char* line; } g_groups[] = {
+    { "root",  "root:x:0:\n" },
+    { "tty",   "tty:x:5:\n" },
+    { "disk",  "disk:x:6:\n" },
+    { "wheel", "wheel:x:10:root\n" },
+    { "video", "video:x:44:\n" },
+    { "users", "users:x:100:\n" },
+    { "input", "input:x:105:\n" },
+};
+static const char g_default_passwd[] = "root:x:0:0:root:/root:/bin/bash\n";
 
 /* ---- default configuration (SF_CONF: created only when missing) ------------ */
 #ifndef SECOS_NO_INIT
@@ -199,6 +255,33 @@ static const char g_inputrc[] =
     "\"\\e[1;5D\": backward-word\n";
 #endif
 
+static const char* default_group(void){
+    static char buf[256];
+    buf[0]=0;
+    for(unsigned i=0;i<sizeof(g_groups)/sizeof(g_groups[0]);i++) sr_cat(buf, g_groups[i].line, sizeof(buf));
+    return buf;
+}
+/* /etc/shadow for the accounts in /etc/passwd (the one on disk when there is
+ * one, else the default), each with a locked password. Used only when
+ * /etc/shadow is missing. */
+static const char* default_shadow(void){
+    static char pw[4096], buf[4096];
+    int n=vfs_read_all("/etc/passwd", pw, sizeof(pw)-1);
+    if(n<0){ n=(int)sr_len(g_default_passwd); sr_cpy(pw, g_default_passwd, sizeof(pw)); }
+    pw[n]=0;
+    buf[0]=0;
+    for(char* p=pw; *p; ){
+        char* line=p; while(*p && *p!='\n') p++;
+        if(*p) *p++=0;
+        char* c=line; while(*c && *c!=':') c++;
+        if(*c!=':' || c==line || line[0]=='#') continue;
+        *c=0;
+        if(sr_len(buf)+sr_len(line)+24 >= sizeof(buf)) break;
+        sr_cat(buf, line, sizeof(buf)); sr_cat(buf, ":!::0:99999:7:::\n", sizeof(buf));
+    }
+    return buf;
+}
+
 static void build_table(void){
     g_nsf = 0;
     // [M31] coreutils: one signed multi-call program, dispatching on argv[0].
@@ -236,10 +319,12 @@ static void build_table(void){
     sf_bin("busybox", user_busybox_elf, user_busybox_elf_len);
     for(int i=0; busybox_applets[i]; i++)
         sf_alias(busybox_applets[i], "busybox", user_bbstub_elf, user_bbstub_elf_len, 0);
-    // Single-user account database for id/whoami/ls -l/ps/tar.
-    sf_conf("/etc/passwd", "root:x:0:0:root:/root:/bin/bash\n");
-    sf_conf("/etc/group", "root:x:0:\n");
 #endif
+    // Account database (id/whoami/ls -l/ps/tar, login, sshd). The shadow file
+    // locks every password ('!'): root logs in by SSH key or on the console.
+    sf_conf("/etc/passwd", g_default_passwd);
+    sf_conf("/etc/group", default_group());
+    sf_conf_mode("/etc/shadow", default_shadow(), 0600);
 #ifndef SECOS_NO_BASH
     sf_bin("bash", user_bash_elf, user_bash_elf_len);
     sf_conf("/etc/bash.bashrc", g_bashrc);
@@ -349,14 +434,21 @@ static void mf_putu(uint64_t v){
 /* ---- file operations ------------------------------------------------------- */
 static void ensure_dir(const char* p){ if(!vfs_lookup(p)) vfs_mkdir(p); }
 
-static void set_mode(const char* path, uint32_t mode){
-    vfs_attr_t a; a.mode=mode; a.uid=0; a.gid=0; a.atime=a.mtime=0;
-    vfs_setattr(path, &a, VFS_ATTR_MODE);
+/* Give `path` this owner and mode unless it already has them (no write, so
+ * no journal transaction, when nothing is wrong). A symlink is left alone: its
+ * own mode means nothing and chmod would follow it. 1 = changed, 0 = already
+ * right or absent, -1 = failed. */
+static int fix_attr(const char* path, uint32_t mode, uint32_t uid, uint32_t gid){
+    vfs_inode_t* x=vfs_lookup(path);
+    if(!x || x->type==VFS_NODE_SYMLINK) return 0;
+    if((x->mode & 07777u)==mode && (x->mode & 0170000u) && x->uid==uid && x->gid==gid) return 0;
+    vfs_attr_t a; a.mode=mode; a.uid=uid; a.gid=gid; a.atime=a.mtime=0;
+    return vfs_lsetattr(path, &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID)==0 ? 1 : -1;
 }
 
 /* Write a system program crash-safely: <dir>/.<name>.sysroot-new, then rename
  * over the old one (one metadata transaction: the old or the new program). */
-static int install_file(const char* path, const uint8_t* data, size_t len){
+static int install_file(const char* path, const uint8_t* data, size_t len, uint32_t mode){
     char tmp[80]; size_t ls=0;
     for(size_t i=0; path[i]; i++) if(path[i]=='/') ls=i;
     size_t k=0;
@@ -365,7 +457,7 @@ static int install_file(const char* path, const uint8_t* data, size_t len){
     sr_cat(tmp, ".", sizeof(tmp)); sr_cat(tmp, path+ls+1, sizeof(tmp)); sr_cat(tmp, ".sysroot-new", sizeof(tmp));
     if(vfs_lookup(tmp)) vfs_remove(tmp);
     if(vfs_create(tmp, data, len)!=0){ vfs_remove(tmp); return -1; }
-    set_mode(tmp, 0755);
+    fix_attr(tmp, mode, 0, 0);
     vfs_inode_t* old = vfs_lookup(path);
     if(old && old->type==VFS_NODE_DIR){ vfs_remove(tmp); return -1; }
     if(vfs_rename(tmp, path)!=0){
@@ -406,18 +498,24 @@ static int write_if_changed(const char* path, const char* text){
 }
 
 /* ---- provisioning ---------------------------------------------------------- */
-static struct { int written, kept, linked, removed, created, failed; } g_st;
+static struct { int written, kept, linked, removed, created, failed, fixed; } g_st;
+
+/* Configuration: created (with its mode) only when missing, then the user's. */
+static void install_conf(const sysfile_t* e){
+    if(vfs_lookup(e->path)) return;
+    if(vfs_create(e->path, e->data, e->len)==0){ g_st.created++; fix_attr(e->path, e->mode, e->uid, e->gid); }
+    else g_st.failed++;
+}
+static void count_fix(int r){ if(r>0) g_st.fixed++; else if(r<0) g_st.failed++; }
 
 static void provision_ramfs(void){
     for(int i=0;i<g_nsf;i++){
         sysfile_t* e=&g_sf[i];
-        if(e->kind==SF_CONF){
-            if(!vfs_lookup(e->path)){ if(vfs_create(e->path, e->data, e->len)==0) g_st.created++; else g_st.failed++; }
-            continue;
-        }
+        if(e->kind==SF_CONF){ install_conf(e); continue; }
         if(e->kind==SF_ALIAS && (e->flags & SF_DISK_ONLY)) continue;
         if(vfs_lookup(e->path)) vfs_remove(e->path);
-        if(vfs_create(e->path, e->data, e->len)==0) g_st.written++; else g_st.failed++;
+        if(vfs_create(e->path, e->data, e->len)==0){ g_st.written++; fix_attr(e->path, e->mode, e->uid, e->gid); }
+        else g_st.failed++;
     }
 }
 
@@ -430,10 +528,7 @@ static void provision_disk(void){
         sysfile_t* e=&g_sf[i];
         mrec_t* r=manifest_find(e->path);
         if(r) r->seen=1;
-        if(e->kind==SF_CONF){
-            if(!vfs_lookup(e->path)){ if(vfs_create(e->path, e->data, e->len)==0) g_st.created++; else g_st.failed++; }
-            continue;
-        }
+        if(e->kind==SF_CONF){ install_conf(e); continue; }
         if(e->kind==SF_ALIAS){
             if(is_link_to(e->path, e->target)) g_st.kept++;
             else {
@@ -450,8 +545,10 @@ static void provision_disk(void){
         vfs_inode_t* ino=vfs_lookup(e->path);
         int same = ino && ino->type==VFS_NODE_FILE && ino->size==e->len && r && r->kind=='F' &&
                    sr_eq(r->a, h) && r->size==e->len && r->mtime==ino->mtime;
-        if(same) g_st.kept++;
-        else if(install_file(e->path, e->data, e->len)==0){
+        if(same){
+            g_st.kept++;
+            count_fix(fix_attr(e->path, e->mode, e->uid, e->gid));   /* e.g. a 0644 program from an older disk */
+        } else if(install_file(e->path, e->data, e->len, e->mode)==0){
             g_st.written++;
             debugcon_writestring("[SYSROOT] wrote "); debugcon_writestring(e->path); debugcon_writestring("\n");
         } else {
@@ -554,6 +651,42 @@ static void install_authorized_keys(void){
     }
 }
 
+/* Append each standard group missing from /etc/group (by name and by gid);
+ * the existing lines, and any group the user added, stay as they are. */
+static void ensure_groups(void){
+    static char buf[8192];
+    int n=vfs_read_all("/etc/group", buf, sizeof(buf)-1);
+    if(n<0) return;
+    buf[n]=0;
+    for(unsigned g=0; g<sizeof(g_groups)/sizeof(g_groups[0]); g++){
+        const char* want=g_groups[g].line;
+        size_t nl=sr_len(g_groups[g].name);
+        const char* wgid=want+nl+3;                      /* "<name>:x:<gid>:" */
+        size_t gl=0; while(wgid[gl] && wgid[gl]!=':') gl++;
+        int found=0;
+        for(int p=0; p<n && !found; ){
+            int q=p; while(q<n && buf[q]!='\n') q++;
+            const char* l=buf+p; int ll=q-p;
+            if(ll>(int)nl && sr_eqn(l, g_groups[g].name, nl) && l[nl]==':') found=1;
+            int f=0, s=0;                                /* third field = gid */
+            for(int k=0;k<ll && f<2;k++) if(l[k]==':' && ++f==2) s=k+1;
+            if(!found && f==2){
+                int e=s; while(e<ll && l[e]!=':') e++;
+                if((size_t)(e-s)==gl && sr_eqn(l+s, wgid, gl)) found=1;
+            }
+            p=q+1;
+        }
+        if(found) continue;
+        char line[64]; size_t o=0;
+        if(n>0 && buf[n-1]!='\n') line[o++]='\n';
+        for(size_t k=0; want[k] && o<sizeof(line)-1; k++) line[o++]=want[k];
+        if(vfs_write("/etc/group", (size_t)n, line, o)!=(int)o){ g_st.failed++; return; }
+        if(n+(int)o < (int)sizeof(buf)-1){ for(size_t k=0;k<o;k++) buf[n+k]=line[k]; n+=(int)o; buf[n]=0; }
+        debugcon_writestring("[SYSROOT] added group "); debugcon_writestring(g_groups[g].name);
+        debugcon_writestring(" to /etc/group\n");
+    }
+}
+
 static int present(const char* p){ return vfs_lookup(p)!=0; }
 
 /* The per-component markers the selftests assert on (same text as before). */
@@ -598,16 +731,22 @@ static void report_components(void){
 
 void sysroot_provision(void){
     uint64_t t0=timer_get_ticks();
-    g_st.written=g_st.kept=g_st.linked=g_st.removed=g_st.created=g_st.failed=0;
-    static const char* const dirs[] = { "/bin","/etc","/var","/var/log","/var/lib","/var/lib/secos",
-                                        "/root","/home","/tmp","/etc/dropbear", 0 };
-    for(int i=0; dirs[i]; i++) ensure_dir(dirs[i]);
+    g_st.written=g_st.kept=g_st.linked=g_st.removed=g_st.created=g_st.failed=g_st.fixed=0;
+    for(unsigned i=0;i<sizeof(g_dirs)/sizeof(g_dirs[0]);i++){
+        if(g_dirs[i].flags & SD_CREATE) ensure_dir(g_dirs[i].p);
+        count_fix(fix_attr(g_dirs[i].p, g_dirs[i].mode, 0, 0));
+    }
     build_table();
     if(g_persistent) provision_disk(); else provision_ramfs();
+    ensure_groups();
     // Release stamp of the running kernel (kernel-owned).
     write_if_changed("/etc/secos-release",
         "NAME=SecOS\nVERSION=0.1.0-dev\nBUILD_TS=" BUILD_TS "\nGIT_HASH=" GIT_HASH "\n");
-    if(g_persistent) write_if_changed("/VERSION", "VERSION=0.1.0-dev\nBUILD_TS=" BUILD_TS "\nGIT_HASH=" GIT_HASH "\n");
+    count_fix(fix_attr("/etc/secos-release", 0644, 0, 0));
+    if(g_persistent){
+        write_if_changed("/VERSION", "VERSION=0.1.0-dev\nBUILD_TS=" BUILD_TS "\nGIT_HASH=" GIT_HASH "\n");
+        count_fix(fix_attr("/VERSION", 0644, 0, 0));
+    }
     install_authorized_keys();
 #if !defined(SECOS_NO_INIT) && defined(SECOS_INIT_TAMPER_TEST)
     // Selftest hook: one flipped code byte, so the signature check refuses
@@ -623,6 +762,7 @@ void sysroot_provision(void){
     debugcon_writestring(" linked="); dbg_dec((uint64_t)g_st.linked);
     debugcon_writestring(" stale_removed="); dbg_dec((uint64_t)g_st.removed);
     debugcon_writestring(" configs_created="); dbg_dec((uint64_t)g_st.created);
+    debugcon_writestring(" modes_fixed="); dbg_dec((uint64_t)g_st.fixed);
     debugcon_writestring(" failed="); dbg_dec((uint64_t)g_st.failed);
     debugcon_writestring(" ms="); dbg_dec(dt); debugcon_writestring("\n");
     if(g_persistent && (g_st.written || g_st.linked || g_st.removed)){
@@ -656,4 +796,10 @@ void sysroot_apply_settings(void){
         return;
     }
     debugcon_writestring("[KEYMAP] /etc/vconsole.conf has no KEYMAP=: build default layout\n");
+}
+
+int sysroot_install_exec(const char* path, const void* data, size_t len){
+    int r=vfs_create(path, data, len);
+    if(r==0) fix_attr(path, 0755, 0, 0);   /* best effort: a FAT32 mount has fixed modes */
+    return r;
 }

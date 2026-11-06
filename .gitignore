@@ -23,6 +23,9 @@ user/*.elf
 user/secwm/*.elf
 user/lvgl/*.elf
 user/*.o
+# [crypt] user/libcrypt.a and its objects (rebuilt by `make libcrypt`)
+user/*.a
+user/cryptobj/
 __pycache__/
 *.vmdk
 uefi_loader.elf

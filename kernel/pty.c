@@ -17,6 +17,7 @@
  *    input goes there too (dropped when the ring is full, as a flooded n_tty
  *    echo would be).
  */
+#include "cred.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "pty.h"
@@ -242,6 +243,13 @@ static int pty_alloc(vfs_inode_t* ptmx, vfs_inode_t** out) {
     name_slave(np->sino.path, idx);
     np->mino.type = np->sino.type = VFS_NODE_FILE;
     np->mino.mode = 0020666; np->sino.mode = 0020620;   /* S_IFCHR */
+    /* [M42] devpts: the slave belongs to whoever opened /dev/ptmx (the session
+     * user: secwm's terminals, or sshd, which chowns it to the login user),
+     * group tty, crw--w----; the master is only reachable through its fd. */
+    {   extern process_t* sched_get_current(void);
+        process_t* op = sched_get_current();
+        np->sino.uid = cred_is_kernel(op) ? 0 : op->cred.euid; np->sino.gid = GID_TTY;
+        np->mino.uid = np->sino.uid; np->mino.gid = 0; }
     np->mino.nlink = np->sino.nlink = 1;
     np->mino.ops = np->sino.ops = ptmx->ops;
     np->mino.fs_data = np->sino.fs_data = NULL;
@@ -460,7 +468,7 @@ int pty_ioctl(process_t* c, void* inode, uint64_t cmd, uint64_t arg) {
         struct tty* ct = (struct tty*)c->ctty;
         int has = ct ? (ct->session && ct->session == c->sid) : !c->ctty_detached;
         if (has) { r = E_PERM; break; }             /* already has one */
-        if (t->session && t->session != c->sid && arg != 1) { r = E_PERM; break; } /* arg 1: steal */
+        if (t->session && t->session != c->sid && (arg != 1 || !cred_is_root(c))) { r = E_PERM; break; } /* arg 1: steal (root) */
         if (ct) { stale = 1; break; }                /* drop the dead ctty first */
         acquire_ctty(c, p);
         break;

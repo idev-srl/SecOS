@@ -23,6 +23,7 @@
 #include "vfs.h"
 #include "pmm.h"
 #include "process.h"
+#include "cred.h"
 #include "spinlock.h"
 #include "kiface.h"
 #include "klog.h"
@@ -120,6 +121,8 @@ struct psnap {
     struct { uint8_t kind; uint8_t pipe_w; const void* obj; const vfs_fs_ops_t* ops; char path[128]; } fd[32];
     int      nvma;
     struct { uint64_t start, end, flags; uint8_t type; uint8_t has_inode; } vma[PS_MAXVMA];
+    struct proc_cred cred;   /* [M42] owner of /proc/<pid> = the effective ids */
+    int      inspect_ok;     /* [M42] the reader may see the private files */
 };
 enum { FDK_NONE=0, FDK_FILE, FDK_PIPE, FDK_TTY, FDK_SOCK };
 static struct psnap g_ps;
@@ -131,6 +134,8 @@ static void snap_cb(process_t* p, void* u){
     struct psnap* s = &g_ps;
     s->found = 1;
     s->pid = p->pid; s->ppid = p->ppid; s->pgid = p->pgid; s->cpu = p->cpu_affinity;
+    s->cred = p->cred;
+    s->inspect_ok = cred_may_inspect(sched_get_current(), p);
     s->state = p->state;
     for(int i=0;i<16;i++) s->comm[i]=p->ki.comm[i];
     s->comm[15]=0;
@@ -382,7 +387,13 @@ static void gen_pid_status(struct sb* s){
     sb_str(s,"\nTgid:\t"); sb_u64(s,g_ps.pid);
     sb_str(s,"\nNgid:\t0\nPid:\t"); sb_u64(s,g_ps.pid);
     sb_str(s,"\nPPid:\t"); sb_u64(s,g_ps.ppid);
-    sb_str(s,"\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t32\nGroups:\t\n");
+    sb_str(s,"\nTracerPid:\t0\nUid:\t"); sb_u64(s,g_ps.cred.ruid); sb_putc(s,'\t'); sb_u64(s,g_ps.cred.euid);
+    sb_putc(s,'\t'); sb_u64(s,g_ps.cred.suid); sb_putc(s,'\t'); sb_u64(s,g_ps.cred.euid);   /* fsuid = euid */
+    sb_str(s,"\nGid:\t"); sb_u64(s,g_ps.cred.rgid); sb_putc(s,'\t'); sb_u64(s,g_ps.cred.egid);
+    sb_putc(s,'\t'); sb_u64(s,g_ps.cred.sgid); sb_putc(s,'\t'); sb_u64(s,g_ps.cred.egid);
+    sb_str(s,"\nFDSize:\t32\nGroups:\t");
+    for(uint32_t i=0;i<g_ps.cred.ngroups && i<CRED_NGROUPS;i++){ sb_u64(s,g_ps.cred.groups[i]); sb_putc(s,' '); }
+    sb_putc(s,'\n');
     sb_kv_kb(s,"VmPeak:",g_ps.vsz/1024);
     sb_kv_kb(s,"VmSize:",g_ps.vsz/1024);
     sb_kv_kb(s,"VmLck:",0);
@@ -441,6 +452,10 @@ static int         g_inext;
 static spinlock_t  g_proc_lock = SPINLOCK_INIT;
 
 static int is_link(int k){ return k==PK_SELF||k==PK_PID_CWD||k==PK_PID_EXE||k==PK_PID_ROOT||k==PK_PID_FD; }
+/* [M42] What Linux guards with a ptrace-style check: only root or a reader
+ * whose effective ids equal all of the target's ids (cred_may_inspect). */
+static int is_private(int k){ return k==PK_PID_ENVIRON||k==PK_PID_MAPS||k==PK_PID_CWD||k==PK_PID_EXE||
+                                     k==PK_PID_ROOT||k==PK_PID_FDDIR||k==PK_PID_FD; }
 static int is_dir(int k){ return k==PK_ROOT||k==PK_PID_DIR||k==PK_PID_FDDIR; }
 
 /* Generate node `key` into g_genbuf; returns its length (-1 = gone). Caller
@@ -451,6 +466,7 @@ static int gen_key(uint64_t key){
     if(k>=PK_PID_DIR){
         if(!snap(K_PID(key))) return -1;
         if(k==PK_PID_FD && (K_FD(key)>=32 || g_ps.fd[K_FD(key)].kind==FDK_NONE)) return -1;
+        if(is_private(k) && !g_ps.inspect_ok) return -1;          /* [M42] */
     }
     switch(k){
     case PK_MEMINFO: gen_meminfo(&s); break;
@@ -518,6 +534,12 @@ static void fill_node(vfs_inode_t* ino, uint64_t key, const char* path){
     ino->fs_data = (void*)(uintptr_t)key;
     ino->mode = is_dir(k) ? (0x4000|0555) : is_link(k) ? (0xA000|0777) : (0x8000|0444);
     ino->uid = ino->gid = 0;
+    if(k>=PK_PID_DIR && snap(K_PID(key))){                 /* [M42] owned by the process's euid */
+        ino->uid = g_ps.cred.euid; ino->gid = g_ps.cred.egid;
+        if(k==PK_PID_ENVIRON) ino->mode = 0x8000|0400;
+        if(k==PK_PID_MAPS)    ino->mode = 0x8000|0444;
+        if(k==PK_PID_FDDIR)   ino->mode = 0x4000|0500;
+    }
     ino->nlink = is_dir(k) ? 2 : 1;
     uint64_t now = kclock_real_sec();
     ino->atime = ino->mtime = ino->ctime = now;
@@ -600,7 +622,8 @@ static int procfs_readdir(const char* dir, vfs_iter_cb cb, void* user){
     } else if(k==PK_PID_DIR){
         for(int i=0;i<NPIDF;i++) keys[nk++]=KEY(g_pidf[i].kind,K_PID(key),0);
     } else {
-        if(snap(K_PID(key))) for(int i=0;i<32;i++) if(g_ps.fd[i].kind!=FDK_NONE) keys[nk++]=KEY(PK_PID_FD,K_PID(key),i);
+        if(snap(K_PID(key)) && g_ps.inspect_ok)            /* [M42] fd/ is private */
+            for(int i=0;i<32;i++) if(g_ps.fd[i].kind!=FDK_NONE) keys[nk++]=KEY(PK_PID_FD,K_PID(key),i);
     }
     /* The callbacks only copy names (getdents) or count, so they run under the
      * lock that also guards the static key/name tables. */

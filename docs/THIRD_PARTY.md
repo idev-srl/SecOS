@@ -11,6 +11,7 @@ image can get the corresponding source.
 | GNU bash | 5.2 | GPL-3.0-or-later | no: fetched by `tools/port-bash.sh` | `/bin/bash` |
 | BusyBox | 1.36.1 | GPL-2.0-only | no: fetched by `tools/port-busybox.sh` | `/bin/busybox` + applet stubs in `/bin` |
 | musl libc (regex, fnmatch, getopt only) | 1.2.5 | MIT | no: fetched by `tools/port-busybox.sh` | linked into `/bin/busybox` |
+| musl libc (crypt: SHA-256/SHA-512-crypt, bcrypt) | 1.2.5 | MIT | yes: `third_party/musl-crypt/` (unmodified, vendored by `tools/vendor-musl-crypt.sh`) | `user/libcrypt.a`, linked into programs that call `crypt()` |
 | Lua | 5.4.7 | MIT | yes: `third_party/lua/` | `/bin/lua` |
 | LVGL (with its built-in Montserrat + FontAwesome glyph tables) | 9.2.2 | MIT (fonts: SIL OFL 1.1) | no: fetched by `tools/port-lvgl.sh` | linked into `/bin/sysmon` |
 | Terminus Font (8x16 regular + bold) | 4.49.1 | SIL OFL 1.1 | yes: `third_party/terminus-font/` (BDF) | glyph table `user/secwm/font16.h` in `/bin/secwm`, `/bin/sysinfo`, `/bin/swptest`, `/bin/sysmon` |
@@ -69,7 +70,9 @@ the image was distributed and for no more than the cost of making the copy.
 
 Licence texts: `docs/licenses/busybox-1.36.1-LICENSE` (BusyBox, GPL-2.0, copied
 verbatim from the tarball), `docs/licenses/musl-1.2.5-COPYRIGHT` (musl, MIT, its
-copyright notice must ship with the musl code linked into BusyBox), `COPYING`
+copyright notice must ship with the musl code linked into BusyBox), `third_party/musl-crypt/COPYRIGHT` (the same musl notice, for
+the vendored crypt sources; `third_party/musl-crypt/SHA256SUMS` lists their
+upstream checksums), `COPYING`
 (GPL-3.0) in the bash tarball, and the copyright notice in
 `third_party/lua/src/lua.h` for Lua.
 `docs/licenses/lvgl-9.2.2-LICENCE.txt` (LVGL, MIT, copied by `tools/port-lvgl.sh`;

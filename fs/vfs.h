@@ -23,9 +23,9 @@ typedef struct vfs_inode {
     size_t size;               // file size (0 for dir)
     void* fs_data;             // pointer to underlying FS specific entry/object
     const struct vfs_fs_ops* ops; // back-pointer to filesystem operations
-    // [M26] POSIX metadata. Stored & exposed (stat/chmod/chown/utimes) but NOT
-    // used for multi-user access enforcement — the signature is the trust
-    // boundary in SecOS, so a signed process has ambient access regardless.
+    // [M26] POSIX metadata, [M42] enforced: the signature decides which code
+    // may run, these decide who may access the file (kernel/cred.c). mode 0 =
+    // "the FS keeps no modes": treated as 0755 (dir) / 0644 (file), root-owned.
     uint32_t mode;             // full POSIX mode: S_IFMT type bits | permission bits
     uint32_t uid, gid;         // owner / group
     uint64_t atime, mtime, ctime; // unix seconds
@@ -147,6 +147,12 @@ vfs_inode_t* vfs_lookup_follow(const char* path);
 vfs_inode_t* vfs_lookup_ex(const char* path, int follow, int* err);
 // Canonicalize an absolute path (".", "..", symlinks resolved). 0 or -errno.
 int vfs_walk(const char* path, char* out, size_t outsz, int follow_final);
+// Same, asking `search` for every directory descended through (the root and
+// each intermediate component, symlink targets included); its non-zero -errno
+// aborts the walk. Used for the per-component search-permission check.
+typedef int (*vfs_search_cb)(void* ctx, const vfs_inode_t* dir);
+int vfs_walk_checked(const char* path, char* out, size_t outsz, int follow_final,
+                     vfs_search_cb search, void* ctx);
 // rmdir: remove an empty directory (-ENOTDIR/-ENOTEMPTY/-EBUSY). 0 or -errno.
 int vfs_rmdir(const char* path);
 // Hard link old -> new (same FS; -EXDEV/-EEXIST/-EPERM). 0 or -errno.
@@ -154,6 +160,8 @@ int vfs_link(const char* oldp, const char* newp);
 // statfs() of the filesystem holding `path` / behind `ops`. 0 or -errno.
 int vfs_statfs(const char* path, vfs_statfs_t* st);
 int vfs_statfs_ops(const vfs_fs_ops_t* ops, vfs_statfs_t* st);
+// Mount point of the filesystem holding `path` ("/" = the root FS), or NULL.
+const char* vfs_mount_point_for(const char* path);
 // Mount point of the filesystem behind `ops` (NULL if not mounted).
 const char* vfs_mount_point_of(const vfs_fs_ops_t* ops);
 // Flush one filesystem (fsync of a file on it). 0/-1.
@@ -177,6 +185,8 @@ int vfs_rename(const char* oldp, const char* newp);
 int vfs_truncate(const char* path, size_t new_size);
 // [M26] Change attributes (chmod/chown/utimes); valid = VFS_ATTR_* bitmask.
 int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid);
+// [M42] setattr without following a final symlink (lchown, resolved paths).
+int vfs_lsetattr(const char* path, const vfs_attr_t* a, unsigned valid);
 // [M26] Read a symlink target (NUL-terminated). Returns length or -1.
 int vfs_readlink(const char* path, char* buf, size_t len);
 // [M26] Create a symlink at linkpath pointing to target. Returns 0/-1.

@@ -48,6 +48,11 @@
 #define MANIFEST_FLAG_CAP_INPUT             (1u<<13)// open /dev/input/eventN (evdev)
 #define MANIFEST_FLAG_CAP_DISPLAY           (1u<<14)// open /dev/fb0, KDSETMODE KD_GRAPHICS
 // CAP_NET (bit 4) is the network capability and folds into the same model.
+// [M42] Set-id aware: a set-user-id / set-group-id bit on this program's file is
+// honoured only when its signed manifest carries this flag (and the file is on
+// the root filesystem). su, passwd and sudo have it; nothing else does, so a
+// chmod u+s on any other signed binary has no effect. Not a capability.
+#define MANIFEST_FLAG_SETID                 (1u<<15)
 #define MANIFEST_CAP_MASK \
     (MANIFEST_FLAG_CAP_NET | MANIFEST_FLAG_CAP_FS_READ | MANIFEST_FLAG_CAP_FS_WRITE | \
      MANIFEST_FLAG_CAP_PROC | MANIFEST_FLAG_CAP_IPC | MANIFEST_FLAG_CAP_SIGNAL | \

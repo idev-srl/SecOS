@@ -17,6 +17,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "kiface.h"
+#include "cred.h"
 #include "process.h"
 #include "sched.h"
 #include "signal.h"
@@ -219,6 +220,7 @@ static uint64_t sys_clock_gettime(process_t* c, int clk, uint64_t uts) {
 
 static uint64_t sys_clock_settime(process_t* c, uint64_t num, int clk, uint64_t uts) {
     if (!cap_check(c, CAP_TIME, num, "clock_settime")) return NEG(E_PERM);
+    if (!cred_is_root(c)) return NEG(E_PERM);                 /* [M42] setting the clock: root */
     struct k_timespec ts;
     if (copy_from_user(&ts, (const void*)uts, sizeof(ts))) return NEG(E_FAULT);
     if (clk != KCLOCK_REALTIME) return NEG(E_INVAL);
@@ -287,6 +289,10 @@ static uint64_t sys_syslog(process_t* c, uint64_t num, int type, uint64_t ubuf, 
                   type == KLOG_ACTION_CONSOLE_OFF || type == KLOG_ACTION_CONSOLE_ON ||
                   type == KLOG_ACTION_CONSOLE_LEVEL);
     if (!cap_check(c, writes ? CAP_FS_WRITE : CAP_FS_READ, num, "syslog")) return NEG(E_PERM);
+    /* [M42] The kernel log is root's (dmesg_restrict=1): others may only ask
+     * for the buffer sizes. */
+    if (!cred_is_root(c) && type != KLOG_ACTION_CLOSE && type != KLOG_ACTION_OPEN &&
+        type != 9 /*SIZE_UNREAD*/ && type != 10 /*SIZE_BUFFER*/) return NEG(E_PERM);
     switch (type) {
     case KLOG_ACTION_CLOSE: case KLOG_ACTION_OPEN: return 0;
     case KLOG_ACTION_READ: case KLOG_ACTION_READ_ALL: case KLOG_ACTION_READ_CLEAR: {
@@ -344,7 +350,9 @@ static uint64_t sys_statfs(process_t* c, uint64_t num, uint64_t upath, uint64_t 
     vfs_statfs_t v; int r;
     const void* key = 0;
     if (upath) {
-        char abs[256]; if ((r = ki_user_path(c, upath, abs, sizeof(abs)))) return NEG(-r);
+        char ab0[256]; if ((r = ki_user_path(c, upath, ab0, sizeof(ab0)))) return NEG(-r);
+        char abs[256];                                    /* [M42] search permission on the way */
+        if ((r = cred_check_path(c, ab0, 1, 0, abs, sizeof(abs), 0))) return NEG(-r);
         r = vfs_statfs(abs, &v);
         vfs_inode_t* ino = vfs_lookup_follow(abs); key = ino ? ino->ops : 0;
     } else {
@@ -523,6 +531,49 @@ static uint64_t sys_poll(process_t* c, trapframe_t* tf, uint64_t ufds, uint64_t 
     return 0;                                     /* only for a non-blockable caller */
 }
 
+/* [M42] rename(old, new) / link(old, new) permission rules (kernel/cred.c).
+ * On success p0/p1 hold the canonical paths. rename: the source may be
+ * removed from its directory (w+x, sticky), the target directory accepts a
+ * new entry (w+x) and an existing target may be replaced (w+x, sticky); a
+ * directory moved to another parent needs w on itself (its ".."). link: the
+ * new name may be created, and a non-owner may only link a regular, non-set-id
+ * file it can read and write (Linux fs.protected_hardlinks=1). */
+static int ki_perm_rename_link(process_t* c, int is_rename, char* p0, char* p1) {
+    char c0[256], c1[256]; int e;
+    if ((e = cred_resolve(c, p0, 0, c0, sizeof(c0)))) return e;
+    if ((e = cred_resolve(c, p1, 0, c1, sizeof(c1)))) return e;
+    vfs_inode_t* src = vfs_lookup(c0);
+    if (!src) return -E_NOENT;
+    int src_dir = src->type == VFS_NODE_DIR;
+    uint32_t smode = cred_inode_mode(src), suid = src->uid;
+    int src_rw = cred_inode_perm(c, src, MAY_READ | MAY_WRITE) == 0;
+    int src_w  = cred_inode_perm(c, src, MAY_WRITE) == 0;
+    if (is_rename) {
+        if ((e = cred_may_delete(c, c0))) return e;
+        if (vfs_lookup(c1)) { if ((e = cred_may_delete(c, c1))) return e; }
+        else if ((e = cred_may_create(c, c1))) return e;
+        if (src_dir && !cred_is_root(c)) {
+            size_t l0 = 0, l1 = 0;
+            for (size_t i = 0; c0[i]; i++) if (c0[i] == '/') l0 = i;
+            for (size_t i = 0; c1[i]; i++) if (c1[i] == '/') l1 = i;
+            int same = (l0 == l1);
+            for (size_t i = 0; same && i < l0; i++) if (c0[i] != c1[i]) same = 0;
+            if (!same && !src_w) return -E_ACCES;
+        }
+    } else {
+        if (vfs_lookup(c1)) return -17;                   /* EEXIST */
+        if ((e = cred_may_create(c, c1))) return e;
+        if (!cred_is_root(c) && suid != c->cred.euid) {
+            if (src_dir || (smode & 0170000u) != 0100000u) return -E_PERM;
+            if ((smode & 04000u) || ((smode & 02010u) == 02010u)) return -E_PERM;
+            if (!src_rw) return -E_PERM;
+        }
+    }
+    for (int i = 0; i < 256; i++) { p0[i] = c0[i]; if (!c0[i]) break; }
+    for (int i = 0; i < 256; i++) { p1[i] = c1[i]; if (!c1[i]) break; }
+    return 0;
+}
+
 /* ---------------------------------------------------------------- dispatcher */
 int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
     if (num < 65 || num > 79) return 0;
@@ -548,6 +599,7 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
     case 71: case 72: {                                                 /* SYS_RENAME / SYS_LINK */
         if (!cap_check(c, CAP_FS_WRITE, num, num == 71 ? "rename" : "link")) { r = NEG(E_PERM); break; }
         if ((e = ki_user_path(c, a0, p0, sizeof(p0))) || (e = ki_user_path(c, a1, p1, sizeof(p1)))) { r = NEG(-e); break; }
+        if ((e = ki_perm_rename_link(c, num == 71, p0, p1))) { r = NEG(-e); break; }   /* [M42] */
         if (num == 71) { ki_pagecache_drop_path(p0); ki_pagecache_drop_path(p1); e = vfs_rename(p0, p1); }
         else e = vfs_link(p0, p1);
         r = e < 0 ? NEG(-e) : 0;
@@ -560,6 +612,9 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
         if (len < 0 || len > 0xFFFFFFFFll) { r = NEG(E_INVAL); break; }
         if (a0) {
             if ((e = ki_user_path(c, a0, p0, sizeof(p0)))) { r = NEG(-e); break; }
+            { char cp[256];                               /* [M42] write permission on the file */
+              if ((e = cred_check_path(c, p0, 1, MAY_WRITE, cp, sizeof(cp), 0))) { r = NEG(-e); break; }
+              for (int i = 0; i < 256; i++) { p0[i] = cp[i]; if (!cp[i]) break; } }
             ki_pagecache_drop_path(p0);
             e = vfs_truncate(p0, (size_t)len);
             if (e == 0) { vfs_inode_t* ino = vfs_lookup_follow(p0); if (ino) pagecache_invalidate(ino, 0, 1ULL << 62); }
@@ -578,6 +633,11 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
     case 74:                                                            /* SYS_RMDIR */
         if (!cap_check(c, CAP_FS_WRITE, num, "rmdir")) { r = NEG(E_PERM); break; }
         if ((e = ki_user_path(c, a0, p0, sizeof(p0)))) { r = NEG(-e); break; }
+        { char cp[256];                                   /* [M42] w+x on the parent, sticky */
+          if ((e = cred_resolve(c, p0, 0, cp, sizeof(cp)))) { r = NEG(-e); break; }
+          if (!vfs_lookup(cp)) { r = NEG(E_NOENT); break; }
+          if ((e = cred_may_delete(c, cp))) { r = NEG(-e); break; }
+          for (int i = 0; i < 256; i++) { p0[i] = cp[i]; if (!cp[i]) break; } }
         e = vfs_rmdir(p0);
         r = e < 0 ? NEG(-e) : 0;
         break;
@@ -586,12 +646,16 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
         if ((e = ki_user_path(c, a0, p0, sizeof(p0)))) { r = NEG(-e); break; }
         int mode = (int)a1;
         if (mode & ~7) { r = NEG(E_INVAL); break; }
-        vfs_inode_t* ino = vfs_lookup_ex(p0, 1, &e);
-        if (!ino) { r = NEG(e ? -e : E_NOENT); break; }
-        /* The signature is the trust boundary: a signed process may read and
-         * write anything; X needs an executable (or unknown, mode 0) file. */
-        if ((mode & 1) && ino->type == VFS_NODE_FILE && ino->mode && !(ino->mode & 0111)) { r = NEG(E_ACCES); break; }
-        r = 0;
+        /* [M42] access() answers for the REAL uid/gid (a set-id program asks
+         * "may my invoker do this?"): run the walk and the check with the
+         * effective ids temporarily set to the real ones (no preemption in
+         * a syscall, and the process runs on one CPU). */
+        uint32_t se = c->cred.euid, sg = c->cred.egid;
+        c->cred.euid = c->cred.ruid; c->cred.egid = c->cred.rgid;
+        vfs_inode_t* ino = 0;
+        e = cred_check_path(c, p0, 1, mode, 0, 0, &ino);
+        c->cred.euid = se; c->cred.egid = sg;
+        r = e ? NEG(-e) : 0;
         break;
     }
     case 76: {                                                          /* SYS_UMASK */

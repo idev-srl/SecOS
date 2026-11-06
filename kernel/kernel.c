@@ -29,6 +29,7 @@
 #include "multiboot.h"
 #include "multiboot2.h"
 #include "pmm.h"
+#include "sysroot.h"
 #include "vmm.h"
 #include "idt.h"
 #include "tss.h"
@@ -229,7 +230,7 @@ static void m9_run_demo(void) {
                              : "[M9] tampered ELF REFUSED (good)\n");
 
     // Publish the signed hello into the VFS, to be loaded back from there.
-    if (vfs_create("/bin/hello", user_hello_elf, user_hello_elf_len) != 0)
+    if (sysroot_install_exec("/bin/hello", user_hello_elf, user_hello_elf_len) != 0)
         debugcon_writestring("[M9] WARN: vfs_create /bin/hello failed\n");
 
     static process_t  idle; static trapframe_t idle_tf;
@@ -315,9 +316,9 @@ static void m11_run_demo(void) {
     debugcon_writestring("[M11] driver space demo\n");
     // [M12] Publish the signed ELFs into the VFS; the M12 heap makes the
     // large-file ramfs copy reliable (closes the M11 gotcha).
-    if (vfs_create("/bin/driver", user_driver_elf, user_driver_elf_len) != 0)
+    if (sysroot_install_exec("/bin/driver", user_driver_elf, user_driver_elf_len) != 0)
         debugcon_writestring("[M11] WARN: vfs_create /bin/driver failed\n");
-    if (vfs_create("/bin/userprobe", user_userprobe_elf, user_userprobe_elf_len) != 0)
+    if (sysroot_install_exec("/bin/userprobe", user_userprobe_elf, user_userprobe_elf_len) != 0)
         debugcon_writestring("[M11] WARN: vfs_create /bin/userprobe failed\n");
 
     static process_t  idle; static trapframe_t idle_tf;
@@ -667,7 +668,7 @@ __attribute__((noreturn)) static void m16_idle_entry(void) {
             extern int vfs_remove(const char*);
             debugcon_writestring("[M16] --- argv + blocking wait + exit status ---\n");
             vfs_remove("/m16_child.elf");
-            if (vfs_create("/m16_child.elf", user_m16_child_elf, user_m16_child_elf_len) == 0)
+            if (sysroot_install_exec("/m16_child.elf", user_m16_child_elf, user_m16_child_elf_len) == 0)
                 debugcon_writestring("[M16] child ELF placed in VFS\n");
             else
                 debugcon_writestring("[M16] FAIL: could not place child ELF\n");
@@ -892,18 +893,18 @@ static uint8_t execve_idle_stack[16384] __attribute__((aligned(16)));
 static int execve_step = 0, execve_done = 0;
 
 static void execve_install(void) {
-    if (vfs_create("/bin/exectest", user_exectest_elf, user_exectest_elf_len) != 0)
+    if (sysroot_install_exec("/bin/exectest", user_exectest_elf, user_exectest_elf_len) != 0)
         debugcon_writestring("[EXECVE] WARN: install /bin/exectest failed\n");
     uint8_t* t = (uint8_t*)kmalloc(user_exectest_elf_len);
     if (t) {
         for (unsigned i = 0; i < user_exectest_elf_len; i++) t[i] = user_exectest_elf[i];
         t[user_exectest_elf_len / 2] ^= 0x01;           // one flipped byte: signature breaks
-        vfs_create("/bin/exectest_tampered", t, user_exectest_elf_len);
+        sysroot_install_exec("/bin/exectest_tampered", t, user_exectest_elf_len);
         kfree(t);
     }
-    vfs_create("/bin/exectest_unsigned", user_exectest_unsigned_elf, user_exectest_unsigned_elf_len);
+    sysroot_install_exec("/bin/exectest_unsigned", user_exectest_unsigned_elf, user_exectest_unsigned_elf_len);
     static const char script[] = "#!/bin/bash\necho script\n";
-    vfs_create("/bin/exectest_script", script, sizeof(script) - 1);
+    sysroot_install_exec("/bin/exectest_script", script, sizeof(script) - 1);
     debugcon_writestring("[EXECVE] test binaries installed\n");
 }
 
@@ -1311,7 +1312,7 @@ static void m24_run_demo(void) {
 // The signed system programs (coreutils, BusyBox, bash, lua, dropbear, init,
 // the GUI, ...) and the default /etc configuration are installed on the root
 // by kernel/sysroot.c (refresh policy for a persistent root included).
-#include "sysroot.h"
+// (sysroot.h is included at the top: the demos use sysroot_install_exec.)
 extern void shell_init(void);
 extern void shell_run(void);
 extern void shell_run_line(const char* line);
@@ -1372,7 +1373,7 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
         extern int vfs_create(const char*, const void*, size_t);
         extern int vfs_remove(const char*);
         vfs_remove("/mnt/hello.elf");
-        if (vfs_create("/mnt/hello.elf", user_hello_elf, user_hello_elf_len) == 0)
+        if (sysroot_install_exec("/mnt/hello.elf", user_hello_elf, user_hello_elf_len) == 0)
             debugcon_writestring("[M10] wrote signed hello.elf to disk\n");
         else
             debugcon_writestring("[M10] FAIL: could not write hello.elf to disk\n");
@@ -1383,7 +1384,7 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
             for (size_t i = 0; i < user_hello_elf_len && i < sizeof(bad); i++) bad[i] = user_hello_elf[i];
             bad[0x100] ^= 0x01; // flip a code byte -> signature mismatch
             vfs_remove("/mnt/bad.elf");
-            vfs_create("/mnt/bad.elf", bad, user_hello_elf_len);
+            sysroot_install_exec("/mnt/bad.elf", bad, user_hello_elf_len);
             int br = ksys_spawn("/mnt/bad.elf");
             debugcon_writestring(br < 0 ? "[M10] tampered disk ELF REFUSED (good)\n"
                                         : "[M10] FAIL: tampered disk ELF accepted\n");
@@ -1398,7 +1399,7 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
         extern int vfs_create(const char*, const void*, size_t);
         extern int vfs_remove(const char*);
         vfs_remove("/bin/m31");
-        if (vfs_create("/bin/m31", user_m31_libc_elf, user_m31_libc_elf_len) == 0)
+        if (sysroot_install_exec("/bin/m31", user_m31_libc_elf, user_m31_libc_elf_len) == 0)
             debugcon_writestring("[M31] wrote signed libc test to /bin/m31\n");
         shell_run_line("run /bin/m31");
         // Prove the coreutils userland runs (1 spawn keeps the boot demo quick;

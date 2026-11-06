@@ -39,12 +39,21 @@ static vfs_inode_t* inode_from_entry(const ramfs_entry_t* e){ if(!e) return NULL
     // too (a rename changes the entry's name in place).
     vfs_inode_t* ino = NULL;
     for(size_t i=0;i<inode_cache_used;i++){ if(inode_cache[i].fs_data == (void*)e){ ino = &inode_cache[i]; break; } }
-    if(!ino && inode_cache_used < sizeof(inode_cache)/sizeof(inode_cache[0]))
-        ino = &inode_cache[inode_cache_used++];
+    int fresh = 0;
+    if(!ino && inode_cache_used < sizeof(inode_cache)/sizeof(inode_cache[0])){
+        ino = &inode_cache[inode_cache_used++]; fresh = 1;
+    }
     // Cache full: recycle a dead inode. Fresh slots go first so a dead inode an
     // fd may still hold is recycled as late as possible.
-    if(!ino) for(size_t i=0;i<inode_cache_used;i++) if(inode_is_dead(&inode_cache[i])){ ino=&inode_cache[i]; break; }
+    if(!ino) for(size_t i=0;i<inode_cache_used;i++) if(inode_is_dead(&inode_cache[i])){ ino=&inode_cache[i]; fresh=1; break; }
     if(!ino) return NULL;
+    // [M42] The cached inode is the ramfs's only copy of mode/uid/gid (chmod and
+    // chown land here through vfs_setattr). A slot bound to a new entry starts
+    // from "no mode, root-owned" -- never with a previous file's owner.
+    if(fresh){
+        ino->mode = 0; ino->uid = 0; ino->gid = 0; ino->nlink = 1;
+        ino->atime = ino->mtime = ino->ctime = 0;
+    }
     // Path already absolute in ramfs_entry_t.name (without leading '/')
     // Build canonical path with leading '/' (root = "/")
     size_t k=0; const char* src=e->name; if(!src[0]){ ino->path[0]='/'; ino->path[1]=0; } else {

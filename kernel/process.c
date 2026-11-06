@@ -452,6 +452,12 @@ static void aslr_log(uint64_t st_top, uint64_t brk, uint64_t mm) {
     debugcon_writestring("\n");
 }
 
+// [M42] Does p's signed manifest allow set-id execution (MANIFEST_FLAG_SETID)?
+int process_manifest_setid(const process_t* p) {
+    const elf_manifest_t* mf = p ? (const elf_manifest_t*)p->manifest : NULL;
+    return mf && (mf->flags & MANIFEST_FLAG_SETID) ? 1 : 0;
+}
+
 process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     return process_create_from_elf_args(elf_buf, size, 0, NULL);
 }
@@ -509,6 +515,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->wait_pty = NULL; p->sid = p->pid; p->ctty = NULL; p->ctty_detached = 0;  // own session, console
     p->sigsusp_active = 0; p->sigsusp_saved = 0; p->sig_eintr_rip = 0; p->sig_rerun_eintr = 0; p->fpu_valid = 0;
     p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
+    cred_init_root(&p->cred);         // [M42] kernel-made: root (SYS_SPAWN copies the spawner's)
     // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases
     // (<=32MB each, within their multi-GB regions). Transparent to programs.
     p->brk_start = USER_HEAP_BASE + aslr_slide(32ULL*1024*1024);

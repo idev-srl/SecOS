@@ -2052,7 +2052,8 @@ else
     FAIL=$((FAIL+1))
 fi
 
-# =====================================================================# MOUNT HARDENING GATE (fix/mount-hardening). Three bugs found by the M41 exFAT
+# ============================================================================
+# MOUNT HARDENING GATE (fix/mount-hardening). Three bugs found by the M41 exFAT
 # work, all outside its driver:
 # (1) vfs_mount() stored the caller's mount-point pointer — a kernel-stack copy
 #     for SYS_MOUNT — so a userland `mount -t vfat|ext2` left a dangling entry
@@ -2122,7 +2123,6 @@ else
     FAIL=$((FAIL+1))
 fi
 rm -rf "$MHD"
-=======
 # ---- M42: NTFS read-only (host-made image, listing vs ntfs-3g, corrupt images) ----
 # The image is made by the real host tools (mkntfs + ntfs-3g in a user
 # namespace, tools/ntfs-host.sh); ntfs-3g's listing of it (type, size and
@@ -2262,6 +2262,40 @@ if make disk-ntfs >/tmp/secos_selftest_m42_disk.log 2>&1; then
 else
     echo "  [FAIL] M42 disk-ntfs build (mkntfs/ntfs-3g missing and fetch failed? see /tmp/secos_selftest_m42_disk.log)"
     FAIL=$((FAIL+1))
+fi
+
+# ---- libc crypt(): vendored musl SHA-crypt/bcrypt, host + in-guest KATs ----
+# Host: the vendored sources built with the host compiler (tools/crypt_kat/).
+# Guest: the signed user/crypt_test.elf is put on an ext2 data disk (mode 0755)
+# and run from bash at /mnt, so the gate needs no kernel/sysroot change. It
+# needs the default image to reach the bash prompt.
+CRYPTLOG=/tmp/secos_selftest_crypt.log
+CRYPTSER=/tmp/secos_selftest_crypt.serial
+CRYPTDIR=/tmp/secos_selftest_crypt
+echo "[selftest] crypt(): host KAT + in-guest KAT from /mnt (mb2, serial, ~75s)..."
+tools/crypt_kat/run.sh >"$CRYPTDIR.host" 2>&1 && grep -q "\[crypt\] KAT OK" "$CRYPTDIR.host"
+check "crypt host KAT (SHA-512/SHA-256-crypt spec vectors, bcrypt, pwhash)" $?
+if make crypt-test >/tmp/secos_selftest_build.log 2>&1 && \
+   { make clean >/dev/null 2>&1 || true; make iso >>/tmp/secos_selftest_build.log 2>&1; }; then
+    rm -rf "$CRYPTDIR"; mkdir -p "$CRYPTDIR/stage"
+    install -m 0755 user/crypt_test.elf "$CRYPTDIR/stage/crypt_test"
+    dd if=/dev/zero of="$CRYPTDIR/disk.img" bs=1M count=16 status=none
+    mkfs.ext2 -q -L SECOSDATA -d "$CRYPTDIR/stage" "$CRYPTDIR/disk.img"
+    : > "$CRYPTLOG"
+    ( sleep 30; printf '  /mnt/crypt_test; echo CK-$?\r'; sleep 40 ) | \
+        timeout 75 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+            -drive file="$CRYPTDIR/disk.img",if=virtio,format=raw \
+            -debugcon file:"$CRYPTLOG" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -serial stdio >"$CRYPTSER" 2>&1
+    tr -d '\r' < "$CRYPTSER" > "$CRYPTSER.txt"
+    grep -q "^\[crypt\] KAT OK: 0 failure(s)" "$CRYPTSER.txt" && grep -q "^CK-0" "$CRYPTSER.txt"
+    check "crypt in-guest KAT: signed /mnt/crypt_test passes every vector (exit 0)" $?
+    ! grep -q "^\[crypt\] FAIL" "$CRYPTSER.txt"; check "crypt in-guest KAT: no failing check" $?
+    ! grep -q "\[EXC\]\|\[PANIC\]" "$CRYPTLOG"; check "crypt no CPU exception or panic" $?
+    rm -rf "$CRYPTDIR"
+else
+    echo "[selftest] CRYPT BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "crypt in-guest KAT build" 1
 fi
 
 echo "[selftest] ---"

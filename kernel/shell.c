@@ -1714,7 +1714,7 @@ static void run_job(char* line, int background){
             vfs_inode_t* fino=vfs_lookup(redir);
             if(!fino){ vfs_create(redir,"",0); fino=vfs_lookup(redir); }
             else if(!redir_append){ vfs_truncate(redir,0); fino=vfs_lookup(redir); }
-            if(fino){ p->fds[1].used=1; p->fds[1].is_pipe=0; p->fds[1].pipe_w=0; p->fds[1].inode=fino; p->fds[1].offset = redir_append ? fino->size : 0; }
+            if(fino){ p->fds[1].used=1; p->fds[1].is_pipe=0; p->fds[1].pipe_w=0; p->fds[1].inode=fino; p->fds[1].flags=1 /*O_WRONLY*/; p->fds[1].offset = redir_append ? fino->size : 0; }
             else { terminal_writestring("redirect: cannot open "); terminal_writestring(redir); terminal_writestring("\n"); procs[created]=p; pids[created]=p->pid; created++; goto fail; }
         }
         if(i==0) pgid=p->pid;

@@ -31,6 +31,7 @@
 #include "fbdev.h"
 #include "cap.h"
 #include "process.h"
+#include "cred.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -55,11 +56,34 @@ static int g_built;
 static void sset(char* d, const char* s) { int i=0; while(s[i] && i<15){ d[i]=s[i]; i++; } d[i]=0; }
 static int seq(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
 
+// [M42] Device permissions (Linux defaults): the data sinks/sources and the
+// terminal multiplexers are world read-write; the console belongs to root
+// until login gives it to the user who logged in there; the kernel log and
+// block devices are root's (group disk: nobody is in it by default); the
+// framebuffer is root:video and the input devices root:input -- and those two
+// additionally need CAP_DISPLAY / CAP_INPUT in the opener's signed manifest.
+static uint32_t dev_mode(enum dev_kind k, uint32_t* gid) {
+    *gid = GID_ROOT;
+    switch (k) {
+    case DEV_NULL: case DEV_ZERO: case DEV_FULL: case DEV_RANDOM:
+    case DEV_TTY: case DEV_PTMX:   return 0020666;
+    case DEV_CONSOLE:              return 0020600;
+    case DEV_KMSG:                 return 0020600;
+    case DEV_FB:     *gid = GID_VIDEO; return 0020660;
+    case DEV_BLOCK:  *gid = GID_DISK;  return 0060660;
+    }
+    return 0020600;
+}
 static void add(const char* name, enum dev_kind k, block_dev_t* b) {
     if (g_nnodes >= DEVFS_MAX) return;
     sset(g_nodes[g_nnodes].name, name);
     g_nodes[g_nnodes].kind = k;
     g_nodes[g_nnodes].blk = b;
+    uint32_t gid;
+    g_inodes[g_nnodes].mode = dev_mode(k, &gid);   // kept across lookups; chmod/chown change it
+    g_inodes[g_nnodes].uid = 0;
+    g_inodes[g_nnodes].gid = gid;
+    g_inodes[g_nnodes].nlink = 1;
     g_nnodes++;
 }
 
@@ -99,6 +123,7 @@ static vfs_inode_t* fill_inode(int i) {
     vfs_inode_t* ino = &g_inodes[i < 0 ? DEVFS_MAX : i];
     if (i < 0) {
         ino->path[0]='/'; ino->path[1]=0; ino->type=VFS_NODE_DIR; ino->size=0; ino->fs_data=NULL;
+        ino->mode = 0040755; ino->uid = ino->gid = 0; ino->nlink = 2;   // [M42] /dev: root 0755
         return ino;
     }
     ino->path[0]='/'; int k=1; const char* s=g_nodes[i].name;
