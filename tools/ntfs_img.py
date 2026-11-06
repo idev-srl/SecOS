@@ -98,7 +98,7 @@ def populate(d, scale=1.0):
     sp = 48 if scale >= 1 else 8
     with open(f"{d}/sparse.bin", "wb") as f:
         f.write(pattern(10000, 3))
-        f.seek((sp // 2) << 20); f.write(pattern(70000, 4))
+        f.seek((20 if scale >= 1 else 4) << 20); f.write(pattern(70000, 4))
         f.seek((sp << 20) - 5000); f.write(pattern(5000, 5))
     # compressed (LZNT1): directory with the compressed attribute
     os.makedirs(f"{d}/compressed")

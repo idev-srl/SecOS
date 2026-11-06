@@ -209,6 +209,8 @@ int main(int argc, char** argv){
         if(ntfs_mount("fz", "/mnt") != 0){ fprintf(stderr, "mount failed\n"); return 1; }
         int rc = do_list();
         g_ops = NULL;
+        fflush(stdout);
+        free(base); free(g_img); free(g_paths); free(g_type);
         return rc;
     }
     long iters = atol(argv[2]);
@@ -278,7 +280,7 @@ int main(int argc, char** argv){
         alarm(0);
         if((it + 1) % 1000 == 0) fprintf(stderr, "  %ld iterations, %ld mounts\n", it + 1, mounted);
     }
-    free(base); free(g_img); free(files); free(indx); free(hot); free(cl);
+    free(base); free(g_img); free(files); free(indx); free(hot); free(cl); free(g_paths); free(g_type);
     printf("ntfs_fuzz: %ld images, %ld successful mounts, no crash/hang/UB\n", iters, mounted);
     return 0;
 }
