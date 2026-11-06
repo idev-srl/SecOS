@@ -322,8 +322,9 @@ static const vt_ops_t fb_vt_ops = {
 
 int fb_console_init(void){
     framebuffer_info_t info; if(!fb_get_info(&info)) return -1; if (info.bpp != 32) return -1;
-    // If virt_addr unset but physical address is high, attempt mapping: physmap may already cover.
-    if (info.virt_addr == 0 && info.addr >= (16ULL*1024*1024)) {
+    // If virt_addr is unset, reach the framebuffer through the physmap (fb_init
+    // runs in phase 2, after the physmap; [M44] there is no identity fallback).
+    if (info.virt_addr == 0) {
     // Attempt phys_to_virt lookup directly; assume vmm_extend_physmap was called earlier.
         extern uint64_t phys_to_virt(uint64_t phys);
         uint64_t tentative = phys_to_virt(info.addr);

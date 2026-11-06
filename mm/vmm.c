@@ -489,6 +489,82 @@ void vmm_audit_wx(void) {
                                                     : " *** EXECUTABLE ENTRIES ***\n");
 }
 
+// ---- [M44] Retiring the low identity map ----
+// The kernel PML4[0] holds the boot-time low identity map (phys 0..512 MB, 2 MB
+// pages). It is needed only until the physmap is up and early boot has consumed
+// the loader structures; after that every kernel access to physical memory goes
+// through the physmap (phys_to_virt) or a high-half kernel VA. The identity
+// tables are then unhooked from the kernel PML4 and kept ONLY behind a private
+// AP-trampoline CR3: an AP starts in real mode at phys 0x8000 and must execute
+// there for a few instructions after enabling paging, before it jumps to the
+// high half and switches to the kernel CR3 (kernel/smp.c ap_entry).
+static uint64_t g_ident_pdpt_phys = 0;   // boot identity PDPT (-> 0..512 MB PD)
+static uint64_t g_ap_tramp_pml4   = 0;   // AP-trampoline PML4 (< 4 GB, see below)
+
+void vmm_drop_low_identity(void) {
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(kernel_space.pml4_phys & ADDRESS_MASK);
+    uint64_t e = pml4[0];
+    if (!(e & VMM_FLAG_PRESENT)) {
+        debugcon_writestring("[IDMAP] kernel PML4[0] already empty\n");
+        return;
+    }
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(e & ADDRESS_MASK);
+    int extra = 0;
+    for (int i = 1; i < PT_ENTRIES; i++) if (pdpt[i] & VMM_FLAG_PRESENT) extra++;
+    if (extra) {
+        // Something other than the identity PD lives in the kernel lower half:
+        // never expected (every runtime kernel mapping is in the high half).
+        debugcon_writestring("[IDMAP] WARNING: kernel PML4[0] has extra PDPT entries=");
+        debugcon_print_hex((uint64_t)extra);
+        debugcon_writestring(" — dropped with the identity map\n");
+    }
+    g_ident_pdpt_phys = e & ADDRESS_MASK;
+    // The AP trampoline loads CR3 with a 32-bit mov, so its PML4 must sit below
+    // 4 GB: allocate it now, while early-boot frames are still low.
+    void* f = pmm_alloc_frame();
+    if (f && ((uint64_t)f & ADDRESS_MASK) < 0x100000000ULL) {
+        zero_frame((uint64_t)f);
+        g_ap_tramp_pml4 = (uint64_t)f & ADDRESS_MASK;
+    } else if (f) {
+        pmm_free_frame(f);
+    }
+    pml4[0] = 0;
+    write_cr3(read_cr3());                 // identity entries are non-global: flushed
+    debugcon_writestring("[IDMAP] low identity map removed from the kernel page tables "
+                         "(PML4[0] empty; reachable only from the AP-trampoline CR3)\n");
+}
+
+// CR3 for the AP trampoline: the kernel high half + the boot identity map.
+// Rebuilt on each call so it carries the current kernel high-half PML4 entries.
+// Returns 0 when unavailable (no SMP bring-up possible).
+uint64_t vmm_ap_trampoline_cr3(void) {
+    if (!g_ap_tramp_pml4 || !g_ident_pdpt_phys) return 0;
+    uint64_t* k = (uint64_t*)phys_to_virt(kernel_space.pml4_phys & ADDRESS_MASK);
+    uint64_t* t = (uint64_t*)phys_to_virt(g_ap_tramp_pml4);
+    for (int i = 0; i < PT_ENTRIES; i++) t[i] = (i >= 256) ? k[i] : 0;
+    t[0] = g_ident_pdpt_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    return g_ap_tramp_pml4;
+}
+
+// Count present lower-half entries of a user address space OUTSIDE the user
+// window (PML4[1..255], and PDPT slots of PML4[0] outside USER_CODE_BASE ..
+// USER_STACK_TOP). Must be 0: such an entry could only be a kernel low mapping
+// (the identity map) leaking into a user CR3.
+int vmm_space_low_kernel_entries(vmm_space_t* space) {
+    if (!space) return -1;
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(space->pml4_phys & ADDRESS_MASK);
+    int n = 0;
+    for (int i = 1; i < 256; i++) if (pml4[i] & VMM_FLAG_PRESENT) n++;
+    if (pml4[0] & VMM_FLAG_PRESENT) {
+        uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[0] & ADDRESS_MASK);
+        const int lo = (int)((USER_CODE_BASE >> 30) & 0x1FF);
+        const int hi = (int)((USER_STACK_TOP  >> 30) & 0x1FF);
+        for (int i = 0; i < PT_ENTRIES; i++)
+            if ((i < lo || i > hi) && (pdpt[i] & VMM_FLAG_PRESENT)) n++;
+    }
+    return n;
+}
+
 // --- M1.3: Guard pages ---
 // Split a 2MB huge page containing guard_virt into 4KB pages, then mark guard_virt not-present.
 // Must be called AFTER vmm_init_physmap() (uses phys_to_virt).
@@ -834,38 +910,27 @@ vmm_space_t* vmm_space_create_user(void) {
     uint64_t new_phys = (uint64_t)pml4_new & ADDRESS_MASK;
     uint64_t* old_pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(old_phys) : (uint64_t*)old_phys;
     uint64_t* new_pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(new_phys) : (uint64_t*)new_phys;
-    // Copy all kernel PML4 entries as supervisor (strip USER). The kernel high
-    // half (256..511, physmap) must stay supervisor and shared.
-    for (int i=0;i<PT_ENTRIES;i++) {
+    // Share the kernel HIGH half only (256..511: image, physmap, stacks), as
+    // supervisor (strip USER). The lower half is built below (user pages only).
+    for (int i=256;i<PT_ENTRIES;i++) {
         uint64_t e = old_pml4[i];
         if (e & VMM_FLAG_PRESENT) new_pml4[i] = e & ~VMM_FLAG_USER; // share kernel mappings
     }
-    // PML4[0] is special: it covers BOTH the kernel low identity map
-    // (0..512MB, needed while the kernel runs on behalf of a user process) AND
-    // the entire user range — USER_CODE_BASE (4GB) .. USER_STACK_TOP (16GB) are
-    // all < 512GB, i.e. PML4 index 0.  The two must coexist: PML4[0] needs the
-    // USER bit so ring-3 can reach its USER leaves, while kernel pages beneath
-    // stay supervisor (and thus inaccessible to ring-3).  Sharing the kernel's
-    // PDPT here would also collide/leak user tables across processes, so give
-    // each user space its OWN PDPT for PML4[0]: copy the kernel low entries
-    // (supervisor) and leave the user-range PDPT slots empty for the loader.
+    // PML4[0] covers the entire user range (USER_CODE_BASE 4 GB ..
+    // USER_STACK_TOP 16 GB are all < 512 GB). Each user space owns a PRIVATE,
+    // initially EMPTY PDPT for it (sharing one would leak user tables across
+    // processes). [M44] It deliberately inherits NOTHING from the kernel's
+    // PML4[0]: during early boot that slot holds the low identity map (phys
+    // 0..512 MB, virt == phys), and a user CR3 carrying it would let any
+    // ring-0 access through a low user-supplied pointer hit real physical
+    // memory. The kernel reaches RAM only through the physmap and its own
+    // high-half image, so the lower half of a user CR3 holds user pages only.
     {
         const int uidx = (int)((USER_CODE_BASE >> 39) & 0x1FF); // 0 for current layout
-        uint64_t kern_pdpt_phys = old_pml4[uidx] & ADDRESS_MASK;
-        uint64_t* kern_pdpt = (old_pml4[uidx] & VMM_FLAG_PRESENT)
-            ? (physmap_initialized ? (uint64_t*)phys_to_virt(kern_pdpt_phys) : (uint64_t*)kern_pdpt_phys)
-            : NULL;
         void* priv = pmm_alloc_frame();
         if (!priv) { pmm_free_frame(pml4_new); return NULL; }
         zero_frame((uint64_t)priv);
         uint64_t priv_phys = (uint64_t)priv & ADDRESS_MASK;
-        uint64_t* priv_pdpt = physmap_initialized ? (uint64_t*)phys_to_virt(priv_phys) : (uint64_t*)priv_phys;
-        const int lo = (int)((USER_CODE_BASE >> 30) & 0x1FF);
-        const int hi = (int)((USER_STACK_TOP  >> 30) & 0x1FF);
-        for (int i = 0; i < PT_ENTRIES; i++) {
-            if (i >= lo && i <= hi) { priv_pdpt[i] = 0; continue; }      // user range: private, empty
-            priv_pdpt[i] = kern_pdpt ? (kern_pdpt[i] & ~VMM_FLAG_USER) : 0; // kernel low: supervisor
-        }
         new_pml4[uidx] = priv_phys | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_USER;
     }
     vmm_space_t* space = (vmm_space_t*)kmalloc(sizeof(vmm_space_t));
@@ -905,7 +970,6 @@ int vmm_space_destroy(vmm_space_t* space) {
     uint32_t n_pages = 0, n_tables = 0;
 
     // All user addresses are in PML4[0] (USER_CODE_BASE..USER_STACK_TOP are within 0..512GB).
-    // PML4[0] points to the SHARED kernel PDPT — must not free the PDPT itself.
     // User allocations injected PDPT entries 4..15; walk only that range.
     int pdpt_lo = (int)((USER_CODE_BASE >> 30) & 0x1FF); // 4
     int pdpt_hi = (int)((USER_STACK_TOP  >> 30) & 0x1FF); // 15
@@ -945,10 +1009,9 @@ int vmm_space_destroy(vmm_space_t* space) {
             n_tables++;
             pdpt[pi] = 0;
         }
-        // [M8] Since M7 each user space owns a PRIVATE PDPT for PML4[0]
-        // (kernel low entries are copied, not shared at this level), so the
-        // PDPT frame itself must be freed.  Its PDPT[0] points to the shared
-        // kernel low-identity PD, which we correctly never walked or freed.
+        // [M8] Since M7 each user space owns a PRIVATE PDPT for PML4[0], so
+        // the PDPT frame itself must be freed. [M44] It holds user entries
+        // only (no kernel low-identity PD is ever copied into it).
         pmm_free_frame((void*)pdpt_phys);
         n_tables++;
     }
@@ -1295,22 +1358,44 @@ int vmm_protect_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
     return 0;
 }
 
+// Full 4-level walk honouring 1 GB / 2 MB pages (the physmap and the boot
+// tables use them; the old get_pt-based walk misread a huge-page PDE as a PT).
+// Returns the physical address, or 0 when unmapped.
+static uint64_t vmm_walk_translate(uint64_t pml4_phys, uint64_t virt) {
+    if (!physmap_initialized) return 0;
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys & ADDRESS_MASK);
+    uint64_t e = pml4[(virt >> 39) & 0x1FF];
+    if (!(e & VMM_FLAG_PRESENT)) return 0;
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(e & ADDRESS_MASK);
+    e = pdpt[(virt >> 30) & 0x1FF];
+    if (!(e & VMM_FLAG_PRESENT)) return 0;
+    if (e & VMM_FLAG_PS) return (e & 0x000FFFFFC0000000ULL) | (virt & 0x3FFFFFFFULL);
+    uint64_t* pdt = (uint64_t*)phys_to_virt(e & ADDRESS_MASK);
+    e = pdt[(virt >> 21) & 0x1FF];
+    if (!(e & VMM_FLAG_PRESENT)) return 0;
+    if (e & VMM_FLAG_PS) return (e & 0x000FFFFFFFE00000ULL) | (virt & 0x1FFFFFULL);
+    uint64_t* pt = (uint64_t*)phys_to_virt(e & ADDRESS_MASK);
+    e = pt[(virt >> 12) & 0x1FF];
+    if (!(e & VMM_FLAG_PRESENT)) return 0;
+    return (e & ADDRESS_MASK) | (virt & 0xFFF);
+}
+
 uint64_t vmm_translate(uint64_t virt) {
-    uint64_t* pt = get_pt(virt, 0, 0);
-    if (!pt) return 0;
-    int pt_i = (virt >> 12) & 0x1FF;
-    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return 0;
-    return (pt[pt_i] & ADDRESS_MASK) | (virt & 0xFFF);
+    return vmm_walk_translate(kernel_space.pml4_phys, virt);
 }
 
 uint64_t vmm_translate_in_space(vmm_space_t* space, uint64_t virt) {
     if (!space) return 0;
-    uint64_t* pt = get_pt_space(space, virt, 0, 0);
-    if (!pt) return 0;
-    int pt_i = (virt >> 12) & 0x1FF;
-    if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return 0;
-    return (pt[pt_i] & ADDRESS_MASK) | (virt & 0xFFF);
+    return vmm_walk_translate(space->pml4_phys, virt);
 }
+
+// [M44] Kernel VA -> physical for addresses outside the kernel image and the
+// physmap (the M2/M5 stack region, ...). See kvirt_to_phys in vmm.h.
+uint64_t vmm_kvirt_to_phys_slow(uint64_t v) {
+    return vmm_walk_translate(kernel_space.pml4_phys, v);
+}
+
+int vmm_physmap_ready(void) { return physmap_initialized; }
 
 int vmm_alloc_page(uint64_t virt, uint64_t flags) {
     void* frame = pmm_alloc_frame();

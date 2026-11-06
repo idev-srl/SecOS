@@ -1537,7 +1537,19 @@ static void kernel_main_phase2(void) {
     vmm_audit_wx();
 #endif
 
+    // [M44] Retire the boot low identity map: from here on the kernel reaches
+    // physical memory only through the physmap and its high-half image. (The
+    // W^X audit above still inspected it, while it was live.)
+    vmm_drop_low_identity();
+
     heap_init();
+    {   // [M44] A user address space never carries a kernel lower-half mapping.
+        vmm_space_t* probe = vmm_space_create_user();
+        int n = probe ? vmm_space_low_kernel_entries(probe) : -1;
+        if (probe) vmm_space_destroy(probe);
+        debugcon_writestring(n == 0 ? "[IDMAP] user CR3 audit: no low kernel mappings (OK)\n"
+                                    : "[IDMAP] user CR3 audit: FAIL (low kernel mappings present)\n");
+    }
     sched_init();
     driver_registry_init();
     { extern void ipc_init(void); ipc_init(); }  // [M13] kernel IPC channels
@@ -2199,7 +2211,7 @@ static void kernel_main_phase2(void) {
             fb_finalize_mapping();
             framebuffer_info_t info;
             if (fb_get_info(&info)) {
-                uint64_t base = info.virt_addr ? info.virt_addr : info.addr;
+                uint64_t base = info.virt_addr;   // [M44] physmap VA (fb_finalize_mapping)
                 volatile uint32_t* p = (uint32_t*)base;
                 p[0]=0x0000FF; p[1]=0x00FF00; p[2]=0xFF0000;
                 if (terminal_try_enable_fb()) {
@@ -2450,6 +2462,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // Moved before tss_init so that vmm_map() in tss_init uses physmap-aware
     // page table walks.  Interrupts are disabled; no IDT/TSS needed yet.
     vmm_init_physmap();
+    // [M44] The VGA text buffer moves from the identity map to the physmap.
+    { extern void terminal_relocate_vga(void); terminal_relocate_vga(); }
 
     // Step 4: Allocate new kernel stack (16KB + guard pages) in dedicated VA region
     uint64_t new_rsp = vmm_alloc_kernel_stack();

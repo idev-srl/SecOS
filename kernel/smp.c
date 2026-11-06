@@ -36,10 +36,6 @@ extern void lapic_enable_this_cpu(void);
 extern void idt_ap_load(void);
 extern uint64_t ktime_us(void);
 
-static inline uint64_t read_cr3(void) {
-    uint64_t v; __asm__ volatile ("mov %%cr3, %0" : "=r"(v)); return v;
-}
-
 /* Busy delay via the calibrated monotonic clock (falls back to a rough spin if
  * the TSC is not yet calibrated, which shouldn't happen this late in boot). */
 static void ap_udelay(uint64_t us) {
@@ -48,9 +44,10 @@ static void ap_udelay(uint64_t us) {
     while (ktime_us() - start < us) __asm__ volatile ("pause");
 }
 
-/* Low memory (0x8000 / 0x8F00) is identity-mapped, so a physical address is a
- * valid pointer. */
-static volatile uint8_t* lowp(uint64_t phys) { return (volatile uint8_t*)phys; }
+/* Low memory (0x8000 / 0x8F00) is written through the physmap. [M44] The low
+ * identity map is gone from the kernel page tables; only the AP itself runs
+ * on it, briefly, via the dedicated trampoline CR3 (vmm_ap_trampoline_cr3). */
+static volatile uint8_t* lowp(uint64_t phys) { return (volatile uint8_t*)phys_to_virt(phys); }
 
 /* Per-AP idle task (a ring-0 kernel context). When a core has no runnable user
  * task pinned to it, it runs its idle loop; the LAPIC timer preempts idle to a
@@ -68,6 +65,10 @@ extern void sched_reap_zombies(void);
  *  4. start its LAPIC timer and run the idle loop — the timer tick schedules any
  *     user task pinned (cpu_affinity) to this core. */
 void ap_entry(void) {
+    /* [M44] Leave the trampoline CR3 (kernel high half + the boot identity map
+     * the real-mode stub needed) for the kernel CR3 at once: from here on the
+     * AP runs high only, and the identity map exists nowhere it can reach. */
+    vmm_switch_space(vmm_get_kernel_space());
     cpu_t* c = this_cpu();
     extern void cpu_enable_sse(void);
     extern void cpu_enable_mitigations(void);
@@ -117,7 +118,12 @@ void smp_init(void) {
     /* Copy the trampoline to 0x8000 and publish the shared parameters. */
     uint64_t sz = (uint64_t)(_binary_ap_trampoline_bin_end - _binary_ap_trampoline_bin_start);
     for (uint64_t i = 0; i < sz; i++) lowp(AP_TRAMPOLINE_PHYS)[i] = _binary_ap_trampoline_bin_start[i];
-    *(volatile uint64_t*)lowp(AP_PARAM_CR3)   = read_cr3();
+    uint64_t tramp_cr3 = vmm_ap_trampoline_cr3();
+    if (!tramp_cr3) {
+        debugcon_writestring("[SMP] no AP-trampoline CR3 (identity tables missing) — single CPU\n");
+        return;
+    }
+    *(volatile uint64_t*)lowp(AP_PARAM_CR3)   = tramp_cr3;
     *(volatile uint64_t*)lowp(AP_PARAM_ENTRY) = (uint64_t)&ap_entry;
 
     for (uint32_t i = 0; i < t->cpu_count; i++) {
