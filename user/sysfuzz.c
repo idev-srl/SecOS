@@ -31,6 +31,9 @@
  *    close, SIGTTIN/SIGTTOU) and never re-defaults them, so a batch can
  *    neither stop nor block on its own terminal.
  *
+ * Run by an unprivileged user (the multi-user gate), every batch also checks
+ * that it did not end up with uid/euid/suid 0 ("[sysfuzz] ESCALATION").
+ *
  * Usage: sysfuzz [-s seed] [-b batches] [-c calls] [-r batch] [-v] [-F]
  *   -r N   replay only batch N verbosely (reproducer)
  *   -F     run batches in-process (no fork), for verbose panic triage
@@ -123,8 +126,9 @@
 #define SYS_SYSINFO 79
 
 #define NSYS_KNOWN 80
-/* Syscalls numbered past the contiguous range, drawn as well. */
-static const long g_extra_sys[] = { SYS_SETSID, SYS_GETSID };
+/* Syscalls numbered past the contiguous range, drawn as well: sessions and
+ * the [M43] credential calls 100-109 (getuid .. setgroups). */
+static const long g_extra_sys[] = { SYS_SETSID, SYS_GETSID, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109 };
 #define NSYS_EXTRA ((long)(sizeof(g_extra_sys) / sizeof(g_extra_sys[0])))
 
 typedef unsigned long u64;
@@ -424,6 +428,24 @@ static const char* sysname(long n){
     return "oor";
 }
 
+/* [M43] A fuzzer started without root must never come out with root ids. */
+static long g_start_ids[3];
+static void ids_now(long* v){
+    long r[3] = { -1, -1, -1 };
+    unsigned u[3];
+    if(secos_syscall(100 /*SYS_GETUID*/, (long)u, 0, 0, 0, 0) >= 0){ r[0]=u[0]; r[1]=u[1]; r[2]=u[2]; }
+    v[0]=r[0]; v[1]=r[1]; v[2]=r[2];
+}
+static void check_escalation(long b){
+    if(g_start_ids[0]==0 || g_start_ids[1]==0 || g_start_ids[2]==0) return;   /* started as root */
+    long v[3]; ids_now(v);
+    if(v[0]==0 || v[1]==0 || v[2]==0){
+        printf("[sysfuzz] ESCALATION in batch %ld: uid %ld/%ld/%ld -> %ld/%ld/%ld\n", b,
+               g_start_ids[0], g_start_ids[1], g_start_ids[2], v[0], v[1], v[2]);
+        _exit(99);
+    }
+}
+
 static long atou(const char* s){ long v=0; int neg=0; if(*s=='-'){neg=1;s++;} while(*s>='0'&&*s<='9'){v=v*10+(*s-'0');s++;} return neg?-v:v; }
 
 int main(int argc, char** argv){
@@ -438,7 +460,8 @@ int main(int argc, char** argv){
         else if(argv[i][0]=='-'&&argv[i][1]=='v') g_verbose=1;
         else if(argv[i][0]=='-'&&argv[i][1]=='F') g_nofork=1;
     }
-    printf("[sysfuzz] seed=%lu batches=%ld calls=%ld\n",seed,batches,calls);
+    ids_now(g_start_ids);
+    printf("[sysfuzz] seed=%lu batches=%ld calls=%ld uid=%ld euid=%ld\n",seed,batches,calls,g_start_ids[0],g_start_ids[1]);
     setup_fixtures();
 
     for(long b=0;b<batches;b++){
@@ -451,6 +474,7 @@ int main(int argc, char** argv){
             g_rng = batch_seed ? batch_seed : 1;
             batch_file();
             for(long k=0;k<calls;k++) one_call();
+            check_escalation(b);
             printf("[sysfuzz] batch %ld ok (nofork)\n",b);
             continue;
         }
@@ -460,6 +484,7 @@ int main(int argc, char** argv){
             if(replay>=0) g_verbose=1;
             batch_file();
             for(long k=0;k<calls;k++) one_call();
+            check_escalation(b);
             _exit((int)(batch_seed%100));
         } else if(pid>0){
             int st = waitpid(pid);
@@ -471,6 +496,8 @@ int main(int argc, char** argv){
                  * then PANICS the kernel). We do NOT replay in the parent — that
                  * would re-run the same fault and kill the fuzzer itself. */
                 printf("[sysfuzz] batch %ld (seed=%lu) child KILLED sig=%d (repro: -r %ld -v -F)\n",b,batch_seed,WTERMSIG(st),b);
+            } else if(st>=0 && WEXITSTATUS(st)==99 && (u64)(batch_seed%100)!=99){
+                printf("[sysfuzz] batch %ld ESCALATED (status 99)\n",b);
             } else {
                 printf("[sysfuzz] batch %ld ok (status=%d)\n",b,WEXITSTATUS(st));
             }
