@@ -266,8 +266,30 @@ iso: $(KERNEL)
 # kernel includes the committed crypto/user_*_elf.h, so this only needs to run
 # when a user program changes (keeps the kernel build python-free).
 USER_CFLAGS = -ffreestanding -nostdlib -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 -Wall -Iuser -Iuser/include -ffunction-sections -fdata-sections
+# crypt()/crypt_r() from musl 1.2.5 (MIT, third_party/musl-crypt/, unmodified;
+# refresh with tools/vendor-musl-crypt.sh) + user/crypt_glue.c, archived as
+# user/libcrypt.a - the SecOS -lcrypt.
+# Put it last on the link line (after the program objects). Being an archive,
+# only programs that call crypt()/crypt_r() pull it in, so programs with their
+# own crypt stub (busybox_compat.c, dropbear_compat.c) are unaffected. musl's
+# internal <crypt.h> must win over user/include/crypt.h for the vendored
+# files, hence the include order.
+MUSL_CRYPT      = third_party/musl-crypt
+LIBCRYPT        = user/libcrypt.a
+LIBCRYPT_CFLAGS = -I$(MUSL_CRYPT)/src/include -Iuser/musl-crypt-compat $(USER_CFLAGS) -Wno-sign-compare -Wno-missing-braces
+LIBCRYPT_VENDOR = crypt crypt_sha256 crypt_sha512 crypt_blowfish
+.PHONY: libcrypt
+libcrypt:
+	mkdir -p user/cryptobj
+	rm -f user/cryptobj/*.o
+	for f in $(LIBCRYPT_VENDOR); do \
+	    $(CC) $(LIBCRYPT_CFLAGS) -c $(MUSL_CRYPT)/src/crypt/$$f.c -o user/cryptobj/musl_$$f.o || exit 1; \
+	done
+	$(CC) $(LIBCRYPT_CFLAGS) -c user/crypt_glue.c -o user/cryptobj/crypt_glue.o
+	rm -f $(LIBCRYPT)
+	ar rcs $(LIBCRYPT) user/cryptobj/*.o
 .PHONY: user-progs
-user-progs:
+user-progs: libcrypt
 	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
 	$(CC) $(USER_CFLAGS) -c user/note.S       -o user/note.o
 	$(CC) $(USER_CFLAGS) -c user/note_driver.S -o user/note_driver.o

@@ -37,7 +37,7 @@ int   setgroups(unsigned n, const int* g);
 int   fchown(int fd, unsigned uid, unsigned gid);
 int   lchown(const char* path, unsigned uid, unsigned gid);
 char* getpass(const char* prompt);          /* /dev/tty, echo off */
-char* crypt(const char* key, const char* setting);   /* user/crypt.c (libcrypt.o): $6$ SHA-512-crypt */
+char* crypt(const char* key, const char* setting);   /* <crypt.h>; link user/libcrypt.a (musl: $6$/$5$/$2b$) */
 unsigned umask(unsigned m);                 /* SYS_UMASK: applied to open/mkdir */
 
 /* Filesystem calls (kernel syscalls 70-75). */
