@@ -14,6 +14,7 @@
 
 typedef struct {
     vfs_inode_t* inode;
+    const vfs_fs_ops_t* ops;  // filesystem the page was read from
     uint64_t     off;     // page-aligned file offset
     uint64_t     phys;    // cached frame (0 = none)
     uint8_t      valid;
@@ -53,7 +54,7 @@ static uint64_t pagecache_get_phys_nolock(vfs_inode_t* inode, uint64_t off) {
     if (!f) return 0;
     uint64_t phys = (uint64_t)f & ADDRESS_MASK;
     pc_fill(inode, off, phys);
-    e->inode = inode; e->off = off; e->phys = phys; e->valid = 1;
+    e->inode = inode; e->ops = inode->ops; e->off = off; e->phys = phys; e->valid = 1;
     return phys;
 }
 
@@ -94,6 +95,23 @@ void pagecache_invalidate(vfs_inode_t* inode, uint64_t offset, uint64_t len) {
     for (int i = 0; i < PC_ENTRIES; i++) {
         if (pc[i].valid && pc[i].inode == inode &&
             pc[i].off < end && pc[i].off + 4096 > offset) {
+            if (pc[i].phys) pmm_free_frame((void*)pc[i].phys);
+            pc[i].valid = 0; pc[i].phys = 0;
+        }
+    }
+    spin_unlock_irqrestore(&pc_lock, fl);
+}
+
+// Drop every page read from the filesystem behind 'ops'. The VFS calls this
+// when that filesystem is mounted or unmounted: drivers reset their inode pool
+// on mount, so a vfs_inode_t* that cached one file's pages under the previous
+// mount is handed to a different file under the next one, and a lookup keyed
+// by that pointer would serve the old file's bytes.
+void pagecache_invalidate_fs(const struct vfs_fs_ops* ops) {
+    if (!ops) return;
+    uint64_t fl = spin_lock_irqsave(&pc_lock);
+    for (int i = 0; i < PC_ENTRIES; i++) {
+        if (pc[i].valid && pc[i].ops == ops) {
             if (pc[i].phys) pmm_free_frame((void*)pc[i].phys);
             pc[i].valid = 0; pc[i].phys = 0;
         }

@@ -316,6 +316,10 @@ uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
         if (c->fds[fd].is_pipe || c->fds[fd].is_sock) return (uint64_t)-1;  // not a file
         vfs_inode_t* ino = (vfs_inode_t*)c->fds[fd].inode;
         if (!ino) return (uint64_t)-1;
+        // devfs/procfs/sysfs contents are generated and their inode slots are
+        // recycled per lookup: cached pages keyed by such a slot would later be
+        // served as another node's contents. Not mappable (Linux: -ENODEV).
+        if (!ino->ops || (ino->ops->flags & VFS_FS_NOCACHE)) return (uint64_t)(int64_t)-19;
         if (vma_add_file(&c->vmas, base, base + len, m18_prot_to_flags(prot), ino, 0) != 0)
             return (uint64_t)-1;
     }

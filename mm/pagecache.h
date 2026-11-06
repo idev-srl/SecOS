@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 struct vfs_inode;
+struct vfs_fs_ops;
 
 // Physical frame of the cached page holding file bytes [off&~0xFFF, +4096),
 // populated from the VFS on miss. Returns 0 on failure.
@@ -26,5 +27,9 @@ int pagecache_read(struct vfs_inode* inode, uint64_t offset, void* kbuf, uint64_
 // Drop cached pages of 'inode' overlapping [offset, offset+len) (after a write),
 // so a subsequent read re-populates from the (now updated) file.
 void pagecache_invalidate(struct vfs_inode* inode, uint64_t offset, uint64_t len);
+
+// Drop every cached page of the filesystem behind 'ops' (on mount/unmount:
+// inode slots of the previous mount are reused for other files).
+void pagecache_invalidate_fs(const struct vfs_fs_ops* ops);
 
 #endif // PAGECACHE_H

@@ -21,6 +21,7 @@
 #include "block.h"
 #include "debugcon.h"
 #include "heap.h"
+#include "pagecache.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -329,8 +330,10 @@ static uint32_t alloc_inode(int is_dir){
     }
     return 0;
 }
+static void vslot_drop_cache(uint32_t ino);
 static void free_inode(uint32_t ino, int is_dir){
     if(ino==0) return;
+    vslot_drop_cache(ino);   /* the number (and its VFS slot) may go to a new file */
     uint32_t g=(ino-1)/g_inodes_per_group, i=(ino-1)%g_inodes_per_group;
     uint32_t bmp=gd_inode_bitmap(g); if(!bmp) return;
     if(blk_read(bmp,g_xb)!=0) return;
@@ -699,6 +702,14 @@ static e2_vslot_t* vslot(int i){ return &g_vchunk[i/E2_VCHUNK][i%E2_VCHUNK]; }
 static e2_vslot_t* vslot_find(uint32_t ino){
     for(int i=0;i<g_vused;i++){ e2_vslot_t* s=vslot(i); if(s->n.ino==ino) return s; }
     return NULL;
+}
+
+/* An on-disk inode was freed: a later file that gets the same number shares
+ * its VFS slot, so the old file's cached pages must go now (kernel-internal
+ * vfs_remove callers don't invalidate before removing). */
+static void vslot_drop_cache(uint32_t ino){
+    e2_vslot_t* s=vslot_find(ino);
+    if(s) pagecache_invalidate(&s->v, 0, 1ULL<<62);
 }
 
 static vfs_inode_t* vino_alloc(const char* path){

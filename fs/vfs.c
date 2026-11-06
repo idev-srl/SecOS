@@ -10,6 +10,7 @@
  */
 #include "vfs.h"
 #include "spinlock.h"
+#include "pagecache.h"
 #include <stddef.h>
 
 #define VFS_MAX_MOUNTS 12   // [M23] root + /mnt + /dev + /proc + /sys + headroom
@@ -56,6 +57,7 @@ static vfs_mount_t* find_mount_by_point_nolock(const char* mp){
 
 int vfs_mount_root(const vfs_fs_ops_t* ops, const char* fs_name){
     if(!ops || !fs_name) return -1;
+    pagecache_invalidate_fs(ops);                // slots reused from an earlier mount
     uint64_t fl = spin_lock_irqsave(&g_mount_lock);
     if(find_mount_by_point_nolock("/")){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; } // already mounted
     if(g_mount_count >= VFS_MAX_MOUNTS){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
@@ -71,7 +73,14 @@ int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name){
     if(!ops || !fs_name) return -1;
     uint64_t fl = spin_lock_irqsave(&g_mount_lock);
     vfs_mount_t* r = find_mount_by_point_nolock("/");
-    if(r){ r->ops = ops; r->fs_name = fs_name; spin_unlock_irqrestore(&g_mount_lock, fl); return 0; }
+    if(r){
+        const vfs_fs_ops_t* old = r->ops;
+        r->ops = ops; r->fs_name = fs_name;
+        spin_unlock_irqrestore(&g_mount_lock, fl);
+        if(old != ops) pagecache_invalidate_fs(old);
+        pagecache_invalidate_fs(ops);
+        return 0;
+    }
     spin_unlock_irqrestore(&g_mount_lock, fl);
     // vfs_mount_root takes g_mount_lock itself — call it OUTSIDE the lock (not
     // recursive). It re-checks for an existing root, so the drop/re-take is safe.
@@ -101,6 +110,9 @@ int vfs_mount(const char* mount_point, const vfs_fs_ops_t* ops, const char* fs_n
     g_mounts[g_mount_count].fs_name = fs_name;
     g_mount_count++;
     spin_unlock_irqrestore(&g_mount_lock, fl);
+    // The FS may just have reset its inode pool, handing out vfs_inode_t slots
+    // an earlier mount used: the page cache must not serve that mount's pages.
+    pagecache_invalidate_fs(ops);
     return 0;
 }
 
@@ -115,11 +127,15 @@ int vfs_unmount(const char* mount_point){
         const char* a=g_mounts[i].mount_point; const char* b=mount_point; size_t k=0; int eq=1;
         while(a[k]||b[k]){ if(a[k]!=b[k]){ eq=0; break; } k++; }
         if(eq){
+            const vfs_fs_ops_t* ops = g_mounts[i].ops;
             mp_store_put_nolock(a);
             for(int j=i;j<g_mount_count-1;j++) g_mounts[j]=g_mounts[j+1];
             g_mount_count--;
             g_mounts[g_mount_count].mount_point=NULL; g_mounts[g_mount_count].ops=NULL; g_mounts[g_mount_count].fs_name=NULL;
+            int still = 0;                       // same FS still mounted elsewhere?
+            for(int j=0;j<g_mount_count;j++) if(g_mounts[j].ops==ops) still = 1;
             spin_unlock_irqrestore(&g_mount_lock, fl);
+            if(!still) pagecache_invalidate_fs(ops);
             return 0;
         }
     }
