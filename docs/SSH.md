@@ -1,7 +1,7 @@
 # SSH into SecOS (Dropbear)
 
 SecOS ships the **Dropbear** SSH server, built from source and signed like every
-other ring-3 program. Since M42 it is **multi-user**: every account in
+other ring-3 program. Since M43 it is **multi-user**: every account in
 `/etc/passwd` may log in with a public key from `~user/.ssh/authorized_keys`
 or with its password from `/etc/shadow`; root may log in with a key only (see
 [Authentication modes](#authentication-modes)). Exec channels and pty
@@ -219,7 +219,7 @@ the host key survive reboots. On a RAMFS root they live in RAM and are lost.
 ## Security model
 
 - **Two gates.** The code signature decides which programs may run at all;
-  since M42 the credentials decide who they act for. A user's session runs
+  since M43 the credentials decide who they act for. A user's session runs
   with the user's uid/gid/groups, so file permissions apply (it cannot read
   `/etc/shadow`, write `/etc`, or chown other users' files). A root key is
   still equivalent to console access: protect it, and use `command="..."` /
@@ -232,7 +232,7 @@ the host key survive reboots. On a RAMFS root they live in RAM and are lost.
   contact cannot be told apart from a reboot. Use a persistent root, or
   provision `/etc/dropbear/dropbear_ed25519_host_key` from outside, to keep a
   stable host identity. The private host key is created mode 0600 by root, so
-  since M42 other users cannot read it.
+  since M43 other users cannot read it.
 - **Randomness:** see below. Host keys and key-exchange secrets come from
   `/dev/urandom`.
 

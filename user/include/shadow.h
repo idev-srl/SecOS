@@ -1,4 +1,4 @@
-/* <shadow.h> - SecOS libc: /etc/shadow (mode 0600, root only). [M42]
+/* <shadow.h> - SecOS libc: /etc/shadow (mode 0600, root only). [M43]
  * SPDX-License-Identifier: MIT */
 #ifndef _SHADOW_H
 #define _SHADOW_H

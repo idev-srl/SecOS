@@ -23,7 +23,7 @@ typedef struct vfs_inode {
     size_t size;               // file size (0 for dir)
     void* fs_data;             // pointer to underlying FS specific entry/object
     const struct vfs_fs_ops* ops; // back-pointer to filesystem operations
-    // [M26] POSIX metadata, [M42] enforced: the signature decides which code
+    // [M26] POSIX metadata, [M43] enforced: the signature decides which code
     // may run, these decide who may access the file (kernel/cred.c). mode 0 =
     // "the FS keeps no modes": treated as 0755 (dir) / 0644 (file), root-owned.
     uint32_t mode;             // full POSIX mode: S_IFMT type bits | permission bits
@@ -185,7 +185,7 @@ int vfs_rename(const char* oldp, const char* newp);
 int vfs_truncate(const char* path, size_t new_size);
 // [M26] Change attributes (chmod/chown/utimes); valid = VFS_ATTR_* bitmask.
 int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid);
-// [M42] setattr without following a final symlink (lchown, resolved paths).
+// [M43] setattr without following a final symlink (lchown, resolved paths).
 int vfs_lsetattr(const char* path, const vfs_attr_t* a, unsigned valid);
 // [M26] Read a symlink target (NUL-terminated). Returns length or -1.
 int vfs_readlink(const char* path, char* buf, size_t len);

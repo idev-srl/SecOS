@@ -16,7 +16,7 @@ int   isatty(int fd);
 char* ttyname(int fd);                      /* "/dev/pts/N", "/dev/console" or NULL */
 int   ttyname_r(int fd, char* buf, size_t len);
 
-/* [M42] Credentials (kernel/cred.c). The signature decides which code runs;
+/* [M43] Credentials (kernel/cred.c). The signature decides which code runs;
  * these ids decide who it acts for (file permissions, signals). */
 int   getuid(void);
 int   geteuid(void);

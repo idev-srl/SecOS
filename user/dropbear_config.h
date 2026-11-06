@@ -47,7 +47,7 @@
 #undef HAVE_GETRANDOM
 #undef HAVE_CLEARENV
 #undef HAVE_EXPLICIT_BZERO
-/* [M42] Real accounts: the SecOS libc's credentials (kernel/cred.c), the
+/* [M43] Real accounts: the SecOS libc's credentials (kernel/cred.c), the
  * /etc/shadow parser and crypt() from user/libcrypt.a (musl SHA-crypt/bcrypt). */
 #define HAVE_GETGROUPLIST 1
 #define HAVE_SETRESGID 1

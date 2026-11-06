@@ -150,7 +150,7 @@ static void pg_cb(process_t* p, void* u) {
     struct pg_ctx* c = (struct pg_ctx*)u;
     if (p->state == PROC_ZOMBIE || c->n >= PG_MAX) return;
     if (!(c->all ? (p->pid != 0 && p->pid != c->skip) : (p->pgid == c->pgid))) return;
-    if (c->sender && !cred_may_signal(c->sender, p, c->sig)) {   // [M42]
+    if (c->sender && !cred_may_signal(c->sender, p, c->sig)) {   // [M43]
         c->denied++;
         return;
     }
@@ -175,7 +175,7 @@ static int signal_post_all(uint32_t except, int sig) {
     process_foreach(pg_cb, &c);
     return post_collected(&c, sig);
 }
-// [M42] kill(-1 / -pgid) from `sender`: post to the targets it may signal.
+// [M43] kill(-1 / -pgid) from `sender`: post to the targets it may signal.
 // Returns the number signalled; *denied counts the ones refused (EPERM when
 // nothing could be signalled but something matched).
 static int signal_post_checked(process_t* sender, uint32_t pgid, int all, int sig, int* denied) {
@@ -307,7 +307,7 @@ int signal_pgid_exists(uint32_t pgid) {
 long ksys_kill(int pid, int sig) {
     if (sig < 0 || sig >= NSIG) return -22;
     process_t* cur = sched_get_current();
-    // [M42] Credential rules (kernel/cred.c): root, or the sender's real or
+    // [M43] Credential rules (kernel/cred.c): root, or the sender's real or
     // effective uid matches the target's real or saved uid (SIGCONT also within
     // the session). -EPERM(1) when every match was refused.
     if (pid <= 0) {
@@ -334,7 +334,7 @@ long ksys_setpgid(int pid, int pgid) {
     if (!cur) return -1;
     process_t* t = (pid == 0) ? cur : process_find_by_pid((uint32_t)pid);
     if (!t) return -3;                                   // -ESRCH
-    // [M42] POSIX: only the caller itself or one of its children (fork or
+    // [M43] POSIX: only the caller itself or one of its children (fork or
     // spawn), in the caller's session; a root caller may move anything (the
     // kernel shell builds pipelines that way).
     if (t != cur && !cred_is_root(cur) &&

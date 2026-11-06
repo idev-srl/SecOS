@@ -652,7 +652,7 @@ int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) {
 
 /* [M40] Console-only requests: graphics handoff (KDSETMODE/KDGETMODE, see
  * drivers/fbdev.c) and the keyboard layout (KDSKBLAYOUT/KDGKBLAYOUT). */
-/* [M42] Global console state (layout, graphics mode): root, or the user the
+/* [M43] Global console state (layout, graphics mode): root, or the user the
  * console belongs to (login chowns /dev/console to whoever logs in there). */
 static int console_owner_ok(void) {
     extern process_t* sched_get_current(void);

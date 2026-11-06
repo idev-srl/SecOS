@@ -3,9 +3,8 @@
 Phase 3, item 2 (`TASKS.md`). User guide: `docs/USERS.md`.
 
 M43 is numbered after M41 (persistent root, exFAT) and M42 (NTFS). The kernel
-credential work was written earlier on `feat/multiuser`, and its code comments
-still carry the tag `[M42]`. Read those `[M42]` tags in `kernel/cred.*`,
-`fs/*` and `kernel/syscall.c` as this milestone.
+credential work was written earlier on `feat/multiuser` with the tag `[M42]`;
+the Phase 3 integration renamed those code tags to `[M43]`.
 
 ## Revising M26
 

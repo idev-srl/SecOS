@@ -458,7 +458,7 @@ static int fat_write_file(fat_node_t* nd, size_t offset, const void* buf, size_t
     return (int)written;
 }
 
-/* ── [M42] Ownership: FAT has none, so the mount supplies it ──────────────────
+/* ── [M43] Ownership: FAT has none, so the mount supplies it ──────────────────
  * uid=/gid=/umask=/dmask=/fmask= (fs/mntopts.h): default root:root 0755/0644,
  * a file with ATTR_READ_ONLY loses its write bits. "ro" is refused (this
  * driver has no read-only mode). chmod/chown are accepted and ignored
@@ -491,7 +491,7 @@ static vfs_inode_t* fat32_lookup(const char* path){
     nd->first_cluster=fc; nd->size=sz; nd->is_dir=isd;
     ino->ino = fat_ino_of(loc.clus, loc.off);
     ino->mode = mntopts_mode(&g_fopt, isd, !isd && loc.clus && (loc.raw[11] & 0x01));
-    ino->nlink = 1; ino->uid = g_fopt.uid; ino->gid = g_fopt.gid;      /* [M42] mount options */
+    ino->nlink = 1; ino->uid = g_fopt.uid; ino->gid = g_fopt.gid;      /* [M43] mount options */
     ino->atime = ino->mtime = ino->ctime = 0;
     if(loc.clus){                                  /* root has no entry: times stay 0 */
         ino->mtime = fat_to_unix(rd16(loc.raw+22), rd16(loc.raw+24));
@@ -774,7 +774,7 @@ int fat32_mount(const char* dev_name, const char* mount_point){
     g_fsinfo_sec = rd16(bs+48);
     g_fsinfo_done = 0;
     g_mounted = 1;
-    g_fopt = g_fopt_new;                                  /* [M42] this mount's owner/masks */
+    g_fopt = g_fopt_new;                                  /* [M43] this mount's owner/masks */
     mntopts_default(&g_fopt_new);
     return vfs_mount(mount_point, &fat32_ops, "fat32");
 }

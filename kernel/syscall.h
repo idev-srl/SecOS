@@ -75,7 +75,7 @@
 #define SYS_SETSID      85 // setsid() -> new session id / -EPERM (already a group leader)
 #define SYS_GETSID      86 // getsid(pid) -> session id (pid 0 = caller) / -ESRCH
 // 90-94 are reserved for the GUI work; 95-99 for init / system services.
-// [M42] Credentials (kernel/cred.c). 100-109; POSIX rules for who may change ids.
+// [M43] Credentials (kernel/cred.c). 100-109; POSIX rules for who may change ids.
 #define SYS_GETUID      100 // getuid(res*) -> ruid; res != NULL: {ruid,euid,suid} (getresuid)
 #define SYS_GETEUID     101 // geteuid()
 #define SYS_GETGID      102 // getgid(res*) -> rgid; res != NULL: {rgid,egid,sgid} (getresgid)

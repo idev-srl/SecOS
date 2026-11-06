@@ -107,7 +107,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     if(!path) return -1;
     // Follow symlinks like execve does: on a persistent root the multi-call
     // aliases are links (/bin/ls -> busybox); argv[0] keeps the name used.
-    // [M42] A user process needs search permission on the way and x on the
+    // [M43] A user process needs search permission on the way and x on the
     // file (root: at least one x bit); kernel-context spawns are not checked.
     process_t* caller = sched_get_current();
     char rp[256];
@@ -139,7 +139,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     // child would: without this `cd /tmp; tar cf a.tar f1` ran tar in "/".
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0) p->ki.umask = sp->ki.umask;
-      if (sp && sp->pid != 0) p->cred = sp->cred;          // [M42] same user as the spawner
+      if (sp && sp->pid != 0) p->cred = sp->cred;          // [M43] same user as the spawner
       cred_exec_setid(p, fmode, fuid, fgid, setid_fs && process_manifest_setid(p)); }
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0 && sp->cwd[0]) {
@@ -193,7 +193,7 @@ long ksys_execve(struct trapframe* tf, uint64_t upath, uint64_t uargv, uint64_t 
     if(r != 0){ kfree(blob); return r; }
 
     char ap[256]; proc_resolve_path(c, kpath, ap, sizeof(ap));   // cwd-relative
-    // [M42] search permission on the way + x on the file (root: any x bit).
+    // [M43] search permission on the way + x on the file (root: any x bit).
     char rp[256]; vfs_inode_t* ino = 0;
     { int e = cred_check_path(c, ap, 1, MAY_EXEC, rp, sizeof(rp), &ino);
       if(e){ kfree(blob); return e; } }
@@ -320,7 +320,7 @@ uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
     if (!(flags & MAP_ANONYMOUS) && fd >= 0 && fd < 32 && c->fds[fd].used &&
         !c->fds[fd].is_pipe && !c->fds[fd].is_sock && c->fds[fd].inode) {
         extern int devfs_is_fb(void* inode);
-        // [M42] A mapping never grants more than the open did: readable fd
+        // [M43] A mapping never grants more than the open did: readable fd
         // required, and a writable shared (device) map needs O_RDWR.
         if ((c->fds[fd].flags & 3) == 1) return (uint64_t)(int64_t)-13;              // -EACCES: O_WRONLY
         if ((flags & 0x01 /*MAP_SHARED*/) && (prot & PROT_WRITE) && (c->fds[fd].flags & 3) != 2)
@@ -468,7 +468,7 @@ void proc_resolve_path(process_t* c, const char* in, char* out, int outsz){
     out[o]=0;
 }
 
-// [M42] The absolute path of an open file (for fchmod/fchown/futimes): the
+// [M43] The absolute path of an open file (for fchmod/fchown/futimes): the
 // inode keeps its mount-relative path. 0 or -errno (-EBADF / -EINVAL).
 static int fd_abs_path(int fd, char* out, int cap){
     process_t* c=sched_get_current(); if(!c) return -9;
@@ -495,7 +495,7 @@ int ksys_open_mode(const char* path, int flags, uint32_t mode){
     process_t* c=sched_get_current(); if(!c) return -1;
     (void)kiface_apply_create_mode;
     char ap[256]; proc_resolve_path(c, path, ap, sizeof(ap));             // [M39] cwd-relative
-    // [M42] Resolve with search permission on every component, then check
+    // [M43] Resolve with search permission on every component, then check
     // the access the open asks for (read/write by owner/group/other; O_TRUNC
     // needs write), or, to create, write+search on the parent directory.
     char rp[256];
@@ -588,7 +588,7 @@ int ksys_read(int fd, void* ubuf, int len){ extern process_t* sched_get_current(
     int is_pipe = c->fds[fd].used && c->fds[fd].is_pipe;
     int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
     if(!is_pipe && !is_file && fd!=0) return -1;
-    if(is_file && (c->fds[fd].flags & 3) == 1) return -9;   // [M42] -EBADF: opened O_WRONLY
+    if(is_file && (c->fds[fd].flags & 3) == 1) return -9;   // [M43] -EBADF: opened O_WRONLY
     uio_buf_t u;
     // [M30] A redirected pipe/file end takes precedence over the console
     // special-case, so a pipeline can wire its read end onto fd 0 (stdin).
@@ -651,7 +651,7 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
     int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
     if(!is_pipe && !is_file && fd!=1 && fd!=2) return -1;
     if(is_pipe && !c->fds[fd].pipe_w) return -1;            // [M25] write end only
-    if(is_file && (c->fds[fd].flags & 3) == 0) return -9;   // [M42] -EBADF: opened O_RDONLY
+    if(is_file && (c->fds[fd].flags & 3) == 0) return -9;   // [M43] -EBADF: opened O_RDONLY
     vfs_inode_t* ino = is_file ? (vfs_inode_t*)c->fds[fd].inode : 0;
     uio_buf_t u;
     if(ino && pty_is_inode(ino)){
@@ -787,7 +787,7 @@ static void stat_fill(const vfs_inode_t* ino, struct secos_stat* st){
 
 int ksys_stat(const char* path, struct secos_stat* st){
     char rp[256]; proc_resolve_path(sched_get_current(), path, rp, sizeof(rp)); path = rp; // [M39] cwd-relative
-    vfs_inode_t* ino=0;                                     // [M42] search permission on the way
+    vfs_inode_t* ino=0;                                     // [M43] search permission on the way
     int e = cred_check_path(sched_get_current(), path, 1, 0, 0, 0, &ino);
     if(!ino) return e ? e : -2;                             // -ENOENT / -ENOTDIR / -ELOOP / -EACCES
     stat_fill(ino, st);
@@ -806,7 +806,7 @@ int ksys_lstat(const char* path, struct secos_stat* st){
     return 0;
 }
 
-// [M26] chmod/chown/utimes, [M42] with the owner/root rules (kernel/cred.c).
+// [M26] chmod/chown/utimes, [M43] with the owner/root rules (kernel/cred.c).
 // `path` is absolute; follow = 0 for lchown. The fd forms (fchmod/fchown/
 // futimes) pass the fd's absolute path, already resolved.
 static int attr_target(const char* path, int follow, char* cp, size_t cap){
@@ -830,7 +830,7 @@ int ksys_utimes(const char* path, uint64_t atime, uint64_t mtime){
 int ksys_readlink(const char* path, char* buf, int len){
     extern int vfs_readlink(const char*, char*, size_t);
     if(len<=0) return -1;
-    char cp[256]; int e=attr_target(path, 0, cp, sizeof(cp)); if(e) return e;   // [M42] search perm
+    char cp[256]; int e=attr_target(path, 0, cp, sizeof(cp)); if(e) return e;   // [M43] search perm
     return vfs_readlink(cp, buf, (size_t)len);
 }
 int ksys_symlink(const char* target, const char* linkpath){
@@ -874,7 +874,7 @@ int ksys_getdents(const char* path, void* ubuf, int buflen){
     // cwd-relative + normalized: bash's glob and readline's filename completion
     // open "." and "dir/" (trailing slash), which vfs_readdir does not accept.
     char rp[256]; proc_resolve_path(sched_get_current(), path, rp, sizeof(rp)); path = rp;
-    char cp[256]; vfs_inode_t* di=0;                          // [M42] listing needs r on the dir
+    char cp[256]; vfs_inode_t* di=0;                          // [M43] listing needs r on the dir
     int e = cred_check_path(sched_get_current(), path, 1, MAY_READ, cp, sizeof(cp), &di);
     if(e) return e == -CRED_ENOENT ? -1 : e;               // (kbuf not allocated yet)
     path = cp;
@@ -891,7 +891,7 @@ int ksys_getdents(const char* path, void* ubuf, int buflen){
 int ksys_create(const char* path){
     extern int vfs_create(const char*, const void*, size_t);
     process_t* c=sched_get_current();
-    char cp[256]; int e=cred_resolve(c, path, 0, cp, sizeof(cp)); if(e) return e;   // [M42]
+    char cp[256]; int e=cred_resolve(c, path, 0, cp, sizeof(cp)); if(e) return e;   // [M43]
     if(vfs_lookup(cp)) return -17;                                                   // -EEXIST
     if((e=cred_may_create(c, cp))) return e;
     int r = vfs_create(cp, "", 0);
@@ -902,7 +902,7 @@ int ksys_create(const char* path){
 int ksys_mkdir_mode(const char* path, uint32_t mode){
     extern int vfs_mkdir(const char*);
     process_t* c=sched_get_current();
-    char cp[256]; int e=cred_resolve(c, path, 0, cp, sizeof(cp)); if(e) return e;   // [M42]
+    char cp[256]; int e=cred_resolve(c, path, 0, cp, sizeof(cp)); if(e) return e;   // [M43]
     if(vfs_lookup(cp)) return -17;                                                   // -EEXIST
     if((e=cred_may_create(c, cp))) return e;
     int r = vfs_mkdir(cp);
@@ -913,7 +913,7 @@ int ksys_mkdir(const char* path){ return ksys_mkdir_mode(path, 0); }
 int ksys_unlink(const char* path){
     extern int vfs_remove(const char*);
     process_t* c=sched_get_current();
-    char cp[256]; int e=cred_resolve(c, path, 0, cp, sizeof(cp)); if(e) return e;   // [M42]
+    char cp[256]; int e=cred_resolve(c, path, 0, cp, sizeof(cp)); if(e) return e;   // [M43]
     if(!vfs_lookup(cp)) return -2;
     if((e=cred_may_delete(c, cp))) return e;                     // w+x on the parent, sticky dirs
     // Drop the cached pages first: the FS may hand this inode slot (or inode
@@ -925,7 +925,7 @@ int ksys_unlink(const char* path){
 // [M26] mount/umount: map a block-device name + fstype to the existing FS mount
 // helpers (the same path the boot mount and shell `mountdev` use). fstype:
 // "fat32"/"vfat" -> FAT32; "ext2"/"ext4"/"extN" -> ext driver; "exfat";
-// "ntfs" (read-only); "auto"/"" -> try them in that order. Root only [M42].
+// "ntfs" (read-only); "auto"/"" -> try them in that order. Root only [M43].
 // `opts` = mount(2) data: uid=,gid=,umask=,dmask=,fmask= for the FSes that
 // keep no owners (fs/mntopts.h).
 static int str_eq2(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
@@ -936,7 +936,7 @@ int ksys_mount_opts(const char* dev, const char* target, const char* fstype, con
     extern int exfat_mount(const char*, const char*);
     extern int ntfs_mount(const char*, const char*);
     if(!dev||!target||!fstype) return -1;
-    if(!cred_is_root(sched_get_current())) return -CRED_EPERM;   // [M42] root only
+    if(!cred_is_root(sched_get_current())) return -CRED_EPERM;   // [M43] root only
     // Accept the devfs spelling ("/dev/vda") as well as the bare block name.
     if(dev[0]=='/'&&dev[1]=='d'&&dev[2]=='e'&&dev[3]=='v'&&dev[4]=='/') dev += 5;
     if(!block_find(dev)) return -1;                       // no such device
@@ -996,7 +996,7 @@ int ksys_umount(const char* target){
     // Normalize like every other path syscall ("/mnt/", "/mnt/.", relative
     // paths, "" -> cwd), so "/" cannot be reached under another spelling.
     char abs[256];
-    if(!cred_is_root(sched_get_current())) return -CRED_EPERM;   // [M42] root only
+    if(!cred_is_root(sched_get_current())) return -CRED_EPERM;   // [M43] root only
     proc_resolve_path(sched_get_current(), target, abs, sizeof(abs));
     const vfs_fs_ops_t* ops = NULL;
     {
@@ -1090,7 +1090,7 @@ int ksys_chdir(const char* upath){
     process_t* c=sched_get_current(); if(!c) return -1;
     char k[256]; if(copy_user_str(upath, k, sizeof(k))!=0) return -1;
     char ab0[256]; proc_resolve_path(c, k, ab0, sizeof(ab0));
-    char abs[256]; vfs_inode_t* ino=0;                          // [M42] x on every component
+    char abs[256]; vfs_inode_t* ino=0;                          // [M43] x on every component
     int e = cred_check_path(c, ab0, 1, 0, abs, sizeof(abs), &ino);
     if(!ino) return e ? e : -1;
     if(ino->type != VFS_NODE_DIR) return -20;                   // -ENOTDIR
@@ -1353,7 +1353,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         if (copy_to_user((void*)a1, &st, sizeof(st)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return 0;
     }
-    // [M42] path == NULL: the fd form (fchmod / fchown / futimes); the fd is
+    // [M43] path == NULL: the fd form (fchmod / fchown / futimes); the fd is
     // the last argument. chown a3 bit 0: do not follow a final symlink (lchown).
     case SYS_CHMOD: {
         CAP_GATE(CAP_FS_WRITE, "chmod");  // [M35]
@@ -1403,7 +1403,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         if (copy_user_str((const char*)a0, kdev, sizeof(kdev)) != 0) return (uint64_t)(int64_t)-EFAULT;
         if (copy_user_str((const char*)a1, ktgt, sizeof(ktgt)) != 0) return (uint64_t)(int64_t)-EFAULT;
         if (copy_user_str((const char*)a2, kfs,  sizeof(kfs))  != 0) return (uint64_t)(int64_t)-EFAULT;
-        kopt[0] = 0;   // [M42] a3: mount options (FAT32/exFAT/NTFS: uid=,gid=,umask=,dmask=,fmask=)
+        kopt[0] = 0;   // [M43] a3: mount options (FAT32/exFAT/NTFS: uid=,gid=,umask=,dmask=,fmask=)
         if (a3 && copy_user_str((const char*)a3, kopt, sizeof(kopt)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_mount_opts(kdev, ktgt, kfs, kopt);
     }
@@ -1434,7 +1434,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         char kp[256]; if (copy_user_str((const char*)a0, kp, sizeof(kp)) != 0) return (uint64_t)(int64_t)-EFAULT;
         char ab[256]; proc_resolve_path(sched_get_current(), kp, ab, sizeof(ab));   // cwd-relative
         (void)kiface_apply_create_mode;
-        return (uint64_t)(int64_t)ksys_mkdir_mode(ab, (uint32_t)a1);   // [M42] owner + mode & ~umask
+        return (uint64_t)(int64_t)ksys_mkdir_mode(ab, (uint32_t)a1);   // [M43] owner + mode & ~umask
     }
     case SYS_UNLINK: {
         CAP_GATE(CAP_FS_WRITE, "unlink"); // [M35]
@@ -1479,7 +1479,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
             return (uint64_t)(int64_t)socket_connect(sx, (uint32_t)a1, (uint16_t)a2);
         case SYS_BIND:
             if ((uint16_t)a1 != 0 && (uint16_t)a1 < 1024 && !cred_is_root(c))
-                return (uint64_t)(int64_t)-13;                          // [M42] -EACCES: privileged port
+                return (uint64_t)(int64_t)-13;                          // [M43] -EACCES: privileged port
             return (uint64_t)(int64_t)socket_bind(sx, (uint16_t)a1);
         case SYS_LISTEN:
             return (uint64_t)(int64_t)socket_listen(sx, (int)a1);
@@ -1594,7 +1594,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
 
     case SYS_GETUID: case SYS_GETEUID: case SYS_GETGID: case SYS_GETEGID:
     case SYS_SETUID: case SYS_SETGID: case SYS_SETRESUID: case SYS_SETRESGID:
-    case SYS_GETGROUPS: case SYS_SETGROUPS:                 // [M42] kernel/cred.c
+    case SYS_GETGROUPS: case SYS_SETGROUPS:                 // [M43] kernel/cred.c
         return (uint64_t)(int64_t)cred_syscall(num, a0, a1, a2);
 
     case SYS_FSTAT: {

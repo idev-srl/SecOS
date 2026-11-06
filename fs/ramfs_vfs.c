@@ -47,7 +47,7 @@ static vfs_inode_t* inode_from_entry(const ramfs_entry_t* e){ if(!e) return NULL
     // fd may still hold is recycled as late as possible.
     if(!ino) for(size_t i=0;i<inode_cache_used;i++) if(inode_is_dead(&inode_cache[i])){ ino=&inode_cache[i]; fresh=1; break; }
     if(!ino) return NULL;
-    // [M42] The cached inode is the ramfs's only copy of mode/uid/gid (chmod and
+    // [M43] The cached inode is the ramfs's only copy of mode/uid/gid (chmod and
     // chown land here through vfs_setattr). A slot bound to a new entry starts
     // from "no mode, root-owned" -- never with a previous file's owner.
     if(fresh){

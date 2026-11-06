@@ -554,7 +554,7 @@ int vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
     char cp[VFS_PATH]; int e=vfs_walk(path, cp, sizeof(cp), 1); if(e) return e;   // chmod follows
     return vfs_setattr_at(cp, a, valid);
 }
-// [M42] Same without following a final symlink (lchown; kernel/cred.c hands
+// [M43] Same without following a final symlink (lchown; kernel/cred.c hands
 // over paths it has already resolved).
 int vfs_lsetattr(const char* path, const vfs_attr_t* a, unsigned valid){
     char cp[VFS_PATH]; int e=vfs_canon_entry(path, cp, sizeof(cp)); if(e) return e;

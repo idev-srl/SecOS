@@ -259,7 +259,7 @@ uint64_t syscall_handler(trapframe_t* tf) {
     // re-runs the syscall (state kept in its PCB) until the final phase, which
     // never returns. A confined manifest needs CAP_POWER.
     else if (num == SYS_REBOOT) {
-        if (!cap_check(cur, CAP_POWER, num, "reboot") || !cred_is_root(cur)) {   // [M42] root only
+        if (!cap_check(cur, CAP_POWER, num, "reboot") || !cred_is_root(cur)) {   // [M43] root only
             ret = (uint64_t)(int64_t)-1;                // EPERM
         } else {
             long r = power_syscall_step(cur, (int)tf->rdi);

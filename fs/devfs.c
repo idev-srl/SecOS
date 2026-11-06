@@ -56,7 +56,7 @@ static int g_built;
 static void sset(char* d, const char* s) { int i=0; while(s[i] && i<15){ d[i]=s[i]; i++; } d[i]=0; }
 static int seq(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
 
-// [M42] Device permissions (Linux defaults): the data sinks/sources and the
+// [M43] Device permissions (Linux defaults): the data sinks/sources and the
 // terminal multiplexers are world read-write; the console belongs to root
 // until login gives it to the user who logged in there; the kernel log and
 // block devices are root's (group disk: nobody is in it by default); the
@@ -123,7 +123,7 @@ static vfs_inode_t* fill_inode(int i) {
     vfs_inode_t* ino = &g_inodes[i < 0 ? DEVFS_MAX : i];
     if (i < 0) {
         ino->path[0]='/'; ino->path[1]=0; ino->type=VFS_NODE_DIR; ino->size=0; ino->fs_data=NULL;
-        ino->mode = 0040755; ino->uid = ino->gid = 0; ino->nlink = 2;   // [M42] /dev: root 0755
+        ino->mode = 0040755; ino->uid = ino->gid = 0; ino->nlink = 2;   // [M43] /dev: root 0755
         return ino;
     }
     ino->path[0]='/'; int k=1; const char* s=g_nodes[i].name;

@@ -220,7 +220,7 @@ static uint64_t sys_clock_gettime(process_t* c, int clk, uint64_t uts) {
 
 static uint64_t sys_clock_settime(process_t* c, uint64_t num, int clk, uint64_t uts) {
     if (!cap_check(c, CAP_TIME, num, "clock_settime")) return NEG(E_PERM);
-    if (!cred_is_root(c)) return NEG(E_PERM);                 /* [M42] setting the clock: root */
+    if (!cred_is_root(c)) return NEG(E_PERM);                 /* [M43] setting the clock: root */
     struct k_timespec ts;
     if (copy_from_user(&ts, (const void*)uts, sizeof(ts))) return NEG(E_FAULT);
     if (clk != KCLOCK_REALTIME) return NEG(E_INVAL);
@@ -289,7 +289,7 @@ static uint64_t sys_syslog(process_t* c, uint64_t num, int type, uint64_t ubuf, 
                   type == KLOG_ACTION_CONSOLE_OFF || type == KLOG_ACTION_CONSOLE_ON ||
                   type == KLOG_ACTION_CONSOLE_LEVEL);
     if (!cap_check(c, writes ? CAP_FS_WRITE : CAP_FS_READ, num, "syslog")) return NEG(E_PERM);
-    /* [M42] The kernel log is root's (dmesg_restrict=1): others may only ask
+    /* [M43] The kernel log is root's (dmesg_restrict=1): others may only ask
      * for the buffer sizes. */
     if (!cred_is_root(c) && type != KLOG_ACTION_CLOSE && type != KLOG_ACTION_OPEN &&
         type != 9 /*SIZE_UNREAD*/ && type != 10 /*SIZE_BUFFER*/) return NEG(E_PERM);
@@ -351,7 +351,7 @@ static uint64_t sys_statfs(process_t* c, uint64_t num, uint64_t upath, uint64_t 
     const void* key = 0;
     if (upath) {
         char ab0[256]; if ((r = ki_user_path(c, upath, ab0, sizeof(ab0)))) return NEG(-r);
-        char abs[256];                                    /* [M42] search permission on the way */
+        char abs[256];                                    /* [M43] search permission on the way */
         if ((r = cred_check_path(c, ab0, 1, 0, abs, sizeof(abs), 0))) return NEG(-r);
         r = vfs_statfs(abs, &v);
         vfs_inode_t* ino = vfs_lookup_follow(abs); key = ino ? ino->ops : 0;
@@ -531,7 +531,7 @@ static uint64_t sys_poll(process_t* c, trapframe_t* tf, uint64_t ufds, uint64_t 
     return 0;                                     /* only for a non-blockable caller */
 }
 
-/* [M42] rename(old, new) / link(old, new) permission rules (kernel/cred.c).
+/* [M43] rename(old, new) / link(old, new) permission rules (kernel/cred.c).
  * On success p0/p1 hold the canonical paths. rename: the source may be
  * removed from its directory (w+x, sticky), the target directory accepts a
  * new entry (w+x) and an existing target may be replaced (w+x, sticky); a
@@ -599,7 +599,7 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
     case 71: case 72: {                                                 /* SYS_RENAME / SYS_LINK */
         if (!cap_check(c, CAP_FS_WRITE, num, num == 71 ? "rename" : "link")) { r = NEG(E_PERM); break; }
         if ((e = ki_user_path(c, a0, p0, sizeof(p0))) || (e = ki_user_path(c, a1, p1, sizeof(p1)))) { r = NEG(-e); break; }
-        if ((e = ki_perm_rename_link(c, num == 71, p0, p1))) { r = NEG(-e); break; }   /* [M42] */
+        if ((e = ki_perm_rename_link(c, num == 71, p0, p1))) { r = NEG(-e); break; }   /* [M43] */
         if (num == 71) { ki_pagecache_drop_path(p0); ki_pagecache_drop_path(p1); e = vfs_rename(p0, p1); }
         else e = vfs_link(p0, p1);
         r = e < 0 ? NEG(-e) : 0;
@@ -612,7 +612,7 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
         if (len < 0 || len > 0xFFFFFFFFll) { r = NEG(E_INVAL); break; }
         if (a0) {
             if ((e = ki_user_path(c, a0, p0, sizeof(p0)))) { r = NEG(-e); break; }
-            { char cp[256];                               /* [M42] write permission on the file */
+            { char cp[256];                               /* [M43] write permission on the file */
               if ((e = cred_check_path(c, p0, 1, MAY_WRITE, cp, sizeof(cp), 0))) { r = NEG(-e); break; }
               for (int i = 0; i < 256; i++) { p0[i] = cp[i]; if (!cp[i]) break; } }
             ki_pagecache_drop_path(p0);
@@ -633,7 +633,7 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
     case 74:                                                            /* SYS_RMDIR */
         if (!cap_check(c, CAP_FS_WRITE, num, "rmdir")) { r = NEG(E_PERM); break; }
         if ((e = ki_user_path(c, a0, p0, sizeof(p0)))) { r = NEG(-e); break; }
-        { char cp[256];                                   /* [M42] w+x on the parent, sticky */
+        { char cp[256];                                   /* [M43] w+x on the parent, sticky */
           if ((e = cred_resolve(c, p0, 0, cp, sizeof(cp)))) { r = NEG(-e); break; }
           if (!vfs_lookup(cp)) { r = NEG(E_NOENT); break; }
           if ((e = cred_may_delete(c, cp))) { r = NEG(-e); break; }
@@ -646,7 +646,7 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
         if ((e = ki_user_path(c, a0, p0, sizeof(p0)))) { r = NEG(-e); break; }
         int mode = (int)a1;
         if (mode & ~7) { r = NEG(E_INVAL); break; }
-        /* [M42] access() answers for the REAL uid/gid (a set-id program asks
+        /* [M43] access() answers for the REAL uid/gid (a set-id program asks
          * "may my invoker do this?"): run the walk and the check with the
          * effective ids temporarily set to the real ones (no preemption in
          * a syscall, and the process runs on one CPU). */

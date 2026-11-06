@@ -99,7 +99,7 @@ int input_register(input_dev_t* d) {
     scpy(n->path, "/input/event", sizeof(n->path));
     { int k = slen(n->path); n->path[k++] = (char)('0' + idx); n->path[k] = 0; }
     n->type = VFS_NODE_FILE; n->size = 0; n->fs_data = d;
-    n->mode = 0020660; n->nlink = 1;                 /* S_IFCHR | 0660 root:input [M42] */
+    n->mode = 0020660; n->nlink = 1;                 /* S_IFCHR | 0660 root:input [M43] */
     n->uid = 0; n->gid = 105;                        /* GID_INPUT; opening also needs CAP_INPUT */
     spin_unlock_irqrestore(&g_input_lock, fl);
     debugcon_writestring("[INPUT] /dev/input/event");

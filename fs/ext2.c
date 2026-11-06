@@ -936,7 +936,7 @@ static vfs_inode_t* e2_lookup(const char* path){
         uint16_t m=rd16(in+0);
         v->mode=m;
         if((m&S_IFMT)==0xA000) v->type=VFS_NODE_SYMLINK;   // S_IFLNK
-        // [M42] 32-bit ids: osd2 l_i_uid_high@120 / l_i_gid_high@122 (Linux layout).
+        // [M43] 32-bit ids: osd2 l_i_uid_high@120 / l_i_gid_high@122 (Linux layout).
         v->uid=(uint32_t)rd16(in+2) | ((uint32_t)rd16(in+120)<<16);
         v->gid=(uint32_t)rd16(in+24) | ((uint32_t)rd16(in+122)<<16);
         v->atime=rd32(in+8); v->ctime=rd32(in+12); v->mtime=rd32(in+16);

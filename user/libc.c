@@ -289,7 +289,7 @@ int putenv(char* s){
 }
 void abort(void){ write(2,"abort\n",6); _exit(134); }
 
-/* [M42] Real credentials (kernel/cred.c, syscalls 100-109). The code signature
+/* [M43] Real credentials (kernel/cred.c, syscalls 100-109). The code signature
  * decides which code runs; these ids decide who it acts for. setreuid/seteuid
  * and friends are built on setresuid with the POSIX semantics; the kernel
  * enforces who may change what. */
@@ -1209,7 +1209,7 @@ __attribute__((weak)) char* ttyname(int fd){
  * and overrides the weak definitions. A built-in root entry stands in when
  * /etc/passwd or /etc/group is missing (informational only: it has no
  * password, so nothing can authenticate as it). Each file has its own buffer,
- * so walking the groups while holding a passwd entry is safe. [M42] */
+ * so walking the groups while holding a passwd entry is safe. [M43] */
 #include <pwd.h>
 #include <grp.h>
 #include <shadow.h>

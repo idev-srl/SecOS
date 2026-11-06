@@ -243,7 +243,7 @@ static int pty_alloc(vfs_inode_t* ptmx, vfs_inode_t** out) {
     name_slave(np->sino.path, idx);
     np->mino.type = np->sino.type = VFS_NODE_FILE;
     np->mino.mode = 0020666; np->sino.mode = 0020620;   /* S_IFCHR */
-    /* [M42] devpts: the slave belongs to whoever opened /dev/ptmx (the session
+    /* [M43] devpts: the slave belongs to whoever opened /dev/ptmx (the session
      * user: secwm's terminals, or sshd, which chowns it to the login user),
      * group tty, crw--w----; the master is only reachable through its fd. */
     {   extern process_t* sched_get_current(void);

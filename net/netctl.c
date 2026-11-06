@@ -57,7 +57,7 @@ long ksys_netctl(uint64_t op, uint64_t idx, uint64_t arg) {
         return 0;
     }
     case NETCTL_SET: {
-        if (!cred_is_root(c)) return -1;                        /* [M42] -EPERM: root only */
+        if (!cred_is_root(c)) return -1;                        /* [M43] -EPERM: root only */
         struct secos_ifinfo k;
         if (copy_from_user(&k, (const void*)arg, sizeof(k)) != 0) return -14;
         int ph = dhcp_poll(d);
@@ -68,7 +68,7 @@ long ksys_netctl(uint64_t op, uint64_t idx, uint64_t arg) {
         return 0;
     }
     case NETCTL_DHCP_START:
-        if (!cred_is_root(c)) return -1;                        /* [M42] -EPERM: root only */
+        if (!cred_is_root(c)) return -1;                        /* [M43] -EPERM: root only */
         return dhcp_start(d);
     case NETCTL_DHCP_POLL: {
         int ph = dhcp_poll(d);
