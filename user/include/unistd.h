@@ -16,15 +16,28 @@ int   isatty(int fd);
 char* ttyname(int fd);                      /* "/dev/pts/N", "/dev/console" or NULL */
 int   ttyname_r(int fd, char* buf, size_t len);
 
-/* [M39] single-user identity (signature is the trust boundary; everyone is root) */
+/* [M42] Credentials (kernel/cred.c). The signature decides which code runs;
+ * these ids decide who it acts for (file permissions, signals). */
 int   getuid(void);
 int   geteuid(void);
 int   getgid(void);
 int   getegid(void);
 int   setuid(int u);
 int   setgid(int g);
+int   seteuid(int e);
+int   setegid(int e);
+int   setreuid(int r, int e);
+int   setregid(int r, int e);
+int   setresuid(int r, int e, int s);
+int   setresgid(int r, int e, int s);
+int   getresuid(int* r, int* e, int* s);
+int   getresgid(int* r, int* e, int* s);
 int   getgroups(int n, int* g);
 int   setgroups(unsigned n, const int* g);
+int   fchown(int fd, unsigned uid, unsigned gid);
+int   lchown(const char* path, unsigned uid, unsigned gid);
+char* getpass(const char* prompt);          /* /dev/tty, echo off */
+char* crypt(const char* key, const char* setting);   /* user/crypt.c (libcrypt.o): $6$ SHA-512-crypt */
 unsigned umask(unsigned m);                 /* SYS_UMASK: applied to open/mkdir */
 
 /* Filesystem calls (kernel syscalls 70-75). */

@@ -49,6 +49,7 @@ int     stat(const char* path, struct stat* st);
 /* [M26] VFS maturity: metadata + symlinks */
 int     lstat(const char* path, struct stat* st);
 int     chmod(const char* path, unsigned mode);
+int     fchmod(int fd, unsigned mode);           /* [M42] libc.c: SYS_CHMOD fd form */
 int     chown(const char* path, unsigned uid, unsigned gid);
 int     utimes(const char* path, unsigned long atime, unsigned long mtime);
 long    readlink(const char* path, char* buf, long len);
