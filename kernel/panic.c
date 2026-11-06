@@ -17,6 +17,15 @@
 #include "../mm/user_copy.h"
 #include <stdint.h>
 
+// [M45] KASLR: a kernel-image address as it is in kernel.bin (runtime VA minus
+// the slide), so logged addresses resolve with addr2line/nm and do not reveal
+// the slide. Other addresses are returned unchanged.
+static uint64_t link_addr(uint64_t a) {
+    uint64_t base = kernel_vma_base();
+    if (a >= base && a - base < (512ULL << 20)) return a - g_kaslr_slide;
+    return a;
+}
+
 /* [M39] Debug breadcrumb: drivers doing long in-kernel bring-up (ath9k) write
  * their last progress line here. The exception handler clears the screen, so we
  * reprint it inside the panic dump — it's how we localize a fault that happens
@@ -236,7 +245,7 @@ void exception_handler(struct registers* regs) {
                 if (g_kverbose) {
                     debugcon_writestring("[UACCESS] -EFAULT fixup addr=");
                     debugcon_print_hex(cr2);
-                    debugcon_writestring(" rip="); debugcon_print_hex(regs->rip);
+                    debugcon_writestring(" rip="); debugcon_print_hex(link_addr(regs->rip));
                     debugcon_writestring("\n");
                 }
                 regs->rip = fix;
@@ -255,6 +264,7 @@ void exception_handler(struct registers* regs) {
           debugcon_writestring("[EXC] int="); debugcon_print_hex(int_no);
           debugcon_writestring(" err="); debugcon_print_hex(err_code);
           debugcon_writestring(" rip="); debugcon_print_hex(regs->rip);
+          if (!from_user) { debugcon_writestring(" lrip="); debugcon_print_hex(link_addr(regs->rip)); }
           debugcon_writestring(" cr2="); debugcon_print_hex(_cr2);
           debugcon_writestring(" cs="); debugcon_print_hex(regs->cs);
           debugcon_writestring(" rsp="); debugcon_print_hex(regs->rsp);
@@ -286,6 +296,7 @@ void exception_handler(struct registers* regs) {
         char hex_chars[] = "0123456789ABCDEF";
         for (int i = 60; i >= 0; i -= 4) terminal_putchar(hex_chars[(err_code >> i) & 0xF]);
         terminal_writestring("\nRIP: "); print_hex64(regs->rip);
+        terminal_writestring(" (kernel.bin: "); print_hex64(link_addr(regs->rip)); terminal_writestring(")");
         terminal_writestring("\nRSP: "); print_hex64(regs->rsp);
         terminal_writestring("\nCS: "); print_hex64(regs->cs);
         terminal_writestring("\nRFLAGS: "); print_hex64(regs->rflags);
