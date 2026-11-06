@@ -1,10 +1,11 @@
 # SSH into SecOS (Dropbear)
 
 SecOS ships the **Dropbear** SSH server, built from source and signed like every
-other ring-3 program. It supports **public-key authentication only**, for a
-single `root` identity. This is stage 1: non-interactive `ssh host 'command'`
-works end to end. An interactive shell over a PTY is still pending (see
-[What's pending](#whats-pending)).
+other ring-3 program. Since M42 it is **multi-user**: every account in
+`/etc/passwd` may log in with a public key from `~user/.ssh/authorized_keys`
+or with its password from `/etc/shadow`; root may log in with a key only (see
+[Authentication modes](#authentication-modes)). Exec channels and pty
+sessions both work.
 
 ```
 $ ssh -p 2222 root@localhost 'echo hi; uname -a'
@@ -32,8 +33,9 @@ Files:
 - `user/dropbear_port.h` is force-included. It renames libsecos's non-POSIX
   socket prototypes away and adds the POSIX declarations the port needs.
 - `user/dropbear_compat.c` holds the shims: POSIX sockets, getaddrinfo, select
-  over poll, writev, waitpid, sigaction, the root account, time, O_EXCL /
-  O_NOFOLLOW and the PTY calls. Generic ones are tagged
+  over poll, writev, waitpid, sigaction, time, O_EXCL / O_NOFOLLOW and the PTY
+  calls. Credentials, the account database and `crypt()` are not shimmed: they
+  are the SecOS libc's and `user/libcrypt.a` (musl), linked last. Generic ones are tagged
   `TODO(integration): move to libc`.
 - `user/dropbear-include/` provides `sys/socket.h`, `netinet/*`, `arpa/inet.h`,
   `netdb.h`, `poll.h`, `sys/select.h`, `syslog.h` and `sys/un.h`.
@@ -45,14 +47,13 @@ fails the build instead of truncating a pointer.
 
 ## Configuration (`user/dropbear_localoptions.h`)
 
-- **Authentication:** public key only. Password and PAM auth are compiled out,
-  and so are the client's password and askpass paths.
-- **Identity:** non-multiuser (`DROPBEAR_SVR_MULTIUSER 0`). The only account
-  that can log in is the one the server runs as. The compat layer's passwd
-  database contains just `root` (uid 0, home `/root`, shell `/bin/bash`,
-  password locked). Any other user name does not exist and is rejected before
-  keys are checked. Dropbear also confirms that `getgroups()` fails with
-  ENOSYS, i.e. that the kernel really has no users.
+- **Authentication:** public key and password (`DROPBEAR_SVR_PASSWORD_AUTH 1`,
+  against `/etc/shadow`); PAM is compiled out, and so are the client's
+  password and askpass paths. See [Authentication modes](#authentication-modes).
+- **Identity:** multi-user (`DROPBEAR_SVR_MULTIUSER 1`,
+  `DROPBEAR_SVR_DROP_PRIVS 1`). Accounts come from `/etc/passwd`,
+  `/etc/shadow` and `/etc/group` through the libc. The shell must be listed in
+  `/etc/shells` (or, without that file, be `/bin/bash` or `/bin/sh`).
 - **Algorithms:** ed25519 host and user keys only (no RSA, DSS, ECDSA or SK).
   Key exchange is `mlkem768x25519-sha256` (post-quantum hybrid) or
   `curve25519-sha256`. Ciphers are chacha20-poly1305, aes128/256-gcm and
@@ -62,6 +63,51 @@ fails the build instead of truncating a pointer.
   `/proc/self/exe` and real execve).
 - **On:** `authorized_keys` options are honoured (`command=`, `no-pty`, ...).
   `MAX_AUTH_TRIES` is 6.
+
+## Authentication modes
+
+| Account | Public key | Password |
+|---------|------------|----------|
+| root (uid 0) | yes, `/root/.ssh/authorized_keys` | **refused**, even when correct |
+| any other account | yes, `~user/.ssh/authorized_keys` | yes, `/etc/shadow` hash |
+| locked account (`!...` or `*` in `/etc/shadow`) | yes (as on Linux; lock with `usermod -L` + remove the keys, or set the shell to `/bin/false`) | refused |
+| account with an empty hash | yes | refused ("blank password") |
+| unknown user | refused | refused |
+
+- **Keys.** Dropbear's own `authorized_keys` checks apply: the file, `~/.ssh`
+  and the home directory must be owned by the user or root and not writable
+  by group or others, otherwise the key is ignored. `command=`, `no-pty` and
+  the other key options are honoured.
+- **Passwords.** The hash is read with `getspnam()` (root reads
+  `/etc/shadow`, mode 0600, before the privilege drop) and checked with the
+  libc `crypt()` (musl SHA-512-crypt `$6$`, SHA-256-crypt `$5$`, bcrypt `$2b$`;
+  any other prefix, including a leading `!`, makes `crypt()` fail, which
+  Dropbear reports as a locked account) and a constant-time comparison. No
+  hash code is written here.
+- **Root password logins** are off by default in the SecOS build: the port
+  makes upstream's `-g` ("disable password logins for root") the default, so
+  it holds even with an `/etc/inittab` that does not pass `-g` (persistent
+  roots keep their inittab). Root logs in with a key; to administer with a
+  password, log in as a user and use `su`/`sudo`. Turning root password logins
+  on needs a rebuild (remove the `norootpass` patch in `tools/port-dropbear.sh`).
+- **After authentication** the connection's process (forked by the listener,
+  which stays root) calls `setgid(pw_gid)`, `initgroups(user, pw_gid)` and
+  `setuid(pw_uid)` at once (`DROP_PRIVS`), so the channels, the pty
+  allocation and the shell all run as the user. The session gets `HOME`,
+  `SHELL`, `USER`, `LOGNAME` and the cwd from `/etc/passwd`, and `PATH` is
+  `/bin:/usr/bin` (root: `/bin:/usr/bin:/sbin:/usr/sbin`).
+- **Pty slave.** The kernel creates `/dev/pts/N` owned by the process that
+  opened `/dev/ptmx` (here the user), group `tty` (5), mode 0620, which is
+  what `pty_setowner` expects, so a user's terminal is never root's. At the
+  end of a session Dropbear tries to give the (already closed) slave back to
+  root and logs `chown /dev/pts/N 0 0 failed: Input/output error`; this is
+  harmless.
+- **Set-id manifest flag.** `dropbearmulti`'s manifest does **not** carry
+  `MANIFEST_FLAG_SETID`. That flag only lets the kernel honour the S_ISUID /
+  S_ISGID bits of the file being exec'd; Dropbear is started as root by init
+  and only lowers its ids (root may set any id, see `kernel/cred.c`), so it
+  needs no set-id execution. Leaving the flag off means a `chmod u+s` on
+  `dropbearmulti` (which would also make `dbclient` set-uid) has no effect.
 
 ### Signed manifest: least privilege
 
@@ -172,22 +218,21 @@ the host key survive reboots. On a RAMFS root they live in RAM and are lost.
 
 ## Security model
 
-- **The signature is the trust boundary.** SecOS has no users or passwords, so
-  "who may log in" is "who holds a private key listed in `authorized_keys`".
-  An authenticated session gets a root bash, which can run any signed program.
-  An SSH key is therefore equivalent to console access. Protect it accordingly,
-  and use `command="..."` / `no-pty` options in `authorized_keys` to restrict a
-  key.
-- **Password auth cannot be enabled at runtime:** the code is not in the
-  binary. The selftest checks that a password-only client is refused with
-  `Permission denied (publickey)`.
+- **Two gates.** The code signature decides which programs may run at all;
+  since M42 the credentials decide who they act for. A user's session runs
+  with the user's uid/gid/groups, so file permissions apply (it cannot read
+  `/etc/shadow`, write `/etc`, or chown other users' files). A root key is
+  still equivalent to console access: protect it, and use `command="..."` /
+  `no-pty` options in `authorized_keys` to restrict a key.
+- **Passwords travel inside the encrypted channel** and are checked against
+  `/etc/shadow`; `MAX_AUTH_TRIES` (6) bounds the guesses per connection. Root
+  never authenticates with a password.
 - **Host key on ramfs:** a key generated with `-R` lives in RAM. Each boot gets
   a new identity, so clients that pin keys will warn, and a MITM on first
   contact cannot be told apart from a reboot. Use a persistent root, or
   provision `/etc/dropbear/dropbear_ed25519_host_key` from outside, to keep a
-  stable host identity. SecOS does not enforce file modes, so the private host
-  key is readable by any signed program on the box. This follows from
-  signature-as-trust: any signed program is trusted.
+  stable host identity. The private host key is created mode 0600 by root, so
+  since M42 other users cannot read it.
 - **Randomness:** see below. Host keys and key-exchange secrets come from
   `/dev/urandom`.
 
@@ -276,7 +321,8 @@ ssh then continues without a tty.
    `ptsname()` builds `/dev/pts/N` from it.
 3. **`ioctl(master, TIOCSPTLCK /*0x40045431*/, int* lock)`**: the slave cannot
    be opened while locked. A pair starts locked; `unlockpt()` passes 0.
-   `grantpt()` is a no-op (single user; nodes are created 0620 root).
+   `grantpt()` is a no-op (the slave is created owned by the opener, group
+   tty, mode 0620).
 4. **`/dev/pts/N`** (dynamic devfs directory `/dev/pts`). Opening it returns a
    **slave** fd. The slave is a full TTY with the same line discipline as the
    console (`kernel/tty.c`): cooked mode (echo, erase, kill, ^D EOF), raw mode
@@ -320,10 +366,16 @@ using a per-run port in 22000-22999. init has already taken the lease and
 started dropbear. The gate installs a key generated at test time by hand (no
 private key is committed) and checks from the host:
 exec output and exit status 0; stderr and exit status 3; wrong key, unknown
-user and password-only client refused; a 6th sequential session; pty sessions
+user and a key-less root client refused; a 6th sequential session; pty sessions
 and window changes; the host key generated on first use (`/var/log/sshd.log`);
 no `[EXC]`/`[PANIC]`. It SKIPs if the host lacks `ssh`/`ssh-keygen`, or if the
 kernel has no `SYS_POLL`.
+
+The **MUPORTS** gate (`tools/mu_ports_test.sh`, port 26000-26999) covers the
+multi-user modes: key and password login as a test user written straight into
+`/etc/passwd`/`/etc/shadow`/`/etc/group` (uid, groups, HOME, cwd, pty slave
+`tuser:tty 0620`, `/etc/shadow` unreadable), wrong and locked passwords
+refused, root's correct password refused while root's key works.
 
 The **INIT** gate (end of `tools/selftest.sh`, port 23000-23999) covers the
 zero-step boot: an image built with `SSH_AUTHORIZED_KEYS=<throwaway key>`

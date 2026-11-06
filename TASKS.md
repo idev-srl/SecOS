@@ -178,8 +178,16 @@ robustness and the paused real-hardware bring-up — see below.
          e.g. PBKDF2-SHA-512 on the in-kernel/libc crypto, or yescrypt/bcrypt);
          `useradd`, `passwd`, `su` (sudo optional);
    - [ ] a home directory per user (`/home/<user>`, `/root` for root);
-   - [ ] SSH logs in as the matching user (Dropbear multi-user mode,
-         `~user/.ssh/authorized_keys`) instead of always root;
+   - [x] SSH logs in as the matching user (Dropbear multi-user mode,
+         `~user/.ssh/authorized_keys`) instead of always root — `feat/multiuser-ports`:
+         `DROPBEAR_SVR_MULTIUSER` + `DROP_PRIVS`, key or `/etc/shadow` password
+         (libc `crypt()`), root by key only (password refused by default), pty slave
+         `user:tty 0620`; see `docs/SSH.md` "Authentication modes";
+   - [x] BusyBox, bash and Dropbear rebuilt on the real id syscalls (no fake-root
+         stubs; BusyBox keeps the kernel's errno, e.g. EROFS; its id/whoami/su/login/
+         passwd/adduser/... applets are configured out for SecOS's own tools; libc
+         `opendir` reads directories of any size, so bash globs see >256 entries);
+         selftest gate MUPORTS (`tools/mu_ports_test.sh`);
    - [ ] init's console runs `login` (or a getty) instead of a root bash, opt-out for dev.
 3. [ ] **More filesystems:**
    - [ ] **exFAT read-write** (the specification is public since 2019): boot-sector
