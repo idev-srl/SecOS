@@ -1645,6 +1645,20 @@ static int job_wait_foreground(uint32_t pgid, const uint32_t* pids, int npid){
 // Launch a (possibly piped) job: `cmd1 args | cmd2 | ...`, optionally in the
 // background (trailing &, stripped by the caller). 'line' is mutated in place.
 static uint8_t g_job_spawn_buf[2*1024*1024]; // 2 MB: GNU bash with readline is ~1.1 MB
+// A freshly created process is PROC_NEW, which the scheduler may already pick:
+// a timer tick right after process_create_*() can run it to completion before
+// the shell has wired its fds / pgid. The old code then set the ZOMBIE back to
+// READY, and the scheduler restarted it from its initial trapframe (seen as a
+// program running twice and then faulting on a garbage return address). Hold
+// the process (NEW -> BLOCKED, atomically) right after creation and release
+// only what was held; a process that already ran is never resurrected.
+static int sh_hold_new(process_t* p){
+    return __sync_bool_compare_and_swap(&p->state, PROC_NEW, PROC_BLOCKED);
+}
+static void sh_release(process_t* p, int held){
+    if(held) __sync_bool_compare_and_swap(&p->state, PROC_BLOCKED, PROC_READY);
+}
+
 static void run_job(char* line, int background){
     // [M38] Output redirection: strip a trailing `> file` / `>> file` and remember
     // the target + append mode. Applied to the LAST pipeline stage's fd 1 (stdout).
@@ -1690,7 +1704,7 @@ static void run_job(char* line, int background){
 
     extern process_t* process_create_from_elf_args(const void*, size_t, int, const char* const*);
     extern int vfs_read_all(const char*, void*, size_t);
-    process_t* procs[JOB_NPROC]; uint32_t pids[JOB_NPROC]; int created=0;
+    process_t* procs[JOB_NPROC]; uint32_t pids[JOB_NPROC]; int held[JOB_NPROC]; int created=0;
     uint32_t pgid=0; void* prev_read=NULL;
     for(int i=0;i<ns;i++){
         int n=vfs_read_all(paths[i], g_job_spawn_buf, sizeof(g_job_spawn_buf));
@@ -1699,6 +1713,7 @@ static void run_job(char* line, int background){
         process_t* p=process_create_from_elf_args(g_job_spawn_buf,(size_t)n,argc[i],av[i]);
         if(!p){ terminal_writestring("run: cannot launch "); terminal_writestring(paths[i]);
                 terminal_writestring(" (missing or unsigned)\n"); goto fail; }
+        held[created]=sh_hold_new(p);
         // Wire stdin from the previous stage's pipe, stdout to a fresh pipe.
         if(prev_read){ p->fds[0].used=1; p->fds[0].is_pipe=1; p->fds[0].pipe_w=0; p->fds[0].inode=prev_read; prev_read=NULL; }
         if(i < ns-1){
@@ -1721,7 +1736,7 @@ static void run_job(char* line, int background){
         p->pgid=pgid; p->ppid=0;
         procs[i]=p; pids[i]=p->pid; created++;
     }
-    for(int i=0;i<created;i++) procs[i]->state=PROC_READY;
+    for(int i=0;i<created;i++) sh_release(procs[i], held[i]);
 
     if(background){
         int jn=job_add(pgid,pids,created,line,0);
@@ -1735,7 +1750,7 @@ static void run_job(char* line, int background){
     }
     return;
 fail:
-    for(int i=0;i<created;i++) if(procs[i]){ signal_post(procs[i],9/*SIGKILL*/); procs[i]->state=PROC_READY; }
+    for(int i=0;i<created;i++) if(procs[i]){ signal_post(procs[i],9/*SIGKILL*/); sh_release(procs[i], held[i]); }
     for(int spin=0; spin<2000 && sched_count_alive_user()>0; spin++){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
 }
 
@@ -1753,10 +1768,11 @@ int shell_exec_foreground(const char* path, int argc, const char* const* argv,
     if(n<=0) return -1;
     process_t* p=process_create_from_elf_args(g_job_spawn_buf,(size_t)n,argc,argv);
     if(!p) return -1;
+    int held=sh_hold_new(p);
     uint32_t pid=p->pid;
     p->pgid=pid; p->ppid=0;
     if(created) created(p);
-    p->state=PROC_READY;
+    sh_release(p, held);
     for(;;){
         int stopped=job_wait_foreground(pid,&pid,1);
         if(!stopped || !keep_running) return stopped;
