@@ -39,3 +39,4 @@ user/lua.elf
 # [M40] KEYMAP build stamp
 .keymap.stamp
 .gui-autostart.stamp
+exfat_corrupt/
