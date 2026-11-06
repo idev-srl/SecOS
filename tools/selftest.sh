@@ -772,6 +772,46 @@ grep -q "\[M35\] audit log total events: 0x0000000000000004" "$M35LOG"; check "M
 grep -q "\[M35\] DONE" "$M35LOG"; check "M35 demo completed ([M35] DONE)" $?
 ! grep -q "\[EXC\]" "$M35LOG"; check "no CPU exception ([EXC]) during M35 run" $?
 
+# ---- M46: exec confinement (no_new_privs; caps only shrink across exec) ----
+# user/m46_confine.c in three signed builds: m46conf (confined), m46probe
+# (ambient + explicit NET/INPUT/DISPLAY), m46setid (SETID, root 04755). The
+# kernel spawns the ambient control first, then the confined driver. (fb0 does
+# not exist yet when the demo runs - the framebuffer comes up later in boot -
+# so the explicit-cap check uses /dev/input/event0, the same gate.)
+M46LOG=/tmp/secos_selftest_m46.log
+echo "[selftest] Building M46 image (M46_CONFINE_DEMO=1, signing enforced)..."
+build_demo M46 "-DM46_CONFINE_DEMO=1"
+echo "[selftest] Running M46 (mb2, 60s)..."
+run_iso "$M46LOG" 60; declutter "$M46LOG"
+m46() { grep -aq "^\[m46\] $1" "$M46LOG"; check "M46 $2" $?; }
+m46 "ctl socket=OK"   "ambient control: probe gets CAP_NET"
+m46 "ctl input=OK"    "ambient control: probe gets CAP_INPUT"
+m46 "ctl write=OK"    "ambient control: probe writes files"
+m46 "ctl-setid caps=.* uid=1000 euid=0" "ambient control: SETID program run as uid 1000 gets euid 0 (spawn)"
+m46 "ctl-setid-exec caps=.* uid=1000 euid=0" "ambient control: SETID program gets euid 0 (execve)"
+m46 "set nnp rc=0 nnp=1" "prctl(PR_SET_NO_NEW_PRIVS) on an ambient process"
+m46 "nnp-setid caps=.* euid=1000" "voluntary no_new_privs: SETID program keeps euid 1000 (spawn)"
+m46 "nnp-setid-exec caps=.* euid=1000" "voluntary no_new_privs: SETID program keeps euid 1000 (execve)"
+m46 "conf caps=0x60000f40 nnp=1" "confined driver: caps 0xF40, confined, no_new_privs automatic"
+m46 "spawn caps=0x60000f40 nnp=1" "spawned ambient probe is confined to the parent's caps"
+m46 "spawn socket=DENIED" "spawned ambient probe: no CAP_NET"
+m46 "spawn input=DENIED"  "spawned ambient probe: no CAP_INPUT"
+m46 "spawn write=DENIED"  "spawned ambient probe: no file write"
+m46 "fork caps=0x60000f40 nnp=1" "fork child keeps the parent's confinement"
+m46 "exec caps=0x60000f40 nnp=1" "execve of the ambient probe stays confined"
+m46 "exec socket=DENIED"  "execve'd probe: no CAP_NET"
+m46 "exec input=DENIED"   "execve'd probe: no CAP_INPUT"
+m46 "exec write=DENIED"   "execve'd probe: no file write"
+m46 "busybox touch rc=1 file=ABSENT" "spawned BusyBox cannot create a file"
+m46 "bash redirect rc=1 file=ABSENT" "spawned bash cannot create a file"
+m46 "conf-setid caps=.* uid=1000 euid=1000" "confined uid 1000 + SETID program: no euid 0 (spawn)"
+m46 "conf-setid-exec caps=.* uid=1000 euid=1000" "confined uid 1000 + SETID program: no euid 0 (execve)"
+m46 "clear nnp rc=-22 nnp=1" "no_new_privs cannot be cleared"
+grep -aq "\[AUDIT\] pid=.* DENY  NET (spawn)" "$M46LOG"; check "M46 lost capability audited ([AUDIT] DENY NET (spawn))" $?
+grep -aq "\[AUDIT\] pid=.* DENY  SETID (setid-nnp)" "$M46LOG"; check "M46 refused set-id exec audited" $?
+grep -aq "\[M46\] DONE" "$M46LOG"; check "M46 demo completed ([M46] DONE)" $?
+! grep -aq "\[EXC\]" "$M46LOG"; check "no CPU exception ([EXC]) during M46 run" $?
+
 # ---- M39: POSIX shell-from-source foundation (cwd/env/dup2/termios/...) ----
 M39PLOG=/tmp/secos_selftest_m39posix.log
 echo "[selftest] Building M39 POSIX image (M39_POSIX_DEMO=1, signing enforced)..."
