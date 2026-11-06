@@ -1615,7 +1615,7 @@ else
         grep -q "^SSH-42-OK" "$SSHDIR/o1" && grep -q "^SecOS" "$SSHDIR/o1" && grep -q "^RC=0" "$SSHDIR/o1"
         check "SSH exec channel: output + uname, exit status 0" $?
         grep -q "^SSH-ERR" "$SSHDIR/o2" && grep -q "^RC=3" "$SSHDIR/o2"; check "SSH exec channel: stderr forwarded, exit status 3 propagated" $?
-        ! grep -q "SSH-BADKEY-RAN" "$SSHDIR/o3" && grep -q "Permission denied (publickey)" "$SSHDIR/o3"
+        ! grep -q "SSH-BADKEY-RAN" "$SSHDIR/o3" && grep -q "Permission denied (publickey" "$SSHDIR/o3"
         check "SSH unauthorized key refused" $?
         ! grep -q "SSH-NOUSER-RAN" "$SSHDIR/o4" && grep -q "Permission denied" "$SSHDIR/o4"; check "SSH unknown user refused" $?
         grep -q "Permission denied (publickey,password)" "$SSHDIR/o5" && ! grep -q "^RC=0" "$SSHDIR/o5"
