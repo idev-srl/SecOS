@@ -48,13 +48,14 @@ static int sig_interrupted(process_t* cur, trapframe_t* tf) {
     return signal_pending(cur);
 }
 
-// Socket I/O that may block: read/write/recv/send/recvfrom/sendto/accept on a
+// Socket I/O that may block: read/write/recv/send/recvfrom/sendto/accept/connect on a
 // socket fd. Returns the fd's entry when `num` is one of them and the fd is a
 // socket, else NULL.
 static struct proc_fd_entry* sock_wait_fd(process_t* cur, uint64_t num, uint64_t a0) {
     if (!cur) return NULL;
     if (num != SYS_READ && num != SYS_WRITE && num != SYS_RECV && num != SYS_SEND &&
-        num != SYS_RECVFROM && num != SYS_SENDTO && num != SYS_ACCEPT) return NULL;
+        num != SYS_RECVFROM && num != SYS_SENDTO && num != SYS_ACCEPT &&
+        num != SYS_CONNECT) return NULL;
     if (a0 >= 32 || !cur->fds[a0].used || !cur->fds[a0].is_sock) return NULL;
     return &cur->fds[a0];
 }
@@ -324,7 +325,12 @@ uint64_t syscall_handler(trapframe_t* tf) {
         struct proc_fd_entry* e = sock_wait_fd(cur, num, tf->rdi);
         cur->sleep_until = 0;
         ret = syscall_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8);
-        if (ret == (uint64_t)(int64_t)(-11) && !(e->flags & SOCK_O_NONBLOCK)) {
+        // [M47] connect() is non-blocking in the socket layer too: -EINPROGRESS
+        // (handshake started) / -EALREADY (still running) mean "would block".
+        int wouldblock = ret == (uint64_t)(int64_t)(-11) ||
+            (num == SYS_CONNECT && (ret == (uint64_t)(int64_t)(-115) ||
+                                    ret == (uint64_t)(int64_t)(-114)));
+        if (wouldblock && !(e->flags & SOCK_O_NONBLOCK)) {
             if (sig_interrupted(cur, tf)) {
                 ret = (uint64_t)(int64_t)(-4);          // EINTR
             } else {

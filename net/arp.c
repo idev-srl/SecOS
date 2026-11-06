@@ -15,7 +15,7 @@
 
 #define ARP_CACHE 16
 struct arp_entry { uint32_t ip; uint8_t mac[6]; int valid; uint32_t age; };
-static struct arp_entry g_cache[ARP_CACHE];
+static struct arp_entry g_cache[ARP_CACHE];   /* [M47] stack lock */
 
 static const uint8_t BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
@@ -30,6 +30,7 @@ static void cache_put(uint32_t ip, const uint8_t mac[6]) {
 }
 
 int arp_lookup(uint32_t ip, uint8_t out_mac[6]) {
+    NET_ASSERT_STACK_LOCKED();
     for (int i = 0; i < ARP_CACHE; i++)
         if (g_cache[i].valid && g_cache[i].ip == ip) {
             for (int j=0;j<6;j++) out_mac[j]=g_cache[i].mac[j];
@@ -83,6 +84,12 @@ void arp_input(net_dev_t* dev, const uint8_t* frame, uint32_t len) {
         pkt[26]=(uint8_t)(spa>>16); pkt[27]=(uint8_t)(spa>>24);
         eth_send(dev, sha, ETH_TYPE_ARP, pkt, sizeof(pkt));
     }
+}
+
+int arp_entries(void) {
+    int n = 0;
+    for (int i = 0; i < ARP_CACHE; i++) if (g_cache[i].valid) n++;
+    return n;
 }
 
 void arp_tick(void) {

@@ -15,6 +15,7 @@
 #define NET_H
 #include <stdint.h>
 #include "pci.h"
+#include "net_lock.h"
 
 #define NET_MTU       1500
 #define NET_FRAME_MAX 1536        /* MTU + Ethernet header + FCS slack */
@@ -42,6 +43,13 @@ typedef struct net_dev {
     pci_device_t pci;            /* the NIC's PCI function (for IRQ setup) */
     net_irq_mode_t irq_mode;
     int      link_up;
+    /* [M47] Locking (see net_lock.h), set up by net_register_dev(). The core
+     * calls poll() only under rx_lock and transmit() only under tx_lock, so a
+     * driver needs no locking of its own for its rings. rx_kick asks the CPU
+     * holding rx_lock to drain once more (an RX kick never gets lost). */
+    net_spinlock_t rx_lock;
+    net_spinlock_t tx_lock;
+    volatile int   rx_kick;
 } net_dev_t;
 
 /* ---- Driver-facing core API ---- */
@@ -50,8 +58,19 @@ int        net_dev_count(void);
 net_dev_t* net_get_dev(int i);
 net_dev_t* net_primary(void);                      /* first registered NIC */
 
-/* Driver -> stack: hand a received Ethernet frame to the stack (copies out). */
+/* Driver -> stack: hand a received Ethernet frame to the stack (copies out).
+ * Called from dev->poll() (rx_lock held); takes the stack lock per frame. */
 void net_rx(net_dev_t* dev, const void* frame, uint32_t len);
+
+/* [M47] Drain dev's RX ring under rx_lock (any context; never spins on a busy
+ * ring: the CPU already draining it is asked to go round again instead). */
+void net_dev_poll(net_dev_t* dev);
+/* [M47] dev->transmit() under tx_lock (stack lock held by the caller). */
+int  net_dev_xmit(net_dev_t* dev, const void* frame, uint32_t len);
+
+/* [M47] Leak/stress accounting for NETCTL_STATS (stack lock taken inside). */
+struct secos_netstats;
+void net_get_stats(struct secos_netstats* st);
 
 /* Wire the device's interrupt to dev->poll: try MSI-X, then legacy INTx, then
  * register dev->poll for timer-tick polling. Returns the chosen mode (also
@@ -77,7 +96,8 @@ int net_ping_rtt(uint32_t dst_ip, uint16_t seq, uint64_t* rtt_tsc);
  * retransmit). Cheap no-op when networking is absent. */
 void net_tick(void);
 
-/* ---- Protocol layer entry points (implemented across the net layer) ---- */
+/* ---- Protocol layer entry points (implemented across the net layer) ----
+ * [M47] Unless noted, every function below expects the stack lock held. */
 void eth_input(net_dev_t* dev, const uint8_t* frame, uint32_t len);   /* L2 demux */
 /* Send a payload as an Ethernet frame to dst_mac with the given ethertype. */
 int  eth_send(net_dev_t* dev, const uint8_t dst_mac[6], uint16_t ethertype,
@@ -87,6 +107,7 @@ int  eth_send(net_dev_t* dev, const uint8_t dst_mac[6], uint16_t ethertype,
 void arp_input(net_dev_t* dev, const uint8_t* frame, uint32_t len);
 int  arp_resolve(net_dev_t* dev, uint32_t ip, uint8_t out_mac[6]);    /* 0 ok, -1 pending */
 int  arp_lookup(uint32_t ip, uint8_t out_mac[6]);                    /* passive: 0 hit, -1 miss */
+int  arp_entries(void);                                               /* valid cache entries */
 void arp_request(net_dev_t* dev, uint32_t target_ip);
 void arp_tick(void);                                                  /* cache aging */
 

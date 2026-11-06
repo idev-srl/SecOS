@@ -10,11 +10,12 @@
 #define ETH_TYPE_IPV4 0x0800
 #define ETH_TYPE_ARP  0x0806
 
-// Outgoing-frame scratch (the stack is single-threaded/serialized).
+// Outgoing-frame scratch: [M47] guarded by the stack lock (every sender holds it).
 static uint8_t g_txframe[NET_FRAME_MAX];
 
 int eth_send(net_dev_t* dev, const uint8_t dst_mac[6], uint16_t ethertype,
              const void* payload, uint32_t len) {
+    NET_ASSERT_STACK_LOCKED();
     if (!dev || !dev->transmit) return -1;
     if (len > NET_MTU) return -1;
     uint8_t* f = g_txframe;
@@ -25,7 +26,7 @@ int eth_send(net_dev_t* dev, const uint8_t dst_mac[6], uint16_t ethertype,
     for (uint32_t i = 0; i < len; i++) f[14 + i] = p[i];
     uint32_t total = 14 + len;
     if (total < 60) { for (uint32_t i = total; i < 60; i++) f[i] = 0; total = 60; } // min frame
-    return dev->transmit(dev, f, total);
+    return net_dev_xmit(dev, f, total);
 }
 
 void eth_input(net_dev_t* dev, const uint8_t* frame, uint32_t len) {

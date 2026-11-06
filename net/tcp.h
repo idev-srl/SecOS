@@ -7,9 +7,10 @@
  * A small but correct TCP: connection table, full open/close state machine,
  * cumulative ACKs, a sliding send window, in-order receive buffering, and a
  * retransmit timer driven from net_tick(). Active open (connect) and passive
- * open (listen/accept) are both supported with a tiny backlog. Single-threaded
- * (poll/shell context) so no locking. The blocking helpers spin on `hlt` so the
- * timer tick can drive RX (same idiom as the ping self-test / DHCP).
+ * open (listen/accept) are both supported with a tiny backlog. [M47] The
+ * non-blocking core and the stack hooks expect the stack lock held (see
+ * net_lock.h); the blocking helpers take it per step and spin on `hlt` without
+ * it so the timer tick can drive RX (same idiom as the ping self-test / DHCP).
  */
 #ifndef NET_TCP_H
 #define NET_TCP_H
@@ -51,5 +52,6 @@ void        tcp_close(tcp_conn_t* c);                    /* orderly close + free
 /* ---- stack hooks ---- */
 void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len);
 void tcp_tick(void);                                     /* retransmit + TIME_WAIT (from net_tick) */
+void tcp_count(uint32_t* used, uint32_t* orphans);       /* NETCTL_STATS */
 
 #endif /* NET_TCP_H */

@@ -9,6 +9,14 @@
  * from net_tick(). Out-of-order segments are dropped and re-ACKed (the peer
  * retransmits) — correct, if not fast. Good enough for a client doing an HTTP
  * GET and a tiny echo server.
+ *
+ * [M47] Locking: the connection table, every control block, the retransmit /
+ * TIME-WAIT timers and the TX scratch (g_seg, g_cs) are guarded by the stack
+ * lock (net/net_lock.h). tcp_input/tcp_tick run under it from the RX path and
+ * the tick; the non-blocking core is called by the socket layer with it held;
+ * the blocking shell helpers at the bottom take it per step and never across a
+ * wait. A control block owned by a socket is freed only by tcp_release() (the
+ * socket's last close) or, once orphaned, by tcp_tick() — never by the RX path.
  */
 #include "tcp.h"
 #include "debugcon.h"
@@ -31,6 +39,7 @@ extern uint64_t timer_get_ticks(void);
 #define TCP_TIMEWAIT 2000          /* ~2 s linger */
 #define TCP_MAX_BACKLOG 4          /* per-listener queued children (16-entry table) */
 #define TCP_ORPHAN_MS 10000        /* a released conn gets this long to finish FIN */
+#define TCP_ARP_RETRY 20           /* SYN not sent yet (ARP pending): retry every 20 ms */
 
 /* flags */
 #define F_FIN 0x01
@@ -59,6 +68,8 @@ struct tcp_conn {
     uint8_t      accepted;             /* child handed out by tcp_accept_ready */
     uint8_t      orphan;               /* socket released it: free once closed */
     uint64_t     orphan_deadline;      /* hard limit for an orphan's FIN handshake */
+    uint8_t      syn_unsent;           /* SYN_SENT but the SYN never left (ARP miss) */
+    uint64_t     syn_retry_at;
     int          backlog;              /* LISTEN: max not-yet-accepted children */
 };
 
@@ -90,6 +101,7 @@ static uint16_t eph_port(void){
 }
 
 tcp_conn_t* tcp_alloc(void){
+    NET_ASSERT_STACK_LOCKED();
     for(int i=0;i<TCP_MAX_CONN;i++) if(!g_conns[i].used){
         struct tcp_conn* c=&g_conns[i];
         for(size_t k=0;k<sizeof(*c);k++) ((uint8_t*)c)[k]=0;
@@ -102,8 +114,16 @@ void tcp_free(tcp_conn_t* c){ if(c){ c->used=0; c->state=TCP_CLOSED; } }
 tcp_state_t tcp_get_state(const tcp_conn_t* c){ return c?c->state:TCP_CLOSED; }
 int tcp_rx_available(const tcp_conn_t* c){ return c?(int)c->rx_len:0; }
 
+void tcp_count(uint32_t* used, uint32_t* orphans){
+    uint32_t u=0, o=0;
+    for(int i=0;i<TCP_MAX_CONN;i++) if(g_conns[i].used){ u++; if(g_conns[i].orphan) o++; }
+    *used=u; *orphans=o;
+}
+
 // ---- segment transmit ----
-static void tcp_xmit(struct tcp_conn* c, uint8_t flags, const uint8_t* data, uint32_t dlen, uint32_t seq){
+// Returns ipv4_send()'s result: <0 when the segment did not leave (ARP miss).
+static int tcp_xmit(struct tcp_conn* c, uint8_t flags, const uint8_t* data, uint32_t dlen, uint32_t seq){
+    NET_ASSERT_STACK_LOCKED();
     uint32_t hdr = 20;
     uint8_t* s = g_seg;
     s[0]=(uint8_t)(c->local_port>>8);  s[1]=(uint8_t)c->local_port;
@@ -135,7 +155,7 @@ static void tcp_xmit(struct tcp_conn* c, uint8_t flags, const uint8_t* data, uin
     uint16_t csum = net_checksum(g_cs, 12+seglen);
     s[16]=(uint8_t)(csum>>8); s[17]=(uint8_t)csum;
 
-    ipv4_send(c->dev, c->remote_ip, IP_PROTO_TCP, s, seglen);
+    return ipv4_send(c->dev, c->remote_ip, IP_PROTO_TCP, s, seglen);
 }
 
 static void arm_rto(struct tcp_conn* c){ c->rto_deadline = timer_get_ticks()+TCP_RTO; c->retries=0; }
@@ -176,7 +196,10 @@ int tcp_start_connect(tcp_conn_t* c, net_dev_t* dev, uint32_t dip, uint16_t dpor
     c->iss = csprng_u32();                          /* unpredictable ISN (blind injection) */
     c->snd_una=c->iss; c->snd_nxt=c->iss; c->rcv_nxt=0;
     c->state=TCP_SYN_SENT;
-    tcp_xmit(c, F_SYN, NULL, 0, c->iss);
+    /* A SYN dropped on an ARP miss is retried every TCP_ARP_RETRY ms by
+     * tcp_tick (the ARP request is out) instead of waiting a full RTO. */
+    c->syn_unsent = tcp_xmit(c, F_SYN, NULL, 0, c->iss) < 0;
+    c->syn_retry_at = timer_get_ticks() + TCP_ARP_RETRY;
     c->snd_nxt = c->iss + 1;
     arm_rto(c);
     return 0;
@@ -284,6 +307,7 @@ static uint32_t rx_accept(struct tcp_conn* c, const uint8_t* data, uint32_t len)
 }
 
 void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len){
+    NET_ASSERT_STACK_LOCKED();
     if(len<20) return;
     uint16_t sport=(uint16_t)((seg[0]<<8)|seg[1]);
     uint16_t dport=(uint16_t)((seg[2]<<8)|seg[3]);
@@ -402,6 +426,7 @@ void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len
 }
 
 void tcp_tick(void){
+    NET_ASSERT_STACK_LOCKED();
     uint64_t now=timer_get_ticks();
     for(int i=0;i<TCP_MAX_CONN;i++){
         struct tcp_conn* c=&g_conns[i];
@@ -412,6 +437,13 @@ void tcp_tick(void){
         }
         if(c->orphan && (c->state==TCP_CLOSED || now>=c->orphan_deadline)){ c->used=0; continue; }
         if(c->state==TCP_CLOSED) continue;
+        if(c->state==TCP_SYN_SENT && c->syn_unsent){
+            if(now>=c->syn_retry_at){
+                if(tcp_xmit(c, F_SYN, NULL, 0, c->iss)==0){ c->syn_unsent=0; arm_rto(c); }
+                else c->syn_retry_at = now + TCP_ARP_RETRY;
+            }
+            continue;
+        }
         if(c->rto_deadline && now>=c->rto_deadline && c->snd_una!=c->snd_nxt){
             if(++c->retries>TCP_MAX_RETX){ c->reset=1; conn_closed(c); continue; }
             /* Retransmit the oldest unacked unit. */
@@ -434,29 +466,28 @@ void tcp_tick(void){
     }
 }
 
-// ---- blocking convenience ----
+// ---- blocking convenience (kernel shell) ----
+// [M47] Each step takes the stack lock; the hlt waits run without it. The
+// first SYN no longer needs an ARP warm-up: tcp_tick retries it every
+// TCP_ARP_RETRY ms until the next hop resolves.
 tcp_conn_t* tcp_connect(net_dev_t* dev, uint32_t dip, uint16_t dport){
-    // Warm the next-hop ARP first (gateway for off-subnet) so the very first SYN
-    // goes out instead of being dropped on a pending ARP — otherwise a fresh
-    // destination could report "connect failed" until a retransmit happened.
-    if(dev){
-        uint32_t nh = (dev->netmask && (dip & dev->netmask)==(dev->ip & dev->netmask)) ? dip : dev->gateway;
-        uint8_t mac[6];
-        if(arp_resolve(dev, nh, mac)!=0){
-            uint64_t adl=timer_get_ticks()+1000;
-            while(timer_get_ticks()<adl && arp_lookup(nh, mac)!=0) __asm__ volatile("sti; hlt");
-        }
-    }
+    uint64_t fl=net_lock();
     tcp_conn_t* c=tcp_alloc();
+    if(c && tcp_start_connect(c, dev, dip, dport)!=0){ tcp_free(c); c=NULL; }
+    net_unlock(fl);
     if(!c) return NULL;
-    if(tcp_start_connect(c, dev, dip, dport)!=0){ tcp_free(c); return NULL; }
     uint64_t deadline=timer_get_ticks()+8000;
     while(timer_get_ticks()<deadline){
-        if(c->state==TCP_ESTABLISHED) return c;
-        if(c->reset || c->state==TCP_CLOSED) break;
+        fl=net_lock();
+        tcp_state_t st=c->state; int rst=c->reset;
+        net_unlock(fl);
+        if(st==TCP_ESTABLISHED) return c;
+        if(rst || st==TCP_CLOSED) break;
         __asm__ volatile("sti; hlt");
     }
+    fl=net_lock();
     tcp_free(c);
+    net_unlock(fl);
     return NULL;
 }
 
@@ -464,7 +495,9 @@ int tcp_send_all(tcp_conn_t* c, const void* data, uint32_t len){
     const uint8_t* p=(const uint8_t*)data; uint32_t off=0;
     uint64_t deadline=timer_get_ticks()+8000;
     while(off<len && timer_get_ticks()<deadline){
+        uint64_t fl=net_lock();
         int n=tcp_write(c, p+off, len-off);
+        net_unlock(fl);
         if(n<0) return -1;
         off+=(uint32_t)n;
         if(off<len) __asm__ volatile("sti; hlt");   /* tx buffer full: let ACKs drain it */
@@ -475,7 +508,9 @@ int tcp_send_all(tcp_conn_t* c, const void* data, uint32_t len){
 int tcp_recv_block(tcp_conn_t* c, void* buf, uint32_t len, uint32_t ms){
     uint64_t deadline=timer_get_ticks()+ms;
     while(timer_get_ticks()<deadline){
+        uint64_t fl=net_lock();
         int n=tcp_read(c, buf, len);
+        net_unlock(fl);
         if(n>0) return n;
         if(n<0) return 0;                            /* peer closed, drained = EOF */
         __asm__ volatile("sti; hlt");
@@ -514,11 +549,18 @@ void tcp_get_addrs(const tcp_conn_t* c, uint32_t* lip, uint16_t* lport, uint32_t
 
 void tcp_close(tcp_conn_t* c){
     if(!c) return;
+    uint64_t fl=net_lock();
     tcp_start_close(c);
+    net_unlock(fl);
     uint64_t deadline=timer_get_ticks()+4000;
     while(timer_get_ticks()<deadline){
-        if(c->state==TCP_CLOSED || c->state==TCP_TIME_WAIT) break;
+        fl=net_lock();
+        tcp_state_t st=c->state;
+        net_unlock(fl);
+        if(st==TCP_CLOSED || st==TCP_TIME_WAIT) break;
         __asm__ volatile("sti; hlt");
     }
+    fl=net_lock();
     tcp_free(c);
+    net_unlock(fl);
 }
