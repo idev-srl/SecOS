@@ -108,6 +108,18 @@ static void on_signal(int sig) {
     else g_shutdown = SECOS_REBOOT_POWEROFF;
 }
 
+/* [M43] Built with CONSOLE=root (secos.console=root on /proc/cmdline)? */
+static int console_root(void) {
+    char b[512];
+    int fd = open("/proc/cmdline", O_RDONLY);
+    if (fd < 0) return 0;
+    int n = (int)read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    b[n] = 0;
+    return strstr(b, "secos.console=root") != 0;
+}
+
 /* ---- /etc/inittab ---------------------------------------------------------- */
 static int parse_action(const char* s) {
     for (int i = 0; i < (int)(sizeof(g_action_names) / sizeof(g_action_names[0])); i++)
@@ -173,8 +185,10 @@ static void load_inittab(const char* path) {
         }
         s = nl ? nl + 1 : 0;
     }
-    if (g_n == 0) {   /* no usable inittab: keep a console shell at least */
-        char def[] = "console:console:/bin/bash -i";
+    if (g_n == 0) {   /* no usable inittab: keep a console login (or shell) at least */
+        char def_login[] = "console:console:/bin/login";
+        char def_root[] = "console:console:/bin/bash -i";
+        char* def = console_root() || access("/bin/login", X_OK) != 0 ? def_root : def_login;
         say("%s missing or empty; using \"%s\"\n", path, def);
         parse_line(def, &g_tab[g_n++]);
     }
@@ -189,6 +203,10 @@ static void child_setup(const struct entry* e) {
     sigprocmask(SIG_SETMASK, &none, 0);
     setsid();                                  /* own session and process group */
     if (e->action == A_CONSOLE) {
+        /* [M43] A new console session: the console is root's again (login
+         * gives it to whoever logs in; the previous user loses it here). */
+        fchown(0, 0, 0);
+        fchmod(0, 0600);
         ioctl(0, TIOCSCTTY, 0);                /* the console is our controlling tty */
         tcsetpgrp(0, getpid());                /* ... and we are its foreground */
     } else if (e->action == A_RESPAWN || e->action == A_ONCE) {
