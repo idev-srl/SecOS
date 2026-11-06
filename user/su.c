@@ -32,17 +32,17 @@ int main(int argc, char** argv) {
     const char* cmd = 0;
     const char* shell = 0;
     const char* target = "root";
-    int i = 1;
-    for (; i < argc; i++) {
+    int have_user = 0;
+    for (int i = 1; i < argc; i++) {           /* options may come before or after USER */
         const char* a = argv[i];
         if (!strcmp(a, "-") || !strcmp(a, "-l") || !strcmp(a, "--login")) login = 1;
         else if (!strcmp(a, "-c") || !strcmp(a, "--command")) { if (++i >= argc) usage(); cmd = argv[i]; }
         else if (!strcmp(a, "-s") || !strcmp(a, "--shell")) { if (++i >= argc) usage(); shell = argv[i]; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) usage();
         else if (a[0] == '-') { acct_err("unknown option %s", a); usage(); }
-        else { target = a; i++; break; }
+        else if (!have_user) { target = a; have_user = 1; }
+        else { acct_err("extra argument %s (use -c COMMAND)", a); usage(); }
     }
-    if (i < argc) { acct_err("extra arguments after the user name (use -c)"); usage(); }
     if (geteuid() != 0) { acct_err("must be set-uid root (installed 04755 with the SETID manifest)"); return 1; }
 
     unsigned caller = (unsigned)getuid();
