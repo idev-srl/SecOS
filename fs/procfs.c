@@ -331,11 +331,12 @@ static void gen_mounts(struct sb* s){
         if(ops && ops->mntinfo){ const char* a=0; const char* b=0; if(ops->mntinfo(&a,&b)==0){ if(a){ src=a; dev=1; } if(b) type=b; } }
         if(dev) sb_str(s,"/dev/");
         sb_str(s, src); sb_putc(s,' '); sb_str(s, mp?mp:"?"); sb_putc(s,' ');
-        sb_str(s, type); sb_str(s," rw,relatime 0 0\n");
+        sb_str(s, type);
+        sb_str(s, (ops && (ops->flags & VFS_FS_RDONLY)) ? " ro,relatime 0 0\n" : " rw,relatime 0 0\n");
     }
 }
 static void gen_filesystems(struct sb* s){
-    sb_str(s,"nodev\tramfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tsysfs\n\tvfat\n\texfat\n\text2\n\text3\n\text4\n");
+    sb_str(s,"nodev\tramfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tsysfs\n\tvfat\n\texfat\n\tntfs\n\text2\n\text3\n\text4\n");
 }
 
 /* --- per pid (g_ps snapshot) --- */

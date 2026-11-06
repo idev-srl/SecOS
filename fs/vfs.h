@@ -68,6 +68,9 @@ typedef void (*vfs_iter_cb)(const vfs_inode_t* child, void* user);
 // are generated/dynamic (devfs, procfs, sysfs) set VFS_FS_NOCACHE so reads go
 // straight to ->read() instead of through the unified page cache.
 #define VFS_FS_NOCACHE 0x1
+// Read-only filesystem (e.g. NTFS): open() for writing / O_TRUNC / O_CREAT
+// fails with -EROFS and /proc/mounts shows "ro".
+#define VFS_FS_RDONLY  0x2
 
 // Filesystem operations interface (per mounted FS root)
 typedef struct vfs_fs_ops {

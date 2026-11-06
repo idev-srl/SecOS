@@ -2052,8 +2052,7 @@ else
     FAIL=$((FAIL+1))
 fi
 
-# ============================================================================
-# MOUNT HARDENING GATE (fix/mount-hardening). Three bugs found by the M41 exFAT
+# =====================================================================# MOUNT HARDENING GATE (fix/mount-hardening). Three bugs found by the M41 exFAT
 # work, all outside its driver:
 # (1) vfs_mount() stored the caller's mount-point pointer — a kernel-stack copy
 #     for SYS_MOUNT — so a userland `mount -t vfat|ext2` left a dangling entry
@@ -2123,6 +2122,147 @@ else
     FAIL=$((FAIL+1))
 fi
 rm -rf "$MHD"
+=======
+# ---- M42: NTFS read-only (host-made image, listing vs ntfs-3g, corrupt images) ----
+# The image is made by the real host tools (mkntfs + ntfs-3g in a user
+# namespace, tools/ntfs-host.sh); ntfs-3g's listing of it (type, size and
+# content hash of every object) is the reference. SecOS walks the whole volume
+# in the kernel and its listing must match exactly; targeted checks cover
+# Unicode / case-insensitive names, the fragmented ($ATTRIBUTE_LIST), sparse
+# and LZNT1 files, EFS -> EACCES, symlinks/junctions and EROFS on every write.
+# A second boot attaches six damaged images (AHCI x4 + NVMe + USB); the host
+# harness checks two more and fuzzes the driver under ASan/UBSan.
+M42LOG=/tmp/secos_selftest_m42.log
+M42CLOG=/tmp/secos_selftest_m42_corrupt.log
+M42ULOG=/tmp/secos_selftest_m42_user.log
+M42USER=/tmp/secos_selftest_m42_user.ser
+echo "[selftest] Building M42 image (M42_NTFS_DEMO=1)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA=-DM42_NTFS_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M42 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+if make disk-ntfs >/tmp/secos_selftest_m42_disk.log 2>&1; then
+    echo "[selftest] Running M42 NTFS good-image suite (virtio, 45s)..."
+    : > "$M42LOG"
+    timeout 45 qemu-system-x86_64 -cdrom myos.iso -drive file=disk.img,if=virtio,format=raw -boot d \
+        -debugcon file:"$M42LOG" -global isa-debugcon.iobase=0xe9 -no-reboot -display none -m 256M
+    grep -q "\[NTFS\] mounted vda at /mnt (ro)" "$M42LOG"; check "M42 boot auto-mounts the NTFS disk at /mnt (read-only)" $?
+    for t in "full tree walk without readdir/lookup errors" "case-insensitive lookup (\$UpCase)" \
+             "unicode long name read" "case-insensitive non-ASCII lookup" "CJK name read" \
+             "DOS 8.3 alias hidden from readdir" "metafiles hidden (\$MFT, \$Volume, ...)" \
+             "2000-entry multi-level directory lists everything" \
+             "fragmented.bin (\$ATTRIBUTE_LIST, ~1300 runs) verify" "big.bin 5MiB verify" \
+             "sparse.bin 48MiB (holes read as zero) verify" "compressed (LZNT1) file readable" \
+             "EFS-encrypted file -> EACCES" "hard link: nlink=2" "Windows relative symlink" \
+             "junction -> path under the mount point" "WSL + Interix symlinks" \
+             "every write op refused with EROFS (create/mkdir/unlink/rename/truncate/write/symlink/link/rmdir/chmod)" \
+             "read-write mount request refused" "/proc/mounts lists /mnt ntfs ro" "/proc/filesystems lists ntfs" \
+             "statfs type=NTFS, read-only, sane counts" "second simultaneous NTFS instance" \
+             "stale inode after unmount fails cleanly" "remount + read"; do
+        grep -qF "[M42] $t: OK" "$M42LOG"; check "M42 $t" $?
+    done
+    n_ok=$(grep -c "^\[M42\] .*: OK$" "$M42LOG" || true); n_bad=$(grep -c "^\[M42\] .*: FAIL$" "$M42LOG" || true)
+    [[ "$n_ok" -ge 37 && "$n_bad" -eq 0 ]]; check "M42 all in-kernel NTFS checks OK (ok=$n_ok fail=$n_bad)" $?
+    grep -q "\[M42\] DONE" "$M42LOG"; check "M42 good-image suite completed" $?
+    ! grep -q "\[EXC\]\|\[PANIC\]" "$M42LOG"; check "no CPU exception during M42 good-image run" $?
+    grep "^\[M42L\] " "$M42LOG" | sed 's/^\[M42L\] //' > /tmp/secos_selftest_m42.list
+    python3 -I tools/ntfs_img.py compare disk.img.list /tmp/secos_selftest_m42.list /mnt >/tmp/secos_selftest_m42_cmp.log 2>&1
+    rc=$?; check "M42 kernel listing == ntfs-3g listing (size + content hash of every file; $(tail -1 /tmp/secos_selftest_m42_cmp.log))" $rc
+    if make disk-ntfs-corrupt >/tmp/secos_selftest_m42_disk.log 2>&1; then
+        echo "[selftest] Running M42 NTFS corrupt-image suite (q35, 6 disks, 40s)..."
+        : > "$M42CLOG"
+        C=ntfs_corrupt
+        timeout 40 qemu-system-x86_64 -machine q35 -m 256M -cdrom myos.iso -boot d \
+            -drive file=$C/files.img,format=raw,if=ide,index=0 \
+            -drive file=$C/bootmain.img,format=raw,if=ide,index=1 \
+            -drive file=$C/mft0.img,format=raw,if=ide,index=3 \
+            -drive file=$C/mftboth.img,format=raw,if=ide,index=4 \
+            -drive file=$C/upcase.img,if=none,id=nvm,format=raw -device nvme,serial=secos1,drive=nvm \
+            -device qemu-xhci,id=xhci -drive file=$C/rootbad.img,if=none,id=us,format=raw -device usb-storage,bus=xhci.0,drive=us \
+            -debugcon file:"$M42CLOG" -global isa-debugcon.iobase=0xe9 -no-reboot -no-shutdown -display none
+        SDA="$(sed -n '/dev=sda mount rc=0x0000000000000000/,/dev=sdb/p' "$M42CLOG")"
+        grep -q "/mnt/ok.txt read=0x0000000000000007" <<<"$SDA"; check "M42 corrupt/files: volume mounts, intact file reads" $?
+        grep -q "/mnt/runbad.bin read=0xFFFFFFFFFFFFFFFB" <<<"$SDA"; check "M42 corrupt/files: run list LCN outside the volume -> EIO" $?
+        grep -q "/mnt/attrbad.bin lookup=NULL" <<<"$SDA"; check "M42 corrupt/files: attribute length overflowing the record -> refused" $?
+        grep -q "/mnt/compressed/c.txt read=0xFFFFFFFFFFFFFFFB" <<<"$SDA"; check "M42 corrupt/files: bad LZNT1 stream -> EIO" $?
+        grep -q "/mnt/secret.efs read=0xFFFFFFFFFFFFFFF3" <<<"$SDA"; check "M42 corrupt/files: EFS file -> EACCES" $?
+        grep -q "/mnt/loopdir readdir=0xFFFFFFFFFFFFFFFF" <<<"$SDA"; check "M42 corrupt/files: index node looping onto itself -> readdir error (no hang)" $?
+        grep -q "/mnt/indxbad readdir=0xFFFFFFFFFFFFFFFF" <<<"$SDA"; check "M42 corrupt/files: torn INDX block (fixup) -> readdir error" $?
+        grep -q "volume is marked dirty" "$M42CLOG" && grep -q "Windows is hibernated" "$M42CLOG"
+        check "M42 corrupt/files: dirty flag + hiberfil.sys (Fast Startup) -> warnings, read-only" $?
+        grep -q "main boot sector invalid; using the backup copy" "$M42CLOG" && grep -q "dev=sdb mount rc=0x0000000000000000" "$M42CLOG"
+        check "M42 corrupt/bootmain: main boot sector bad -> backup copy" $?
+        grep -q "\$MFT record 0 damaged, using the \$MFTMirr copy" "$M42CLOG" && grep -q "dev=sdc mount rc=0x0000000000000000" "$M42CLOG"
+        check "M42 corrupt/mft0: \$MFT record 0 torn -> \$MFTMirr copy" $?
+        grep -q "dev=sdd mount rc=0xFFFFFFFFFFFFFFFF" "$M42CLOG"; check "M42 corrupt/mftboth: record 0 torn in \$MFT and \$MFTMirr -> refused" $?
+        grep -q "dev=nvme0n1 mount rc=0xFFFFFFFFFFFFFFFF" "$M42CLOG" && grep -q "\$UpCase invalid" "$M42CLOG"
+        check "M42 corrupt/upcase: damaged \$UpCase -> refused" $?
+        grep -q "dev=usb0 mount rc=0xFFFFFFFFFFFFFFFF" "$M42CLOG" && grep -q "root directory invalid" "$M42CLOG"
+        check "M42 corrupt/rootbad: bad root index -> refused" $?
+        grep -q "\[M42C\] DONE (kernel alive)" "$M42CLOG" && ! grep -q "\[EXC\]\|\[PANIC\]" "$M42CLOG"
+        check "M42 corrupt suite: kernel alive, no CPU exception or panic" $?
+        if make -C tools/ntfs_fuzz >/dev/null 2>&1; then
+            ! tools/ntfs_fuzz/ntfs_fuzz ntfs_corrupt/bootboth.img list >/dev/null 2>&1 && \
+            ! tools/ntfs_fuzz/ntfs_fuzz ntfs_corrupt/geo.img list >/dev/null 2>&1
+            check "M42 host: both boot sectors bad / impossible geometry -> refused" $?
+            tools/ntfs_fuzz/ntfs_fuzz disk.img list > /tmp/secos_selftest_m42_host.list 2>/dev/null && \
+                python3 -I tools/ntfs_img.py compare disk.img.list /tmp/secos_selftest_m42_host.list >/dev/null 2>&1
+            check "M42 host: driver built for the host (ASan/UBSan) lists the image identically" $?
+            echo "[selftest] Running NTFS host fuzz (ASan+UBSan, 3000 + 400 mutated images)..."
+            timeout 300 tools/ntfs_fuzz/ntfs_fuzz ntfs_corrupt/base.img 3000 42 >/tmp/secos_selftest_m42_fuzz.log 2>&1 && \
+            timeout 300 tools/ntfs_fuzz/ntfs_fuzz disk.img 400 4242 >>/tmp/secos_selftest_m42_fuzz.log 2>&1
+            check "M42 host fuzz: 3400 mutated images, no crash/UB/hang" $?
+        else
+            echo "  [SKIP] M42 host harness (gcc with ASan/UBSan unavailable)"
+        fi
+    else
+        echo "  [FAIL] M42 corrupt image build (see /tmp/secos_selftest_m42_disk.log)"; FAIL=$((FAIL+1))
+    fi
+    # Userland: BusyBox mount/ls/cat/df over the serial bash, default image.
+    make clean >/dev/null 2>&1 || true
+    if make iso >/tmp/secos_selftest_build.log 2>&1; then
+        echo "[selftest] Running M42 userland mount -t ntfs over serial bash (70s)..."
+        : > "$M42ULOG"
+        ( sleep 28
+          printf '  umount /mnt; mkdir -p /x; mount -t ntfs /dev/vda /x && echo MN1-$(cat /x/hello.txt)\r'; sleep 4
+          printf '  echo MN2-$(grep -c " /x ntfs ro," /proc/mounts)\r'; sleep 3
+          printf '  df | grep /x | sed s/^/MN3-/\r'; sleep 3
+          printf '  cat /x/Relazione* | sed s/^/MN4-/\r'; sleep 3
+          printf '  (echo hi > /x/new.txt) 2>&1 | sed s/^/MN5-/\r'; sleep 3
+          printf '  ln -s hello.txt /x/l 2>&1 | sed s/^/MN6-/; rm /x/hello.txt 2>&1 | sed s/^/MN6-/\r'; sleep 3
+          printf '  cat /x/secret.efs 2>&1 | sed s/^/MN7-/\r'; sleep 3
+          printf '  ls /x/many | wc -l | sed s/^/MN8-/\r'; sleep 4
+          printf '  md5sum /x/fragmented.bin /x/compressed/text.txt | sed s/^/MN9-/\r'; sleep 6
+          printf '  ls -l /x/winlink_rel | sed s/^/MNA-/; cat /x/winlink_rel | sed s/^/MNA-/; cat /x/junction/c/d/e/f/g/deep.txt | sed s/^/MNJ-/\r'; sleep 3
+          printf '  umount /x && echo MNB-$(grep -c ntfs /proc/mounts)\r'; sleep 3
+        ) | timeout 70 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+            -drive file=disk.img,if=virtio,format=raw \
+            -debugcon file:"$M42ULOG" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -serial stdio >"$M42USER" 2>&1
+        FRAG_MD5="$(python3 -I -c 'import hashlib,sys; sys.path.insert(0,"tools"); import ntfs_img as n; print(hashlib.md5(n.pattern(5<<20,9)).hexdigest())' 2>/dev/null)"
+        TEXT_MD5="$(python3 -I -c 'import hashlib,sys; sys.path.insert(0,"tools"); import ntfs_img as n; print(hashlib.md5(n.text_blob(300000)).hexdigest())' 2>/dev/null)"
+        grep -q "^MN1-hello from ntfs" "$M42USER"; check "M42 user: mount -t ntfs /dev/vda /x (BusyBox, SYS_MOUNT)" $?
+        grep -q "^MN2-1" "$M42USER"; check "M42 user: /proc/mounts shows the ntfs mount read-only" $?
+        grep -q "^MN3-/dev/vda .* /x" "$M42USER"; check "M42 user: df lists the ntfs mount" $?
+        grep -q "^MN4-Il documento" "$M42USER"; check "M42 user: bash reads a long Unicode name" $?
+        grep -q "^MN5-.*Read-only file system" "$M42USER" && [[ "$(grep -c '^MN6-.*Read-only file system' "$M42USER")" -ge 2 ]]
+        check "M42 user: shell redirection, ln -s and rm fail with EROFS" $?
+        grep -q "^MN7-.*Permission denied" "$M42USER"; check "M42 user: reading an EFS file fails with EACCES" $?
+        grep -q "^MN8-2000" "$M42USER"; check "M42 user: ls lists all 2000 entries of the big directory" $?
+        grep -q "^MN9-$FRAG_MD5 " "$M42USER" && grep -q "^MN9-$TEXT_MD5 " "$M42USER"
+        check "M42 user: md5sum of the fragmented and the compressed file match the host" $?
+        grep -q "^MNA-.*winlink_rel -> a/b/c/d/e/f/g/deep.txt" "$M42USER" && grep -q "^MNA-deep down" "$M42USER"
+        check "M42 user: Windows symlink shown by ls -l and followed by cat" $?
+        grep -q "^MNJ-deep down" "$M42USER"; check "M42 user: path through a junction (target mapped under /x)" $?
+        grep -q "^MNB-0" "$M42USER"; check "M42 user: umount drops the ntfs mount" $?
+    else
+        echo "  [FAIL] M42 userland image build"; FAIL=$((FAIL+1))
+    fi
+else
+    echo "  [FAIL] M42 disk-ntfs build (mkntfs/ntfs-3g missing and fetch failed? see /tmp/secos_selftest_m42_disk.log)"
+    FAIL=$((FAIL+1))
+fi
 
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"

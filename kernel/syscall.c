@@ -457,9 +457,14 @@ int ksys_open_mode(const char* path, int flags, uint32_t mode){
     vfs_inode_t* ino=vfs_lookup_ex(path, 1, &lerr);
     if(ino && (flags & 0x40) && (flags & 0x80)) return -17;                  // O_EXCL: -EEXIST
     if(!ino && (flags & 0x40) && (lerr==0 || lerr==-2)){                     // O_CREAT
-        if(vfs_create(path,"",0)==0){ kiface_apply_create_mode(path, mode, 0); ino=vfs_lookup_follow(path); }
+        int cr = vfs_create(path,"",0);
+        if(cr==0){ kiface_apply_create_mode(path, mode, 0); ino=vfs_lookup_follow(path); }
+        else if(cr==-30) return -30;                                         // -EROFS
     }
     if(!ino) return lerr ? lerr : -2;   // [M39] -ENOENT so libc can set errno (bash rcfile probing)
+    // [M42] Read-only filesystem: no write access, no O_TRUNC (-EROFS).
+    if(ino->type==VFS_NODE_FILE && ino->ops && (ino->ops->flags & VFS_FS_RDONLY) && ((flags & 3) || (flags & 0x200)))
+        return -30;
     if((flags & 0x200) && ino->size){                                        // O_TRUNC
         vfs_truncate(path,0); ino=vfs_lookup_follow(path); if(!ino) return -1;
         pagecache_invalidate(ino, 0, 1ULL<<62);
@@ -780,14 +785,21 @@ static void gd_cb(const vfs_inode_t* child, void* user){
 }
 int ksys_getdents(const char* path, void* ubuf, int buflen){
     extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*);
-    static char kbuf[65536];                 // up to 256 entries (BusyBox fills /bin)
-    struct gd_ctx g = { kbuf, sizeof(kbuf), 0 };
+    // As many records as the caller's buffer holds (up to 1 MiB = 4096
+    // entries): BusyBox's opendir retries with a bigger buffer when one comes
+    // back full, so large directories (e.g. Windows folders on NTFS) list whole.
+    if(buflen <= 0) return -1;
+    int cap = buflen > (1 << 20) ? (1 << 20) : buflen;
+    char* kbuf = (char*)kmalloc((size_t)cap);
+    if(!kbuf) return -12;                    // -ENOMEM
+    struct gd_ctx g = { kbuf, cap, 0 };
     // cwd-relative + normalized: bash's glob and readline's filename completion
     // open "." and "dir/" (trailing slash), which vfs_readdir does not accept.
     char rp[256]; proc_resolve_path(sched_get_current(), path, rp, sizeof(rp)); path = rp;
-    if(vfs_readdir(path, gd_cb, &g) != 0) return -1;
+    if(vfs_readdir(path, gd_cb, &g) != 0){ kfree(kbuf); return -1; }
     int n = g.len < buflen ? g.len : buflen;
-    if(n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0) return -1;
+    if(n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0){ kfree(kbuf); return -1; }
+    kfree(kbuf);
     return n;
 }
 int ksys_create(const char* path){
@@ -816,6 +828,7 @@ int ksys_mount(const char* dev, const char* target, const char* fstype){
     extern int fat32_mount(const char*, const char*);
     extern int ext2_mount(const char*, const char*);
     extern int exfat_mount(const char*, const char*);
+    extern int ntfs_mount(const char*, const char*);
     if(!dev||!target||!fstype) return -1;
     // Accept the devfs spelling ("/dev/vda") as well as the bare block name.
     if(dev[0]=='/'&&dev[1]=='d'&&dev[2]=='e'&&dev[3]=='v'&&dev[4]=='/') dev += 5;
@@ -829,11 +842,13 @@ int ksys_mount(const char* dev, const char* target, const char* fstype){
     int isfat = str_eq2(fstype,"fat32")||str_eq2(fstype,"vfat");
     int isext = str_eq2(fstype,"ext2")||str_eq2(fstype,"ext4")||str_eq2(fstype,"extN");
     int isexf = str_eq2(fstype,"exfat");
+    int isntfs= str_eq2(fstype,"ntfs")||str_eq2(fstype,"ntfs3")||str_eq2(fstype,"ntfs-3g");  // [M42] read-only
     int isauto= str_eq2(fstype,"auto")||fstype[0]==0;
     if(isfat) return fat32_mount(dev,target);
     if(isext) return ext2_mount(dev,target);
     if(isexf) return exfat_mount(dev,target);
-    if(isauto){ if(fat32_mount(dev,target)==0) return 0; if(ext2_mount(dev,target)==0) return 0; return exfat_mount(dev,target); }
+    if(isntfs) return ntfs_mount(dev,target);
+    if(isauto){ if(fat32_mount(dev,target)==0) return 0; if(ext2_mount(dev,target)==0) return 0; if(exfat_mount(dev,target)==0) return 0; return ntfs_mount(dev,target); }
     return -1;                                            // unknown fstype
 }
 void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
