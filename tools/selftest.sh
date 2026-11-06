@@ -822,12 +822,17 @@ build_demo M45 "-DSECOS_KASLR_DEBUG -DSECOS_SMP_AT_BOOT"
 k45_meas=$(kaslr_host_meas)
 grep -q "^\[kaslr\] [0-9]* relocations" /tmp/secos_selftest_build.log; check "M45 relocation table extracted at link time" $?
 [[ -n "$(nm kernel.bin | awk '$3=="_kaslr_start"')" ]]; check "M45 kernel.bin carries the .kaslr table" $?
-slides=""; n_ok=0; n_meas=0; n_wx=0; n_exc=0
+slides=""; canaries=""; n_ok=0; n_meas=0; n_wx=0; n_exc=0; n_ssp=0; n_leak=0
 for i in 1 2 3 4 5; do
     echo "[selftest] Running M45 KASLR boot $i/5 (mb2, 15s)..."
     run_iso "$K45/mb2_$i.log" 15
     s=$(grep -ao "\[KASLR-DEBUG\] slide=0x[0-9a-f]*" "$K45/mb2_$i.log" | head -1 | sed 's/.*=//')
     slides="$slides $s"
+    canaries="$canaries $(grep -ao "\[KASLR-DEBUG\] canary=0x[0-9a-f]*" "$K45/mb2_$i.log" | head -1 | sed 's/.*=//')"
+    grep -q "\[SSP\] stack canary randomized at boot" "$K45/mb2_$i.log" && n_ssp=$((n_ssp+1))
+    # Kernel-image addresses in the log must be link-time ones (0xFFFFFFFF80..83..):
+    # a slid address would reveal the slide through dmesg.
+    grep -aoiE "0xFFFFFFFF[0-9A-F]{8}" "$K45/mb2_$i.log" | grep -viE "^0xFFFFFFFF8[0-3]|^0xFFFFFFFFFFFFFFFF$" | grep -q . && n_leak=$((n_leak+1))
     grep -q "\[KASLR\] on: kernel base randomized, 768 slots x 2 MiB (~9.6 bits), entropy=.*by MB2 entry" "$K45/mb2_$i.log" && n_ok=$((n_ok+1))
     m=$(grep -ao "\[M37\] kernel code measurement (sha256 .text+.rodata): [0-9a-f]*" "$K45/mb2_$i.log" | awk '{print $NF}')
     [[ -n "$m" && "$m" == "$k45_meas" ]] && n_meas=$((n_meas+1))
@@ -845,6 +850,9 @@ for s in $slides; do (( s % 0x200000 == 0 && s < 768 * 0x200000 )) || bad_slide=
 [[ "$n_meas" -eq 5 ]]; check "M45 measured boot slide-independent: 5/5 equal to sha256 of kernel.bin (n=$n_meas)" $?
 [[ "$n_wx" -eq 5 ]]; check "M45 W^X audit clean at the slid base in 5/5 boots (n=$n_wx)" $?
 [[ "$n_exc" -eq 0 ]]; check "M45 no CPU exception in the 5 KASLR boots" $?
+c_uniq=$(tr ' ' '\n' <<<"$canaries" | grep . | sort -u | wc -l)
+[[ "$n_ssp" -eq 5 && "$c_uniq" -ge 4 ]]; check "M45 stack canary randomized at boot ($c_uniq distinct of 5)" $?
+[[ "$n_leak" -eq 0 ]]; check "M45 no slid kernel address in the kernel log ($n_leak boots leaked)" $?
 # SMP + RDRAND: the APs come up on the relocated image.
 echo "[selftest] Running M45 KASLR (mb2, -smp 4 -cpu max, 25s)..."
 run_iso "$K45/smp.log" 25 -smp 4 -cpu max
@@ -898,6 +906,7 @@ if [[ -n "$OVMF45" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
     m=$(grep -ao "\[M37\] kernel code measurement (sha256 .text+.rodata): [0-9a-f]*" "$K45/u_a.dbg" | awk '{print $NF}')
     [[ -n "$m" && "$m" == "$k45_meas" ]]; check "M45 UEFI: measurement equals the MB2 one and the file hash" $?
     grep -q "\[WX\] kernel image W^X verified (0 violations)" "$K45/u_a.dbg"; check "M45 UEFI: W^X audit clean at the slid base" $?
+    grep -q "\[SSP\] stack canary randomized at boot" "$K45/u_a.dbg"; check "M45 UEFI: stack canary randomized by the loader" $?
     grep -q "\[KASLR\] on: .*entropy=EFI_RNG" "$K45/u_rng.dbg"; check "M45 UEFI: entropy from EFI_RNG_PROTOCOL (virtio-rng)" $?
     grep -q "\[KASLR\] off (nokaslr boot option)" "$K45/u_nok.dbg"; check "M45 UEFI: 'nokaslr' load option keeps the link base" $?
     ! grep -q "\[EXC\]" "$K45/u_a.dbg" "$K45/u_b.dbg" "$K45/u_rng.dbg" "$K45/u_nok.dbg"; check "no CPU exception ([EXC]) during the M45 UEFI runs" $?
@@ -909,6 +918,7 @@ echo "[selftest] Building M45 opt-out image (SECOS_NO_KASLR)..."
 build_demo M45-off "-DSECOS_NO_KASLR"
 run_iso "$K45/off.log" 15
 grep -q "\[KASLR\] off (built with SECOS_NO_KASLR)" "$K45/off.log"; check "M45 -DSECOS_NO_KASLR boots at the link base" $?
+grep -q "\[SSP\] stack canary randomized at boot" "$K45/off.log"; check "M45 SECOS_NO_KASLR still randomizes the stack canary" $?
 grep -q "\[WX\] kernel image W^X verified (0 violations)" "$K45/off.log"; check "M45 SECOS_NO_KASLR boot reaches the W^X audit" $?
 
 # ---- Phase L (M36/M37) + M38/M39 boot hardening on the DEFAULT image ----
@@ -949,6 +959,7 @@ fi
 grep -q "\[M37\] measured boot OK" "$MLLOG"; check "M37 measured boot OK" $?
 # M45 KASLR is on in the default image, and the slide is never logged there.
 grep -q "\[KASLR\] on: kernel base randomized" "$MLLOG"; check "M45 default image: KASLR on" $?
+grep -q "\[SSP\] stack canary randomized at boot" "$MLLOG"; check "M45 default image: stack canary randomized at boot" $?
 ! grep -aq "KASLR-DEBUG" "$MLLOG" kernel.bin; check "M45 default image never logs the slide" $?
 # M38 WPA2 crypto KATs + M39 association-core KATs (run at boot in crypto selftest).
 grep -q "\[WPA2\] PBKDF2 PMK KAT PASS" "$MLLOG"; check "M38 WPA2 PBKDF2-SHA1 PMK KAT (IEEE 802.11i)" $?

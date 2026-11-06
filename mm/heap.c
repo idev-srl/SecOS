@@ -254,8 +254,9 @@ static int heap_fault(uint32_t line, const char* what, const void* block,
     msg_cat(&n, " block="); msg_hex(&n, (uint64_t)(uintptr_t)block);
     msg_cat(&n, " expected="); msg_hex(&n, expected);
     msg_cat(&n, " found="); msg_hex(&n, found);
-    msg_cat(&n, " caller="); msg_hex(&n, caller);
-    msg_cat(&n, " owner="); msg_hex(&n, owner);
+    // [M45] link-time (kernel.bin) addresses: resolvable, and no KASLR leak.
+    msg_cat(&n, " caller="); msg_hex(&n, kaddr_link(caller));
+    msg_cat(&n, " owner="); msg_hex(&n, kaddr_link(owner));
 
     if (g_heap_expect) {
         g_heap_detected++;

@@ -15,13 +15,19 @@
  * is inside the signed file (secure boot covers it) and loaded with the image.
  *
  * Layout (little endian):
- *   struct kaslr_hdr                 (48 bytes)
+ *   struct kaslr_hdr                 (56 bytes)
  *   uint32_t entries[hdr.count]      sorted by address; bit 31 = 32-bit field
  *                                    (R_X86_64_32S), else 64-bit (R_X86_64_64);
  *                                    bits 0..30 = physical address of the field.
  *
  * The `slide`, `source` and `state` header fields are zero in the file and
  * filled by the relocator at boot; the kernel reads them back (kernel/kaslr.c).
+ *
+ * `guard_phys` is the physical address of the stack-protector guard
+ * (__stack_chk_guard). The relocator overwrites it with a fresh random value
+ * before the first instruction of kernel C code runs, so no protected frame
+ * ever holds the compile-time constant. This is done even when the slide is
+ * disabled (nokaslr / SECOS_NO_KASLR).
  *
  * Copyright (c) 2026 iDev srl
  * SPDX-License-Identifier: MIT
@@ -32,7 +38,7 @@
 #include <stdint.h>
 
 #define KASLR_MAGIC        0x4C53414Bu   /* 'KASL' */
-#define KASLR_VERSION      1u
+#define KASLR_VERSION      2u
 #define KASLR_LINK_BASE    0xFFFFFFFF80000000ULL
 #define KASLR_ALIGN        (2ULL << 20)          /* slide granularity: 2 MiB */
 #define KASLR_WINDOW       (512ULL << 20)        /* high-half window: phys 0..512 MiB */
@@ -54,6 +60,7 @@
 #define KASLR_ST_OFF_CMD   0x0008u   /* disabled by the `nokaslr` boot option */
 #define KASLR_ST_UEFI      0x0010u   /* relocated by the UEFI loader */
 #define KASLR_ST_MB2       0x0020u   /* relocated by the Multiboot2 entry */
+#define KASLR_ST_CANARY    0x0040u   /* stack-protector guard randomized */
 
 /* hdr.source: entropy source of the slide */
 #define KASLR_SRC_NONE     0u
@@ -73,6 +80,8 @@ struct kaslr_hdr {
     uint64_t slide;       /* runtime: chosen slide (bytes) */
     uint32_t source;      /* runtime: KASLR_SRC_* */
     uint32_t state;       /* runtime: KASLR_ST_* */
+    uint32_t guard_phys;  /* physical address of __stack_chk_guard (0 = none) */
+    uint32_t reserved;
 };
 
 static inline const uint32_t* kaslr_entries(const struct kaslr_hdr* h) {
@@ -95,6 +104,9 @@ uint64_t kaslr_pick_slide(uint64_t rnd, uint32_t slots);
 /* Add `slide` to every recorded field. Refuses (returns -1) if the table was
  * already applied. Writes slide/source/state into the header. */
 int kaslr_apply(struct kaslr_hdr* h, uint64_t slide, uint32_t source, uint32_t state);
+/* Store a random stack-protector guard (low byte zero, so a C-string overflow
+ * cannot reproduce it) at h->guard_phys; sets KASLR_ST_CANARY. */
+void kaslr_set_guard(struct kaslr_hdr* h, uint64_t rnd);
 /* Word search for "nokaslr" in an 8-bit command line (n bytes, or NUL). */
 int kaslr_cmdline_nokaslr(const char* s, uint64_t n);
 /* Multiboot2: search the command-line tag of the MB2 info block. */

@@ -74,8 +74,33 @@ static void both_dec(uint64_t v) {
     both(&b[i]);
 }
 
+extern uintptr_t __stack_chk_guard;   // kernel/panic.c
+
+static void canary_report(const struct kaslr_hdr* h) {
+    if (h && (h->state & KASLR_ST_CANARY))
+        both("[SSP] stack canary randomized at boot\n");
+    else
+        both("[SSP] stack canary NOT randomized (compile-time value)\n");
+#ifdef SECOS_KASLR_DEBUG
+    {
+        static const char hx[] = "0123456789abcdef";
+        const char* p = "[KASLR-DEBUG] canary=0x";
+        while (*p) debugcon_putchar_raw(*p++);
+        for (int i = 60; i >= 0; i -= 4)
+            debugcon_putchar_raw(hx[((uint64_t)__stack_chk_guard >> i) & 0xF]);
+        debugcon_putchar_raw('\n');
+    }
+#endif
+}
+
+static void slide_report(const struct kaslr_hdr* h);
+
 void kaslr_report(void) {
-    const struct kaslr_hdr* h = g_hdr;
+    slide_report(g_hdr);
+    canary_report(g_hdr);
+}
+
+static void slide_report(const struct kaslr_hdr* h) {
     if (!h) { both("[KASLR] off (no relocation table)\n"); return; }
     if (h->state & KASLR_ST_OFF_BUILD) { both("[KASLR] off (built with SECOS_NO_KASLR)\n"); return; }
     if (h->state & KASLR_ST_OFF_CMD)   { both("[KASLR] off (nokaslr boot option)\n"); return; }

@@ -137,6 +137,14 @@ int kaslr_apply(struct kaslr_hdr* h, uint64_t slide, uint32_t source, uint32_t s
     return 0;
 }
 
+void kaslr_set_guard(struct kaslr_hdr* h, uint64_t rnd) {
+    if (!kaslr_hdr_valid(h) || !h->guard_phys || (h->state & KASLR_ST_CANARY)) return;
+    uint64_t g = kc_mix(rnd) & ~0xFFULL;
+    if (!g) g = 0x5EC05EC05EC05E00ULL;
+    *(kaslr_u64_ua*)(uint64_t)h->guard_phys = g;
+    h->state |= KASLR_ST_CANARY;
+}
+
 static inline int kc_is_sep(char c) {
     return c == 0 || c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
@@ -200,6 +208,8 @@ uint64_t kaslr_boot_mb2(uint32_t magic, uint64_t info, struct kaslr_hdr* h,
             state |= KASLR_ST_RANDOM;
         }
         if (kaslr_apply(h, slide, source, state) != 0) slide = 0;
+        /* A second, independent draw for the stack canary. */
+        kaslr_set_guard(h, kaslr_entropy(slide, 1, &source));
     }
     kaslr_map_window(pdpt, pdt_a, pdt_b, slide);
     return slide;

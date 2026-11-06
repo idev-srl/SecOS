@@ -28,7 +28,7 @@ import struct
 import sys
 
 KASLR_MAGIC = 0x4C53414B
-KASLR_VERSION = 1
+KASLR_VERSION = 2
 LINK_BASE = 0xFFFFFFFF80000000
 ALIGN = 2 << 20
 WINDOW = 512 << 20
@@ -171,35 +171,55 @@ def extract(path):
     for (a, fa), (b, _) in zip(out, out[1:]):
         if a + (4 if fa else 8) > b:
             die("overlapping relocated fields at phys 0x%x / 0x%x" % (a, b))
-    return [a | f for a, f in out], n_abs_high
+    return [a | f for a, f in out], n_abs_high, guard_phys(elf)
 
 
-def build_table(entries, disabled):
+def guard_phys(elf):
+    """Physical address of __stack_chk_guard (the boot relocator randomizes it),
+    or 0 if the kernel has none. It must sit in a file-backed section that does
+    not move between the passes (.data)."""
+    for idx, s in enumerate(elf.sh):
+        if s["type"] != SHT_SYMTAB:
+            continue
+        strtab = elf.sh[s["link"]]
+        for shndx, value, name in elf.symbols(idx):
+            if shndx in (SHN_UNDEF, SHN_ABS) or shndx >= len(elf.sh):
+                continue
+            if elf.cstr(strtab["off"] + name) != "__stack_chk_guard":
+                continue
+            if elf.sh[shndx]["sname"] != ".data":
+                die("__stack_chk_guard is in %s, expected .data" % elf.sh[shndx]["sname"])
+            return elf.va_to_phys(value, 8)
+    return 0
+
+
+def build_table(entries, disabled, guard):
     flags = F_DISABLED if disabled else 0
-    hdr = struct.pack("<IHHIIQQQII", KASLR_MAGIC, KASLR_VERSION, flags, len(entries),
-                      SLOTS, LINK_BASE, ALIGN, 0, 0, 0)
-    assert len(hdr) == 48
+    hdr = struct.pack("<IHHIIQQQIIII", KASLR_MAGIC, KASLR_VERSION, flags, len(entries),
+                      SLOTS, LINK_BASE, ALIGN, 0, 0, 0, guard, 0)
+    assert len(hdr) == 56
     return hdr + b"".join(struct.pack("<I", e) for e in entries)
 
 
 def main(argv):
     if len(argv) >= 3 and argv[0] == "extract":
         disabled = "--disabled" in argv[3:]
-        entries, n_abs = extract(argv[1])
-        table = build_table(entries, disabled)
+        entries, n_abs, guard = extract(argv[1])
+        table = build_table(entries, disabled, guard)
         with open(argv[2], "wb") as f:
             f.write(table)
         n32 = sum(1 for e in entries if e & ENT_32)
-        print("[kaslr] %d relocations (%d x 64-bit, %d x 32S), table %d bytes%s"
+        print("[kaslr] %d relocations (%d x 64-bit, %d x 32S), table %d bytes, guard %s%s"
               % (len(entries), len(entries) - n32, n32, len(table),
+                 ("@0x%x" % guard) if guard else "none",
                  ", KASLR disabled at build time" if disabled else ""))
         return 0
     if len(argv) == 3 and argv[0] == "check":
         with open(argv[2], "rb") as f:
             want = f.read()
         disabled = bool(struct.unpack_from("<H", want, 6)[0] & F_DISABLED)
-        entries, _ = extract(argv[1])
-        if build_table(entries, disabled) != want:
+        entries, _, guard = extract(argv[1])
+        if build_table(entries, disabled, guard) != want:
             die("pass-2 relocations differ from the embedded table (layout moved)")
         elf = Elf(argv[1])
         ks = [s for s in elf.sh if s["sname"] == ".kaslr"]

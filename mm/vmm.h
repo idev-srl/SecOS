@@ -50,6 +50,13 @@ typedef struct vmm_space {
 #define KERNEL_VMA_BASE 0xFFFFFFFF80000000ULL
 extern uint64_t g_kaslr_slide;   // kernel/kaslr.c
 static inline uint64_t kernel_vma_base(void) { return KERNEL_VMA_BASE + g_kaslr_slide; }
+// [M45] A kernel-image address as it is in kernel.bin (runtime VA minus the
+// slide), for logs: it resolves with nm/addr2line and does not reveal the slide.
+// Addresses outside the high-half window are returned unchanged.
+static inline uint64_t kaddr_link(uint64_t a) {
+    uint64_t base = kernel_vma_base();
+    return (a >= base && a - base < (512ULL << 20)) ? a - g_kaslr_slide : a;
+}
 
 // Initialize physmap for all physical memory (rounded up to 2MB boundary)
 void vmm_init_physmap(void);

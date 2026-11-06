@@ -249,6 +249,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
                 puts16(SystemTable, WIDE("[KASLR] on, kernel base randomized (768 slots x 2 MiB)\r\n"));
             }
             if (kaslr_apply(kh, kaslr_slide, source, state) != 0) kaslr_slide = 0;
+            // Independent draw for the stack-protector guard (also when the
+            // slide is disabled).
+            {
+                int ok2 = 0;
+                uint64_t e2 = uefi_rng64(SystemTable, &ok2);
+                uint32_t src2;
+                kaslr_set_guard(kh, kaslr_entropy(e2 ^ kaslr_slide, 1, &src2));
+            }
         } else if (kh && kaslr_hdr_valid(kh)) {
             kaslr_slide = kh->slide;   // already applied (never happens on a fresh load)
         } else {
