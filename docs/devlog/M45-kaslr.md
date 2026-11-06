@@ -46,7 +46,7 @@ the image stays below 512 MiB.
    boot GDT) stay as they are. Every value is cross-checked against the linked
    bytes; GOT relocations, `R_X86_64_32` to a high address, references outside
    the window, overlapping fields and unknown types are hard errors.
-3. Output: a 48-byte header + one `u32` per field (bit 31 = 32-bit field,
+3. Output: a 56-byte header + one `u32` per field (bit 31 = 32-bit field,
    bits 0..30 = **physical** address of the field), sorted. ~31 KB.
 4. **Pass 2**: the table is linked back as section `.kaslr`, placed **after
    `.data` and before `.bss`**: no section that carries relocations moves, so
@@ -130,6 +130,35 @@ OVMF + `-device virtio-rng-pci` gives `EFI_RNG`.
   appends it to `grub.cfg`), or in the UEFI loader's load options
   (`\EFI\...\BOOTX64.EFI nokaslr` from the shell / a boot entry).
 
+### Stack-protector guard
+
+The canary (`__stack_chk_guard`, `kernel/panic.c`) used to be a compile-time
+constant. The table header (version 2) records the guard's **physical address**
+(the tool looks the symbol up in pass 1 and requires it in `.data`, which does
+not move). Both relocators store a fresh random value there — a second draw,
+independent of the slide — **before the first instruction of kernel C code**, so
+no protected frame ever saved the old value and no `no_stack_protector`
+annotation is needed. The low byte is zeroed (a C-string overflow cannot write
+it back); `0` is never used. This happens even with `nokaslr` /
+`-DSECOS_NO_KASLR`. The kernel logs `[SSP] stack canary randomized at boot`
+(value only on raw debugcon in a `SECOS_KASLR_DEBUG` build).
+
+This only matters once GCC actually reads that variable: on `main`, with
+`-mcmodel=kernel`, it read `%gs:0x28` (the IVT through the low identity map).
+The fix (`-mstack-protector-guard=global`, commit `913aafa` on
+`feat/smap-noident`) is **cherry-picked** on this branch (`3367c30`, identical
+patch, so merging both branches is clean); `objdump` shows 0 `%gs:0x28` and
+~1000 `__stack_chk_guard` references.
+
+### Kernel addresses in the kernel log
+
+Debugcon output is also kept by the kernel log ring (dmesg, `/proc/kmsg`), so a
+runtime kernel address printed there gives the slide away. `kaddr_link()`
+(`mm/vmm.h`) converts an image address to its `kernel.bin` value; it is used by
+the heap-corruption report (its boot selftest prints `caller=`/`owner=`), the
+TSS banner, the verbose uaccess-fixup trace and the `[EXC]` line (`lrip=`). The
+gate asserts that no slid image address appears in the boot log.
+
 ## Measured boot, secure boot, reproducible builds
 
 - **Measured boot (M37)**: the live `.text`/`.rodata` bytes now depend on the
@@ -173,15 +202,19 @@ base is the natural next step.
   audit clean in 5/5, no `[EXC]`; `-smp 4 -cpu max` (RDRAND, 4 CPUs online);
   MB2 `nokaslr`; UEFI ×2 (slides differ, secure boot OK, measurement equal to
   MB2's, W^X clean), UEFI + virtio-rng (`entropy=EFI_RNG`), UEFI `nokaslr` via
-  `startup.nsh`; a `-DSECOS_NO_KASLR` build. The default-image block also checks
+  `startup.nsh`; a `-DSECOS_NO_KASLR` build; the stack canary is randomized
+  (≥ 4 distinct of 5 boots, also by the UEFI loader and with `SECOS_NO_KASLR`);
+  no slid kernel address in the log. The default-image block also checks
   "KASLR on" and that `KASLR-DEBUG` appears neither in the log nor the binary.
 
 ## Open issues / follow-ups
 
 - Physmap / heap / M2 stack region base randomization (see table).
-- Kernel pointers in the kernel log: a few boot traces print kernel addresses on
-  debugcon, which the log ring keeps for dmesg. A `kptr_restrict`-style pass
-  (print link-relative or hashed values) would close it.
+- Kernel pointers in the kernel log: the boot log is clean (gate-checked) and
+  the known printers use `kaddr_link()`, but there is no systematic
+  `kptr_restrict`; a ring-0 `[EXC]` still prints the runtime RIP (the system
+  halts right after). Physmap/heap addresses are logged freely (not randomized
+  anyway).
 - The `.kaslr` table stays mapped RW/NX after boot (it is read once more by the
   measurement); it could be made read-only or freed.
 - 9.6 bits is the ceiling of a 2 MiB-granular slide inside the 2 GiB
