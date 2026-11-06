@@ -77,7 +77,6 @@ extern int     sys_unlink(const char*)                   __asm__("unlink");
 extern int     sys_chdir(const char*)                    __asm__("chdir");
 extern int     sys_rename(const char*, const char*)      __asm__("rename");
 extern int     sys_utimes(const char*, unsigned long, unsigned long) __asm__("utimes");
-extern int     sys_mount(const char*, const char*, const char*) __asm__("mount");
 extern int     sys_umount(const char*)                   __asm__("umount");
 extern void*   sys_mmap(void*, size_t, int, int)         __asm__("mmap");
 extern void*   sys_mmap_file(void*, size_t, int, int, int) __asm__("mmap_file");
@@ -354,10 +353,19 @@ int munlockall(void) { return 0; }
 int madvise(void* a, size_t l, int v) { (void)a; (void)l; (void)v; return 0; }
 void* mremap(void* o, size_t ol, size_t nl, int f, ...) { (void)o; (void)ol; (void)nl; (void)f; errno = ENOMEM; return MAP_FAILED; }
 int mount(const char* src, const char* tgt, const char* type, unsigned long fl, const void* data) {
-    (void)data;
     if (fl & (MS_REMOUNT | MS_BIND | MS_MOVE)) { errno = EINVAL; return -1; }
     if (!type || !*type) { errno = EINVAL; return -1; }
-    return (int)se(sys_mount(src, AP(tgt), type), EINVAL);
+    /* `data` (-o uid=,gid=,umask=,... for vfat/exfat/ntfs) goes to the kernel
+     * as SYS_MOUNT a3; MS_RDONLY is passed as a leading "ro". */
+    char opt[128]; size_t n = 0; const char* d = (const char*)data;
+    if (fl & MS_RDONLY) { opt[n++] = 'r'; opt[n++] = 'o'; }
+    if (d && *d) {
+        if (n) opt[n++] = ',';
+        while (*d && n < sizeof(opt) - 1) opt[n++] = *d++;
+        if (*d) { errno = EINVAL; return -1; }
+    }
+    opt[n] = 0;
+    return (int)se(secos_syscall(38 /*SYS_MOUNT*/, (long)src, (long)AP(tgt), (long)type, n ? (long)opt : 0, 0), EINVAL);
 }
 int umount2(const char* t, int fl) { (void)fl; return (int)se(sys_umount(AP(t)), EINVAL); }
 int sbb_umount2(const char* t, int fl) __asm__("sbb_umount2");

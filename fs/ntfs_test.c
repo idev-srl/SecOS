@@ -23,6 +23,8 @@
 #include "block.h"
 #include "debugcon.h"
 #include "heap.h"
+#include "../kernel/process.h"
+#include "../kernel/cred.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -276,6 +278,30 @@ static void good_mode(void){
     /* ---- second instance + remount ---- */
     int m2 = ntfs_mount(devc, "/mnt2");
     ok("second simultaneous NTFS instance", m2 == 0 && read_eq("/mnt2/hello.txt", "hello from ntfs\n") && ntfs_mounted_count() == 2);
+    if(m2 == 0) vfs_unmount("/mnt2");
+
+    /* ---- ownership: mount-supplied owner/modes + EROFS before EACCES ---- */
+    static process_t u1000, u2000;             /* fake user processes (pid != 0) */
+    u1000.pid = 0x7001; u1000.cred.ruid = u1000.cred.euid = 1000; u1000.cred.rgid = u1000.cred.egid = 100;
+    u2000.pid = 0x7002; u2000.cred.ruid = u2000.cred.euid = 2000; u2000.cred.rgid = u2000.cred.egid = 2000;
+    vfs_inode_t* hf = vfs_lookup("/mnt/hello.txt");
+    ok("default owner root:root, files 0644, dirs 0755",
+       hf && hf->uid == 0 && hf->mode == 0100644u && (dd = vfs_lookup("/mnt/many")) && dd->mode == 040755u);
+    ok("a user may read; any write -> EROFS (not EACCES)",
+       hf && cred_inode_perm(&u2000, hf, MAY_READ) == 0 && cred_inode_perm(&u2000, hf, MAY_WRITE) == -CRED_EROFS &&
+       cred_may_create(&u2000, "/mnt/new.txt") == -CRED_EROFS && cred_chmod(&u2000, "/mnt/hello.txt", 0777) == -CRED_EROFS);
+    ok("mount option rw -> EROFS", ntfs_set_mount_options("rw") == 0 && ntfs_mount(devc, "/mnt2") == -30);
+    ok("bad mount option refused", ntfs_set_mount_options("uid=x") != 0 && ntfs_set_mount_options("bogus") != 0);
+    ntfs_set_mount_options("uid=1000,gid=100,umask=077");
+    m2 = ntfs_mount(devc, "/mnt2");
+    hf = vfs_lookup("/mnt2/hello.txt");
+    vfs_inode_t* d2 = vfs_lookup("/mnt2/many");
+    ok("mount -o uid=1000,gid=100,umask=077: owner + modes",
+       m2 == 0 && hf && d2 && hf->uid == 1000 && hf->gid == 100 && hf->mode == 0100700u && d2->mode == 040700u);
+    ok("umask=077: owner reads, other user EACCES",
+       hf && cred_inode_perm(&u1000, hf, MAY_READ) == 0 && cred_inode_perm(&u2000, hf, MAY_READ) == -CRED_EACCES);
+    hf = vfs_lookup("/mnt/hello.txt");
+    ok("per-volume options (first volume unchanged)", hf && hf->uid == 0 && hf->mode == 0100644u);
     if(m2 == 0) vfs_unmount("/mnt2");
     vfs_inode_t* old = vfs_lookup("/mnt/big.bin");
     int um = vfs_unmount("/mnt");

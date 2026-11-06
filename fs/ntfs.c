@@ -39,6 +39,7 @@
 #include "block.h"
 #include "debugcon.h"
 #include "heap.h"
+#include "mntopts.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -200,6 +201,7 @@ typedef struct nt_vol {
     int32_t   hash[NT_HASH];
     nt_node_t* root;
     vfs_fs_ops_t ops;
+    mntopts_t opt;                   /* owner/masks (NTFS ACLs are not mapped) */
 } nt_vol_t;
 
 static nt_vol_t g_vol[NTFS_MAX_VOLUMES];
@@ -1102,13 +1104,14 @@ static int nt_resolve(nt_vol_t* v, const char* path, nt_node_t** out){
 /* ── VFS operations ──────────────────────────────────────────────────────── */
 static void vi_fill(nt_node_t* n){
     vfs_inode_t* vi = node_vi(n);
-    if(n->kind == NK_DIR){ vi->type = VFS_NODE_DIR; vi->size = 0; vi->mode = 040755; }
+    const mntopts_t* o = &n->v->opt;
+    if(n->kind == NK_DIR){ vi->type = VFS_NODE_DIR; vi->size = 0; vi->mode = mntopts_mode(o, 1, 0); }
     else if(n->kind == NK_LINK){ vi->type = VFS_NODE_SYMLINK; vi->size = slen(n->link); vi->mode = 0120777; }
     else {
         vi->type = VFS_NODE_FILE; vi->size = (size_t)n->data.data_size;
-        vi->mode = (n->fattr & FA_READONLY) ? 0100444 : 0100644;
+        vi->mode = mntopts_mode(o, 0, (n->fattr & FA_READONLY) != 0);
     }
-    vi->uid = vi->gid = 0;
+    vi->uid = o->uid; vi->gid = o->gid;
     vi->nlink = n->nlink ? n->nlink : 1;
     vi->mtime = n->t_mod; vi->atime = n->t_acc; vi->ctime = n->t_chg;
 }
@@ -1152,9 +1155,9 @@ static void walk_emit(nt_walk_t* w, const nt_ie_t* e){
     c->type = (fa & FA_DIR_INDEX) ? VFS_NODE_DIR : VFS_NODE_FILE;
     if((fa & FA_REPARSE) && (tag == RT_SYMLINK || tag == RT_MOUNT_POINT || tag == RT_LX_SYMLINK)) c->type = VFS_NODE_SYMLINK;
     c->size = c->type == VFS_NODE_FILE ? (size_t)rd64(k + 0x30) : 0;
-    c->mode = c->type == VFS_NODE_DIR ? 040755 : c->type == VFS_NODE_SYMLINK ? 0120777 : 0100644;
+    c->mode = c->type == VFS_NODE_SYMLINK ? 0120777 : mntopts_mode(&w->v->opt, c->type == VFS_NODE_DIR, (fa & FA_READONLY) != 0);
     c->fs_data = NULL; c->ops = NULL;
-    c->uid = c->gid = 0; c->nlink = 1;
+    c->uid = w->v->opt.uid; c->gid = w->v->opt.gid; c->nlink = 1;
     c->mtime = nt2unix(rd64(k + 0x10)); c->ctime = nt2unix(rd64(k + 0x18)); c->atime = nt2unix(rd64(k + 0x20));
     w->cb(c, w->user);
 }
@@ -1604,7 +1607,19 @@ static int mount_inner(nt_vol_t* v, block_dev_t* dev, const char* dev_name, cons
     return 0;
 }
 
+/* Owner/mode options for the next mount (fs/mntopts.h); an explicit "rw"
+ * makes it fail with EROFS, as a read-write request does. */
+static mntopts_t g_nopt_new = { 0, 0, 022, 0133, 0, 0 };
+int ntfs_set_mount_options(const char* opts){
+    mntopts_t o;
+    if(mntopts_parse(opts, &o) != 0) return -1;
+    g_nopt_new = o;
+    return 0;
+}
+
 int ntfs_mount_opts(const char* dev_name, const char* mount_point, int want_rw){
+    mntopts_t opt = g_nopt_new; mntopts_default(&g_nopt_new);
+    if(opt.rw) want_rw = 1;
     if(want_rw){ nt_log("read-write mount refused (driver is read-only)"); return -NT_EROFS; }
     if(!dev_name || !mount_point || mount_point[0] != '/') return -1;
     block_dev_t* dev = block_find(dev_name);
@@ -1620,6 +1635,7 @@ int ntfs_mount_opts(const char* dev_name, const char* mount_point, int want_rw){
     v->idx = (int)(v - g_vol);
     vol_release(v);
     ops_init(v);
+    v->opt = opt;
     if(mount_inner(v, dev, dev_name, mount_point) != 0){ vol_release(v); return -1; }
     v->mounted = 1;
     if(vfs_mount(v->mp, &v->ops, "ntfs") != 0){ vol_release(v); return -1; }

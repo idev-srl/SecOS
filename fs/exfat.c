@@ -32,6 +32,7 @@
 #include "debugcon.h"
 #include "heap.h"
 #include "pagecache.h"
+#include "mntopts.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -980,14 +981,22 @@ static void nodes_moved(uint32_t odfirst, uint32_t oslot, const exobj_t* now){
 }
 
 static vfs_fs_ops_t exfat_ops;
+/* Owner/mode of the mounted volume (exFAT keeps none: fs/mntopts.h). */
+static mntopts_t g_xopt     = { 0, 0, 022, 0133, 0, 0 };
+static mntopts_t g_xopt_new = { 0, 0, 022, 0133, 0, 0 };   /* for the next mount */
+int exfat_set_mount_options(const char* opts){
+    mntopts_t o;
+    if(mntopts_parse(opts, &o) != 0) return -1;
+    g_xopt_new = o;
+    return 0;
+}
 static int ex_attached(void){ return V.mounted && vfs_mount_point_of(&exfat_ops) != NULL; }
 
 static void ino_fill(vfs_inode_t* ino, const exobj_t* o){
     ino->type = (o->attr & AT_DIR) ? VFS_NODE_DIR : VFS_NODE_FILE;
     ino->size = (o->attr & AT_DIR) ? 0 : (size_t)o->st.size;
-    ino->mode = 0;
-    if(!(o->attr & AT_DIR) && (o->attr & AT_RO)) ino->mode = 0100444u;
-    ino->uid = ino->gid = 0;
+    ino->mode = mntopts_mode(&g_xopt, (o->attr & AT_DIR) != 0, (o->attr & AT_RO) != 0);
+    ino->uid = g_xopt.uid; ino->gid = g_xopt.gid;
     ino->nlink = 1;
     if(o->is_root){ ino->atime = ino->mtime = ino->ctime = 0; return; }
     ino->mtime = ts_to_unix(o->tm, o->tm10, o->um);
@@ -1024,7 +1033,8 @@ static int readdir_cb(exset_t* s, void* u){
     child.type = (attr & AT_DIR) ? VFS_NODE_DIR : VFS_NODE_FILE;
     child.size = (attr & AT_DIR) ? 0 : (size_t)rd64(s->raw + 56);
     child.fs_data = NULL; child.ops = NULL;
-    child.mode = 0; child.uid = child.gid = 0; child.nlink = 1;
+    child.mode = mntopts_mode(&g_xopt, (attr & AT_DIR) != 0, (attr & AT_RO) != 0);
+    child.uid = g_xopt.uid; child.gid = g_xopt.gid; child.nlink = 1;
     child.mtime = ts_to_unix(rd32(s->raw + 12), s->raw[21], s->raw[23]);
     child.atime = child.ctime = child.mtime;
     c->cb(&child, c->user);
@@ -1452,7 +1462,7 @@ int exfat_mount(const char* dev_name, const char* mount_point){
     V.flags = g.flags;
     V.active_fat = (g.nfats == 2 && (g.flags & VF_ACTIVEFAT)) ? 1 : 0;
     V.dirty_at_mount = (g.flags & VF_DIRTY) ? 1 : 0;
-    V.ro = backup || !dev->write || g.nfats != 1 || (g.flags & VF_MEDIAFAIL);
+    V.ro = backup || !dev->write || g.nfats != 1 || (g.flags & VF_MEDIAFAIL) || g_xopt_new.ro;
     V.hint = 2;
     cache_reset();
     g_corrupt_logged = 0;
@@ -1529,6 +1539,8 @@ int exfat_mount(const char* dev_name, const char* mount_point){
     g_devname[k] = 0;
     g_vused = 0;
     V.mounted = 1;
+    g_xopt = g_xopt_new; mntopts_default(&g_xopt_new);    /* this mount's owner/masks */
+    exfat_ops.flags = V.ro ? VFS_FS_RDONLY : 0;           /* EROFS before EACCES (kernel/cred.c) */
     if(vfs_mount(g_mp, &exfat_ops, "exfat") != 0){ V.mounted = 0; return -1; }
     debugcon_writestring("[EXFAT] mounted "); debugcon_writestring(g_devname);
     debugcon_writestring(" at "); debugcon_writestring(g_mp);

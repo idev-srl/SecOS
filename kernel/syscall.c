@@ -924,8 +924,10 @@ int ksys_unlink(const char* path){
 
 // [M26] mount/umount: map a block-device name + fstype to the existing FS mount
 // helpers (the same path the boot mount and shell `mountdev` use). fstype:
-// "fat32"/"vfat" -> FAT32; "ext2"/"ext4"/"extN" -> ext driver; "auto"/"" -> try
-// both. The signature is the trust boundary, so any signed caller may mount.
+// "fat32"/"vfat" -> FAT32; "ext2"/"ext4"/"extN" -> ext driver; "exfat";
+// "ntfs" (read-only); "auto"/"" -> try them in that order. Root only [M42].
+// `opts` = mount(2) data: uid=,gid=,umask=,dmask=,fmask= for the FSes that
+// keep no owners (fs/mntopts.h).
 static int str_eq2(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
 int ksys_mount_opts(const char* dev, const char* target, const char* fstype, const char* opts){
     extern void* block_find(const char* name);
@@ -950,11 +952,24 @@ int ksys_mount_opts(const char* dev, const char* target, const char* fstype, con
     int isntfs= str_eq2(fstype,"ntfs")||str_eq2(fstype,"ntfs3")||str_eq2(fstype,"ntfs-3g");  // [M42] read-only
     int isauto= str_eq2(fstype,"auto")||fstype[0]==0;
     extern int fat32_set_mount_options(const char* opts);
-    if(isfat){ if(fat32_set_mount_options(opts)!=0) return -CRED_EINVAL; return fat32_mount(dev,target); }
     if(isext) return ext2_mount(dev,target);
-    if(isexf) return exfat_mount(dev,target);
-    if(isntfs) return ntfs_mount(dev,target);
-    if(isauto){ if(fat32_set_mount_options(opts)==0 && fat32_mount(dev,target)==0) return 0; if(ext2_mount(dev,target)==0) return 0; if(exfat_mount(dev,target)==0) return 0; return ntfs_mount(dev,target); }
+    // Owner/mode options of FAT32/exFAT/NTFS (fs/mntopts.h); ext2/ext4 keep
+    // real owners and ignore them. A malformed option list is -EINVAL.
+    extern int exfat_set_mount_options(const char* opts);
+    extern int ntfs_set_mount_options(const char* opts);
+    int r = -1;
+    if(isfat){ if(fat32_set_mount_options(opts)!=0) return -CRED_EINVAL; r = fat32_mount(dev,target); }
+    else if(isexf){ if(exfat_set_mount_options(opts)!=0) return -CRED_EINVAL; r = exfat_mount(dev,target); }
+    else if(isntfs){ if(ntfs_set_mount_options(opts)!=0) return -CRED_EINVAL; r = ntfs_mount(dev,target); }
+    else if(isauto){
+        if(fat32_set_mount_options(opts)==0 && fat32_mount(dev,target)==0) r = 0;
+        else if(ext2_mount(dev,target)==0) r = 0;
+        else if(exfat_set_mount_options(opts)==0 && exfat_mount(dev,target)==0) r = 0;
+        else if(ntfs_set_mount_options(opts)==0) r = ntfs_mount(dev,target);
+    }
+    // A refused mount must not leave its options for the next one.
+    fat32_set_mount_options(""); exfat_set_mount_options(""); ntfs_set_mount_options("");
+    if(isfat || isexf || isntfs || isauto) return r;
     return -1;                                            // unknown fstype
 }
 int ksys_mount(const char* dev, const char* target, const char* fstype){ return ksys_mount_opts(dev, target, fstype, ""); }
@@ -1388,7 +1403,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         if (copy_user_str((const char*)a0, kdev, sizeof(kdev)) != 0) return (uint64_t)(int64_t)-EFAULT;
         if (copy_user_str((const char*)a1, ktgt, sizeof(ktgt)) != 0) return (uint64_t)(int64_t)-EFAULT;
         if (copy_user_str((const char*)a2, kfs,  sizeof(kfs))  != 0) return (uint64_t)(int64_t)-EFAULT;
-        kopt[0] = 0;   // [M42] a3: mount options (FAT32: uid=,gid=,umask=,dmask=,fmask=)
+        kopt[0] = 0;   // [M42] a3: mount options (FAT32/exFAT/NTFS: uid=,gid=,umask=,dmask=,fmask=)
         if (a3 && copy_user_str((const char*)a3, kopt, sizeof(kopt)) != 0) return (uint64_t)(int64_t)-EFAULT;
         return (uint64_t)(int64_t)ksys_mount_opts(kdev, ktgt, kfs, kopt);
     }

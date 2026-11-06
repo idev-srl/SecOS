@@ -328,6 +328,29 @@ All public documentation; no source code was copied or ported.
 - The behaviour of the host's ntfs-3g/mkntfs was used as a black-box oracle
   (the reference listing), not as source.
 
+## Ownership and modes (Phase 3 integration with multi-user)
+
+NTFS (whose ACLs are not mapped) stores no Unix owner or mode, and since `feat/multiuser-base` the VFS
+enforces permissions, so the mount supplies them, as Linux ntfs3 does
+(`fs/mntopts.h`, shared by FAT32, exFAT and NTFS):
+
+- default: every object is `root:root`, directories `0755`, files `0644`
+  (no exec bits: programs are not run from these volumes). Any user can read a
+  mounted USB stick or data disk; only root writes it.
+- mount(2) data `uid=N,gid=N,umask=OOO,dmask=OOO,fmask=OOO` change that per
+  mount (`umask` sets both masks, so `umask=027` gives `0750` files and
+  directories, as on Linux), e.g. `mount -t ntfs -o uid=1000,gid=100 /dev/usb0 /media`.
+  A malformed or unknown option refuses the mount with `EINVAL`; options never
+  leak into the next mount.
+- a file with the FS read-only attribute (`FILE_ATTRIBUTE_READONLY`) loses its write bits.
+- options are per volume (up to 4 NTFS volumes); an explicit `rw` fails with
+  `EROFS` like any read-write request; symlinks/junctions stay `0777`.
+- writes to a read-only mount fail with `EROFS` before any permission
+  check, root included (`kernel/cred.c`), as Linux `inode_permission()`.
+- BusyBox `mount -o ...` forwards its data string (and `-r` as `ro`) to
+  `SYS_MOUNT` (`user/busybox_compat.c`); this takes effect with the next
+  `make port-busybox`.
+
 ## Known gaps
 
 - **Read-only.** Write support is the next step (see `TASKS.md`).

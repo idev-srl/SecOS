@@ -15,6 +15,10 @@
 // or if the single exFAT instance is already mounted elsewhere.
 int exfat_mount(const char* dev_name, const char* mount_point);
 
+// Owner/mode options (uid=,gid=,umask=,dmask=,fmask=,ro,rw; fs/mntopts.h) for
+// the next exfat_mount(). 0, or -1 if malformed. "" restores the defaults.
+int exfat_set_mount_options(const char* opts);
+
 // Probe only: 1 if `dev_name` carries an exFAT boot sector signature, else 0.
 int exfat_probe(const char* dev_name);
 

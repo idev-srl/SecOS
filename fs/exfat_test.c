@@ -20,6 +20,8 @@
 #include "vfs.h"
 #include "block.h"
 #include "debugcon.h"
+#include "../kernel/process.h"
+#include "../kernel/cred.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -227,6 +229,32 @@ static void good_mode(const char* devp){
     ok("remount", rm == 0);
     ok("persistence after remount", read_eq(WNAME, WBODY) && read_eq(NDIR "/moved.txt", "rename payload\n") &&
                                     verify_pattern("/mnt/sfb.bin", 32u * 4096, 7) && !vfs_lookup("/mnt/delete_me.txt"));
+    /* ---- ownership: mount-supplied owner/modes + DAC (kernel/cred.c) ---- */
+    static process_t u1000, u2000;             /* fake user processes (pid != 0) */
+    u1000.pid = 0x7001; u1000.cred.ruid = u1000.cred.euid = 1000; u1000.cred.rgid = u1000.cred.egid = 100;
+    u2000.pid = 0x7002; u2000.cred.ruid = u2000.cred.euid = 2000; u2000.cred.rgid = u2000.cred.egid = 2000;
+    vfs_inode_t* df = vfs_lookup(WNAME);
+    vfs_inode_t* dd = vfs_lookup(NDIR);
+    ok("default owner root:root, files 0644, dirs 0755",
+       df && dd && df->uid == 0 && df->gid == 0 && df->mode == 0100644u && dd->mode == 040755u);
+    ok("default: a user may read, not write (EACCES)",
+       df && cred_inode_perm(&u1000, df, MAY_READ) == 0 && cred_inode_perm(&u1000, df, MAY_WRITE) == -CRED_EACCES);
+    umount_clean("/mnt");
+    exfat_set_mount_options("uid=1000,gid=100,umask=027,ro");
+    rm = exfat_mount(dev, "/mnt");
+    df = vfs_lookup(WNAME); dd = vfs_lookup(NDIR);
+    ok("mount -o uid=1000,gid=100,umask=027,ro: owner + modes",
+       rm == 0 && df && dd && df->uid == 1000 && df->gid == 100 && df->mode == 0100750u && dd->mode == 040750u);
+    ok("ro mount: write -> EROFS before EACCES (owner and other user)",
+       df && cred_inode_perm(&u1000, df, MAY_WRITE) == -CRED_EROFS && cred_inode_perm(&u2000, df, MAY_WRITE) == -CRED_EROFS);
+    ok("umask=027: owner reads, others get EACCES",
+       df && cred_inode_perm(&u1000, df, MAY_READ) == 0 && cred_inode_perm(&u2000, df, MAY_READ) == -CRED_EACCES);
+    ok("ro mount: create refused, statfs ST_RDONLY",
+       vfs_create("/mnt/ro_new.txt", "x", 1) != 0 && vfs_statfs("/mnt", &sf) == 0 && (sf.flags & 1));
+    umount_clean("/mnt");
+    rm = exfat_mount(dev, "/mnt");
+    df = vfs_lookup(WNAME);
+    ok("options do not leak into the next mount", rm == 0 && df && df->uid == 0 && df->mode == 0100644u);
     umount_clean("/mnt");
     ok("final unmount clean", dev_dirty_bit(dev) == 0);
     lg("[M41] DONE\n");

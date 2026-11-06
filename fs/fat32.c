@@ -16,6 +16,7 @@
 #include "block.h"
 #include "heap.h"
 #include "pagecache.h"
+#include "mntopts.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -458,39 +459,15 @@ static int fat_write_file(fat_node_t* nd, size_t offset, const void* buf, size_t
 }
 
 /* ── [M42] Ownership: FAT has none, so the mount supplies it ──────────────────
- * Every file and directory of the volume is owned by the mount's uid:gid with
- * mode 0777 & ~dmask (directories) / 0777 & ~fmask (files), as Linux vfat.
- * Options (mount(2) data, comma-separated): uid=N gid=N umask=OOO (both masks)
- * dmask=OOO fmask=OOO. Defaults: root:root, dmask 022, fmask 133 -> 0755 / 0644
- * (no exec bits: programs are not run from FAT). chmod/chown are accepted and
- * ignored (nothing to store), after the usual owner/root check. */
-struct fat_opts { uint32_t uid, gid, dmask, fmask; };
-static struct fat_opts g_fopt     = { 0, 0, 022, 0133 };   /* the mounted volume */
-static struct fat_opts g_fopt_new = { 0, 0, 022, 0133 };   /* for the next mount */
-static int fopt_num(const char** pp, int base, uint32_t* out){
-    const char* p=*pp; uint32_t v=0; int n=0;
-    while((*p>='0' && *p<=(base==8?'7':'9'))){ v=v*(uint32_t)base+(uint32_t)(*p-'0'); p++; n++; if(n>10) return -1; }
-    if(!n) return -1;
-    *out=v; *pp=p; return 0;
-}
-static int fopt_key(const char** pp, const char* k){
-    const char* p=*pp; while(*k){ if(*p!=*k) return 0; p++; k++; }
-    *pp=p; return 1;
-}
+ * uid=/gid=/umask=/dmask=/fmask= (fs/mntopts.h): default root:root 0755/0644,
+ * a file with ATTR_READ_ONLY loses its write bits. "ro" is refused (this
+ * driver has no read-only mode). chmod/chown are accepted and ignored
+ * (nothing to store), after the usual owner/root check. */
+static mntopts_t g_fopt     = { 0, 0, 022, 0133, 0, 0 };   /* the mounted volume */
+static mntopts_t g_fopt_new = { 0, 0, 022, 0133, 0, 0 };   /* for the next mount */
 int fat32_set_mount_options(const char* opts){
-    struct fat_opts o = { 0, 0, 022, 0133 };
-    const char* p = opts ? opts : "";
-    while(*p){
-        uint32_t v;
-        if(fopt_key(&p,"uid=")){ if(fopt_num(&p,10,&v)) return -1; o.uid=v; }
-        else if(fopt_key(&p,"gid=")){ if(fopt_num(&p,10,&v)) return -1; o.gid=v; }
-        else if(fopt_key(&p,"umask=")){ if(fopt_num(&p,8,&v)) return -1; o.dmask=o.fmask=v&0777; }
-        else if(fopt_key(&p,"dmask=")){ if(fopt_num(&p,8,&v)) return -1; o.dmask=v&0777; }
-        else if(fopt_key(&p,"fmask=")){ if(fopt_num(&p,8,&v)) return -1; o.fmask=v&0777; }
-        else if(fopt_key(&p,"rw") || fopt_key(&p,"defaults")){ }
-        else return -1;                                   /* unknown option: refuse */
-        if(*p==',') p++; else if(*p) return -1;
-    }
+    mntopts_t o;
+    if(mntopts_parse(opts, &o) != 0 || o.ro) return -1;
     g_fopt_new = o;
     return 0;
 }
@@ -513,7 +490,7 @@ static vfs_inode_t* fat32_lookup(const char* path){
     if(nd->first_cluster && nd->first_cluster!=fc) pagecache_invalidate(ino, 0, 1ULL<<62);
     nd->first_cluster=fc; nd->size=sz; nd->is_dir=isd;
     ino->ino = fat_ino_of(loc.clus, loc.off);
-    ino->mode = isd ? (0040000u | (0777u & ~g_fopt.dmask)) : (0100000u | (0777u & ~g_fopt.fmask));
+    ino->mode = mntopts_mode(&g_fopt, isd, !isd && loc.clus && (loc.raw[11] & 0x01));
     ino->nlink = 1; ino->uid = g_fopt.uid; ino->gid = g_fopt.gid;      /* [M42] mount options */
     ino->atime = ino->mtime = ino->ctime = 0;
     if(loc.clus){                                  /* root has no entry: times stay 0 */
@@ -798,6 +775,6 @@ int fat32_mount(const char* dev_name, const char* mount_point){
     g_fsinfo_done = 0;
     g_mounted = 1;
     g_fopt = g_fopt_new;                                  /* [M42] this mount's owner/masks */
-    g_fopt_new.uid = g_fopt_new.gid = 0; g_fopt_new.dmask = 022; g_fopt_new.fmask = 0133;
+    mntopts_default(&g_fopt_new);
     return vfs_mount(mount_point, &fat32_ops, "fat32");
 }

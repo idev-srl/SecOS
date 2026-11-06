@@ -22,6 +22,9 @@ int ntfs_mount(const char* dev_name, const char* mount_point);
 // Same, with an explicit access mode: want_rw != 0 is refused with -30
 // (EROFS) because this driver has no write support.
 int ntfs_mount_opts(const char* dev_name, const char* mount_point, int want_rw);
+// Owner/mode options (uid=,gid=,umask=,dmask=,fmask=,ro; "rw" -> EROFS;
+// fs/mntopts.h) for the next mount. 0, or -1 if malformed.
+int ntfs_set_mount_options(const char* opts);
 
 // Probe only: 1 if `dev_name` carries an NTFS boot sector signature, else 0.
 int ntfs_probe(const char* dev_name);
