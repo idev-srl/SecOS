@@ -185,8 +185,11 @@ robustness and the paused real-hardware bring-up — see below.
          BusyBox keeps the kernel's errno, e.g. EROFS; its id/whoami/su/login/passwd/
          adduser/... applets are configured out for SecOS's own tools; libc `opendir`
          reads directories of any size); selftest gate MUPORTS (`tools/mu_ports_test.sh`);
-   - [ ] a hostile multi-user selftest gate (a user probing every boundary, exact errnos);
-   - [ ] the kernel's missing/unsigned-init fallback is still an unauthenticated root bash.
+   - [x] permission-enforcement regression gate PERM (`tools/perm_guest.sh` as an unprivileged
+         user: denials with exact errno text + positive controls);
+   - [x] a missing/unsigned `/bin/init` falls back to `/bin/login` on the console (not a root
+         bash) unless built `CONSOLE=root`;
+   - [x] FAT32/exFAT/NTFS owner + modes from mount options (`fs/mntopts.h`), EROFS before EACCES.
 3. [ ] **More filesystems:**
    - [x] **exFAT read-write** (the specification is public since 2019): boot-sector
          checksum, FAT + allocation bitmap, up-case table, directory entry sets with
