@@ -449,9 +449,14 @@ int ksys_open_mode(const char* path, int flags, uint32_t mode){
     vfs_inode_t* ino=vfs_lookup_ex(path, 1, &lerr);
     if(ino && (flags & 0x40) && (flags & 0x80)) return -17;                  // O_EXCL: -EEXIST
     if(!ino && (flags & 0x40) && (lerr==0 || lerr==-2)){                     // O_CREAT
-        if(vfs_create(path,"",0)==0){ kiface_apply_create_mode(path, mode, 0); ino=vfs_lookup_follow(path); }
+        int cr = vfs_create(path,"",0);
+        if(cr==0){ kiface_apply_create_mode(path, mode, 0); ino=vfs_lookup_follow(path); }
+        else if(cr==-30) return -30;                                         // -EROFS
     }
     if(!ino) return lerr ? lerr : -2;   // [M39] -ENOENT so libc can set errno (bash rcfile probing)
+    // [M42] Read-only filesystem: no write access, no O_TRUNC (-EROFS).
+    if(ino->type==VFS_NODE_FILE && ino->ops && (ino->ops->flags & VFS_FS_RDONLY) && ((flags & 3) || (flags & 0x200)))
+        return -30;
     if((flags & 0x200) && ino->size){                                        // O_TRUNC
         vfs_truncate(path,0); ino=vfs_lookup_follow(path); if(!ino) return -1;
         pagecache_invalidate(ino, 0, 1ULL<<62);

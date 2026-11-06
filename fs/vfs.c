@@ -341,7 +341,8 @@ int vfs_rmdir(const char* path){
     if(vfs_readdir(cp, vfs_count_cb, &c)!=0) return -5;   // EIO
     if(c.n) return -39;                                   // ENOTEMPTY
     char rel[256]; vfs_mount_t* m=vfs_resolve(cp,rel,sizeof(rel)); if(!m||!m->ops) return -1;
-    return m->ops->remove(rel) == 0 ? 0 : -5;
+    int r = m->ops->remove(rel);
+    return r == 0 ? 0 : (r == -30 ? -30 : -5);           // EROFS / EIO
 }
 
 // rename: atomic within one filesystem (the FS replaces an existing target in
@@ -376,7 +377,8 @@ int vfs_rename(const char* oldp, const char* newp){
         }
     }
     if(!mo->ops->rename) return -1;
-    return mo->ops->rename(ro, rn) == 0 ? 0 : -5;         // EIO
+    int r = mo->ops->rename(ro, rn);
+    return r == 0 ? 0 : (r == -30 ? -30 : -5);           // EROFS / EIO
 }
 
 // link: a new name for an existing non-directory, same filesystem only.
@@ -394,7 +396,8 @@ int vfs_link(const char* oldp, const char* newp){
     if(!mo||!mn) return -2;
     if(mo!=mn) return -18;                                // EXDEV
     if(!mo->ops->link) return -1;                         // EPERM: FS has no hard links
-    return mo->ops->link(ro, rn) == 0 ? 0 : -5;
+    int r = mo->ops->link(ro, rn);
+    return r == 0 ? 0 : (r == -30 ? -30 : -5);           // EROFS / EIO
 }
 
 int vfs_truncate(const char* path, size_t new_size){
