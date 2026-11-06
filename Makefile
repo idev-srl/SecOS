@@ -639,6 +639,22 @@ disk-exfat-corrupt:
 	bash tools/exfat-host.sh mkcorrupt $(EXFAT_CORRUPT_DIR)
 	@echo "disk-exfat-corrupt: $(EXFAT_CORRUPT_DIR)/{files,geo,csum1,csum2,upcase,rootcycle}.img"
 
+# [M42] NTFS data disk built with the real host tools (mkntfs + ntfs-3g in an
+# unprivileged user namespace; fetched without sudo if missing, see
+# tools/ntfs-host.sh): long Unicode names, a fragmented file with an
+# $ATTRIBUTE_LIST, sparse + LZNT1-compressed files, symlinks/junctions, an EFS
+# file, a 2000-entry multi-level directory. $(DISK_IMG).list is the ntfs-3g
+# reference listing. `make disk-ntfs-corrupt` builds the damaged-image suite.
+NTFS_CORRUPT_DIR = ntfs_corrupt
+.PHONY: disk-ntfs disk-ntfs-corrupt
+disk-ntfs:
+	bash tools/ntfs-host.sh mkgood $(DISK_IMG)
+	@echo "disk-ntfs: $(DISK_IMG) (NTFS, 96MB, reference listing $(DISK_IMG).list)"
+disk-ntfs-corrupt:
+	rm -rf $(NTFS_CORRUPT_DIR)
+	bash tools/ntfs-host.sh mkcorrupt $(NTFS_CORRUPT_DIR)
+	@echo "disk-ntfs-corrupt: $(NTFS_CORRUPT_DIR)/{files,bootmain,bootboth,mft0,mftboth,upcase,rootbad,geo}.img"
+
 # [M27a] ext4 image with a DIRTY JBD2 journal: a committed transaction rewrites
 # /target.bin from OLD to NEW, pending replay. e2fsck-validated synthetic journal
 # (tools/mk_dirty_journal.py). A correct journal-recovery driver replays it on mount.
