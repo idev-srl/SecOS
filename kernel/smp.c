@@ -21,6 +21,9 @@
 #include "process.h"
 #include "trapframe.h"
 #include "tss.h"
+#include "tlb.h"
+
+void smp_tlb_selftest_ap(cpu_t* c);
 #include <stddef.h>
 
 /* Trampoline blob (objcopy of the flat binary) + its load/parameter addresses. */
@@ -91,7 +94,81 @@ void ap_entry(void) {
     c->online = 1;
     lapic_timer_start_this_cpu(1000);
     __asm__ volatile ("sti");
-    for (;;) { sched_reap_zombies(); __asm__ volatile ("hlt"); }
+    for (;;) { smp_tlb_selftest_ap(c); sched_reap_zombies(); __asm__ volatile ("hlt"); }
+}
+
+/* ---- [M48] TLB shootdown selftest (boot, >= 2 CPUs online) ----
+ * The BSP maps a scratch kernel page (the last kernel-stack slot, unused at
+ * boot) to frame A and has every AP read it, so each AP caches the
+ * translation. It then remaps the page to frame B WITH a shootdown: every AP
+ * must now read B. As a negative control it remaps to frame C WITHOUT the
+ * shootdown: an AP still holding the old translation reads B, which shows the
+ * test can see a missing invalidation (QEMU's per-vCPU soft TLB keeps stale
+ * entries exactly like hardware). APs participate from their idle loop. */
+static volatile struct {
+    uint32_t phase;            /* 0 idle, 1..3 = read round n                */
+    uint64_t va;
+    volatile uint64_t seen[3]; /* per round: APs that answered               */
+    volatile uint64_t good[3]; /* per round: APs that read the expected value */
+    uint64_t expect[3];
+} g_tlbt;
+void smp_tlb_selftest_ap(cpu_t* c) {
+    uint32_t ph = g_tlbt.phase;
+    if (!ph || ph > 3) return;
+    static volatile uint8_t done[3][SMP_MAX_CPUS];
+    if (done[ph - 1][c->index]) return;
+    uint64_t v = *(volatile uint64_t*)g_tlbt.va;
+    if (v == g_tlbt.expect[ph - 1]) __atomic_add_fetch(&g_tlbt.good[ph - 1], 1, __ATOMIC_SEQ_CST);
+    done[ph - 1][c->index] = 1;
+    __atomic_add_fetch(&g_tlbt.seen[ph - 1], 1, __ATOMIC_SEQ_CST);
+}
+static int tlbt_round(uint32_t ph, uint64_t want, uint32_t naps) {
+    g_tlbt.expect[ph - 1] = want;
+    __sync_synchronize();
+    g_tlbt.phase = ph;
+    uint64_t t0 = ktime_us();
+    while (g_tlbt.seen[ph - 1] < naps && ktime_us() - t0 < 2000000ULL)
+        __asm__ volatile ("sti; hlt");               /* APs answer on their next tick */
+    return (int)g_tlbt.seen[ph - 1];
+}
+void smp_tlb_selftest(void) {
+    extern uint64_t vmm_alloc_kernel_stack_for_slot(uint32_t);
+    extern int vmm_free_kernel_stack_for_slot(uint32_t);
+    extern int vmm_selftest_remap(uint64_t, uint64_t, int);
+    uint32_t naps = smp_online_count() - 1;
+    static int done_once;
+    // Boot only: the scratch slot is free while no process exists (a later
+    // shell `smp` may run with the table full).
+    if (naps == 0 || done_once || process_count_all() != 0) return;
+    done_once = 1;
+    uint64_t top = vmm_alloc_kernel_stack_for_slot(M5_MAX_KSTACK_SLOTS - 1);
+    void* fb = pmm_alloc_frame(); void* fc = pmm_alloc_frame();
+    if (!top || !fb || !fc) { debugcon_writestring("[M48] TLB selftest: no scratch page\n"); return; }
+    uint64_t va = top - 0x1000ULL;                   /* top page of the slot */
+    *(volatile uint64_t*)va = 0xAAAAAAAAAAAAAAAAULL;
+    *(volatile uint64_t*)phys_to_virt((uint64_t)fb) = 0xBBBBBBBBBBBBBBBBULL;
+    *(volatile uint64_t*)phys_to_virt((uint64_t)fc) = 0xCCCCCCCCCCCCCCCCULL;
+    uint64_t fa = vmm_translate(va) & ~0xFFFULL;
+    g_tlbt.va = va;
+    tlbt_round(1, 0xAAAAAAAAAAAAAAAAULL, naps);      /* APs cache va -> A */
+    vmm_selftest_remap(va, (uint64_t)fb, 1);         /* va -> B, shot down */
+    int seen2 = tlbt_round(2, 0xBBBBBBBBBBBBBBBBULL, naps);
+    vmm_selftest_remap(va, (uint64_t)fc, 0);         /* va -> C, NOT shot down */
+    tlbt_round(3, 0xCCCCCCCCCCCCCCCCULL, naps);
+    g_tlbt.phase = 0;
+    debugcon_writestring("[M48] TLB selftest: aps="); debugcon_print_hex(naps);
+    debugcon_writestring(" with-shootdown fresh="); debugcon_print_hex(g_tlbt.good[1]);
+    debugcon_writestring("/"); debugcon_print_hex((uint64_t)seen2);
+    debugcon_writestring(" without stale="); debugcon_print_hex(g_tlbt.seen[2] - g_tlbt.good[2]);
+    debugcon_writestring("\n");
+    debugcon_writestring(g_tlbt.good[1] == naps && (uint64_t)seen2 == naps
+                         ? "[M48] TLB shootdown selftest PASS\n" : "[M48] TLB shootdown selftest FAIL\n");
+    /* Put frame A back so the slot frees what it allocated, then retire it
+     * (the broken remap above left stale entries: flush them everywhere). */
+    vmm_selftest_remap(va, fa, 1);
+    vmm_free_kernel_stack_for_slot(M5_MAX_KSTACK_SLOTS - 1);
+    tlb_shootdown_kernel(top - M5_KSTACK_SLOT_SIZE, M5_KSTACK_SLOT_PAGES);
+    pmm_free_frame(fb); pmm_free_frame(fc);
 }
 
 /* Allocate an AP's idle PCB + trapframe + switch stack. */
@@ -191,4 +268,5 @@ void smp_init(void) {
     debugcon_writestring("[SMP] online cpus=");
     debugcon_print_hex(smp_online_count());
     debugcon_writestring("\n");
+    smp_tlb_selftest();
 }

@@ -1328,6 +1328,21 @@ static int vmm_unmap_noflush(uint64_t virt) {
     return 0;
 }
 
+// [M48] TLB shootdown selftest hook (kernel/smp.c): point the kernel page at
+// `va` to `newphys`, with (shoot = 1) or without (shoot = 0, a deliberately
+// broken remap: the negative control) the cross-CPU invalidation.
+int vmm_selftest_remap(uint64_t va, uint64_t newphys, int shoot) {
+    uint64_t fl = spin_lock_irqsave(&kstack_lock);
+    int r = vmm_unmap_noflush(va);
+    if (r == 0) {
+        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");     // this CPU only
+        if (shoot) tlb_shootdown_kernel(va, 1);
+        r = vmm_map(va, newphys, VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_NOEXEC);
+    }
+    spin_unlock_irqrestore(&kstack_lock, fl);
+    return r;
+}
+
 int vmm_unmap(uint64_t virt) {
     int r = vmm_unmap_noflush(virt);
     if (r == 0) tlb_shootdown_kernel(virt, 1);   // [M48] kernel half: every CPU

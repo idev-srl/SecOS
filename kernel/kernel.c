@@ -128,7 +128,12 @@ __attribute__((noreturn)) static void m8_idle_entry(void) {
         if (m8_round == 0) {
             debugcon_writestring("[M8] round 1: spawning\n");
             m8_spawn_round(); m8_round = 1;
-        } else if (alive == 0 && m8_round <= M8_ROUNDS) {
+        } else if (alive == 0 && process_count_all() == 0 && m8_round <= M8_ROUNDS) {
+            // [M48] Measure only once every zombie is reaped. "alive == 0"
+            // alone (the M29-3 flake) let a round end while zombies whose last
+            // CPU had not yet switched off them were still unreaped, holding
+            // their address space and kernel stack: free memory then differed
+            // between rounds depending on timing.
             m8_free[m8_round] = pmm_get_free_memory();
             debugcon_writestring("[M8] round "); debugcon_print_hex((uint64_t)m8_round);
             debugcon_writestring(" complete, free="); debugcon_print_hex(m8_free[m8_round]);
