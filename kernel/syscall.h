@@ -74,7 +74,14 @@
 // Sessions + pseudo-terminals (numbers 85-89 are reserved for the pty work).
 #define SYS_SETSID      85 // setsid() -> new session id / -EPERM (already a group leader)
 #define SYS_GETSID      86 // getsid(pid) -> session id (pid 0 = caller) / -ESRCH
-// 90-94 are reserved for the GUI work; 95-99 for init / system services.
+// 90-94 were reserved for the GUI work (unused); 95-99 for init / system services.
+// [M46] prctl(option, arg): PR_SET_NO_NEW_PRIVS (38, arg 1) / PR_GET_NO_NEW_PRIVS
+// (39) as on Linux, plus PR_SECOS_GET_CAPS (0x53430001): effective caps
+// (MANIFEST_FLAG_CAP_* bits) | bit 30 if confined | bit 29 if no_new_privs.
+#define SYS_PRCTL       90
+#define PR_SET_NO_NEW_PRIVS 38
+#define PR_GET_NO_NEW_PRIVS 39
+#define PR_SECOS_GET_CAPS   0x53430001
 // [M43] Credentials (kernel/cred.c). 100-109; POSIX rules for who may change ids.
 #define SYS_GETUID      100 // getuid(res*) -> ruid; res != NULL: {ruid,euid,suid} (getresuid)
 #define SYS_GETEUID     101 // geteuid()

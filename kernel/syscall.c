@@ -102,6 +102,19 @@ static void spawn_inherit_stdio(process_t* parent, process_t* child){
     }
 }
 
+// [M43/M46] Honour a set-id bit only on the root fs, for a SETID manifest, and
+// never under no_new_privs (`nnp` = the exec'ing process's bit before the new
+// image was loaded, like Linux). A refused set-id exec is audited.
+static int setid_allowed(process_t* p, uint32_t fmode, int setid_fs, int nnp){
+    int base = setid_fs && process_manifest_setid(p);
+    int want = (fmode & 04000u) || ((fmode & 02000u) && (fmode & 0010u));
+    if(want && base && nnp){
+        cap_audit(p->pid, CAP_AUDIT_SETID, SYS_EXECVE, "setid-nnp", 0);
+        return 0;
+    }
+    return base;
+}
+
 int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     extern int vfs_read_all(const char*, void*, size_t);
     if(!path) return -1;
@@ -125,6 +138,15 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     if(n <= 0) return -1;
     process_t* p = process_create_from_elf_args(g_spawn_buf, (size_t)n, argc, argv);
     if(!p) return -1;
+    // [M46] Exec confinement: the child's caps are bounded by the spawner's
+    // (no_new_privs spawner); such a child never gains a Driver Space binding.
+    cap_exec_bound_t bound = cap_exec_bound(caller);
+    cap_exec_transition(p, bound, "spawn");
+    if(bound.valid && bound.nnp && p->proc_type == PROC_TYPE_DRIVER){
+        driver_remove_all_bindings(p);
+        p->proc_type = PROC_TYPE_USER; p->drv_dev_id = -1; p->drv_caps = 0;
+        cap_audit(p->pid, CAP_AUDIT_DRIVER, SYS_SPAWN, "spawn-nnp", 0);
+    }
     spawn_inherit_stdio(sched_get_current(), p);   // before READY: never runs without them
     p->spawner_pid = sched_get_current() ? sched_get_current()->pid : 0; // SYS_WAIT ownership
     // Job control: a spawned program joins its spawner's process group, so a
@@ -140,7 +162,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0) p->ki.umask = sp->ki.umask;
       if (sp && sp->pid != 0) p->cred = sp->cred;          // [M43] same user as the spawner
-      cred_exec_setid(p, fmode, fuid, fgid, setid_fs && process_manifest_setid(p)); }
+      cred_exec_setid(p, fmode, fuid, fgid, setid_allowed(p, fmode, setid_fs, bound.valid && bound.nnp)); }
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0 && sp->cwd[0]) {
           int i = 0; for (; sp->cwd[i] && i < (int)sizeof(p->cwd) - 1; i++) p->cwd[i] = sp->cwd[i];
@@ -210,8 +232,9 @@ long ksys_execve(struct trapframe* tf, uint64_t upath, uint64_t uargv, uint64_t 
     if(ino->ops->read(ino, 0, img, size) < 0){ kfree(img); kfree(blob); return -EACCES; }
     debugcon_writestring("[EXEC] execve pid="); debugcon_print_hex(c->pid);
     debugcon_writestring(" path="); debugcon_writestring(rp); debugcon_writestring("\n");
+    int nnp_before = c->no_new_privs;                             // [M46]
     r = process_exec(c, tf, img, size, blob, used, argc, envc);   // owns img
-    if(r == 0) cred_exec_setid(c, fmode, fuid, fgid, setid_fs && process_manifest_setid(c));
+    if(r == 0) cred_exec_setid(c, fmode, fuid, fgid, setid_allowed(c, fmode, setid_fs, nnp_before));
     if(r == 0){
         // /proc/<pid>/{cmdline,comm,stat}: the new image's argv (the blob holds
         // argc NUL-terminated strings first; cmdline keeps at most 256 bytes).
@@ -1579,6 +1602,22 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_GETCWD:  return (uint64_t)(int64_t)ksys_getcwd((char*)a0, (int)a1);
     case SYS_IOCTL:   return (uint64_t)(int64_t)ksys_ioctl((int)a0, a1, a2);
     case SYS_GETPPID: return (uint64_t)ksys_getppid();
+    case SYS_PRCTL: {                         // [M46] no_new_privs + capability query
+        process_t* c = sched_get_current();
+        if (!c) return (uint64_t)(int64_t)-22;
+        if (a0 == PR_SET_NO_NEW_PRIVS) {
+            if (a1 != 1) return (uint64_t)(int64_t)-22;   // can never be cleared
+            c->no_new_privs = 1;
+            debugcon_writestring("[CAPX] pid="); debugcon_print_hex(c->pid);
+            debugcon_writestring(" set no_new_privs\n");
+            return 0;
+        }
+        if (a0 == PR_GET_NO_NEW_PRIVS) return (uint64_t)(c->no_new_privs ? 1 : 0);
+        if (a0 == PR_SECOS_GET_CAPS)
+            return (uint64_t)(cap_effective(c) | (c->cap_enforce ? (1u << 30) : 0)
+                              | (c->no_new_privs ? (1u << 29) : 0));
+        return (uint64_t)(int64_t)-22;
+    }
     case SYS_FCNTL:   return (uint64_t)(int64_t)ksys_fcntl((int)a0, (int)a1, (long)a2);
     case SYS_GETPGID: {                       // job control (bash getpgrp/getpgid)
         extern long ksys_getpgid(int);

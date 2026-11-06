@@ -53,6 +53,13 @@
 // the root filesystem). su, passwd and sudo have it; nothing else does, so a
 // chmod u+s on any other signed binary has no effect. Not a capability.
 #define MANIFEST_FLAG_SETID                 (1u<<15)
+// [M46] Session gateway: a confined program whose job is to start authenticated
+// sessions (Dropbear). It stays confined itself, but it does NOT get the
+// automatic no_new_privs bit that every other confined program gets, so the
+// session it starts runs under the session program's own manifest. Signed (an
+// unsigned program cannot claim it) and has no effect once no_new_privs is
+// already set (inherited or voluntary). Not a capability.
+#define MANIFEST_FLAG_SESSION_GATEWAY       (1u<<16)
 #define MANIFEST_CAP_MASK \
     (MANIFEST_FLAG_CAP_NET | MANIFEST_FLAG_CAP_FS_READ | MANIFEST_FLAG_CAP_FS_WRITE | \
      MANIFEST_FLAG_CAP_PROC | MANIFEST_FLAG_CAP_IPC | MANIFEST_FLAG_CAP_SIGNAL | \

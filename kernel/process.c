@@ -13,6 +13,7 @@
 #include "mm/elf_manifest.h"
 #include "mm/elf_sign.h"
 #include "driver_if.h"
+#include "cap.h"
 #include "pmm.h"
 #include "debugcon.h"
 #include "spinlock.h"   // [M29] SMP: serialize the process table
@@ -528,6 +529,10 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     elf_manifest_t* mf = im.mf;
     p->manifest = mf;
     proc_apply_caps(p, mf);
+    // [M46] Kernel-made: no bound; a confined image gets no_new_privs. SYS_SPAWN
+    // re-applies the rule with the spawner's bound (ksys_spawn_argv).
+    p->no_new_privs = 0;
+    cap_exec_transition(p, cap_exec_bound(NULL), "load");
     // [M11] Driver Space: the signed manifest is the trust root for the
     // driver claim. If it declares PROC_TYPE_DRIVER, validate the device
     // and grant only capabilities the device actually supports (subset),
@@ -716,7 +721,11 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     p->vmas = *nv;
     p->image = im.image; p->image_size = im.image_size;
     p->manifest = im.mf;
-    proc_apply_caps(p, im.mf);
+    {   // [M46] Exec confinement: the new image's caps are bounded by the old's.
+        cap_exec_bound_t bound = cap_exec_bound(p);
+        proc_apply_caps(p, im.mf);
+        cap_exec_transition(p, bound, "execve");
+    }
     p->entry = im.entry;
     p->stack_top = im.stack_top;
     p->brk_start = brk; p->brk_cur = brk; p->mmap_next = mm;
