@@ -76,7 +76,6 @@ static void wr64(uint8_t* p, uint64_t v){ for(int i = 0; i < 8; i++) p[i] = (uin
 static void mzero(void* d, size_t n){ uint8_t* p = (uint8_t*)d; while(n--) *p++ = 0; }
 static void mcopy(void* d, const void* s, size_t n){ uint8_t* a = (uint8_t*)d; const uint8_t* b = (const uint8_t*)s; while(n--) *a++ = *b++; }
 static size_t slen(const char* s){ size_t n = 0; while(s[n]) n++; return n; }
-static int seq(const char* a, const char* b){ while(*a && *a == *b){ a++; b++; } return *a == *b; }
 
 static void ex_log(const char* m){ debugcon_writestring("[EXFAT] "); debugcon_writestring(m); debugcon_writestring("\n"); }
 static void ex_logx(const char* m, uint64_t v){ debugcon_writestring("[EXFAT] "); debugcon_writestring(m); debugcon_print_hex(v); debugcon_writestring("\n"); }
@@ -131,7 +130,7 @@ static int dev_wr(uint64_t fsec, const void* buf, uint32_t n){
     return block_write(V.dev, fsec * V.spf, buf, n * V.spf) == (int)(n * V.spf) ? 0 : -1;
 }
 
-#define EX_CACHE 16
+#define EX_CACHE 64              /* 256 KiB: keeps a big directory + its FAT sectors hot */
 static uint8_t  g_cbuf[EX_CACHE][EX_MAX_SS];
 static uint64_t g_clba[EX_CACHE];
 static uint32_t g_cage[EX_CACHE];
@@ -923,40 +922,59 @@ static int set_delete(exst_t* d, uint32_t slot, uint32_t cnt){
 }
 
 /* ── VFS inode pool ──────────────────────────────────────────────────────── */
+/* One VFS inode per entry set (keyed by its location: directory first cluster
+ * + slot; the root by itself), never reused while mounted: an open fd keeps
+ * its vfs_inode_t* (the VFS has no inode refcount), so recycling a slot would
+ * make that fd read and write whatever file the slot was handed to next. A
+ * rename retargets the slot; an unlink marks it dead (I/O on it fails). Slots
+ * come in kmalloc'd chunks, as in fs/ext2.c; a remount reuses the chunks. */
 typedef struct { exobj_t o; int chain_ok; int dead; } exnode_t;
-#define EX_INODES 64
-static vfs_inode_t g_ino[EX_INODES];
-static exnode_t    g_nd[EX_INODES];
-static int         g_ino_used, g_ino_next;
+typedef struct { vfs_inode_t v; exnode_t n; } exslot_t;
+#define EX_VCHUNK      64
+#define EX_VCHUNKS_MAX 512                 /* 32768 distinct entries per mount */
+static exslot_t* g_vchunk[EX_VCHUNKS_MAX];
+static int       g_vused;
 
-static vfs_inode_t* inode_get(const char* path){
-    for(int i = 0; i < g_ino_used; i++) if(seq(g_ino[i].path, path)) return &g_ino[i];
-    int idx;
-    if(g_ino_used < EX_INODES) idx = g_ino_used++;
-    else { idx = g_ino_next; g_ino_next = (g_ino_next + 1) % EX_INODES; }
-    vfs_inode_t* ino = &g_ino[idx];
-    /* The page cache is keyed by inode pointer: a slot handed to another file
-     * (or reused after a remount) must not serve the previous file's pages. */
-    pagecache_invalidate(ino, 0, 1ULL << 62);
-    size_t k = 0;
-    for(; path[k] && k < sizeof(ino->path) - 1; k++) ino->path[k] = path[k];
-    ino->path[k] = 0;
-    ino->fs_data = &g_nd[idx];
-    return ino;
-}
+static exslot_t* vslot(int i){ return &g_vchunk[i / EX_VCHUNK][i % EX_VCHUNK]; }
 static int same_loc(const exobj_t* a, uint32_t dfirst, uint32_t slot){
     return !a->is_root && a->dir.first == dfirst && a->slot == slot;
 }
+
+static vfs_inode_t* inode_get(const char* path, const exobj_t* o){
+    exslot_t* s = NULL;
+    for(int i = 0; i < g_vused && !s; i++){
+        exslot_t* c = vslot(i);
+        if(c->n.dead) continue;
+        if(o->is_root ? c->n.o.is_root : same_loc(&c->n.o, o->dir.first, o->slot)) s = c;
+    }
+    if(!s){
+        int idx = g_vused;
+        if(idx / EX_VCHUNK >= EX_VCHUNKS_MAX){ ex_log("VFS inode pool full"); return NULL; }
+        if(!g_vchunk[idx / EX_VCHUNK]){
+            g_vchunk[idx / EX_VCHUNK] = (exslot_t*)kmalloc(sizeof(exslot_t) * EX_VCHUNK);
+            if(!g_vchunk[idx / EX_VCHUNK]) return NULL;
+        }
+        s = vslot(idx);
+        mzero(s, sizeof(*s));
+        g_vused++;
+        /* The page cache is keyed by inode pointer: a slot reused after a
+         * remount must not serve the previous file's pages. */
+        pagecache_invalidate(&s->v, 0, 1ULL << 62);
+        s->v.fs_data = &s->n;
+    }
+    vfs_inode_t* ino = &s->v;
+    size_t k = 0;
+    for(; path[k] && k < sizeof(ino->path) - 1; k++) ino->path[k] = path[k];
+    ino->path[k] = 0;
+    return ino;
+}
 /* An entry set moved or vanished: retarget / kill cached nodes. */
 static void nodes_moved(uint32_t odfirst, uint32_t oslot, const exobj_t* now){
-    for(int i = 0; i < g_ino_used; i++){
-        exnode_t* n = &g_nd[i];
+    for(int i = 0; i < g_vused; i++){
+        exnode_t* n = &vslot(i)->n;
         if(n->dead || !same_loc(&n->o, odfirst, oslot)) continue;
-        /* Open fds keep working on a renamed file; the old path no longer
-         * names this slot either way. */
         if(now){ n->o.dir = now->dir; n->o.slot = now->slot; n->o.cnt = now->cnt; }
         else n->dead = 1;
-        g_ino[i].path[0] = 0;
     }
 }
 
@@ -982,7 +1000,8 @@ static vfs_inode_t* ex_lookup(const char* path){
     if(!V.mounted) return NULL;
     exobj_t o;
     if(ex_resolve(path, &o) != 0) return NULL;
-    vfs_inode_t* ino = inode_get(path && path[0] ? path : "/");
+    vfs_inode_t* ino = inode_get(path && path[0] ? path : "/", &o);
+    if(!ino) return NULL;
     exnode_t* n = (exnode_t*)ino->fs_data;
     n->o = o; n->chain_ok = 0; n->dead = 0;
     ino_fill(ino, &o);
@@ -1208,9 +1227,9 @@ static int ex_truncate(const char* path, size_t new_size){
     if(s->vdl > new_size) s->vdl = new_size;
     if(obj_store(&o, 1) != 0) return -1;
     /* refresh cached nodes of this entry (open fds) */
-    for(int i = 0; i < g_ino_used; i++){
-        exnode_t* n = &g_nd[i];
-        if(!n->dead && same_loc(&n->o, o.dir.first, o.slot)){ n->o.st = o.st; n->chain_ok = 0; g_ino[i].size = (size_t)o.st.size; }
+    for(int i = 0; i < g_vused; i++){
+        exslot_t* x = vslot(i);
+        if(!x->n.dead && same_loc(&x->n.o, o.dir.first, o.slot)){ x->n.o.st = o.st; x->n.chain_ok = 0; x->v.size = (size_t)o.st.size; }
     }
     return 0;
 }
@@ -1505,7 +1524,7 @@ int exfat_mount(const char* dev_name, const char* mount_point){
     g_mp[k] = 0;
     for(k = 0; dev_name[k] && k < sizeof(g_devname) - 1; k++) g_devname[k] = dev_name[k];
     g_devname[k] = 0;
-    g_ino_used = 0; g_ino_next = 0;
+    g_vused = 0;
     V.mounted = 1;
     if(vfs_mount(g_mp, &exfat_ops, "exfat") != 0){ V.mounted = 0; return -1; }
     debugcon_writestring("[EXFAT] mounted "); debugcon_writestring(g_devname);
