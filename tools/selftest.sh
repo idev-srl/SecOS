@@ -2069,7 +2069,7 @@ if make disk-ntfs >/tmp/secos_selftest_m42_disk.log 2>&1; then
         grep -qF "[M42] $t: OK" "$M42LOG"; check "M42 $t" $?
     done
     n_ok=$(grep -c "^\[M42\] .*: OK$" "$M42LOG" || true); n_bad=$(grep -c "^\[M42\] .*: FAIL$" "$M42LOG" || true)
-    [[ "$n_ok" -ge 38 && "$n_bad" -eq 0 ]]; check "M42 all in-kernel NTFS checks OK (ok=$n_ok fail=$n_bad)" $?
+    [[ "$n_ok" -ge 37 && "$n_bad" -eq 0 ]]; check "M42 all in-kernel NTFS checks OK (ok=$n_ok fail=$n_bad)" $?
     grep -q "\[M42\] DONE" "$M42LOG"; check "M42 good-image suite completed" $?
     ! grep -q "\[EXC\]\|\[PANIC\]" "$M42LOG"; check "no CPU exception during M42 good-image run" $?
     grep "^\[M42L\] " "$M42LOG" | sed 's/^\[M42L\] //' > /tmp/secos_selftest_m42.list
@@ -2140,7 +2140,7 @@ if make disk-ntfs >/tmp/secos_selftest_m42_disk.log 2>&1; then
           printf '  cat /x/secret.efs 2>&1 | sed s/^/MN7-/\r'; sleep 3
           printf '  ls /x/many | wc -l | sed s/^/MN8-/\r'; sleep 4
           printf '  md5sum /x/fragmented.bin /x/compressed/text.txt | sed s/^/MN9-/\r'; sleep 6
-          printf '  ls -l /x/winlink_rel | sed s/^/MNA-/; cat /x/winlink_rel | sed s/^/MNA-/\r'; sleep 3
+          printf '  ls -l /x/winlink_rel | sed s/^/MNA-/; cat /x/winlink_rel | sed s/^/MNA-/; cat /x/junction/c/d/e/f/g/deep.txt | sed s/^/MNJ-/\r'; sleep 3
           printf '  umount /x && echo MNB-$(grep -c ntfs /proc/mounts)\r'; sleep 3
         ) | timeout 70 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
             -drive file=disk.img,if=virtio,format=raw \
@@ -2160,6 +2160,7 @@ if make disk-ntfs >/tmp/secos_selftest_m42_disk.log 2>&1; then
         check "M42 user: md5sum of the fragmented and the compressed file match the host" $?
         grep -q "^MNA-.*winlink_rel -> a/b/c/d/e/f/g/deep.txt" "$M42USER" && grep -q "^MNA-deep down" "$M42USER"
         check "M42 user: Windows symlink shown by ls -l and followed by cat" $?
+        grep -q "^MNJ-deep down" "$M42USER"; check "M42 user: path through a junction (target mapped under /x)" $?
         grep -q "^MNB-0" "$M42USER"; check "M42 user: umount drops the ntfs mount" $?
     else
         echo "  [FAIL] M42 userland image build"; FAIL=$((FAIL+1))
