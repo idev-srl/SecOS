@@ -12,6 +12,7 @@
 #include "trapframe.h"
 #include "../mm/elf.h" // for ELF_OK
 #include "../mm/vma.h" // [M14] per-process VMAs for demand paging
+#include "cred.h"      // [M42] uid/gid credentials
 
 // [M11] Process privilege type. A "driver" is a Ring-3 process granted
 // capability-mediated hardware access (SYS_DRIVER). The claim is rooted in the
@@ -148,6 +149,10 @@ typedef struct process {
     uint8_t  ctty_detached;
     uint32_t spawner_pid;    // pid of the process whose SYS_SPAWN created us (0 = kernel/
                              // fork). With ppid, the only caller allowed to SYS_WAIT us.
+    // [M42] Credentials: real/effective/saved uid + gid and the supplementary
+    // groups. Inherited by fork, spawn and execve; changed by the set*id
+    // syscalls and a set-id exec (kernel/cred.c). Kernel-made processes: root.
+    struct proc_cred cred;
     char     cwd[256];       // [M39] per-process current working directory (for chdir/getcwd + relative paths)
     // [M29] SMP: the CPU this process is pinned to. Assigned round-robin at
     // creation; only this CPU schedules, preempts, and reaps it, so the context
@@ -198,6 +203,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf); // [M19] COW fork
 int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
                  const char* blob, uint64_t blen, int argc, int envc);
 void process_print(const process_t* p);
+int  process_manifest_setid(const process_t* p);   // [M42] MANIFEST_FLAG_SETID in the signed manifest
 process_t* process_get_last(void);
 process_t* process_find_by_pid(uint32_t pid);
 void process_foreach(void (*cb)(process_t*, void*), void* user);

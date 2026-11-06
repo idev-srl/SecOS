@@ -85,6 +85,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/syscall_trap.c \
 	$(KERNEL_DIR)/signal.c \
 	$(KERNEL_DIR)/cap.c \
+	$(KERNEL_DIR)/cred.c \
 	$(KERNEL_DIR)/driver_if.c \
 	$(KERNEL_DIR)/ipc.c \
 	$(KERNEL_DIR)/pipe.c \
