@@ -234,3 +234,15 @@ helpers duplicating bash's (`xmalloc.c`, `xfree.c`, `shell.c`, `tilde.c`); the
 readline SIGALRM timeout path has an upstream macro bug (`timerset(&x.y, ...)`)
 that the port patches. `/bin/ttytest` and the selftest "line editing" section
 drive all of it over serial; `tools/soak_drive.py` types some lines with edits.
+
+## Multi-user rebuild (M42, feat/multiuser-ports)
+
+bash is rebuilt against the libc with the real credentials (kernel/cred.c): the
+shim's `setresuid`/`setresgid`/`setreuid`/`setregid` (always "succeeded"),
+`fchmod` (a no-op) and `eaccess` (true whenever the path existed) are gone, so
+`$UID`/`$EUID`, `test -r/-w/-x` and `[[ -O ]]` answer for the real user.
+`eaccess()` is now a libc function (the effective ids; `access()` keeps the
+real ids). The libc `opendir()` grows its `SYS_GETDENTS` buffer until a listing
+fits (the kernel returns up to 4096 entries), so a glob over a directory with
+more than 256 entries is complete. The MUPORTS selftest gate checks a glob over
+1000 files and `test -r/-w` as a non-root SSH user.

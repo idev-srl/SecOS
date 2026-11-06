@@ -55,14 +55,7 @@ char*   getpass(const char* prompt);
 char*   crypt(const char* key, const char* salt);
 int     setpgrp(void);
 pid_t   tcgetsid(int fd);
-int     seteuid(uid_t u);
-int     setegid(gid_t g);
-int     setreuid(uid_t r, uid_t e);
-int     setregid(gid_t r, gid_t e);
-int     setresuid(uid_t r, uid_t e, uid_t s);
-int     setresgid(gid_t r, gid_t e, gid_t s);
-int     getresuid(uid_t* r, uid_t* e, uid_t* s);
-int     getresgid(gid_t* r, gid_t* e, gid_t* s);
+/* get/set[res][ug]id, getgroups/setgroups: libc <unistd.h> (real ids). */
 int     chroot(const char* path);
 int     getpagesize(void);
 int     getdtablesize(void);

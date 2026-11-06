@@ -1,7 +1,8 @@
 /* SecOS - bash port compatibility shim. Provides the POSIX symbols bash
- * references that SecOS's libc lacks, mapped to SecOS syscalls or sane single-
- * user stubs (the signature is the trust boundary, so uid/gid are 0 and resource
- * limits are unlimited). SPDX-License-Identifier: MIT */
+ * references that SecOS's libc lacks, mapped to SecOS syscalls or sane stubs
+ * (resource limits are unlimited). Credentials (getuid/setresuid/...),
+ * fchmod and eaccess are the real ones from the SecOS libc (kernel/cred.c).
+ * SPDX-License-Identifier: MIT */
 #include "bash_port.h"
 #include "libsecos.h"
 #include "termios.h"
@@ -79,7 +80,6 @@ int getitimer(int w, struct itimerval* o){ (void)w; if(o) zmem(o,0,sizeof(*o)); 
 
 /* ---- fd / stdio helpers ---- */
 int isascii(int c){ return (c>=0 && c<128); }
-int fchmod(int fd, int mode){ (void)fd;(void)mode; return 0; }
 int fstat(int fd, struct stat* st){ if(!st) return -1; zmem(st,0,sizeof(*st)); return (int)secos_syscall(56 /*SYS_FSTAT*/, fd, (long)st, 0,0,0); }
 int fileno(void* f){ return f ? *(int*)f : -1; }                 /* SecOS FILE: int fd is first member */
 void clearerr(void* f){ (void)f; }
@@ -87,7 +87,6 @@ int setvbuf(void* f, char* b, int m, unsigned long s){ (void)f;(void)b;(void)m;(
 int fpurge(void* f){ (void)f; return 0; }
 int getdtablesize(void){ return 32; }
 int gethostname(char* n, unsigned long l){ const char* h="secos"; unsigned long i=0; for(; h[i] && i<l-1; i++) n[i]=h[i]; if(l) n[i]=0; return 0; }
-int eaccess(const char* p, int mode){ (void)mode; struct stat st; return stat(p,&st)==0 ? 0 : -1; }
 
 /* ---- temp files ---- */
 static unsigned long g_tmpseq = 0x1234;
@@ -135,11 +134,7 @@ int brand(void){ g_rng = g_rng*1103515245+12345; return (int)((g_rng>>16) & 0x7f
 unsigned int brand32(void){ return get_urandom32(); }
 void sbrand32(unsigned int s){ g_rng = s ? s : 1; }
 
-int setresuid(int r,int e,int s){ (void)r;(void)e;(void)s; return 0; }
-int setresgid(int r,int e,int s){ (void)r;(void)e;(void)s; return 0; }
-int setreuid(int r,int e){ (void)r;(void)e; return 0; }
-int setregid(int r,int e){ (void)r;(void)e; return 0; }
-/* access(): the SecOS libc (SYS_ACCESS). */
+/* access()/eaccess(), setres[ug]id/setre[ug]id, fchmod: the SecOS libc. */
 
 /* asprintf (brace expansion {01..10}): format into a malloc'd string. */
 #include <stdarg.h>

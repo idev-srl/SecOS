@@ -1565,7 +1565,8 @@ fsck.fat -n "$KIFAT" >/dev/null 2>&1; check "KIFACE FAT32 data disk fsck.fat-cle
 # console bash installs a throwaway test key (generated here, never committed)
 # as /root/.ssh/authorized_keys by hand, and ssh runs from the host: an exec
 # channel with output + exit status, stderr, a wrong key, an unknown user and a
-# password-only client (password auth is compiled out). Needs host ssh +
+# password-only client (root has no password login; the multi-user password
+# logins are covered by the MUPORTS gate). Needs host ssh +
 # ssh-keygen, and a kernel with SYS_POLL (78); otherwise SKIP. See docs/SSH.md.
 # (The INIT gate at the end covers the baked-key, zero-step boot.)
 SSHLOG=/tmp/secos_selftest_ssh.log
@@ -1619,11 +1620,11 @@ else
         grep -q "^SSH-42-OK" "$SSHDIR/o1" && grep -q "^SecOS" "$SSHDIR/o1" && grep -q "^RC=0" "$SSHDIR/o1"
         check "SSH exec channel: output + uname, exit status 0" $?
         grep -q "^SSH-ERR" "$SSHDIR/o2" && grep -q "^RC=3" "$SSHDIR/o2"; check "SSH exec channel: stderr forwarded, exit status 3 propagated" $?
-        ! grep -q "SSH-BADKEY-RAN" "$SSHDIR/o3" && grep -q "Permission denied (publickey)" "$SSHDIR/o3"
+        ! grep -q "SSH-BADKEY-RAN" "$SSHDIR/o3" && grep -q "Permission denied (publickey" "$SSHDIR/o3"
         check "SSH unauthorized key refused" $?
         ! grep -q "SSH-NOUSER-RAN" "$SSHDIR/o4" && grep -q "Permission denied" "$SSHDIR/o4"; check "SSH unknown user refused" $?
-        grep -q "Permission denied (publickey)" "$SSHDIR/o5" && ! grep -qi "password" <(grep -v "^RC=" "$SSHDIR/o5" | grep -v "PreferredAuthentications")
-        check "SSH password authentication not offered (publickey only)" $?
+        grep -q "Permission denied (publickey,password)" "$SSHDIR/o5" && ! grep -q "^RC=0" "$SSHDIR/o5"
+        check "SSH root without a key is refused (no password login for root)" $?
         grep -q "^500" "$SSHDIR/o6"; check "SSH sequential sessions keep working (6th session, file I/O)" $?
         grep -q "^/dev/pts/[0-9]" "$SSHDIR/o7" && grep -q "^30 90" "$SSHDIR/o7" && grep -q "^PTY-42" "$SSHDIR/o7"
         check "SSH -tt: the session runs on a pty (tty = /dev/pts/N, stty size)" $?
@@ -2365,6 +2366,35 @@ if make iso CONSOLE=login ROOT_PASSWORD=Root-pw9 >/tmp/secos_selftest_build.log 
 else
     echo "[selftest] USERS BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     check "USERS image build" 1
+fi
+
+# ============================================================================
+# MUPORTS GATE: BusyBox, bash and Dropbear on real multi-user credentials.
+# tools/mu_ports_test.sh writes a test account straight into /etc/passwd,
+# /etc/shadow (an `openssl passwd -6` hash made here) and /etc/group, then
+# checks BusyBox owner names / chown / chmod / errno messages (EROFS when the
+# kernel has a read-only filesystem), a bash glob over 1000 entries, and SSH
+# key + password logins as the user (uid, groups, HOME, pty owner, no
+# /etc/shadow), locked/wrong/root passwords refused. Private mktemp dir, host
+# port 26000-26999 (never 2222). [PASS]/[FAIL] lines are counted here.
+# ============================================================================
+echo "[selftest] MUPORTS gate: multi-user BusyBox/bash/Dropbear (mb2, ~150s)..."
+make clean >/dev/null 2>&1 || true
+if make iso >/tmp/secos_selftest_build.log 2>&1; then
+    MUP_OUT=$(mktemp /tmp/secos_selftest_muports.XXXXXX)
+    tools/mu_ports_test.sh >"$MUP_OUT" 2>&1
+    while IFS= read -r l; do
+        case "$l" in
+            "  [PASS] "*) check "${l#  \[PASS\] }" 0 ;;
+            "  [FAIL] "*) check "${l#  \[FAIL\] }" 1 ;;
+            "  [SKIP] "*|"    "*) echo "$l" ;;
+        esac
+    done <"$MUP_OUT"
+    grep -q "RESULT:\|\[SKIP\] MUPORTS gate" "$MUP_OUT" || { check "MUPORTS gate ran to completion" 1; tail -20 "$MUP_OUT"; }
+    rm -f "$MUP_OUT"
+else
+    echo "[selftest] MUPORTS BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "MUPORTS gate build" 1
 fi
 
 echo "[selftest] ---"

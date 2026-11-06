@@ -245,10 +245,13 @@ int db_open(const char* path, int flags, ...);          /* O_EXCL/O_NOFOLLOW/mod
 #define open(...) db_open(__VA_ARGS__)
 int db_waitpid(pid_t pid, int* status, int options);   /* waitpid(pid,&st,opt) */
 #define waitpid(p,s,o) db_waitpid(p,s,o)
-/* Dropbear's non-multiuser mode requires getgroups() to fail with ENOSYS
- * (SecOS has no users/groups); see svr-runopts/common-session. */
-int db_getgroups(int n, int* g);
-#define getgroups(n,g) db_getgroups(n,g)
+/* Credentials (getuid/setgid/setresgid/initgroups/getgroups...), getpwnam/
+ * getspnam/getgrnam and crypt(): the SecOS libc + user/libcrypt.a. */
+#include <unistd.h>
+#include <pwd.h>
+#include <grp.h>
+#include <shadow.h>
+#include <crypt.h>
 
 /* ---- signals ---- */
 struct sigaction {
@@ -298,10 +301,7 @@ int nanosleep(const struct timespec* req, struct timespec* rem);
 /* ---- misc POSIX (TODO(integration): move to libc) ---- */
 struct stat;
 int   fstat(int fd, struct stat* st);
-int   fchmod(int fd, mode_t mode);
-int   fchown(int fd, uid_t uid, gid_t gid);
 int   fsync(int fd);
-int   access(const char* path, int mode);
 int   link(const char* oldp, const char* newp);
 int   ftruncate(int fd, off_t len);
 int   fileno(FILE* f);
@@ -314,15 +314,8 @@ long  sysconf(int name);
 #define _SC_CLK_TCK  2
 #define _SC_PAGESIZE 30
 int   getpagesize(void);
-int   setegid(gid_t g);
-int   seteuid(uid_t u);
-int   initgroups(const char* user, gid_t g);
 pid_t vfork(void);
 int   execl(const char* path, const char* arg, ...);
-char* crypt(const char* key, const char* salt);
-char* getusershell(void);
-void  setusershell(void);
-void  endusershell(void);
 int   setvbuf(FILE* f, char* buf, int mode, size_t size);
 #ifndef _IOFBF
 #define _IOFBF 0

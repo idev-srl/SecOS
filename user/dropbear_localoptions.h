@@ -4,9 +4,13 @@
  * src/default_options.h. See docs/SSH.md.
  * SPDX-License-Identifier: MIT
  *
- * Policy: public-key authentication only, single "root" identity (SecOS has
- * no users and no passwords; the code signature is the trust boundary), no
- * forwarding of any kind, modern algorithms only.
+ * Policy: every account in /etc/passwd may log in (multi-user, M42) with a
+ * public key from ~user/.ssh/authorized_keys or with its password from
+ * /etc/shadow (checked with the libc crypt(), user/libcrypt.a). Root may log
+ * in with a key only: the SecOS build refuses root password logins (as if
+ * -g were always given). After authentication the session process drops to
+ * the user (setgid + initgroups + setuid). No forwarding of any kind, modern
+ * algorithms only.
  */
 #ifndef SECOS_DROPBEAR_LOCALOPTIONS_H
 #define SECOS_DROPBEAR_LOCALOPTIONS_H
@@ -79,8 +83,8 @@
 #define DROPBEAR_DH_GROUP1_CLIENTONLY 0
 #define DROPBEAR_CLI_COMPRESSION 0
 
-/* --- authentication: public key only --- */
-#define DROPBEAR_SVR_PASSWORD_AUTH 0
+/* --- authentication: public key, or password from /etc/shadow --- */
+#define DROPBEAR_SVR_PASSWORD_AUTH 1
 #define DROPBEAR_SVR_PAM_AUTH 0
 #define DROPBEAR_SVR_PUBKEY_AUTH 1
 #define DROPBEAR_SVR_PUBKEY_OPTIONS 1   /* honour command=/no-pty/... restrictions */
@@ -88,10 +92,14 @@
 #define DROPBEAR_CLI_PUBKEY_AUTH 1
 #define DROPBEAR_USE_PASSWORD_ENV 0
 #define DROPBEAR_CLI_ASKPASS_HELPER 0
-/* Single identity: only the user the server runs as (root) may log in, and
- * dropbear verifies getgroups() reports ENOSYS (a non-multiuser kernel). */
-#define DROPBEAR_SVR_MULTIUSER 0
-#define DROPBEAR_SVR_DROP_PRIVS 0
+/* Multi-user: the server runs as root (init starts it) and serves any account;
+ * the per-connection process switches to the user as soon as authentication
+ * succeeds (DROP_PRIVS), so the channel, the pty and the shell never run as
+ * root for a non-root login. */
+#define DROPBEAR_SVR_MULTIUSER 1
+#define DROPBEAR_SVR_DROP_PRIVS 1
+/* Valid login shells when /etc/shells is missing (Dropbear's getusershell). */
+#define COMPAT_USER_SHELLS "/bin/bash", "/bin/sh"
 
 /* --- misc --- */
 #define DO_HOST_LOOKUP 0

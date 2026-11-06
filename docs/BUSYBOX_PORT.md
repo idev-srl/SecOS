@@ -2,7 +2,7 @@
 
 SecOS ships **BusyBox 1.36.1**, built from unmodified upstream source, as its
 main Unix userland: one signed multi-call binary, `/bin/busybox`, plus a signed
-stub under each of its 123 applet names in `/bin`. GNU bash stays the shell
+stub under each of its 121 applet names in `/bin`. GNU bash stays the shell
 (`/bin/bash`); BusyBox is configured without a shell.
 
 Licensing: BusyBox is GPL-2.0. Its source is fetched at build time and never
@@ -61,7 +61,11 @@ is fine and no loading from disk is needed.
 What `busybox_compat.c` provides:
 
 - **errno and paths.** Several libsecos wrappers return a bare -1, so the
-  shims set errno; path calls are made absolute (lexically normalised). `rename`,
+  shims set errno; the kernel's own errno (`EACCES`, `EPERM`, `EROFS`,
+  `ENOTDIR`, `ENOSPC`, ...) is always kept, and only a bare -1 falls back to a
+  best guess (until M42 `open`/`mkdir` replaced every error with `EACCES`, so
+  a read-only filesystem said "Permission denied"). Path calls are made
+  absolute (lexically normalised). `rename`,
   `link` and `rmdir` are the kernel's atomic syscalls. Also: `O_DIRECTORY`
   checks, `opendir` for large directories, and `realpath`.
 - **Private stdio** (`bbio_*` link names). The libc FILE reads one byte per
@@ -80,6 +84,11 @@ What `busybox_compat.c` provides:
   without an ELF header through bash (POSIX ENOEXEC rule) and maps `sh` to
   bash. Also `popen` and `sigaction`.
 - **Time.** libc's wall clock and UTC calendar; `strptime` lives here.
+- **Credentials.** Nothing: `get/set[res][ug]id`, `getgroups`/`setgroups`,
+  `initgroups`, `fchown`/`fchmod`/`lchown`, `eaccess`, `getpass` and `crypt`
+  are the SecOS libc's (kernel/cred.c, M42). The single-user stubs that
+  claimed root are gone. `getlogin()` names the real uid. BusyBox's own
+  libpwdgrp reads `/etc/passwd` and `/etc/group` for names.
 - **System information.** `uname` is the kernel's with the node name from
   `/etc/hostname`; `getmntent` (from `/proc/mounts`), and C-locale
   wide-character functions for musl's regex.
@@ -89,7 +98,8 @@ What `busybox_compat.c` provides:
 `busybox_install()` in `kernel/kernel.c` runs at boot, right after the SecOS
 coreutils are installed. It writes `/bin/busybox`, then installs the stub as
 `/bin/<applet>` for each applet, replacing any same-named SecOS coreutils
-program. It also creates a root-only `/etc/passwd` and `/etc/group`.
+program. The account files (`/etc/passwd`, `/etc/group`, `/etc/shadow`) come
+from `kernel/sysroot.c`.
 
 - **Why stubs, not symlinks or copies.** The ramfs root has no symlinks (on
   an ext2/ext4 root `execve` follows them to the signed image, so symlinks
@@ -99,7 +109,7 @@ program. It also creates a root-only `/etc/passwd` and `/etc/group`.
 - **What the stub does.** Each stub is itself signed. It `execve`s
   `/bin/busybox` with the same `argv` and environment (in place: same pid,
   fds, signals), and BusyBox dispatches on `basename(argv[0])`.
-- **Cost.** 123 stubs take 1.8 MB of ramfs, and each command costs one extra
+- **Cost.** 121 stubs take 1.8 MB of ramfs, and each command costs one extra
   in-place exec (a signature check of the 565 KB image).
 
 ### Which program wins for each name
@@ -110,10 +120,30 @@ program. It also creates a root-only `/etc/passwd` and `/etc/group`.
 | `help`, `coreutils` | SecOS coreutils | BusyBox has no `help` |
 | `cat echo wc head tail rev nl yes seq ls mkdir rm touch cp basename dirname stat true false uname sleep clear hexdump uptime` | BusyBox | Prefer BusyBox wherever it has the applet. `uname` prints `SecOS`; `uptime` works through `sysinfo()` |
 | `poweroff reboot halt shutdown` | SecOS power commands | Not in the BusyBox config |
+| `login su sudo passwd useradd userdel groupadd usermod id whoami groups` | SecOS account tools (`feat/multiuser-tools`) | The BusyBox applets are configured out, see below |
 | `lua` | Lua 5.4.7 | |
 
 The `cmdsubst`, `userland` and `BURST` selftest gates run against these
 BusyBox applets. Example: `seq 1 50 | wc` must print exactly `50 50 141`.
+
+### Applets configured out for the account tools
+
+SecOS has its own account tools (one policy for login, su, sudo, password
+changes and the account files), so `user/busybox.config` forces these BusyBox
+applets off, and no `/bin` stub is installed for them:
+
+| Applet | Was built before M42 | SecOS replacement |
+|--------|----------------------|-------------------|
+| `id` | yes | `id` |
+| `whoami` | yes | `whoami` |
+| `groups` | no | `groups` |
+| `login` | no | `login` |
+| `su` | no | `su` (and `sudo`) |
+| `sulogin` | no | console login policy of init |
+| `passwd`, `chpasswd`, `cryptpw`, `mkpasswd` | no | `passwd` |
+| `adduser`, `deluser` | no | `useradd`, `userdel`, `usermod` |
+| `addgroup`, `delgroup` | no | `groupadd` |
+| `vlock`, `getty` | no | (none) |
 
 ## Applet status (QEMU, ramfs root, user-mode networking)
 
@@ -130,9 +160,9 @@ is missing.
 | `sort` `uniq` `cut` `tr` `head` `tail` `wc` `cat` `tac` `rev` `tee` `nl` `fold` `paste` `split` `comm` `expand` `unexpand` `tsort` `shuf` `factor` | works | `sort -n -k`, `uniq -c` |
 | `xargs` | works | real `execve`: no argument-count limit (`seq 1 30 \| xargs -n 10 echo`) |
 | `find` | works | `-name -type -print -exec` (real `execve`) |
-| `ls` `cp` `mv` `rm` `mkdir` `rmdir` `touch` `stat` `du` `readlink` `realpath` `basename` `dirname` `pwd` `mktemp` | works | `cp -r`, `rm -r`, `mkdir -p`. `mv` is an atomic rename (also of directories) within one filesystem. Times are whole seconds |
+| `ls` `cp` `mv` `rm` `mkdir` `rmdir` `touch` `stat` `du` `readlink` `realpath` `basename` `dirname` `pwd` `mktemp` | works | `cp -r`, `rm -r`, `mkdir -p`. `mv` is an atomic rename (also of directories) within one filesystem. Times are whole seconds. `ls -l` / `stat -c %U:%G` show the names from `/etc/passwd` and `/etc/group`; directories of any size list whole (up to 4096 entries per `SYS_GETDENTS`) |
 | `ln` | partial | `ln` / `ln -s` work on ext2/ext4 (SYS_LINK, symlinks); the ramfs root supports neither (EPERM) |
-| `chmod` `chown` | works | on disk on ext2/ext4; kept on the in-memory inode on ramfs/devfs (`stat` shows it), not persisted on FAT |
+| `chmod` `chown` | works | `chown user:group`, `-R`; the kernel's owner/root rules apply (`Operation not permitted` for a non-owner). On disk on ext2/ext4; kept on the in-memory inode on ramfs/devfs (`stat` shows it), not persisted on FAT |
 | `truncate` | works | any size (SYS_TRUNCATE) |
 | `sync` | works | SYS_SYNC (flushes the mounted filesystems) |
 | `md5sum` `sha1sum` `sha256sum` `sha512sum` `cksum` `crc32` | works | match the host values |
@@ -144,7 +174,7 @@ is missing.
 | `clear` `reset` `tty` `stty` | works | `stty -a` shows the real termios and window size; `tty` names `/dev/console` or `/dev/pts/N` |
 | `date` `cal` | works | RTC-anchored wall clock (UTC) |
 | `sleep` `usleep` `time` `timeout` `watch` | works | `timeout` reaches the real program through the stubs (SIGTERM forwarding) |
-| `id` `whoami` `hostname` `uname` `nproc` | works | single user `root`; hostname from `/etc/hostname` (default `secos`) |
+| `hostname` `uname` `nproc` | works | hostname from `/etc/hostname` (default `secos`) |
 | `env` `printenv` | works | the environment crosses `execve`; bash exports PATH/HOME (`/etc/bash.bashrc`) |
 | `which` | works | |
 | `free` `uptime` | works | from `sysinfo()`; real load averages |
@@ -169,7 +199,17 @@ is missing.
   spawner's cwd, as `execve` keeps the cwd. Before, `cd /tmp; tar cf a.tar f1`
   ran `tar` in `/`.
 - **`fs/ramfs.h` and `kernel/syscall.c`, limits.** Ramfs now holds 256 entries
-  (was 96) and `SYS_GETDENTS` returns up to 256 names (was 64).
+  (was 96) and `SYS_GETDENTS` returns up to 256 names (was 64); since M42 it
+  fills the caller's buffer, up to 4096 names.
+
+## Multi-user rebuild (M42, feat/multiuser-ports)
+
+Rebuilt against the libc with the real id syscalls: the compat layer no longer
+fakes root, keeps the kernel's errno, and the account applets are configured
+out (table above). `tools/mu_ports_test.sh` (selftest "MUPORTS") checks
+`ls -l`/`ls -ln`/`stat` owner names, `chown user:group`, `chmod`, the
+`ENOTDIR` and `EROFS` messages, `EACCES`/`EPERM` for a non-root user over SSH,
+and `ls`/`find` over a 1000-entry directory.
 
 ## Phase 2 integration (2026-11, integ/phase2)
 

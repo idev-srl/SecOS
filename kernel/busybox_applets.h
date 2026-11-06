@@ -3,19 +3,19 @@
  * SPDX-License-Identifier: MIT */
 #ifndef SECOS_BUSYBOX_APPLETS_H
 #define SECOS_BUSYBOX_APPLETS_H
-#define BUSYBOX_NUM_APPLETS 123
+#define BUSYBOX_NUM_APPLETS 121
 static const char* const busybox_applets[] = {
     "[", "[[", "awk", "base64", "basename", "bunzip2", "bzcat", "bzip2", "cal", "cat", "chmod",
     "chown", "cksum", "clear", "cmp", "comm", "cp", "crc32", "cut", "date", "dd", "df", "diff",
     "dirname", "dmesg", "du", "echo", "egrep", "env", "expand", "expr", "factor", "false",
     "fgrep", "find", "fold", "free", "grep", "gunzip", "gzip", "head", "hexdump", "hostname",
-    "id", "ifconfig", "ip", "kill", "killall", "less", "ln", "ls", "md5sum", "mkdir", "mktemp",
+    "ifconfig", "ip", "kill", "killall", "less", "ln", "ls", "md5sum", "mkdir", "mktemp",
     "more", "mount", "mv", "nc", "netstat", "nl", "nproc", "nslookup", "od", "paste", "pidof",
     "ping", "printenv", "printf", "ps", "pwd", "readlink", "realpath", "reset", "rev", "rm",
     "rmdir", "sed", "seq", "sha1sum", "sha256sum", "sha512sum", "shuf", "sleep", "sort",
     "split", "stat", "strings", "stty", "sync", "tac", "tail", "tar", "tee", "telnet", "test",
     "time", "timeout", "top", "touch", "tr", "true", "truncate", "tsort", "tty", "umount",
     "uname", "unexpand", "uniq", "unxz", "uptime", "usleep", "vi", "watch", "wc", "wget",
-    "which", "whoami", "xargs", "xxd", "xz", "xzcat", "yes", "zcat", 0
+    "which", "xargs", "xxd", "xz", "xzcat", "yes", "zcat", 0
 };
 #endif

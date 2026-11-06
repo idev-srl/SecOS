@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 int errno = 0;
 
@@ -336,6 +338,32 @@ int fchmod(int fd, unsigned m){ return (int)id_sc(secos_syscall(32, 0, (long)m, 
 int fchown(int fd, unsigned u, unsigned g){ return (int)id_sc(secos_syscall(33, 0, (long)u, (long)g, (long)fd, 0)); }
 int lchown(const char* p, unsigned u, unsigned g){ return (int)id_sc(secos_syscall(33, (long)p, (long)u, (long)g, 0, 1)); }
 /* umask() is the kernel's (SYS_UMASK, libsecos.c): it applies to open/mkdir. */
+/* eaccess()/euidaccess(): access() for the EFFECTIVE ids (bash's test -r/-w/-x,
+ * BusyBox's test). SYS_ACCESS answers for the real ids, which is the same
+ * thing unless the caller runs set-id; then the mode bits are checked here
+ * against the effective ids (the walk itself was already done by stat() with
+ * the effective ids). Root passes everything except exec without any x bit. */
+int eaccess(const char* p, int mode){
+    if(getuid() == geteuid() && getgid() == getegid()) return access(p, mode);
+    struct stat st;
+    if(stat(p, &st) != 0) return -1;
+    if(mode == F_OK) return 0;
+    unsigned want = (unsigned)mode & 7, bits;
+    int uid = geteuid();
+    if(uid == 0){
+        if(!(want & X_OK) || S_ISDIR(st.st_mode) || (st.st_mode & 0111)) return 0;
+        errno = EACCES; return -1;
+    }
+    if((int)st.st_uid == uid) bits = (st.st_mode >> 6) & 7;
+    else {
+        int ing = (int)st.st_gid == getegid(), g[32], n = getgroups(32, g);
+        for(int i = 0; !ing && i < n; i++) if(g[i] == (int)st.st_gid) ing = 1;
+        bits = ing ? (st.st_mode >> 3) & 7 : st.st_mode & 7;
+    }
+    if((bits & want) == want) return 0;
+    errno = EACCES; return -1;
+}
+int euidaccess(const char* p, int mode){ return eaccess(p, mode); }
 
 /* Wall clock (CLOCK_REALTIME = RTC anchored to the TSC, UTC). */
 int gettimeofday(struct timeval* tv, void* tz){
@@ -400,15 +428,20 @@ int execle(const char* path, const char* arg, ...){
 /* ============================== <dirent.h> ============================= */
 #include <dirent.h>
 DIR* opendir(const char* path){
-    /* The kernel returns up to 256 entries of 256 bytes (SYS_GETDENTS); /bin
-     * holds well over 64 once BusyBox is installed. */
+    /* SYS_GETDENTS fills as many 256-byte records as the buffer holds (up to
+     * 1 MiB = 4096 entries): start at 64 KiB and retry with a bigger buffer
+     * while a listing comes back full, so big directories list whole (bash's
+     * glob over 1000 files). */
     DIR* d = malloc(sizeof(DIR)); if(!d) return 0;
-    d->buf = malloc(65536);
-    if(!d->buf){ free(d); return 0; }
-    long n = getdents(path, d->buf, 65536);
-    if(n < 0){ free(d->buf); free(d); return 0; }
-    d->len = (int)n; d->pos = 0;
-    return d;
+    for(long cap = 64 * 1024; cap <= (1L << 20); cap *= 4){
+        d->buf = malloc((size_t)cap);
+        if(!d->buf) break;
+        long n = getdents(path, d->buf, cap);
+        if(n < 0){ free(d->buf); free(d); if(n < -1) errno = (int)-n; else errno = ENOENT; return 0; }
+        if(n + 256 <= cap || cap == (1L << 20)){ d->len = (int)n; d->pos = 0; return d; }
+        free(d->buf);
+    }
+    free(d); errno = ENOMEM; return 0;
 }
 struct dirent* readdir(DIR* d){
     if(!d || d->pos + 256 > d->len) return 0;

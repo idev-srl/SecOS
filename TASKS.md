@@ -176,8 +176,15 @@ robustness and the paused real-hardware bring-up — see below.
          `useradd/userdel/usermod/groupadd/groupdel/chpasswd/id/whoami/groups`; SHA-512 crypt;
    - [x] `/home/<user>` 0700 from `/etc/skel`; init's console runs `login` (`CONSOLE=root` opt-out);
    - [x] secwm runs as the logged-in user (video/input groups);
-   - [ ] SSH logs in as the matching user (Dropbear multi-user mode, `~user/.ssh/authorized_keys`)
-         — `feat/multiuser-ports`; also bash/BusyBox uid stubs (`\u` in PS1 shows root);
+   - [x] SSH logs in as the matching user (Dropbear multi-user mode,
+         `~user/.ssh/authorized_keys`) — `feat/multiuser-ports`: `DROPBEAR_SVR_MULTIUSER` +
+         `DROP_PRIVS`, key or `/etc/shadow` password (libc `crypt()`), root by key only
+         (password refused by default), pty slave `user:tty 0620`; see `docs/SSH.md`
+         "Authentication modes";
+   - [x] BusyBox, bash and Dropbear rebuilt on the real id syscalls (no fake-root stubs;
+         BusyBox keeps the kernel's errno, e.g. EROFS; its id/whoami/su/login/passwd/
+         adduser/... applets are configured out for SecOS's own tools; libc `opendir`
+         reads directories of any size); selftest gate MUPORTS (`tools/mu_ports_test.sh`);
    - [ ] a hostile multi-user selftest gate (a user probing every boundary, exact errnos);
    - [ ] the kernel's missing/unsigned-init fallback is still an unauthenticated root bash.
 3. [ ] **More filesystems:**
