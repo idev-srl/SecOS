@@ -57,6 +57,7 @@
 #include <sys/resource.h>
 #include <sys/uio.h>
 #include <sched.h>
+#include <pwd.h>
 
 /* ---- the original libsecos/libc entry points (bypassing the relabels) ---- */
 extern long    secos_syscall(long, long, long, long, long, long);
@@ -171,24 +172,21 @@ static const char* ap(const char* p, char* out, size_t n) {
     return out;
 }
 #define AP(p) ap((p), (char[PATH_MAX]){ 0 }, PATH_MAX)
-/* chmod/chown/utimes on a filesystem without POSIX metadata (the ramfs root,
- * FAT32) fail with a bare -1 from the VFS. Such a filesystem has nothing to
- * store, so report success instead of making cp -p / mv / tar print a
- * "can't preserve ..." warning per file. A real error (-errno) is kept. */
-static int meta_rc(long r) { return r == -1 ? 0 : (int)se(r, EPERM); }
+/* chmod/chown/utimes: the kernel enforces the owner/root rules and returns
+ * -errno (a filesystem without on-disk metadata keeps the change in memory or
+ * ignores it, and reports success), so -1 is a real EPERM. */
+static int meta_rc(long r) { return (int)se(r, EPERM); }
 
 int chmod(const char* p, unsigned m) {
     if (!path_exists(p)) { errno = ENOENT; return -1; }
     return meta_rc(sys_chmod(AP(p), m & 07777));
 }
-int fchmod(int fd, mode_t m) { (void)fd; (void)m; return 0; }
+/* fchmod/fchown/lchown: the SecOS libc (real SYS_CHMOD/SYS_CHOWN fd and no-follow forms). */
 int fchmodat(int d, const char* p, mode_t m, int f) { (void)d; (void)f; return chmod(p, m); }
 int chown(const char* p, unsigned u, unsigned g) {
     if (!path_exists(p)) { errno = ENOENT; return -1; }
     return meta_rc(sys_chown(AP(p), u, g));
 }
-int lchown(const char* p, uid_t u, gid_t g) { return chown(p, u, g); }
-int fchown(int fd, uid_t u, gid_t g) { (void)fd; (void)u; (void)g; return 0; }
 long readlink(const char* p, char* buf, long len) {
     struct stat st;
     if (sys_lstat(p, &st) < 0) { errno = ENOENT; return -1; }
@@ -202,9 +200,12 @@ int symlink(const char* t, const char* l) {
     return (int)se(sys_symlink(t, AP(l)), EPERM);
 }
 int symlinkat(const char* t, int d, const char* l) { (void)d; return symlink(t, l); }
+/* mkdir/open/rmdir keep the kernel's errno (EACCES, EROFS, ENOSPC, ...);
+ * only a bare -1 falls back to a best guess. */
 int mkdir(const char* p, unsigned m) {
     if (path_exists(p)) { errno = EEXIST; return -1; }
-    if (sys_mkdir(AP(p), m) < 0) {
+    if (sys_mkdir(AP(p), m) < 0) {                       /* libsecos set errno */
+        if (errno != EPERM) return -1;                    /* EPERM = a bare -1: guess below */
         char par[PATH_MAX]; strncpy(par, p, sizeof(par) - 1); par[sizeof(par) - 1] = 0;
         char* s = strrchr(par, '/');
         if (s && s != par) { *s = 0; if (!path_is_dir(par)) { errno = ENOENT; return -1; } }
@@ -219,7 +220,7 @@ int unlink(const char* p) {
     if (S_ISDIR(st.st_mode)) { errno = EISDIR; return -1; }
     return (int)se(sys_unlink(AP(p)), EACCES);
 }
-int rmdir(const char* p) { return sys_rmdir(AP(p)); }
+int rmdir(const char* p) { return sys_rmdir(AP(p)); }   /* libsecos sets errno */
 int unlinkat(int d, const char* p, int fl) { (void)d; return (fl & AT_REMOVEDIR) ? rmdir(p) : unlink(p); }
 int remove(const char* p) { return path_is_dir(p) ? rmdir(p) : unlink(p); }
 int chdir(const char* p) {
@@ -248,6 +249,7 @@ int open(const char* path, int flags, ...) {
     if (exists && S_ISDIR(st.st_mode) && (flags & O_ACCMODE) != O_RDONLY) { errno = EISDIR; return -1; }
     int fd = sys_open(path, flags & (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND));
     if (fd < 0) {
+        if (errno != EACCES && errno != EPERM) return -1;  /* the kernel's errno (EROFS, ENOSPC, ...); EPERM = a bare -1 */
         if (!exists && (flags & O_CREAT)) {
             char par[PATH_MAX]; strncpy(par, path, sizeof(par) - 1); par[sizeof(par) - 1] = 0;
             char* s = strrchr(par, '/');
@@ -282,9 +284,8 @@ int ioctl(int fd, unsigned long req, ...) {
         return fcntl(fd, F_SETFD, req == FIOCLEX ? FD_CLOEXEC : 0) < 0 ? -1 : 0;
     return (int)se(sys_ioctl(fd, req, arg), ENOTTY);
 }
-int eaccess(const char* p, int m) { return access(p, m); }
-int euidaccess(const char* p, int m) { return access(p, m); }
-int faccessat(int d, const char* p, int m, int f) { (void)d; (void)f; return access(p, m); }
+/* eaccess/euidaccess: the SecOS libc (effective ids). */
+int faccessat(int d, const char* p, int m, int f) { (void)d; return (f & AT_EACCESS) ? eaccess(p, m) : access(p, m); }
 int utimes(const char* p, const struct timeval tv[2]) {
     unsigned long a, m;
     if (tv) { a = (unsigned long)tv[0].tv_sec; m = (unsigned long)tv[1].tv_sec; }
@@ -766,19 +767,17 @@ int getitimer(int w, struct itimerval* v) { (void)w; memset(v, 0, sizeof(*v)); r
 int pause(void) { return sigsuspend(NULL); }
 void psignal(int sig, const char* s) { if (s && *s) fprintf(stderr, "%s: ", s); fprintf(stderr, "%s\n", strsignal(sig)); }
 
-/* identity: single user, everything is root (signature = trust boundary) */
-int seteuid(uid_t u) { (void)u; return 0; }
-int setegid(gid_t g) { (void)g; return 0; }
-int setreuid(uid_t r, uid_t e) { (void)r; (void)e; return 0; }
-int setregid(gid_t r, gid_t e) { (void)r; (void)e; return 0; }
-int setresuid(uid_t r, uid_t e, uid_t s) { (void)r; (void)e; (void)s; return 0; }
-int setresgid(gid_t r, gid_t e, gid_t s) { (void)r; (void)e; (void)s; return 0; }
-int getresuid(uid_t* r, uid_t* e, uid_t* s) { *r = *e = *s = 0; return 0; }
-int getresgid(gid_t* r, gid_t* e, gid_t* s) { *r = *e = *s = 0; return 0; }
-int initgroups(const char* u, gid_t g) { (void)u; (void)g; return 0; }
+/* identity: the real credentials of the SecOS libc (kernel/cred.c):
+ * get/set[res][ug]id, setgroups/getgroups and initgroups are not shadowed here.
+ * getlogin: the name of the real uid (there is no utmp). */
 int chroot(const char* p) { (void)p; errno = EPERM; return -1; }
-char* getlogin(void) { return (char*)"root"; }
-int getlogin_r(char* b, size_t l) { if (l < 5) return ERANGE; strcpy(b, "root"); return 0; }
+char* getlogin(void) { struct passwd* pw = getpwuid(getuid()); return pw ? pw->pw_name : NULL; }
+int getlogin_r(char* b, size_t l) {
+    const char* n = getlogin();
+    if (!n) return ENXIO;
+    if (strlen(n) + 1 > l) return ERANGE;
+    strcpy(b, n); return 0;
+}
 int nice(int inc) { (void)inc; return 0; }
 int getpriority(int w, id_t who) { (void)w; (void)who; return 0; }
 int setpriority(int w, id_t who, int p) { (void)w; (void)who; (void)p; return 0; }
@@ -969,13 +968,7 @@ int uname(struct utsname* u) {
     return 0;
 }
 char* ctermid(char* s) { static char b[] = "/dev/tty"; if (s) { strcpy(s, b); return s; } return b; }
-char* getpass(const char* prompt) {
-    static char b[128];
-    fputs(prompt, stderr); fflush(stderr);
-    if (!fgets(b, sizeof(b), stdin)) return NULL;
-    b[strcspn(b, "\n")] = 0; return b;
-}
-char* crypt(const char* k, const char* s) { (void)k; (void)s; errno = ENOSYS; return NULL; }
+/* getpass (echo off on /dev/tty) and crypt (musl, user/libcrypt.a): the SecOS libc. */
 int acct(const char* p) { (void)p; errno = ENOSYS; return -1; }
 int lockf(int fd, int c, off_t l) { (void)fd; (void)c; (void)l; return 0; }
 size_t confstr(int n, char* b, size_t l) { (void)n; const char* v = "/bin:/usr/bin"; if (b && l) { strncpy(b, v, l - 1); b[l - 1] = 0; } return strlen(v) + 1; }
