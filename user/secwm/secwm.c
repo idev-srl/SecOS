@@ -5,12 +5,20 @@
  * CAP_DISPLAY | CAP_INPUT, keyboards and pointers held with EVIOCGRAB). It
  * draws the desktop, the panel, window decorations and the mouse cursor, and
  * hosts three kinds of windows:
- *   - terminals: a VT emulator (term.c) on a pty running `bash -i` as a
- *     session leader with the pty as its controlling terminal;
+ *   - terminals: a VT emulator (term.c) on a pty running the user's shell
+ *     (from /etc/passwd, `-i`) as a session leader with the pty as its
+ *     controlling terminal;
  *   - the clock, drawn by the compositor itself;
  *   - clients: separate signed programs (no GUI capabilities) speaking the
  *     SWP protocol (swp.h) over two pipes the compositor created for them.
  * Design, protocol and threat model: docs/GUI.md.
+ *
+ * [M43] secwm runs as the user who started it, never as root on someone's
+ * behalf: /dev/fb0 (root:video 0660) and /dev/input/eventN (root:input 0660)
+ * need the groups video and input on top of CAP_DISPLAY / CAP_INPUT, and the
+ * terminals run that user's shell. The init hook `--auto` (started by root)
+ * switches to the user named by "user=NAME" in /etc/gui-autostart first; with
+ * no user there it starts as root only on a CONSOLE=root build.
  *
  *   secwm [--trace] [--no-term] [--run PROGRAM]... [--auto]
  *   Ctrl+Alt+T terminal, Ctrl+Alt+N next window, Ctrl+Alt+W close window,
@@ -32,6 +40,8 @@
 #include <linux/input.h>
 #include <linux/kd.h>
 #include "libsecos.h"
+#include <pwd.h>
+#include <grp.h>
 #include "gfx.h"
 #include "term.h"
 #include "swp.h"
@@ -557,7 +567,15 @@ static win_t* open_terminal(void) {
         child_sanitize(2);
         const char* home = getenv("HOME");
         if (!home || chdir(home) != 0) chdir("/");
-        char* argv[] = { "bash", "-i", 0 };
+        /* The user's own shell (/etc/passwd), as that user: secwm runs with
+         * the ids of whoever started it. */
+        const struct passwd* pw = getpwuid(getuid());
+        static char sh[128];
+        snprintf(sh, sizeof(sh), "%s", pw && pw->pw_shell && pw->pw_shell[0] == '/' ? pw->pw_shell : "/bin/bash");
+        const char* base = strrchr(sh, '/');
+        char* argv[] = { (char*)(base ? base + 1 : sh), "-i", 0 };
+        execve(sh, argv, child_env());
+        argv[0] = "bash";
         execve("/bin/bash", argv, child_env());
         execve("/bin/sh", argv, child_env());
         _exit(127);
@@ -1346,6 +1364,64 @@ static int auto_enabled(void) {
     return strstr(b, "secos.gui_autostart=1") != NULL;
 }
 
+static int cmdline_has(const char* what) {
+    char b[512];
+    int fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    int n = (int)read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    b[n] = 0;
+    return strstr(b, what) != NULL;
+}
+
+/* [M43] `--auto` started by root (init): become the user named by "user=NAME"
+ * in /etc/gui-autostart, the console included (it is the session's terminal).
+ * 0 = go on (as that user, or as root on a CONSOLE=root build), -1 = stop. */
+static int auto_become_user(void) {
+    if (geteuid() != 0) return 0;
+    char b[256], name[40] = "";
+    int fd = open("/etc/gui-autostart", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        int n = (int)read(fd, b, sizeof(b) - 1);
+        close(fd);
+        if (n < 0) n = 0;
+        b[n] = 0;
+        char* u = strstr(b, "user=");
+        if (u) {
+            u += 5;
+            int k = 0;
+            while (u[k] && u[k] != '\n' && u[k] != ' ' && u[k] != '\r' && k < (int)sizeof(name) - 1) { name[k] = u[k]; k++; }
+            name[k] = 0;
+        }
+    }
+    if (!name[0]) {
+        if (cmdline_has("secos.console=root")) return 0;          /* the old behaviour: root's desktop */
+        printf("secwm: --auto: no user=NAME in /etc/gui-autostart; not starting the desktop as root\n");
+        return -1;
+    }
+    const struct passwd* pw = getpwnam(name);
+    if (!pw) { printf("secwm: --auto: unknown user %s\n", name); return -1; }
+    int uid = pw->pw_uid, gid = pw->pw_gid;
+    static char home[160], shell[160];
+    snprintf(home, sizeof(home), "%s", pw->pw_dir && pw->pw_dir[0] ? pw->pw_dir : "/");
+    snprintf(shell, sizeof(shell), "%s", pw->pw_shell && pw->pw_shell[0] ? pw->pw_shell : "/bin/bash");
+    chown("/dev/console", (unsigned)uid, 5 /* tty */);
+    chmod("/dev/console", 0620);
+    if (initgroups(name, gid) != 0 || setresgid(gid, gid, gid) != 0 || setresuid(uid, uid, uid) != 0 ||
+        getuid() != uid || geteuid() != uid) {
+        printf("secwm: --auto: cannot switch to %s\n", name);
+        return -1;
+    }
+    setenv("HOME", home, 1);
+    setenv("USER", name, 1);
+    setenv("LOGNAME", name, 1);
+    setenv("SHELL", shell, 1);
+    setenv("PATH", uid == 0 ? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" : "/usr/local/bin:/usr/bin:/bin", 1);
+    if (chdir(home) != 0) chdir("/");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     int want_term = 1;
     const char* runs[8]; int nruns = 0;
@@ -1353,7 +1429,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--trace")) trace = 1;
         else if (!strcmp(argv[i], "--no-term")) want_term = 0;
         else if (!strcmp(argv[i], "--run") && i + 1 < argc) { if (nruns < 8) runs[nruns++] = argv[++i]; else i++; }
-        else if (!strcmp(argv[i], "--auto")) { if (!auto_enabled()) return 0; }
+        else if (!strcmp(argv[i], "--auto")) { if (!auto_enabled()) return 0; if (auto_become_user() != 0) return 1; }
         else {
             printf("usage: %s [--trace] [--no-term] [--run PROGRAM]... [--auto]\n", argv[0]);
             return 2;

@@ -41,9 +41,16 @@ KEYMAP_DEF := $(if $(KEYMAP),-DSECOS_KEYMAP_DEFAULT='"$(KEYMAP)"',)
 # CFLAGS_EXTRA=-DSECOS_GUI_AUTOSTART. The default boot stays the text console.
 GUI_AUTOSTART ?=
 GUI_DEF := $(if $(filter 1 yes y,$(GUI_AUTOSTART)),-DSECOS_GUI_AUTOSTART,)
+# [M43] Console policy (docs/USERS.md). Default: init runs /bin/login on the
+# console. `make iso CONSOLE=root` (-DSECOS_CONSOLE_ROOT) keeps the root bash of
+# before, with no login; tools/selftest.sh builds that way. It sets the default
+# /etc/inittab (and switches an unmodified default one) and the
+# secos.console= hint on /proc/cmdline.
+CONSOLE ?= login
+CONSOLE_DEF := $(if $(filter root,$(CONSOLE)),-DSECOS_CONSOLE_ROOT,)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
 		  -fstack-protector-strong $(INCLUDES) \
-		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(GUI_DEF) $(CFLAGS_EXTRA)
+		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(GUI_DEF) $(CONSOLE_DEF) $(CFLAGS_EXTRA)
 # Header dependency tracking: every kernel object also depends on the headers it
 # includes (gcc writes foo.d next to foo.o). Without it, changing only a header
 # (e.g. a regenerated embedded program crypto/user_*_elf.h) left the objects that
@@ -211,6 +218,10 @@ $(DRIVERS_DIR)/keymap.o: $(KEYMAP_STAMP)
 GUI_STAMP := .gui-autostart.stamp
 $(shell echo '$(GUI_DEF)' | cmp -s - $(GUI_STAMP) 2>/dev/null || echo '$(GUI_DEF)' > $(GUI_STAMP))
 $(KERNEL_DIR)/kernel.o $(KERNEL_DIR)/sysroot.o $(FS_DIR)/procfs.o: $(GUI_STAMP)
+# Same for CONSOLE (kernel/sysroot.c: default inittab; fs/procfs.c: cmdline).
+CONSOLE_STAMP := .console.stamp
+$(shell echo '$(CONSOLE_DEF)' | cmp -s - $(CONSOLE_STAMP) 2>/dev/null || echo '$(CONSOLE_DEF)' > $(CONSOLE_STAMP))
+$(KERNEL_DIR)/sysroot.o $(FS_DIR)/procfs.o: $(CONSOLE_STAMP)
 
 $(DRIVERS_DIR)/%.o: $(DRIVERS_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -237,6 +248,21 @@ FORCE:
 $(AUTHKEYS_H): FORCE
 	@python3 tools/gen-authorized-keys.py $@ $(SSH_AUTHORIZED_KEYS)
 $(KERNEL_DIR)/kernel.o: $(AUTHKEYS_H)
+
+# [M43] First root password, baked as a hash: `make iso ROOT_PASSWORD=...`
+# (hashed on the build host with the vendored musl SHA-512 crypt) or
+# ROOT_PASSWORD_HASH='$$6$$...' (a ready hash, e.g. `openssl passwd -6`). At
+# boot the kernel gives it to root only while root's password is still unset
+# ("!") in /etc/shadow. Only the hash reaches the image; build/root_pwhash.h is
+# ignored by git and keeps its salt while the password is unchanged.
+ROOT_PASSWORD ?=
+ROOT_PASSWORD_HASH ?=
+ROOT_PWHASH_H = build/root_pwhash.h
+$(ROOT_PWHASH_H): export ROOT_PASSWORD := $(ROOT_PASSWORD)
+$(ROOT_PWHASH_H): export ROOT_PASSWORD_HASH := $(ROOT_PASSWORD_HASH)
+$(ROOT_PWHASH_H): FORCE
+	@tools/gen-root-pwhash.sh $@
+$(KERNEL_DIR)/sysroot.o: $(ROOT_PWHASH_H)
 
 $(KERNEL): $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
@@ -520,7 +546,37 @@ user-progs: libcrypt
 	python3 tools/secos-sign user/loadkeys.elf --dev
 	python3 tools/elf2h.py user/loadkeys.elf user_loadkeys_elf crypto/user_loadkeys_elf.h
 	$(MAKE) --no-print-directory gui-progs
+	$(MAKE) --no-print-directory acct-progs
 	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+
+# [M43] Multi-user tools (docs/USERS.md). login/su/sudo/passwd are signed with
+# the SETID manifest (user/note_setid.S) and installed root 04755 by
+# kernel/sysroot.c; usertools (useradd/userdel/usermod/groupadd/groupdel/
+# chpasswd/id/whoami/groups) carries the plain
+# manifest, so a set-uid bit on them is ignored. libcrypt goes last.
+ACCT_SETID = login su sudo passwd
+.PHONY: acct-progs
+acct-progs: libcrypt
+	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note.S       -o user/note.o
+	$(CC) $(USER_CFLAGS) -c user/note_setid.S -o user/note_setid.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c   -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c       -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/acct.c       -o user/acct.o
+	for p in $(ACCT_SETID) usertools; do \
+	    $(CC) $(USER_CFLAGS) -c user/$$p.c -o user/$$p.o || exit 1; \
+	done
+	for p in $(ACCT_SETID); do \
+	    $(LD) --gc-sections -T user/user.ld -o user/$$p.elf user/crt0.o user/note_setid.o user/libsecos.o user/libc.o \
+	        user/$$p.o user/acct.o $(LIBCRYPT) || exit 1; \
+	done
+	$(LD) --gc-sections -T user/user.ld -o user/usertools.elf user/crt0.o user/note.o user/libsecos.o user/libc.o \
+	    user/usertools.o user/acct.o $(LIBCRYPT)
+	for p in $(ACCT_SETID) usertools; do \
+	    python3 tools/secos-sign user/$$p.elf --dev || exit 1; \
+	    python3 tools/elf2h.py user/$$p.elf user_$${p}_elf crypto/user_$${p}_elf.h || exit 1; \
+	done
+	@echo "acct-progs: built+signed $(ACCT_SETID) (SETID) + usertools -> crypto/*.h"
 
 # Graphical UI (docs/GUI.md): the secwm compositor + terminal (signed
 # CAP_INPUT|CAP_DISPLAY, the only program holding fb0 and the input devices),
@@ -833,7 +889,7 @@ run-vnc: iso $(ROOT_DEP)
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
-	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP) $(CONSOLE_STAMP)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)

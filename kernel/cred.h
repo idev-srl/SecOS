@@ -9,7 +9,7 @@
  *     uid/gid + file modes (owner/group/other rwx), with root (euid 0) exempt
  *     from the file-permission checks except that exec needs at least one x bit.
  * This revises M26 ("POSIX metadata stored but not enforced"). The rules, and
- * every place they are enforced, are listed in docs/devlog/M42-multiuser.md.
+ * every place they are enforced, are listed in docs/devlog/M43-multiuser.md.
  */
 #ifndef SECOS_CRED_H
 #define SECOS_CRED_H

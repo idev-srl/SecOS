@@ -47,3 +47,4 @@ tools/exfat_fuzz/exfat_fuzz
 ntfs_corrupt/
 tools/ntfs_fuzz/ntfs_fuzz
 *.img.list
+.console.stamp
