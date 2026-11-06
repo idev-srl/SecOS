@@ -1977,6 +1977,70 @@ else
     check "crypt in-guest KAT build" 1
 fi
 
+# ---- [M43] account tools: console login, su, sudo, passwd, useradd ----------
+# A CONSOLE=login image with a baked ROOT_PASSWORD, driven over serial: a wrong
+# then the right root password at the console login, useradd/usermod/chpasswd,
+# logout + login as the new wheel user (the console becomes theirs), su with the
+# right and a wrong password, sudo as a wheel member, passwd changing the own
+# password and a login with the new one. Then, as an unprivileged user, the
+# syscall fuzzer (which also fuzzes the id syscalls 100-109) must finish
+# without any batch coming out with root ids.
+MULOG=/tmp/secos_selftest_users.log
+MUSER=/tmp/secos_selftest_users.serial
+echo "[selftest] Account tools: console login, su, sudo, passwd, unprivileged fuzzing (mb2, serial, ~210s)..."
+if make iso CONSOLE=login ROOT_PASSWORD=Root-pw9 >/tmp/secos_selftest_build.log 2>&1; then
+    : > "$MULOG"
+    ( sleep 25
+      printf 'root\r'; sleep 2; printf 'nope\r'; sleep 6
+      printf 'root\r'; sleep 2; printf 'Root-pw9\r'; sleep 4
+      printf 'echo MU1-$(id -u)-$HOME\r'; sleep 2
+      printf 'useradd carol; useradd dave; useradd -M fz; usermod -aG wheel,video,input carol; printf "carol:Carol-pw1\\ndave:Dave-pw1\\n" | chpasswd; echo MU2-$?\r'; sleep 8
+      printf 'echo MU3-$(stat -c %%a-%%U /home/carol /bin/su | tr "\\n" -)\r'; sleep 2
+      printf 'exit\r'; sleep 4
+      printf 'carol\r'; sleep 2; printf 'Carol-pw1\r'; sleep 4
+      printf 'echo MU4-$(id -un)-$(pwd)-$(stat -c %%U /dev/console)\r'; sleep 2
+      printf 'su dave -c "echo MU5-\\$(id -un)"\r'; sleep 3; printf 'Dave-pw1\r'; sleep 4
+      printf 'su dave -c "echo MU6-BAD"; echo MU6-rc$?\r'; sleep 3; printf 'wrongpw\r'; sleep 5
+      printf 'sudo /bin/bash -c "echo MU7-\\$(id -u)"\r'; sleep 3; printf 'Carol-pw1\r'; sleep 4
+      printf 'su dave -c "sudo id; echo MU8-rc\\$?"\r'; sleep 3; printf 'Dave-pw1\r'; sleep 5
+      printf 'passwd\r'; sleep 3; printf 'Carol-pw1\r'; sleep 3; printf 'Carol-pw2\r'; sleep 2; printf 'Carol-pw2\r'; sleep 5
+      printf 'exit\r'; sleep 4
+      printf 'carol\r'; sleep 2; printf 'Carol-pw2\r'; sleep 4
+      printf 'echo MU9-$(id -un)\r'; sleep 2
+      printf 'sudo su fz -c "/bin/sysfuzz -s 4711 -b 12 -c 150"\r'; sleep 3
+      printf 'Carol-pw2\r'; sleep 60
+      printf 'echo MU10-alive-$(id -un)\r'; sleep 3 ) | \
+        timeout 210 qemu-system-x86_64 -cdrom myos.iso -boot d -m 512M \
+            -debugcon file:"$MULOG" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -serial stdio > "$MUSER" 2>&1
+    tr -d '\r' < "$MUSER" > "$MUSER.txt"
+    grep -q "root password set from the build" "$MULOG"; check "USERS ROOT_PASSWORD hash applied to the unset root entry" $?
+    grep -q "^Login incorrect" "$MUSER.txt"; check "USERS console login refuses a wrong password" $?
+    grep -q "^MU1-0-/root" "$MUSER.txt"; check "USERS console login as root with the baked password" $?
+    grep -q "^MU2-0" "$MUSER.txt"; check "USERS useradd + usermod -aG + chpasswd" $?
+    grep -q "^MU3-700-carol-4755-root-" "$MUSER.txt"; check "USERS new home 0700 owned by the user; /bin/su root 4755" $?
+    grep -q "^MU4-carol-/home/carol-carol" "$MUSER.txt"; check "USERS login as a user: ids, home, console owned by the user" $?
+    grep -q "^MU5-dave" "$MUSER.txt"; check "USERS su with the right password" $?
+    grep -q "su: Authentication failure" "$MUSER.txt" && grep -q "^MU6-rc1" "$MUSER.txt" && ! grep -q "^MU6-BAD" "$MUSER.txt"
+    check "USERS su with a wrong password fails (exit 1)" $?
+    grep -q "^MU7-0" "$MUSER.txt"; check "USERS sudo as a wheel member with the own password" $?
+    grep -q "not a member of group wheel" "$MUSER.txt" && grep -q "^MU8-rc1" "$MUSER.txt"
+    check "USERS sudo refused outside wheel" $?
+    grep -q "password updated successfully" "$MUSER.txt" && grep -q "^MU9-carol" "$MUSER.txt"
+    check "USERS passwd changes the own password; login with the new one" $?
+    ! grep -q "Carol-pw1\|Dave-pw1\|wrongpw\|Root-pw9" <(sed -n '/login:/,$p' "$MUSER.txt" | grep -v "^printf\|chpasswd")
+    check "USERS no password ever echoed on the console" $?
+    grep -q "^\[sysfuzz\] seed=4711 .* uid=100[0-9]" "$MUSER.txt" && grep -q "^\[sysfuzz\] DONE ok" "$MUSER.txt" && \
+        ! grep -q "ESCALAT" "$MUSER.txt"
+    check "USERS sysfuzz as an unprivileged user: done, no batch gained root ids" $?
+    grep -q "^MU10-alive-carol" "$MUSER.txt"; check "USERS system alive after unprivileged fuzzing" $?
+    ! grep -q "ring0\|\[PANIC\]" "$MULOG"; check "USERS no kernel fault or panic" $?
+    make iso >/tmp/secos_selftest_build.log 2>&1   # leave the default selftest image behind
+else
+    echo "[selftest] USERS BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "USERS image build" 1
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
