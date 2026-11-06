@@ -853,8 +853,10 @@ static void gd_cb(const vfs_inode_t* child, void* user){
 }
 int ksys_getdents(const char* path, void* ubuf, int buflen){
     extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*);
-    static char kbuf[65536];                 // up to 256 entries (BusyBox fills /bin)
-    struct gd_ctx g = { kbuf, sizeof(kbuf), 0 };
+    // As many records as the caller's buffer holds (up to 1 MiB = 4096
+    // entries): BusyBox's opendir retries with a bigger buffer when one comes
+    // back full, so large directories (e.g. Windows folders on NTFS) list whole.
+    if(buflen <= 0) return -1;
     // cwd-relative + normalized: bash's glob and readline's filename completion
     // open "." and "dir/" (trailing slash), which vfs_readdir does not accept.
     char rp[256]; proc_resolve_path(sched_get_current(), path, rp, sizeof(rp)); path = rp;
@@ -862,9 +864,14 @@ int ksys_getdents(const char* path, void* ubuf, int buflen){
     int e = cred_check_path(sched_get_current(), path, 1, MAY_READ, cp, sizeof(cp), &di);
     if(e) return e == -CRED_ENOENT ? -1 : e;
     path = cp;
-    if(vfs_readdir(path, gd_cb, &g) != 0) return -1;
+    int cap = buflen > (1 << 20) ? (1 << 20) : buflen;
+    char* kbuf = (char*)kmalloc((size_t)cap);
+    if(!kbuf) return -12;                    // -ENOMEM
+    struct gd_ctx g = { kbuf, cap, 0 };
+    if(vfs_readdir(path, gd_cb, &g) != 0){ kfree(kbuf); return -1; }
     int n = g.len < buflen ? g.len : buflen;
-    if(n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0) return -1;
+    if(n > 0 && copy_to_user(ubuf, kbuf, (size_t)n) != 0){ kfree(kbuf); return -1; }
+    kfree(kbuf);
     return n;
 }
 int ksys_create(const char* path){
