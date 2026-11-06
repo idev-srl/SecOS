@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # SecOS - reproducible Dropbear SSH port. Fetches a pinned Dropbear release,
 # verifies its SHA-256, configures it with a hand-written config.h +
-# localoptions.h (public-key auth only, ed25519, curve25519/mlkem768,
+# localoptions.h (multi-user: public-key or /etc/shadow password auth, root by
+# key only; ed25519, curve25519/mlkem768,
 # chacha20-poly1305/aes-gcm/aes-ctr, hmac-sha2, no forwarding), CROSS-compiles
 # dropbearmulti (dropbear + dropbearkey + dbclient) against SecOS's freestanding
 # libc (-nostdinc + user/dropbear-include + user/port-include stubs +
 # user/dropbear_port.h force include + user/dropbear_compat.c shims), links it
-# with the CAP_NET manifest, signs it and embeds it as
+# with the CAP_NET manifest and user/libcrypt.a (crypt(), musl; built by
+# `make libcrypt`), signs it and embeds it as
 # crypto/user_dropbear_elf.h. See docs/SSH.md.  SPDX-License-Identifier: MIT
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,6 +47,19 @@ cp "$ROOT/user/dropbear_config.h" "$WORK/config.h"
 cp "$ROOT/user/dropbear_localoptions.h" "$WORK/localoptions.h"
 { printf '/* Generated from src/default_options.h by tools/port-dropbear.sh */\n\n'
   sh "$WORK/src/ifndef_wrapper.sh" < "$WORK/src/default_options.h"; } > "$WORK/default_options_guard.h"
+# SecOS policy: no password login for root, whatever the command line says
+# (upstream's -g made the default). Root logs in with a key; other accounts
+# with a key or their /etc/shadow password.
+python3 -I - "$WORK/src/svr-runopts.c" <<'PY'
+import sys
+f = sys.argv[1]; s = open(f).read()
+old = "\tsvr_opts.norootpass = 0;"
+if old in s:
+    s = s.replace(old, "\tsvr_opts.norootpass = 1; /* SecOS: root password login refused (always -g) */", 1)
+    open(f, 'w').write(s)
+elif "SecOS: root password login refused" not in s:
+    sys.exit("[port-dropbear] svr-runopts.c: norootpass default not found")
+PY
 
 # Object lists straight from the upstream makefiles (no configure needed).
 mkvar() { python3 -I - "$1" "$2" <<'PY'
@@ -78,7 +93,7 @@ rm -f "$OBJ"/libtom*.a; ar rcs "$OBJ/libtomcrypt.a" "$OBJ"/ltc/*.o; ar rcs "$OBJ
 ld --gc-sections -T "$ROOT/user/user.ld" -o "$ROOT/user/dropbearmulti.elf" \
    "$ROOT/user/crt0.o" "$OBJ/zz_note.o" "$OBJ"/db/*.o "$OBJ"/zz_compat.o "$OBJ"/zz_setjmp.o \
    "$OBJ/libtomcrypt.a" "$OBJ/libtommath.a" \
-   "$ROOT/user/libsecos.o" "$ROOT/user/libc.o" "$ROOT/user/libm.o"
+   "$ROOT/user/libsecos.o" "$ROOT/user/libc.o" "$ROOT/user/libm.o" "$ROOT/user/libcrypt.a"
 
 echo "[port-dropbear] 5/5 sign + embed -> crypto/user_dropbear_elf.h"
 cd "$ROOT"   # run python from the repo (a pyenv-local interpreter has 'cryptography')

@@ -39,18 +39,22 @@
 #define HAVE_GETNAMEINFO 1
 #define HAVE_GAI_STRERROR 1
 #define HAVE_CONST_GAI_STRERROR_PROTO 1
-/* basename/daemon come from Dropbear's own compat.c; getusershell from ours. */
-#define HAVE_GETUSERSHELL 1
+/* basename/daemon/getusershell (/etc/shells) come from Dropbear's own compat.c. */
+#undef HAVE_GETUSERSHELL
 #undef HAVE_BASENAME
 #undef HAVE_DAEMON
 #define HAVE_WRITEV 1          /* compat: a write() loop */
 #undef HAVE_GETRANDOM
 #undef HAVE_CLEARENV
 #undef HAVE_EXPLICIT_BZERO
-#undef HAVE_GETGROUPLIST
-#undef HAVE_SETRESGID
+/* [M42] Real accounts: the SecOS libc's credentials (kernel/cred.c), the
+ * /etc/shadow parser and crypt() from user/libcrypt.a (musl SHA-crypt/bcrypt). */
+#define HAVE_GETGROUPLIST 1
+#define HAVE_SETRESGID 1
+#define HAVE_CRYPT 1
+#define HAVE_CRYPT_H 1
+#define HAVE_SHADOW_H 1
 #undef HAVE_FEXECVE
-#undef HAVE_CRYPT
 #undef HAVE_GETPASS
 #undef HAVE_OPENPTY
 

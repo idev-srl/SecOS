@@ -630,13 +630,14 @@ port-busybox:
 	bash tools/port-busybox.sh
 	@echo "port-busybox: BusyBox 1.36.1 built from source, signed -> crypto/user_busybox_elf.h"
 
-# Dropbear SSH (2026.94, SHA-256 pinned) from source: public-key auth only,
+# Dropbear SSH (2026.94, SHA-256 pinned) from source: multi-user, public-key or
+# /etc/shadow password auth (crypt() from user/libcrypt.a; root by key only),
 # ed25519 + curve25519/mlkem768 + chacha20-poly1305/aes-gcm/aes-ctr. Builds the
 # SecOS user objects, then runs tools/port-dropbear.sh (fetch + verify + cross-
 # compile + link with the confined CAP_NET manifest + sign + embed as
 # crypto/user_dropbear_elf.h, installed to /bin/dropbearmulti). See docs/SSH.md.
 .PHONY: port-dropbear
-port-dropbear:
+port-dropbear: libcrypt
 	$(CC) $(USER_CFLAGS) -c user/crt0.S     -o user/crt0.o
 	$(CC) $(USER_CFLAGS) -c user/libsecos.c -o user/libsecos.o
 	$(CC) $(USER_CFLAGS) -c user/libc.c     -o user/libc.o

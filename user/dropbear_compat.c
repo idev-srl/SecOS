@@ -303,10 +303,8 @@ W int link(const char* oldp, const char* newp){
 W int fileno(FILE* f){ return f ? f->fd : (errno = EBADF, -1); }
 W void clearerr(FILE* f){ (void)f; }
 W int setvbuf(FILE* f, char* buf, int mode, size_t size){ (void)f; (void)buf; (void)mode; (void)size; return 0; }
-W int fchmod(int fd, mode_t mode){ (void)fd; (void)mode; return 0; }
-W int fchown(int fd, uid_t uid, gid_t gid){ (void)fd; (void)uid; (void)gid; return 0; }
+/* fchmod/fchown/access: the SecOS libc (real SYS_CHMOD/SYS_CHOWN/SYS_ACCESS). */
 W int ftruncate(int fd, off_t len){ (void)fd; (void)len; errno = ENOSYS; return -1; }
-W int access(const char* path, int mode){ (void)mode; struct stat st; return stat(path, &st) == 0 ? 0 : -1; }
 
 /* ===================== processes / signals ===================== */
 /* waitpid(pid, &st, opt) over SYS_WAIT (one pid, blocking) / SYS_WAITANY. The
@@ -326,7 +324,6 @@ int db_waitpid(pid_t pid, int* status, int options){
     if(status) *status = (int)(code & 0xffff);
     return pid;
 }
-int db_getgroups(int n, int* g){ (void)n; (void)g; errno = ENOSYS; return -1; }
 static void (*g_sigdisp[NSIG])(int);
 W int sigaction(int sig, const struct sigaction* act, struct sigaction* old){
     if(sig <= 0 || sig >= NSIG){ errno = EINVAL; return -1; }
@@ -343,9 +340,6 @@ W int sigaddset(sigset_t* s, int n){ if(s) *s |= (1UL << (n & 63)); return 0; }
 W int sigdelset(sigset_t* s, int n){ if(s) *s &= ~(1UL << (n & 63)); return 0; }
 W int sigismember(const sigset_t* s, int n){ return s ? (int)((*s >> (n & 63)) & 1) : 0; }
 W unsigned int alarm(unsigned int s){ (void)s; return 0; }
-W int setegid(gid_t g){ (void)g; return 0; }
-W int seteuid(uid_t u){ (void)u; return 0; }
-W int initgroups(const char* user, gid_t g){ (void)user; (void)g; return 0; }
 W int setpgrp(void){ return setpgid(0, 0); }
 W int getrlimit(int r, struct rlimit* l){ (void)r; if(l){ l->rlim_cur = RLIM_INFINITY; l->rlim_max = RLIM_INFINITY; } return 0; }
 W int setrlimit(int r, const struct rlimit* l){ (void)r; (void)l; return 0; }
@@ -360,22 +354,11 @@ W int gethostname(char* name, size_t len){
     strlcpy(name, h, len); return 0;
 }
 
-/* ===================== identity: one "root" account ===================== */
-/* SecOS has no user database: the signature is the trust boundary. Dropbear
- * runs non-multiuser, so the only account that can authenticate is the one it
- * runs as. Any other user name does not exist (Dropbear rejects it before
- * looking at keys). The password field is locked: password auth is compiled
- * out anyway (DROPBEAR_SVR_PASSWORD_AUTH 0). */
-/* getpwnam/getpwuid/getgr*: libc (/etc/passwd + /etc/group, shared with
- * BusyBox). Dropbear runs non-multiuser, so only the account it runs as
- * (root) can authenticate whatever the files list. */
-/* Valid login shells (there is no /etc/shells): the account's own shell. */
-static const char* const g_shells[] = { "/bin/bash", 0 };
-static int g_shell_i;
-char* getusershell(void){ const char* s = g_shells[g_shell_i]; if(s) g_shell_i++; return (char*)s; }
-void setusershell(void){ g_shell_i = 0; }
-void endusershell(void){ g_shell_i = 0; }
-W char* crypt(const char* key, const char* salt){ (void)key; (void)salt; errno = ENOSYS; return 0; }
+/* ===================== identity (M42 multi-user) ===================== */
+/* Nothing here: credentials (setgid/initgroups/setuid/setresgid/getgroups),
+ * the account database (getpwnam/getspnam/getgrnam over /etc/passwd,
+ * /etc/shadow, /etc/group) are the SecOS libc's, crypt() is musl's from
+ * user/libcrypt.a, getusershell() is Dropbear's own (/etc/shells). */
 
 /* ===================== PTY (kernel side pending; see docs/SSH.md) ===================== */
 /* Standard Linux implementation over /dev/ptmx + TIOCGPTN/TIOCSPTLCK: it
