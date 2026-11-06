@@ -242,8 +242,10 @@ int open(const char* path, int flags, ...) {
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     struct stat st;
     int exists = sys_stat(path, &st) >= 0;
+    int serr = exists ? 0 : errno;
     if (exists && (flags & O_CREAT) && (flags & O_EXCL)) { errno = EEXIST; return -1; }
-    if (!exists && !(flags & O_CREAT)) { errno = ENOENT; return -1; }
+    /* Keep a search-permission denial on the way (EACCES) instead of ENOENT. */
+    if (!exists && !(flags & O_CREAT)) { errno = (serr == EACCES || serr == ENOTDIR) ? serr : ENOENT; return -1; }
     if (exists && (flags & O_DIRECTORY) && !S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
     if (exists && S_ISDIR(st.st_mode) && (flags & O_ACCMODE) != O_RDONLY) { errno = EISDIR; return -1; }
     int fd = sys_open(path, flags & (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND));
