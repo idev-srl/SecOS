@@ -705,11 +705,15 @@ static void stat_fill(const vfs_inode_t* ino, struct secos_stat* st){
     st->st_nlink = ino->nlink ? ino->nlink : 1;
     st->st_uid = ino->uid; st->st_gid = ino->gid;
     st->st_atime = ino->atime; st->st_mtime = ino->mtime; st->st_ctime = ino->ctime;
-    // [M39] A stable unique inode id (the inode pointer) so userland tree-walks —
-    // bash's getcwd compares (st_dev,st_ino) up the path — work. st_dev is a
-    // single constant (one logical FS namespace to userland).
-    st->st_dev = 1;
-    st->st_ino = (uint64_t)(uintptr_t)ino;
+    // Per-mount st_dev (the block device's dev_t, or an anonymous 0:N for a
+    // virtual FS), so df <path>, find -xdev, du -x and cp -a can tell mounts
+    // apart; it used to be one constant for every file. st_ino is the FS's own
+    // id where it has one (ext2 inode number, FAT/exFAT entry location), else
+    // the inode pointer — unique, which userland tree-walks (bash's getcwd
+    // compares (st_dev,st_ino) up the path) depend on.
+    st->st_dev = vfs_dev_of_ops(ino->ops);
+    if(!st->st_dev) st->st_dev = 1;
+    st->st_ino = ino->ino ? ino->ino : (uint64_t)(uintptr_t)ino;
     st->st_rdev = 0;
     st->st_blksize = 512;
     st->st_blocks = (int64_t)((ino->size + 511) / 512);

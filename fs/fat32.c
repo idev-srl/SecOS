@@ -351,6 +351,9 @@ static vfs_inode_t* inode_get(const char* path, uint32_t ec, uint32_t eo){
     size_t k=0; for(; path[k] && k<sizeof(ino->path)-1; k++) ino->path[k]=path[k]; ino->path[k]=0;
     return ino;
 }
+/* st_ino: the entry location (unique on the volume, stable across remounts
+ * until a rename moves the entry); the root, which has no entry, is 1. */
+static uint64_t fat_ino_of(uint32_t ec, uint32_t eo){ return ec ? (((uint64_t)ec << 16) | (eo >> 5)) : 1; }
 /* The entry at (ec,eo) is gone (unlink, or the target of a rename). */
 static void inode_kill(uint32_t ec, uint32_t eo){
     fat_vslot_t* s = fvslot_find(ec, eo);
@@ -363,7 +366,7 @@ static void inode_kill(uint32_t ec, uint32_t eo){
 static void inode_move(uint32_t oc, uint32_t oo, uint32_t nc, uint32_t no, const char* newp){
     fat_vslot_t* s = fvslot_find(oc, oo);
     if(!s) return;
-    s->n.ent_clus=nc; s->n.ent_off=no;
+    s->n.ent_clus=nc; s->n.ent_off=no; s->v.ino=fat_ino_of(nc, no);
     size_t k=0; for(; newp[k] && k<sizeof(s->v.path)-1; k++) s->v.path[k]=newp[k]; s->v.path[k]=0;
 }
 
@@ -467,6 +470,7 @@ static vfs_inode_t* fat32_lookup(const char* path){
     /* a different chain behind the same entry: the cached pages are not its */
     if(nd->first_cluster && nd->first_cluster!=fc) pagecache_invalidate(ino, 0, 1ULL<<62);
     nd->first_cluster=fc; nd->size=sz; nd->is_dir=isd;
+    ino->ino = fat_ino_of(loc.clus, loc.off);
     ino->mode = 0; ino->nlink = 1; ino->uid = ino->gid = 0;
     ino->atime = ino->mtime = ino->ctime = 0;
     if(loc.clus){                                  /* root has no entry: times stay 0 */

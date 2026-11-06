@@ -1006,6 +1006,8 @@ static vfs_inode_t* ex_lookup(const char* path){
     exnode_t* n = (exnode_t*)ino->fs_data;
     n->o = o; n->chain_ok = 0; n->dead = 0;
     ino_fill(ino, &o);
+    /* st_ino: the entry-set location, unique on the volume (root: 1) */
+    ino->ino = o.is_root ? 1 : (((uint64_t)o.dir.first << 24) | o.slot);
     return ino;
 }
 

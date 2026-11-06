@@ -782,7 +782,7 @@ static vfs_inode_t* e2_lookup(const char* path){
     if(v){ const char* np=path&&path[0]?path:"/"; size_t k=0; for(; np[k] && k<sizeof(v->path)-1; k++) v->path[k]=np[k]; v->path[k]=0; }
     else v=vino_alloc(path&&path[0]?path:"/");
     if(!v) return NULL;
-    v->type=isd?VFS_NODE_DIR:VFS_NODE_FILE; v->size=sz;
+    v->type=isd?VFS_NODE_DIR:VFS_NODE_FILE; v->size=sz; v->ino=ino;
     // [M26] Populate POSIX metadata from the on-disk inode (standard ext2 layout:
     // i_mode@0, i_uid@2, i_atime@8, i_ctime@12, i_mtime@16, i_gid@24, i_links@26).
     uint8_t in[256];
