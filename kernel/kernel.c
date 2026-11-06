@@ -1453,6 +1453,62 @@ extern void shell_run_line(const char* line);
 #ifndef SECOS_NO_DROPBEAR
 #include "../crypto/user_dropbear_elf.h"
 #endif
+// Interface configuration (user/netcfg.c, SYS_NETCTL): /bin/{netcfg,ifup,ifdown,ifconfig}.
+#include "../crypto/user_netcfg_elf.h"
+// SSH public keys baked at build time (make SSH_AUTHORIZED_KEYS=...): generated
+// into build/ by tools/gen-authorized-keys.py; empty when the variable is unset.
+#include "../build/authorized_keys.h"
+// [M40] /bin/init is PID 1 (user/init.c). -DSECOS_NO_INIT boots straight into
+// bash as before. The default /etc/inittab (installed only when absent, so a
+// persistent root keeps its own) brings the network up, supervises sshd and
+// runs a respawning bash on the console. Format: docs/devlog/M40-init.md.
+#ifndef SECOS_NO_INIT
+static const char g_default_inittab[] =
+    "# /etc/inittab - SecOS init (PID 1). One entry per line:\n"
+    "#   <id>:<action>:<command> [args...]\n"
+    "# id       short name, used in messages and for /var/log/<id>.log\n"
+    "# action   sysinit   run at boot in file order and wait for it\n"
+    "#          respawn   own session, output to /var/log/<id>.log, restarted\n"
+    "#                    with backoff (1 s doubling to 30 s) when it exits\n"
+    "#          console   respawn on the console as session leader with the\n"
+    "#                    console as controlling tty and foreground group\n"
+    "#          once      start at boot, never restarted\n"
+    "#          shutdown  run (and waited for) when the system goes down\n"
+    "# The command is split on blanks and run directly (no shell, no quoting).\n"
+    "net:sysinit:/bin/ifup -t 10\n"
+    "sshd:respawn:/bin/dropbearmulti dropbear -F -R -p 22\n"
+    "console:console:/bin/bash -i\n";
+extern int shell_exec_foreground(const char* path, int argc, const char* const* argv,
+                                 void (*created)(process_t*), int keep_running);
+static void init_mark_pid1(process_t* p) {
+    process_set_init_pid(p->pid);
+    debugcon_writestring("[INIT] /bin/init started, pid=");
+    debugcon_print_hex(p->pid);
+    debugcon_writestring(p->pid == 1 ? " (PID 1)\n" : " (WARN: not PID 1)\n");
+}
+// PID 1 died: SIGKILL every user process it left (console bash, services), so
+// the kernel shell owns the console alone. Bounded wait for the teardown.
+struct init_pids { uint32_t pid[64]; int n; };
+static void init_pids_cb(process_t* p, void* u) {
+    struct init_pids* l = (struct init_pids*)u;
+    if (p->pid != 0 && p->state != PROC_ZOMBIE && l->n < 64) l->pid[l->n++] = p->pid;
+}
+static void init_kill_orphans(void) {
+    extern int signal_post(process_t*, int);
+    extern void sched_reap_zombies(void);
+    extern int sched_count_alive_user(void);
+    struct init_pids l; l.n = 0;
+    process_foreach(init_pids_cb, &l);
+    for (int i = 0; i < l.n; i++) {
+        process_t* p = process_find_by_pid(l.pid[i]);
+        if (p) { signal_post(p, 9 /*SIGKILL*/); if (p->state == PROC_STOPPED) p->state = PROC_READY; }
+    }
+    for (int spin = 0; spin < 3000 && sched_count_alive_user() > 0; spin++) {
+        __asm__ volatile("sti; hlt");
+        sched_reap_zombies();
+    }
+}
+#endif
 static uint8_t   m10_idle_stack[32768] __attribute__((aligned(16)));
 static process_t m10_idle;
 static trapframe_t m10_idle_tf;
@@ -1531,6 +1587,80 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
           else debugcon_writestring("[SSH] FAIL: could not install /bin/dropbearmulti\n");
       } }
 #endif
+    // Network configuration commands (one signed multi-call program). The BusyBox
+    // ifconfig needs SIOCGIF* ioctls SecOS does not have, so netcfg's ifconfig
+    // view replaces it.
+    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
+      extern int vfs_remove(const char*);
+      static const char* const nc[] = { "/bin/netcfg", "/bin/ifup", "/bin/ifdown", "/bin/ifconfig", 0 };
+      int ok = 0;
+      for (int i = 0; nc[i]; i++) {
+          vfs_inode_t* ino = vfs_lookup(nc[i]);
+          if (ino && ino->size == user_netcfg_elf_len) { ok++; continue; }   // already ours
+          if (ino) vfs_remove(nc[i]);                // BusyBox stub or an older build
+          if (vfs_create(nc[i], user_netcfg_elf, user_netcfg_elf_len) == 0) ok++;
+      }
+      debugcon_writestring(ok == 4 ? "[NET] netcfg/ifup/ifdown/ifconfig installed to /bin\n"
+                                   : "[NET] FAIL: could not install netcfg\n"); }
+    // Baked SSH keys -> /root/.ssh/authorized_keys. An existing file (persistent
+    // root) keeps its lines; the baked block is appended when it is missing.
+    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
+      extern int vfs_mkdir(const char*); extern int vfs_write(const char*, size_t, const void*, size_t);
+      extern int vfs_read_all(const char*, void*, size_t);
+      if (!vfs_lookup("/var/log")) vfs_mkdir("/var/log");
+      static const char keys[] = SECOS_AUTHORIZED_KEYS;
+      const size_t klen = SECOS_AUTHORIZED_KEYS_LEN;
+      if (klen) {
+          const char* ak = "/root/.ssh/authorized_keys";
+          if (!vfs_lookup("/root/.ssh")) vfs_mkdir("/root/.ssh");
+          vfs_inode_t* ino = vfs_lookup(ak);
+          int done = 0;
+          if (!ino) {
+              done = vfs_create(ak, keys, klen) == 0;
+          } else if (ino->size < 65536) {
+              static char cur[65536];
+              int n = vfs_read_all(ak, cur, sizeof(cur));
+              int found = 0;
+              for (int i = 0; n > 0 && i + (int)klen <= n && !found; i++) {
+                  size_t j = 0; while (j < klen && cur[i + j] == keys[j]) j++;
+                  found = (j == klen);
+              }
+              done = found || vfs_write(ak, (size_t)(n > 0 ? n : 0), keys, klen) >= 0;
+          }
+          // Dropbear refuses keys under a home it does not trust: /root and
+          // ~/.ssh must be owned by root and not group/world-writable. A
+          // persistent root staged with `mkfs.ext4 -d` carries the build
+          // user's uid, so normalise owner and modes here.
+          { extern int vfs_setattr(const char*, const vfs_attr_t*, unsigned);
+            vfs_attr_t a; a.uid = 0; a.gid = 0; a.atime = a.mtime = 0;
+            a.mode = 0700; vfs_setattr("/root", &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID);
+            vfs_setattr("/root/.ssh", &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID);
+            a.mode = 0600; vfs_setattr(ak, &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID); }
+          debugcon_writestring(done ? "[SSH] baked authorized_keys installed to /root/.ssh\n"
+                                    : "[SSH] FAIL: could not install the baked authorized_keys\n");
+      } else {
+          debugcon_writestring("[SSH] no baked authorized_keys (build with SSH_AUTHORIZED_KEYS=...)\n");
+      } }
+#ifndef SECOS_NO_INIT
+    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
+      extern int vfs_remove(const char*);
+      // A persistent root populated by an older build may hold the M32 demo
+      // init: keep /bin/init in step with the embedded one.
+      vfs_inode_t* ino = vfs_lookup("/bin/init");
+      if (ino && ino->size != user_init_elf_len) { vfs_remove("/bin/init"); ino = NULL; }
+      if (!ino && vfs_create("/bin/init", user_init_elf, user_init_elf_len) != 0)
+          debugcon_writestring("[INIT] FAIL: could not install /bin/init\n");
+#ifdef SECOS_INIT_TAMPER_TEST
+      // Selftest hook: one flipped code byte, so the signature check refuses
+      // /bin/init and the boot must fall back to bash.
+      { extern int vfs_write(const char*, size_t, const void*, size_t);
+        uint8_t b = user_init_elf[0x1000] ^ 0x01;
+        vfs_write("/bin/init", 0x1000, &b, 1);
+        debugcon_writestring("[INIT] TEST: /bin/init tampered\n"); }
+#endif
+      if (!vfs_lookup("/etc/inittab"))
+          vfs_create("/etc/inittab", g_default_inittab, sizeof(g_default_inittab) - 1); }
+#endif
 #if ENABLE_FB
     // Enable the RAM back buffer + auto-flush: rendering/scroll happen in RAM and
     // only the dirty rectangle is written to VRAM — fixes slow scroll on real HW.
@@ -1598,6 +1728,32 @@ __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
                                     : "[M32] FAIL: tampered package accepted\n");
         shell_run_line("run /bin/cat /etc/pkg-motd.txt");
     }
+#endif
+#ifndef SECOS_NO_INIT
+    // [M40] Start /bin/init as PID 1 and wait for it (it never exits in normal
+    // operation; shutdown goes through SYS_REBOOT). Missing or unsigned init:
+    // fall back to the bash login shell below. PID 1 died: say so, stop what
+    // it left behind and give the console to the kernel shell.
+    { extern vfs_inode_t* vfs_lookup(const char*);
+      if (!vfs_lookup("/bin/init")) {
+          terminal_writestring("init: /bin/init not found; falling back to bash\n");
+          debugcon_writestring("[INIT] /bin/init missing; fallback to bash\n");
+      } else {
+          terminal_writestring("Starting /bin/init (PID 1)...\n");
+          static const char* const iav[] = { "init", 0 };
+          int r = shell_exec_foreground("/bin/init", 1, iav, init_mark_pid1, 1);
+          if (r < 0) {
+              terminal_writestring("init: /bin/init could not be started (bad signature?); falling back to bash\n");
+              debugcon_writestring("[INIT] FAIL: /bin/init refused (signature/load); fallback to bash\n");
+          } else {
+              process_set_init_pid(0);
+              terminal_writestring("\n*** PID 1 (/bin/init) exited: stopping its processes, "
+                                   "dropping to the SecOS kernel shell ***\n");
+              debugcon_writestring("[INIT] PID 1 died; fallback to the kernel shell\n");
+              init_kill_orphans();
+              shell_run();
+          }
+      } }
 #endif
 #ifndef SECOS_NO_BASH
     // [M39] Boot into GNU bash as the interactive login shell. When bash exits

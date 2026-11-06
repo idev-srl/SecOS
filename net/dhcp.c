@@ -4,11 +4,12 @@
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
  *
- * A minimal four-way DISCOVER/OFFER/REQUEST/ACK client. Runs synchronously from
- * the shell/idle context: it sends a broadcast request, then spins on `hlt` so
- * the timer tick drives net_tick()->poll and the OFFER/ACK arrive via the bound
- * UDP callback (the same RX trick the ping self-test uses). On ACK it writes the
- * lease (IP / netmask / router / DNS) into the net_dev_t.
+ * A minimal four-way DISCOVER/OFFER/REQUEST/ACK client. The exchange is an
+ * asynchronous state machine (dhcp_start/dhcp_poll): replies arrive through the
+ * bound UDP callback and dhcp_poll() sends the next message or retries. The
+ * kernel shell's `dhcp` spins on it with `hlt` (dhcp_configure); ring 3 (init's
+ * `ifup`) polls it through SYS_NETCTL. On ACK it writes the lease (IP / netmask
+ * / router / DNS) into the net_dev_t.
  */
 #include "udp.h"
 #include "debugcon.h"
@@ -117,56 +118,124 @@ static uint32_t dhcp_build(net_dev_t* dev, struct dhcp_state* st, uint8_t msg_ty
     return o;
 }
 
-// Spin (hlt) until *flag is set or the deadline passes. Returns 1 if set.
-static int dhcp_wait(volatile int* flag, uint64_t ms) {
-    uint64_t deadline = timer_get_ticks() + ms;    /* 1 kHz tick ~= 1 ms */
-    while (timer_get_ticks() < deadline && !*flag)
-        __asm__ volatile ("sti; hlt");
-    return *flag;
+/* ---- Asynchronous client ---------------------------------------------------
+ * One exchange at a time, driven by dhcp_poll(): the UDP callback (RX path)
+ * only records OFFER/ACK/NAK in g_dh.st, and dhcp_poll() moves the state
+ * machine on (send REQUEST, retry, give up) from the caller's context. The
+ * kernel shell spins on it (dhcp_configure); ring 3 polls it through
+ * SYS_NETCTL between sleeps (net/netctl.c), so no syscall spins in ring 0
+ * waiting for the network. */
+#define DHCP_ATTEMPTS   4
+#define DHCP_STEP_MS    1000     /* wait per OFFER and per ACK (1 kHz tick) */
+
+static struct {
+    net_dev_t*        dev;
+    struct dhcp_state st;
+    int               phase;     /* DHCP_PH_* */
+    int               attempt;
+    uint64_t          deadline;
+    uint32_t          old_ip, old_mask, old_gw, old_dns;
+} g_dh;
+static net_dev_t* g_lease_dev;   /* the NIC whose address came from a DHCP ACK */
+
+static void dhcp_send(uint8_t msg) {
+    uint32_t n = dhcp_build(g_dh.dev, &g_dh.st, msg);
+    udp_send(g_dh.dev, 0xFFFFFFFFu, 68, 67, g_pkt, n);
+    g_dh.deadline = timer_get_ticks() + DHCP_STEP_MS;
 }
 
-int dhcp_configure(net_dev_t* dev) {
-    if (!dev) return -1;
-    struct dhcp_state st;
-    for (size_t i = 0; i < sizeof(st); i++) ((uint8_t*)&st)[i] = 0;
-    /* xid: mix MAC + uptime so retries differ. */
-    st.xid = ((uint32_t)dev->mac[2]<<24) ^ ((uint32_t)dev->mac[3]<<16)
-           ^ ((uint32_t)dev->mac[4]<<8) ^ dev->mac[5] ^ (uint32_t)timer_get_ticks();
+static void dhcp_discover(void) {
+    g_dh.st.got_offer = 0; g_dh.st.got_ack = 0; g_dh.st.got_nak = 0;
+    g_dh.phase = DHCP_PH_DISCOVER;
+    dhcp_send(DHCP_DISCOVER);
+}
 
-    /* DHCP runs with an unconfigured source: clear the address so ipv4_send uses
-     * 0.0.0.0 and ipv4_input accepts the broadcast reply. */
-    uint32_t old_ip=dev->ip, old_mask=dev->netmask, old_gw=dev->gateway, old_dns=dev->dns;
-    dev->ip = 0; dev->netmask = 0; dev->gateway = 0; dev->dns = 0;
+static void dhcp_restore(void) {
+    net_dev_t* dev = g_dh.dev;
+    dev->ip = g_dh.old_ip; dev->netmask = g_dh.old_mask;
+    dev->gateway = g_dh.old_gw; dev->dns = g_dh.old_dns;
+}
 
-    if (udp_bind(68, dhcp_cb, &st) != 0) { dev->ip=old_ip; dev->netmask=old_mask; dev->gateway=old_gw; dev->dns=old_dns; return -1; }
-
-    int ok = 0;
-    for (int attempt = 0; attempt < 4 && !ok; attempt++) {
-        st.got_offer = 0;
-        uint32_t n = dhcp_build(dev, &st, DHCP_DISCOVER);
-        udp_send(dev, 0xFFFFFFFFu, 68, 67, g_pkt, n);
-        if (!dhcp_wait(&st.got_offer, 1000)) continue;     /* no OFFER, retry */
-
-        st.got_ack = 0; st.got_nak = 0;
-        n = dhcp_build(dev, &st, DHCP_REQUEST);
-        udp_send(dev, 0xFFFFFFFFu, 68, 67, g_pkt, n);
-        if (dhcp_wait(&st.got_ack, 1000)) ok = 1;
-    }
-
+static void dhcp_finish(int ok) {
+    net_dev_t* dev = g_dh.dev;
     udp_unbind(68);
-
     if (!ok) {
         debugcon_writestring("[DHCP] no lease (timeout)\n");
-        dev->ip=old_ip; dev->netmask=old_mask; dev->gateway=old_gw; dev->dns=old_dns;
-        return -1;
+        dhcp_restore();
+        g_dh.phase = DHCP_PH_FAILED;
+        return;
     }
-    dev->ip      = st.yiaddr;
-    dev->netmask = st.mask ? st.mask : 0x00FFFFFFu;        /* default /24 if absent */
-    dev->gateway = st.router;
-    dev->dns     = st.dns ? st.dns : st.server_id;
+    dev->ip      = g_dh.st.yiaddr;
+    dev->netmask = g_dh.st.mask ? g_dh.st.mask : 0x00FFFFFFu;   /* default /24 if absent */
+    dev->gateway = g_dh.st.router;
+    dev->dns     = g_dh.st.dns ? g_dh.st.dns : g_dh.st.server_id;
+    g_lease_dev  = dev;
+    g_dh.phase   = DHCP_PH_BOUND;
     debugcon_writestring("[DHCP] lease ip="); debugcon_print_hex(dev->ip);
     debugcon_writestring(" gw="); debugcon_print_hex(dev->gateway);
     debugcon_writestring(" dns="); debugcon_print_hex(dev->dns);
     debugcon_writestring("\n");
+}
+
+int dhcp_start(net_dev_t* dev) {
+    if (!dev) return -19;                                       /* -ENODEV */
+    uint64_t now = timer_get_ticks();
+    int busy = (g_dh.phase == DHCP_PH_DISCOVER || g_dh.phase == DHCP_PH_REQUEST);
+    /* An exchange nobody has polled for a while (its caller was killed) is
+     * stale: take it over instead of refusing forever. */
+    if (busy && now < g_dh.deadline + 2 * DHCP_STEP_MS) return -16;   /* -EBUSY */
+    if (busy) { udp_unbind(68); dhcp_restore(); }
+    g_dh.dev = dev;
+    g_dh.old_ip = dev->ip; g_dh.old_mask = dev->netmask;
+    g_dh.old_gw = dev->gateway; g_dh.old_dns = dev->dns;
+    for (size_t i = 0; i < sizeof(g_dh.st); i++) ((uint8_t*)&g_dh.st)[i] = 0;
+    g_dh.attempt = 0;
+    /* xid: mix MAC + uptime so retries differ. */
+    g_dh.st.xid = ((uint32_t)dev->mac[2]<<24) ^ ((uint32_t)dev->mac[3]<<16)
+                ^ ((uint32_t)dev->mac[4]<<8) ^ dev->mac[5] ^ (uint32_t)now;
+    if (g_lease_dev == dev) g_lease_dev = NULL;
+    /* DHCP runs with an unconfigured source: clear the address so ipv4_send uses
+     * 0.0.0.0 and ipv4_input accepts the broadcast reply. */
+    dev->ip = 0; dev->netmask = 0; dev->gateway = 0; dev->dns = 0;
+    if (udp_bind(68, dhcp_cb, &g_dh.st) != 0) {
+        dhcp_restore();
+        g_dh.phase = DHCP_PH_FAILED;
+        return -16;                                             /* -EBUSY */
+    }
+    debugcon_writestring("[DHCP] DISCOVER on "); debugcon_writestring(dev->name);
+    debugcon_writestring("\n");
+    dhcp_discover();
     return 0;
+}
+
+int dhcp_poll(net_dev_t* dev) {
+    if (dev && dev != g_dh.dev) return DHCP_PH_IDLE;
+    uint64_t now = timer_get_ticks();
+    if (g_dh.phase == DHCP_PH_DISCOVER) {
+        if (g_dh.st.got_offer) {
+            g_dh.st.got_ack = 0; g_dh.st.got_nak = 0;
+            g_dh.phase = DHCP_PH_REQUEST;
+            dhcp_send(DHCP_REQUEST);
+        } else if (now >= g_dh.deadline) {
+            if (++g_dh.attempt >= DHCP_ATTEMPTS) dhcp_finish(0);
+            else dhcp_discover();
+        }
+    } else if (g_dh.phase == DHCP_PH_REQUEST) {
+        if (g_dh.st.got_ack) dhcp_finish(1);
+        else if (g_dh.st.got_nak || now >= g_dh.deadline) {
+            if (++g_dh.attempt >= DHCP_ATTEMPTS) dhcp_finish(0);
+            else dhcp_discover();
+        }
+    }
+    return g_dh.phase;
+}
+
+int dhcp_has_lease(const net_dev_t* dev) { return dev && g_lease_dev == dev; }
+
+int dhcp_configure(net_dev_t* dev) {
+    if (dhcp_start(dev) < 0) return -1;
+    int ph;
+    while ((ph = dhcp_poll(dev)) == DHCP_PH_DISCOVER || ph == DHCP_PH_REQUEST)
+        __asm__ volatile ("sti; hlt");   /* the tick drives RX and the deadlines */
+    return ph == DHCP_PH_BOUND ? 0 : -1;
 }

@@ -635,6 +635,15 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
         if(copy_from_user(u.p, (const uint8_t*)ubuf+done, (size_t)want)!=0){ if(done==0) err=-EFAULT; break; }
         int r;
         if(ino){
+            // O_APPEND: every write goes to the current end of file (POSIX).
+            // The offset is per-fd, so writers sharing a log through fork
+            // (a daemon and its children) overwrote each other's lines.
+            // The fd's inode does not track writes made through other fds
+            // (ramfs keeps the size in its entry), so look the size up fresh.
+            if(c->fds[fd].flags & 0x400){
+                vfs_inode_t* cur = vfs_lookup(ino->path);
+                c->fds[fd].offset = (cur == ino || (cur && cur->fs_data == ino->fs_data)) ? cur->size : ino->size;
+            }
             size_t off=c->fds[fd].offset;
             r=ino->ops->write(ino, off, u.p, (size_t)want);
             if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); }
@@ -1362,6 +1371,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     // Sessions (pseudo-terminal support).
     case SYS_SETSID:  return (uint64_t)(int64_t)ksys_setsid();
     case SYS_GETSID:  return (uint64_t)(int64_t)ksys_getsid((int)a0);
+    case SYS_NETCTL: {                        // NIC config + DHCP from ring 3 (CAP_NET)
+        extern long ksys_netctl(uint64_t, uint64_t, uint64_t);
+        return (uint64_t)(int64_t)ksys_netctl(a0, a1, a2);
+    }
 
     case SYS_FSTAT: {
         struct secos_stat kst;

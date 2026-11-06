@@ -1059,7 +1059,7 @@ grep -q "LJ-42-END" "$LJLOG"; check "bash responsive after the job-control seque
 # ============================================================================
 # bash's fork+execve now replaces the forked child in place, so $! is the pid
 # of the program itself (the kernel logs "[EXEC] execve pid=<p> path=..."),
-# `exec cmd` replaces bash (the kernel's recovery shell takes over when cmd
+# `exec cmd` replaces bash (init respawns the console shell when cmd
 # exits), a script without an ELF header gets ENOEXEC and bash runs it, and the
 # environment crosses exec. Markers only appear once expanded.
 BXLOG=/tmp/secos_selftest_bashexec.log
@@ -1087,8 +1087,8 @@ grep -q "BX4-rc-127" "$BXLOG"; check "bash: exec of a missing file fails with 12
 grep -q "BX5-5" "$BXLOG"; check "bash: a script (ENOEXEC) runs through bash" $?
 grep -q "BX6-bar42" "$BXLOG"; check "bash: environment crosses execve" $?
 grep -q "BX7-7" "$BXLOG"; check "bash: exec replaces the login shell" $?
-sed -n '/BX7-7/,$p' "$BXSER" | grep -q "secos:/"
-check "recovery shell takes over after the exec'd program exits" $?
+sed -n '/BX7-7/,$p' "$BXSER" | grep -q "\[init\] started console"
+check "init respawns the console shell after the exec'd program exits" $?
 ! grep -q "\[EXC\]" "$BXLOG"; check "no CPU exception ([EXC]) during bash execve run" $?
 
 # ============================================================================
@@ -1356,7 +1356,7 @@ fi
 # (2) HEAP_CORRUPT_DEMO=1: a 1-byte overflow past kmalloc(100) must panic at
 #     kfree with the tail-canary message; =2: a double free must panic as such.
 # (3) -DSECOS_HEAP_DEBUG (poison-on-free + periodic full check): boot into
-#     bash, run a command burst, drop to the recovery shell and `heapcheck` —
+#     bash, run a command burst, kill PID 1 (init) to drop to the recovery shell and `heapcheck` —
 #     no false positive, heap sound.
 HEAPLOG=/tmp/secos_selftest_heap.log
 echo "[selftest] Building heap-hardening image (default)..."
@@ -1396,7 +1396,7 @@ fi
 ( sleep 25
   for i in $(seq 1 15); do printf '  ls /\r'; sleep 0.6; printf '  cat /proc/meminfo\r'; sleep 0.6; done
   printf '  echo HEAPDBG-$((6*7))-OK\r'; sleep 3
-  printf '  exit\r'; sleep 4
+  printf '  kill -9 1\r'; sleep 6
   printf '  heapcheck\r'; sleep 4 ) | \
     timeout 90 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
         -debugcon file:"$HDBGLOG" -global isa-debugcon.iobase=0xe9 \
@@ -1556,12 +1556,13 @@ fsck.fat -n "$KIFAT" >/dev/null 2>&1; check "KIFACE FAT32 data disk fsck.fat-cle
 # ---- SSH: Dropbear (from source) — non-interactive exec over QEMU hostfwd ----
 # ============================================================================
 # Boots the default image with a user-net NIC forwarding a host port to guest
-# :22, takes a DHCP lease from the kernel shell, installs a throwaway test key
-# (generated here, never committed) as /root/.ssh/authorized_keys, starts
-# `dropbearmulti dropbear -F -R` from bash and runs ssh from the host: an exec
+# :22. init has already taken a DHCP lease and started dropbear (-F -R); the
+# console bash installs a throwaway test key (generated here, never committed)
+# as /root/.ssh/authorized_keys by hand, and ssh runs from the host: an exec
 # channel with output + exit status, stderr, a wrong key, an unknown user and a
 # password-only client (password auth is compiled out). Needs host ssh +
 # ssh-keygen, and a kernel with SYS_POLL (78); otherwise SKIP. See docs/SSH.md.
+# (The INIT gate at the end covers the baked-key, zero-step boot.)
 SSHLOG=/tmp/secos_selftest_ssh.log
 if ! command -v ssh >/dev/null 2>&1 || ! command -v ssh-keygen >/dev/null 2>&1; then
     echo "  [SKIP] SSH gate (host has no ssh / ssh-keygen)"
@@ -1579,12 +1580,11 @@ else
         echo "RC=$?" >>"$out"
     }
     : > "$SSHLOG"
-    ( sleep 25; printf '  exit\r'; sleep 3; printf '  dhcp\r'; sleep 8
-      printf '  run /bin/bash\r'; sleep 6
-      printf '  mkdir /root/.ssh\r'; sleep 2
+    ( sleep 25
+      printf '  mkdir -p /root/.ssh\r'; sleep 2
       printf "  echo '%s' > /root/.ssh/authorized_keys\r" "$SSHPUB"; sleep 2
-      printf '  dropbearmulti dropbear -F -R -p 22 &\r'; sleep 6
       sshq "$SSHDIR/o1" -i "$SSHDIR/id" -o IdentitiesOnly=yes root@localhost 'echo SSH-$((6*7))-OK; uname -s'
+      sshq "$SSHDIR/o9" -i "$SSHDIR/id" -o IdentitiesOnly=yes root@localhost 'cat /var/log/sshd.log'
       sshq "$SSHDIR/o2" -i "$SSHDIR/id" -o IdentitiesOnly=yes root@localhost 'echo SSH-ERR >&2; exit 3'
       sshq "$SSHDIR/o3" -i "$SSHDIR/bad" -o IdentitiesOnly=yes root@localhost 'echo SSH-BADKEY-RAN'
       sshq "$SSHDIR/o4" -i "$SSHDIR/id" -o IdentitiesOnly=yes nobody@localhost 'echo SSH-NOUSER-RAN'
@@ -1605,12 +1605,12 @@ else
             -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$SSHPORT"-:22 -device e1000,netdev=n0 \
             -debugcon file:"$SSHLOG" -global isa-debugcon.iobase=0xe9 \
             -no-reboot -display none -serial stdio >/dev/null 2>&1
-    for f in o1 o2 o3 o4 o5 o6 o7 o8; do { echo "--- $f"; cat "$SSHDIR/$f" 2>/dev/null; } >>"$SSHLOG"; done
+    for f in o1 o2 o3 o4 o5 o6 o7 o8 o9; do { echo "--- $f"; cat "$SSHDIR/$f" 2>/dev/null; } >>"$SSHLOG"; done
     if grep -q "has no poll() (SYS_POLL 78)" "$SSHLOG"; then
         echo "  [SKIP] SSH gate (kernel lacks SYS_POLL 78; Dropbear needs poll/select)"
     else
         grep -q "\[SSH\] installed dropbear to /bin/dropbearmulti" "$SSHLOG"; check "SSH dropbearmulti installed to /bin at boot" $?
-        grep -q "Generated hostkey /etc/dropbear/dropbear_ed25519_host_key" "$SSHLOG"; check "SSH ed25519 host key generated on first connection (-R)" $?
+        grep -q "Generated hostkey /etc/dropbear/dropbear_ed25519_host_key" "$SSHDIR/o9"; check "SSH ed25519 host key generated on first connection (-R, /var/log/sshd.log)" $?
         grep -q "^SSH-42-OK" "$SSHDIR/o1" && grep -q "^SecOS" "$SSHDIR/o1" && grep -q "^RC=0" "$SSHDIR/o1"
         check "SSH exec channel: output + uname, exit status 0" $?
         grep -q "^SSH-ERR" "$SSHDIR/o2" && grep -q "^RC=3" "$SSHDIR/o2"; check "SSH exec channel: stderr forwarded, exit status 3 propagated" $?
@@ -1806,6 +1806,113 @@ if make iso KEYMAP=it >/tmp/secos_selftest_build.log 2>&1; then
 else
     echo "[selftest] KEYMAP=it BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     check "M40 keymap: make KEYMAP=it builds" 1
+fi
+
+# ============================================================================
+# INIT GATE: /bin/init as PID 1 — a ready system with no manual steps.
+# (a) An image built with SSH_AUTHORIZED_KEYS=<throwaway key generated here>
+#     boots with a user-net NIC: init must be PID 1, ifup must take a DHCP
+#     lease on its own, dropbear must be supervised, and ssh from the host must
+#     work straight away (uname, ps, /proc/1/cmdline, ifconfig). The console
+#     bash answers over serial, respawns after `exit`, an orphan is reaped by
+#     init, and `poweroff` goes through init and makes QEMU exit by itself.
+# (b) Same image, NIC without a DHCP server: ifup times out, the boot goes on;
+#     then `kill -9 1` -> the kernel logs PID 1's death and the kernel shell
+#     takes the console.
+# (c) -DSECOS_INIT_TAMPER_TEST: /bin/init fails its signature check -> boot
+#     falls back to the bash login shell.
+# The host port is per run (23000-23999), never the user's 2222.
+# ============================================================================
+INITLOG=/tmp/secos_selftest_init.log
+INITSER=/tmp/secos_selftest_init.serial
+if ! command -v ssh >/dev/null 2>&1 || ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "  [SKIP] INIT gate (host has no ssh / ssh-keygen)"
+else
+    INITDIR=$(mktemp -d /tmp/secos_selftest_init.XXXXXX)
+    ssh-keygen -q -t ed25519 -N '' -C secos-init-selftest -f "$INITDIR/id"
+    INITPORT=$((23000 + $$ % 1000))
+    echo "[selftest] Building the default image with a baked throwaway SSH key..."
+    make clean >/dev/null 2>&1 || true
+    if ! make iso SSH_AUTHORIZED_KEYS="$INITDIR/id.pub" >/tmp/secos_selftest_build.log 2>&1; then
+        echo "[selftest] INIT BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+        exit 2
+    fi
+    initssh() { # initssh <out> <command>
+        timeout 40 ssh -p "$INITPORT" -i "$INITDIR/id" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR \
+            root@localhost "$2" </dev/null >"$1" 2>&1
+        echo "RC=$?" >>"$1"
+    }
+    echo "[selftest] Running init PID 1 boot: DHCP + sshd + console + poweroff (mb2, ~90s)..."
+    : > "$INITLOG"
+    ( sleep 30
+      initssh "$INITDIR/s1" 'uname -a; ps; echo CMDLINE-$(cat /proc/1/cmdline); ifconfig'
+      printf '  echo INITCON-$((6*7))\r'; sleep 3
+      printf '  exit\r'; sleep 4
+      printf '  echo RESPAWN-$((1+1))\r'; sleep 3
+      printf '  bash -c "sleep 1 &"; sleep 3; echo ORPHAN-$((2+3))\r'; sleep 6
+      printf '  poweroff\r'; sleep 1 ) | \
+        timeout 90 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+            -netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$INITPORT"-:22 -device e1000,netdev=n0 \
+            -debugcon file:"$INITLOG" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -serial stdio >"$INITSER" 2>&1
+    init_rc=$?
+    { echo "--- s1"; cat "$INITDIR/s1"; } >>"$INITLOG"
+    grep -q "\[INIT\] /bin/init started, pid=0x0000000000000001 (PID 1)" "$INITLOG"; check "INIT /bin/init started by the kernel as PID 1" $?
+    grep -q "\[init\] SecOS init (pid 1): 3 entries from /etc/inittab" "$INITSER"; check "INIT reads the default /etc/inittab" $?
+    grep -q "\[SSH\] baked authorized_keys installed to /root/.ssh" "$INITLOG"; check "INIT baked SSH key installed as /root/.ssh/authorized_keys" $?
+    grep -q "\[DHCP\] lease ip=" "$INITLOG" && grep -q "ifup: eth0: lease 10.0.2.15/24 gw 10.0.2.2" "$INITSER"
+    check "INIT networking came up by itself (ifup took a DHCP lease)" $?
+    grep -q "\[init\] started sshd (/bin/dropbearmulti) pid" "$INITSER"; check "INIT sshd started as a supervised service" $?
+    grep -q "^SecOS secos" "$INITDIR/s1" && grep -q "^RC=0" "$INITDIR/s1"; check "INIT ssh with the baked key works at once (uname -a, rc 0)" $?
+    grep -Eq "^ +1 root .* init$" "$INITDIR/s1" && grep -q "^CMDLINE-init" "$INITDIR/s1"; check "INIT ps / /proc/1/cmdline show init as PID 1" $?
+    grep -Eq "dropbearmulti dropbear -F -R -p 22$" "$INITDIR/s1" && grep -Eq "/bin/bash -i$" "$INITDIR/s1"
+    check "INIT ps shows the supervised sshd and the console bash" $?
+    grep -q "UP RUNNING dhcp" "$INITDIR/s1"; check "INIT ifconfig reports the DHCP lease" $?
+    grep -q "^INITCON-42" "$INITSER"; check "INIT console bash works over serial" $?
+    grep -q "^RESPAWN-2" "$INITSER" && [[ "$(grep -c "\[init\] started console" "$INITSER")" -ge 2 ]]
+    check "INIT console bash respawns after exit" $?
+    grep -q "\[init\] reaped orphan pid" "$INITSER" && grep -q "^ORPHAN-5" "$INITSER"; check "INIT reaps an orphan re-parented to PID 1" $?
+    grep -q "\[init\] shutdown requested (power off)" "$INITSER" && grep -q "\[POWER\] poweroff requested by pid=0x0000000000000001" "$INITLOG"
+    check "INIT poweroff goes through init (stop services, sync, SYS_REBOOT)" $?
+    [[ $init_rc -eq 0 ]]; check "INIT poweroff makes QEMU exit by itself (rc=$init_rc, 124 = hung)" $?
+    ! grep -q "\[EXC\]\|\[PANIC\]" "$INITLOG"; check "INIT no CPU exception or panic" $?
+
+    INITLOG2=/tmp/secos_selftest_init_nodhcp.log
+    echo "[selftest] Running init with no DHCP server, then kill -9 1 (mb2, ~60s)..."
+    : > "$INITLOG2"
+    ( sleep 32; printf '  echo NODHCP-$((4+4))\r'; sleep 3
+      printf '  kill -9 1\r'; sleep 6
+      printf '  vls /etc\r'; sleep 3 ) | \
+        timeout 60 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+            -netdev socket,id=n0,mcast=230.0.0.1:$INITPORT -device e1000,netdev=n0 \
+            -debugcon file:"$INITLOG2" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -serial stdio >"$INITSER.2" 2>&1
+    grep -q "ifup: eth0: no DHCP lease" "$INITSER.2" && grep -q "^NODHCP-8" "$INITSER.2"
+    check "INIT no DHCP server: ifup times out and the boot goes on" $?
+    grep -q "\[INIT\] PID 1 (/bin/init) exited" "$INITLOG2" && grep -q "\[INIT\] PID 1 died; fallback to the kernel shell" "$INITLOG2"
+    check "INIT death of PID 1 is logged" $?
+    grep -q "inittab" "$INITSER.2" && grep -q "secos:/" "$INITSER.2"; check "INIT kernel shell takes the console after PID 1 dies" $?
+    ! grep -q "\[EXC\]\|\[PANIC\]" "$INITLOG2"; check "INIT no CPU exception or panic (no DHCP, PID 1 killed)" $?
+
+    INITLOG3=/tmp/secos_selftest_init_tamper.log
+    echo "[selftest] Building -DSECOS_INIT_TAMPER_TEST and running the fallback (mb2, ~40s)..."
+    make clean >/dev/null 2>&1 || true
+    if ! make iso CFLAGS_EXTRA=-DSECOS_INIT_TAMPER_TEST >/tmp/secos_selftest_build.log 2>&1; then
+        echo "[selftest] INIT TAMPER BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+        exit 2
+    fi
+    : > "$INITLOG3"
+    ( sleep 25; printf '  echo FALLBACK-$((5+5))\r'; sleep 4 ) | \
+        timeout 40 qemu-system-x86_64 -cdrom myos.iso -boot d -m 256M \
+            -debugcon file:"$INITLOG3" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -serial stdio >"$INITSER.3" 2>&1
+    grep -q "\[INIT\] FAIL: /bin/init refused (signature/load); fallback to bash" "$INITLOG3"
+    check "INIT unsigned /bin/init is refused" $?
+    grep -q "falling back to bash" "$INITSER.3" && grep -q "^FALLBACK-10" "$INITSER.3"; check "INIT fallback: the bash login shell works" $?
+    rm -rf "$INITDIR"
+    make clean >/dev/null 2>&1 || true
+    make iso >/tmp/secos_selftest_build.log 2>&1   # leave a plain default image behind
 fi
 
 echo "[selftest] ---"

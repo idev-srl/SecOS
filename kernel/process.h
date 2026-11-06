@@ -204,5 +204,10 @@ void process_foreach(void (*cb)(process_t*, void*), void* user);
 process_t* process_reap_one(uint32_t affinity); // [M29] detach+return one ZOMBIE
 int process_destroy(process_t* p);
 void process_release_pipes(process_t* p); // drop pipe ends + sockets at exit (EOF to peers)
+// PID 1: the kernel records /bin/init's pid; exiting processes' children are
+// re-parented to it (returns 1 if one of them is already a zombie).
+void     process_set_init_pid(uint32_t pid);
+uint32_t process_init_pid(void);
+int      process_reparent_children(uint32_t dead);
 
 #endif // PROCESS_H

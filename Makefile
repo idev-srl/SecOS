@@ -121,6 +121,7 @@ SRC_C   = \
 	$(NET_DIR)/icmp.c \
 	$(NET_DIR)/udp.c \
 	$(NET_DIR)/dhcp.c \
+	$(NET_DIR)/netctl.c \
 	$(NET_DIR)/dns.c \
 	$(NET_DIR)/tcp.c \
 	$(NET_DIR)/socket.c \
@@ -204,6 +205,19 @@ $(CRYPTO_DIR)/%.o: $(CRYPTO_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(NET_DIR)/%.o: $(NET_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# SSH public keys baked into the image: `make iso SSH_AUTHORIZED_KEYS=~/.ssh/id.pub`
+# (one or more .pub / authorized_keys files, space-separated). The kernel installs
+# them as /root/.ssh/authorized_keys at boot. Without the variable no key is baked
+# and Dropbear refuses every login. The generated header lives in build/ (ignored
+# by git) and is rewritten only when the key set changes. Never commit a key.
+SSH_AUTHORIZED_KEYS ?=
+AUTHKEYS_H = build/authorized_keys.h
+.PHONY: FORCE
+FORCE:
+$(AUTHKEYS_H): FORCE
+	@python3 tools/gen-authorized-keys.py $@ $(SSH_AUTHORIZED_KEYS)
+$(KERNEL_DIR)/kernel.o: $(AUTHKEYS_H)
 
 $(KERNEL): $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
@@ -404,6 +418,11 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/power.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/power.o
 	python3 tools/secos-sign user/power.elf --dev
 	python3 tools/elf2h.py user/power.elf user_power_elf crypto/user_power_elf.h
+	# netcfg/ifup/ifdown/ifconfig over SYS_NETCTL (CAP_NET manifest)
+	$(CC) $(USER_CFLAGS) -c user/netcfg.c      -o user/netcfg.o
+	$(LD) --gc-sections -T user/user.ld -o user/netcfg.elf user/crt0.o user/note_net.o user/libsecos.o user/libc.o user/netcfg.o
+	python3 tools/secos-sign user/netcfg.elf --dev
+	python3 tools/elf2h.py user/netcfg.elf user_netcfg_elf crypto/user_netcfg_elf.h
 	# in-place execve test (EXECVE_DEMO): signed build + an unsigned twin
 	$(CC) $(USER_CFLAGS) -c user/exectest.c   -o user/exectest.o
 	$(LD) --gc-sections -T user/user.ld -o user/exectest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/exectest.o
@@ -441,7 +460,7 @@ user-progs:
 	python3 tools/secos-sign user/loadkeys.elf --dev
 	python3 tools/elf2h.py user/loadkeys.elf user_loadkeys_elf crypto/user_loadkeys_elf.h
 	$(MAKE) --no-print-directory gui-progs
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
 
 # Graphical UI (docs/GUI.md): the secwm compositor + terminal (signed
 # CAP_INPUT|CAP_DISPLAY, the only program holding fb0 and the input devices),

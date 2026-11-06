@@ -74,47 +74,60 @@ it, and signals and timeouts. Everything else is denied and audited, including
 so the program cannot widen them. The session shell is a separate signed
 program (`/bin/bash`) and runs under its own manifest.
 
-## How to run it (QEMU, host port 2222 to guest port 22)
+## Quick start (QEMU, host port 2222 to guest port 22)
 
-1. Boot with a NIC and a host port forward (`make run-ssh` does exactly this). Use `-cpu max` (or
-   `-enable-kvm -cpu host`) so the guest has RDRAND/RDSEED, which seed the
-   kernel RNG (see [Security notes](#security-notes)):
+1. Build with your public key baked in (it is compiled into the kernel and
+   installed as `/root/.ssh/authorized_keys` at boot; never commit a key):
    ```
-   make iso
+   ssh-keygen -t ed25519 -f ~/.ssh/secos_ed25519      # once
+   make iso SSH_AUTHORIZED_KEYS=~/.ssh/secos_ed25519.pub
+   ```
+2. Boot with a NIC and a host port forward (`make run-ssh` does exactly
+   this). Use `-cpu max` (or `-enable-kvm -cpu host`) so the guest has
+   RDRAND/RDSEED, which seed the kernel RNG (see
+   [Security notes](#security-notes)):
+   ```
    qemu-system-x86_64 -cdrom myos.iso -boot d -m 512M -cpu max \
        -netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0 \
        -serial stdio -display none -no-reboot
    ```
-2. Bring the network up. DHCP currently lives in the kernel shell, so leave
-   bash with `exit`, run `dhcp`, then start bash again with `run /bin/bash`.
-3. Install your public key, as in the next section.
-4. Start the server in the foreground or as a background job. `-R` generates
-   the ed25519 host key on first use:
+   `/bin/init` (PID 1) takes a DHCP lease (`ifup`), starts
+   `dropbearmulti dropbear -F -R -p 22` as a supervised service and opens a
+   bash on the console. There are no manual steps.
+3. From the host (WSL):
    ```
-   dropbearmulti dropbear -F -R -p 22 &
-   ```
-   Dropbear logs to stderr; syslog is compiled out, so there is no `-E` flag.
-   To use a key generated ahead of time instead:
-   `dropbearmulti dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key`
-   followed by `dropbearmulti dropbear -F -p 22`.
-5. From the host (WSL):
-   ```
-   ssh -p 2222 root@localhost 'echo hi; uname -a'
+   ssh -i ~/.ssh/secos_ed25519 -p 2222 root@localhost
    ```
    The host key changes every boot unless the root filesystem is persistent.
    Add `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` for
    throwaway VMs, or pin the fingerprint that Dropbear logs.
+
+The same `kernel.bin` carries the keys on the UEFI path (`make uefi
+SSH_AUTHORIZED_KEYS=...`). Without `SSH_AUTHORIZED_KEYS` there is no
+`authorized_keys` file and every login is refused until you install a key by
+hand (next section).
+
+The service and its boot order are in `/etc/inittab` (format:
+[docs/devlog/M40-init.md](devlog/M40-init.md)). Dropbear's log is
+`/var/log/sshd.log`; syslog is compiled out. `-R` generates the ed25519 host key
+on the first connection. To use a key generated ahead of time instead, run
+`dropbearmulti dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key`
+and drop `-R` from the inittab line. `ifconfig` shows the lease; `ifup` takes a
+new one.
 
 The multi-call binary dispatches on its first argument:
 `dropbearmulti dropbear|dropbearkey|dbclient ...`. The ramfs root has no
 symlinks, so `/bin/dropbear` does not exist. On a persistent ext2/ext4 root you
 can `ln -s dropbearmulti /bin/dropbear`.
 
-## Installing your key
+## Installing your key by hand
 
-Dropbear reads `~root/.ssh/authorized_keys`, which is
-`/root/.ssh/authorized_keys`. `dropbear -D <dir>` selects another directory,
-for example `/etc/dropbear`. On the host:
+The baked key (above) is the normal way. Dropbear reads
+`~root/.ssh/authorized_keys`, which is `/root/.ssh/authorized_keys`.
+`dropbear -D <dir>` selects another directory, for example `/etc/dropbear`.
+On a persistent root, the kernel appends the baked block to an existing file
+when it is missing and leaves the other lines alone. To add a key without
+rebuilding, on the host:
 
 ```
 ssh-keygen -t ed25519 -f ~/.ssh/secos_ed25519
@@ -281,13 +294,18 @@ ssh then continues without a tty.
 
 `tools/selftest.sh`, section **SSH: Dropbear**, log `/tmp/secos_selftest_ssh.log`.
 The gate boots the default image with `-netdev user,hostfwd=tcp:127.0.0.1:<port>-:22`,
-using a per-run port in 22000-22999. It takes a lease, installs a key generated
-at test time (no private key is committed), starts dropbear, and checks from
-the host:
+using a per-run port in 22000-22999. init has already taken the lease and
+started dropbear. The gate installs a key generated at test time by hand (no
+private key is committed) and checks from the host:
 exec output and exit status 0; stderr and exit status 3; wrong key, unknown
-user and password-only client refused; a 6th sequential session; no
-`[EXC]`/`[PANIC]`. It SKIPs if the host lacks `ssh`/`ssh-keygen`, or if the
+user and password-only client refused; a 6th sequential session; pty sessions
+and window changes; the host key generated on first use (`/var/log/sshd.log`);
+no `[EXC]`/`[PANIC]`. It SKIPs if the host lacks `ssh`/`ssh-keygen`, or if the
 kernel has no `SYS_POLL`.
+
+The **INIT** gate (end of `tools/selftest.sh`, port 23000-23999) covers the
+zero-step boot: an image built with `SSH_AUTHORIZED_KEYS=<throwaway key>`
+must accept `ssh ... 'uname -a; ps'` with no console input at all.
 
 ## What's pending
 
@@ -298,9 +316,9 @@ kernel has no `SYS_POLL`.
   behaviour), so `ssh -tt host cmd </dev/null` hangs the shell up early.
   Still to check by hand: the login shell (`-bash`) of a session with no
   command on a real terminal.
-- **Init-managed service:** start `dropbear -R -p 22` from `/bin/init`, after
-  DHCP, with the host key on the persistent root. DHCP should also run from
-  init or userland, not only the kernel shell.
+- **Init-managed service: done** (M40). `/bin/init` takes the DHCP lease
+  through `SYS_NETCTL` and supervises Dropbear. The host key persists on a
+  persistent root. See [docs/devlog/M40-init.md](devlog/M40-init.md).
 - Kernel O_NONBLOCK for pipes is done (the user-space emulation and the
   poll/select shims are gone; passwd/group come from libc's `/etc/passwd`
   reader, shared with bash). Still in the port: the POSIX sockets API (libc

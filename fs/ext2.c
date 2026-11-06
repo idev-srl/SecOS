@@ -20,6 +20,7 @@
 #include "vfs.h"
 #include "block.h"
 #include "debugcon.h"
+#include "heap.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -680,18 +681,39 @@ static int split_parent(const char* path, uint32_t* parent_ino, char* comp, size
 }
 
 /* ── VFS inode pool ──────────────────────────────────────────────────────── */
+// One VFS inode per on-disk inode, never reused while mounted: an open fd keeps
+// its vfs_inode_t* (the VFS has no inode refcount), so recycling a slot made
+// that fd read and write whatever file the slot was handed to next. (The old
+// fixed 32-slot pool reused its last slot for every further file: on a
+// persistent root a service's log fd ended up writing into /etc/passwd.)
+// Slots come in kmalloc'd chunks; a remount reuses the chunks.
 typedef struct { uint32_t ino; uint32_t size; int is_dir; } e2_node_t;
-#define E2_INODES 32
-static vfs_inode_t g_vino[E2_INODES];
-static e2_node_t   g_vnode[E2_INODES];
+typedef struct { vfs_inode_t v; e2_node_t n; } e2_vslot_t;
+#define E2_VCHUNK      64
+#define E2_VCHUNKS_MAX 512                 /* 32768 distinct inodes per mount */
+static e2_vslot_t* g_vchunk[E2_VCHUNKS_MAX];
 static int         g_vused;
 
+static e2_vslot_t* vslot(int i){ return &g_vchunk[i/E2_VCHUNK][i%E2_VCHUNK]; }
+
+static e2_vslot_t* vslot_find(uint32_t ino){
+    for(int i=0;i<g_vused;i++){ e2_vslot_t* s=vslot(i); if(s->n.ino==ino) return s; }
+    return NULL;
+}
+
 static vfs_inode_t* vino_alloc(const char* path){
-    for(int i=0;i<g_vused;i++){ const char* a=g_vino[i].path; size_t k=0; int eq=1; while(a[k]||path[k]){ if(a[k]!=path[k]){eq=0;break;} k++; } if(eq) return &g_vino[i]; }
-    int idx=(g_vused<E2_INODES)?g_vused++:(g_vused-1);
-    vfs_inode_t* ino=&g_vino[idx];
+    int idx=g_vused;
+    if(idx/E2_VCHUNK >= E2_VCHUNKS_MAX){ debugcon_writestring("[EXT2] VFS inode pool full\n"); return NULL; }
+    if(!g_vchunk[idx/E2_VCHUNK]){
+        g_vchunk[idx/E2_VCHUNK]=(e2_vslot_t*)kmalloc(sizeof(e2_vslot_t)*E2_VCHUNK);
+        if(!g_vchunk[idx/E2_VCHUNK]) return NULL;
+    }
+    e2_vslot_t* s=vslot(idx);
+    mem_zero((uint8_t*)s, sizeof(*s));
+    g_vused++;
+    vfs_inode_t* ino=&s->v;
     size_t k=0; for(; path[k] && k<sizeof(ino->path)-1; k++) ino->path[k]=path[k]; ino->path[k]=0;
-    ino->fs_data=&g_vnode[idx];
+    ino->fs_data=&s->n;
     return ino;
 }
 
@@ -744,8 +766,8 @@ static vfs_inode_t* e2_lookup(const char* path){
     // One VFS inode per on-disk inode: hard links (several paths, one inode)
     // must share the slot, because the page cache is keyed by the VFS inode —
     // a write through one name must be seen by a read through another.
-    vfs_inode_t* v=NULL;
-    for(int i=0;i<g_vused;i++) if(g_vnode[i].ino==ino){ v=&g_vino[i]; break; }
+    e2_vslot_t* slot=vslot_find(ino);
+    vfs_inode_t* v=slot?&slot->v:NULL;
     if(v){ const char* np=path&&path[0]?path:"/"; size_t k=0; for(; np[k] && k<sizeof(v->path)-1; k++) v->path[k]=np[k]; v->path[k]=0; }
     else v=vino_alloc(path&&path[0]?path:"/");
     if(!v) return NULL;
