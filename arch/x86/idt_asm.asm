@@ -441,6 +441,111 @@ isr_net:
     pop rax
     iretq
 
+;
+; [M48] SMP inter-processor interrupts.
+;  0xF0 TLB shootdown: flush what the request names, ack, EOI (tlb.c). Never
+;       switches tasks, so a plain register save is enough.
+;  0xF1 reschedule: an idle CPU was kicked because a task became runnable.
+;       Builds a full trapframe like isr_timer: the C side may switch to the
+;       task (and then never returns here); otherwise it EOIs and returns.
+global isr_ipi_tlb
+extern tlb_ipi_handler
+isr_ipi_tlb:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    SMAP_CLAC
+    cld
+    call tlb_ipi_handler         ; services the request + LAPIC EOI
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
+global isr_ipi_resched
+extern sched_on_resched_ipi
+isr_ipi_resched:
+    push 0              ; err_code (dummy)
+    push 0xF1           ; int_no
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    SMAP_CLAC
+    cld
+    mov rdi, rsp
+    call sched_on_resched_ipi    ; EOIs first; may switch away (no return)
+    mov rdi, rsp
+    call signal_dispatch         ; returning to ring-3: deliver pending signals
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    iretq
+
+; [M48] void arch_switch_finish(trapframe_t* next_tf, volatile uint32_t* prev_on_cpu,
+;                               uint64_t switch_stack_top)  -- noreturn
+; Last step of a context switch. Moves onto this CPU's private switch stack,
+; THEN releases the previous task (*prev_on_cpu = 0, may be NULL): from that
+; store on another CPU may run the previous task on its own kernel stack, which
+; we have just left. Finally restores next_tf and iretq's (arch_iret_to_tf).
+global arch_switch_finish
+extern arch_iret_to_tf
+arch_switch_finish:
+    mov rsp, rdx
+    test rsi, rsi
+    jz .no_prev
+    mov dword [rsi], 0           ; release store (x86-TSO: ordered after all prior stores)
+.no_prev:
+    jmp arch_iret_to_tf          ; rdi = next_tf
+
 ; ---- M2: Stack-switch trampoline ----
 ; void trampoline_switch_stack(uint64_t new_rsp, void (*fn)(void));
 ; rdi = new_rsp  (System V AMD64: first integer arg)

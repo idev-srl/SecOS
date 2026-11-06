@@ -1528,7 +1528,7 @@ static void sh_stress(const char* a){
     int spawned=0;
     for(int i=0;i<n;i++){
         process_t* p = process_create_from_elf_args(user_spin_elf, user_spin_elf_len, 1, av);
-        if(p) spawned++;
+        if(p){ sched_make_ready(p); spawned++; }
     }
     terminal_writestring("[stress] launched "); print_dec(spawned);
     terminal_writestring(" spinners across "); print_dec((int)smp_online_count());
@@ -1645,18 +1645,16 @@ static int job_wait_foreground(uint32_t pgid, const uint32_t* pids, int npid){
 // Launch a (possibly piped) job: `cmd1 args | cmd2 | ...`, optionally in the
 // background (trailing &, stripped by the caller). 'line' is mutated in place.
 static uint8_t g_job_spawn_buf[2*1024*1024]; // 2 MB: GNU bash with readline is ~1.1 MB
-// A freshly created process is PROC_NEW, which the scheduler may already pick:
-// a timer tick right after process_create_*() can run it to completion before
-// the shell has wired its fds / pgid. The old code then set the ZOMBIE back to
-// READY, and the scheduler restarted it from its initial trapframe (seen as a
-// program running twice and then faulting on a garbage return address). Hold
-// the process (NEW -> BLOCKED, atomically) right after creation and release
-// only what was held; a process that already ran is never resurrected.
+// A freshly created process is PROC_NEW. [M48] No CPU ever picks a NEW task
+// (only sched_make_ready publishes it), so the shell can wire its fds / pgid
+// first. The hold (NEW -> BLOCKED) is kept so a SIGKILL from the failure path
+// below can still make a never-started stage runnable to die; release flips
+// only what was held, so a process that already ran is never resurrected.
 static int sh_hold_new(process_t* p){
     return __sync_bool_compare_and_swap(&p->state, PROC_NEW, PROC_BLOCKED);
 }
 static void sh_release(process_t* p, int held){
-    if(held) __sync_bool_compare_and_swap(&p->state, PROC_BLOCKED, PROC_READY);
+    if(held) sched_wake_task(p, PROC_BLOCKED);
 }
 
 static void run_job(char* line, int background){

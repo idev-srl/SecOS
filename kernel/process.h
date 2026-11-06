@@ -155,10 +155,21 @@ typedef struct process {
     // syscalls and a set-id exec (kernel/cred.c). Kernel-made processes: root.
     struct proc_cred cred;
     char     cwd[256];       // [M39] per-process current working directory (for chdir/getcwd + relative paths)
-    // [M29] SMP: the CPU this process is pinned to. Assigned round-robin at
-    // creation; only this CPU schedules, preempts, and reaps it, so the context
-    // switch needs no lock and a freed PCB is never touched by another core.
+    // [M48] SMP scheduling. cpu_affinity is the task's HOME CPU (a soft
+    // preference: that CPU's scheduler picks it first, any idle CPU may pull
+    // it, and the CPU that runs it becomes its new home). cpu_pin >= 0 is an
+    // explicit hard affinity (only that CPU may run it), -1 = none. on_cpu is
+    // 1 from the moment a CPU claims the task (process_claim_next) until that
+    // CPU has completely switched off its kernel stack, CR3 and FPU state
+    // (arch_switch_finish); no other CPU may run, claim or reap it meanwhile.
+    // wake_snap is g_wake_seq at syscall entry: a wake-up that raced the
+    // decision to block turns the block into an immediate re-run.
     uint32_t cpu_affinity;
+    int32_t  cpu_pin;
+    volatile uint32_t on_cpu;
+    uint64_t wake_snap;
+    uint64_t ready_tick;     // timer tick at which it last became READY (0 = unknown)
+    uint64_t smp_logged;     // APs (index < 64) an [SMP] run marker was logged for
     // Runtime metrics
     uint64_t cpu_ticks;      // accumulated CPU ticks (scheduler)
     uint64_t user_mem_bytes; // virtual memory footprint (updated at creation / future extensions)
@@ -208,7 +219,15 @@ int  process_manifest_setid(const process_t* p);   // [M43] MANIFEST_FLAG_SETID 
 process_t* process_get_last(void);
 process_t* process_find_by_pid(uint32_t pid);
 void process_foreach(void (*cb)(process_t*, void*), void* user);
-process_t* process_reap_one(uint32_t affinity); // [M29] detach+return one ZOMBIE
+process_t* process_reap_one(void); // [M48] detach+return one reapable, off-CPU ZOMBIE
+// [M48] SMP scheduler support (kernel/process.c).
+process_t* process_claim_next(uint32_t cpu, process_t* after); // pick+claim (RUNNING, on_cpu)
+uint32_t process_pick_home(void);          // least-loaded online CPU for a new task
+int      process_count_runnable(void);     // READY tasks not on any CPU
+int      process_count_all(void);          // every task in the table (incl. zombies)
+uint64_t process_lock_irqsave(void);       // the process-table lock (for the
+void     process_unlock_irqrestore(uint64_t); //  scheduler's block/claim steps)
+int      process_set_pin(uint32_t pid, int32_t cpu); // hard affinity; -1 clears
 int process_destroy(process_t* p);
 void process_release_pipes(process_t* p); // drop pipe ends + sockets at exit (EOF to peers)
 // PID 1: the kernel records /bin/init's pid; exiting processes' children are

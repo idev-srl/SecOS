@@ -61,7 +61,7 @@ static void parse_madt(uint64_t madt){
         const uint8_t* e = t+off;
         switch(type){
             case 0:                                        /* Processor Local APIC */
-                if((rd32(e+4) & 1) && g_topo.cpu_count < ACPI_MAX_CPUS)   /* enabled */
+                if((rd32(e+4) & 1) && e[3] != 0xFF && g_topo.cpu_count < ACPI_MAX_CPUS)   /* enabled */
                     g_topo.lapic_ids[g_topo.cpu_count++] = e[3];          /* apic_id */
                 break;
             case 1:                                        /* IOAPIC */
@@ -83,6 +83,14 @@ static void parse_madt(uint64_t madt){
             case 5:                                        /* LAPIC Address Override (64-bit) */
                 g_topo.lapic_base = rd64(e+4);
                 break;
+            case 9: {                                      /* [M48] Processor Local x2APIC */
+                uint32_t id = rd32(e+4);
+                int dup = 0;
+                for(uint32_t k=0; k<g_topo.cpu_count; k++) if(g_topo.lapic_ids[k] == id) dup = 1;
+                if(!dup && (rd32(e+8) & 1) && g_topo.cpu_count < ACPI_MAX_CPUS)
+                    g_topo.lapic_ids[g_topo.cpu_count++] = id;
+                break;
+            }
             default: break;
         }
         off += elen;

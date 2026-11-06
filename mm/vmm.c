@@ -15,6 +15,8 @@
 #include "process.h"   // [M14] process_t (current process VMAs)
 #include "sched.h"     // [M14] sched_get_current()
 #include "spinlock.h"  // [M29] SMP: serialize runtime kernel page-table edits
+#include "tlb.h"       // [M48] SMP TLB shootdown
+#include "percpu.h"    // [M48] per-CPU active address space
 
 // [M29] The M5 per-process kernel-stack slots all live in one shared 2 MiB kernel
 // region (one page table). Mapping/unmapping them happens at RUNTIME on process
@@ -37,6 +39,7 @@ static uint64_t physmap_limit = 0; // physical memory currently covered by physm
 
 // Forward declaration
 static void zero_frame(uint64_t phys);
+static int vmm_unmap_noflush(uint64_t virt);   // [M48] PTE clear, caller flushes
 
 // Extend physmap (already initialized) to cover at least phys_end.
 // Uses 2MB huge pages like vmm_init_physmap.
@@ -130,6 +133,8 @@ void vmm_set_physmap_wc(uint64_t phys, uint64_t size) {
         pdt[pdt_i] = e;
         __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
     }
+    // [M48] The caching type changed: every CPU must drop the old translation.
+    tlb_shootdown_kernel(VMM_PHYSMAP_BASE + start, (end - start) / PAGE_SIZE);
 }
 
 // Zero out entire physical frame
@@ -354,7 +359,7 @@ static void kset_flags(uint64_t va, uint64_t clear, uint64_t set) {
     uint64_t e = pt[i];
     e &= ~clear; e |= set;
     pt[i] = e;
-    __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+    tlb_shootdown_kernel(va, 1);   // [M48] all CPUs
 }
 
 // [M39] Full high-half kernel W^X. Until now vmm_protect_kernel_sections was
@@ -798,18 +803,27 @@ int vmm_free_kernel_stack_for_slot(uint32_t slot) {
     uint64_t glo  = m5_kstack_guard_lo(slot);
     uint64_t ghi  = m5_kstack_guard_hi(slot);
 
+    // [M48] Unmap the whole slot, shoot the range down on every CPU (the task
+    // that used this stack may have run on any of them), and only then hand
+    // the frames back: a CPU still caching the old translation would otherwise
+    // write into a frame the PMM already gave to someone else.
+    uint64_t frames[M5_KSTACK_PAGES];
     uint64_t fl = spin_lock_irqsave(&kstack_lock);
     for (int i = 0; i < M5_KSTACK_PAGES; i++) {
         uint64_t va = base + (uint64_t)i * PAGE_SIZE;
         uint64_t phys = vmm_translate(va);
+        frames[i] = 0;
         if (phys) {
-            vmm_unmap(va);
-            pmm_free_frame((void*)(phys & ADDRESS_MASK));
+            vmm_unmap_noflush(va);
+            frames[i] = phys & ADDRESS_MASK;
         }
     }
     m2_mark_guard(glo);
     m2_mark_guard(ghi);
+    tlb_shootdown_kernel(glo, (ghi - glo) / PAGE_SIZE + 1);
     spin_unlock_irqrestore(&kstack_lock, fl);
+    for (int i = 0; i < M5_KSTACK_PAGES; i++)
+        if (frames[i]) pmm_free_frame((void*)frames[i]);
     return 0;
 }
 
@@ -936,6 +950,7 @@ vmm_space_t* vmm_space_create_user(void) {
     vmm_space_t* space = (vmm_space_t*)kmalloc(sizeof(vmm_space_t));
     if (!space) return NULL;
     space->pml4_phys = (uint64_t)pml4_new & ADDRESS_MASK;
+    for (int w = 0; w < VMM_CPU_MASK_WORDS; w++) space->active_cpus[w] = 0;
 
     // [M3] Address space protection: assert PML4[256..511] have U=0.
     // Entries in the kernel-canonical half must never be accessible from ring-3.
@@ -964,6 +979,15 @@ vmm_space_t* vmm_space_create_user(void) {
 
 int vmm_space_destroy(vmm_space_t* space) {
     if (!space) return -1;
+    // [M48] A space is destroyed only once no CPU has it loaded (its task is
+    // off every CPU, or exec already switched away). Anything else is a bug:
+    // a CPU would keep walking freed page tables.
+    for (int w = 0; w < VMM_CPU_MASK_WORDS; w++) {
+        if (space->active_cpus[w]) {
+            debugcon_writestring("[TLB] BUG: destroying an address space still loaded on a CPU\n");
+            break;
+        }
+    }
 
     uint64_t pml4_phys = space->pml4_phys & ADDRESS_MASK;
     uint64_t* pml4 = physmap_initialized ? (uint64_t*)phys_to_virt(pml4_phys) : (uint64_t*)pml4_phys;
@@ -1129,7 +1153,9 @@ vmm_space_t* vmm_fork_space(vmm_space_t* parent) {
             }
         }
     }
-    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory"); // flush parent TLB
+    // The parent's writable pages just became read-only: flush them wherever
+    // the parent's space is loaded (here, and any other CPU running it).
+    tlb_shootdown(parent, 0, 0);
     return child;
 }
 
@@ -1167,7 +1193,7 @@ int vmm_cow_fault(vmm_space_t* space, uint64_t addr) {
     if (!pmm_unref_frame((void*)oldphys)) pmm_free_frame((void*)oldphys); // drop our old ref
     uint64_t flags = (pte & ~ADDRESS_MASK & ~VMM_FLAG_COW) | VMM_FLAG_RW;  // writable, no COW
     pt[i] = nphys | flags; // PRESENT preserved from pte
-    __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+    tlb_shootdown(space, va, 1);   // [M48] the old frame may be cached elsewhere
     return 0;
 }
 
@@ -1281,16 +1307,21 @@ int vmm_map_in_space(vmm_space_t* space, uint64_t virt, uint64_t phys, uint64_t 
     return 0;
 }
 
-int vmm_unmap(uint64_t virt) {
+// Clear a kernel PTE; the caller owns the TLB shootdown (batching).
+static int vmm_unmap_noflush(uint64_t virt) {
     if (virt & 0xFFF) return -1; // not aligned
     uint64_t* pt = get_pt(virt, 0, 0);
     if (!pt) return -2;
     int pt_i = (virt >> 12) & 0x1FF;
     if (!(pt[pt_i] & VMM_FLAG_PRESENT)) return -3; // not mapped
     pt[pt_i] = 0;
-    // Invalidate TLB
-    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
     return 0;
+}
+
+int vmm_unmap(uint64_t virt) {
+    int r = vmm_unmap_noflush(virt);
+    if (r == 0) tlb_shootdown_kernel(virt, 1);   // [M48] kernel half: every CPU
+    return r;
 }
 
 int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
@@ -1305,7 +1336,7 @@ int vmm_unmap_in_space(vmm_space_t* space, uint64_t virt) {
     if (!vmm_pte_has_frame(pt[pt_i])) return -3; // not mapped
     uint64_t entry = pt[pt_i];
     pt[pt_i] = 0;
-    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    tlb_shootdown(space, virt, 1);           // [M48] every CPU running this space
     if (entry & VMM_FLAG_DEVICE) return 0;   // [M40] device memory: nothing to free
     // Free physical frame — [M19] only when this was the last COW reference.
     void* frame = (void*)(entry & ADDRESS_MASK);
@@ -1354,7 +1385,7 @@ int vmm_protect_in_space(vmm_space_t* space, uint64_t virt, uint64_t flags) {
         }
         pt[pt_i] = phys | nf;
     }
-    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    tlb_shootdown(space, virt, 1);           // [M48] every CPU running this space
     return 0;
 }
 
@@ -1426,9 +1457,21 @@ vmm_space_t* vmm_clone_space(vmm_space_t* src) {
     (void)src; return NULL; // cloning stub (not implemented)
 }
 
+// [M48] Load `space` on this CPU and keep the active-CPU sets exact: the new
+// space gains this CPU (locked RMW, ordered before the CR3 load, so a racing
+// tlb_shootdown either sees the bit or our page walk sees its new PTE), the old
+// one loses it after the CR3 load (a shootdown in between just finds nothing
+// to flush here).
 int vmm_switch_space(vmm_space_t* space) {
     if (!space) return -1;
+    cpu_t* c = this_cpu();
+    vmm_space_t* old = c->active_space;
+    uint32_t w = c->index >> 6; uint64_t bit = 1ULL << (c->index & 63);
+    if (space != &kernel_space) __atomic_or_fetch(&space->active_cpus[w], bit, __ATOMIC_SEQ_CST);
     write_cr3(space->pml4_phys & ADDRESS_MASK);
+    c->active_space = space;
+    if (old && old != space && old != &kernel_space)
+        __atomic_and_fetch(&old->active_cpus[w], ~bit, __ATOMIC_SEQ_CST);
     return 0;
 }
 

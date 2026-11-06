@@ -67,6 +67,7 @@ uint64_t syscall_handler(trapframe_t* tf) {
     uint64_t num = tf->rax;
     // Re-run of a blocking syscall a caught signal woke (see process.h)?
     if (cur) {
+        cur->wake_snap = sched_wake_seq();   // [M48] lost-wakeup guard (sched_block_current)
         cur->sig_rerun_eintr = 0;
         if (cur->sig_eintr_rip && tf->rip - 2 == cur->sig_eintr_rip) {
             cur->sig_rerun_eintr = 1;
@@ -145,6 +146,9 @@ uint64_t syscall_handler(trapframe_t* tf) {
             extern process_t* process_fork(process_t*, trapframe_t*);
             process_t* ch = cur ? process_fork(cur, tf) : 0;
             ret = ch ? (uint64_t)(int64_t)ch->pid : (uint64_t)(int64_t)-1;
+            // [M48] Publish the child only after reading its pid: once READY it
+            // may run, exit and be reaped on another CPU before we look again.
+            if (ch) sched_make_ready(ch);
         }
     }
     else
@@ -391,13 +395,9 @@ uint64_t syscall_handler(trapframe_t* tf) {
             } else if (pipe_fd) {
                 cur->wait_pipe = cur->fds[fd].inode;
                 // SMP: the peer on another CPU can queue data / free room and
-                // call sched_wake_pipe() between our -2 and the block below, a
-                // wakeup nobody repeats. Re-check after a few ticks regardless,
-                // so a lost wakeup costs milliseconds instead of a deadlock.
-                {
-                    extern uint64_t timer_get_ticks(void);
-                    cur->sleep_until = timer_get_ticks() + 5;
-                }
+                // call sched_wake_pipe() between our -2 and the block below.
+                // [M48] That wake bumps the wake sequence, so the block below
+                // re-runs the read/write at once instead of sleeping.
                 tf->rip -= 2;                           // re-run `int 0x80` on wake
                 sched_block_current(tf);                // NORETURN (switches away)
                 ret = 0;                                 // not reached

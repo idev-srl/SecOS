@@ -21,15 +21,21 @@ static inline void debugcon_putchar_raw(char c) {
     __asm__ volatile ("outb %0, $0xE9" : : "a"(c) : "memory");
 }
 
+/* [M48] Kernel debugcon output is line-atomic across CPUs (kernel/klog.c):
+ * with more than one CPU each CPU assembles its line privately and emits it
+ * whole (port 0xE9 + kernel log) at '\n'; single-core output is immediate. */
+void debugcon_kputc(char c);
+void debugcon_kwrite(const char* s);
+void debugcon_kflush(void);          /* emit this CPU's partial line now (panic) */
+
 /* Write one character to ISA debugcon port 0xE9 (and the kernel log). */
 static inline void debugcon_putchar(char c) {
-    debugcon_putchar_raw(c);
-    klog_putc(c);
+    debugcon_kputc(c);
 }
 
 /* Write a NUL-terminated string to debugcon. */
 static inline void debugcon_writestring(const char *s) {
-    while (*s) debugcon_putchar(*s++);
+    debugcon_kwrite(s);
 }
 
 /* Write a uint64_t as 18-char "0x<16 hex digits>" to debugcon. */

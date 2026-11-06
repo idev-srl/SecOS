@@ -65,6 +65,10 @@ typedef struct sigframe {
     uint64_t   magic;
     uint64_t   saved_mask;      /* sig_blocked to restore */
     trapframe_t saved;          /* full interrupted ring-3 context */
+    /* [M48] The interrupted x87/SSE register file (fxsave image): a handler
+     * that uses SSE (printf of a double, vectorised memcpy) must not clobber
+     * the interrupted code's registers. sigreturn restores it (MXCSR masked). */
+    uint8_t    fpu[512] __attribute__((aligned(16)));
 } sigframe_t;
 
 void signal_init_proc(struct process* p);       /* zero handlers/masks at create */

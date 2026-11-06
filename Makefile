@@ -68,6 +68,7 @@ SRC_C   = \
 	$(ARCH_DIR)/acpi.c \
 	$(ARCH_DIR)/tsc.c \
 	$(ARCH_DIR)/percpu.c \
+	$(ARCH_DIR)/tlb.c \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c $(DRIVERS_DIR)/vt.c \
@@ -286,6 +287,9 @@ iso: $(KERNEL)
 	echo '' >> $(ISODIR)/boot/grub/grub.cfg
 	echo 'menuentry "SecOS x64" {' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '    multiboot2 /boot/kernel.bin' >> $(ISODIR)/boot/grub/grub.cfg
+	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'menuentry "SecOS x64 (single CPU: nosmp)" {' >> $(ISODIR)/boot/grub/grub.cfg
+	echo '    multiboot2 /boot/kernel.bin nosmp' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue --output=$(ISO) $(ISODIR) 2>&1 | tee grub-mkrescue.log
 	@echo "ISO creata: $(ISO)"

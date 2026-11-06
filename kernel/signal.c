@@ -104,8 +104,7 @@ int signal_post(process_t* p, int sig) {
     if (sig == SIGCONT) {
         p->sig_pending &= ~(SIGBIT(SIGSTOP) | SIGBIT(SIGTSTP) |
                             SIGBIT(SIGTTIN) | SIGBIT(SIGTTOU));
-        if (p->state == PROC_STOPPED) {
-            p->state = PROC_READY;
+        if (p->state == PROC_STOPPED && sched_wake_task(p, PROC_STOPPED)) {
             // waitpid(WCONTINUED) report + SIGCHLD to the parent (POSIX).
             p->stop_report = 0; p->cont_report = 1;
             extern void sched_notify_parent_cont(process_t*);
@@ -114,11 +113,12 @@ int signal_post(process_t* p, int sig) {
     }
     // SIGKILL also ends a stopped process (POSIX): make it runnable so the
     // pending SIGKILL is acted on at its next kernel exit.
-    if (sig == SIGKILL && p->state == PROC_STOPPED) { p->state = PROC_READY; p->stop_report = 0; }
+    if (sig == SIGKILL && p->state == PROC_STOPPED && sched_wake_task(p, PROC_STOPPED)) p->stop_report = 0;
     // A stop signal cancels a pending SIGCONT.
     if (sig_default_stop(sig)) p->sig_pending &= ~SIGBIT(SIGCONT);
 
     p->sig_pending |= SIGBIT(sig);
+    sched_wake_note();      // [M48] a task deciding to block right now re-checks
 
     int deliverable = (sig == SIGKILL || sig == SIGSTOP) ||
                       !((p->sig_blocked >> sig) & 1);
@@ -135,7 +135,7 @@ int signal_post(process_t* p, int sig) {
         p->wait_pty = NULL;
         if (sig != SIGKILL && p->sig_handler[sig] > 1 /* caught */ && p->tf)
             p->sig_eintr_rip = p->tf->rip;       // the rewound `int 0x80`
-        p->state = PROC_READY;
+        sched_wake_task(p, PROC_BLOCKED);
     }
     return 0;
 }
@@ -234,6 +234,7 @@ void signal_dispatch(trapframe_t* tf) {
             cur->sigsusp_active = 0;
         }
         sf.saved = *tf;                          // full interrupted context
+        __asm__ volatile("fxsave64 %0" : "=m"(*(uint8_t(*)[512])sf.fpu));   // [M48] live user FPU
 
         uint64_t usp = tf->rsp;
         usp -= 128;                              // skip the SysV red zone
@@ -286,6 +287,18 @@ long ksys_sigreturn(trapframe_t* tf) {
     s->rflags = (s->rflags & ~0x200ULL) | 0x202ULL;     // keep IF set, sane bits
     if ((s->rsp >= 0x0000800000000000ULL)) return -1;   // user range only
     cur->sig_blocked = sf.saved_mask;
+    {   // [M48] Restore the interrupted FPU/SSE state. Reserved MXCSR bits would
+        // make fxrstor #GP in the kernel: mask them with the CPU's MXCSR_MASK.
+        static uint32_t mxcsr_mask;
+        if (!mxcsr_mask) {
+            static uint8_t probe[512] __attribute__((aligned(16)));
+            __asm__ volatile("fxsave64 %0" : "=m"(probe));
+            uint32_t m = *(uint32_t*)(probe + 28);
+            mxcsr_mask = m ? m : 0xFFBFu;
+        }
+        *(uint32_t*)(sf.fpu + 24) &= mxcsr_mask;
+        __asm__ volatile("fxrstor64 %0" : : "m"(*(const uint8_t(*)[512])sf.fpu));
+    }
     *tf = *s;                                            // restore in place
     return (long)s->rax;                                // preserve interrupted rax
 }

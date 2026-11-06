@@ -17,12 +17,27 @@ typedef struct { volatile uint32_t locked; } spinlock_t;
 
 static inline void spin_init(spinlock_t* l) { l->locked = 0; }
 
+/* [M48] A CPU waiting for a lock keeps answering TLB shootdowns (see
+ * arch/x86/tlb.h): the initiator may hold this very lock with interrupts off
+ * and be waiting for our acknowledgement, so waiting here must not depend on
+ * the IPI being deliverable. */
+extern volatile uint32_t g_tlb_inflight;
+void tlb_poll(void);
+static inline void cpu_relax_poll(void) {
+    if (g_tlb_inflight) tlb_poll();
+    __asm__ volatile ("pause");
+}
+
 static inline void spin_lock(spinlock_t* l) {
     /* test-and-test-and-set with a pause-spin; acquire ordering via xchg. */
     for (;;) {
         if (__sync_lock_test_and_set(&l->locked, 1) == 0) return;
-        while (l->locked) __asm__ volatile ("pause");
+        while (l->locked) cpu_relax_poll();
     }
+}
+
+static inline int spin_trylock(spinlock_t* l) {
+    return __sync_lock_test_and_set(&l->locked, 1) == 0;
 }
 
 static inline void spin_unlock(spinlock_t* l) {

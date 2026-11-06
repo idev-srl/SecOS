@@ -50,52 +50,68 @@ static void ap_udelay(uint64_t us) {
 static volatile uint8_t* lowp(uint64_t phys) { return (volatile uint8_t*)phys_to_virt(phys); }
 
 /* Per-AP idle task (a ring-0 kernel context). When a core has no runnable user
- * task pinned to it, it runs its idle loop; the LAPIC timer preempts idle to a
- * user task and returns here when that task blocks/exits. */
-static process_t ap_idle[SMP_MAX_CPUS];
-static trapframe_t ap_idle_tf[SMP_MAX_CPUS];
-
+ * task, it runs its idle loop; the LAPIC timer (or a reschedule IPI) preempts
+ * idle to a user task and returns here when that task blocks/exits. [M48] The
+ * PCB and its trapframe are allocated per AP in smp_init (sized by the MADT). */
+extern void* kmalloc(unsigned long);
 extern void lapic_timer_start_this_cpu(uint32_t);
 extern void sched_reap_zombies(void);
+#define AP_SWITCH_STACK_SIZE 0x2000ull   /* private stack for the final switch step */
 
 /* AP 64-bit entry: bring this core fully online and enter the scheduler.
- *  1. enable its Local APIC + load the shared IDT
+ *  1. enable its Local APIC (x2APIC first if the BSP chose it: this_cpu()
+ *     reads the APIC ID in that mode) + load the shared IDT
  *  2. build its own GDT/TSS/IST (ring-3 entry lands on this core's kernel stack)
- *  3. install a per-core idle task as `current`/`idle_task`
- *  4. start its LAPIC timer and run the idle loop — the timer tick schedules any
- *     user task pinned (cpu_affinity) to this core. */
+ *  3. install the per-core idle task as `current`/`idle_task`
+ *  4. start its LAPIC timer and run the idle loop — the timer tick and the
+ *     reschedule IPI pick runnable user tasks (any home; see kernel/sched.c). */
 void ap_entry(void) {
     /* [M44] Leave the trampoline CR3 (kernel high half + the boot identity map
      * the real-mode stub needed) for the kernel CR3 at once: from here on the
      * AP runs high only, and the identity map exists nowhere it can reach. */
-    vmm_switch_space(vmm_get_kernel_space());
+    { uint64_t k = vmm_get_kernel_space()->pml4_phys;
+      __asm__ volatile ("mov %0, %%cr3" :: "r"(k) : "memory"); }
+    lapic_enable_this_cpu();
     cpu_t* c = this_cpu();
+    vmm_switch_space(vmm_get_kernel_space());   /* records the active space */
     extern void cpu_enable_sse(void);
     extern void cpu_enable_mitigations(void);
-    cpu_enable_sse();                    // [M34] SSE for ring-3 tasks pinned to this AP
+    cpu_enable_sse();                    // [M34] SSE for ring-3 tasks on this AP
     cpu_enable_mitigations();            // [M36] SMEP (+SMAP) on this AP too
-    lapic_enable_this_cpu();
+    vmm_pat_init();                      // [M48] same PAT (WC slot) as the BSP: tasks migrate
     idt_ap_load();
     tss_setup_ap(c->index, c->kstack_top);
 
-    process_t* idle = &ap_idle[c->index];
-    trapframe_t* tf = &ap_idle_tf[c->index];
-    for (int i = 0; i < (int)sizeof(*idle); i++) ((uint8_t*)idle)[i] = 0;
-    for (int i = 0; i < (int)sizeof(*tf); i++) ((uint8_t*)tf)[i] = 0;
+    process_t* idle = (process_t*)c->idle_task;   /* allocated by smp_init */
+    c->current = idle;
+    c->in_idle = 1;
+    c->slice_left = 0;
+
+    __sync_synchronize();
+    c->online = 1;
+    lapic_timer_start_this_cpu(1000);
+    __asm__ volatile ("sti");
+    for (;;) { sched_reap_zombies(); __asm__ volatile ("hlt"); }
+}
+
+/* Allocate an AP's idle PCB + trapframe + switch stack. */
+static int ap_alloc_idle(cpu_t* c) {
+    process_t* idle = (process_t*)kmalloc(sizeof(process_t));
+    trapframe_t* tf = (trapframe_t*)kmalloc(sizeof(trapframe_t));
+    void* sw = pmm_alloc_contiguous(AP_SWITCH_STACK_SIZE / PMM_FRAME_SIZE);
+    if (!idle || !tf || !sw) return -1;
+    for (unsigned i = 0; i < sizeof(*idle); i++) ((uint8_t*)idle)[i] = 0;
+    for (unsigned i = 0; i < sizeof(*tf); i++) ((uint8_t*)tf)[i] = 0;
     idle->pid = 0;                       /* idle tasks are not in the proc table */
     idle->space = vmm_get_kernel_space();
     idle->kstack_top = c->kstack_top;
     idle->tf = tf;
     idle->state = PROC_RUNNING;
     idle->cpu_affinity = c->index;
+    idle->cpu_pin = (int32_t)c->index;
     c->idle_task = idle;
-    c->current = idle;
-    c->slice_left = 0;
-
-    c->online = 1;
-    lapic_timer_start_this_cpu(1000);
-    __asm__ volatile ("sti");
-    for (;;) { sched_reap_zombies(); __asm__ volatile ("hlt"); }
+    c->switch_stack_top = (uint64_t)phys_to_virt((uint64_t)sw) + AP_SWITCH_STACK_SIZE;
+    return 0;
 }
 
 uint32_t smp_online_count(void) {
@@ -132,11 +148,15 @@ void smp_init(void) {
         int idx = smp_register_cpu(id);
         if (idx < 0) continue;
 
+        if (cpu_by_index(idx)->online) continue;      /* already up (shell `smp` twice) */
         /* Per-AP kernel stack (contiguous frames, addressed via the physmap). */
         void* base = pmm_alloc_contiguous(AP_KSTACK_SIZE / PMM_FRAME_SIZE);
         if (!base) { debugcon_writestring("[SMP] AP kstack alloc failed\n"); continue; }
         uint64_t stack_top = (uint64_t)phys_to_virt((uint64_t)base) + AP_KSTACK_SIZE;
         cpu_by_index(idx)->kstack_top = stack_top;
+        if (ap_alloc_idle(cpu_by_index(idx)) != 0) {
+            debugcon_writestring("[SMP] AP idle/switch-stack alloc failed\n"); continue;
+        }
         *(volatile uint64_t*)lowp(AP_PARAM_STACK) = stack_top;
 
         /* INIT, then two STARTUP IPIs at vector (0x8000 >> 12). */
@@ -147,7 +167,7 @@ void smp_init(void) {
         lapic_send_sipi(id, (uint8_t)(AP_TRAMPOLINE_PHYS >> 12));
 
         int online = 0;
-        for (int spins = 0; spins < 100 && !online; spins++) {
+        for (int spins = 0; spins < 200 && !online; spins++) {
             if (cpu_by_index(idx)->online) online = 1; else ap_udelay(1000);
         }
         debugcon_writestring(online ? "[SMP] cpu online lapic_id=" : "[SMP] cpu TIMEOUT lapic_id=");

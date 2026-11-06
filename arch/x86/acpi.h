@@ -15,7 +15,7 @@
 #define ACPI_H
 #include <stdint.h>
 
-#define ACPI_MAX_CPUS    64
+#define ACPI_MAX_CPUS    256   /* = SMP_MAX_CPUS */
 #define ACPI_MAX_IOAPICS 4
 #define ACPI_MAX_OVERRIDES 16
 
@@ -23,7 +23,7 @@ typedef struct {
     int      found;                       /* ACPI tables parsed OK              */
     uint64_t lapic_base;                  /* Local APIC MMIO physical address   */
     uint32_t cpu_count;                   /* enabled processors (LAPICs)        */
-    uint8_t  lapic_ids[ACPI_MAX_CPUS];    /* per-CPU Local APIC IDs             */
+    uint32_t lapic_ids[ACPI_MAX_CPUS];    /* per-CPU Local APIC IDs (x2APIC: 32-bit) */
     uint32_t bsp_lapic_id;                /* this (boot) CPU's LAPIC ID         */
     uint32_t ioapic_count;
     struct { uint8_t id; uint64_t base; uint32_t gsi_base; } ioapics[ACPI_MAX_IOAPICS];

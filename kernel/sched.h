@@ -24,5 +24,14 @@ void sched_wake_pipe(void* pp);            // [M25] wake pipe read/write blocker
 void sched_wake_pty(void* pty);            // wake pty read/write/poll blockers on pty
 void sched_reap_zombies(void);             // free ZOMBIE processes (not current)
 int  sched_count_alive_user(void);         // user processes not yet ZOMBIE
+// [M48] SMP
+int  sched_make_ready(process_t* p);       // NEW -> READY (publish a built task) + kick
+int  sched_wake_task(process_t* p, int from_state); // CAS from_state -> READY + kick
+void sched_kick_for(process_t* p);         // reschedule IPI to an idle CPU for p
+void sched_wake_note(void);                // a wait condition changed (lost-wakeup guard)
+uint64_t sched_wake_seq(void);             // current wake sequence (syscall entry snapshot)
+void sched_on_resched_ipi(trapframe_t* tf);
+void sched_cpu_stats(uint32_t cpu, uint64_t* switches, uint64_t* migrations,
+                     uint64_t* ipi_tlb, uint64_t* ipi_resched);
 
 #endif
