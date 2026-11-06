@@ -174,9 +174,13 @@ robustness and the paused real-hardware bring-up — see below.
          `~user/.ssh/authorized_keys`) instead of always root;
    - [ ] init's console runs `login` (or a getty) instead of a root bash, opt-out for dev.
 3. [ ] **More filesystems:**
-   - [ ] **exFAT read-write** (the specification is public since 2019): boot-sector
+   - [x] **exFAT read-write** (the specification is public since 2019): boot-sector
          checksum, FAT + allocation bitmap, up-case table, directory entry sets with
-         name hashes; validated host-side with `fsck.exfat`;
+         name hashes; validated host-side with `fsck.exfat` — **M41**, `fs/exfat.c`,
+         `docs/devlog/M41-exfat.md` (open: one volume at a time, TexFAT RO, 4 KiB-sector
+         volumes untested; found on the way: `SYS_MOUNT` hands fat32/ext2 a stack
+         mount-point pointer, `fat32` page-cache staleness on inode-slot reuse,
+         constant `st_dev` breaks `df <path>`);
    - [ ] **NTFS read-only first, read-write later** — probably by porting Linux `ntfs3`
          (GPLv2) through a compat shim, as done for ath9k (`drivers/ath9k_port/`).
 4. [ ] **init / services hardening:** DHCP lease renewal, service dependencies beyond
