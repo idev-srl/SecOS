@@ -2138,6 +2138,7 @@ static void kernel_main_phase2(void) {
         extern int fat32_mount(const char* dev_name, const char* mount_point);
         extern int ext2_mount(const char* dev_name, const char* mount_point);
         extern int exfat_mount(const char* dev_name, const char* mount_point);
+        extern int ntfs_mount(const char* dev_name, const char* mount_point);
         extern int vfs_remove(const char* path);
         extern int vfs_read_all(const char* path, void* buf, size_t bufsize);
         extern int vfs_create(const char* path, const void* data, size_t size);
@@ -2153,6 +2154,7 @@ static void kernel_main_phase2(void) {
             if      (fat32_mount(cand[i], "/mnt") == 0) { fsname = "FAT32"; mounted_dev = cand[i]; }
             else if (ext2_mount (cand[i], "/mnt") == 0) { fsname = "extN";  mounted_dev = cand[i]; }
             else if (exfat_mount(cand[i], "/mnt") == 0) { fsname = "exFAT"; mounted_dev = cand[i]; }
+            else if (ntfs_mount (cand[i], "/mnt") == 0) { fsname = "NTFS";  mounted_dev = cand[i]; }
         }
         // Partitioned media: if no whole-disk raw FS mounted, try every registered
         // block device — including the partition sub-devices (usb0p1, sda1, ...).
@@ -2164,6 +2166,7 @@ static void kernel_main_phase2(void) {
                 if      (fat32_mount(bd->name, "/mnt") == 0) { fsname = "FAT32"; mounted_dev = bd->name; }
                 else if (ext2_mount (bd->name, "/mnt") == 0) { fsname = "extN";  mounted_dev = bd->name; }
                 else if (exfat_mount(bd->name, "/mnt") == 0) { fsname = "exFAT"; mounted_dev = bd->name; }
+                else if (ntfs_mount (bd->name, "/mnt") == 0) { fsname = "NTFS";  mounted_dev = bd->name; }
             }
         }
         (void)mounted_dev;

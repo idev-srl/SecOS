@@ -809,6 +809,7 @@ int ksys_mount(const char* dev, const char* target, const char* fstype){
     extern int fat32_mount(const char*, const char*);
     extern int ext2_mount(const char*, const char*);
     extern int exfat_mount(const char*, const char*);
+    extern int ntfs_mount(const char*, const char*);
     if(!dev||!target||!fstype) return -1;
     // Accept the devfs spelling ("/dev/vda") as well as the bare block name.
     if(dev[0]=='/'&&dev[1]=='d'&&dev[2]=='e'&&dev[3]=='v'&&dev[4]=='/') dev += 5;
@@ -816,11 +817,13 @@ int ksys_mount(const char* dev, const char* target, const char* fstype){
     int isfat = str_eq2(fstype,"fat32")||str_eq2(fstype,"vfat");
     int isext = str_eq2(fstype,"ext2")||str_eq2(fstype,"ext4")||str_eq2(fstype,"extN");
     int isexf = str_eq2(fstype,"exfat");
+    int isntfs= str_eq2(fstype,"ntfs")||str_eq2(fstype,"ntfs3")||str_eq2(fstype,"ntfs-3g");  // [M42] read-only
     int isauto= str_eq2(fstype,"auto")||fstype[0]==0;
     if(isfat) return fat32_mount(dev,target);
     if(isext) return ext2_mount(dev,target);
     if(isexf) return exfat_mount(dev,target);
-    if(isauto){ if(fat32_mount(dev,target)==0) return 0; if(ext2_mount(dev,target)==0) return 0; return exfat_mount(dev,target); }
+    if(isntfs) return ntfs_mount(dev,target);
+    if(isauto){ if(fat32_mount(dev,target)==0) return 0; if(ext2_mount(dev,target)==0) return 0; if(exfat_mount(dev,target)==0) return 0; return ntfs_mount(dev,target); }
     return -1;                                            // unknown fstype
 }
 void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);

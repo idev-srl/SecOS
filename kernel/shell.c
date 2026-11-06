@@ -964,7 +964,9 @@ static void sh_mountdev(const char* a){
     if(ext2_mount(dev, mp)==0){ terminal_writestring("[mountdev] ext2/4 mounted "); terminal_writestring(dev); terminal_writestring(" -> "); terminal_writestring(mp); terminal_writestring("\n"); return; }
     extern int exfat_mount(const char*, const char*);
     if(exfat_mount(dev, mp)==0){ terminal_writestring("[mountdev] exFAT mounted "); terminal_writestring(dev); terminal_writestring(" -> "); terminal_writestring(mp); terminal_writestring("\n"); return; }
-    terminal_writestring("[mountdev] mount FAILED (device not FAT32/extN/exFAT, or already mounted there)\n");
+    extern int ntfs_mount(const char*, const char*);
+    if(ntfs_mount(dev, mp)==0){ terminal_writestring("[mountdev] NTFS mounted (read-only) "); terminal_writestring(dev); terminal_writestring(" -> "); terminal_writestring(mp); terminal_writestring("\n"); return; }
+    terminal_writestring("[mountdev] mount FAILED (device not FAT32/extN/exFAT/NTFS, or already mounted there)\n");
 }
 
 // Print v as `digits` uppercase hex nibbles (no 0x), for compact diagnostics.
