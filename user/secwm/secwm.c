@@ -1254,7 +1254,11 @@ static void read_input(indev_t* d) {
             if (e->type == EV_SYN && e->code == SYN_DROPPED) { d->skip_to_syn = 1; continue; }
             if (d->skip_to_syn) { if (e->type == EV_SYN && e->code == SYN_REPORT) d->skip_to_syn = 0; continue; }
             if (e->type == EV_KEY) {
-                if (e->code == BTN_LEFT || e->code == BTN_RIGHT || e->code == BTN_MIDDLE) button_event(e->code, e->value);
+                if (e->code == BTN_LEFT || e->code == BTN_RIGHT || e->code == BTN_MIDDLE) {
+                    /* value 2 = "already down" (a USB report repeating the
+                     * button state): not a new click. */
+                    if (e->value != 2) button_event(e->code, e->value);
+                }
                 else if (e->code < 256) key_event(e->code, e->value);
             } else if (e->type == EV_REL) {
                 if (e->code == REL_X) { mx += e->value; pointer_moved = 1; }
