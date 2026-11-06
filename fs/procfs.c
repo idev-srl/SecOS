@@ -335,7 +335,7 @@ static void gen_mounts(struct sb* s){
     }
 }
 static void gen_filesystems(struct sb* s){
-    sb_str(s,"nodev\tramfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tsysfs\n\tvfat\n\text2\n\text3\n\text4\n");
+    sb_str(s,"nodev\tramfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tsysfs\n\tvfat\n\texfat\n\text2\n\text3\n\text4\n");
 }
 
 /* --- per pid (g_ps snapshot) --- */
