@@ -1611,7 +1611,12 @@ static int jbd2_recover(void){
         jsb_finalize_csum(g_jdesc);
         uint32_t jpb=bmap_read(g_jin,0); if(jpb) blk_write(jpb, g_jdesc);
     }
-    if(needs){ wr32(sb+96, feat_incompat & ~0x4u); sb_finalize_csum(sb); block_write(g_dev, 2, sbsec, 2); }
+    /* Clear NEEDS_RECOVERY on the superblock AS REPLAYED: the transaction may
+     * have carried the superblock itself (free counts), so the copy read
+     * before the replay is stale and must not be written back. */
+    if(block_read(g_dev, 2, sbsec, 2)==2 && (rd32(sb+96) & 0x4u)){
+        wr32(sb+96, rd32(sb+96) & ~0x4u); sb_finalize_csum(sb); block_write(g_dev, 2, sbsec, 2);
+    }
     return committed ? 1 : 0;
 }
 
