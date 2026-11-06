@@ -2230,7 +2230,7 @@ if make disk-ntfs >/tmp/secos_selftest_m42_disk.log 2>&1; then
           printf '  df | grep /x | sed s/^/MN3-/\r'; sleep 3
           printf '  cat /x/Relazione* | sed s/^/MN4-/\r'; sleep 3
           printf '  (echo hi > /x/new.txt) 2>&1 | sed s/^/MN5-/\r'; sleep 3
-          printf '  ln -s hello.txt /x/l 2>&1 | sed s/^/MN6-/; rm /x/hello.txt 2>&1 | sed s/^/MN6-/\r'; sleep 3
+          printf '  ln -s hello.txt /x/l 2>&1 | sed s/^/MN6-/; rm -f /x/hello.txt 2>&1 | sed s/^/MN6-/\r'; sleep 3
           printf '  cat /x/secret.efs 2>&1 | sed s/^/MN7-/\r'; sleep 3
           printf '  ls /x/many | wc -l | sed s/^/MN8-/\r'; sleep 4
           printf '  md5sum /x/fragmented.bin /x/compressed/text.txt | sed s/^/MN9-/\r'; sleep 6
