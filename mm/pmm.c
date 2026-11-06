@@ -25,10 +25,11 @@
  *      metadata lives in the physmap, allocated from RAM by the early allocator.
  *
  * COW refcounts (one byte per frame, extra references beyond the owner) are
- * allocated lazily per 16 MiB chunk on the first pmm_share_frame() in it, so
- * memory that is never shared (the kernel, the page cache, most of RAM) costs
- * nothing. A count that reaches 255 sticks: the frame is then never freed
- * (a leak instead of a use-after-free).
+ * allocated lazily per 16 MiB chunk on the first pmm_share_frame() in it and
+ * released when its last non-zero count drops, so memory that is not shared
+ * (the kernel, the page cache, most of RAM) costs nothing. A count that
+ * reaches 255 sticks: the frame is then never freed (a leak instead of a
+ * use-after-free).
  *
  * Zones: frames below 4 GiB are the DMA32 zone. Ordinary allocations prefer
  * frames at or above 4 GiB and fall back to DMA32 only when that is exhausted;
@@ -67,6 +68,7 @@ typedef struct pmm_section {
     uint32_t free;                          // free frames in this section
     uint32_t hint;                          // bitmap word to resume scanning at
     uint8_t* refs[PMM_REF_CHUNKS];          // lazily allocated COW refcount chunks
+    uint16_t refs_used[PMM_REF_CHUNKS];     // non-zero counts per chunk (0 = free the chunk)
     uint64_t summary[PMM_SUMMARY_WORDS];    // bit w set = bitmap word w is full
     uint64_t bitmap[PMM_SECTION_WORDS];     // bit set = frame used
 } pmm_section_t;
@@ -463,7 +465,7 @@ void pmm_late_init(void) {
             if (!p) { terminal_writestring("[PMM][ERR] cannot allocate a section descriptor\n"); continue; }
             pmm_section_t* s = (pmm_section_t*)phys_to_virt(p);
             s->free = 0; s->hint = 0;
-            for (uint64_t k = 0; k < PMM_REF_CHUNKS; k++) s->refs[k] = NULL;
+            for (uint64_t k = 0; k < PMM_REF_CHUNKS; k++) { s->refs[k] = NULL; s->refs_used[k] = 0; }
             for (uint64_t k = 0; k < PMM_SUMMARY_WORDS; k++) s->summary[k] = ~0ULL;
             for (uint64_t k = 0; k < PMM_SECTION_WORDS; k++) s->bitmap[k] = ~0ULL;
             g_sec[si] = s;
@@ -685,12 +687,24 @@ static uint8_t* ref_slot(uint64_t frame, int create) {
     return &s->refs[c][i % PMM_REF_CHUNK_FRAMES];
 }
 
+// Drop chunk c of section s once no frame in it is shared any more.
+static void ref_chunk_put(pmm_section_t* s, uint64_t c) {
+    if (--s->refs_used[c] != 0) return;
+    uint64_t phys = virt_to_phys((uint64_t)(uintptr_t)s->refs[c]);
+    s->refs[c] = NULL;
+    g_ref_chunks--;
+    pmm_section_t* fs = sec_of(phys / PMM_FRAME_SIZE);
+    uint64_t i = (phys / PMM_FRAME_SIZE) & (PMM_SECTION_FRAMES - 1);
+    if (fs) { sec_mark(fs, i, i + 1, 0); g_free_frames++; }
+}
+
 int pmm_share_frame(void* addr) {
     uint64_t frame = (uint64_t)addr / PMM_FRAME_SIZE;
     uint64_t fl = spin_lock_irqsave(&pmm_lock);
     uint8_t* r = ref_slot(frame, 1);
     int rc = -1;
     if (r) {
+        if (*r == 0) sec_of(frame)->refs_used[(frame & (PMM_SECTION_FRAMES - 1)) / PMM_REF_CHUNK_FRAMES]++;
         if (*r != PMM_REF_STICKY) (*r)++;   // saturate: the frame is then pinned forever
         rc = 0;
     }
@@ -704,7 +718,10 @@ int pmm_unref_frame(void* addr) {
     uint8_t* r = ref_slot(frame, 0);
     int still = 0;
     if (r && *r > 0) {
-        if (*r != PMM_REF_STICKY) (*r)--;   // a sticky count never drops
+        if (*r != PMM_REF_STICKY) {         // a sticky count never drops
+            if (--(*r) == 0)
+                ref_chunk_put(sec_of(frame), (frame & (PMM_SECTION_FRAMES - 1)) / PMM_REF_CHUNK_FRAMES);
+        }
         still = 1;
     }
     spin_unlock_irqrestore(&pmm_lock, fl);
@@ -855,7 +872,7 @@ int pmm_selftest(void) {
     if (b) pmm_free_frame((void*)b);
     if (c) pmm_free_contiguous((void*)c, 16);
     for (int i = 0; i < n; i++) pmm_free_frame((void*)(frames[i] * PMM_FRAME_SIZE));
-    uint64_t expect = free0 - (g_ref_chunks - chunks0);
+    uint64_t expect = free0 - (g_ref_chunks - chunks0);   // chunks are released again
     int free_ok = (g_free_frames == expect) &&
                   pmm_get_free_memory() <= pmm_get_total_memory() &&
                   pmm_get_used_memory() + pmm_get_free_memory() == pmm_get_total_memory();
