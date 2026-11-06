@@ -2387,7 +2387,7 @@ fi
 # Regression test for the access rules (kernel/cred.c). Root logs in on the
 # console (CONSOLE=login, baked ROOT_PASSWORD), creates eve and bob, mounts an
 # ext2 disk holding tools/perm_guest.sh at /opt and an exFAT disk at /media
-# with uid=eve,gid=eve,umask=027 (NTFS is the boot disk, read-only at /mnt),
+# with uid=eve,gid=eve,umask=027 and NTFS read-only at /mnt (all on AHCI),
 # then runs the script as eve. Each case prints "PT <case> rc=<n> <message>";
 # denials must carry the expected errno text, positive controls must pass.
 PMLOG=/tmp/secos_selftest_perm.log
@@ -2406,7 +2406,8 @@ if make iso CONSOLE=login ROOT_PASSWORD=Root-pw9 >/tmp/secos_selftest_build.log 
     ( sleep 28
       printf 'root\r'; sleep 2; printf 'Root-pw9\r'; sleep 5
       printf 'useradd eve; useradd bob; printf "eve:Eve-pw1\\nbob:Bob-pw1\\n" | chpasswd; echo PS0-$?\r'; sleep 8
-      printf 'mkdir -p /opt /media /tmp/rid && mount -t ext2 /dev/sda /opt && mount -t exfat -o uid=$(id -u eve),gid=$(id -g eve),umask=027 /dev/sdb /media; echo PS1-$?\r'; sleep 5
+      printf 'umount /mnt 2>/dev/null; mkdir -p /opt /media /tmp/rid && mount -t ntfs /dev/sda /mnt && mount -t ext2 /dev/sdb /opt; echo PS1-$?\r'; sleep 5
+      printf 'mount -t exfat -o uid=$(id -u eve),gid=$(id -g eve),umask=027 /dev/sdc /media; echo PS1X-$?\r'; sleep 4
       printf 'cp /bin/usertools /tmp/rid/id && chmod 4755 /tmp/rid/id; echo PS2-$(stat -c %%a-%%U /tmp/rid/id)-$(id -u eve)\r'; sleep 3
       printf 'su eve -c "/bin/bash /opt/perm_guest.sh"\r'; sleep 30
       printf 'su bob -c "cat /media/eve.txt" 2>&1 | sed s/^/PX1-/\r'; sleep 4
@@ -2414,43 +2415,44 @@ if make iso CONSOLE=login ROOT_PASSWORD=Root-pw9 >/tmp/secos_selftest_build.log 
       printf 'su eve -c "su bob -c \\"echo PW-BAD\\"; echo PW-rc\\$?"\r'; sleep 4; printf 'wrongpw\r'; sleep 6
       printf 'echo PEND\r'; sleep 3 ) | \
         timeout 150 qemu-system-x86_64 -machine q35 -cdrom myos.iso -boot d -m 512M \
-            -drive file=disk.img,if=virtio,format=raw \
-            -drive file="$PMD/ext2.img",format=raw,if=ide,index=0 \
-            -drive file="$PMD/exfat.img",format=raw,if=ide,index=1 \
+            -drive file=disk.img,format=raw,if=ide,index=0 \
+            -drive file="$PMD/ext2.img",format=raw,if=ide,index=1 \
+            -drive file="$PMD/exfat.img",format=raw,if=ide,index=3 \
             -debugcon file:"$PMLOG" -global isa-debugcon.iobase=0xe9 \
             -no-reboot -display none -serial stdio > "$PMSER" 2>&1
     tr -d '\r' < "$PMSER" > "$PMSER.txt"; P="$PMSER.txt"
     EVE=$(grep -a '^PS2-' "$P" | head -1 | sed 's/.*-//')
     pt() { grep -a "^PT $1 rc=" "$P" | head -1; }
     deny() { # deny CASE "message regex" description
-        local l; l=$(pt "$1"); [[ -n "$l" && "$l" != *" rc=0 "* && "$l" != *" rc=0" ]] && grep -Eq "$2" <<<"$l"
-        check "PERM denied: $3 ($l)" $?
+        local l r; l=$(pt "$1"); [[ -n "$l" && "$l" != *" rc=0 "* && "$l" != *" rc=0" ]] && grep -Eq "$2" <<<"$l"; r=$?
+        check "PERM denied: $3 ($l)" $r
     }
-    grep -aq '^PS0-0' "$P" && grep -aq '^PS1-0' "$P" && grep -aq '^PS2-4755-root-' "$P" && [[ -n "$EVE" && "$EVE" != 0 ]]
+    same() { # same CASE "expected line" description
+        local l r; l=$(pt "$1"); [[ "$l" == "$2" ]]; r=$?
+        check "PERM $3 ($l)" $r
+    }
+    grep -aq '^PS0-0' "$P" && grep -aq '^PS1-0' "$P" && grep -aq '^PS1X-0' "$P" && grep -aq '^PS2-4755-root-' "$P" && [[ -n "$EVE" && "$EVE" != 0 ]]
     check "PERM setup: users, /opt (ext2), /media (exFAT uid=eve,umask=027), root 4755 copy" $?
     grep -aq "^PT-BEGIN uid=$EVE " "$P"; check "PERM the script runs as eve (uid $EVE)" $?
     deny shadow-read   "Permission denied"          "read /etc/shadow (EACCES)"
     deny passwd-write  "Permission denied"          "write /etc/passwd (EACCES)"
     deny kill-root     "Operation not permitted"    "kill -0 1, a root process (EPERM)"
     deny home-other    "Permission denied"          "list another user's 0700 home (EACCES)"
-    deny dev-disk      "Permission denied"          "open /dev/vda without group disk (EACCES)"
+    deny dev-disk      "Permission denied"          "open /dev/sda without group disk (EACCES)"
     deny dev-fb        "Permission denied"          "open /dev/fb0 without group video (EACCES)"
     deny chown-to-root "Operation not permitted"    "chown own file to root (EPERM)"
     deny sudo-nowheel  "not a member of group wheel" "sudo outside wheel"
     deny ntfs-write    "Read-only file system"      "create on the NTFS mount (EROFS, not EACCES)"
     deny ntfs-rm       "Read-only file system"      "unlink on the NTFS mount (EROFS, not EACCES)"
-    [[ "$(pt setid-root)" == "PT setid-root rc=0 $EVE" ]]
-    check "PERM set-uid root file without a SETID manifest runs with eve's ids ($(pt setid-root))" $?
-    [[ "$(pt setid-own)" == "PT setid-own rc=0 $EVE" ]]
-    check "PERM chmod u+s on an own file + exec: still eve ($(pt setid-own))" $?
+    same setid-root "PT setid-root rc=0 $EVE" "set-uid root file without a SETID manifest runs with eve's ids"
+    same setid-own  "PT setid-own rc=0 $EVE"  "chmod u+s on an own file + exec: still eve"
     grep -aq '^PX1-.*Permission denied' "$P"; check "PERM denied: bob reads eve's file on the umask=027 exFAT mount" $?
     grep -aq "su: Authentication failure" "$P" && grep -aq '^PW-rc1' "$P" && ! grep -aq '^PW-BAD' "$P"
     check "PERM denied: su with a wrong password (exit 1)" $?
     for c in ok-passwd-read ok-home-write ok-ntfs-read ok-own-chmod ok-exfat-write; do
-        [[ "$(pt $c)" == "PT $c rc=0"* ]]; check "PERM allowed (control): $c ($(pt $c))" $?
+        l=$(pt $c); [[ "$l" == "PT $c rc=0"* ]]; r=$?; check "PERM allowed (control): $c ($l)" $r
     done
-    [[ "$(pt ok-exfat-owner)" == "PT ok-exfat-owner rc=0 eve 750" ]]
-    check "PERM exFAT mount options: eve's new file is eve-owned, mode 750 ($(pt ok-exfat-owner))" $?
+    same ok-exfat-owner "PT ok-exfat-owner rc=0 eve 750" "exFAT mount options: eve's new file is eve-owned, mode 750"
     grep -aq '^PR1-root:' "$P"; check "PERM allowed (control): root reads /etc/shadow" $?
     grep -aq '^PT-END' "$P" && grep -aq '^PEND' "$P"; check "PERM script and session completed" $?
     ! grep -aq "ring0\|\[PANIC\]\|\[EXC\]" "$PMLOG"; check "PERM no kernel fault or panic" $?

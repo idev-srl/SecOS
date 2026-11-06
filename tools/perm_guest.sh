@@ -23,7 +23,7 @@ t shadow-read      cat /etc/shadow
 t passwd-write     bash -c 'echo x >> /etc/passwd'
 t kill-root        kill -0 1
 t home-other       ls /home/bob
-t dev-disk         head -c 1 /dev/vda
+t dev-disk         head -c 1 /dev/sda
 t dev-fb           head -c 1 /dev/fb0
 touch "$HOME/mine"
 t chown-to-root    chown root "$HOME/mine"
