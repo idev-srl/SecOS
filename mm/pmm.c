@@ -155,10 +155,14 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
     uint64_t bitmap_virt = (uint64_t)&_kernel_end;
     uint64_t bitmap_phys = kvirt_to_phys(bitmap_virt);
     frame_bitmap = (uint32_t*)bitmap_virt;
-    // Zero bitmap
+    // Start with every frame USED: only the reported available regions are
+    // freed below. Starting all-free (as before) also handed out the holes
+    // between regions -- firmware-reserved, ACPI and, under UEFI, the loader's
+    // own data (only EfiConventionalMemory is reported) -- and made free
+    // memory exceed the total (/proc/meminfo MemFree > MemTotal on UEFI).
     uint64_t dwords = (bitmap_size + 3) / 4;
     for (uint64_t i = 0; i < dwords; i++) {
-        frame_bitmap[i] = 0x00000000;
+        frame_bitmap[i] = 0xFFFFFFFFu;
     }
     // [M19] Place the COW refcount array (uint16 per frame) right after the
     // bitmap, 8-byte aligned, and zero it. Both live in the low-identity window.
@@ -167,7 +171,7 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
     frame_refs = (uint16_t*)refs_virt;
     for (uint64_t i = 0; i < total_frames; i++) frame_refs[i] = 0;
     uint64_t refs_phys_end = kvirt_to_phys(refs_virt) + refs_size;
-    used_frames = 0;
+    used_frames = total_frames;
 
     // Mark regions as free
     uint64_t free_frames_before = used_frames; // usato per fallback
@@ -202,12 +206,9 @@ static void pmm_build_from_regions(struct avail_region* regions, int region_coun
         uint64_t end_f = fallback_end / PMM_FRAME_SIZE;
         if (end_f > total_frames) end_f = total_frames;
         for (uint64_t f = start_f; f < end_f; f++) {
-            if (!bitmap_test(f)) {
-                // leave as free
-            }
+            if (bitmap_test(f)) { bitmap_clear(f); used_frames--; }
         }
-    // Recount used frames (protect kernel) - simple: mark kernel frames, keep rest free
-        used_frames = 0;
+        // Keep the kernel + bitmap + refcount frames used.
         for (uint64_t f=0; f<kernel_end_frame; f++) { if (!bitmap_test(f)) { bitmap_set(f); used_frames++; } }
     }
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
