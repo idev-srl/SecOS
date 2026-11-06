@@ -514,4 +514,12 @@ char* ptsname(int fd);
 #define _PATH_DEVNULL "/dev/null"
 #endif
 
+/* libsecos chmod()/chown() return -errno and leave errno alone; Dropbear
+ * reads errno (pty_release() ignores ENOENT for a slave that is already
+ * gone, and logged a stale "Input/output error" instead). These set errno. */
+int db_chmod(const char* path, unsigned mode);
+int db_chown(const char* path, unsigned uid, unsigned gid);
+#define chmod db_chmod
+#define chown db_chown
+
 #endif /* SECOS_DROPBEAR_PORT_H */

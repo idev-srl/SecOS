@@ -304,6 +304,12 @@ W int fileno(FILE* f){ return f ? f->fd : (errno = EBADF, -1); }
 W void clearerr(FILE* f){ (void)f; }
 W int setvbuf(FILE* f, char* buf, int mode, size_t size){ (void)f; (void)buf; (void)mode; (void)size; return 0; }
 /* fchmod/fchown/access: the SecOS libc (real SYS_CHMOD/SYS_CHOWN/SYS_ACCESS). */
+int db_chmod(const char* path, unsigned mode){
+    return (int)sc_ret(secos_syscall(32 /*SYS_CHMOD*/, (long)path, (long)mode, 0, 0, 0));
+}
+int db_chown(const char* path, unsigned uid, unsigned gid){
+    return (int)sc_ret(secos_syscall(33 /*SYS_CHOWN*/, (long)path, (long)uid, (long)gid, 0, 0));
+}
 W int ftruncate(int fd, off_t len){ (void)fd; (void)len; errno = ENOSYS; return -1; }
 
 /* ===================== processes / signals ===================== */
