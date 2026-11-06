@@ -61,22 +61,39 @@ static uint32_t pick_affinity(void) {
     return a;
 }
 
+// A table index doubles as the process's kernel-stack slot. The reaper detaches
+// a zombie from the table (process_reap_one) before process_destroy() unmaps
+// its kernel stack, so the index stays reserved here until then: otherwise
+// another CPU's proc_add() could take it and map its kstack over the still-
+// mapped old one ("[M2][PANIC] vmm_map failed (-3)"), and the late unmap would
+// then free the new process's stack frames. Guarded by proc_lock.
+static uint8_t kstack_slot_busy[MAX_PROCESSES];
+
 static int proc_add(process_t* p) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (int i=0;i<MAX_PROCESSES;i++) {
-        if (!proc_table[i]) { proc_table[i]=p; p->kstack_slot = (uint8_t)i;
+        if (!proc_table[i] && !kstack_slot_busy[i]) {
+            proc_table[i]=p; p->kstack_slot = (uint8_t)i; kstack_slot_busy[i] = 1;
             spin_unlock_irqrestore(&proc_lock, fl); return 0; }
     }
     spin_unlock_irqrestore(&proc_lock, fl);
     return -1;
 }
 
+// Called once p's kernel stack is gone (process_destroy, failed creation): the
+// table entry and the kstack slot may be handed out again.
 static void proc_remove(process_t* p) {
     if (!p) return;
     uint64_t fl = spin_lock_irqsave(&proc_lock);
+    int found = 0;
     for (int i=0;i<MAX_PROCESSES;i++) {
-        if (proc_table[i] == p) { proc_table[i] = NULL; break; }
+        if (proc_table[i] == p) { proc_table[i] = NULL; found = 1; break; }
     }
+    // A reaped zombie was detached by process_reap_one; anything else that was
+    // never added owns no slot.
+    if ((found || p->state == PROC_ZOMBIE) && p->kstack_slot < MAX_PROCESSES &&
+        !proc_table[p->kstack_slot])
+        kstack_slot_busy[p->kstack_slot] = 0;
     spin_unlock_irqrestore(&proc_lock, fl);
 }
 
