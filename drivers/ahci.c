@@ -21,6 +21,8 @@
 #include <stddef.h>
 
 // ---- HBA / port registers ----
+#define HBA_CAP   0x00
+#define CAP_S64A  (1u << 31)   // 64-bit addressing
 #define HBA_GHC   0x04
 #define HBA_PI    0x0C
 #define GHC_AE    (1u << 31)
@@ -185,6 +187,15 @@ int ahci_init(void) {
     if (!g_abar) { debugcon_writestring("[AHCI] ABAR map failed\n"); return -1; }
 
     hw(HBA_GHC, hr(HBA_GHC) | GHC_AE);
+    // [M49] Every DMA structure is a static kernel buffer (command lists, FIS
+    // areas, command table, the 64 KB bounce): an HBA without CAP.S64A can only
+    // reach them while the kernel image sits below 4 GiB.
+    if (!(hr(HBA_CAP) & CAP_S64A) &&
+        (phys_of(g_dma) + sizeof(g_dma) > 0x100000000ULL ||
+         phys_of(g_clb) + sizeof(g_clb) > 0x100000000ULL)) {
+        debugcon_writestring("[AHCI] 32-bit DMA HBA but the kernel image is above 4 GiB\n");
+        return -1;
+    }
     uint32_t pi = hr(HBA_PI);
     debugcon_writestring("[AHCI] HBA ABAR=0x"); debugcon_print_hex(abar_phys);
     debugcon_writestring(" PI=0x"); debugcon_print_hex(pi); debugcon_writestring("\n");
