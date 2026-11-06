@@ -400,15 +400,20 @@ int execle(const char* path, const char* arg, ...){
 /* ============================== <dirent.h> ============================= */
 #include <dirent.h>
 DIR* opendir(const char* path){
-    /* The kernel returns up to 256 entries of 256 bytes (SYS_GETDENTS); /bin
-     * holds well over 64 once BusyBox is installed. */
+    /* SYS_GETDENTS fills as many 256-byte records as the buffer holds (up to
+     * 1 MiB = 4096 entries): start at 64 KiB and retry with a bigger buffer
+     * while a listing comes back full, so big directories list whole (bash's
+     * glob over 1000 files). */
     DIR* d = malloc(sizeof(DIR)); if(!d) return 0;
-    d->buf = malloc(65536);
-    if(!d->buf){ free(d); return 0; }
-    long n = getdents(path, d->buf, 65536);
-    if(n < 0){ free(d->buf); free(d); return 0; }
-    d->len = (int)n; d->pos = 0;
-    return d;
+    for(long cap = 64 * 1024; cap <= (1L << 20); cap *= 4){
+        d->buf = malloc((size_t)cap);
+        if(!d->buf) break;
+        long n = getdents(path, d->buf, cap);
+        if(n < 0){ free(d->buf); free(d); if(n < -1) errno = (int)-n; else errno = ENOENT; return 0; }
+        if(n + 256 <= cap || cap == (1L << 20)){ d->len = (int)n; d->pos = 0; return d; }
+        free(d->buf);
+    }
+    free(d); errno = ENOMEM; return 0;
 }
 struct dirent* readdir(DIR* d){
     if(!d || d->pos + 256 > d->len) return 0;
