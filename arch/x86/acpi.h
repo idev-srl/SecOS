@@ -35,6 +35,8 @@ typedef struct {
     uint16_t slp_typa;    /* SLP_TYPa value for S5 (soft-off)         */
     uint16_t slp_typb;    /* SLP_TYPb value for S5                    */
     int      s5_ok;       /* 1 if PM1a_CNT + _S5 were parsed          */
+    uint32_t smi_cmd;     /* SMI_CMD port (0 = no legacy ACPI mode switch) */
+    uint8_t  acpi_enable; /* value written to SMI_CMD to enter ACPI mode */
     /* FADT reset register (for ACPI reboot — the only method that works on many
      * modern UEFI laptops, where the legacy 8042 reset line is not wired). */
     uint8_t  reset_supported; /* FADT flags bit10 set + reg present       */

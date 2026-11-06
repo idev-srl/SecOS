@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "klog.h"
+#include "debugcon.h"   /* debugcon_putchar_raw */
 
 extern uint64_t ktime_ns(void);
 
@@ -74,6 +75,34 @@ static void commit_line(void) {
     ring_put('\n');
     g_llen = 0;
     g_nrec++;
+}
+
+/* ---- [M46] line-buffered mirror of the user console (see klog.h) ---- */
+#define DCU_MAX 256
+static char     g_dcu[DCU_MAX];
+static int      g_dcu_n;
+static uint64_t g_dcu_since;                 /* tick of the first held byte */
+extern uint64_t debugcon_line_lock(void);
+extern void     debugcon_line_unlock(uint64_t);
+extern uint64_t timer_get_ticks(void);
+static void dcu_flush_locked(void) {
+    for (int i = 0; i < g_dcu_n; i++) debugcon_putchar_raw(g_dcu[i]);
+    g_dcu_n = 0;
+}
+void debugcon_user_write(const char* buf, int len) {
+    uint64_t f = debugcon_line_lock();
+    for (int i = 0; i < len; i++) {
+        if (g_dcu_n == 0) g_dcu_since = timer_get_ticks();
+        g_dcu[g_dcu_n++] = buf[i];
+        if (buf[i] == '\n' || g_dcu_n == DCU_MAX) dcu_flush_locked();
+    }
+    debugcon_line_unlock(f);
+}
+void debugcon_user_tick(uint64_t now) {
+    if (!g_dcu_n || now - g_dcu_since < DEBUGCON_USER_HOLD_TICKS) return;   /* racy peek: fine */
+    uint64_t f = debugcon_line_lock();
+    if (g_dcu_n && now - g_dcu_since >= DEBUGCON_USER_HOLD_TICKS) dcu_flush_locked();
+    debugcon_line_unlock(f);
 }
 
 void klog_putc(char c) {

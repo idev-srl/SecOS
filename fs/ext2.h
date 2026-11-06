@@ -33,3 +33,6 @@ typedef struct ext2_superblock {
 // Mount ext2/ext4 (no-journal) read-write from block device name at the given
 // VFS mount point; returns 0 on success.
 int ext2_mount(const char* dev_name, const char* mount_point);
+// [M46] mount(2) data for the next ext2_mount: ro / rw / defaults, noload /
+// norecovery (ro only). 0, or -1 for a malformed list.
+int ext2_set_mount_options(const char* opts);

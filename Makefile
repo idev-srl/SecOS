@@ -553,7 +553,29 @@ user-progs: libcrypt
 	python3 tools/elf2h.py user/loadkeys.elf user_loadkeys_elf crypto/user_loadkeys_elf.h
 	$(MAKE) --no-print-directory gui-progs
 	$(MAKE) --no-print-directory acct-progs
+	$(MAKE) --no-print-directory m46-progs
 	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+
+# [M46] Exec confinement selftest (docs/devlog/M46-exec-confinement.md): one
+# source, three signed manifests -- m46conf (confined driver), m46probe (ambient
+# + explicit NET/INPUT/DISPLAY) and m46setid (SETID, installed root 04755).
+.PHONY: m46-progs
+m46-progs:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S          -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note_m46conf.S  -o user/note_m46conf.o
+	$(CC) $(USER_CFLAGS) -c user/note_m46probe.S -o user/note_m46probe.o
+	$(CC) $(USER_CFLAGS) -c user/note_setid.S    -o user/note_setid.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c      -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c          -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/m46_confine.c   -o user/m46_confine.o
+	for v in conf:m46conf probe:m46probe setid:setid; do \
+	    n=$${v%%:*}; note=$${v##*:}; \
+	    $(LD) --gc-sections -T user/user.ld -o user/m46$$n.elf user/crt0.o user/note_$$note.o \
+	        user/libsecos.o user/libc.o user/m46_confine.o || exit 1; \
+	    python3 tools/secos-sign user/m46$$n.elf --dev || exit 1; \
+	    python3 tools/elf2h.py user/m46$$n.elf user_m46$${n}_elf crypto/user_m46$${n}_elf.h || exit 1; \
+	done
+	@echo "m46-progs: built+signed m46conf + m46probe + m46setid -> crypto/*.h"
 
 # [M43] Multi-user tools (docs/USERS.md). login/su/sudo/passwd are signed with
 # the SETID manifest (user/note_setid.S) and installed root 04755 by

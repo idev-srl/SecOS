@@ -79,6 +79,7 @@ typedef struct process {
     int      cap_net;       // [M24] CAP_NET: 1 if the signed manifest grants sockets
     int      cap_enforce;   // [M35] 1 if confined to cap_mask (least privilege)
     uint32_t cap_mask;      // [M35] granted MANIFEST_FLAG_CAP_* bits when enforcing
+    int      no_new_privs;  // [M46] sticky: exec/spawn can only shrink caps, no set-id, no driver
     uint64_t* mapped_pages; // array of virtual page addresses (code+data+stack)
     uint32_t mapped_page_count; // page count
     // [M14] Demand paging: pages are not eagerly mapped. 'vmas' describes the

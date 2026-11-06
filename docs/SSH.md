@@ -118,7 +118,11 @@ CAP_SIGNAL | CAP_TIME` (`0xFF0`). These cover sockets, the host key,
 it, and signals and timeouts. Everything else is denied and audited, including
 `CAP_POWER` and Driver Space. The flags are covered by the Ed25519 signature,
 so the program cannot widen them. The session shell is a separate signed
-program (`/bin/bash`) and runs under its own manifest.
+program (`/bin/bash`) and runs under its own manifest: the manifest also sets
+`MANIFEST_FLAG_SESSION_GATEWAY` (bit 16, flags `0x10FF0`), which exempts
+Dropbear from the automatic `no_new_privs` of confined programs (M46,
+[docs/devlog/M46-exec-confinement.md](devlog/M46-exec-confinement.md)), so an
+ssh session can still use `sudo`, `su` and `poweroff`.
 
 ## Quick start (QEMU, host port 2222 to guest port 22)
 

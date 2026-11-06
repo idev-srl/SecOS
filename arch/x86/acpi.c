@@ -108,8 +108,17 @@ static uint64_t find_madt(uint64_t sdt, int is_xsdt){ return find_table(sdt, is_
  * standard portable ACPI shutdown recipe (works on QEMU, VMware, real HW). */
 static void parse_fadt(uint64_t fadt){
     const uint8_t* f = pv(fadt);
+    uint32_t flen = rd32(f + 4);
     g_topo.pm1a_cnt = rd32(f + 64);     /* PM1a_CNT_BLK */
     g_topo.pm1b_cnt = rd32(f + 68);     /* PM1b_CNT_BLK */
+    /* ACPI 2.0+: X_PM1a/b_CNT_BLK (12-byte GAS @172/@184). Used only when the
+     * 32-bit field is empty and the register is in system I/O space (id 1). */
+    if(flen >= 196){
+        if(!g_topo.pm1a_cnt && f[172] == 1) g_topo.pm1a_cnt = (uint32_t)rd64(f + 176);
+        if(!g_topo.pm1b_cnt && f[184] == 1) g_topo.pm1b_cnt = (uint32_t)rd64(f + 188);
+    }
+    g_topo.smi_cmd     = rd32(f + 48);  /* SMI_CMD */
+    g_topo.acpi_enable = f[52];         /* ACPI_ENABLE */
     /* Reset register (ACPI 2.0+, FADT >= 129 bytes). RESET_REG is a 12-byte GAS
      * at offset 116 (AddressSpaceId @116, Address @120), RESET_VALUE @128; FADT
      * flags @112 bit10 (RESET_REG_SUP) gates support. */
@@ -130,29 +139,33 @@ static void parse_fadt(uint64_t fadt){
     if(!dsdt) return;
     const uint8_t* d = pv(dsdt);
     uint32_t dlen = rd32(d + 4);
-    /* Find "_S5_" (5F 53 35 5F) and parse the following Package. */
-    for(uint32_t i = 36; i + 6 < dlen; i++){
-        if(d[i]=='_' && d[i+1]=='S' && d[i+2]=='5' && d[i+3]=='_'){
-            const uint8_t* p = d + i + 4;
-            /* Optional: NameOp(0x08) precedes the name; the value is a Package. */
-            if(*p == 0x08) p++;          /* (rare positioning) */
-            if(*p != 0x12) continue;     /* PackageOp expected */
-            p++;                         /* skip PackageOp */
-            p++;                         /* skip PkgLength (1 byte; small pkg) */
-            p++;                         /* skip NumElements */
-            /* element 0 -> SLP_TYPa, element 1 -> SLP_TYPb. Constants: 0x00=Zero,
-             * 0x01=One, 0x0A xx = byte. */
-            for(int e=0; e<2; e++){
-                uint16_t v = 0;
-                if(*p == 0x0A){ p++; v = *p++; }
-                else if(*p == 0x00){ v = 0; p++; }
-                else if(*p == 0x01){ v = 1; p++; }
-                else { p++; }
-                if(e==0) g_topo.slp_typa = v; else g_topo.slp_typb = v;
-            }
-            g_topo.s5_ok = (g_topo.pm1a_cnt != 0);
-            return;
+    /* Find the object "Name (_S5, Package () {SLP_TYPa, SLP_TYPb, ...})":
+     * NameOp (0x08), optionally a root prefix '\\', the NameSeg "_S5_", then
+     * PackageOp (0x12) PkgLength NumElements and the elements. A "_S5_" that is
+     * not a NameOp target (a reference inside a method, a string) is skipped. */
+    for(uint32_t i = 38; i + 16 < dlen; i++){
+        if(!(d[i]=='_' && d[i+1]=='S' && d[i+2]=='5' && d[i+3]=='_')) continue;
+        if(!(d[i-1] == 0x08 || (d[i-1] == '\\' && d[i-2] == 0x08))) continue;
+        const uint8_t* p = d + i + 4;
+        if(*p != 0x12) continue;          /* PackageOp expected */
+        p++;
+        p += 1 + (*p >> 6);               /* PkgLength: lead byte + 0..3 more bytes */
+        p++;                              /* NumElements */
+        /* Elements 0/1: Zero (0x00), One (0x01), BytePrefix (0x0A), WordPrefix
+         * (0x0B) or DWordPrefix (0x0C) constants. Only bits 0-2 are SLP_TYP. */
+        int ok = 1;
+        for(int e=0; e<2; e++){
+            uint32_t v = 0;
+            if(*p == 0x00 || *p == 0x01){ v = *p++; }
+            else if(*p == 0x0A){ v = p[1]; p += 2; }
+            else if(*p == 0x0B){ v = rd16(p + 1); p += 3; }
+            else if(*p == 0x0C){ v = rd32(p + 1); p += 5; }
+            else { ok = (e == 1); break; }   /* SLP_TYPb may be absent / non-constant */
+            if(e==0) g_topo.slp_typa = (uint16_t)(v & 7); else g_topo.slp_typb = (uint16_t)(v & 7);
         }
+        if(!ok) continue;
+        g_topo.s5_ok = (g_topo.pm1a_cnt != 0);
+        return;
     }
 }
 
@@ -197,23 +210,47 @@ int acpi_init(uint64_t rsdp_hint){
 const acpi_topology_t* acpi_get(void){ return &g_topo; }
 
 static inline void outw(uint16_t port, uint16_t v){ __asm__ volatile("outw %0,%1"::"a"(v),"Nd"(port)); }
+static inline uint16_t inw(uint16_t port){ uint16_t v; __asm__ volatile("inw %1,%0":"=a"(v):"Nd"(port)); return v; }
+static inline void outb_p(uint16_t port, uint8_t v){ __asm__ volatile("outb %0,%1"::"a"(v),"Nd"(port)); }
+/* ~1 ms per step: the PIT-independent port-0x80 delay (about 1 us per access). */
+static void acpi_delay_ms(int ms){
+    for(int i = 0; i < ms * 1000; i++) __asm__ volatile("outb %%al,$0x80"::"a"(0));
+}
 
+/* S5 (soft-off). The write that powers off is asynchronous on some platforms
+ * (QEMU under TCG processes the shutdown request on its main loop while the
+ * vCPU keeps running), so each attempt is followed by a wait before the next
+ * one, and failure is declared only after the last. */
 void acpi_poweroff(void){
-    const uint16_t SLP_EN = 1u << 13;
+    const uint16_t SLP_EN = 1u << 13, SCI_EN = 1u << 0;
     debugcon_writestring("[ACPI] poweroff: pm1a="); debugcon_print_hex(g_topo.pm1a_cnt);
     debugcon_writestring(" slp_typa="); debugcon_print_hex(g_topo.slp_typa);
     debugcon_writestring(" s5_ok="); debugcon_print_hex((uint64_t)g_topo.s5_ok);
     debugcon_writestring("\n");
-    /* Preferred: the FADT/_S5 values (correct on real HW + VMware). */
     if(g_topo.s5_ok && g_topo.pm1a_cnt){
-        outw((uint16_t)g_topo.pm1a_cnt, (uint16_t)((g_topo.slp_typa << 10) | SLP_EN));
-        if(g_topo.pm1b_cnt)
-            outw((uint16_t)g_topo.pm1b_cnt, (uint16_t)((g_topo.slp_typb << 10) | SLP_EN));
+        uint16_t a = (uint16_t)g_topo.pm1a_cnt, b = (uint16_t)g_topo.pm1b_cnt;
+        /* Legacy firmware boots in SMM/legacy mode (SCI_EN clear): switch to
+         * ACPI mode first (FADT SMI_CMD <- ACPI_ENABLE), or a real chipset
+         * ignores SLP_EN. Bounded wait for SCI_EN. */
+        if(!(inw(a) & SCI_EN) && g_topo.smi_cmd && g_topo.acpi_enable){
+            outb_p((uint16_t)g_topo.smi_cmd, g_topo.acpi_enable);
+            for(int i = 0; i < 300 && !(inw(a) & SCI_EN); i++) acpi_delay_ms(1);
+        }
+        /* SLP_TYP is bits 10-12; keep the other bits (SCI_EN etc.). */
+        uint16_t va = (uint16_t)((inw(a) & ~(7u << 10)) | ((g_topo.slp_typa & 7u) << 10));
+        uint16_t vb = b ? (uint16_t)((inw(b) & ~(7u << 10)) | ((g_topo.slp_typb & 7u) << 10)) : 0;
+        outw(a, va);                               /* SLP_TYP first, then SLP_EN */
+        if(b) outw(b, vb);
+        outw(a, (uint16_t)(va | SLP_EN));
+        if(b) outw(b, (uint16_t)(vb | SLP_EN));
+        acpi_delay_ms(500);
+        debugcon_writestring("[ACPI] S5 via PM1 did not power off; trying emulator ports\n");
     }
     /* Fallbacks for emulators whose _S5 we couldn't parse. */
     outw(0x604,  0x2000);   /* QEMU (newer)            */
     outw(0xB004, 0x2000);   /* QEMU/Bochs (older)      */
     outw(0x4004, 0x3400);   /* VirtualBox              */
+    acpi_delay_ms(500);
     /* If we are still here, ACPI poweroff is unavailable on this platform. */
 }
 

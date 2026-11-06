@@ -53,7 +53,11 @@ static void wr16(uint8_t* p, uint16_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8);
 static void wr32(uint8_t* p, uint32_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
 
 static int sec_read(uint64_t lba, uint8_t* buf){ return block_read(g_dev, lba, buf, 1)==1 ? 0 : -1; }
-static int sec_write(uint64_t lba, const uint8_t* buf){ return block_write(g_dev, lba, buf, 1)==1 ? 0 : -1; }
+static int      g_ro;          /* [M46] mounted read-only (-o ro, or a read-only device) */
+static int sec_write(uint64_t lba, const uint8_t* buf){
+    if(g_ro) return -1;                                   /* never touch a read-only volume */
+    return block_write(g_dev, lba, buf, 1)==1 ? 0 : -1;
+}
 
 static uint64_t clus_lba(uint32_t c){ return (uint64_t)g_data_start + (uint64_t)(c-2)*g_sec_per_clus; }
 static int clus_valid(uint32_t c){ return c>=2 && c < g_total_clusters+2; }
@@ -460,19 +464,21 @@ static int fat_write_file(fat_node_t* nd, size_t offset, const void* buf, size_t
 
 /* ── [M43] Ownership: FAT has none, so the mount supplies it ──────────────────
  * uid=/gid=/umask=/dmask=/fmask= (fs/mntopts.h): default root:root 0755/0644,
- * a file with ATTR_READ_ONLY loses its write bits. "ro" is refused (this
- * driver has no read-only mode). chmod/chown are accepted and ignored
+ * a file with ATTR_READ_ONLY loses its write bits. [M46] "ro" mounts the
+ * volume read-only (every change fails with EROFS, nothing is written; so
+ * does a device without a write path). chmod/chown are accepted and ignored
  * (nothing to store), after the usual owner/root check. */
 static mntopts_t g_fopt     = { 0, 0, 022, 0133, 0, 0 };   /* the mounted volume */
 static mntopts_t g_fopt_new = { 0, 0, 022, 0133, 0, 0 };   /* for the next mount */
 int fat32_set_mount_options(const char* opts){
     mntopts_t o;
-    if(mntopts_parse(opts, &o) != 0 || o.ro) return -1;
+    if(mntopts_parse(opts, &o) != 0) return -1;
     g_fopt_new = o;
     return 0;
 }
 static int fat32_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
     (void)path; (void)a; (void)valid;
+    if(g_ro) return -30;                                  /* -EROFS */
     return 0;                                             /* nothing to store (vfat "quiet") */
 }
 
@@ -546,6 +552,7 @@ static int fat32_read(vfs_inode_t* ino, size_t off, void* buf, size_t len){
 
 static int fat32_write(vfs_inode_t* ino, size_t off, const void* data, size_t len){
     if(!g_mounted || !ino || ino->type!=VFS_NODE_FILE) return -1;
+    if(g_ro) return -30;                                  /* -EROFS */
     fat_node_t* nd = (fat_node_t*)ino->fs_data;
     if(nd->dead) return -1;                 /* unlinked: its entry slot may be reused */
     int r = fat_write_file(nd, off, data, len);
@@ -555,6 +562,7 @@ static int fat32_write(vfs_inode_t* ino, size_t off, const void* data, size_t le
 
 static int fat32_create(const char* path, const void* initial, size_t size){
     if(!g_mounted || !path) return -1;
+    if(g_ro) return -30;                                  /* -EROFS */
     /* fail if exists */
     if(path_resolve(path, NULL, NULL, NULL, NULL)==0) return -1;
     uint32_t parent; uint8_t n83[11]; char comp[64];
@@ -576,6 +584,7 @@ static int fat32_create(const char* path, const void* initial, size_t size){
 }
 
 static int fat32_mkdir(const char* path){
+    if(g_ro) return -30;                                  /* -EROFS */
     if(!g_mounted || !path) return -1;
     if(path_resolve(path, NULL, NULL, NULL, NULL)==0) return -1;
     uint32_t parent; uint8_t n83[11]; char comp[64];
@@ -603,6 +612,7 @@ static int fat32_mkdir(const char* path){
 }
 
 static int fat32_remove(const char* path){
+    if(g_ro) return -30;                                  /* -EROFS */
     if(!g_mounted || !path) return -1;
     uint32_t fc; uint32_t sz; int isd; dent_loc_t loc; loc.clus=0;
     if(path_resolve(path, &fc, &sz, &isd, &loc)!=0) return -1;
@@ -614,6 +624,7 @@ static int fat32_remove(const char* path){
 }
 
 static int fat32_truncate(const char* path, size_t new_size){
+    if(g_ro) return -30;                                  /* -EROFS */
     if(!g_mounted || !path) return -1;
     uint32_t fc; uint32_t sz; int isd; dent_loc_t loc; loc.clus=0;
     if(path_resolve(path, &fc, &sz, &isd, &loc)!=0) return -1;
@@ -650,6 +661,7 @@ static int fat32_truncate(const char* path, size_t new_size){
  * directory moved to another parent gets its ".." re-pointed. Not crash-atomic
  * (FAT has no journal), but never leaves both names pointing at one chain. */
 static int fat32_rename(const char* oldp, const char* newp){
+    if(g_ro) return -30;                                  /* -EROFS */
     if(!g_mounted || !oldp || !newp) return -1;
     uint32_t fc, sz; int isd; dent_loc_t loc; loc.clus=0;
     if(path_resolve(oldp, &fc, &sz, &isd, &loc)!=0) return -1;
@@ -715,6 +727,17 @@ done:
  * (no cached FAT sectors), so there is nothing left to flush at shutdown. */
 static int fat32_sync(void){ return 0; }
 
+/* [M46] mount -o remount,ro|rw. Writes go straight to the device, so going
+ * read-only has nothing to flush; going read-write needs a writable device. */
+static vfs_fs_ops_t fat32_ops;
+static int fat32_remount(int ro){
+    if(!g_mounted) return -22;
+    if(!ro && (!g_dev || !g_dev->write)) return -30;
+    g_ro = ro ? 1 : 0;
+    fat32_ops.flags = g_ro ? VFS_FS_RDONLY : 0;
+    return 0;
+}
+
 static int fat32_mntinfo(const char** src, const char** type){
     if(!g_mounted) return -1;
     if(src) *src = (g_dev && g_dev->name) ? g_dev->name : "fat32";
@@ -726,7 +749,7 @@ static vfs_fs_ops_t fat32_ops = {
     .lookup=fat32_lookup, .readdir=fat32_readdir, .read=fat32_read, .write=fat32_write,
     .create=fat32_create, .mkdir=fat32_mkdir, .remove=fat32_remove, .rename=fat32_rename,
     .truncate=fat32_truncate, .sync=fat32_sync, .statfs=fat32_statfs, .mntinfo=fat32_mntinfo,
-    .setattr=fat32_setattr
+    .setattr=fat32_setattr, .remount=fat32_remount
 };
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */
@@ -776,5 +799,7 @@ int fat32_mount(const char* dev_name, const char* mount_point){
     g_mounted = 1;
     g_fopt = g_fopt_new;                                  /* [M43] this mount's owner/masks */
     mntopts_default(&g_fopt_new);
+    g_ro = (g_fopt.ro || !dev->write) ? 1 : 0;            /* [M46] -o ro / read-only device */
+    fat32_ops.flags = g_ro ? VFS_FS_RDONLY : 0;
     return vfs_mount(mount_point, &fat32_ops, "fat32");
 }

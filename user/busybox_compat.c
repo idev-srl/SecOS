@@ -356,12 +356,17 @@ int munlockall(void) { return 0; }
 int madvise(void* a, size_t l, int v) { (void)a; (void)l; (void)v; return 0; }
 void* mremap(void* o, size_t ol, size_t nl, int f, ...) { (void)o; (void)ol; (void)nl; (void)f; errno = ENOMEM; return MAP_FAILED; }
 int mount(const char* src, const char* tgt, const char* type, unsigned long fl, const void* data) {
-    if (fl & (MS_REMOUNT | MS_BIND | MS_MOVE)) { errno = EINVAL; return -1; }
-    if (!type || !*type) { errno = EINVAL; return -1; }
+    if (fl & (MS_BIND | MS_MOVE)) { errno = EINVAL; return -1; }
+    /* MS_REMOUNT (mount -o remount,ro|rw <dir>) needs no source or type. */
+    if (fl & MS_REMOUNT) { if (!src) src = ""; if (!type) type = ""; }
+    else if (!type || !*type) { errno = EINVAL; return -1; }
     /* `data` (-o uid=,gid=,umask=,... for vfat/exfat/ntfs) goes to the kernel
-     * as SYS_MOUNT a3; MS_RDONLY is passed as a leading "ro". */
+     * as SYS_MOUNT a3; MS_REMOUNT / MS_RDONLY are passed as leading "remount"
+     * / "ro" tokens. */
     char opt[128]; size_t n = 0; const char* d = (const char*)data;
+    if (fl & MS_REMOUNT) { const char* r = "remount,"; while (*r) opt[n++] = *r++; }
     if (fl & MS_RDONLY) { opt[n++] = 'r'; opt[n++] = 'o'; }
+    else if (n) n--;                                   /* drop the trailing ',' */
     if (d && *d) {
         if (n) opt[n++] = ',';
         while (*d && n < sizeof(opt) - 1) opt[n++] = *d++;

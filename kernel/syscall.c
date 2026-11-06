@@ -102,6 +102,19 @@ static void spawn_inherit_stdio(process_t* parent, process_t* child){
     }
 }
 
+// [M43/M46] Honour a set-id bit only on the root fs, for a SETID manifest, and
+// never under no_new_privs (`nnp` = the exec'ing process's bit before the new
+// image was loaded, like Linux). A refused set-id exec is audited.
+static int setid_allowed(process_t* p, uint32_t fmode, int setid_fs, int nnp){
+    int base = setid_fs && process_manifest_setid(p);
+    int want = (fmode & 04000u) || ((fmode & 02000u) && (fmode & 0010u));
+    if(want && base && nnp){
+        cap_audit(p->pid, CAP_AUDIT_SETID, SYS_EXECVE, "setid-nnp", 0);
+        return 0;
+    }
+    return base;
+}
+
 int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     extern int vfs_read_all(const char*, void*, size_t);
     if(!path) return -1;
@@ -125,6 +138,15 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     if(n <= 0) return -1;
     process_t* p = process_create_from_elf_args(g_spawn_buf, (size_t)n, argc, argv);
     if(!p) return -1;
+    // [M46] Exec confinement: the child's caps are bounded by the spawner's
+    // (no_new_privs spawner); such a child never gains a Driver Space binding.
+    cap_exec_bound_t bound = cap_exec_bound(caller);
+    cap_exec_transition(p, bound, "spawn");
+    if(bound.valid && bound.nnp && p->proc_type == PROC_TYPE_DRIVER){
+        driver_remove_all_bindings(p);
+        p->proc_type = PROC_TYPE_USER; p->drv_dev_id = -1; p->drv_caps = 0;
+        cap_audit(p->pid, CAP_AUDIT_DRIVER, SYS_SPAWN, "spawn-nnp", 0);
+    }
     spawn_inherit_stdio(sched_get_current(), p);   // before READY: never runs without them
     p->spawner_pid = sched_get_current() ? sched_get_current()->pid : 0; // SYS_WAIT ownership
     // Job control: a spawned program joins its spawner's process group, so a
@@ -140,7 +162,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0) p->ki.umask = sp->ki.umask;
       if (sp && sp->pid != 0) p->cred = sp->cred;          // [M43] same user as the spawner
-      cred_exec_setid(p, fmode, fuid, fgid, setid_fs && process_manifest_setid(p)); }
+      cred_exec_setid(p, fmode, fuid, fgid, setid_allowed(p, fmode, setid_fs, bound.valid && bound.nnp)); }
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0 && sp->cwd[0]) {
           int i = 0; for (; sp->cwd[i] && i < (int)sizeof(p->cwd) - 1; i++) p->cwd[i] = sp->cwd[i];
@@ -210,8 +232,9 @@ long ksys_execve(struct trapframe* tf, uint64_t upath, uint64_t uargv, uint64_t 
     if(ino->ops->read(ino, 0, img, size) < 0){ kfree(img); kfree(blob); return -EACCES; }
     debugcon_writestring("[EXEC] execve pid="); debugcon_print_hex(c->pid);
     debugcon_writestring(" path="); debugcon_writestring(rp); debugcon_writestring("\n");
+    int nnp_before = c->no_new_privs;                             // [M46]
     r = process_exec(c, tf, img, size, blob, used, argc, envc);   // owns img
-    if(r == 0) cred_exec_setid(c, fmode, fuid, fgid, setid_fs && process_manifest_setid(c));
+    if(r == 0) cred_exec_setid(c, fmode, fuid, fgid, setid_allowed(c, fmode, setid_fs, nnp_before));
     if(r == 0){
         // /proc/<pid>/{cmdline,comm,stat}: the new image's argv (the blob holds
         // argc NUL-terminated strings first; cmdline keeps at most 256 bytes).
@@ -722,13 +745,11 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
             // through the TTY's termios output processing (OPOST/ONLCR).
             extern int tty_write(const void* buf, int len);
             tty_write(u.p, want);
-            // Not a kernel message: skip klog. One chunk at a time under the
-            // debugcon line lock (irqs off), so a scheduler/kernel line printed
-            // from an interrupt cannot land in the middle of the user's line.
-            { extern uint64_t debugcon_line_lock(void); extern void debugcon_line_unlock(uint64_t);
-              uint64_t df = debugcon_line_lock();
-              for(int i=0;i<want;i++) debugcon_putchar_raw((char)u.p[i]);
-              debugcon_line_unlock(df); }
+            // Not a kernel message: skip klog. Mirrored in whole lines
+            // (kernel/klog.c), so a scheduler/kernel line printed between two
+            // write() calls of one user line cannot land in the middle of it.
+            { extern void debugcon_user_write(const char*, int);
+              debugcon_user_write((const char*)u.p, want); }
             r = want;
         }
         if(r<=0){ if(done==0) err=r; break; }
@@ -927,8 +948,44 @@ int ksys_unlink(const char* path){
 // "fat32"/"vfat" -> FAT32; "ext2"/"ext4"/"extN" -> ext driver; "exfat";
 // "ntfs" (read-only); "auto"/"" -> try them in that order. Root only [M43].
 // `opts` = mount(2) data: uid=,gid=,umask=,dmask=,fmask= for the FSes that
-// keep no owners (fs/mntopts.h).
+// keep no owners (fs/mntopts.h); "ro"/"rw" for every FS (NTFS is always ro);
+// ext2/ext4 also "noload" (ro without journal replay). [M46] A "remount"
+// token switches the volume already mounted at `target` between ro and rw
+// (FAT32, ext2/ext4: other FSes have no remount hook -> EINVAL).
 static int str_eq2(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
+// Remove every whole-word `tok` from the comma list `s` (in place); 1 if found.
+static int mnt_take_opt(char* s, const char* tok){
+    int found = 0; char* w = s; const char* r = s;
+    while(*r){
+        const char* e = r; while(*e && *e != ',') e++;
+        int n = (int)(e - r), k = 0;
+        while(tok[k] && k < n && r[k] == tok[k]) k++;
+        if(!tok[k] && k == n) found = 1;
+        else { if(w != s) *w++ = ','; for(int i = 0; i < n; i++) *w++ = r[i]; }
+        r = *e ? e + 1 : e;
+    }
+    *w = 0;
+    return found;
+}
+static int ksys_remount(const char* target, const char* opts){
+    char abs[256];
+    proc_resolve_path(sched_get_current(), target, abs, sizeof(abs));
+    const vfs_fs_ops_t* ops = NULL;
+    int n = vfs_mount_count();
+    for(int i=0;i<n;i++){
+        const char* mp=0; const char* fsn=0;
+        if(vfs_mount_info(i,&mp,&fsn)==0 && mp && str_eq2(mp,abs)){ ops = vfs_mount_ops_at(i); break; }
+    }
+    if(!ops) return -CRED_EINVAL;                         // not a mount point
+    char o[128]; int i = 0;
+    for(; opts[i] && i < (int)sizeof(o) - 1; i++) o[i] = opts[i];
+    o[i] = 0;
+    int ro = mnt_take_opt(o, "ro"), rw = mnt_take_opt(o, "rw");
+    mnt_take_opt(o, "defaults");
+    (void)rw;                                             // the other options are left as they are
+    if(!ops->remount) return -CRED_EINVAL;
+    return ops->remount(ro);
+}
 int ksys_mount_opts(const char* dev, const char* target, const char* fstype, const char* opts){
     extern void* block_find(const char* name);
     extern int fat32_mount(const char*, const char*);
@@ -937,6 +994,12 @@ int ksys_mount_opts(const char* dev, const char* target, const char* fstype, con
     extern int ntfs_mount(const char*, const char*);
     if(!dev||!target||!fstype) return -1;
     if(!cred_is_root(sched_get_current())) return -CRED_EPERM;   // [M43] root only
+    {   // [M46] mount -o remount,...: no device / fstype needed.
+        char o[128]; int i = 0;
+        for(; opts && opts[i] && i < (int)sizeof(o) - 1; i++) o[i] = opts[i];
+        o[i] = 0;
+        if(mnt_take_opt(o, "remount")) return ksys_remount(target, o);
+    }
     // Accept the devfs spelling ("/dev/vda") as well as the bare block name.
     if(dev[0]=='/'&&dev[1]=='d'&&dev[2]=='e'&&dev[3]=='v'&&dev[4]=='/') dev += 5;
     if(!block_find(dev)) return -1;                       // no such device
@@ -952,7 +1015,13 @@ int ksys_mount_opts(const char* dev, const char* target, const char* fstype, con
     int isntfs= str_eq2(fstype,"ntfs")||str_eq2(fstype,"ntfs3")||str_eq2(fstype,"ntfs-3g");  // [M42] read-only
     int isauto= str_eq2(fstype,"auto")||fstype[0]==0;
     extern int fat32_set_mount_options(const char* opts);
-    if(isext) return ext2_mount(dev,target);
+    extern int ext2_set_mount_options(const char* opts);
+    if(isext){                                            // [M46] ro / noload
+        if(ext2_set_mount_options(opts)!=0) return -CRED_EINVAL;
+        int er = ext2_mount(dev,target);
+        ext2_set_mount_options("");
+        return er;
+    }
     // Owner/mode options of FAT32/exFAT/NTFS (fs/mntopts.h); ext2/ext4 keep
     // real owners and ignore them. A malformed option list is -EINVAL.
     extern int exfat_set_mount_options(const char* opts);
@@ -963,12 +1032,13 @@ int ksys_mount_opts(const char* dev, const char* target, const char* fstype, con
     else if(isntfs){ if(ntfs_set_mount_options(opts)!=0) return -CRED_EINVAL; r = ntfs_mount(dev,target); }
     else if(isauto){
         if(fat32_set_mount_options(opts)==0 && fat32_mount(dev,target)==0) r = 0;
-        else if(ext2_mount(dev,target)==0) r = 0;
+        else if(ext2_set_mount_options(opts)==0 && ext2_mount(dev,target)==0) r = 0;
         else if(exfat_set_mount_options(opts)==0 && exfat_mount(dev,target)==0) r = 0;
         else if(ntfs_set_mount_options(opts)==0) r = ntfs_mount(dev,target);
     }
     // A refused mount must not leave its options for the next one.
     fat32_set_mount_options(""); exfat_set_mount_options(""); ntfs_set_mount_options("");
+    ext2_set_mount_options("");
     if(isfat || isexf || isntfs || isauto) return r;
     return -1;                                            // unknown fstype
 }
@@ -1579,6 +1649,22 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_GETCWD:  return (uint64_t)(int64_t)ksys_getcwd((char*)a0, (int)a1);
     case SYS_IOCTL:   return (uint64_t)(int64_t)ksys_ioctl((int)a0, a1, a2);
     case SYS_GETPPID: return (uint64_t)ksys_getppid();
+    case SYS_PRCTL: {                         // [M46] no_new_privs + capability query
+        process_t* c = sched_get_current();
+        if (!c) return (uint64_t)(int64_t)-22;
+        if (a0 == PR_SET_NO_NEW_PRIVS) {
+            if (a1 != 1) return (uint64_t)(int64_t)-22;   // can never be cleared
+            c->no_new_privs = 1;
+            debugcon_writestring("[CAPX] pid="); debugcon_print_hex(c->pid);
+            debugcon_writestring(" set no_new_privs\n");
+            return 0;
+        }
+        if (a0 == PR_GET_NO_NEW_PRIVS) return (uint64_t)(c->no_new_privs ? 1 : 0);
+        if (a0 == PR_SECOS_GET_CAPS)
+            return (uint64_t)(cap_effective(c) | (c->cap_enforce ? (1u << 30) : 0)
+                              | (c->no_new_privs ? (1u << 29) : 0));
+        return (uint64_t)(int64_t)-22;
+    }
     case SYS_FCNTL:   return (uint64_t)(int64_t)ksys_fcntl((int)a0, (int)a1, (long)a2);
     case SYS_GETPGID: {                       // job control (bash getpgrp/getpgid)
         extern long ksys_getpgid(int);

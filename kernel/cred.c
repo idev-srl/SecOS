@@ -302,7 +302,7 @@ int cred_exec_setid(process_t* p, uint32_t fmode, uint32_t fuid, uint32_t fgid, 
         if(fmode & S_ISUID_) p->cred.euid = fuid;
         if((fmode & S_ISGID_) && (fmode & 0010u)) p->cred.egid = fgid;
     } else if(want){
-        debugcon_writestring("[CRED] set-id bit ignored (not on the root fs, or the manifest lacks SETID)\n");
+        debugcon_writestring("[CRED] set-id bit ignored (not on the root fs, no SETID manifest, or no_new_privs)\n");
     }
     p->cred.suid = p->cred.euid;                          /* POSIX: saved = effective after exec */
     p->cred.sgid = p->cred.egid;

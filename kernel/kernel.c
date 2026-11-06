@@ -509,6 +509,73 @@ static void m35_run_demo(void) {
 }
 #endif /* M35_CAP_DEMO */
 
+// ---- [M46] Exec confinement demo (gated; off by default) ----
+// Installs three signed builds of user/m46_confine.c (confined driver, ambient
+// probe with explicit NET/INPUT/DISPLAY, SETID root 04755) and runs, through
+// the real SYS_SPAWN path, first the ambient control (`m46probe ctl`) and then
+// the confined driver (`m46conf`). The selftest greps the [m46]/[CAPX]/[AUDIT]
+// lines: nothing started by a no_new_privs process may hold more caps than it.
+#ifndef M46_CONFINE_DEMO
+#define M46_CONFINE_DEMO 0
+#endif
+#if M46_CONFINE_DEMO
+#include "trapframe.h"
+#include "cap.h"
+#include "syscall.h"
+#include "../crypto/user_m46conf_elf.h"
+#include "../crypto/user_m46probe_elf.h"
+#include "../crypto/user_m46setid_elf.h"
+static uint8_t m46_idle_stack[16384] __attribute__((aligned(16)));
+static int m46_step = 0;
+static int m46_spawn(const char* path, const char* a0, const char* a1) {
+    const char* av[3] = { a0, a1, 0 };
+    int pid = ksys_spawn_argv(path, a1 ? 2 : 1, av);
+    debugcon_writestring("[M46] spawned "); debugcon_writestring(path);
+    debugcon_writestring(pid > 0 ? " ok\n" : " FAILED\n");
+    return pid;
+}
+__attribute__((noreturn)) static void m46_idle_entry(void) {
+    for (;;) {
+        __asm__ volatile("cli");
+        sched_reap_zombies();
+        if (m46_step == 0) {
+            m46_step = 1;
+            m46_spawn("/bin/m46probe", "m46probe", "ctl");
+        } else if (m46_step == 1 && sched_count_alive_user() == 0) {
+            m46_step = 2;
+            m46_spawn("/bin/m46conf", "m46conf", 0);
+        } else if (m46_step == 2 && sched_count_alive_user() == 0) {
+            m46_step = 3;
+            debugcon_writestring("[M46] DONE\n");
+        }
+        __asm__ volatile("sti; hlt");
+    }
+}
+static void m46_run_demo(void) {
+    extern void tss_set_kernel_stack(uint64_t);
+    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
+    debugcon_writestring("[M46] exec confinement demo\n");
+    sysroot_provision();   // /bin/busybox, /bin/bash (normally done by the idle shell)
+    int r = sysroot_install_exec("/bin/m46conf", user_m46conf_elf, user_m46conf_elf_len);
+    r |= sysroot_install_exec("/bin/m46probe", user_m46probe_elf, user_m46probe_elf_len);
+    r |= sysroot_install_exec("/bin/m46setid", user_m46setid_elf, user_m46setid_elf_len);
+    vfs_attr_t a; a.mode = 04755; a.uid = 0; a.gid = 0; a.atime = a.mtime = 0;
+    r |= vfs_lsetattr("/bin/m46setid", &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID);
+    debugcon_writestring(r == 0 ? "[M46] installed /bin/m46{conf,probe,setid}\n" : "[M46] FAIL: install\n");
+    static process_t idle; static trapframe_t idle_tf;
+    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
+    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
+    idle.pid = 0; idle.space = vmm_get_kernel_space();
+    idle.kstack_top = (uint64_t)(m46_idle_stack + sizeof(m46_idle_stack));
+    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
+    idle_tf.rip = (uint64_t)m46_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
+    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
+    sched_set_idle(&idle); sched_set_current(&idle);
+    tss_set_kernel_stack(idle.kstack_top);
+    arch_iret_to_tf(&idle_tf); // does not return
+}
+#endif /* M46_CONFINE_DEMO */
+
 // ---- [M14] Demand paging demo (gated; off by default) ----
 // Proves, non-interactively, that user pages are NOT eagerly mapped: a signed
 // program is loaded (process_create_from_elf) and BEFORE it runs we count the
@@ -2149,6 +2216,9 @@ static void kernel_main_phase2(void) {
 #endif
 #if M35_CAP_DEMO
     m35_run_demo(); // capability confinement demo — does not return
+#endif
+#if M46_CONFINE_DEMO
+    m46_run_demo(); // exec confinement demo — does not return
 #endif
 #if M14_DEMAND_DEMO
     m14_run_demo(); // demand paging demo — does not return
