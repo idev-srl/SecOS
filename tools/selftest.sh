@@ -33,6 +33,11 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# [M43] The gates drive a root bash on the console over serial: build every
+# image with the pre-login console policy (make CONSOLE=root). A gate that
+# tests the console login itself passes CONSOLE=login on its make line.
+export CONSOLE=root
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
