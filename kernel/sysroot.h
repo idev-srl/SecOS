@@ -26,3 +26,9 @@ void sysroot_provision(void);
 /* Apply persistent settings read from /etc (keyboard layout from
  * /etc/vconsole.conf KEYMAP=). The build default stays when the file is absent. */
 void sysroot_apply_settings(void);
+
+/* Create `path` with `data` as an executable: root:root 0755 (exec needs an x
+ * bit, M42). For the boot demos that place a program in the VFS and run it
+ * from user space. Returns vfs_create's result (0 = created). */
+#include <stddef.h>
+int sysroot_install_exec(const char* path, const void* data, size_t len);

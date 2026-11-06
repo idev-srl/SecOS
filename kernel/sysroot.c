@@ -797,3 +797,9 @@ void sysroot_apply_settings(void){
     }
     debugcon_writestring("[KEYMAP] /etc/vconsole.conf has no KEYMAP=: build default layout\n");
 }
+
+int sysroot_install_exec(const char* path, const void* data, size_t len){
+    int r=vfs_create(path, data, len);
+    if(r==0) fix_attr(path, 0755, 0, 0);   /* best effort: a FAT32 mount has fixed modes */
+    return r;
+}
