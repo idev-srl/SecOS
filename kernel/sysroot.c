@@ -85,7 +85,7 @@ extern int vfs_read_all(const char*, void*, size_t);
 // is one signed program in build 1 and another in build 2, to prove that an
 // upgraded kernel refreshes exactly the program that changed.
 #include "../crypto/user_hello_elf.h"
-#include "../crypto/user_spin_elf.h"
+#include "../crypto/user_m16_child_elf.h"
 #endif
 
 /* ---- small string helpers ------------------------------------------------ */
@@ -269,7 +269,7 @@ static void build_table(void){
     sf_conf("/etc/inittab", g_default_inittab);
 #endif
 #if defined(SECOS_SYSROOT_TEST) && SECOS_SYSROOT_TEST == 2
-    sf_bin("sysroot_probe", user_spin_elf, user_spin_elf_len);
+    sf_bin("sysroot_probe", user_m16_child_elf, user_m16_child_elf_len);
 #elif defined(SECOS_SYSROOT_TEST)
     sf_bin("sysroot_probe", user_hello_elf, user_hello_elf_len);
 #endif

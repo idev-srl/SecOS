@@ -1809,6 +1809,29 @@ else
 fi
 
 # ============================================================================
+# M41 PERSISTENT ROOT GATE: the default `make run*` system disk (tools/mkroot.sh,
+# ext4 + journal + metadata_csum) across boots, a kernel upgrade, hard kills and
+# corrupt disks. tools/persist_test.sh does the work in a private mktemp dir
+# (host port 24000-24999) and prints [PASS]/[FAIL] lines, counted here.
+# ============================================================================
+if command -v mkfs.ext4 >/dev/null 2>&1 && command -v debugfs >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1; then
+    echo "[selftest] M41 persistent root gate (2 builds, ~10 boots)..."
+    PERSIST_OUT=$(mktemp /tmp/secos_selftest_persist.XXXXXX)
+    tools/persist_test.sh --crash-runs "${PERSIST_CRASH_RUNS:-3}" >"$PERSIST_OUT" 2>&1
+    while IFS= read -r l; do
+        case "$l" in
+            "  [PASS] "*) check "${l#  \[PASS\] }" 0 ;;
+            "  [FAIL] "*) check "${l#  \[FAIL\] }" 1 ;;
+            "    "*) echo "$l" ;;
+        esac
+    done <"$PERSIST_OUT"
+    grep -q "RESULT:" "$PERSIST_OUT" || { check "PERSIST gate ran to completion" 1; tail -20 "$PERSIST_OUT"; }
+    rm -f "$PERSIST_OUT"
+else
+    echo "  [SKIP] M41 persistent root gate (needs mkfs.ext4, debugfs, ssh-keygen)"
+fi
+
+# ============================================================================
 # INIT GATE: /bin/init as PID 1 — a ready system with no manual steps.
 # (a) An image built with SSH_AUTHORIZED_KEYS=<throwaway key generated here>
 #     boots with a user-net NIC: init must be PID 1, ifup must take a DHCP
@@ -1859,7 +1882,7 @@ else
     init_rc=$?
     { echo "--- s1"; cat "$INITDIR/s1"; } >>"$INITLOG"
     grep -q "\[INIT\] /bin/init started, pid=0x0000000000000001 (PID 1)" "$INITLOG"; check "INIT /bin/init started by the kernel as PID 1" $?
-    grep -q "\[init\] SecOS init (pid 1): 3 entries from /etc/inittab" "$INITSER"; check "INIT reads the default /etc/inittab" $?
+    grep -q "\[init\] SecOS init (pid 1): 4 entries from /etc/inittab" "$INITSER"; check "INIT reads the default /etc/inittab" $?
     grep -q "\[SSH\] baked authorized_keys installed to /root/.ssh" "$INITLOG"; check "INIT baked SSH key installed as /root/.ssh/authorized_keys" $?
     grep -q "\[DHCP\] lease ip=" "$INITLOG" && grep -q "ifup: eth0: lease 10.0.2.15/24 gw 10.0.2.2" "$INITSER"
     check "INIT networking came up by itself (ifup took a DHCP lease)" $?
