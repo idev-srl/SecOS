@@ -810,7 +810,8 @@ int pmm_selftest(void) {
 
     // 1. Sample sections: indices of present sections, evenly spread.
     uint64_t npresent = 0, last = 0;
-    for (uint64_t si = 0; si < g_nsec; si++) if (g_sec[si]) { npresent++; last = si; }
+    uint64_t last_free = 0;   // highest section with a free frame (metadata may fill the top one)
+    for (uint64_t si = 0; si < g_nsec; si++) if (g_sec[si]) { npresent++; last = si; if (g_sec[si]->free) last_free = si; }
     uint64_t step = npresent > 64 ? npresent / 64 : 1, k = 0;
     uint64_t fl = spin_lock_irqsave(&pmm_lock);
     for (uint64_t si = 0; si < g_nsec && n < NS - 1; si++) {
@@ -840,7 +841,7 @@ int pmm_selftest(void) {
     debugcon_writestring(" sections="); st_dec(npresent);
     debugcon_writestring(" highest_frame_MiB="); st_dec((highest * PMM_FRAME_SIZE) >> 20);
     debugcon_writestring(bad ? " pattern FAIL\n" : " pattern OK\n");
-    if (bad || n == 0 || (highest >> PMM_SECTION_SHIFT) != last) fail = 1;
+    if (bad || n == 0 || (highest >> PMM_SECTION_SHIFT) != last_free) fail = 1;
 
     // 2. Zones: an ordinary frame comes from >= 4 GiB when such RAM is free;
     //    pmm_alloc_below / pmm_alloc_contiguous_below stay under the limit.
