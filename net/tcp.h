@@ -53,5 +53,7 @@ void        tcp_close(tcp_conn_t* c);                    /* orderly close + free
 void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len);
 void tcp_tick(void);                                     /* retransmit + TIME_WAIT (from net_tick) */
 void tcp_count(uint32_t* used, uint32_t* orphans);       /* NETCTL_STATS */
+void tcp_alloc_failures(uint64_t* full, uint64_t* nomem);
+uint32_t tcp_peak(void);
 
 #endif /* NET_TCP_H */

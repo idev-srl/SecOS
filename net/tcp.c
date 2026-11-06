@@ -94,6 +94,7 @@ static void conn_closed(struct tcp_conn* c){
     c->state = TCP_CLOSED;
     if (c->orphan || (c->listener && !c->accepted)) conn_free(c);
 }
+static void conn_abort(struct tcp_conn* c);
 static uint16_t g_eph = 49152;
 static uint8_t  g_seg[1600];           /* TX scratch (header + data) */
 static uint8_t  g_cs[12 + 1600];       /* pseudo-header + segment for checksum */
@@ -113,22 +114,49 @@ static uint16_t eph_port(void){
     return 0;
 }
 
+static uint64_t g_alloc_full, g_alloc_nomem;
+static uint32_t g_peak;
+uint32_t tcp_peak(void){ return g_peak; }
+
+/* Table full: recycle the orphaned TIME-WAIT connection closest to expiry
+ * (nobody holds a pointer to an orphan; its 2 s linger only absorbs stray
+ * retransmissions). Returns a freed slot index or -1. */
+static int reclaim_time_wait(void){
+    int best=-1;
+    for(int i=0;i<TCP_MAX_CONN;i++){
+        struct tcp_conn* c=&g_conns[i];
+        if(c->used && c->orphan && c->state==TCP_TIME_WAIT &&
+           (best<0 || c->tw_deadline < g_conns[best].tw_deadline)) best=i;
+    }
+    if(best>=0) conn_free(&g_conns[best]);
+    return best;
+}
+
 tcp_conn_t* tcp_alloc(void){
     NET_ASSERT_STACK_LOCKED();
-    for(int i=0;i<TCP_MAX_CONN;i++) if(!g_conns[i].used){
-        struct tcp_conn* c=&g_conns[i];
+    int slot=-1;
+    for(int i=0;i<TCP_MAX_CONN;i++) if(!g_conns[i].used){ slot=i; break; }
+    if(slot<0) slot=reclaim_time_wait();
+    if(slot>=0){
+        struct tcp_conn* c=&g_conns[slot];
         for(size_t k=0;k<sizeof(*c);k++) ((uint8_t*)c)[k]=0;
         c->tx=(uint8_t*)kmalloc(TCP_TXBUF);
         c->rx=(uint8_t*)kmalloc(TCP_RXBUF);
-        if(!c->tx || !c->rx){ conn_free(c); return NULL; }
-        c->used=1; c->state=TCP_CLOSED; return c;
+        if(!c->tx || !c->rx){ conn_free(c); g_alloc_nomem++; return NULL; }
+        c->used=1; c->state=TCP_CLOSED;
+        uint32_t u=0, o=0; tcp_count(&u, &o);
+        if(u>g_peak) g_peak=u;
+        return c;
     }
+    g_alloc_full++;
     return NULL;
 }
 void tcp_free(tcp_conn_t* c){ if(c) conn_free(c); }
 
 tcp_state_t tcp_get_state(const tcp_conn_t* c){ return c?c->state:TCP_CLOSED; }
 int tcp_rx_available(const tcp_conn_t* c){ return c?(int)c->rx_len:0; }
+
+void tcp_alloc_failures(uint64_t* full, uint64_t* nomem){ *full=g_alloc_full; *nomem=g_alloc_nomem; }
 
 void tcp_count(uint32_t* used, uint32_t* orphans){
     uint32_t u=0, o=0;
@@ -419,6 +447,13 @@ void tcp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* seg, uint32_t len
         }
     }
 
+    /* New data for a connection nobody can read any more: abort (RFC 1122
+     * 4.2.2.13) instead of buffering it until the orphan times out. */
+    if(c->orphan && plen>0 && (c->state==TCP_FIN_WAIT_1 || c->state==TCP_FIN_WAIT_2)){
+        conn_abort(c);
+        return;
+    }
+
     /* In-order data. */
     int did_ack=0;
     if(plen>0 && (c->state==TCP_ESTABLISHED || c->state==TCP_FIN_WAIT_1 || c->state==TCP_FIN_WAIT_2)){
@@ -537,9 +572,18 @@ int tcp_recv_block(tcp_conn_t* c, void* buf, uint32_t len, uint32_t ms){
     return 0;
 }
 
+/* Abort: RST the peer and free the slot at once. */
+static void conn_abort(struct tcp_conn* c){
+    tcp_xmit(c, F_RST|F_ACK, NULL, 0, c->snd_nxt);
+    conn_free(c);
+}
+
 /* Non-blocking close for the socket layer: start the orderly FIN handshake and
  * hand the slot to tcp_tick(), which frees it once CLOSED/TIME-WAIT is over (or
- * after TCP_ORPHAN_MS). A LISTEN conn also drops its not-yet-accepted children. */
+ * after TCP_ORPHAN_MS). A LISTEN conn also drops its not-yet-accepted children.
+ * Closing with unread received data aborts with RST instead (RFC 1122
+ * 4.2.2.13, what Linux does): the data can never be read, and a peer that keeps
+ * sending would otherwise pin the orphan for the full TCP_ORPHAN_MS. */
 void tcp_release(tcp_conn_t* c){
     if(!c || !c->used) return;
     if(c->state==TCP_LISTEN){
@@ -556,6 +600,7 @@ void tcp_release(tcp_conn_t* c){
         return;
     }
     if(c->state==TCP_CLOSED || c->state==TCP_SYN_SENT || c->state==TCP_SYN_RCVD){ conn_free(c); return; }
+    if(c->rx_len>0 && c->state!=TCP_TIME_WAIT){ conn_abort(c); return; }
     c->orphan=1; c->orphan_deadline=timer_get_ticks()+TCP_ORPHAN_MS;
     tcp_start_close(c);
 }

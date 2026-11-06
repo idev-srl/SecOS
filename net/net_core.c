@@ -162,6 +162,7 @@ void net_tick(void) {
 
 extern int sock_count_used(void);
 extern void tcp_count(uint32_t* used, uint32_t* orphans);
+extern void tcp_alloc_failures(uint64_t* full, uint64_t* nomem);
 extern int udp_bind_count(void);
 void net_get_stats(struct secos_netstats* st) {
     uint64_t fl = net_lock();
@@ -169,11 +170,12 @@ void net_get_stats(struct secos_netstats* st) {
     tcp_count(&st->tcp_conns, &st->tcp_orphans);
     st->udp_binds = (uint32_t)udp_bind_count();
     st->arp_entries = (uint32_t)arp_entries();
-    st->_pad = 0;
+    { extern uint32_t tcp_peak(void); st->tcp_peak = tcp_peak(); }
     st->rx_frames = g_rx_frames;
     st->tx_frames = g_tx_frames;
     st->tx_errors = g_tx_errors;
     st->rx_rekicks = g_rx_rekicks;
+    tcp_alloc_failures(&st->tcp_full, &st->tcp_nomem);
     net_unlock(fl);
 }
 

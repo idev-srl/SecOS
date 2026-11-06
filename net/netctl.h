@@ -36,11 +36,13 @@ struct secos_netstats {
     uint32_t tcp_orphans;    /* closed by the socket layer, finishing FIN */
     uint32_t udp_binds;      /* UDP port bindings */
     uint32_t arp_entries;    /* valid ARP cache entries */
-    uint32_t _pad;
+    uint32_t tcp_peak;       /* most TCP control blocks ever in use at once */
     uint64_t rx_frames;      /* frames handed to the stack */
     uint64_t tx_frames;      /* frames handed to a driver */
     uint64_t tx_errors;      /* driver transmit failures */
     uint64_t rx_rekicks;     /* RX drains requested while another CPU drained */
+    uint64_t tcp_full;       /* tcp_alloc() failures: table full */
+    uint64_t tcp_nomem;      /* tcp_alloc() failures: no heap for the buffers */
 };
 
 #endif
