@@ -690,9 +690,10 @@ static int dir_scan(exst_t* d, set_cb_t cb, void* u){
             int r = set_read(d, slot, &sset);
             if(r == -2) return -2;
             if(r == 0){
+                uint32_t cnt = sset.cnt;      /* saved: a callback may scan again */
                 int c = cb(&sset, u);
                 if(c) return c;
-                slot += sset.cnt;
+                slot += cnt;
                 continue;
             }
         }
