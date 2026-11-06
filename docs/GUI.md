@@ -39,7 +39,12 @@ In QEMU, use `make run-gui`. It builds the ISO and opens a GTK window with a
 PS/2 keyboard and a USB tablet (`-device qemu-xhci -device usb-tablet`), so the
 pointer follows the host cursor without a mouse grab. With an Italian keyboard
 use `make run-gui KEYMAP=it`, or type `loadkeys it` in SecOS (before or after
-`startgui`). The debugcon log goes to `secos-gui.log`.
+`startgui`). The debugcon log goes to `secos-gui.log`. The window also has an
+e1000 NIC with host port `GUI_SSH_PORT` (default 2222) forwarded to the guest's
+sshd, so with a baked key you can log in over SSH while the GUI runs:
+
+    make run-gui KEYMAP=it SSH_AUTHORIZED_KEYS=~/.ssh/id_ed25519.pub GUI_AUTOSTART=1
+    ssh -p 2222 root@localhost
 
 ### Autostart (opt-in)
 
@@ -47,14 +52,22 @@ use `make run-gui KEYMAP=it`, or type `loadkeys it` in SecOS (before or after
 otherwise exits 0 at once. So init can always run it, and the GUI stays off
 until it is enabled:
 
-- at build time: `make iso CFLAGS_EXTRA=-DSECOS_GUI_AUTOSTART` creates the
-  file at boot;
-- on a persistent root: `touch /etc/gui-autostart`.
+- at build time: `make iso GUI_AUTOSTART=1` (same as
+  `CFLAGS_EXTRA=-DSECOS_GUI_AUTOSTART`) creates the file at boot **and** adds
+  this entry to the default `/etc/inittab`:
 
-The init process (PID 1, the `feat/init-pid1` work) should launch it once, not
-with respawn, on the console: for example `console::once:/bin/startgui --auto`.
-With respawn, leaving the GUI with Ctrl+Alt+Backspace would just start it
-again. The GUI is not the boot default.
+      gui:once:/bin/startgui --auto
+
+- on a persistent root, whose `/etc/inittab` is kept as it is: add that line
+  to `/etc/inittab` and `touch /etc/gui-autostart`.
+
+init (PID 1) starts it once, after the `sysinit` entries (so after `ifup`),
+next to the console bash; `once` means it is never restarted. Leaving the GUI
+(Ctrl+Alt+Backspace, Exit, or a crash) returns the screen to the console bash
+that init keeps running underneath: while the GUI owns the screen, console
+output is recorded but not drawn, and the keyboard goes only to the GUI
+(EVIOCGRAB). The serial console still reaches that bash. The GUI is not the
+boot default.
 
 ## Using it
 
