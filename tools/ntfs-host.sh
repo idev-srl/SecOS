@@ -18,6 +18,7 @@
 #   tools/ntfs-host.sh run IMG 'CMD'         run CMD with the image mounted at $M
 #   tools/ntfs-host.sh mkgood IMG            build the M42 test image (+ IMG.list)
 #   tools/ntfs-host.sh mkcorrupt DIR         build the corrupt-image suite in DIR
+#   tools/ntfs-host.sh mkfuzz IMG            smaller full-featured image (fuzz base)
 #   tools/ntfs-host.sh verify IMG LIST [MP]  compare a SecOS listing with IMG.list
 set -uo pipefail
 
@@ -104,6 +105,19 @@ cmd_mkcorrupt() {
     $PY corrupt "$base" "$dir"
 }
 
+cmd_mkfuzz() {
+    local img="$1"
+    cmd_mkfs "$img" 32
+    cmd_run "$img" '$PY populate-fuzz "$M"' || die "populating $img failed"
+    local n; n="$(inode_of "$img" /secret.efs)"; [[ -n "$n" ]] && $PY efs "$img" "$n"
+    cmd_run "$img" '$PY list "$M"' > "$img.list" || die "host listing failed"
+    local fr; fr="$(inode_of "$img" /fragmented.bin)"
+    $PY info "$img" "$fr" | grep -q "attr 0x20" || echo "ntfs-host: note: fuzz fragmented.bin has no \$ATTRIBUTE_LIST" >&2
+    local md; md="$(inode_of "$img" /many)"
+    $PY info "$img" "$md" | grep -q "internal_nodes=[1-9]" || echo "ntfs-host: note: fuzz /many index is single-level" >&2
+    echo "ntfs-host: $img ready (fuzz base)"
+}
+
 cmd_verify() {
     # The listing ntfs-3g produced at build time is the reference.
     $PY compare "$1.list" "$2" "${3:-/mnt}"
@@ -115,6 +129,7 @@ case "${1:-}" in
     run)       cmd_run "$2" "$3" ;;
     mkgood)    cmd_mkgood "$2" ;;
     mkcorrupt) cmd_mkcorrupt "$2" ;;
+    mkfuzz)    cmd_mkfuzz "$2" ;;
     verify)    cmd_verify "$2" "$3" "${4:-/mnt}" ;;
     *) sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \?//'; exit 2 ;;
 esac

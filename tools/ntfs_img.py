@@ -4,6 +4,7 @@
 Independent of the SecOS driver. Subcommands:
 
   populate DIR             fill a mounted (ntfs-3g) volume with the test tree
+  populate-fuzz DIR        scaled-down full tree (fuzz base)
   populate-small DIR       small tree for the corrupt-image base
   list DIR                 walk a mounted tree, print the reference listing
   compare REF OURS         compare two listings (see ntfs_fuzz `list`)
@@ -72,7 +73,10 @@ def wfile(path, data):
     with open(path, "wb") as f:
         f.write(data)
 
-def populate(d):
+def populate(d, scale=1.0):
+    """Full test tree; scale < 1 builds the smaller fuzz base."""
+    many, filler = int(MANY * scale), int(3000 * scale)
+    mib = max(1, int(5 * scale))
     wfile(f"{d}/hello.txt", b"hello from ntfs\n")
     wfile(f"{d}/{LONG_UNI}", "Il documento è pronto per la revisione.\n".encode())
     wfile(f"{d}/{CJK}", "こんにちは NTFS\n".encode())
@@ -91,10 +95,11 @@ def populate(d):
     wfile(f"{d}/linked_a.txt", b"two names\n")
     os.link(f"{d}/linked_a.txt", f"{d}/linked_b.txt")
     # sparse: 48 MiB logical, three data islands
+    sp = 48 if scale >= 1 else 8
     with open(f"{d}/sparse.bin", "wb") as f:
         f.write(pattern(10000, 3))
-        f.seek(20 << 20); f.write(pattern(70000, 4))
-        f.seek((48 << 20) - 5000); f.write(pattern(5000, 5))
+        f.seek((sp // 2) << 20); f.write(pattern(70000, 4))
+        f.seek((sp << 20) - 5000); f.write(pattern(5000, 5))
     # compressed (LZNT1): directory with the compressed attribute
     os.makedirs(f"{d}/compressed")
     setxattr(f"{d}/compressed", "system.ntfs_attrib_be", (0x800).to_bytes(4, "big"))
@@ -119,14 +124,14 @@ def populate(d):
     wfile(f"{d}/secret.efs", b"this must not be readable\n")
     # big directory: several B+ tree levels
     os.makedirs(f"{d}/many")
-    for i in range(MANY):
+    for i in range(many):
         wfile(f"{d}/many/entry_{i:05d}_with_a_reasonably_long_name.dat", b"%d\n" % i)
     # fragmentation: 4 KiB files, then ballast until the volume is full, then
     # every other 4 KiB file deleted: the only free space left is ~1500
     # one-cluster holes, so the next file is written in ~1300 runs (too many
     # for one MFT record -> $ATTRIBUTE_LIST + extension records).
     os.makedirs(f"{d}/filler")
-    for i in range(3000):
+    for i in range(filler):
         wfile(f"{d}/filler/f{i:04d}", pattern(4096, i & 0xFF))
     os.sync()
     chunk = bytes(1 << 20)
@@ -138,16 +143,16 @@ def populate(d):
         except OSError:
             pass
     os.sync()
-    for i in range(0, 3000, 2):
+    for i in range(0, filler, 2):
         os.unlink(f"{d}/filler/f{i:04d}")
     os.sync()
-    wfile(f"{d}/fragmented.bin", pattern(5 << 20, 9))
+    wfile(f"{d}/fragmented.bin", pattern((mib << 20) if scale >= 1 else (filler // 2 - 100) * 4096, 9))
     os.sync()
     for name in ("ballast", "ballast2"):
         if os.path.exists(f"{d}/{name}"):
             os.unlink(f"{d}/{name}")
     os.sync()
-    wfile(f"{d}/big.bin", pattern(5 << 20, 11))
+    wfile(f"{d}/big.bin", pattern(mib << 20, 11))
 
 def populate_small(d):
     wfile(f"{d}/ok.txt", b"intact\n")
@@ -492,6 +497,7 @@ def main():
         print(__doc__); sys.exit(2)
     cmd, args = sys.argv[1], sys.argv[2:]
     if cmd == "populate": populate(args[0])
+    elif cmd == "populate-fuzz": populate(args[0], 0.35)
     elif cmd == "populate-small": populate_small(args[0])
     elif cmd == "list": list_tree(args[0])
     elif cmd == "compare": sys.exit(compare(args[0], args[1], args[2] if len(args) > 2 else "/mnt"))

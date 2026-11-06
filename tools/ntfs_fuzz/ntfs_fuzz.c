@@ -150,6 +150,43 @@ static void exercise(void){
     walk_free();
 }
 
+/* Pre-scan helpers (raw, unfixed records: good enough to find targets). */
+static uint32_t rd32h(const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint16_t rd16h(const uint8_t* p){ return (uint16_t)(p[0] | (p[1] << 8)); }
+/* 1 if the record has an attribute list, is an extension record, holds an
+ * index allocation / reparse point, or compressed/sparse data. Compressed
+ * $DATA runs are added to the cluster list `cl`. */
+static int interesting(const uint8_t* r, size_t rs, uint64_t cb, uint64_t* cl, size_t* ncl, size_t maxcl){
+    int hit = rd32h(r + 0x20) != 0;                      /* base reference: extension */
+    uint32_t pos = rd16h(r + 0x14), used = rd32h(r + 0x18);
+    if(used > rs) used = (uint32_t)rs;
+    for(int k = 0; k < 64 && pos + 16 <= used; k++){
+        uint32_t t = rd32h(r + pos), len = rd32h(r + pos + 4);
+        if(t == 0xFFFFFFFF || len < 0x18 || pos + len > used) break;
+        uint16_t fl = rd16h(r + pos + 0x0C);
+        if(t == 0x20 || t == 0xA0 || t == 0xC0) hit = 1;
+        if(t == 0x80 && r[pos + 8] && (fl & 0x80FF)){
+            hit = 1;
+            uint32_t p = pos + rd16h(r + pos + 0x20);
+            int64_t lcn = 0;
+            while(p < pos + len && r[p] && *ncl < maxcl){
+                uint32_t lb = r[p] & 15, ob = r[p] >> 4;
+                if(!lb || lb > 8 || ob > 8 || p + 1 + lb + ob > pos + len) break;
+                uint64_t ln = 0; for(uint32_t i = 0; i < lb; i++) ln |= (uint64_t)r[p + 1 + i] << (8 * i);
+                if(ob){
+                    uint64_t d = 0; for(uint32_t i = 0; i < ob; i++) d |= (uint64_t)r[p + 1 + lb + i] << (8 * i);
+                    if(ob < 8 && (r[p + lb + ob] & 0x80)) d |= ~0ULL << (8 * ob);
+                    lcn += (int64_t)d;
+                    for(uint64_t c = 0; c < ln && *ncl < maxcl; c++) cl[(*ncl)++] = ((uint64_t)lcn + c) * cb;
+                }
+                p += 1 + lb + ob;
+            }
+        }
+        pos += len;
+    }
+    return hit;
+}
+
 static uint64_t g_rng;
 static uint64_t rnd(void){ g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17; return g_rng; }
 static uint64_t g_seed;
@@ -187,15 +224,25 @@ int main(int argc, char** argv){
         else if(!memcmp(base + o, "INDX", 4)) indx[nindx++] = o;
     }
     if(!nfile){ fprintf(stderr, "no FILE records found\n"); return 2; }
-    fprintf(stderr, "base: %zu FILE records, %zu INDX blocks\n", nfile, nindx);
+    uint64_t cb = (uint64_t)rd16h(base + 0x0B) * (base[0x0D] <= 0x80 ? base[0x0D] : 1u);
+    if(!cb) cb = 4096;
+    size_t nint = 0, ncl = 0;
+    size_t* hot = malloc(sizeof(size_t) * nfile);
+    uint64_t* cl = malloc(sizeof(uint64_t) * 65536);
+    for(size_t i = 0; i < nfile; i++)
+        if(interesting(base + files[i], 1024, cb, cl, &ncl, 65536)) hot[nint++] = files[i];
+    if(!nint) hot[nint++] = files[0];
+    fprintf(stderr, "base: %zu FILE records (%zu interesting), %zu INDX blocks, %zu compressed clusters\n",
+            nfile, nint, nindx, ncl);
     long mounted = 0;
     for(long it = 0; it < iters; it++){
         g_seed = seed0 + (uint64_t)it;
         g_rng = g_seed * 0x9E3779B97F4A7C15ull + 1;
         memcpy(g_img, base, len);
         int nflip = 1 + (int)(rnd() % 16);
-        int region = (int)(rnd() % 8);
+        int region = (int)(rnd() % 11);
         size_t pick = files[rnd() % nfile];
+        if(region >= 8 && region <= 9) pick = hot[rnd() % nint];
         if(region == 2 && nindx) pick = indx[rnd() % nindx];
         for(int k = 0; k < nflip; k++){
             uint64_t off;
@@ -207,6 +254,9 @@ int main(int argc, char** argv){
             case 4: off = files[rnd() % (nfile < 40 ? nfile : 40)] + rnd() % 1024; break; /* metafiles */
             case 5: off = files[rnd() % nfile] + 0x38 + rnd() % 0x100; break;            /* many records */
             case 6: off = (nindx ? indx[rnd() % nindx] : pick) + 0x18 + rnd() % 0x200; break; /* index headers */
+            case 8: off = pick + rnd() % 1024; break;                       /* attr list / extension / index / reparse / compressed */
+            case 9: off = pick + 0x38 + rnd() % 0x200; break;               /* ... their attribute headers + runs */
+            case 10: off = ncl ? cl[rnd() % ncl] + rnd() % cb : rnd() % len; break;  /* LZNT1 data */
             default: off = rnd() % len; break;
             }
             if(off >= len) continue;
@@ -228,7 +278,7 @@ int main(int argc, char** argv){
         alarm(0);
         if((it + 1) % 1000 == 0) fprintf(stderr, "  %ld iterations, %ld mounts\n", it + 1, mounted);
     }
-    free(base); free(g_img); free(files); free(indx);
+    free(base); free(g_img); free(files); free(indx); free(hot); free(cl);
     printf("ntfs_fuzz: %ld images, %ld successful mounts, no crash/hang/UB\n", iters, mounted);
     return 0;
 }
