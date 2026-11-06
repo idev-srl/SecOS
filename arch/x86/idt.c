@@ -143,6 +143,8 @@ void idt_init(void) {
     
     // Install PS/2 keyboard handler (IRQ1 mapped to interrupt 0x21)
     idt_set_gate(0x21, (uint64_t)isr_keyboard, 0x08, 0x8E);
+    // [M40] PS/2 mouse (IRQ12 -> 0x2C); stays masked until ps2mouse_init + irq_enable_aux
+    idt_set_gate(0x2C, (uint64_t)isr_mouse, 0x08, 0x8E);
 
     // Syscall gate INT 0x80 (trap gate, present, DPL=3 -> type_attr 0xEE)
     idt_set_gate(0x80, (uint64_t)syscall_entry, 0x08, 0xEE);

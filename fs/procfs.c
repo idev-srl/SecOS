@@ -408,12 +408,14 @@ static void gen_pid_maps(struct sb* s){
         int none = (f & VMM_FLAG_PROTNONE) ? 1 : 0;
         sb_hex(s,g_ps.vma[i].start,8); sb_putc(s,'-'); sb_hex(s,g_ps.vma[i].end,8); sb_putc(s,' ');
         sb_putc(s, none?'-':'r'); sb_putc(s, (!none && (f&VMM_FLAG_RW))?'w':'-');
-        sb_putc(s, (!none && !(f&VMM_FLAG_NOEXEC))?'x':'-'); sb_putc(s,'p');
+        sb_putc(s, (!none && !(f&VMM_FLAG_NOEXEC))?'x':'-');
+        sb_putc(s, g_ps.vma[i].type==VMA_TYPE_PHYS ? 's' : 'p');   // [M40] device map is shared
         sb_str(s," 00000000 00:00 0");
         const char* name=0;
         if(g_ps.vma[i].start<g_ps.stack_top && g_ps.vma[i].end>=g_ps.stack_top) name="[stack]";
         else if(g_ps.vma[i].start>=g_ps.brk_start && g_ps.vma[i].end<=g_ps.brk_cur && g_ps.brk_cur>g_ps.brk_start) name="[heap]";
         else if(g_ps.vma[i].type==VMA_TYPE_FILE && !g_ps.vma[i].has_inode) name=g_ps.comm;
+        else if(g_ps.vma[i].type==VMA_TYPE_PHYS) name="/dev/fb0";   // the only device map (M40)
         if(name){ sb_str(s,"                          "); if(name==g_ps.comm && g_ps.cmdlen && g_ps.cmdline[0]=='/') sb_str(s,g_ps.cmdline); else sb_str(s,name); }
         sb_putc(s,'\n');
     }

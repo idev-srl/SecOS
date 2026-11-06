@@ -28,9 +28,13 @@ ASFLAGS = -f elf64
 BUILD_TS := $(shell if [ -n "$$SOURCE_DATE_EPOCH" ]; then date -u -d @$$SOURCE_DATE_EPOCH +%Y%m%d%H%M%S; else date -u +%Y%m%d%H%M%S; fi)
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo NOHASH)
 # Nota: CONFIG_MULTIBOOT e CONFIG_UEFI sono ora definiti in config.h (dual-boot support)
+# [M40] Boot keyboard layout (drivers/keymap.c): `make iso KEYMAP=it`. The code
+# default is "us"; switch at runtime with `loadkeys it|us`.
+KEYMAP ?=
+KEYMAP_DEF := $(if $(KEYMAP),-DSECOS_KEYMAP_DEFAULT='"$(KEYMAP)"',)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
 		  -fstack-protector-strong $(INCLUDES) \
-		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(CFLAGS_EXTRA)
+		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(CFLAGS_EXTRA)
 # Header dependency tracking: every kernel object also depends on the headers it
 # includes (gcc writes foo.d next to foo.o). Without it, changing only a header
 # (e.g. a regenerated embedded program crypto/user_*_elf.h) left the objects that
@@ -51,6 +55,8 @@ SRC_C   = \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c $(DRIVERS_DIR)/vt.c \
+	$(DRIVERS_DIR)/input.c $(DRIVERS_DIR)/keymap.c $(DRIVERS_DIR)/ps2mouse.c \
+	$(DRIVERS_DIR)/fbdev.c \
 	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
 	$(DRIVERS_DIR)/ahci.c $(DRIVERS_DIR)/nvme.c \
 	$(DRIVERS_DIR)/xhci.c $(DRIVERS_DIR)/usb.c \
@@ -180,6 +186,12 @@ $(KERNEL_DIR)/%.o: $(KERNEL_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(ARCH_DIR)/%.o: $(ARCH_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
+# [M40] drivers/keymap.o bakes in KEYMAP: rebuild it whenever the value changes.
+# The stamp is rewritten (at parse time) only when its content would change.
+KEYMAP_STAMP := .keymap.stamp
+$(shell echo '$(KEYMAP)' | cmp -s - $(KEYMAP_STAMP) 2>/dev/null || echo '$(KEYMAP)' > $(KEYMAP_STAMP))
+$(DRIVERS_DIR)/keymap.o: $(KEYMAP_STAMP)
+
 $(DRIVERS_DIR)/%.o: $(DRIVERS_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(MM_DIR)/%.o: $(MM_DIR)/%.c
@@ -409,7 +421,65 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/ptytest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/ptytest.o
 	python3 tools/secos-sign user/ptytest.elf --dev
 	python3 tools/elf2h.py user/ptytest.elf user_ptytest_elf crypto/user_ptytest_elf.h
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + exectest{,_unsigned} + ttytest + ptytest -> crypto/*.h"
+	# [M40] GUI kernel interfaces: /dev/fb0 + /dev/input/eventN demo and test
+	# (signed with the CAP_INPUT|CAP_DISPLAY manifest), a capability-less twin
+	# of the test (refusals), and loadkeys (console keyboard layout)
+	$(CC) $(USER_CFLAGS) -c user/note_gui.S    -o user/note_gui.o
+	$(CC) $(USER_CFLAGS) -c user/fbdemo.c      -o user/fbdemo.o
+	$(LD) --gc-sections -T user/user.ld -o user/fbdemo.elf user/crt0.o user/note_gui.o user/libsecos.o user/libc.o user/fbdemo.o
+	python3 tools/secos-sign user/fbdemo.elf --dev
+	python3 tools/elf2h.py user/fbdemo.elf user_fbdemo_elf crypto/user_fbdemo_elf.h
+	$(CC) $(USER_CFLAGS) -c user/guitest.c     -o user/guitest.o
+	$(LD) --gc-sections -T user/user.ld -o user/guitest.elf user/crt0.o user/note_gui.o user/libsecos.o user/libc.o user/guitest.o
+	$(LD) --gc-sections -T user/user.ld -o user/guitest_nocap.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/guitest.o
+	python3 tools/secos-sign user/guitest.elf --dev
+	python3 tools/secos-sign user/guitest_nocap.elf --dev
+	python3 tools/elf2h.py user/guitest.elf user_guitest_elf crypto/user_guitest_elf.h
+	python3 tools/elf2h.py user/guitest_nocap.elf user_guitest_nocap_elf crypto/user_guitest_nocap_elf.h
+	$(CC) $(USER_CFLAGS) -c user/loadkeys.c    -o user/loadkeys.o
+	$(LD) --gc-sections -T user/user.ld -o user/loadkeys.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/loadkeys.o
+	python3 tools/secos-sign user/loadkeys.elf --dev
+	python3 tools/elf2h.py user/loadkeys.elf user_loadkeys_elf crypto/user_loadkeys_elf.h
+	$(MAKE) --no-print-directory gui-progs
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+
+# Graphical UI (docs/GUI.md): the secwm compositor + terminal (signed
+# CAP_INPUT|CAP_DISPLAY, the only program holding fb0 and the input devices),
+# and its clients, signed with the confined manifest (CAP_ENFORCE|FS_READ|TIME):
+# sysinfo (System panel) and swptest (isolation selftest). The keymap tables
+# are the kernel's own drivers/keymap.c compiled once more for user space.
+# font16.h is generated from the vendored Terminus Font (SIL OFL 1.1):
+#   python3 tools/bdf2c.py user/secwm/font16.h third_party/terminus-font/ter-u16{n,b}.bdf
+SWM = user/secwm
+SWM_CFLAGS = $(USER_CFLAGS) -I$(SWM)
+.PHONY: gui-progs
+gui-progs:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note_gui.S   -o user/note_gui.o
+	$(CC) $(USER_CFLAGS) -c user/note_confined.S -o user/note_confined.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c   -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c       -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/libm.c       -o user/libm.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/gfx.c       -o $(SWM)/gfx.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/term.c      -o $(SWM)/term.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/swpc.c      -o $(SWM)/swpc.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/secwm.c     -o $(SWM)/secwm.o
+	$(CC) $(SWM_CFLAGS) -c drivers/keymap.c   -o $(SWM)/keymap.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/sysinfo.c   -o $(SWM)/sysinfo.o
+	$(CC) $(SWM_CFLAGS) -c $(SWM)/swptest.c   -o $(SWM)/swptest.o
+	$(LD) --gc-sections -T user/user.ld -o $(SWM)/secwm.elf user/crt0.o user/note_gui.o user/libsecos.o user/libc.o user/libm.o \
+	  $(SWM)/secwm.o $(SWM)/term.o $(SWM)/gfx.o $(SWM)/keymap.o
+	$(LD) --gc-sections -T user/user.ld -o $(SWM)/sysinfo.elf user/crt0.o user/note_confined.o user/libsecos.o user/libc.o user/libm.o \
+	  $(SWM)/sysinfo.o $(SWM)/swpc.o $(SWM)/gfx.o
+	$(LD) --gc-sections -T user/user.ld -o $(SWM)/swptest.elf user/crt0.o user/note_confined.o user/libsecos.o user/libc.o \
+	  $(SWM)/swptest.o $(SWM)/swpc.o $(SWM)/gfx.o
+	python3 tools/secos-sign $(SWM)/secwm.elf --dev
+	python3 tools/secos-sign $(SWM)/sysinfo.elf --dev
+	python3 tools/secos-sign $(SWM)/swptest.elf --dev
+	python3 tools/elf2h.py $(SWM)/secwm.elf user_secwm_elf crypto/user_secwm_elf.h
+	python3 tools/elf2h.py $(SWM)/sysinfo.elf user_sysinfo_elf crypto/user_sysinfo_elf.h
+	python3 tools/elf2h.py $(SWM)/swptest.elf user_swptest_elf crypto/user_swptest_elf.h
+	@echo "gui-progs: built+signed secwm + sysinfo + swptest -> crypto/*.h"
 
 # Staleness guard for the committed embedded programs: rebuild + re-sign them
 # (deterministic: same sources -> byte-identical headers) and fail if any
@@ -471,6 +541,15 @@ port-bash:
 # compiled against the SecOS libc + user/busybox-include + user/busybox_compat.c,
 # signed -> crypto/user_busybox_elf.h + the applet stub crypto/user_bbstub_elf.h
 # + kernel/busybox_applets.h. Needs network (first run) + python3 'cryptography'.
+# LVGL 9.2.2 (MIT) from source: tools/port-lvgl.sh fetches the pinned release
+# (SHA-256 checked), compiles it with user/lvgl/lv_conf.h and links the LVGL
+# system monitor (user/lvgl/sysmon.c, an SWP client of secwm, confined
+# manifest) -> crypto/user_sysmon_elf.h, installed as /bin/sysmon.
+.PHONY: port-lvgl
+port-lvgl:
+	bash tools/port-lvgl.sh
+	@echo "port-lvgl: LVGL $(shell sed -n 's/^LV=//p' tools/port-lvgl.sh) built from source, sysmon signed -> crypto/user_sysmon_elf.h"
+
 .PHONY: port-busybox
 port-busybox:
 	bash tools/port-busybox.sh
@@ -597,6 +676,17 @@ run-ssh: iso
 	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -cpu max -serial stdio -display none -no-reboot \
 		-netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0
 
+# Graphical UI in a GTK window (docs/GUI.md): PS/2 keyboard + a USB tablet, so
+# the guest pointer follows the host cursor without a mouse grab. Type
+# `startgui` at the bash prompt; Ctrl+Alt+Backspace leaves the GUI. Italian
+# keyboard: `make run-gui KEYMAP=it` (or `loadkeys it` in SecOS). Debugcon
+# (kernel log + GUI markers) goes to secos-gui.log.
+.PHONY: run-gui
+run-gui: iso
+	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -display gtk \
+		-device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 \
+		-debugcon file:secos-gui.log -global isa-debugcon.iobase=0xe9
+
 # Run with a VNC server on :0 (connect a VNC viewer to localhost:5900)
 .PHONY: run-vnc
 run-vnc: iso
@@ -605,7 +695,7 @@ run-vnc: iso
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
-	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)

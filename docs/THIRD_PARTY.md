@@ -12,6 +12,8 @@ image can get the corresponding source.
 | BusyBox | 1.36.1 | GPL-2.0-only | no: fetched by `tools/port-busybox.sh` | `/bin/busybox` + applet stubs in `/bin` |
 | musl libc (regex, fnmatch, getopt only) | 1.2.5 | MIT | no: fetched by `tools/port-busybox.sh` | linked into `/bin/busybox` |
 | Lua | 5.4.7 | MIT | yes: `third_party/lua/` | `/bin/lua` |
+| LVGL (with its built-in Montserrat + FontAwesome glyph tables) | 9.2.2 | MIT (fonts: SIL OFL 1.1) | no: fetched by `tools/port-lvgl.sh` | linked into `/bin/sysmon` |
+| Terminus Font (8x16 regular + bold) | 4.49.1 | SIL OFL 1.1 | yes: `third_party/terminus-font/` (BDF) | glyph table `user/secwm/font16.h` in `/bin/secwm`, `/bin/sysinfo`, `/bin/swptest`, `/bin/sysmon` |
 
 ## Upstream sources and checksums
 
@@ -21,6 +23,8 @@ image can get the corresponding source.
 | `busybox-1.36.1.tar.bz2` | https://busybox.net/downloads/busybox-1.36.1.tar.bz2 | `b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314` |
 | `musl-1.2.5.tar.gz` | https://musl.libc.org/releases/musl-1.2.5.tar.gz | `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4` |
 | Lua 5.4.7 | https://www.lua.org/ftp/lua-5.4.7.tar.gz | vendored in `third_party/lua/` |
+| `lvgl-9.2.2.tar.gz` | https://github.com/lvgl/lvgl/archive/refs/tags/v9.2.2.tar.gz | `129b4e00e06639fa79d7e8a6cab3c1ecce2445b1a246652ccd34f22e7b17ad6f` |
+| `terminus-font-4.49.1.tar.gz` | https://sourceforge.net/projects/terminus-font/files/terminus-font-4.49/ | `d961c1b781627bf417f9b340693d64fc219e0113ad3a3af1a3424c7aa373ef79` (two BDF files + `OFL.TXT` vendored) |
 
 The BusyBox checksum matches the `busybox-1.36.1.tar.bz2.sha256` file published
 next to the tarball. `tools/port-busybox.sh` checks both the BusyBox and the musl
@@ -68,3 +72,14 @@ verbatim from the tarball), `docs/licenses/musl-1.2.5-COPYRIGHT` (musl, MIT, its
 copyright notice must ship with the musl code linked into BusyBox), `COPYING`
 (GPL-3.0) in the bash tarball, and the copyright notice in
 `third_party/lua/src/lua.h` for Lua.
+`docs/licenses/lvgl-9.2.2-LICENCE.txt` (LVGL, MIT, copied by `tools/port-lvgl.sh`;
+LVGL's built-in fonts are converted from Montserrat and FontAwesome Free, both
+SIL OFL 1.1), and `third_party/terminus-font/OFL.TXT` (Terminus Font, SIL OFL
+1.1, Reserved Font Name "Terminus Font"; `tools/bdf2c.py` converts a glyph
+subset to a C table without changing the glyphs, see
+`third_party/terminus-font/README.secos`).
+
+LVGL is MIT, so its source does not have to ship with the image. It is fetched
+at build time, like the GPL ports, because the upstream tree is 19 MB: the
+repository holds only `user/lvgl/lv_conf.h`, the application, the port script
+and the signed `crypto/user_sysmon_elf.h`.

@@ -117,6 +117,10 @@ static const uint8_t font8x16[95][16] = {
 
 
 static int fb_enabled = 0;
+// [M40] Graphics mode (KDSETMODE KD_GRAPHICS): a client owns the screen. The vt
+// keeps interpreting output into its cell grid, but nothing is drawn; leaving
+// graphics mode repaints the whole console from the grid (fb_console_redraw).
+static volatile int fb_gfx = 0;
 static uint32_t fb_width, fb_height, fb_pitch;
 static uint64_t fb_phys_addr = 0;
 static const uint32_t glyph_w = 8, glyph_h = 16;
@@ -158,12 +162,45 @@ static uint32_t blend(uint32_t a,uint32_t b,float t){
 }
 
 /* ---- glyphs -------------------------------------------------------------- */
+// [M40] Accented letters = base letter + accent rows; three symbols drawn here.
+static const uint8_t glyph_section[11] = {0x3C,0x66,0x06,0x1C,0x36,0x66,0x6C,0x38,0x60,0x66,0x3C};
+static const uint8_t glyph_pound[9] = {0x38,0x6C,0x0C,0x0C,0x3F,0x0C,0x0C,0x4E,0x3F};
+static const uint8_t glyph_euro[9] = {0x78,0xCC,0x06,0x1F,0x06,0x1F,0x06,0xCC,0x78};
+static int accent_glyph(uint8_t g, uint8_t out[16]){
+    static const struct { uint8_t g; char base; uint8_t kind; } tab[] = {
+        { VT_G_A_GRAVE, 'a', 1 }, { VT_G_E_GRAVE, 'e', 1 }, { VT_G_E_ACUTE, 'e', 2 },
+        { VT_G_I_GRAVE, 'i', 1 }, { VT_G_O_GRAVE, 'o', 1 }, { VT_G_U_GRAVE, 'u', 1 },
+        { VT_G_CA_GRAVE, 'A', 1 }, { VT_G_CE_GRAVE, 'E', 1 }, { VT_G_CE_ACUTE, 'E', 2 },
+        { VT_G_CI_GRAVE, 'I', 1 }, { VT_G_CO_GRAVE, 'O', 1 }, { VT_G_CU_GRAVE, 'U', 1 },
+        { VT_G_C_CEDIL, 'c', 3 },
+    };
+    const uint8_t* sym = 0; int nsym = 0;
+    if(g == VT_G_SECTION){ sym = glyph_section; nsym = (int)sizeof(glyph_section); }
+    if(g == VT_G_POUND)  { sym = glyph_pound;   nsym = (int)sizeof(glyph_pound); }
+    if(g == VT_G_EURO)   { sym = glyph_euro;    nsym = (int)sizeof(glyph_euro); }
+    if(sym){ for(int r=0;r<nsym && r<16;r++) out[r]=sym[r]; return 1; }
+    for(unsigned i=0;i<sizeof(tab)/sizeof(tab[0]);i++){
+        if(tab[i].g != g) continue;
+        const uint8_t* b = font8x16[tab[i].base - 32];
+        int upper = (tab[i].base >= 'A' && tab[i].base <= 'Z');
+        int shift = upper ? 3 : 0;               // capitals move down to make room
+        for(int r=0;r+shift<16;r++) out[r+shift] = b[r];
+        if(tab[i].base == 'i'){ out[0] = 0; out[1] = 0; }   // drop the dot
+        if(tab[i].kind == 1){ out[0] |= 0x06; out[1] |= 0x0C; }        // grave
+        else if(tab[i].kind == 2){ out[0] |= 0x30; out[1] |= 0x18; }   // acute
+        else { out[8] |= 0x10; out[9] |= 0x18; }                       // cedilla
+        return 1;
+    }
+    return 0;
+}
+
 // Fill out[16] with the bitmap of glyph code g (bit n = pixel column n, the
 // font's LSB-left encoding). Covers ASCII, the CP437 box-drawing subset and the
 // extra vt glyphs (ellipsis, middle dot, degree, block, shade, check, unknown).
 static void glyph_rows(uint8_t g, uint8_t out[16]){
     for(int i=0;i<16;i++) out[i]=0;
     if(g >= 0x20 && g <= 0x7E){ for(int i=0;i<16;i++) out[i]=font8x16[g-32][i]; return; }
+    if(g >= 0x90 && g <= 0x9F && accent_glyph(g, out)) return;
     // Box drawing: arms Left/Right/Up/Down meeting in the cell centre.
     enum { L=1, R=2, U=4, D=8 };
     int arms = 0;
@@ -202,7 +239,7 @@ static void glyph_rows(uint8_t g, uint8_t out[16]){
 // clipped against the framebuffer (vt coordinates are already in range, the
 // check guards a geometry change underneath us).
 static void fb_draw_cell_px(int x, int y, const vt_cell_t* c, int with_cursor){
-    if(!fb_enabled || x < 0 || y < 0) return;
+    if(!fb_enabled || fb_gfx || x < 0 || y < 0) return;
     uint32_t gx = (uint32_t)x * glyph_w, gy = (uint32_t)y * glyph_h;
     if(gx + glyph_w > fb_width || gy + glyph_h > fb_height) return;
     uint8_t rows[16]; glyph_rows(c->ch, rows);
@@ -228,6 +265,7 @@ void fb_console_draw_logo(void);
 // buffer (RAM back buffer when enabled, never read from VRAM otherwise).
 static int fbvt_scroll(int top, int bot, int n){
     if(!fb_enabled) return -1;
+    if(fb_gfx) return 0;                       // graphics mode: the grid alone moves
     int cols, rows; vt_get_size(&cols, &rows);
     (void)cols;
     if(top < 0 || bot >= rows || top >= bot) return -1;
@@ -267,6 +305,7 @@ static void fbvt_flush(void){ fb_console_flush_if_auto(); }
 
 static int fbvt_clear_all(uint8_t bg){
     if(!fb_enabled) return -1;
+    if(fb_gfx) return 0;
     uint32_t rgb = vga_palette[bg & 0xF];
     uint8_t* target = fb_target();
     for(uint32_t y=0; y<fb_height; y++){
@@ -292,7 +331,7 @@ int fb_console_init(void){
         info.virt_addr = tentative;
     }
     fb_width = info.width; fb_height = info.height; fb_pitch = info.pitch; fb_phys_addr = (info.virt_addr ? info.virt_addr : info.addr);
-    fb_enabled = 1; fb_clear(0x000000);
+    fb_enabled = 1; fb_gfx = 0; fb_clear(0x000000);   // a (re)init is always text mode (panic path)
     // Drop the double buffer (a re-init may change geometry). Free it first — the
     // caller (boot / clear) re-enables it; otherwise the console falls back to slow
     // direct-VRAM rendering (scroll reads VRAM). Previously this leaked dbuf.
@@ -310,6 +349,7 @@ int fb_console_init(void){
 
 // Simple stylized SecOS logo (5 letters) rendered top-right
 static void draw_block(int x,int y,int w,int h,uint32_t rgb){
+    if(fb_gfx) return;
     if(x<0||y<0) return; if(x+w>fb_width) w=fb_width-x; if(y+h>fb_height) h=fb_height-y;
     uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
     uint8_t* target = (dbuf_enabled && dbuf)? dbuf : base;
@@ -328,7 +368,7 @@ static int logo_glow_enabled=1; // glow effect enabled
 #define KERNEL_VERSION "v0.2"
 #endif
 static void fb_console_clear_logo_area(void){
-    if(!fb_enabled) return;
+    if(!fb_enabled || fb_gfx) return;
     if(logo_chip_w==0 || logo_chip_h==0) return;
     int top = logo_chip_y - (logo_pin_len+2);
     int bottom = logo_chip_y + logo_chip_h + 2 + logo_pin_len; // esclusivo
@@ -413,7 +453,7 @@ void fb_console_draw_logo(void){
 }
 // Redraw only glow ring to reduce flicker
 static void fb_console_draw_logo_glow(void){
-    if(!fb_enabled || !logo_glow_enabled) return;
+    if(!fb_enabled || fb_gfx || !logo_glow_enabled) return;
     if(logo_chip_w==0) return;
     float phase = (logo_glow_phase % 200) / 200.0f;
     uint32_t glow_a = 0x003366; uint32_t glow_b = 0x00AAFF; uint32_t glow_c = 0x33DDFF;
@@ -431,7 +471,7 @@ static void fb_console_draw_logo_glow(void){
 
 // Timer tick callback
 static void fb_console_tick(void){
-    if(!cursor_blink_enabled || !fb_enabled) return;
+    if(!cursor_blink_enabled || !fb_enabled || fb_gfx) return;
     if(vt_busy()) return;   // output in progress: the cursor position may be transient
     blink_counter++;
     // Update glow slowly every 5 ticks independent of cursor blink (not while a
@@ -499,6 +539,7 @@ int fb_console_enable_dbuf(void){
 // screen is painted straight to VRAM anyway; leaking the buffer is irrelevant.
 void fb_console_panic_detach_dbuf(void){
     dbuf = NULL; dbuf_enabled = 0;
+    fb_gfx = 0;     // [M40] the panic screen must show even over a graphics client
 }
 void fb_console_disable_dbuf(void){
     if(!dbuf_enabled) return;
@@ -508,7 +549,7 @@ void fb_console_disable_dbuf(void){
     kfree(dbuf); dbuf=NULL; dbuf_enabled=0;
 }
 void fb_console_flush(void){
-    if(!dbuf_enabled || !dbuf) return;
+    if(!dbuf_enabled || !dbuf || fb_gfx) return;
     if(dx1<=dx0 || dy1<=dy0) return;            // nothing dirty
     uint8_t* base=(uint8_t*)(uint64_t)fb_phys_addr;
     int x0=dx0<0?0:dx0, y0=dy0<0?0:dy0;
@@ -525,6 +566,27 @@ void fb_console_flush(void){
     }
     dirty_reset();
 }
+// [M40] Console handoff. on=1: stop drawing (a graphics client owns the screen).
+// on=0: repaint everything from the vt grid (background, cells, logo, cursor)
+// and present it, so the text console comes back exactly as it was.
+void fb_console_redraw(void){
+    if(!fb_enabled || fb_gfx) return;
+    uint8_t fg, bg; vt_get_colors(&fg, &bg); (void)fg;
+    fbvt_clear_all(bg);
+    int cols, rows; vt_get_size(&cols, &rows);
+    for(int y=0; y<rows; y++)
+        for(int x=0; x<cols; x++){ const vt_cell_t* c = vt_cell_at(x, y); if(c) fb_draw_cell_px(x, y, c, 0); }
+    if(!vt_app_owns_screen()) fb_console_draw_logo();
+    { int x, y; if(vt_get_cursor(&x, &y)) fbvt_cursor(x, y, 1); }
+    if(dbuf_enabled && dbuf){ dirty_all(); fb_console_flush(); }
+}
+void fb_console_set_graphics(int on){
+    if(on){ fb_gfx = 1; return; }
+    if(!fb_gfx) return;
+    fb_gfx = 0;
+    fb_console_redraw();
+}
+int fb_console_in_graphics(void){ return fb_gfx; }
 void fb_console_set_dbuf_auto(int on){ dbuf_auto_flush = on?1:0; if(dbuf_auto_flush) fb_console_flush(); }
 // Removed scale APIs
 void fb_console_fontdump(char c){

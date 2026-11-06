@@ -25,6 +25,11 @@ void fb_console_fontdump(char c); // stampa su console info glyph
 void fb_console_draw_logo(void); // disegna logo SecOS top-right
 int fb_console_enable_cursor_blink(uint32_t timer_freq);
 void fb_console_disable_cursor_blink(void);
+/* [M40] Console handoff for a graphics client (KDSETMODE): 1 = stop drawing,
+ * 0 = leave graphics mode and repaint the text console from the vt grid. */
+void fb_console_set_graphics(int on);
+int  fb_console_in_graphics(void);
+void fb_console_redraw(void);
 #endif
 
 #endif

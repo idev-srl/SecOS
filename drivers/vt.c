@@ -246,12 +246,22 @@ uint8_t vt_glyph_for(uint32_t cp) {
     /* Zero-width: combining marks, ZW space/joiners, BOM, variation selectors. */
     if ((cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x200B && cp <= 0x200F) ||
         cp == 0xFEFF || (cp >= 0xFE00 && cp <= 0xFE0F) || cp == 0x00AD) return 0;
+    switch (cp) {                       /* [M40] letters with a real glyph */
+    case 0x00E0: return VT_G_A_GRAVE;  case 0x00E8: return VT_G_E_GRAVE;
+    case 0x00E9: return VT_G_E_ACUTE;  case 0x00EC: return VT_G_I_GRAVE;
+    case 0x00F2: return VT_G_O_GRAVE;  case 0x00F9: return VT_G_U_GRAVE;
+    case 0x00C0: return VT_G_CA_GRAVE; case 0x00C8: return VT_G_CE_GRAVE;
+    case 0x00C9: return VT_G_CE_ACUTE; case 0x00CC: return VT_G_CI_GRAVE;
+    case 0x00D2: return VT_G_CO_GRAVE; case 0x00D9: return VT_G_CU_GRAVE;
+    case 0x00E7: return VT_G_C_CEDIL;  case 0x00A7: return VT_G_SECTION;
+    case 0x00A3: return VT_G_POUND;    case 0x20AC: return VT_G_EURO;
+    default: break;
+    }
     if (cp >= 0xC0 && cp <= 0xFF) return (uint8_t)latin1_fold[cp - 0xC0];
     switch (cp) {
     case 0x00A0: case 0x2002: case 0x2003: case 0x2009: case 0x202F: return ' ';
     case 0x00A1: return '!';
     case 0x00A2: return 'c';
-    case 0x00A3: return 'L';
     case 0x00A9: return 'c';
     case 0x00AE: return 'r';
     case 0x00AB: case 0x2039: return '<';
@@ -281,7 +291,6 @@ uint8_t vt_glyph_for(uint32_t cp) {
     case 0x2588: case 0x2589: case 0x258A: case 0x258B: case 0x258C: case 0x2590:
     case 0x2580: case 0x2584: case 0x25A0: return VT_G_BLOCK;
     case 0x2591: case 0x2592: case 0x2593: return VT_G_SHADE;
-    case 0x20AC: return 'E';
     case 0x2264: return '<';
     case 0x2265: return '>';
     case 0x2260: return '#';

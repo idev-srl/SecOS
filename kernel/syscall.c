@@ -21,6 +21,8 @@
 #include "heap.h"             // kmalloc for read()/write() bounce buffers
 #include "pty.h"              // pseudo-terminals, sessions, controlling terminal
 #include "tty.h"
+#include "input.h"            // [M40] /dev/input/eventN clients
+#include "fbdev.h"            // [M40] /dev/fb0
 
 extern uint64_t timer_get_ticks(void);
 void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
@@ -40,17 +42,18 @@ void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
 static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; p->fds[i].is_sock=0; return i; } } return -1; }
 
 // Take / drop the extra reference a duplicated fd entry holds on its object
-// (pipe end, socket, or pty end; pty_ref/pty_unref ignore any other inode).
+// (pipe end, socket, pty end or evdev client; pty_ref/pty_unref and
+// input_obj_ref/unref ignore any inode that is not theirs).
 // Used by dup/dup2/fcntl(F_DUPFD)/spawn stdio inheritance and close.
 static void fd_entry_ref(struct proc_fd_entry* e){
     if(e->is_pipe) pipe_ref((pipe_t*)e->inode, e->pipe_w);
     else if(e->is_sock) socket_ref(e->is_sock - 1);
-    else pty_ref(e->inode);
+    else { pty_ref(e->inode); input_obj_ref(e->inode); }
 }
 static void fd_entry_unref(struct proc_fd_entry* e){
     if(e->is_pipe){ pipe_unref((pipe_t*)e->inode, e->pipe_w); e->is_pipe=0; }
     else if(e->is_sock){ int sx=e->is_sock-1; e->is_sock=0; socket_unref(sx); }
-    else { void* ino=e->inode; e->inode=NULL; pty_unref(ino); }   // a pty end may hang up
+    else { void* ino=e->inode; e->inode=NULL; pty_unref(ino); input_obj_unref(ino); }   // a pty end may hang up
 }
 
 // [M25] pipe(): allocate a pipe object and two fds (read end + write end).
@@ -283,9 +286,21 @@ uint64_t ksys_brk(uint64_t new_brk){
 }
 
 uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd){
+    return ksys_mmap6(addr, len, prot, flags, fd, 0);
+}
+// [M40] mmap with a file offset (6th argument, r9). Only device mappings
+// (/dev/fb0, MAP_SHARED) honour it; file mappings stay offset 0 (M20).
+uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off){
     (void)addr;                                     // hint ignored (bump allocator)
     process_t* c = sched_get_current();
     if (!c || len == 0) return (uint64_t)-1;
+    if (!(flags & MAP_ANONYMOUS) && fd >= 0 && fd < 32 && c->fds[fd].used &&
+        !c->fds[fd].is_pipe && !c->fds[fd].is_sock && c->fds[fd].inode) {
+        extern int devfs_is_fb(void* inode);
+        if (devfs_is_fb(c->fds[fd].inode))
+            return (uint64_t)fbdev_mmap(c, len, prot, flags, off);
+        if (input_is_client(c->fds[fd].inode)) return (uint64_t)(int64_t)-19;   // -ENODEV
+    }
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return (uint64_t)-1; // W^X
     uint64_t base = c->mmap_next;
     if (base >= USER_MMAP_END || len > USER_MMAP_END - base) return (uint64_t)-1; // arena exhausted (no wrap)
@@ -330,6 +345,10 @@ int ksys_munmap(uint64_t addr, uint64_t len){
         if (addr <= v->start && end >= v->end)      vma_remove(&c->vmas, v);   // fully covered
         else if (addr <= v->start)                  v->start = end;            // trim front
         else if (end >= v->end)                     v->end = addr;             // trim back
+        else if (v->type == VMA_TYPE_PHYS) {                                   // hole in a device map:
+            if (vma_split(&c->vmas, v, end) != 0) { /* set full: the tail is dropped */ }
+            v->end = addr;                                                     // tail kept, rebased
+        }
         else {                                                                 // hole: split (ANON)
             uint64_t old_end = v->end; v->end = addr;
             if (v->type == VMA_TYPE_ANON)
@@ -347,6 +366,13 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
     if (!len) return -1;                                        // EINVAL
     uint64_t end = addr + len;
     if (!vma_overlaps(&c->vmas, addr, end)) return -1;          // must be backed
+    // [M40] Device memory (the framebuffer) is never executable.
+    if (prot & PROT_EXEC) {
+        for (uint32_t i = 0; i < c->vmas.count; i++) {
+            const vma_t* v = &c->vmas.v[i];
+            if (v->type == VMA_TYPE_PHYS && addr < v->end && v->start < end) return -1;
+        }
+    }
     uint64_t newf = m18_prot_to_flags(prot);
     // Split VMAs straddling either boundary so the new protection applies to
     // exactly [addr, end): pages demand-faulted later take the VMA's flags, so a
@@ -433,7 +459,11 @@ int ksys_open_mode(const char* path, int flags, uint32_t mode){
     // /dev/ptmx -> a new pty master, /dev/tty -> the controlling terminal,
     // /dev/pts/N -> that slave (may become the session's controlling tty).
     int pr = pty_open_hook(c, &ino, flags); if(pr<0) return pr;
-    int fd=fd_alloc(c); if(fd<0){ pty_unref(ino); return -1; }
+    // [M40] /dev/fb0 and /dev/input/eventN: capability gate (CAP_DISPLAY /
+    // CAP_INPUT), and a per-open evdev client substituted into the fd.
+    { extern int devfs_open_hook(void*, vfs_inode_t**, int);
+      int gr = devfs_open_hook(c, &ino, flags); if(gr<0) return gr; }
+    int fd=fd_alloc(c); if(fd<0){ pty_unref(ino); input_obj_unref(ino); return -1; }
     c->fds[fd].inode=ino; c->fds[fd].flags=flags;
     c->fds[fd].offset = (flags & 0x400) ? ino->size : 0;    // O_APPEND -> seek to end
     c->fds[fd].cloexec = (flags & K_O_CLOEXEC) ? 1 : 0;     // O_CLOEXEC
@@ -510,6 +540,14 @@ int ksys_read(int fd, void* ubuf, int len){ extern process_t* sched_get_current(
         return r;
     }
     vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode;
+    if(input_is_client(ino)){                               // [M40] evdev: whole input_events
+        int want = len < 4096 ? len : 4096;
+        if(uio_get(&u, want)!=0) return -1;
+        int r = input_read(ino, u.p, want, (c->fds[fd].flags & 0x800) != 0);  // O_NONBLOCK
+        if(r>0 && copy_to_user(ubuf, u.p, (size_t)r)!=0) r = -EFAULT;
+        uio_put(&u);
+        return r;                                           // -2: blocks (timed re-poll)
+    }
     if(pty_is_inode(ino)){                                  // pty master/slave: one chunk
         int want = len < 4096 ? len : 4096;
         if(uio_get(&u, want)!=0) return -1;
@@ -896,6 +934,19 @@ int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
         if(cmd == TTY_FIONBIO) FD_SET_NONBLOCK();
         int r = pty_ioctl(c, c->fds[fd].inode, cmd, arg);
         return r == -515 ? -22 : r;             // unknown request: -EINVAL
+    }
+    // [M40] evdev client (EVIOCG*) and /dev/fb0 (FBIO*).
+    if(c->fds[fd].used && !c->fds[fd].is_pipe && !c->fds[fd].is_sock && c->fds[fd].inode){
+        extern int devfs_is_fb(void* inode);
+        if(input_is_client(c->fds[fd].inode)){
+            if(cmd == TTY_FIONBIO) FD_SET_NONBLOCK();
+            return input_ioctl(c->fds[fd].inode, cmd, arg);
+        }
+        if(devfs_is_fb(c->fds[fd].inode)){
+            if(cmd == TTY_FIONBIO) FD_SET_NONBLOCK();
+            int r = fbdev_ioctl(cmd, arg);
+            return r == -515 ? -25 : r;         // not an fb request: -ENOTTY
+        }
     }
     // The console TTY: fds 0/1/2 when not redirected, any dup of a console fd
     // (inode==NULL, not a pipe), and an open /dev/tty or /dev/console. bash

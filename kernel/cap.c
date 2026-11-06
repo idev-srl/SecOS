@@ -20,6 +20,8 @@ const char* cap_name(uint32_t cap) {
         case CAP_SIGNAL:   return "SIGNAL";
         case CAP_TIME:     return "TIME";
         case CAP_POWER:    return "POWER";
+        case CAP_INPUT:    return "INPUT";
+        case CAP_DISPLAY:  return "DISPLAY";
         default:           return "?";
     }
 }
@@ -63,6 +65,13 @@ int cap_check(const process_t* p, uint32_t cap, uint64_t syscall_num, const char
         cap_audit(p->pid, cap, syscall_num, name, ok);
     else if (!ok)
         cap_audit(p ? p->pid : 0, cap, syscall_num, name, ok);
+    return ok;
+}
+
+int cap_check_explicit(const process_t* p, uint32_t cap, uint64_t syscall_num, const char* name) {
+    if (!p || p->pid == 0) return 1;                 /* kernel / idle-shell context */
+    int ok = (p->cap_mask & cap) ? 1 : 0;
+    if (!ok || p->cap_enforce) cap_audit(p->pid, cap, syscall_num, name, ok);
     return ok;
 }
 

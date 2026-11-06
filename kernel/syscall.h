@@ -120,6 +120,7 @@ struct secos_sockaddr {
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
 #define PROT_EXEC   0x4
+#define MAP_SHARED    0x01   // [M40] device mappings (/dev/fb0) only
 #define MAP_PRIVATE   0x02
 #define MAP_ANONYMOUS 0x20
 
@@ -177,6 +178,7 @@ int ksys_wait(int pid);             // returns 0 when pid has exited, -1 if unkn
 // [M18] dynamic memory
 uint64_t ksys_brk(uint64_t new_brk);
 uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd);
+uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off); // [M40]
 int ksys_munmap(uint64_t addr, uint64_t len);
 int ksys_mprotect(uint64_t addr, uint64_t len, int prot);
 // [M23] file positioning + stat

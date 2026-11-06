@@ -163,6 +163,7 @@ static void sh_stress(const char* a);   // [M29] SMP CPU stress
 static void sh_smp(const char* a);      // [M29] bring up secondary cores (opt-in)
 static void sh_pkg(const char* a);      // [M32] signed package install
 static void sh_verbose(const char* a);  // [M31] toggle kernel debug verbosity
+static void sh_loadkeys(const char* a); // [M40] console keyboard layout (us, it)
 static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
 static void sh_drvtest(const char* a);
 #if ENABLE_RTC
@@ -223,6 +224,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"sleep",     sh_sleep,     "sleep N seconds"},
     {"uname",     sh_uname,     "system name + build"},
     {"verbose",   sh_verbose,   "toggle kernel debug logs"},
+    {"loadkeys",  sh_loadkeys,  "keyboard layout: loadkeys [us|it]"},
     {"info",      sh_info,      "system information"},
     {"audit",     sh_audit,     "show the capability audit log [M35]"},
     {"blk",       sh_blk,       "list block devices"},
@@ -1795,6 +1797,17 @@ static void sh_run(const char* a){
 }
 
 // [M31] Toggle kernel verbosity (the per-spawn [PROC]/[ELF]/[M5]/... debug noise).
+static void sh_loadkeys(const char* a){
+    extern int keyboard_set_keymap(const char*); extern const char* keyboard_keymap_name(void);
+    while(*a==' ') a++;
+    if(*a){
+        char name[16]; int i=0;
+        while(a[i] && a[i]!=' ' && i<15){ name[i]=a[i]; i++; }
+        name[i]=0;
+        if(keyboard_set_keymap(name)!=0){ terminal_writestring("loadkeys: unknown layout (us it)\n"); return; }
+    }
+    terminal_writestring("keyboard layout: "); terminal_writestring(keyboard_keymap_name()); terminal_writestring("\n");
+}
 static void sh_verbose(const char* a){
     extern int g_kverbose;
     while(*a==' ') a++;

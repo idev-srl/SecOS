@@ -1670,6 +1670,144 @@ grep -Eq "PL4- +5000 +5000 +23893-E" "$PIPELOG"; check "PIPE bash seq 1 5000 | w
 grep -q "PL5-42-END" "$PIPELOG"; check "PIPE bash still responsive after the pipelines" $?
 ! grep -q "\[EXC\]\|\[PANIC\]" "$PIPELOG"; check "PIPE no CPU exception ([EXC]) or panic" $?
 
+# ============================================================================
+# M40 GUI GATE: /dev/fb0 (fbdev), /dev/input/eventN (evdev), console handoff,
+# keymaps. tools/gui_drive.py boots the plain image (built for the uaccess
+# gate) with qemu-xhci + usb-tablet + usb-mouse next to the PS/2 keyboard and
+# mouse, types commands into bash over serial and injects input over QMP
+# (sendkey / mouse_move / mouse_button / input-send-event); screendump checks
+# what is really on screen. In-guest markers come from the signed /bin/guitest
+# (user/guitest.c) and its capability-less twin /bin/guitest_nocap.
+# A second run on a KEYMAP=it image adds usb-kbd (USB HID keyboard path, and
+# the build-time default layout).
+# ============================================================================
+GUILOG=/tmp/secos_selftest_gui.log
+GUIDRV=/tmp/secos_selftest_gui.drv
+echo "[selftest] Running M40 GUI gate (fb0/evdev/KDSETMODE/keymap, mb2, serial+QMP, <=300s)..."
+: > "$GUIDRV"
+timeout 330 python3 tools/gui_drive.py --log "$GUILOG" --out "$GUIDRV" --scenario main >/dev/null 2>&1
+for t in guitest-fb-ran guitest-nocap-ran flood-sent guitest-input-ran loadkeys-it guitest-keys-ran \
+         gfx-exit-pixels gfx-exit-console-suppressed gfx-exit-restored-log gfx-exit-text-back gfx-exit-text-drawn \
+         gfx-crash-pixels gfx-crash-console-suppressed gfx-crash-restored-log gfx-crash-text-back gfx-crash-text-drawn \
+         bash-responsive; do
+    grep -q "\[GUI-DRV\] $t OK" "$GUIDRV"; check "M40 driver: $t" $?
+done
+for t in OPEN IOCTL PUTVAR NOTTY MMAP MMAP-RW WRITE-MMAP MMAP-RANGE MMAP-OFFSET MPROTECT-EXEC MPROTECT-RO FORK-SHARED NOLEAK; do
+    grep -q "^GF-$t-OK" "$GUILOG"; check "M40 fb0: $t" $?
+done
+grep -q "G-END fb fails=0" "$GUILOG"; check "M40 fb0: guitest fb completed with 0 failures" $?
+grep -q "^GN-FB-DENIED-OK" "$GUILOG" && grep -q "\[AUDIT\] pid=.* DENY  DISPLAY (fb0-open)" "$GUILOG"
+check "M40 caps: /dev/fb0 refused (EACCES + audit) without CAP_DISPLAY" $?
+grep -q "^GN-INPUT-DENIED-OK" "$GUILOG" && grep -q "\[AUDIT\] pid=.* DENY  INPUT (input-open)" "$GUILOG"
+check "M40 caps: /dev/input/event* refused (EACCES + audit) without CAP_INPUT" $?
+grep -q "^GN-KD-DENIED-OK" "$GUILOG"; check "M40 caps: KD_GRAPHICS refused (EPERM) without CAP_DISPLAY" $?
+ps2='"ImExPS/2 Generic Explorer Mouse"'; um='"QEMU USB Mouse"'; tab='"QEMU USB Tablet"'; kb='"AT Translated Set 2 keyboard"'
+grep -qF "GI-EV $ps2 type=2 code=0 value=10" "$GUILOG" && grep -qF "GI-EV $ps2 type=2 code=1 value=5" "$GUILOG" &&
+grep -qF "GI-EV $ps2 type=2 code=0 value=-3" "$GUILOG" && grep -qF "GI-EV $ps2 type=2 code=1 value=-7" "$GUILOG"
+check "M40 evdev: PS/2 mouse REL_X/REL_Y (+10,+5 / -3,-7) on IRQ12" $?
+grep -qF "GI-EV $ps2 type=1 code=272 value=1" "$GUILOG" && grep -qF "GI-EV $ps2 type=1 code=272 value=0" "$GUILOG" &&
+grep -qF "GI-EV $ps2 type=2 code=8 value=1" "$GUILOG"
+check "M40 evdev: PS/2 mouse BTN_LEFT press/release + REL_WHEEL +1" $?
+grep -qF "GI-EV $um type=2 code=0 value=12" "$GUILOG" && grep -qF "GI-EV $um type=2 code=1 value=-6" "$GUILOG" &&
+grep -qF "GI-EV $um type=1 code=273 value=1" "$GUILOG" && grep -qF "GI-EV $um type=2 code=8 value=-1" "$GUILOG"
+check "M40 evdev: USB HID mouse REL_X/REL_Y, BTN_RIGHT, REL_WHEEL -1" $?
+grep -qF "GI-EV $tab type=3 code=0 value=16384" "$GUILOG" && grep -qF "GI-EV $tab type=3 code=1 value=8192" "$GUILOG" &&
+grep -qF "GI-EV $tab type=1 code=272 value=1" "$GUILOG" && grep -q "GI-ABS event[0-9] r=0 min=0 max=32767" "$GUILOG"
+check "M40 evdev: usb-tablet ABS_X/ABS_Y absolute (16384, 8192) + EVIOCGABS range + button" $?
+grep -qF "GI-EV $kb type=1 code=30 value=1" "$GUILOG" && grep -qF "GI-EV $kb type=1 code=30 value=0" "$GUILOG"
+check "M40 evdev: PS/2 keyboard KEY_A press/release (console tty still fed)" $?
+for t in OPEN SHORTREAD SYN SYN-DROPPED GRAB; do
+    grep -q "^GI-$t-OK" "$GUILOG"; check "M40 evdev: $t" $?
+done
+grep -q "G-END input fails=0" "$GUILOG"; check "M40 evdev: guitest input completed with 0 failures" $?
+KT_IT='3c3e2f3a5f40235b5d7b7dc3a0c3a8c3a9c3acc3b2c3b9607e4022c2a3e282ac'
+grep -q "^GK-BYTES $KT_IT\$" "$GUILOG"; check "M40 keymap it (PS/2): < > / : _ @ # [ ] { } à è é ì ò ù \` ~ @(Ctrl+AltGr) \" £ €" $?
+[ "$(grep -c '\[VT\] text console restored (graphics owner exited' "$GUILOG")" -ge 2 ]
+check "M40 console: text console restored after the graphics owner exits and after it crashes" $?
+grep -q "^GG-CRASHING" "$GUILOG" && grep -q "\[KILL\] pid=" "$GUILOG"; check "M40 console: the crashing graphics client was killed (SIGSEGV)" $?
+! grep -q "\[PANIC\]\|\[EXC\].*ring0" "$GUILOG"; check "M40 no kernel panic / ring-0 fault during the GUI gate" $?
+
+# fb0 under UEFI/OVMF (GOP framebuffer, q35): the same fb + handoff checks.
+# The ESP is a private copy (vvfat is read-write: the guest may write to it).
+OVMF_G=""
+for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
+         /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2-ovmf/OVMF_CODE.fd; do
+    [[ -f "$f" ]] && { OVMF_G="$f"; break; }
+done
+if [[ -n "$OVMF_G" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
+    GUIULOG=/tmp/secos_selftest_gui_uefi.log
+    GUIUDIST=$(mktemp -d /tmp/secos_gui_esp.XXXXXX); cp -r dist/. "$GUIUDIST"/
+    echo "[selftest] Running M40 fb0 under UEFI/OVMF (q35, serial, 115s)..."
+    : > "$GUIULOG"
+    ( sleep 55; printf '\025  /bin/guitest fb\r'; sleep 20; printf '\025  /bin/guitest gfx\r'; sleep 25
+      printf '\025  echo UEFIGUI-$((6*7))-END\r'; sleep 5 ) | \
+        timeout 115 qemu-system-x86_64 -machine q35,accel=tcg -m 512M -bios "$OVMF_G" \
+            -drive format=raw,file=fat:rw:"$GUIUDIST"/ \
+            -debugcon file:"$GUIULOG" -global isa-debugcon.iobase=0xe9 \
+            -no-reboot -display none -net none -serial stdio >/dev/null 2>&1
+    rm -rf "$GUIUDIST"
+    grep -q "G-END fb fails=0" "$GUIULOG"; check "M40 UEFI: guitest fb (GOP fb0 ioctls/mmap/refusals/no leak) 0 failures" $?
+    grep -q "^GG-KDGRAPHICS-OK" "$GUIULOG" && grep -q "\[VT\] text console restored (graphics owner exited" "$GUIULOG"
+    check "M40 UEFI: KD_GRAPHICS + text console restored on exit" $?
+    grep -q "UEFIGUI-42-END" "$GUIULOG"; check "M40 UEFI: bash responsive afterwards" $?
+else
+    echo "  [SKIP] M40 UEFI fb0 gate (OVMF missing or make uefi failed)"
+fi
+
+# ============================================================================
+# GUI GATE: secwm compositor + graphical terminal + SWP client isolation
+# (docs/GUI.md). tools/gui_wm_drive.py boots the plain image with a PS/2
+# keyboard and a usb-tablet, starts `startgui --trace` from bash over serial and
+# drives it over QMP: screendump checks the desktop/panel/client pixels, a click
+# focuses the terminal, sendkey types `echo GUI-OK-$((6*7))` and the pty output
+# must come back as GUI-OK-42 (secwm --trace mirrors terminal lines to
+# debugcon), job control on the pty (Ctrl+C / Ctrl+Z / fg), launcher button +
+# Ctrl+Alt+T, Italian AltGr symbols, window drag, Ctrl+Alt+Backspace back to
+# the text console. A second session runs five hostile SWP clients (out of
+# bounds PUT, lying length, unknown "read pixels" request, PUT before CREATE,
+# oversized request) next to a good one; a third kills the compositor with
+# SIGSEGV and checks the console comes back.
+# ============================================================================
+WMLOG=/tmp/secos_selftest_wm.log
+WMDRV=/tmp/secos_selftest_wm.drv
+echo "[selftest] Running GUI compositor gate (secwm + terminal + SWP isolation, mb2, serial+QMP, <=450s)..."
+: > "$WMDRV"
+timeout 480 python3 tools/gui_wm_drive.py --log "$WMLOG" --out "$WMDRV" --timeout 450 >/dev/null 2>&1
+for t in wm-ready term-open client-window client-sandbox-fds client-sandbox-nocap client-sandbox-pts \
+         client-sandbox-confined screen-size desktop-pixel panel-pixel not-text-console client-pixels \
+         term-focus-click client-focus-out pty-echo-42 no-key-leak-to-client job-ctrl-c job-ctrl-z job-fg \
+         pty-winsize shortcut-next-window client-focus-in client-key client-button no-key-leak-to-term \
+         launcher-terminal shortcut-terminal layout-it layout-it-symbols layout-us lvgl-sysmon-ready lvgl-sysmon-pixels \
+         lvgl-sysmon-click close-shortcut drag-move resize-grip resize-winsize \
+         exit-combo exit-message text-console-back bash-after-exit \
+         wm2-ready hostile-oob hostile-len hostile-read hostile-early hostile-big hostile-no-oob-pixels \
+         hostile-good-client-intact hostile-wm-alive exit-button \
+         crash-ready crash-restored crash-bash crash-text-console bash-responsive no-panic; do
+    grep -q "\[WM-DRV\] $t OK" "$WMDRV"; check "GUI wm: $t" $?
+done
+[ "$(grep -c 'SW-VIOLATION client' "$WMLOG")" -eq 5 ]; check "GUI wm: exactly the 5 hostile clients were disconnected" $?
+! grep -q "SWE-STILL-CONNECTED" "$WMLOG"; check "GUI wm: no hostile client stayed connected" $?
+
+GUIKLOG=/tmp/secos_selftest_gui_it.log
+GUIKDRV=/tmp/secos_selftest_gui_it.drv
+echo "[selftest] Building KEYMAP=it image + USB HID keyboard gate (<=300s)..."
+make clean >/dev/null 2>&1 || true
+if make iso KEYMAP=it >/tmp/secos_selftest_build.log 2>&1; then
+    : > "$GUIKDRV"
+    timeout 330 python3 tools/gui_drive.py --log "$GUIKLOG" --out "$GUIKDRV" --scenario usbkbd >/dev/null 2>&1
+    grep -q "\[KBD\] keymap it" "$GUIKLOG" && grep -q "\[GUI-DRV\] boot-keymap-it OK" "$GUIKDRV"
+    check "M40 keymap: make KEYMAP=it boots with the Italian layout" $?
+    grep -q "^GK-BYTES $KT_IT\$" "$GUIKLOG"; check "M40 keymap it (USB HID keyboard): same bytes as PS/2" $?
+    grep -qF 'GI-EV "QEMU USB Keyboard" type=1 code=30 value=1' "$GUIKLOG" && grep -qF 'GI-EV "QEMU USB Keyboard" type=1 code=30 value=0' "$GUIKLOG"
+    check "M40 evdev: USB HID keyboard KEY_A press/release" $?
+    grep -q "G-END input fails=0" "$GUIKLOG"; check "M40 evdev: guitest input (with usb-kbd) completed with 0 failures" $?
+    grep -q "\[GUI-DRV\] bash-responsive OK" "$GUIKDRV"; check "M40 bash responsive after the USB keyboard gate" $?
+    ! grep -q "\[PANIC\]\|\[EXC\].*ring0" "$GUIKLOG"; check "M40 no kernel panic / ring-0 fault (KEYMAP=it run)" $?
+else
+    echo "[selftest] KEYMAP=it BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "M40 keymap: make KEYMAP=it builds" 1
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

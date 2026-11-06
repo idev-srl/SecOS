@@ -48,6 +48,10 @@ typedef struct usb_device {
     xhci_ring_t ep0;         // control endpoint ring (DCI 1)
     xhci_ring_t epr[XHCI_EPR_PER_DEV];
     int      n_epr;
+    uint8_t  iface_sub;       // [M40] bInterfaceSubClass of the bound interface
+    uint8_t  iface_proto;     // [M40] bInterfaceProtocol
+    uint16_t hid_rdesc_len;   // [M40] HID report descriptor length (0 = none)
+    uint8_t  iproduct;        // [M40] iProduct string descriptor index (0 = none)
     void*    class_priv;      // bound class driver state
     int      class_id;        // USB_CLASS_* the core bound, or 0
 } usb_device_t;

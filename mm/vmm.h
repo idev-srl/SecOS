@@ -27,6 +27,11 @@
 // restores the page with its contents. Walkers that free/share/count user
 // frames must treat a parked leaf as owning its frame (vmm_pte_has_frame).
 #define VMM_FLAG_PROTNONE  (1ULL<<10)
+// [M40] Software bit: the leaf maps DEVICE memory (e.g. the framebuffer) that the
+// PMM does not own. Walkers that free/share/COW user frames must leave such a
+// frame alone: unmap/destroy just drop the PTE, fork copies it verbatim (the
+// mapping stays shared), mprotect keeps the bit and never adds COW.
+#define VMM_FLAG_DEVICE    (1ULL<<11)
 #define VMM_FLAG_NOEXEC    (1ULL<<63) // NX bit (requires EFER.NXE enabled)
 
 // Address space structure (currently only physical PML4 pointer)

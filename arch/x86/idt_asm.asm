@@ -260,6 +260,47 @@ isr_keyboard:
     
     iretq
 
+; [M40] PS/2 mouse handler (IRQ12 = interrupt 0x2C)
+global isr_mouse
+extern ps2mouse_handler
+extern irq_eoi_aux
+
+isr_mouse:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cld                 ; SysV ABI: DF=0 in C code
+    call ps2mouse_handler
+    call irq_eoi_aux    ; LAPIC EOI, or slave + master 8259
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
 ; ============================================================================
 ; MSI/MSI-X interrupt stubs — IMPLEMENTED BUT NOT YET TESTED / not enabled by
 ; default (the kernel is polled). These vectors (0x40 xHCI, 0x41 NVMe) are only

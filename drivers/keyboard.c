@@ -4,8 +4,8 @@
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
  *
- * Scancode set 1 -> the bytes a VT100/xterm-style terminal sends: printable
- * ASCII, Enter = CR, Backspace = DEL (0x7f), Ctrl+key = C0 control, Alt+key =
+ * Scancode set 1 -> Linux key codes -> (keymap) the bytes a VT100/xterm-style
+ * terminal sends: printable characters (UTF-8 above ASCII), Enter = CR, Backspace = DEL (0x7f), Ctrl+key = C0 control, Alt+key =
  * ESC prefix, and ESC [ ... sequences for the cursor/editing/function keys.
  * Bytes land in a ring buffer shared with the USB HID keyboard; the console
  * TTY (kernel/tty.c) consumes them raw and applies termios (ICRNL, ISIG, ...).
@@ -16,6 +16,9 @@
 #include "serial.h"
 #include "spinlock.h"
 #include "signal.h"   // [M30] Ctrl-C/Ctrl-Z -> SIGINT/SIGTSTP to the foreground group
+#include "input.h"    // [M40] evdev node for the PS/2 keyboard
+#include "keymap.h"   // [M40] keyboard layouts (us, it)
+#include "ps2mouse.h" // [M40] AUX bytes that reach the keyboard IRQ
 
 #define KEYBOARD_DATA_PORT 0x60
 #define BUFFER_SIZE 256
@@ -33,7 +36,7 @@ static int buffer_end = 0;
 // Modifier key states
 static bool shift_l, shift_r;
 static bool ctrl_l, ctrl_r;     // [M25] Ctrl for control codes
-static bool alt_l, alt_r;       // Alt = meta (ESC prefix)
+static bool alt_l, alt_r;       // Alt = meta (ESC prefix); right Alt = AltGr on layouts that have it
 static bool caps_lock = false;
 static bool num_lock = false;
 static int  e0_prefix = 0;      // previous byte was 0xE0 (extended key)
@@ -52,25 +55,6 @@ static inline uint8_t inb(uint16_t port) {
     __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
-
-// Scancode map US QWERTY -> ASCII (no shift). Enter = CR, Backspace = DEL,
-// Esc = 0x1B (the bytes a terminal sends).
-static const char scancode_to_ascii[] = {
-    0,  0x1B, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0x7F,
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\r',
-    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
-    0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
-    '*', 0, ' '
-};
-
-// Scancode map US QWERTY -> ASCII (with shift)
-static const char scancode_to_ascii_shift[] = {
-    0,  0x1B, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 0x7F,
-    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\r',
-    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
-    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
-    '*', 0, ' '
-};
 
 /* ---- key -> bytes (shared with usb_hid.c) --------------------------------- */
 static int put_str(char* out, const char* s) { int n = 0; while (s[n]) { out[n] = s[n]; n++; } return n; }
@@ -211,102 +195,110 @@ void keyboard_inject_seq(const char* s, int n) {
     spin_unlock_irqrestore(&kbd_lock, fl);
 }
 
-/* Extended (0xE0-prefixed) make codes -> KEY_*. */
-static int ext_key(uint8_t sc) {
+/* ---- [M40] key codes, keymaps, evdev ---------------------------------------
+ * Both keyboard paths report Linux key codes (KC_*): the PS/2 handler converts
+ * scancode set 1 (+ the 0xE0 prefix), usb_hid.c converts HID usages. Every key
+ * event goes to the device's /dev/input/eventN node and, unless a client holds
+ * EVIOCGRAB, through keyboard_key_event() into the console: modifier state,
+ * the active keymap (drivers/keymap.c), termios ISIG, and the byte ring. */
+static input_dev_t g_ps2kbd;
+static int g_ps2kbd_ready;
+
+/* Extended (0xE0-prefixed) set-1 make codes -> key codes. */
+static int ps2_ext_keycode(uint8_t sc) {
     switch (sc) {
-    case 0x48: return KEY_UP;    case 0x50: return KEY_DOWN;
-    case 0x4D: return KEY_RIGHT; case 0x4B: return KEY_LEFT;
-    case 0x47: return KEY_HOME;  case 0x4F: return KEY_END;
-    case 0x49: return KEY_PGUP;  case 0x51: return KEY_PGDN;
-    case 0x52: return KEY_INS;   case 0x53: return KEY_DEL;
-    case 0x1C: return '\r';      /* keypad Enter */
-    case 0x35: return '/';       /* keypad / */
+    case 0x1C: return KC_KPENTER;   case 0x1D: return KC_RIGHTCTRL;
+    case 0x35: return KC_KPSLASH;   case 0x37: return KC_SYSRQ;
+    case 0x38: return KC_RIGHTALT;  case 0x47: return KC_HOME;
+    case 0x48: return KC_UP;        case 0x49: return KC_PAGEUP;
+    case 0x4B: return KC_LEFT;      case 0x4D: return KC_RIGHT;
+    case 0x4F: return KC_END;       case 0x50: return KC_DOWN;
+    case 0x51: return KC_PAGEDOWN;  case 0x52: return KC_INSERT;
+    case 0x53: return KC_DELETE;    case 0x5B: return KC_LEFTMETA;
+    case 0x5C: return KC_RIGHTMETA; case 0x5D: return KC_COMPOSE;
     default:   return 0;
     }
 }
-/* Keypad (no 0xE0) with Num Lock off acts as the navigation keys. */
-static int keypad_key(uint8_t sc) {
-    static const char digits[] = "789-456+1230.";   /* 0x47..0x53 */
-    if (sc < 0x47 || sc > 0x53) return 0;
-    if (num_lock || sc == 0x4A || sc == 0x4E) return digits[sc - 0x47];
-    switch (sc) {
-    case 0x47: return KEY_HOME;  case 0x48: return KEY_UP;   case 0x49: return KEY_PGUP;
-    case 0x4B: return KEY_LEFT;  case 0x4C: return 0;        case 0x4D: return KEY_RIGHT;
-    case 0x4F: return KEY_END;   case 0x50: return KEY_DOWN; case 0x51: return KEY_PGDN;
-    case 0x52: return KEY_INS;   case 0x53: return KEY_DEL;
-    default: return 0;
+
+/* Layout-independent keys -> ASCII control / KEY_* terminal key; 0 = ask the
+ * keymap, -1 = the key produces nothing. */
+static int special_key(int kc, int shift) {
+    switch (kc) {
+    case KC_ESC:       return 0x1B;
+    case KC_BACKSPACE: return 0x7F;
+    case KC_TAB:       return shift ? KEY_BACKTAB : '\t';
+    case KC_ENTER: case KC_KPENTER: return '\r';
+    case KC_UP:    return KEY_UP;    case KC_DOWN:  return KEY_DOWN;
+    case KC_LEFT:  return KEY_LEFT;  case KC_RIGHT: return KEY_RIGHT;
+    case KC_HOME:  return KEY_HOME;  case KC_END:   return KEY_END;
+    case KC_PAGEUP: return KEY_PGUP; case KC_PAGEDOWN: return KEY_PGDN;
+    case KC_INSERT: return KEY_INS;  case KC_DELETE: return KEY_DEL;
+    case KC_KPSLASH: return '/';     case KC_KPASTERISK: return '*';
+    case KC_KPMINUS: return '-';     case KC_KPPLUS: return '+';
+    case KC_F11: return KEY_F11;     case KC_F12: return KEY_F12;
+    default: break;
     }
-}
-static int fkey(uint8_t sc) {
-    if (sc >= 0x3B && sc <= 0x44) return KEY_F1 + (sc - 0x3B);
-    if (sc == 0x57) return KEY_F11;
-    if (sc == 0x58) return KEY_F12;
+    if (kc >= KC_F1 && kc <= KC_F10) return KEY_F1 + (kc - KC_F1);
+    if (kc >= KC_KP7 && kc <= KC_KPDOT) {
+        /* Keypad: digits with Num Lock on, else the navigation keys. */
+        static const char digits[] = "789-456+1230.";
+        if (num_lock) return digits[kc - KC_KP7];
+        switch (kc) {
+        case KC_KP7: return KEY_HOME;  case KC_KP8: return KEY_UP;    case KC_KP9: return KEY_PGUP;
+        case KC_KP4: return KEY_LEFT;  case KC_KP6: return KEY_RIGHT;
+        case KC_KP1: return KEY_END;   case KC_KP2: return KEY_DOWN;  case KC_KP3: return KEY_PGDN;
+        case KC_KP0: return KEY_INS;   case KC_KPDOT: return KEY_DEL;
+        default: return -1;            /* KP5 with Num Lock off: nothing */
+        }
+    }
     return 0;
 }
 
-// Keyboard interrupt handler
-void keyboard_handler(void) {
-    uint8_t scancode = inb(KEYBOARD_DATA_PORT);
-
-    // [M29] Guard modifier state + ring buffer. Use the _nolock helpers below
-    // since we already hold kbd_lock (it is not recursive). Every return path unlocks.
+void keyboard_key_event(int kc, int value) {
     uint64_t fl = spin_lock_irqsave(&kbd_lock);
-
-    if (e1_skip > 0) { e1_skip--; spin_unlock_irqrestore(&kbd_lock, fl); return; }
-    if (scancode == 0xE1) { e1_skip = 5; spin_unlock_irqrestore(&kbd_lock, fl); return; }  // Pause
-    if (scancode == 0xE0) { e0_prefix = 1; spin_unlock_irqrestore(&kbd_lock, fl); return; }
-    int ext = e0_prefix; e0_prefix = 0;
-
-    int release = (scancode & 0x80) != 0;
-    uint8_t sc = scancode & 0x7F;
-
-    // Modifiers (make and break).
-    if (!ext && (sc == 0x2A || sc == 0x36)) {      // Left/Right Shift
-        if (sc == 0x2A) shift_l = !release; else shift_r = !release;
-        spin_unlock_irqrestore(&kbd_lock, fl); return;
+    switch (kc) {                                  /* modifiers: make and break */
+    case KC_LEFTSHIFT:  shift_l = value != 0; goto out;
+    case KC_RIGHTSHIFT: shift_r = value != 0; goto out;
+    case KC_LEFTCTRL:   ctrl_l  = value != 0; goto out;
+    case KC_RIGHTCTRL:  ctrl_r  = value != 0; goto out;
+    case KC_LEFTALT:    alt_l   = value != 0; goto out;
+    case KC_RIGHTALT:   alt_r   = value != 0; goto out;
+    case KC_LEFTMETA: case KC_RIGHTMETA: goto out;
+    default: break;
     }
-    if (ext && (sc == 0x2A || sc == 0x36)) {       // fake shifts around extended keys
-        spin_unlock_irqrestore(&kbd_lock, fl); return;
-    }
-    if (sc == 0x1D) {                              // [M25] Ctrl (E0 1D = right)
-        if (ext) ctrl_r = !release; else ctrl_l = !release;
-        spin_unlock_irqrestore(&kbd_lock, fl); return;
-    }
-    if (sc == 0x38) {                              // Alt (E0 38 = right / AltGr)
-        if (ext) alt_r = !release; else alt_l = !release;
-        spin_unlock_irqrestore(&kbd_lock, fl); return;
-    }
-    if (release) { spin_unlock_irqrestore(&kbd_lock, fl); return; }
-    if (!ext && sc == 0x3A) { caps_lock = !caps_lock; spin_unlock_irqrestore(&kbd_lock, fl); return; }
-    if (!ext && sc == 0x45) { num_lock = !num_lock; spin_unlock_irqrestore(&kbd_lock, fl); return; }
+    if (!value) goto out;                          /* releases end here */
+    if (kc == KC_CAPSLOCK) { caps_lock = !caps_lock; goto out; }
+    if (kc == KC_NUMLOCK)  { num_lock = !num_lock; goto out; }
+    if (kc == KC_SCROLLLOCK || kc == KC_SYSRQ || kc == KC_PAUSE || kc == KC_COMPOSE) goto out;
 
     int shift = shift_l || shift_r;
-    int mods = (shift ? KMOD_SHIFT : 0) | ((ctrl_l || ctrl_r) ? KMOD_CTRL : 0) |
-               ((alt_l || alt_r) ? KMOD_ALT : 0);
-
-    int key = 0;
-    if (ext) key = ext_key(sc);
-    else if ((key = fkey(sc)) != 0) { }
-    else if ((key = keypad_key(sc)) != 0) { }
-    else if (sc < sizeof(scancode_to_ascii)) {
-        char a;
-        if (shift) a = scancode_to_ascii_shift[sc];
-        else {
-            a = scancode_to_ascii[sc];
-            if (caps_lock && a >= 'a' && a <= 'z') a -= 32;  // Caps Lock for letters
-        }
-        if (shift && caps_lock && a >= 'A' && a <= 'Z') a += 32;
-        key = (unsigned char)a;
-        if (key == '\t' && shift) { key = KEY_BACKTAB; mods &= ~KMOD_SHIFT; }
-    }
-    if (!key) { spin_unlock_irqrestore(&kbd_lock, fl); return; }
-    if (key >= 0x100 || key < 0x20 || key == 0x7F) {
-        if (key < 0x100) mods &= ~KMOD_SHIFT;
-    }
+    int ctrl  = ctrl_l || ctrl_r;
+    const keymap_t* km = keymap_active();
+    int altgr = alt_r && km->has_altgr;            /* right Alt = AltGr on such layouts */
+    int alt   = alt_l || (alt_r && !km->has_altgr);
 
     char seq[8];
-    int n = keyboard_key_bytes(key, mods, seq);
-    if (n <= 0) { spin_unlock_irqrestore(&kbd_lock, fl); return; }
+    int n = 0;
+    int key = special_key(kc, shift);
+    if (key < 0) goto out;
+    if (key) {
+        int mods = (ctrl ? KMOD_CTRL : 0) | (alt ? KMOD_ALT : 0);
+        if (key >= 0x100 && key != KEY_BACKTAB && shift) mods |= KMOD_SHIFT;
+        n = keyboard_key_bytes(key, mods, seq);
+    } else {
+        uint32_t cp = keymap_lookup(kc, shift, altgr, caps_lock);
+        if (!cp) goto out;
+        /* Windows sends AltGr as LeftCtrl+RightAlt: an AltGr symbol never
+         * becomes a control code. */
+        if (altgr) ctrl = 0;
+        if (cp < 0x80) {
+            n = keyboard_key_bytes((int)cp, (ctrl ? KMOD_CTRL : 0) | (alt ? KMOD_ALT : 0), seq);
+        } else {
+            if (alt) seq[n++] = 0x1B;              /* meta prefix */
+            n += keymap_utf8(cp, seq + n);         /* the console is UTF-8 */
+        }
+    }
+    if (n <= 0) goto out;
 
     // [M30] Job control: with termios ISIG on and a foreground process group
     // owning the console, VINTR/VQUIT/VSUSP are delivered as signals instead of
@@ -329,9 +321,44 @@ void keyboard_handler(void) {
         // prompt line-editor cancels the current line as before.
         if (!fg && seq[0] == 0x03) g_break_pending = 1;
     }
-
     buffer_put_seq_nolock(seq, n);
+out:
     spin_unlock_irqrestore(&kbd_lock, fl);
+}
+
+// PS/2 keyboard interrupt handler (IRQ1)
+void keyboard_handler(void) {
+    // A byte from the AUX (mouse) port can sit in the shared output buffer:
+    // hand it to the mouse driver instead of misreading it as a scancode.
+    uint8_t status = inb(0x64);
+    if (!(status & 0x01)) return;                  /* spurious: nothing to read */
+    if (status & 0x20) { ps2mouse_byte(inb(KEYBOARD_DATA_PORT)); return; }
+    uint8_t scancode = inb(KEYBOARD_DATA_PORT);
+
+    uint64_t fl = spin_lock_irqsave(&kbd_lock);
+    if (e1_skip > 0) { e1_skip--; spin_unlock_irqrestore(&kbd_lock, fl); return; }
+    if (scancode == 0xE1) { e1_skip = 5; spin_unlock_irqrestore(&kbd_lock, fl); return; }  // Pause
+    if (scancode == 0xE0) { e0_prefix = 1; spin_unlock_irqrestore(&kbd_lock, fl); return; }
+    int ext = e0_prefix; e0_prefix = 0;
+    spin_unlock_irqrestore(&kbd_lock, fl);
+
+    int release = (scancode & 0x80) != 0;
+    uint8_t sc = scancode & 0x7F;
+    int kc;
+    if (ext) {
+        if (sc == 0x2A || sc == 0x36) return;      /* fake shifts around extended keys */
+        kc = ps2_ext_keycode(sc);
+    } else {
+        /* Set-1 make codes ARE the Linux key codes for the main block. */
+        kc = (sc <= KC_KPDOT || sc == KC_102ND || sc == KC_F11 || sc == KC_F12) ? sc : 0;
+    }
+    if (!kc) return;
+    if (g_ps2kbd_ready) {
+        input_event(&g_ps2kbd, EV_KEY, (uint16_t)kc, release ? 0 : 1);
+        input_sync(&g_ps2kbd);
+        if (input_grabbed(&g_ps2kbd)) return;      /* EVIOCGRAB: the console does not see it */
+    }
+    keyboard_key_event(kc, release ? 0 : 1);
 }
 
 // Initialize keyboard state
@@ -342,6 +369,33 @@ void keyboard_init(void) {
     caps_lock = false;
     num_lock = false;
     e0_prefix = 0; e1_skip = 0;
+    (void)keymap_active();                         /* resolve the build-time default */
+}
+
+// [M40] Expose the PS/2 keyboard as an evdev device (/dev/input/eventN).
+void keyboard_register_input(void) {
+    if (g_ps2kbd_ready) return;
+    input_dev_t* d = &g_ps2kbd;
+    const char* nm = "AT Translated Set 2 keyboard";
+    int i = 0;
+    for (; nm[i]; i++) d->name[i] = nm[i];
+    d->name[i] = 0;
+    const char* ph = "isa0060/serio0/input0";
+    for (i = 0; ph[i]; i++) d->phys[i] = ph[i];
+    d->phys[i] = 0;
+    d->id.bustype = BUS_I8042; d->id.vendor = 0x0001; d->id.product = 0x0001; d->id.version = 0xab41;
+    input_set_capability(d, EV_REP, 0);
+    for (int k = 1; k < 128; k++) input_set_capability(d, EV_KEY, (uint16_t)k);
+    if (input_register(d) >= 0) g_ps2kbd_ready = 1;
+}
+
+/* Active keymap name / select (console tty ioctl, `loadkeys`). */
+const char* keyboard_keymap_name(void) { return keymap_active()->name; }
+int keyboard_set_keymap(const char* name) {
+    uint64_t fl = spin_lock_irqsave(&kbd_lock);
+    int r = keymap_select(name);
+    spin_unlock_irqrestore(&kbd_lock, fl);
+    return r;
 }
 
 /* Kernel shell view of one raw byte: CR -> '\n', DEL -> '\b'. */
