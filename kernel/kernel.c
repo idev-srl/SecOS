@@ -2550,6 +2550,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // Moved before tss_init so that vmm_map() in tss_init uses physmap-aware
     // page table walks.  Interrupts are disabled; no IDT/TSS needed yet.
     vmm_init_physmap();
+    // [M49] With all RAM in the physmap, switch the PMM from its early bump
+    // allocator to the sectioned bitmap (metadata lives in the physmap).
+    pmm_late_init();
     // [M44] The VGA text buffer moves from the identity map to the physmap.
     { extern void terminal_relocate_vga(void); terminal_relocate_vga(); }
 

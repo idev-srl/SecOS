@@ -39,19 +39,42 @@ typedef struct vmm_space {
     uint64_t pml4_phys;  // Physical frame of PML4
 } vmm_space_t;
 
-// Virtual base of physmap (chosen in unused high area)
+// Virtual base of the physmap (Linux's 4-level direct-map base). [M49] The
+// window is 64 TiB (128 PML4 slots). The base must stay 1 GiB aligned; every
+// user of it goes through this one definition so it can be randomized later.
 #define VMM_PHYSMAP_BASE 0xFFFF888000000000ULL
+#define VMM_PHYSMAP_SIZE (64ULL << 40)
 
 // [M12] Higher-half kernel base: the kernel image is linked at this VMA and the
 // low identity (0-512MB) maps to it via PML4[511]. A kernel-image symbol's
 // physical address is its VMA minus this base.
 #define KERNEL_VMA_BASE 0xFFFFFFFF80000000ULL
 
-// Initialize physmap for all physical memory (rounded up to 2MB boundary)
+// Build the physmap from the PMM's RAM ranges (WB, 1G/2M/4K pages, NX).
 void vmm_init_physmap(void);
-void vmm_extend_physmap(uint64_t phys_end); // extend physmap if needed (2MB granularity)
+// [M49] Cache types for physmap mappings.
+#define VMM_CACHE_WB 0
+#define VMM_CACHE_WC 1
+#define VMM_CACHE_UC 2
+// [M49] Map device memory [phys, phys+size) into the physmap with `cache`
+// (retagging pages already mapped). Returns phys_to_virt(phys), 0 on failure.
+uint64_t vmm_map_mmio(uint64_t phys, uint64_t size, int cache);
+// [M49] Map firmware memory (ACPI tables, ...) write-back where it is not
+// mapped yet. Returns phys_to_virt(phys), 0 on failure.
+uint64_t vmm_map_phys(uint64_t phys, uint64_t size);
+// Deprecated: map the 2 MiB block below phys_end uncached if unmapped. Use
+// vmm_map_mmio.
+void vmm_extend_physmap(uint64_t phys_end);
 void vmm_pat_init(void);                          // [FB-WC] program PAT slot 1 = Write-Combining
 void vmm_set_physmap_wc(uint64_t phys, uint64_t size); // [FB-WC] retag physmap range as WC
+// [M49] Physmap geometry / cost, and a leaf audit (supervisor + NX everywhere).
+typedef struct {
+    uint64_t ram_end, span, slots, tables;
+    uint64_t leaves_4k, leaves_2m, leaves_1g;
+    int gbpages, maxphy, la57;
+} vmm_physmap_stats_t;
+void vmm_physmap_get_stats(vmm_physmap_stats_t* st);
+void vmm_physmap_audit(void);
 
 // Helper conversions
 static inline uint64_t phys_to_virt(uint64_t phys) { return VMM_PHYSMAP_BASE + phys; }
@@ -69,7 +92,7 @@ static inline uint64_t virt_to_phys(uint64_t virt) { return (virt >= VMM_PHYSMAP
 uint64_t vmm_kvirt_to_phys_slow(uint64_t v);
 static inline uint64_t kvirt_to_phys(uint64_t v) {
     if (v >= KERNEL_VMA_BASE)  return v - KERNEL_VMA_BASE;
-    if (v >= VMM_PHYSMAP_BASE && v < VMM_PHYSMAP_BASE + (1ULL << 39)) return v - VMM_PHYSMAP_BASE;
+    if (v >= VMM_PHYSMAP_BASE && v < VMM_PHYSMAP_BASE + VMM_PHYSMAP_SIZE) return v - VMM_PHYSMAP_BASE;
     return vmm_kvirt_to_phys_slow(v);
 }
 

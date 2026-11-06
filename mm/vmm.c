@@ -16,6 +16,8 @@
 #include "sched.h"     // [M14] sched_get_current()
 #include "spinlock.h"  // [M29] SMP: serialize runtime kernel page-table edits
 
+extern void print_hex(uint64_t value);
+
 // [M29] The M5 per-process kernel-stack slots all live in one shared 2 MiB kernel
 // region (one page table). Mapping/unmapping them happens at RUNTIME on process
 // create/destroy, which under SMP run concurrently on different cores — racing on
@@ -33,54 +35,9 @@ static spinlock_t kstack_lock = SPINLOCK_INIT;
 
 static vmm_space_t kernel_space;
 static int physmap_initialized = 0;
-static uint64_t physmap_limit = 0; // physical memory currently covered by physmap
 
 // Forward declaration
 static void zero_frame(uint64_t phys);
-
-// Extend physmap (already initialized) to cover at least phys_end.
-// Uses 2MB huge pages like vmm_init_physmap.
-void vmm_extend_physmap(uint64_t phys_end) {
-    if (!physmap_initialized) return; // will be configured by vmm_init_physmap
-    const uint64_t HUGE_SIZE = 2ULL * 1024 * 1024;
-    uint64_t target = (phys_end + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);
-    if (target <= physmap_limit) return;
-
-    uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
-    // M1.2: physmap_initialized==1 here (checked at function entry), use phys_to_virt
-    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
-    int pml4_i = (VMM_PHYSMAP_BASE >> 39) & 0x1FF;
-    int pdpt_i_start = (VMM_PHYSMAP_BASE >> 30) & 0x1FF;
-    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) { terminal_writestring("[ERR] extend physmap: PDPT missing\n"); return; }
-    uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[pml4_i] & ADDRESS_MASK);
-    uint64_t phys_cursor = physmap_limit;
-    while (phys_cursor < target) {
-        int pdpt_i = pdpt_i_start + ((phys_cursor >> 30) & 0x1FF);
-    if (pdpt_i >= 512) { terminal_writestring("[WARN] extend physmap: exceeded PDPT range\n"); break; }
-        uint64_t* pdt;
-        if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) {
-            void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] extend physmap: PDT alloc fail\n"); break; }
-            zero_frame((uint64_t)frame);
-            pdpt[pdpt_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
-            pdt = (uint64_t*)phys_to_virt((uint64_t)frame & ADDRESS_MASK);
-        } else {
-            pdt = (uint64_t*)phys_to_virt(pdpt[pdpt_i] & ADDRESS_MASK);
-        }
-        for (int pdt_i=0; pdt_i<512 && phys_cursor < target; pdt_i++) {
-            uint64_t virt = VMM_PHYSMAP_BASE + phys_cursor;
-            int virt_pdt_i = (virt >> 21) & 0x1FF;
-            if (virt_pdt_i != pdt_i) continue;
-            if (!(pdt[pdt_i] & VMM_FLAG_PRESENT)) {
-                pdt[pdt_i] = (phys_cursor & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS | VMM_FLAG_NOEXEC;
-            }
-            phys_cursor += HUGE_SIZE;
-        }
-    }
-    physmap_limit = phys_cursor;
-    terminal_writestring("[OK] Physmap extended to ");
-    char hex[17]; hex[16]='\0'; uint64_t v=physmap_limit; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
-    terminal_writestring("0x"); terminal_writestring(hex); terminal_writestring(" (fisico)\n");
-}
 
 // [FB-WC] Program PAT entry 1 (selected by a PTE's PWT bit) to Write-Combining so
 // the framebuffer can be mapped WC. On real hardware the firmware MTRRs typically
@@ -98,38 +55,6 @@ void vmm_pat_init(void) {
     __asm__ volatile("wrmsr" :: "a"(lo), "d"(hi), "c"(0x277));
     uint64_t cr3; __asm__ volatile("mov %%cr3,%0":"=r"(cr3));
     __asm__ volatile("mov %0,%%cr3"::"r"(cr3):"memory");   // flush so the new PAT meaning applies
-}
-
-// [FB-WC] Retag the physmap 2MB pages covering [phys, phys+size) as Write-Combining
-// (PAT slot 1: set PWT, clear PCD and the 2MB-page PAT bit). The framebuffer is its
-// own 2MB-aligned MMIO region, so neighbouring RAM is unaffected. Call vmm_pat_init
-// first.
-void vmm_set_physmap_wc(uint64_t phys, uint64_t size) {
-    if (!physmap_initialized || size == 0) return;
-    const uint64_t HUGE = 2ULL * 1024 * 1024;
-    uint64_t start = phys & ~(HUGE - 1);
-    uint64_t end   = (phys + size + HUGE - 1) & ~(HUGE - 1);
-    vmm_extend_physmap(end);
-    uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
-    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
-    int pml4_i = (VMM_PHYSMAP_BASE >> 39) & 0x1FF;
-    int pdpt_i_start = (VMM_PHYSMAP_BASE >> 30) & 0x1FF;
-    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) return;
-    uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[pml4_i] & ADDRESS_MASK);
-    for (uint64_t p = start; p < end; p += HUGE) {
-        int pdpt_i = pdpt_i_start + ((p >> 30) & 0x1FF);
-        if (pdpt_i >= 512 || !(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) continue;
-        uint64_t* pdt = (uint64_t*)phys_to_virt(pdpt[pdpt_i] & ADDRESS_MASK);
-        uint64_t virt = VMM_PHYSMAP_BASE + p;
-        int pdt_i = (virt >> 21) & 0x1FF;
-        if (!(pdt[pdt_i] & VMM_FLAG_PRESENT)) continue;
-        uint64_t e = pdt[pdt_i];
-        e |= VMM_FLAG_PWT;          // PWT=1
-        e &= ~VMM_FLAG_PCD;         // PCD=0
-        e &= ~(1ULL << 12);         // PAT bit (2MB page) = 0  -> PAT index 1 = WC
-        pdt[pdt_i] = e;
-        __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
-    }
 }
 
 // Zero out entire physical frame
@@ -520,13 +445,11 @@ void vmm_drop_low_identity(void) {
     }
     g_ident_pdpt_phys = e & ADDRESS_MASK;
     // The AP trampoline loads CR3 with a 32-bit mov, so its PML4 must sit below
-    // 4 GB: allocate it now, while early-boot frames are still low.
-    void* f = pmm_alloc_frame();
-    if (f && ((uint64_t)f & ADDRESS_MASK) < 0x100000000ULL) {
+    // 4 GB.
+    void* f = pmm_alloc_below(0x100000000ULL);   // [M49] DMA32-style zone request
+    if (f) {
         zero_frame((uint64_t)f);
         g_ap_tramp_pml4 = (uint64_t)f & ADDRESS_MASK;
-    } else if (f) {
-        pmm_free_frame(f);
     }
     pml4[0] = 0;
     write_cr3(read_cr3());                 // identity entries are non-global: flushed
@@ -1077,6 +1000,7 @@ vmm_space_t* vmm_fork_space(vmm_space_t* parent) {
     if (!parent) return 0;
     vmm_space_t* child = vmm_space_create_user();
     if (!child) return 0;
+    int failed = 0;
     uint64_t ppml4_phys = parent->pml4_phys & ADDRESS_MASK;
     uint64_t* ppml4 = physmap_initialized ? (uint64_t*)phys_to_virt(ppml4_phys) : (uint64_t*)ppml4_phys;
     int pdpt_lo = (int)((USER_CODE_BASE >> 30) & 0x1FF);
@@ -1110,11 +1034,15 @@ vmm_space_t* vmm_fork_space(vmm_space_t* parent) {
                         // later mprotect(RW) sees the shared refcount and maps it
                         // RO+COW (vmm_protect_in_space).
                         uint64_t* cpt = get_pt_space(child, va, 1, VMM_FLAG_USER | VMM_FLAG_RW);
-                        if (cpt) { pmm_share_frame((void*)phys); cpt[ti] = pte; }
+                        if (!cpt || pmm_share_frame((void*)phys) != 0) { failed = 1; goto out; }
+                        cpt[ti] = pte;
                         continue;
                     }
                     uint64_t flags = pte & ~ADDRESS_MASK & ~VMM_FLAG_PRESENT;
-                    pmm_share_frame((void*)phys);
+                    // [M49] Refcount chunks are allocated on demand: out of
+                    // memory here aborts the fork (the parent is unchanged
+                    // apart from pages already marked COW, which stay valid).
+                    if (pmm_share_frame((void*)phys) != 0) { failed = 1; goto out; }
                     uint64_t childflags = flags;
                     if (pte & VMM_FLAG_RW) {                 // writable -> COW both sides
                         uint64_t cow = (flags & ~VMM_FLAG_RW) | VMM_FLAG_COW;
@@ -1129,7 +1057,9 @@ vmm_space_t* vmm_fork_space(vmm_space_t* parent) {
             }
         }
     }
+out:
     __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory"); // flush parent TLB
+    if (failed) { vmm_space_destroy(child); return 0; }
     return child;
 }
 
@@ -1171,68 +1101,351 @@ int vmm_cow_fault(vmm_space_t* space, uint64_t addr) {
     return 0;
 }
 
-// Map all available physical memory using 2MB huge pages to reduce table count.
+// ---- [M49] Physmap: all RAM at VMM_PHYSMAP_BASE + phys (up to 64 TiB) ----
+//
+// Layout follows Linux's 4-level direct map: up to 128 PML4 slots of 512 GiB.
+// Built from the firmware memory map (pmm_ram_range): only RAM-like ranges are
+// mapped write-back, with 1 GiB pages when the CPU has them (CPUID pdpe1gb),
+// else 2 MiB, with 4 KiB pages at unaligned range edges -- so no WB mapping
+// ever covers a PCI hole or other MMIO. Device memory and firmware tables get
+// explicit mappings at the same physmap address (vmm_map_mmio / vmm_map_phys)
+// with the right cache type. Every physmap leaf is RW + NX, supervisor-only.
+//
+// The PDPTs of every PML4 slot the CPU's physical address width can reach are
+// allocated at boot, before any user address space exists: user CR3s copy the
+// kernel PML4 high half once at creation, so later physmap growth (an MMIO BAR
+// mapped at runtime) lands in shared PDPTs and is visible to every process.
+//
+// The base is used only through VMM_PHYSMAP_BASE (vmm.h) and must be 1 GiB
+// aligned for 1 GiB pages (2 MiB minimum), so it can be randomized later.
+
+#define PM_1G (1ULL << 30)
+#define PM_2M (1ULL << 21)
+#define PM_512G (1ULL << 39)
+#define PM_ADDR_1G 0x000FFFFFC0000000ULL
+#define PM_ADDR_2M 0x000FFFFFFFE00000ULL
+#define PM_PAT_LARGE (1ULL << 12)
+#define PM_PAT_4K    (1ULL << 7)
+#define PM_LEAF (VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_NOEXEC)
+
+static int      g_pm_1g = 0;          // 1 GiB pages available
+static uint64_t g_pm_slots = 0;       // PML4 slots pre-populated
+static uint64_t g_pm_span = 0;        // physical span those slots cover
+static uint64_t g_pm_ram_end = 0;     // end of the highest RAM range mapped
+static uint64_t g_pm_tables = 0;      // page-table frames owned by the physmap
+static uint64_t g_pm_leaves[3];       // leaves: [0]=4K [1]=2M [2]=1G
+static int      g_pm_maxphy = 36;     // CPU physical address bits
+static int      g_pm_la57 = 0;        // CPU supports 5-level paging (not used)
+static spinlock_t g_pm_lock = SPINLOCK_INIT;
+
+static inline uint64_t* pm_tab(uint64_t phys) {
+    return physmap_initialized ? (uint64_t*)phys_to_virt(phys) : (uint64_t*)phys;
+}
+
+static uint64_t pm_cache_bits(int cache) {
+    switch (cache) {
+    case VMM_CACHE_WC: return VMM_FLAG_PWT;                  // PAT slot 1 (vmm_pat_init)
+    case VMM_CACHE_UC: return VMM_FLAG_PWT | VMM_FLAG_PCD;   // PAT slot 3 = UC
+    default:           return 0;                             // PAT slot 0 = WB
+    }
+}
+
+// Child table of table[idx], created (zeroed) if absent. NULL on OOM.
+static uint64_t* pm_next(uint64_t* table, int idx) {
+    uint64_t e = table[idx];
+    if (e & VMM_FLAG_PRESENT) return pm_tab(e & ADDRESS_MASK);
+    void* f = pmm_alloc_frame();
+    if (!f) return NULL;
+    zero_frame((uint64_t)f);
+    table[idx] = ((uint64_t)f & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    g_pm_tables++;
+    return pm_tab((uint64_t)f & ADDRESS_MASK);
+}
+
+// Split a 1 GiB leaf into 512 x 2 MiB leaves with the same attributes.
+static int pm_split_1g(uint64_t* pdpt, int i) {
+    uint64_t e = pdpt[i];
+    void* f = pmm_alloc_frame();
+    if (!f) return -1;
+    uint64_t* pd = pm_tab((uint64_t)f & ADDRESS_MASK);
+    uint64_t base = e & PM_ADDR_1G, flags = e & ~PM_ADDR_1G;
+    for (int k = 0; k < PT_ENTRIES; k++) pd[k] = (base + (uint64_t)k * PM_2M) | flags;
+    pdpt[i] = ((uint64_t)f & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    g_pm_tables++; g_pm_leaves[2]--; g_pm_leaves[1] += PT_ENTRIES;
+    return 0;
+}
+
+// Split a 2 MiB leaf into 512 x 4 KiB leaves (the PAT bit moves from 12 to 7).
+static int pm_split_2m(uint64_t* pd, int i) {
+    uint64_t e = pd[i];
+    void* f = pmm_alloc_frame();
+    if (!f) return -1;
+    uint64_t* pt = pm_tab((uint64_t)f & ADDRESS_MASK);
+    uint64_t base = e & PM_ADDR_2M, flags = e & ~PM_ADDR_2M;
+    int pat = (flags & PM_PAT_LARGE) != 0;
+    flags &= ~(VMM_FLAG_PS | PM_PAT_LARGE);
+    if (pat) flags |= PM_PAT_4K;
+    for (int k = 0; k < PT_ENTRIES; k++) pt[k] = (base + (uint64_t)k * PAGE_SIZE) | flags;
+    pd[i] = ((uint64_t)f & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
+    g_pm_tables++; g_pm_leaves[1]--; g_pm_leaves[0] += PT_ENTRIES;
+    return 0;
+}
+
+// Map physical [start, end) into the physmap with cache type `cache`.
+// force=0: only pages not mapped yet are added (RAM keeps its WB mapping).
+// force=1: every page of the range ends up with `cache`, splitting huge pages
+//          that straddle the range edges.
+// Caller holds g_pm_lock (or runs single-threaded at boot).
+static int pm_map_range(uint64_t start, uint64_t end, int cache, int force) {
+    start &= ~(PAGE_SIZE - 1);
+    end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (end > VMM_PHYSMAP_SIZE) {
+        debugcon_writestring("[PHYSMAP][WARN] range beyond the 64 TiB physmap clipped: ");
+        debugcon_print_hex(end); debugcon_writestring("\n");
+        end = VMM_PHYSMAP_SIZE;
+    }
+    if (start >= end) return -1;
+    const uint64_t cb = pm_cache_bits(cache);
+    const uint64_t cmask_lg = VMM_FLAG_PWT | VMM_FLAG_PCD | PM_PAT_LARGE;
+    const uint64_t cmask_4k = VMM_FLAG_PWT | VMM_FLAG_PCD | PM_PAT_4K;
+    uint64_t* pml4 = pm_tab(kernel_space.pml4_phys & ADDRESS_MASK);
+    int changed = 0, rc = 0;
+    uint64_t p = start;
+    while (p < end) {
+        uint64_t va = VMM_PHYSMAP_BASE + p;
+        int i4 = (int)((va >> 39) & 0x1FF), i3 = (int)((va >> 30) & 0x1FF);
+        int i2 = (int)((va >> 21) & 0x1FF), i1 = (int)((va >> 12) & 0x1FF);
+        if (!(pml4[i4] & VMM_FLAG_PRESENT) && g_pm_slots) {
+            // Beyond the slots pre-populated at boot: user CR3s would not see
+            // it. Only possible above the CPU's reported physical width.
+            debugcon_writestring("[PHYSMAP][ERR] address outside the pre-populated slots: ");
+            debugcon_print_hex(p); debugcon_writestring("\n");
+            rc = -1; break;
+        }
+        uint64_t* pdpt = pm_next(pml4, i4);
+        if (!pdpt) { rc = -1; break; }
+        uint64_t left = end - p;
+        uint64_t e3 = pdpt[i3];
+        if (!(e3 & VMM_FLAG_PRESENT)) {
+            if (g_pm_1g && !(va & (PM_1G - 1)) && left >= PM_1G) {
+                pdpt[i3] = p | PM_LEAF | VMM_FLAG_PS | cb;
+                g_pm_leaves[2]++; p += PM_1G; continue;
+            }
+        } else if (e3 & VMM_FLAG_PS) {
+            if (!force || (e3 & cmask_lg) == cb) { p = (p | (PM_1G - 1)) + 1; continue; }
+            if (!(va & (PM_1G - 1)) && left >= PM_1G) {
+                pdpt[i3] = (e3 & ~cmask_lg) | cb; changed = 1; p += PM_1G; continue;
+            }
+            if (pm_split_1g(pdpt, i3)) { rc = -1; break; }
+            changed = 1;
+        }
+        uint64_t* pd = pm_next(pdpt, i3);
+        if (!pd) { rc = -1; break; }
+        uint64_t e2 = pd[i2];
+        if (!(e2 & VMM_FLAG_PRESENT)) {
+            if (!(va & (PM_2M - 1)) && left >= PM_2M) {
+                pd[i2] = p | PM_LEAF | VMM_FLAG_PS | cb;
+                g_pm_leaves[1]++; p += PM_2M; continue;
+            }
+        } else if (e2 & VMM_FLAG_PS) {
+            if (!force || (e2 & cmask_lg) == cb) { p = (p | (PM_2M - 1)) + 1; continue; }
+            if (!(va & (PM_2M - 1)) && left >= PM_2M) {
+                pd[i2] = (e2 & ~cmask_lg) | cb; changed = 1; p += PM_2M; continue;
+            }
+            if (pm_split_2m(pd, i2)) { rc = -1; break; }
+            changed = 1;
+        }
+        uint64_t* pt = pm_next(pd, i2);
+        if (!pt) { rc = -1; break; }
+        uint64_t e1 = pt[i1];
+        if (!(e1 & VMM_FLAG_PRESENT)) {
+            pt[i1] = p | PM_LEAF | cb;
+            g_pm_leaves[0]++;
+        } else if (force && (e1 & cmask_4k) != cb) {
+            pt[i1] = (e1 & ~cmask_4k) | cb;
+            changed = 1;
+        }
+        p += PAGE_SIZE;
+    }
+    // Changed live entries: flush (physmap entries are never global).
+    // NOTE(SMP): no remote shootdown here -- device mappings are made at boot,
+    // before the APs run anything that could cache the old attribute.
+    if (changed && physmap_initialized) write_cr3(read_cr3());
+    return rc;
+}
+
+static void pm_cpu_features(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u), "c"(0));
+    uint32_t max_ext = a;
+    if (max_ext >= 0x80000001u) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000001u), "c"(0));
+        g_pm_1g = (d >> 26) & 1;                       // Page1GB
+    }
+    if (max_ext >= 0x80000008u) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000008u), "c"(0));
+        g_pm_maxphy = (int)(a & 0xFF);
+    }
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0u), "c"(0));
+    if (a >= 7) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7u), "c"(0));
+        g_pm_la57 = (c >> 16) & 1;                     // LA57: detection only
+    }
+    if (VMM_PHYSMAP_BASE & (PM_1G - 1)) g_pm_1g = 0;   // 1G leaves need a 1 GiB aligned base
+}
+
+static void pm_dec(uint64_t v) {
+    char b[24]; int i = 0;
+    if (v == 0) b[i++] = '0';
+    while (v) { b[i++] = (char)('0' + v % 10); v /= 10; }
+    char o[24]; int j = 0;
+    while (i) o[j++] = b[--i];
+    o[j] = 0;
+    debugcon_writestring(o);
+}
+
 void vmm_init_physmap(void) {
     if (physmap_initialized) return;
-    uint64_t total = pmm_get_total_memory();
-    if (total == 0) {
-    terminal_writestring("[WARN] physmap: total memory = 0\n");
-        return;
+    if (VMM_PHYSMAP_BASE & (PM_2M - 1)) PANIC("physmap base not 2 MiB aligned");
+    pm_cpu_features();
+    // Pre-populate the PDPT of every slot a physical address of this CPU can
+    // fall in (at least up to the RAM top), capped at the 64 TiB window.
+    uint64_t span = (g_pm_maxphy >= 63) ? VMM_PHYSMAP_SIZE : (1ULL << g_pm_maxphy);
+    uint64_t ram_top = 0;
+    for (int i = 0; i < pmm_ram_range_count(); i++) {
+        uint64_t s, e;
+        pmm_ram_range(i, &s, &e);
+        if (e > ram_top) ram_top = e;
     }
-    // Round up to 2MB multiples
-    const uint64_t HUGE_SIZE = 2ULL * 1024 * 1024;
-    uint64_t limit = (total + HUGE_SIZE - 1) & ~(HUGE_SIZE - 1);
-
-    uint64_t pml4_phys = kernel_space.pml4_phys & ADDRESS_MASK;
-    uint64_t* pml4 = (uint64_t*)pml4_phys; // identity assumption
-
-    // Calculate PML4 / PDPT / PDT indices for physmap range
-    // Using VMM_PHYSMAP_BASE: extract PML4 index
-    int pml4_i = (VMM_PHYSMAP_BASE >> 39) & 0x1FF;
-    int pdpt_i_start = (VMM_PHYSMAP_BASE >> 30) & 0x1FF;
-
-    // Ensure PDPT is present
-    uint64_t* pdpt = (uint64_t*)(pml4[pml4_i] & ADDRESS_MASK);
-    if (!(pml4[pml4_i] & VMM_FLAG_PRESENT)) {
-    void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] physmap: PDPT alloc fail\n"); return; }
-        zero_frame((uint64_t)frame);
-        pml4[pml4_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
-        pdpt = (uint64_t*)(((uint64_t)frame) & ADDRESS_MASK);
+    if (ram_top > span) span = ram_top;
+    if (span > VMM_PHYSMAP_SIZE) span = VMM_PHYSMAP_SIZE;
+    uint64_t* pml4 = pm_tab(kernel_space.pml4_phys & ADDRESS_MASK);
+    uint64_t first = VMM_PHYSMAP_BASE & ~(PM_512G - 1);
+    for (uint64_t va = first; va < VMM_PHYSMAP_BASE + span; va += PM_512G) {
+        if (!pm_next(pml4, (int)((va >> 39) & 0x1FF))) PANIC("physmap: PDPT alloc failed");
+        g_pm_slots++;
     }
+    g_pm_span = span;
 
-    uint64_t phys_cursor = 0;
-    while (phys_cursor < limit) {
-    int pdpt_i = pdpt_i_start + ((phys_cursor >> 30) & 0x1FF); // Simple, should not exceed 512 early
-    if (pdpt_i >= 512) { terminal_writestring("[WARN] physmap: exceeds PDPT range\n"); break; }
-        uint64_t* pdt = (uint64_t*)(pdpt[pdpt_i] & ADDRESS_MASK);
-        if (!(pdpt[pdpt_i] & VMM_FLAG_PRESENT)) {
-            void* frame = pmm_alloc_frame(); if (!frame) { terminal_writestring("[ERR] physmap: PDT alloc fail\n"); break; }
-            zero_frame((uint64_t)frame);
-            pdpt[pdpt_i] = ((uint64_t)frame & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW;
-            pdt = (uint64_t*)(((uint64_t)frame) & ADDRESS_MASK);
+    // Legacy low 1 MiB (real-mode area, EBDA, BIOS ROM, AP trampoline page)
+    // WB, with the VGA window [0xA0000, 0xC0000) uncached. Then every RAM range.
+    pm_map_range(0, 0x100000ULL, VMM_CACHE_WB, 0);
+    pm_map_range(0xA0000ULL, 0xC0000ULL, VMM_CACHE_UC, 1);
+    for (int i = 0; i < pmm_ram_range_count(); i++) {
+        uint64_t s, e;
+        pmm_ram_range(i, &s, &e);
+        if (pm_map_range(s, e, VMM_CACHE_WB, 0) != 0) {
+            terminal_writestring("[ERR] physmap: mapping a RAM range failed\n");
+            break;
         }
-    // Fill PDT with huge pages
-        for (int pdt_i = 0; pdt_i < 512 && phys_cursor < limit; pdt_i++) {
-            // Compute corresponding virtual address
-            uint64_t virt = VMM_PHYSMAP_BASE + phys_cursor;
-            int virt_pdt_i = (virt >> 21) & 0x1FF;
-            if (virt_pdt_i != pdt_i) continue; // Align with local index
-            if (!(pdt[pdt_i] & VMM_FLAG_PRESENT)) {
-                // Mark physmap pages NX (non-executable) and RW
-                pdt[pdt_i] = (phys_cursor & ADDRESS_MASK) | VMM_FLAG_PRESENT | VMM_FLAG_RW | VMM_FLAG_PS | VMM_FLAG_NOEXEC;
-            }
-            phys_cursor += HUGE_SIZE;
-        }
+        if (e > g_pm_ram_end) g_pm_ram_end = (e < VMM_PHYSMAP_SIZE) ? e : VMM_PHYSMAP_SIZE;
     }
     physmap_initialized = 1;
-    physmap_limit = limit; // record initial extension
-    terminal_writestring("[OK] Physmap initialized up to ");
-    char hex[17]; hex[16]='\0'; uint64_t v=limit; char hc[]="0123456789ABCDEF"; for(int i=15;i>=0;i--){ hex[i]=hc[v & 0xF]; v >>=4; }
-    terminal_writestring("0x"); terminal_writestring(hex); terminal_writestring(" (fisico)\n");
-    // M1.2: physmap_initialized just became 1; print sample phys_to_virt conversion
-    uint64_t sample = phys_to_virt(0x200000ULL);
-    uint64_t sv = sample; for(int i=15;i>=0;i--){ hex[i]=hc[sv & 0xF]; sv>>=4; }
-    terminal_writestring("[M1.2] physmap_initialized=1. phys_to_virt(0x200000)= 0x"); terminal_writestring(hex); terminal_writestring("\n");
+    terminal_writestring("[OK] Physmap initialized: RAM up to ");
+    print_hex(g_pm_ram_end);
+    terminal_writestring(g_pm_1g ? " (1 GiB pages)\n" : " (2 MiB pages)\n");
+    debugcon_writestring("[PHYSMAP] base="); debugcon_print_hex(VMM_PHYSMAP_BASE);
+    debugcon_writestring(" ram_end_MiB="); pm_dec(g_pm_ram_end >> 20);
+    debugcon_writestring(" slots="); pm_dec(g_pm_slots);
+    debugcon_writestring(" maxphy="); pm_dec((uint64_t)g_pm_maxphy);
+    debugcon_writestring(" pages1g="); pm_dec(g_pm_leaves[2]);
+    debugcon_writestring(" pages2m="); pm_dec(g_pm_leaves[1]);
+    debugcon_writestring(" pages4k="); pm_dec(g_pm_leaves[0]);
+    debugcon_writestring(" tables="); pm_dec(g_pm_tables);
+    debugcon_writestring(g_pm_1g ? " gbpages=1" : " gbpages=0");
+    debugcon_writestring(g_pm_la57 ? " la57=1\n" : " la57=0\n");
+}
+
+uint64_t vmm_map_mmio(uint64_t phys, uint64_t size, int cache) {
+    if (!physmap_initialized || size == 0) return 0;
+    if (cache == VMM_CACHE_WC) vmm_pat_init();
+    uint64_t fl = spin_lock_irqsave(&g_pm_lock);
+    int rc = pm_map_range(phys, phys + size, cache, 1);
+    spin_unlock_irqrestore(&g_pm_lock, fl);
+    return rc == 0 ? phys_to_virt(phys) : 0;
+}
+
+uint64_t vmm_map_phys(uint64_t phys, uint64_t size) {
+    if (!physmap_initialized || size == 0) return 0;
+    uint64_t fl = spin_lock_irqsave(&g_pm_lock);
+    int rc = pm_map_range(phys, phys + size, VMM_CACHE_WB, 0);
+    spin_unlock_irqrestore(&g_pm_lock, fl);
+    return rc == 0 ? phys_to_virt(phys) : 0;
+}
+
+// Deprecated (pre-M49 API): callers passed only the END of an MMIO window.
+// Map the 2 MiB block below phys_end where it is not mapped yet, uncached;
+// RAM already in the physmap keeps its WB mapping. Use vmm_map_mmio instead.
+void vmm_extend_physmap(uint64_t phys_end) {
+    if (!physmap_initialized || phys_end == 0) return;
+    uint64_t start = (phys_end - 1) & ~(PM_2M - 1);
+    uint64_t fl = spin_lock_irqsave(&g_pm_lock);
+    pm_map_range(start, phys_end, VMM_CACHE_UC, 0);
+    spin_unlock_irqrestore(&g_pm_lock, fl);
+}
+
+// [FB-WC] Retag [phys, phys+size) Write-Combining (PAT slot 1, see vmm_pat_init).
+// Only the framebuffer's own pages change: a huge page shared with RAM is split.
+void vmm_set_physmap_wc(uint64_t phys, uint64_t size) {
+    if (!physmap_initialized || size == 0) return;
+    uint64_t fl = spin_lock_irqsave(&g_pm_lock);
+    pm_map_range(phys, phys + size, VMM_CACHE_WC, 1);
+    spin_unlock_irqrestore(&g_pm_lock, fl);
+}
+
+void vmm_physmap_get_stats(vmm_physmap_stats_t* st) {
+    if (!st) return;
+    st->ram_end = g_pm_ram_end;
+    st->span = g_pm_span;
+    st->slots = g_pm_slots;
+    st->tables = g_pm_tables;
+    st->leaves_4k = g_pm_leaves[0];
+    st->leaves_2m = g_pm_leaves[1];
+    st->leaves_1g = g_pm_leaves[2];
+    st->gbpages = g_pm_1g;
+    st->maxphy = g_pm_maxphy;
+    st->la57 = g_pm_la57;
+}
+
+// [M49] Audit the physmap: every leaf must be supervisor + NX. Logs the count.
+void vmm_physmap_audit(void) {
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(kernel_space.pml4_phys & ADDRESS_MASK);
+    uint64_t leaves = 0, bad = 0;
+    uint64_t first = VMM_PHYSMAP_BASE & ~(PM_512G - 1);
+    for (uint64_t va = first; va < VMM_PHYSMAP_BASE + g_pm_span; va += PM_512G) {
+        uint64_t e4 = pml4[(va >> 39) & 0x1FF];
+        if (!(e4 & VMM_FLAG_PRESENT)) continue;
+        if (e4 & VMM_FLAG_USER) bad++;
+        uint64_t* pdpt = (uint64_t*)phys_to_virt(e4 & ADDRESS_MASK);
+        for (int i3 = 0; i3 < PT_ENTRIES; i3++) {
+            uint64_t e3 = pdpt[i3];
+            if (!(e3 & VMM_FLAG_PRESENT)) continue;
+            if (e3 & VMM_FLAG_PS) {
+                leaves++;
+                if ((e3 & VMM_FLAG_USER) || !(e3 & VMM_FLAG_NOEXEC)) bad++;
+                continue;
+            }
+            uint64_t* pd = (uint64_t*)phys_to_virt(e3 & ADDRESS_MASK);
+            for (int i2 = 0; i2 < PT_ENTRIES; i2++) {
+                uint64_t e2 = pd[i2];
+                if (!(e2 & VMM_FLAG_PRESENT)) continue;
+                if (e2 & VMM_FLAG_PS) {
+                    leaves++;
+                    if ((e2 & VMM_FLAG_USER) || !(e2 & VMM_FLAG_NOEXEC)) bad++;
+                    continue;
+                }
+                uint64_t* pt = (uint64_t*)phys_to_virt(e2 & ADDRESS_MASK);
+                for (int i1 = 0; i1 < PT_ENTRIES; i1++) {
+                    uint64_t e1 = pt[i1];
+                    if (!(e1 & VMM_FLAG_PRESENT)) continue;
+                    leaves++;
+                    if ((e1 & VMM_FLAG_USER) || !(e1 & VMM_FLAG_NOEXEC)) bad++;
+                }
+            }
+        }
+    }
+    debugcon_writestring("[PHYSMAP] audit leaves="); pm_dec(leaves);
+    debugcon_writestring(bad ? " *** NON-NX OR USER ENTRIES ***\n" : " all supervisor+NX\n");
 }
 
 int vmm_map(uint64_t virt, uint64_t phys, uint64_t flags) {
