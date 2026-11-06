@@ -59,6 +59,7 @@ void lapic_ipi(uint32_t dest_apic_id, uint8_t vector);
 /* [M48] Inter-processor interrupt vectors (high priority class 0xF). */
 #define VEC_IPI_TLB      0xF0   /* TLB shootdown request (arch/x86/tlb.c)        */
 #define VEC_IPI_RESCHED  0xF1   /* kick an idle CPU into the scheduler           */
+#define VEC_IPI_STOP     0xF2   /* panic: park this CPU (cli; hlt)               */
 
 /* [M48] 1 when the Local APICs run in x2APIC (MSR) mode: chosen at
  * lapic_enable() when the CPU supports it (or the firmware enabled it);

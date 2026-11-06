@@ -91,6 +91,7 @@ static volatile int g_in_kernel_panic = 0;
  * be painted. Kernel stacks/IST live in the shared high half, so this is safe. */
 static void panic_enter(const char* what) {
     __asm__ volatile("cli");
+    debugcon_kflush();            // [M48] this CPU's partial debugcon line first
     if (g_in_kernel_panic) {
         debugcon_writestring("[PANIC] nested fault inside the panic path (");
         debugcon_writestring(what);
@@ -98,6 +99,7 @@ static void panic_enter(const char* what) {
         for (;;) __asm__ volatile("cli; hlt");
     }
     g_in_kernel_panic = 1;
+    { extern void smp_stop_others(void); smp_stop_others(); }   // [M48] freeze the other CPUs
     vmm_switch_space(vmm_get_kernel_space());
 #if ENABLE_FB
     // terminal_initialize() would kfree() the console back buffer; the heap may

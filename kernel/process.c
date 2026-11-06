@@ -24,7 +24,7 @@
 #include "fbdev.h"      // [M40] graphics-owner exit -> text console
 
 #define MAX_PROCESSES 32
-static process_t* proc_table[MAX_PROCESSES];
+static process_t* volatile proc_table[MAX_PROCESSES];
 static uint32_t next_pid = 1;
 static int proc_inited = 0;
 
@@ -93,6 +93,18 @@ void process_unlock_irqrestore(uint64_t fl) { spin_unlock_irqrestore(&proc_lock,
 // sits on runnable work). The claim (RUNNING + on_cpu + new home) happens
 // under proc_lock, so two CPUs can never claim the same task.
 process_t* process_claim_next(uint32_t cpu, process_t* after) {
+    // Lock-free peek first: idle CPUs call this on every tick, and with many
+    // CPUs taking proc_lock just to find nothing became the bottleneck. A
+    // stale read (an entry being freed is still mapped heap memory) can only
+    // miss a task that the next tick or a reschedule IPI picks up.
+    {
+        int any = 0;
+        for (int i = 0; i < MAX_PROCESSES && !any; i++) {
+            process_t* p = proc_table[i];
+            if (p && p != after && p->state == PROC_READY && !p->on_cpu) any = 1;
+        }
+        if (!any) return NULL;
+    }
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     int start = 0;
     if (after) {

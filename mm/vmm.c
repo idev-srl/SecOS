@@ -803,10 +803,15 @@ int vmm_free_kernel_stack_for_slot(uint32_t slot) {
     uint64_t glo  = m5_kstack_guard_lo(slot);
     uint64_t ghi  = m5_kstack_guard_hi(slot);
 
-    // [M48] Unmap the whole slot, shoot the range down on every CPU (the task
-    // that used this stack may have run on any of them), and only then hand
-    // the frames back: a CPU still caching the old translation would otherwise
-    // write into a frame the PMM already gave to someone else.
+    // [M48] Unmap the whole slot and make sure no CPU can still reach the old
+    // frames through a cached translation before handing them back. A slot's
+    // VA is only ever touched by the CPU running its owning task, and every
+    // context switch reloads CR3 (switch_to -> vmm_switch_space) before the
+    // next task's kernel stack is used; the kernel maps nothing global and uses
+    // no PCID, so that reload drops every kernel translation too. A CPU can
+    // therefore only touch this slot again (for the slot's next owner) after a
+    // full flush: the local flush below is enough. TLB_KSTACK_EAGER restores
+    // the all-CPU IPI (needed if global pages or PCID are ever enabled).
     uint64_t frames[M5_KSTACK_PAGES];
     uint64_t fl = spin_lock_irqsave(&kstack_lock);
     for (int i = 0; i < M5_KSTACK_PAGES; i++) {
@@ -820,7 +825,12 @@ int vmm_free_kernel_stack_for_slot(uint32_t slot) {
     }
     m2_mark_guard(glo);
     m2_mark_guard(ghi);
+#ifdef TLB_KSTACK_EAGER
     tlb_shootdown_kernel(glo, (ghi - glo) / PAGE_SIZE + 1);
+#else
+    for (uint64_t va = glo; va <= ghi; va += PAGE_SIZE)
+        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+#endif
     spin_unlock_irqrestore(&kstack_lock, fl);
     for (int i = 0; i < M5_KSTACK_PAGES; i++)
         if (frames[i]) pmm_free_frame((void*)frames[i]);

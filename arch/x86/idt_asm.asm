@@ -530,6 +530,14 @@ isr_ipi_resched:
     add rsp, 16
     iretq
 
+; [M48] Panic on another CPU: park here for good.
+global isr_ipi_stop
+isr_ipi_stop:
+    cli
+.park:
+    hlt
+    jmp .park
+
 ; [M48] void arch_switch_finish(trapframe_t* next_tf, volatile uint32_t* prev_on_cpu,
 ;                               uint64_t switch_stack_top)  -- noreturn
 ; Last step of a context switch. Moves onto this CPU's private switch stack,

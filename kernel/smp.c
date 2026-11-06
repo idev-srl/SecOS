@@ -114,6 +114,20 @@ static int ap_alloc_idle(cpu_t* c) {
     return 0;
 }
 
+uint32_t smp_cpu_lapic_id(uint32_t i) { return cpu_by_index(i)->lapic_id; }
+
+/* [M48] Panic: park every other online CPU (VEC_IPI_STOP: cli; hlt forever) so
+ * the panic report is the last thing the machine does. A CPU running with
+ * interrupts off parks once it enables them again. */
+void smp_stop_others(void) {
+    if (g_cpu_count <= 1) return;
+    cpu_t* me = this_cpu();
+    for (uint32_t i = 0; i < g_cpu_count; i++) {
+        cpu_t* c = cpu_by_index(i);
+        if (c != me && c->online) lapic_ipi(c->lapic_id, VEC_IPI_STOP);
+    }
+}
+
 uint32_t smp_online_count(void) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < smp_cpu_count(); i++)

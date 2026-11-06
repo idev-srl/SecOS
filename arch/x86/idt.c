@@ -149,7 +149,9 @@ void idt_init(void) {
     // [M48] SMP IPIs: TLB shootdown + reschedule (arch/x86/tlb.c, kernel/sched.c)
     { extern void isr_ipi_tlb(void); extern void isr_ipi_resched(void);
       idt_set_gate(0xF0, (uint64_t)isr_ipi_tlb, 0x08, 0x8E);
-      idt_set_gate(0xF1, (uint64_t)isr_ipi_resched, 0x08, 0x8E); }
+      idt_set_gate(0xF1, (uint64_t)isr_ipi_resched, 0x08, 0x8E);
+      extern void isr_ipi_stop(void);
+      idt_set_gate(0xF2, (uint64_t)isr_ipi_stop, 0x08, 0x8E); }
 
     // Syscall gate INT 0x80 (trap gate, present, DPL=3 -> type_attr 0xEE)
     idt_set_gate(0x80, (uint64_t)syscall_entry, 0x08, 0xEE);

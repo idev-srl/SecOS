@@ -76,7 +76,7 @@ static void sb_kv_kb(struct sb* s, const char* k, uint64_t kb){
 enum pk {
     PK_ROOT=1, PK_SELF,
     PK_MEMINFO, PK_UPTIME, PK_LOADAVG, PK_STAT, PK_VERSION, PK_CPUINFO,
-    PK_MOUNTS, PK_FILESYSTEMS, PK_KMSG, PK_CMDLINE_K,
+    PK_MOUNTS, PK_FILESYSTEMS, PK_KMSG, PK_CMDLINE_K, PK_SMP,
     PK_PID_DIR, PK_PID_STAT, PK_PID_STATUS, PK_PID_STATM, PK_PID_CMDLINE,
     PK_PID_COMM, PK_PID_ENVIRON, PK_PID_MAPS, PK_PID_CWD, PK_PID_EXE,
     PK_PID_ROOT, PK_PID_FDDIR, PK_PID_FD,
@@ -90,7 +90,7 @@ static const struct { const char* name; int kind; } g_top[] = {
     {"meminfo",PK_MEMINFO}, {"uptime",PK_UPTIME}, {"loadavg",PK_LOADAVG},
     {"stat",PK_STAT}, {"version",PK_VERSION}, {"cpuinfo",PK_CPUINFO},
     {"mounts",PK_MOUNTS}, {"filesystems",PK_FILESYSTEMS}, {"kmsg",PK_KMSG},
-    {"cmdline",PK_CMDLINE_K},
+    {"cmdline",PK_CMDLINE_K}, {"smp",PK_SMP},
 };
 #define NTOP (int)(sizeof(g_top)/sizeof(g_top[0]))
 static const struct { const char* name; int kind; } g_pidf[] = {
@@ -452,6 +452,31 @@ static int         g_inext;
 static spinlock_t  g_proc_lock = SPINLOCK_INIT;
 
 static int is_link(int k){ return k==PK_SELF||k==PK_PID_CWD||k==PK_PID_EXE||k==PK_PID_ROOT||k==PK_PID_FD; }
+/* [M48] /proc/smp: per-CPU scheduler and IPI counters (SecOS-specific). */
+static void gen_smp(struct sb* s){
+    extern uint32_t smp_cpu_count(void); extern uint32_t smp_online_count(void);
+    extern int lapic_x2apic_mode(void);
+    extern uint64_t tlb_stat_shootdowns(void); extern uint64_t tlb_stat_timeouts(void);
+    extern void sched_cpu_stats(uint32_t, uint64_t*, uint64_t*, uint64_t*, uint64_t*);
+    extern uint32_t smp_cpu_lapic_id(uint32_t);
+    sb_str(s,"cpus "); sb_u64(s, smp_cpu_count());
+    sb_str(s," online "); sb_u64(s, smp_online_count());
+    sb_str(s," x2apic "); sb_u64(s, (uint64_t)lapic_x2apic_mode());
+    sb_str(s," shootdowns "); sb_u64(s, tlb_stat_shootdowns());
+    sb_str(s," shootdown_timeouts "); sb_u64(s, tlb_stat_timeouts());
+    sb_putc(s,'\n');
+    for(uint32_t i=0;i<smp_cpu_count();i++){
+        uint64_t sw, mg, it, ir; sched_cpu_stats(i,&sw,&mg,&it,&ir);
+        sb_str(s,"cpu"); sb_u64(s,i);
+        sb_str(s," apic "); sb_u64(s, smp_cpu_lapic_id(i));
+        sb_str(s," switches "); sb_u64(s,sw);
+        sb_str(s," migrations "); sb_u64(s,mg);
+        sb_str(s," ipi_tlb "); sb_u64(s,it);
+        sb_str(s," ipi_resched "); sb_u64(s,ir);
+        sb_putc(s,'\n');
+    }
+}
+
 /* [M43] What Linux guards with a ptrace-style check: only root or a reader
  * whose effective ids equal all of the target's ids (cred_may_inspect). */
 static int is_private(int k){ return k==PK_PID_ENVIRON||k==PK_PID_MAPS||k==PK_PID_CWD||k==PK_PID_EXE||
@@ -499,6 +524,7 @@ static int gen_key(uint64_t key){
         sb_str(&s," secos.console=login");
 #endif
         sb_putc(&s,'\n'); break; }
+    case PK_SMP: gen_smp(&s); break;
     case PK_SELF: { process_t* c=sched_get_current(); if(!c||!c->pid) return -1; sb_u64(&s,c->pid); break; }
     case PK_PID_STAT: gen_pid_stat(&s); break;
     case PK_PID_STATUS: gen_pid_status(&s); break;
