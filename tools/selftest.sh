@@ -1357,6 +1357,7 @@ if [[ -n "$OVMF_PW" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
     up_rc=$?
     grep -q "\[POWER\] powering off" "$UPLOG"; check "UEFI: poweroff from bash reaches ACPI power-off" $?
     [[ $up_rc -eq 0 ]]; check "UEFI: QEMU exits by itself after poweroff (rc=$up_rc)" $?
+    ! grep -q "ACPI poweroff unavailable" "$UPLOG"; check "UEFI: S5 powered off before the kernel gave up (no \"unavailable\" message)" $?
 else
     echo "  [SKIP] UEFI poweroff (OVMF missing or make uefi failed)"
 fi
