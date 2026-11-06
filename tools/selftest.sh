@@ -798,6 +798,119 @@ n_mm=$(awk '{print $4}' /tmp/secos_selftest_aslr.txt | sort -u | wc -l)
 [[ "$n_aslr" -ge 3 ]]; check "M39 ASLR layout logged per process (n=$n_aslr)" $?
 [[ "$n_st" -ge 2 && "$n_brk" -ge 2 && "$n_mm" -ge 2 ]]; check "M39 ASLR slides differ across processes (stack=$n_st brk=$n_brk mmap=$n_mm distinct)" $?
 
+# ---- M45: kernel KASLR (random 2 MiB-aligned slide of the high-half base) ----
+# A -DSECOS_KASLR_DEBUG image prints the slide on raw debugcon only (never the
+# kernel log). Boot it 5 times under MB2: the slides must differ (>= 4 distinct
+# of 5; 768 slots), every boot must reach the W^X audit clean, and the measured-
+# boot hash must stay the sha256 of .text+.rodata of kernel.bin whatever the
+# slide. Then: -smp 4 -cpu max (RDRAND, APs online), the `nokaslr` MB2 option,
+# UEFI (2 boots, EFI_RNG via virtio-rng, `nokaslr` in the load options) and a
+# -DSECOS_NO_KASLR build.
+kaslr_host_meas() { # sha256 of [.text start, _rodata_end) of kernel.bin
+    local syms ts re toff
+    syms=$(nm kernel.bin 2>/dev/null || true)
+    ts=$(awk '$3=="_text_start"{print $1}' <<<"$syms")
+    re=$(awk '$3=="_rodata_end"{print $1}' <<<"$syms")
+    toff=$(readelf -SW kernel.bin | awk '{for(i=1;i<NF;i++) if($i==".text") print $(i+3)}' || true)
+    [[ -n "$ts" && -n "$re" && -n "$toff" ]] || return 0
+    tail -c +$(( 16#$toff + 1 )) kernel.bin | head -c $(( 16#$re - 16#$ts )) | sha256sum | cut -d' ' -f1
+}
+K45=/tmp/secos_selftest_m45
+rm -rf "$K45"; mkdir -p "$K45"
+echo "[selftest] Building M45 KASLR image (SECOS_KASLR_DEBUG, SECOS_SMP_AT_BOOT)..."
+build_demo M45 "-DSECOS_KASLR_DEBUG -DSECOS_SMP_AT_BOOT"
+k45_meas=$(kaslr_host_meas)
+grep -q "^\[kaslr\] [0-9]* relocations" /tmp/secos_selftest_build.log; check "M45 relocation table extracted at link time" $?
+[[ -n "$(nm kernel.bin | awk '$3=="_kaslr_start"')" ]]; check "M45 kernel.bin carries the .kaslr table" $?
+slides=""; n_ok=0; n_meas=0; n_wx=0; n_exc=0
+for i in 1 2 3 4 5; do
+    echo "[selftest] Running M45 KASLR boot $i/5 (mb2, 15s)..."
+    run_iso "$K45/mb2_$i.log" 15
+    s=$(grep -ao "\[KASLR-DEBUG\] slide=0x[0-9a-f]*" "$K45/mb2_$i.log" | head -1 | sed 's/.*=//')
+    slides="$slides $s"
+    grep -q "\[KASLR\] on: kernel base randomized, 768 slots x 2 MiB (~9.6 bits), entropy=.*by MB2 entry" "$K45/mb2_$i.log" && n_ok=$((n_ok+1))
+    m=$(grep -ao "\[M37\] kernel code measurement (sha256 .text+.rodata): [0-9a-f]*" "$K45/mb2_$i.log" | awk '{print $NF}')
+    [[ -n "$m" && "$m" == "$k45_meas" ]] && n_meas=$((n_meas+1))
+    grep -q "\[WX\] kernel image W^X verified (0 violations)" "$K45/mb2_$i.log" && n_wx=$((n_wx+1))
+    grep -q "\[EXC\]" "$K45/mb2_$i.log" && n_exc=$((n_exc+1))
+done
+n_distinct=$(tr ' ' '\n' <<<"$slides" | grep -c . || true)
+n_uniq=$(tr ' ' '\n' <<<"$slides" | grep . | sort -u | wc -l)
+echo "  slides:$slides"
+[[ "$n_ok" -eq 5 ]]; check "M45 MB2: KASLR on in 5/5 boots (n=$n_ok)" $?
+[[ "$n_distinct" -eq 5 && "$n_uniq" -ge 4 ]]; check "M45 MB2: slides differ across boots ($n_uniq distinct of $n_distinct)" $?
+bad_slide=0
+for s in $slides; do (( s % 0x200000 == 0 && s < 768 * 0x200000 )) || bad_slide=1; done
+[[ "$bad_slide" -eq 0 ]]; check "M45 MB2: every slide 2 MiB-aligned and below 1.5 GiB" $?
+[[ "$n_meas" -eq 5 ]]; check "M45 measured boot slide-independent: 5/5 equal to sha256 of kernel.bin (n=$n_meas)" $?
+[[ "$n_wx" -eq 5 ]]; check "M45 W^X audit clean at the slid base in 5/5 boots (n=$n_wx)" $?
+[[ "$n_exc" -eq 0 ]]; check "M45 no CPU exception in the 5 KASLR boots" $?
+# SMP + RDRAND: the APs come up on the relocated image.
+echo "[selftest] Running M45 KASLR (mb2, -smp 4 -cpu max, 25s)..."
+run_iso "$K45/smp.log" 25 -smp 4 -cpu max
+grep -q "\[KASLR\] on: .*entropy=RDRAND" "$K45/smp.log"; check "M45 entropy from RDRAND when the CPU has it (-cpu max)" $?
+grep -q "\[SMP\] online cpus=0x0000000000000004" "$K45/smp.log"; check "M45 all 4 CPUs online on the slid kernel (-smp 4)" $?
+! grep -q "\[EXC\]" "$K45/smp.log"; check "no CPU exception ([EXC]) during M45 -smp 4 run" $?
+# `nokaslr` on the multiboot2 command line.
+make iso CFLAGS_EXTRA="-DSECOS_KASLR_DEBUG -DSECOS_SMP_AT_BOOT" KERNEL_CMDLINE=nokaslr >/tmp/secos_selftest_build.log 2>&1
+echo "[selftest] Running M45 nokaslr (mb2, 15s)..."
+run_iso "$K45/nok.log" 15
+grep -q "\[KASLR\] off (nokaslr boot option)" "$K45/nok.log"; check "M45 MB2 'nokaslr' keeps the link base" $?
+grep -q "\[WX\] kernel image W^X verified (0 violations)" "$K45/nok.log"; check "M45 MB2 nokaslr boot reaches the W^X audit" $?
+make iso CFLAGS_EXTRA="-DSECOS_KASLR_DEBUG -DSECOS_SMP_AT_BOOT" >/tmp/secos_selftest_build.log 2>&1
+# UEFI: the loader relocates. Two boots (slides differ), one with virtio-rng
+# (EFI_RNG_PROTOCOL), one with `nokaslr` in the load options (startup.nsh).
+OVMF45=""
+for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/OVMF/x64/OVMF.fd \
+         /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2-ovmf/OVMF_CODE.fd; do
+    [[ -f "$f" ]] && { OVMF45="$f"; break; }
+done
+if [[ -n "$OVMF45" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
+    run_uefi45() { # run_uefi45 <esp> <tag> [qemu args]
+        local esp="$1" tag="$2"; shift 2
+        : > "$K45/u_$tag.ser"; : > "$K45/u_$tag.dbg"
+        timeout 35 qemu-system-x86_64 -machine q35,accel=tcg -m 256M -bios "$OVMF45" \
+            -drive format=raw,file=fat:rw:"$esp"/ \
+            -serial file:"$K45/u_$tag.ser" -debugcon file:"$K45/u_$tag.dbg" \
+            -global isa-debugcon.iobase=0xe9 -no-reboot -no-shutdown -display none -net none "$@" >/dev/null 2>&1
+    }
+    # One fresh ESP per boot: OVMF stores NvVars (boot order, device paths) on
+    # a writable ESP, and a stale entry sends a boot with a different PCI
+    # layout (virtio-rng) to the UEFI shell.
+    for t in a b rng; do cp -r dist "$K45/esp_$t"; done
+    mkdir -p "$K45/esp_nok/EFI/SECOS"
+    cp dist/EFI/BOOT/BOOTX64.EFI "$K45/esp_nok/EFI/SECOS/SECOS.EFI"; cp dist/kernel.elf "$K45/esp_nok/"
+    printf 'fs0:\r\n\\EFI\\SECOS\\SECOS.EFI nokaslr\r\n' > "$K45/esp_nok/startup.nsh"
+    echo "[selftest] Running M45 KASLR under UEFI (3 boots + nokaslr, 35s each)..."
+    run_uefi45 "$K45/esp_a" a
+    run_uefi45 "$K45/esp_b" b
+    run_uefi45 "$K45/esp_rng" rng -device virtio-rng-pci
+    run_uefi45 "$K45/esp_nok" nok
+    ua=$(grep -ao "\[KASLR-DEBUG\] slide=0x[0-9a-f]*" "$K45/u_a.dbg" | sed 's/.*=//')
+    ub=$(grep -ao "\[KASLR-DEBUG\] slide=0x[0-9a-f]*" "$K45/u_b.dbg" | sed 's/.*=//')
+    ur=$(grep -ao "\[KASLR-DEBUG\] slide=0x[0-9a-f]*" "$K45/u_rng.dbg" | sed 's/.*=//')
+    echo "  UEFI slides: $ua $ub $ur"
+    grep -q "\[KASLR\] on: .*by UEFI loader" "$K45/u_a.dbg" && grep -q "\[KASLR\] on: .*by UEFI loader" "$K45/u_b.dbg"
+    check "M45 UEFI: the loader randomizes the kernel base" $?
+    [[ -n "$ua" && -n "$ub" && -n "$ur" ]] && [[ $(printf '%s\n' "$ua" "$ub" "$ur" | sort -u | wc -l) -ge 2 ]]
+    check "M45 UEFI: slides differ across boots" $?
+    grep -aq "\[SECURE BOOT\] kernel signature OK" "$K45/u_a.ser"; check "M45 UEFI: secure boot still verifies the KASLR kernel" $?
+    m=$(grep -ao "\[M37\] kernel code measurement (sha256 .text+.rodata): [0-9a-f]*" "$K45/u_a.dbg" | awk '{print $NF}')
+    [[ -n "$m" && "$m" == "$k45_meas" ]]; check "M45 UEFI: measurement equals the MB2 one and the file hash" $?
+    grep -q "\[WX\] kernel image W^X verified (0 violations)" "$K45/u_a.dbg"; check "M45 UEFI: W^X audit clean at the slid base" $?
+    grep -q "\[KASLR\] on: .*entropy=EFI_RNG" "$K45/u_rng.dbg"; check "M45 UEFI: entropy from EFI_RNG_PROTOCOL (virtio-rng)" $?
+    grep -q "\[KASLR\] off (nokaslr boot option)" "$K45/u_nok.dbg"; check "M45 UEFI: 'nokaslr' load option keeps the link base" $?
+    ! grep -q "\[EXC\]" "$K45/u_a.dbg" "$K45/u_b.dbg" "$K45/u_rng.dbg" "$K45/u_nok.dbg"; check "no CPU exception ([EXC]) during the M45 UEFI runs" $?
+else
+    echo "  [SKIP] M45 UEFI KASLR (OVMF missing or make uefi failed)"
+fi
+# Build-time opt-out.
+echo "[selftest] Building M45 opt-out image (SECOS_NO_KASLR)..."
+build_demo M45-off "-DSECOS_NO_KASLR"
+run_iso "$K45/off.log" 15
+grep -q "\[KASLR\] off (built with SECOS_NO_KASLR)" "$K45/off.log"; check "M45 -DSECOS_NO_KASLR boots at the link base" $?
+grep -q "\[WX\] kernel image W^X verified (0 violations)" "$K45/off.log"; check "M45 SECOS_NO_KASLR boot reaches the W^X audit" $?
+
 # ---- Phase L (M36/M37) + M38/M39 boot hardening on the DEFAULT image ----
 # Reproducible build (M37): the default image is built twice from clean with a
 # fixed SOURCE_DATE_EPOCH; kernel.bin must be byte-identical.
@@ -834,6 +947,9 @@ fi
 [[ ${#meas} -eq 64 ]]; check "M37 boot measurement logged (sha256 .text+.rodata)" $?
 [[ -n "$meas" && "$meas" == "$host_meas" ]]; check "M37 boot measurement matches host-side sha256 of kernel.bin" $?
 grep -q "\[M37\] measured boot OK" "$MLLOG"; check "M37 measured boot OK" $?
+# M45 KASLR is on in the default image, and the slide is never logged there.
+grep -q "\[KASLR\] on: kernel base randomized" "$MLLOG"; check "M45 default image: KASLR on" $?
+! grep -aq "KASLR-DEBUG" "$MLLOG" kernel.bin; check "M45 default image never logs the slide" $?
 # M38 WPA2 crypto KATs + M39 association-core KATs (run at boot in crypto selftest).
 grep -q "\[WPA2\] PBKDF2 PMK KAT PASS" "$MLLOG"; check "M38 WPA2 PBKDF2-SHA1 PMK KAT (IEEE 802.11i)" $?
 grep -q "\[WPA2\] AES-128 KAT PASS" "$MLLOG"; check "M38 AES-128 KAT (FIPS-197)" $?
