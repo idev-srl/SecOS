@@ -101,6 +101,8 @@ SRC_C   = \
 	$(FS_DIR)/block.c \
 	$(FS_DIR)/partition.c \
 	$(FS_DIR)/fat32.c \
+	$(FS_DIR)/exfat.c \
+	$(FS_DIR)/exfat_test.c \
 	$(FS_DIR)/ext2.c \
 	$(FS_DIR)/ext2ramdev.c \
 	$(FS_DIR)/devfs.c \
