@@ -1453,7 +1453,7 @@ grep -q "\[SMAP-DEMO\] direct kernel read of a user page" "$SVLOG"; check "M44 S
 grep -q "\[SMAP\] violation: ring-0 read of user address cr2=0x0000000100000000" "$SVLOG"; check "M44 direct kernel read of a user page -> [SMAP] violation" $?
 grep -q "\[PANIC\] SMAP violation" "$SVLOG"; check "M44 SMAP violation panics the kernel (no silent retry)" $?
 ! grep -q "\[SMAP-DEMO\] FAIL" "$SVLOG"; check "M44 the stray access never completed" $?
-run_iso "$SVLOG.nosmap" 20
+run_iso "$SVLOG.nosmap" 20 -cpu qemu64
 grep -q "\[SMAP-DEMO\] skipped: SMAP not enabled" "$SVLOG.nosmap"; check "M44 no SMAP CPU: probe skipped, kernel keeps running" $?
 ! grep -q "\[PANIC\]" "$SVLOG.nosmap"; check "M44 no panic on a CPU without SMAP" $?
 

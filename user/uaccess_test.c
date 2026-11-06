@@ -46,10 +46,24 @@ static void putnum(long v) {
 static long sc(long n, long a0, long a1, long a2, long a3) {
     return secos_syscall(n, a0, a1, a2, a3, 0);
 }
+/* One write() per result line: a kernel trace line ([SCHED] preempt ...) on
+ * debugcon can otherwise land between the name and " OK" and break the
+ * selftest's grep. */
 static void check(const char* name, int ok, long got) {
-    put("[UA-TEST] "); put(name); put(ok ? " OK" : " FAIL");
-    if (!ok) { put(" got="); putnum(got); }
-    put("\n");
+    char line[160]; int n = 0;
+    const char* parts[3] = { "[UA-TEST] ", name, ok ? " OK" : " FAIL" };
+    for (int k = 0; k < 3; k++)
+        for (const char* s = parts[k]; *s && n < 100; s++) line[n++] = *s;
+    if (!ok) {
+        const char* g = " got="; while (*g) line[n++] = *g++;
+        char b[24]; int i = 23; int neg = got < 0; unsigned long u = neg ? -got : got;
+        b[i] = 0;
+        do { b[--i] = (char)('0' + u % 10); u /= 10; } while (u);
+        if (neg) b[--i] = '-';
+        for (const char* s = &b[i]; *s; s++) line[n++] = *s;
+    }
+    line[n++] = '\n';
+    write(1, line, n);
     if (ok) g_pass++; else g_fail++;
 }
 /* A syscall reporting -EFAULT through the raw ABI. */
