@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 int errno = 0;
 
@@ -336,6 +338,32 @@ int fchmod(int fd, unsigned m){ return (int)id_sc(secos_syscall(32, 0, (long)m, 
 int fchown(int fd, unsigned u, unsigned g){ return (int)id_sc(secos_syscall(33, 0, (long)u, (long)g, (long)fd, 0)); }
 int lchown(const char* p, unsigned u, unsigned g){ return (int)id_sc(secos_syscall(33, (long)p, (long)u, (long)g, 0, 1)); }
 /* umask() is the kernel's (SYS_UMASK, libsecos.c): it applies to open/mkdir. */
+/* eaccess()/euidaccess(): access() for the EFFECTIVE ids (bash's test -r/-w/-x,
+ * BusyBox's test). SYS_ACCESS answers for the real ids, which is the same
+ * thing unless the caller runs set-id; then the mode bits are checked here
+ * against the effective ids (the walk itself was already done by stat() with
+ * the effective ids). Root passes everything except exec without any x bit. */
+int eaccess(const char* p, int mode){
+    if(getuid() == geteuid() && getgid() == getegid()) return access(p, mode);
+    struct stat st;
+    if(stat(p, &st) != 0) return -1;
+    if(mode == F_OK) return 0;
+    unsigned want = (unsigned)mode & 7, bits;
+    int uid = geteuid();
+    if(uid == 0){
+        if(!(want & X_OK) || S_ISDIR(st.st_mode) || (st.st_mode & 0111)) return 0;
+        errno = EACCES; return -1;
+    }
+    if((int)st.st_uid == uid) bits = (st.st_mode >> 6) & 7;
+    else {
+        int ing = (int)st.st_gid == getegid(), g[32], n = getgroups(32, g);
+        for(int i = 0; !ing && i < n; i++) if(g[i] == (int)st.st_gid) ing = 1;
+        bits = ing ? (st.st_mode >> 3) & 7 : st.st_mode & 7;
+    }
+    if((bits & want) == want) return 0;
+    errno = EACCES; return -1;
+}
+int euidaccess(const char* p, int mode){ return eaccess(p, mode); }
 
 /* Wall clock (CLOCK_REALTIME = RTC anchored to the TSC, UTC). */
 int gettimeofday(struct timeval* tv, void* tz){

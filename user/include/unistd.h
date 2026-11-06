@@ -47,7 +47,9 @@ unsigned umask(unsigned m);                 /* SYS_UMASK: applied to open/mkdir 
 #define W_OK 2
 #define R_OK 4
 #endif
-int   access(const char* path, int mode);
+int   access(const char* path, int mode);       /* real ids */
+int   eaccess(const char* path, int mode);      /* effective ids */
+int   euidaccess(const char* path, int mode);
 void  sync(void);
 int   syncfs(int fd);
 int   fsync(int fd);
