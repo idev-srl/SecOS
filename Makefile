@@ -103,6 +103,7 @@ SRC_C   = \
 	$(FS_DIR)/fat32.c \
 	$(FS_DIR)/exfat.c \
 	$(FS_DIR)/exfat_test.c \
+	$(FS_DIR)/ntfs.c \
 	$(FS_DIR)/ext2.c \
 	$(FS_DIR)/ext2ramdev.c \
 	$(FS_DIR)/devfs.c \
