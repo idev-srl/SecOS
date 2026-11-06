@@ -460,7 +460,23 @@ static int gen_key(uint64_t key){
     case PK_CPUINFO: gen_cpuinfo(&s); break;
     case PK_MOUNTS: gen_mounts(&s); break;
     case PK_FILESYSTEMS: gen_filesystems(&s); break;
-    case PK_CMDLINE_K: sb_str(&s,"BOOT_IMAGE=/boot/kernel.bin\n"); break;
+    case PK_CMDLINE_K: {
+        /* Build defaults, read by user space when the matching /etc setting
+         * is absent (secwm --auto: /etc/gui-autostart). root= is the root the
+         * kernel mounted (ramfs or the system disk). */
+        extern const char* sysroot_root_dev(void);
+        sb_str(&s,"BOOT_IMAGE=/boot/kernel.bin root=");
+        const char* rd = sysroot_root_dev();
+        if (rd[0]=='r' && rd[1]=='a') sb_str(&s, rd); else { sb_str(&s,"/dev/"); sb_str(&s, rd); }
+#ifdef SECOS_KEYMAP_DEFAULT
+        sb_str(&s," secos.keymap=" SECOS_KEYMAP_DEFAULT);
+#endif
+#ifdef SECOS_GUI_AUTOSTART
+        sb_str(&s," secos.gui_autostart=1");
+#else
+        sb_str(&s," secos.gui_autostart=0");
+#endif
+        sb_putc(&s,'\n'); break; }
     case PK_SELF: { process_t* c=sched_get_current(); if(!c||!c->pid) return -1; sb_u64(&s,c->pid); break; }
     case PK_PID_STAT: gen_pid_stat(&s); break;
     case PK_PID_STATUS: gen_pid_status(&s); break;

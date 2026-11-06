@@ -20,7 +20,7 @@ startgui                      # same binary as /bin/secwm
 | `--no-term` | start without a terminal |
 | `--run "PROGRAM [ARGS]"` | start an SWP client (repeatable, up to 8) |
 | `--trace` | print `SW-*` state markers and every terminal output line to stdout (console + debugcon). Used by the selftest. |
-| `--auto` | exit 0 at once unless `/etc/gui-autostart` exists (the init hook, below) |
+| `--auto` | exit 0 at once unless GUI-at-boot is on (`/etc/gui-autostart`, else the build default; the init hook, below) |
 
 There are three ways back to the text console:
 
@@ -37,29 +37,49 @@ terminals (SIGHUP), kills its clients, releases the input grabs and restores
 
 In QEMU, use `make run-gui`. It builds the ISO and opens a GTK window with a
 PS/2 keyboard and a USB tablet (`-device qemu-xhci -device usb-tablet`), so the
-pointer follows the host cursor without a mouse grab. With an Italian keyboard
-use `make run-gui KEYMAP=it`, or type `loadkeys it` in SecOS (before or after
-`startgui`). The debugcon log goes to `secos-gui.log`. The window also has an
-e1000 NIC with host port `GUI_SSH_PORT` (default 2222) forwarded to the guest's
-sshd, so with a baked key you can log in over SSH while the GUI runs:
+pointer follows the host cursor without a mouse grab. The debugcon log goes to
+`secos-gui.log`. The window also has an e1000 NIC with host port
+`GUI_SSH_PORT` (default 2222) forwarded to the guest's sshd, so with a baked
+key you can log in over SSH while the GUI runs.
 
-    make run-gui KEYMAP=it SSH_AUTHORIZED_KEYS=~/.ssh/id_ed25519.pub GUI_AUTOSTART=1
+Quick start:
+
+    make run-gui SSH_AUTHORIZED_KEYS=~/.ssh/id_ed25519.pub GUI_AUTOSTART=1
+    # in SecOS, once:  loadkeys it      (Italian keyboard; saved, see below)
     ssh -p 2222 root@localhost
+
+`make run-gui` boots from the persistent system disk `secos-root.img`
+(created on the first run, never overwritten by a build; details in
+[docs/devlog/M41-persistent-root.md](devlog/M41-persistent-root.md)). What you
+change in SecOS stays: files in `/root` and `/home`, `/etc` edits, the SSH host
+key, and the settings below. `make run-gui ROOT=ram` boots without the disk
+(RAMFS root, nothing persists); `make reset-root` deletes the disk and starts
+over.
+
+The keyboard layout: `loadkeys it` switches it and saves `KEYMAP=it` in
+`/etc/vconsole.conf`, which the kernel applies at every boot; `loadkeys -n it`
+switches for this boot only. `make run-gui KEYMAP=it` sets the build default,
+used only while `/etc/vconsole.conf` does not exist.
 
 ### Autostart (opt-in)
 
-`startgui --auto` starts the GUI only when `/etc/gui-autostart` exists, and
-otherwise exits 0 at once. So init can always run it, and the GUI stays off
-until it is enabled:
+The default `/etc/inittab` always has this entry:
 
-- at build time: `make iso GUI_AUTOSTART=1` (same as
-  `CFLAGS_EXTRA=-DSECOS_GUI_AUTOSTART`) creates the file at boot **and** adds
-  this entry to the default `/etc/inittab`:
+    gui:once:/bin/startgui --auto
 
-      gui:once:/bin/startgui --auto
+`startgui --auto` starts the GUI only when GUI-at-boot is on, and otherwise
+exits 0 at once:
 
-- on a persistent root, whose `/etc/inittab` is kept as it is: add that line
-  to `/etc/inittab` and `touch /etc/gui-autostart`.
+- `/etc/gui-autostart` holds the setting: `echo 1 > /etc/gui-autostart` turns
+  it on, `echo 0 > /etc/gui-autostart` turns it off (also `yes`/`no`,
+  `on`/`off`; an empty file means on). On the persistent root the setting
+  survives reboots and kernel upgrades.
+- Without the file, the build default decides: `make iso GUI_AUTOSTART=1`
+  (same as `CFLAGS_EXTRA=-DSECOS_GUI_AUTOSTART`) turns it on. The kernel
+  passes it as `secos.gui_autostart=1` on `/proc/cmdline`; the default build
+  has `secos.gui_autostart=0`.
+- A persistent root created before this entry existed (its `/etc/inittab` is
+  kept as it is): add the line above to `/etc/inittab` yourself.
 
 init (PID 1) starts it once, after the `sysinit` entries (so after `ifup`),
 next to the console bash; `once` means it is never restarted. Leaving the GUI
@@ -165,7 +185,8 @@ would gain one request naming the object instead of streaming bytes.
 secwm compiles the kernel's own `drivers/keymap.c` (the US and Italian tables)
 into user space. The tables are shared, not copied. secwm reads the console's
 active layout with `ioctl(/dev/console, KDGKBLAYOUT)` at start and again every
-second, so `loadkeys it` works from any terminal, even while the GUI runs.
+second, so `loadkeys it` works from any terminal, even while the GUI runs. The
+choice is saved in `/etc/vconsole.conf` and restored at boot.
 
 Key codes come from evdev and go through `keymap_lookup()` with the
 Shift/AltGr/Caps state. Special keys use xterm sequences that match the

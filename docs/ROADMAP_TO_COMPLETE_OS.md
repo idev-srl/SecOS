@@ -229,7 +229,9 @@ four phases toward "a system that really works"; the actionable checklist is in
 3. **Phase 3 — complete system.** Approved 2026-11-06, in this order:
    1. **Persistent ext4 root by default** for QEMU and the ISO, so users, keys
       and the SSH host key survive a reboot. The ext4 inode-slot reuse fix from
-      `feat/init-pid1` is its prerequisite (done).
+      `feat/init-pid1` is its prerequisite (done). **Done for QEMU in M41**
+      (`docs/devlog/M41-persistent-root.md`); a real-disk installer for the ISO
+      is still open.
    2. **Real multi-user management:** enforce uid/gid and file modes (root
       exempt); `login` with salted, hashed passwords in `/etc/shadow`;
       `useradd`, `passwd`, `su` (sudo optional); a home directory per user; SSH

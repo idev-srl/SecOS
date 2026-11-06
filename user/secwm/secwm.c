@@ -1319,8 +1319,31 @@ static void cleanup(void) {
     if (fb_fd >= 0) close(fb_fd);
 }
 
+/* `--auto` (the init hook): start only when the GUI-at-boot setting is on.
+ * /etc/gui-autostart holds the setting ("1"/"yes"/"on" or "0"/"no"/"off"; an
+ * empty file means on). Without the file the build default decides: the
+ * kernel puts it on /proc/cmdline (secos.gui_autostart=1, make GUI_AUTOSTART=1). */
 static int auto_enabled(void) {
-    return access("/etc/gui-autostart", 0) == 0;
+    char b[256];
+    int fd = open("/etc/gui-autostart", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        int n = (int)read(fd, b, sizeof(b) - 1);
+        close(fd);
+        if (n < 0) n = 0;
+        b[n] = 0;
+        const char* p = b;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == '0' || *p == 'n' || *p == 'N' || *p == 'f' || *p == 'F' ||
+            ((p[0] == 'o' || p[0] == 'O') && (p[1] == 'f' || p[1] == 'F'))) return 0;
+        return 1;
+    }
+    fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    int n = (int)read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    b[n] = 0;
+    return strstr(b, "secos.gui_autostart=1") != NULL;
 }
 
 int main(int argc, char** argv) {

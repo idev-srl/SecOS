@@ -105,6 +105,10 @@ static void spawn_inherit_stdio(process_t* parent, process_t* child){
 int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     extern int vfs_read_all(const char*, void*, size_t);
     if(!path) return -1;
+    // Follow symlinks like execve does: on a persistent root the multi-call
+    // aliases are links (/bin/ls -> busybox); argv[0] keeps the name used.
+    char rp[256];
+    if(path[0]=='/' && vfs_walk(path, rp, sizeof(rp), 1)==0) path = rp;
     int n = vfs_read_all(path, g_spawn_buf, sizeof(g_spawn_buf));
     if(n <= 0) return -1;
     process_t* p = process_create_from_elf_args(g_spawn_buf, (size_t)n, argc, argv);

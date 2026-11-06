@@ -152,13 +152,21 @@ robustness and the paused real-hardware bring-up — see below.
 - [ ] VT switching (several consoles / graphics sessions).
 
 ### Phase 3 — complete system (approved 2026-11-06, in this order)
-1. [ ] **Persistent ext4 root by default** for QEMU (`make run*`) and the ISO: users,
-   keys, `/etc` and the SSH host key survive a reboot. Builds on `make sysdisk-ext4`,
-   `ext2_mount_root` + `/.secosroot` (M23/M33) and the init `/etc/inittab` "install
-   only when absent" rule. **Prerequisite (done):** the ext2/ext4 VFS inode-slot reuse
-   fix from `feat/init-pid1` (a service log fd once wrote into `/etc/passwd`). Open:
-   first-boot provisioning (create + format the root when no marked volume exists),
-   ISO + data-disk layout, host-key generation on first boot, fsck-on-dirty policy.
+1. [x] **Persistent ext4 root by default** for QEMU (`make run*`): users, keys, `/etc`
+   and the SSH host key survive a reboot (M41, `docs/devlog/M41-persistent-root.md`).
+   `secos-root.img` (tools/mkroot.sh, created once, never overwritten; `ROOT=ram`,
+   `make reset-root`), crash-safe journalled metadata_csum ext4 (JBD2 csum v3 writer),
+   `kernel/sysroot.c` refresh policy (manifest + SHA-256, symlinked multi-call names),
+   `/etc/vconsole.conf` + `/etc/gui-autostart` settings, RAMFS fallback for an unusable
+   disk, gate `tools/persist_test.sh`. Still open:
+   - [ ] block-layer flush/FUA at journal commit (virtio `VIRTIO_BLK_T_FLUSH`, AHCI
+         FLUSH CACHE, NVMe Flush) before relying on it across real power cuts;
+   - [ ] the ISO on real hardware: an installer (partition + `mkroot` a real disk) —
+         today a bare-metal boot stays on RAMFS unless a `/.secosroot` disk is present;
+   - [ ] fsck-on-dirty policy (the kernel replays the journal but has no fsck; a disk
+         with the errors flag is refused, repair it with host `e2fsck`);
+   - [ ] extent trees deeper than one level (writes), htree insert without dropping the
+         index (and its csum tails).
 2. [ ] **Real multi-user management.** Model: **the code signature still decides
    *which code* may run; the uid decides *who* may access which files.** This
    **revises the M26 decision** "POSIX metadata stored & exposed, not enforced":

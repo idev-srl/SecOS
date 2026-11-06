@@ -76,8 +76,27 @@ program (`/bin/bash`) and runs under its own manifest.
 
 ## Quick start (QEMU, host port 2222 to guest port 22)
 
+Short version:
+
+```
+ssh-keygen -t ed25519 -f ~/.ssh/secos_ed25519                  # once
+make run-ssh SSH_AUTHORIZED_KEYS=~/.ssh/secos_ed25519.pub       # serial console + sshd
+ssh -i ~/.ssh/secos_ed25519 -p 2222 root@localhost              # from another terminal
+```
+
+`make run-ssh` (like `run-gui`, `run-serial`, ...) boots from the persistent
+system disk `secos-root.img`, created on the first run and never overwritten by
+a build ([docs/devlog/M41-persistent-root.md](devlog/M41-persistent-root.md)).
+The host key Dropbear generates on the first connection is stored there, so the
+fingerprint stays the same across reboots and kernel upgrades, and so do keys
+you add to `authorized_keys` by hand. `SSH_PORT=` picks another host port,
+`ROOT=ram` boots without the disk (new host key every boot), and
+`make reset-root` deletes the disk (and with it the host key).
+
+Step by step:
+
 1. Build with your public key baked in (it is compiled into the kernel and
-   installed as `/root/.ssh/authorized_keys` at boot; never commit a key):
+   added to `/root/.ssh/authorized_keys` at boot; never commit a key):
    ```
    ssh-keygen -t ed25519 -f ~/.ssh/secos_ed25519      # once
    make iso SSH_AUTHORIZED_KEYS=~/.ssh/secos_ed25519.pub
@@ -98,9 +117,10 @@ program (`/bin/bash`) and runs under its own manifest.
    ```
    ssh -i ~/.ssh/secos_ed25519 -p 2222 root@localhost
    ```
-   The host key changes every boot unless the root filesystem is persistent.
-   Add `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` for
-   throwaway VMs, or pin the fingerprint that Dropbear logs.
+   With the persistent root (the `make run*` default) the host key survives
+   reboots. On a RAMFS root (`ROOT=ram`, or an ISO booted without a system
+   disk) it changes every boot: add `-o StrictHostKeyChecking=no
+   -o UserKnownHostsFile=/dev/null` for such throwaway VMs.
 
 The same `kernel.bin` carries the keys on the UEFI path (`make uefi
 SSH_AUTHORIZED_KEYS=...`). Without `SSH_AUTHORIZED_KEYS` there is no
@@ -116,17 +136,20 @@ and drop `-R` from the inittab line. `ifconfig` shows the lease; `ifup` takes a
 new one.
 
 The multi-call binary dispatches on its first argument:
-`dropbearmulti dropbear|dropbearkey|dbclient ...`. The ramfs root has no
-symlinks, so `/bin/dropbear` does not exist. On a persistent ext2/ext4 root you
-can `ln -s dropbearmulti /bin/dropbear`.
+`dropbearmulti dropbear|dropbearkey|dbclient ...`. On the persistent root the
+kernel also installs `/bin/dropbear`, `/bin/dropbearkey` and `/bin/dbclient` as
+symlinks to it; the RAMFS root has no symlinks, so there only `dropbearmulti`
+exists.
 
 ## Installing your key by hand
 
 The baked key (above) is the normal way. Dropbear reads
 `~root/.ssh/authorized_keys`, which is `/root/.ssh/authorized_keys`.
 `dropbear -D <dir>` selects another directory, for example `/etc/dropbear`.
-On a persistent root, the kernel appends the baked block to an existing file
-when it is missing and leaves the other lines alone. To add a key without
+At every boot the kernel appends each baked key line that is missing from the
+file and leaves the other lines alone, so on the persistent root a key you add
+by hand stays, and a key baked into a later build is added next to it. (The
+kernel never removes a key: delete it from the file yourself.) To add a key without
 rebuilding, on the host:
 
 ```
@@ -144,9 +167,8 @@ echo 'ssh-ed25519 AAAA... you@host' > /root/.ssh/authorized_keys
 
 Then connect with `ssh -i ~/.ssh/secos_ed25519 -p 2222 root@localhost ...`.
 
-On the default ramfs root, the key file and the host key live in RAM and are
-lost at reboot. On a persistent ext2/ext4 root (`make sysdisk-ext4`, root
-adopted through `/.secosroot`), both survive.
+On the persistent root (`make run*`, `secos-root.img`) both the key file and
+the host key survive reboots. On a RAMFS root they live in RAM and are lost.
 
 ## Security model
 
