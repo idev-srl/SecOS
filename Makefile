@@ -29,11 +29,15 @@ BUILD_TS := $(shell if [ -n "$$SOURCE_DATE_EPOCH" ]; then date -u -d @$$SOURCE_D
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo NOHASH)
 # Nota: CONFIG_MULTIBOOT e CONFIG_UEFI sono ora definiti in config.h (dual-boot support)
 # [M40] Boot keyboard layout (drivers/keymap.c): `make iso KEYMAP=it`. The code
-# default is "us"; switch at runtime with `loadkeys it|us`.
+# default is "us"; switch at runtime with `loadkeys it|us`, which saves the
+# choice as KEYMAP= in /etc/vconsole.conf. The kernel applies that file at boot,
+# so the build default only matters while the file does not exist.
 KEYMAP ?=
 KEYMAP_DEF := $(if $(KEYMAP),-DSECOS_KEYMAP_DEFAULT='"$(KEYMAP)"',)
-# GUI at boot (opt-in): `make iso GUI_AUTOSTART=1` adds `gui:once:/bin/startgui
-# --auto` to the default /etc/inittab and creates /etc/gui-autostart. Same as
+# GUI at boot (opt-in): `make iso GUI_AUTOSTART=1` makes the GUI start at boot
+# when /etc/gui-autostart does not exist (the kernel passes the default to
+# `startgui --auto`, the default inittab's gui entry, as secos.gui_autostart=1
+# on /proc/cmdline). /etc/gui-autostart ("1"/"0") overrides it. Same as
 # CFLAGS_EXTRA=-DSECOS_GUI_AUTOSTART. The default boot stays the text console.
 GUI_AUTOSTART ?=
 GUI_DEF := $(if $(filter 1 yes y,$(GUI_AUTOSTART)),-DSECOS_GUI_AUTOSTART,)
@@ -681,9 +685,32 @@ sysdisk-ext4-csum: sysroot-stage
 	mkfs.ext4 -q -O has_journal,extent,64bit,metadata_csum -L SECOSROOT -d /tmp/secos_sysroot $(SYSDISK_IMG)
 	@echo "sysdisk-ext4-csum: $(SYSDISK_IMG) (ext4 journal+extents+metadata_csum root)"
 
+# --- [M41] Persistent system disk (default for every run target) ---
+# secos-root.img is a sparse ext4 volume (journal + metadata_csum) carrying the
+# /.secosroot marker, so the kernel mounts it as "/": files, /root/.ssh, the SSH
+# host key, /etc edits and the keyboard layout survive reboots. It is created
+# once (tools/mkroot.sh) when missing and never overwritten by a build; the
+# kernel refreshes the signed programs in /bin from its image at boot and
+# leaves the rest alone (docs/devlog/M41-persistent-root.md).
+#   make run-gui                 boot with the persistent root
+#   make run-gui ROOT=ram        boot without it (RAMFS root, nothing persists)
+#   make reset-root              DELETE the disk and create a fresh one
+# It is attached as virtio-blk ("vda"): the one bus that works on both the
+# MB2/ISO path (i440fx, -boot d so SeaBIOS boots the CD) and the UEFI/q35 path.
+ROOT      ?= disk
+ROOT_IMG  ?= secos-root.img
+ROOT_SIZE ?= 1G
+ROOT_DRIVE := $(if $(filter ram,$(ROOT)),,-drive file=$(ROOT_IMG),if=virtio,format=raw)
+ROOT_DEP   := $(if $(filter ram,$(ROOT)),,root-img)
+.PHONY: root-img reset-root
+root-img:
+	@bash tools/mkroot.sh $(ROOT_IMG) $(ROOT_SIZE)
+reset-root:
+	@bash tools/mkroot.sh --reset $(ROOT_IMG) $(ROOT_SIZE)
+
 # Run with QEMU (graphical window — needs a working display backend)
-run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -debugcon stdio -global isa-debugcon.iobase=0xe9
+run: iso $(ROOT_DEP)
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -debugcon stdio -global isa-debugcon.iobase=0xe9
 
 # Run headless with a virtio-blk disk attached (debugcon to stdio).
 .PHONY: run-disk
@@ -694,36 +721,38 @@ run-disk: iso
 # Headless: interact with the shell entirely in this terminal over COM1.
 # No GUI/VNC needed (works where WSLg/GTK does not). Ctrl-A X to quit QEMU.
 .PHONY: run-serial
-run-serial: iso
-	qemu-system-x86_64 -cdrom $(ISO) -serial stdio -display none -no-reboot
+run-serial: iso $(ROOT_DEP)
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -serial stdio -display none -no-reboot
 
-# Serial console + an e1000 NIC with host port 2222 forwarded to guest :22, for
-# the Dropbear SSH server (docs/SSH.md). -cpu max gives the guest RDRAND/RDSEED
-# for the kernel RNG.
+# Serial console + an e1000 NIC with host port SSH_PORT (default 2222) forwarded
+# to guest :22, for the Dropbear SSH server (docs/SSH.md). -cpu max gives the
+# guest RDRAND/RDSEED for the kernel RNG.
+SSH_PORT ?= 2222
 .PHONY: run-ssh
-run-ssh: iso
-	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -cpu max -serial stdio -display none -no-reboot \
-		-netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0
+run-ssh: iso $(ROOT_DEP)
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -m 512M -cpu max -serial stdio -display none -no-reboot \
+		-netdev user,id=n0,hostfwd=tcp::$(SSH_PORT)-:22 -device e1000,netdev=n0
 
 # Graphical UI in a GTK window (docs/GUI.md): PS/2 keyboard + a USB tablet, so
 # the guest pointer follows the host cursor without a mouse grab. Type
 # `startgui` at the bash prompt; Ctrl+Alt+Backspace leaves the GUI. Italian
-# keyboard: `make run-gui KEYMAP=it` (or `loadkeys it` in SecOS). Debugcon
-# (kernel log + GUI markers) goes to secos-gui.log. An e1000 NIC forwards host
-# port GUI_SSH_PORT (default 2222) to the guest's sshd (docs/SSH.md):
+# keyboard: `make run-gui KEYMAP=it` (or `loadkeys it` in SecOS, which is saved
+# on the persistent root). Debugcon (kernel log + GUI markers) goes to
+# secos-gui.log. An e1000 NIC forwards host port GUI_SSH_PORT (default 2222) to
+# the guest's sshd (docs/SSH.md):
 #   make run-gui KEYMAP=it SSH_AUTHORIZED_KEYS=~/.ssh/id_ed25519.pub GUI_AUTOSTART=1
 GUI_SSH_PORT ?= 2222
 .PHONY: run-gui
-run-gui: iso
-	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -cpu max -display gtk \
+run-gui: iso $(ROOT_DEP)
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -m 512M -cpu max -display gtk \
 		-device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 \
 		-netdev user,id=n0,hostfwd=tcp::$(GUI_SSH_PORT)-:22 -device e1000,netdev=n0 \
 		-debugcon file:secos-gui.log -global isa-debugcon.iobase=0xe9
 
 # Run with a VNC server on :0 (connect a VNC viewer to localhost:5900)
 .PHONY: run-vnc
-run-vnc: iso
-	qemu-system-x86_64 -cdrom $(ISO) -display vnc=:0 -debugcon stdio -global isa-debugcon.iobase=0xe9
+run-vnc: iso $(ROOT_DEP)
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -display vnc=:0 -debugcon stdio -global isa-debugcon.iobase=0xe9
 
 # Clean generated files
 clean:
@@ -813,7 +842,9 @@ data-vmdk: disk-fat32
 	@echo "✅ data.vmdk (FAT32) — attach in VMware as a SATA disk; mounts at /mnt"
 
 # Boot the built image locally in QEMU+OVMF (sanity check before real hardware).
-run-uefi-disk: uefi-disk
+# The persistent root (ROOT_DRIVE, virtio "vda") is attached here too; OVMF
+# ignores it (no ESP) and boots secos-uefi.img. ROOT=ram leaves it out.
+run-uefi-disk: uefi-disk $(ROOT_DEP)
 	qemu-system-x86_64 -machine q35 -m 256M -bios /usr/share/ovmf/OVMF.fd \
-		-drive file=secos-uefi.img,format=raw,if=ide \
+		-drive file=secos-uefi.img,format=raw,if=ide $(ROOT_DRIVE) \
 		-serial stdio -display none -no-reboot
