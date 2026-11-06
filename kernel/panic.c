@@ -26,7 +26,12 @@ char g_dbg_breadcrumb[200] = {0};
 /* [M36] Stack-smashing protection. -fstack-protector-strong inserts a canary on
  * function entry and calls __stack_chk_fail() if it is corrupted on return. The
  * guard is a fixed non-zero value (KASLR would randomize it per boot). A failure
- * means a kernel stack buffer overflowed — unrecoverable, halt loudly. */
+ * means a kernel stack buffer overflowed — unrecoverable, halt loudly.
+ * [M44] Built with -mstack-protector-guard=global so the canary really is this
+ * variable: with -mcmodel=kernel GCC defaults to the TLS slot %gs:0x28, and the
+ * kernel never sets a GS base, so every canary was the byte pattern at linear
+ * address 0x28 — read through the low identity map (physical 0x28, the real-mode
+ * IVT). That silently tied every protected function to the identity map. */
 uintptr_t __stack_chk_guard = 0x9d8f2b1c7e6a4053UL;
 __attribute__((noreturn)) void __stack_chk_fail(void) {
     debugcon_writestring("[M36] *** stack smashing detected (canary) — halting ***\n");

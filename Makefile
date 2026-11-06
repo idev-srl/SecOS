@@ -49,7 +49,7 @@ GUI_DEF := $(if $(filter 1 yes y,$(GUI_AUTOSTART)),-DSECOS_GUI_AUTOSTART,)
 CONSOLE ?= login
 CONSOLE_DEF := $(if $(filter root,$(CONSOLE)),-DSECOS_CONSOLE_ROOT,)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
-		  -fstack-protector-strong $(INCLUDES) \
+		  -fstack-protector-strong -mstack-protector-guard=global $(INCLUDES) \
 		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(GUI_DEF) $(CONSOLE_DEF) $(CFLAGS_EXTRA)
 # Header dependency tracking: every kernel object also depends on the headers it
 # includes (gcc writes foo.d next to foo.o). Without it, changing only a header
