@@ -756,3 +756,116 @@ void pmm_print_stats(void) {
     terminal_writestring("     PMM metadata:   "); pmm_dec(pmm_get_meta_bytes() >> 10); terminal_writestring(" KB\n");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 }
+
+// ------------------------------------------------------------- selftest ----
+
+// Claim the highest free frame in RAM (selftest: touch the top of the map).
+static int64_t alloc_top_nolock(void) {
+    for (uint64_t si = g_nsec; si-- > 0; ) {
+        pmm_section_t* s = g_sec[si];
+        if (!s || s->free == 0) continue;
+        for (uint64_t w = PMM_SECTION_WORDS; w-- > 0; ) {
+            if (s->bitmap[w] == ~0ULL) continue;
+            uint64_t f = (w << 6) + 63 - (uint64_t)__builtin_clzll(~s->bitmap[w]);
+            sec_mark(s, f, f + 1, 1);
+            g_free_frames--;
+            return (int64_t)((si << PMM_SECTION_SHIFT) + f);
+        }
+    }
+    return -1;
+}
+
+static void st_dec(uint64_t v) { char b[32]; itoa_dec(v, b); debugcon_writestring(b); }
+
+// [M49] Big-memory self-test (boot, cheap): allocate one frame in up to 64
+// RAM sections spread over the whole map (always including the highest one),
+// write a frame-specific pattern through the physmap into every one BEFORE
+// verifying any (so aliasing between distant frames is caught), then check the
+// DMA32 paths, the zone preference, COW refcounts and that the free count is
+// restored. Logs "[BIGMEM] ..." lines; returns 0 on success.
+int pmm_selftest(void) {
+    if (!g_sectioned) return -1;
+    enum { NS = 65 };
+    uint64_t frames[NS]; int n = 0;
+    int fail = 0;
+    uint64_t chunks0 = g_ref_chunks;
+    uint64_t free0 = g_free_frames;
+
+    // 1. Sample sections: indices of present sections, evenly spread.
+    uint64_t npresent = 0, last = 0;
+    for (uint64_t si = 0; si < g_nsec; si++) if (g_sec[si]) { npresent++; last = si; }
+    uint64_t step = npresent > 64 ? npresent / 64 : 1, k = 0;
+    uint64_t fl = spin_lock_irqsave(&pmm_lock);
+    for (uint64_t si = 0; si < g_nsec && n < NS - 1; si++) {
+        if (!g_sec[si]) continue;
+        if ((k++ % step) != 0 && si != last) continue;
+        int64_t f = alloc_in(si, si + 1, ~0ULL, NULL);
+        if (f >= 0) frames[n++] = (uint64_t)f;
+    }
+    {   // plus the highest free frame of all RAM
+        int64_t f = alloc_top_nolock();
+        if (f >= 0) frames[n++] = (uint64_t)f;
+    }
+    spin_unlock_irqrestore(&pmm_lock, fl);
+    uint64_t highest = 0;
+    for (int i = 0; i < n; i++) {
+        volatile uint64_t* p = (volatile uint64_t*)phys_to_virt(frames[i] * PMM_FRAME_SIZE);
+        for (int w = 0; w < 512; w++) p[w] = (frames[i] << 12) ^ ((uint64_t)w * 0x9E3779B97F4A7C15ULL);
+        if (frames[i] > highest) highest = frames[i];
+    }
+    int bad = 0;
+    for (int i = 0; i < n; i++) {
+        volatile uint64_t* p = (volatile uint64_t*)phys_to_virt(frames[i] * PMM_FRAME_SIZE);
+        for (int w = 0; w < 512; w++)
+            if (p[w] != ((frames[i] << 12) ^ ((uint64_t)w * 0x9E3779B97F4A7C15ULL))) { bad++; break; }
+    }
+    debugcon_writestring("[BIGMEM] touched="); st_dec((uint64_t)n);
+    debugcon_writestring(" sections="); st_dec(npresent);
+    debugcon_writestring(" highest_frame_MiB="); st_dec((highest * PMM_FRAME_SIZE) >> 20);
+    debugcon_writestring(bad ? " pattern FAIL\n" : " pattern OK\n");
+    if (bad || n == 0 || (highest >> PMM_SECTION_SHIFT) != last) fail = 1;
+
+    // 2. Zones: an ordinary frame comes from >= 4 GiB when such RAM is free;
+    //    pmm_alloc_below / pmm_alloc_contiguous_below stay under the limit.
+    int have_normal = 0;
+    for (uint64_t si = PMM_DMA32_LIMIT >> 30; si < g_nsec; si++)
+        if (g_sec[si] && g_sec[si]->free) { have_normal = 1; break; }
+    uint64_t a = (uint64_t)pmm_alloc_frame();
+    uint64_t b = (uint64_t)pmm_alloc_below(PMM_DMA32_LIMIT);
+    uint64_t c = (uint64_t)pmm_alloc_contiguous_below(16, PMM_DMA32_LIMIT);
+    int zone_ok = a && b && c && b + PMM_FRAME_SIZE <= PMM_DMA32_LIMIT &&
+                  c + 16 * PMM_FRAME_SIZE <= PMM_DMA32_LIMIT &&
+                  (!have_normal || a >= PMM_DMA32_LIMIT);
+    debugcon_writestring("[BIGMEM] zones: normal="); debugcon_print_hex(a);
+    debugcon_writestring(" dma32="); debugcon_print_hex(b);
+    debugcon_writestring(" dma32x16="); debugcon_print_hex(c);
+    debugcon_writestring(zone_ok ? " OK\n" : " FAIL\n");
+    if (!zone_ok) fail = 1;
+
+    // 3. COW refcount on the highest sampled frame (lazy chunk allocation).
+    void* hf = (void*)(highest * PMM_FRAME_SIZE);
+    int refs_ok = n > 0 && !pmm_frame_shared(hf) && pmm_share_frame(hf) == 0 &&
+                  pmm_frame_shared(hf) && pmm_unref_frame(hf) == 1 &&
+                  !pmm_frame_shared(hf) && pmm_unref_frame(hf) == 0;
+    debugcon_writestring(refs_ok ? "[BIGMEM] refcount OK\n" : "[BIGMEM] refcount FAIL\n");
+    if (!refs_ok) fail = 1;
+
+    // 4. Free everything; the free count must come back (minus new ref chunks).
+    if (a) pmm_free_frame((void*)a);
+    if (b) pmm_free_frame((void*)b);
+    if (c) pmm_free_contiguous((void*)c, 16);
+    for (int i = 0; i < n; i++) pmm_free_frame((void*)(frames[i] * PMM_FRAME_SIZE));
+    uint64_t expect = free0 - (g_ref_chunks - chunks0);
+    int free_ok = (g_free_frames == expect) &&
+                  pmm_get_free_memory() <= pmm_get_total_memory() &&
+                  pmm_get_used_memory() + pmm_get_free_memory() == pmm_get_total_memory();
+    debugcon_writestring("[BIGMEM] meminfo total_MiB="); st_dec(pmm_get_total_memory() >> 20);
+    debugcon_writestring(" free_MiB="); st_dec(pmm_get_free_memory() >> 20);
+    debugcon_writestring(" dma32_free_MiB="); st_dec((pmm_free_frames_below(PMM_DMA32_LIMIT) * PMM_FRAME_SIZE) >> 20);
+    debugcon_writestring(" meta_KiB="); st_dec(pmm_get_meta_bytes() >> 10);
+    debugcon_writestring(free_ok ? " OK\n" : " FAIL\n");
+    if (!free_ok) fail = 1;
+
+    debugcon_writestring(fail ? "[BIGMEM] selftest FAIL\n" : "[BIGMEM] selftest PASS\n");
+    return fail ? -1 : 0;
+}

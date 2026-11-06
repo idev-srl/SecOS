@@ -1752,6 +1752,28 @@ static void kernel_main_phase2(void) {
                                 : "[HEAP] FAIL: large kmalloc(64K)\n");
     }
 
+    // [M49] Big-memory checks: the sectioned PMM (frames across the whole map,
+    // zones, refcounts, meminfo), a multi-MiB kmalloc (contiguous frames,
+    // possibly far above 4 GiB) and the physmap leaf audit (supervisor + NX).
+    {
+        pmm_selftest();
+        extern void* kmalloc(size_t); extern void kfree(void*);
+        size_t big = 4u << 20;
+        uint8_t* p = (uint8_t*)kmalloc(big);
+        int ok = (p != 0);
+        if (ok) {
+            for (size_t i = 0; i < big; i += 4096) p[i] = (uint8_t)(i >> 12);
+            p[big - 1] = 0x5A;
+            for (size_t i = 0; i < big && ok; i += 4096) if (p[i] != (uint8_t)(i >> 12)) ok = 0;
+            if (p[big - 1] != 0x5A) ok = 0;
+            debugcon_writestring("[HEAP] kmalloc(4M) phys=");
+            debugcon_print_hex(kvirt_to_phys((uint64_t)(uintptr_t)p));
+            kfree(p);
+        }
+        debugcon_writestring(ok ? " OK\n" : "[HEAP] FAIL: kmalloc(4M)\n");
+        vmm_physmap_audit();
+    }
+
     // Heap hardening selftest: allocation patterns, aligned frees, and the
     // corruption detectors (exercised in a non-panicking expect mode).
     heap_selftest();

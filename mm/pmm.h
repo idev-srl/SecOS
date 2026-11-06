@@ -71,5 +71,7 @@ uint64_t pmm_free_frames_below(uint64_t limit);
 
 // Debug
 void pmm_print_stats(void);
+// [M49] Boot self-test of the sectioned allocator ([BIGMEM] lines); 0 = pass.
+int pmm_selftest(void);
 
 #endif
