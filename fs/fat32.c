@@ -14,6 +14,8 @@
 #include "fat32.h"
 #include "vfs.h"
 #include "block.h"
+#include "heap.h"
+#include "pagecache.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -305,20 +307,67 @@ static int split_parent(const char* path, uint32_t* parent_clus, uint8_t name83[
 }
 
 /* ── VFS inode pool ──────────────────────────────────────────────────────── */
-typedef struct { uint32_t first_cluster; uint32_t size; int is_dir; uint32_t ent_clus; uint32_t ent_off; } fat_node_t;
-#define FAT_INODES 32
-static vfs_inode_t g_inodes[FAT_INODES];
-static fat_node_t  g_nodes[FAT_INODES];
-static int         g_inode_used;
+/* One VFS inode per directory entry, keyed by the entry's location (cluster +
+ * byte offset; the root, which has no entry, is (0,0)) and never recycled
+ * while mounted. An open fd keeps its vfs_inode_t* (the VFS has no refcount)
+ * and the page cache is keyed by that pointer. The old fixed pool of 32
+ * path-keyed slots handed its last slot to every further file, so an fd was
+ * silently re-pointed at another file and the cache served the previous
+ * file's bytes; "/a.txt" and "/A.TXT" (one FAT file) also got two slots with
+ * two incoherent caches. Slots come in kmalloc'd chunks, like fs/ext2.c (M40)
+ * and fs/exfat.c (M41); a remount reuses the chunks (the VFS drops this FS's
+ * cached pages on every mount). The slot of an unlinked or replaced entry is
+ * marked dead: reads return EOF and writes fail instead of landing in a
+ * directory slot that a new file may reuse. */
+typedef struct { uint32_t first_cluster; uint32_t size; int is_dir; uint32_t ent_clus; uint32_t ent_off; int dead; } fat_node_t;
+typedef struct { vfs_inode_t v; fat_node_t n; } fat_vslot_t;
+#define FAT_VCHUNK      64
+#define FAT_VCHUNKS_MAX 512                /* 32768 entries looked up per mount */
+static fat_vslot_t* g_vchunk[FAT_VCHUNKS_MAX];
+static int          g_inode_used;
 
-static vfs_inode_t* inode_alloc(const char* path){
-    /* reuse by path */
-    for(int i=0;i<g_inode_used;i++){ const char* a=g_inodes[i].path; size_t k=0; int eq=1; while(a[k]||path[k]){ if(a[k]!=path[k]){eq=0;break;} k++; } if(eq) return &g_inodes[i]; }
-    int idx = (g_inode_used<FAT_INODES) ? g_inode_used++ : (g_inode_used-1); /* clobber last if full */
-    vfs_inode_t* ino = &g_inodes[idx];
+static fat_vslot_t* fvslot(int i){ return &g_vchunk[i/FAT_VCHUNK][i%FAT_VCHUNK]; }
+static fat_vslot_t* fvslot_find(uint32_t ec, uint32_t eo){
+    for(int i=0;i<g_inode_used;i++){ fat_vslot_t* s=fvslot(i); if(!s->n.dead && s->n.ent_clus==ec && s->n.ent_off==eo) return s; }
+    return NULL;
+}
+static vfs_inode_t* inode_get(const char* path, uint32_t ec, uint32_t eo){
+    fat_vslot_t* s = fvslot_find(ec, eo);
+    if(!s){
+        int idx = g_inode_used;
+        if(idx/FAT_VCHUNK >= FAT_VCHUNKS_MAX) return NULL;
+        if(!g_vchunk[idx/FAT_VCHUNK]){
+            g_vchunk[idx/FAT_VCHUNK] = (fat_vslot_t*)kmalloc(sizeof(fat_vslot_t)*FAT_VCHUNK);
+            if(!g_vchunk[idx/FAT_VCHUNK]) return NULL;
+        }
+        s = fvslot(idx);
+        uint8_t* z=(uint8_t*)s; for(size_t i=0;i<sizeof(*s);i++) z[i]=0;
+        g_inode_used++;
+        pagecache_invalidate(&s->v, 0, 1ULL<<62);   /* left over from an earlier mount */
+        s->n.ent_clus=ec; s->n.ent_off=eo;
+        s->v.fs_data=&s->n;
+    }
+    vfs_inode_t* ino = &s->v;
     size_t k=0; for(; path[k] && k<sizeof(ino->path)-1; k++) ino->path[k]=path[k]; ino->path[k]=0;
-    ino->fs_data = &g_nodes[idx];
     return ino;
+}
+/* st_ino: the entry location (unique on the volume, stable across remounts
+ * until a rename moves the entry); the root, which has no entry, is 1. */
+static uint64_t fat_ino_of(uint32_t ec, uint32_t eo){ return ec ? (((uint64_t)ec << 16) | (eo >> 5)) : 1; }
+/* The entry at (ec,eo) is gone (unlink, or the target of a rename). */
+static void inode_kill(uint32_t ec, uint32_t eo){
+    fat_vslot_t* s = fvslot_find(ec, eo);
+    if(!s) return;
+    s->n.dead=1; s->n.first_cluster=0; s->n.size=0; s->v.size=0;
+    pagecache_invalidate(&s->v, 0, 1ULL<<62);
+}
+/* The entry moved from (oc,oo) to (nc,no), now named `newp` (rename): an fd
+ * open on it keeps following the file. */
+static void inode_move(uint32_t oc, uint32_t oo, uint32_t nc, uint32_t no, const char* newp){
+    fat_vslot_t* s = fvslot_find(oc, oo);
+    if(!s) return;
+    s->n.ent_clus=nc; s->n.ent_off=no; s->v.ino=fat_ino_of(nc, no);
+    size_t k=0; for(; newp[k] && k<sizeof(s->v.path)-1; k++) s->v.path[k]=newp[k]; s->v.path[k]=0;
 }
 
 /* ── File read ───────────────────────────────────────────────────────────── */
@@ -413,12 +462,15 @@ static vfs_inode_t* fat32_lookup(const char* path){
     if(!g_mounted) return NULL;
     uint32_t fc, sz; int isd; dent_loc_t loc; loc.clus=0; loc.off=0;
     if(path_resolve(path, &fc, &sz, &isd, &loc)!=0) return NULL;
-    vfs_inode_t* ino = inode_alloc(path && path[0] ? path : "/");
+    vfs_inode_t* ino = inode_get(path && path[0] ? path : "/", loc.clus, loc.clus ? loc.off : 0);
     if(!ino) return NULL;
     ino->type = isd ? VFS_NODE_DIR : VFS_NODE_FILE;
     ino->size = sz;
     fat_node_t* nd = (fat_node_t*)ino->fs_data;
-    nd->first_cluster=fc; nd->size=sz; nd->is_dir=isd; nd->ent_clus=loc.clus; nd->ent_off=loc.off;
+    /* a different chain behind the same entry: the cached pages are not its */
+    if(nd->first_cluster && nd->first_cluster!=fc) pagecache_invalidate(ino, 0, 1ULL<<62);
+    nd->first_cluster=fc; nd->size=sz; nd->is_dir=isd;
+    ino->ino = fat_ino_of(loc.clus, loc.off);
     ino->mode = 0; ino->nlink = 1; ino->uid = ino->gid = 0;
     ino->atime = ino->mtime = ino->ctime = 0;
     if(loc.clus){                                  /* root has no entry: times stay 0 */
@@ -475,6 +527,7 @@ static int fat32_read(vfs_inode_t* ino, size_t off, void* buf, size_t len){
 static int fat32_write(vfs_inode_t* ino, size_t off, const void* data, size_t len){
     if(!g_mounted || !ino || ino->type!=VFS_NODE_FILE) return -1;
     fat_node_t* nd = (fat_node_t*)ino->fs_data;
+    if(nd->dead) return -1;                 /* unlinked: its entry slot may be reused */
     int r = fat_write_file(nd, off, data, len);
     if(r>=0) ino->size = nd->size;
     return r;
@@ -496,7 +549,7 @@ static int fat32_create(const char* path, const void* initial, size_t size){
     fat_stamp(loc.raw, 1);
     if(dent_write_back(&loc)!=0) return -1;
     if(initial && size>0){
-        fat_node_t nd; nd.first_cluster=0; nd.size=0; nd.is_dir=0; nd.ent_clus=ec; nd.ent_off=eo;
+        fat_node_t nd; nd.first_cluster=0; nd.size=0; nd.is_dir=0; nd.ent_clus=ec; nd.ent_off=eo; nd.dead=0;
         if(fat_write_file(&nd, 0, initial, size)<0) return -1;
     }
     return 0;
@@ -536,6 +589,7 @@ static int fat32_remove(const char* path){
     if(loc.clus==0) return -1; /* cannot remove root */
     if(fc>=2) fat_free_chain(fc);
     loc.raw[0]=DENT_FREE;
+    inode_kill(loc.clus, loc.off);
     return dent_write_back(&loc);
 }
 
@@ -590,6 +644,7 @@ static int fat32_rename(const char* oldp, const char* newp){
         if(tl.clus==0) return -1;
         if(tfc>=2 && tfc!=fc) fat_free_chain(tfc);
         tl.raw[0]=DENT_FREE;
+        inode_kill(tl.clus, tl.off);
         if(dent_write_back(&tl)!=0) return -1;
     }
     uint32_t ec,eo; if(dir_alloc_slot(parent,&ec,&eo)!=0) return -1;
@@ -599,6 +654,7 @@ static int fat32_rename(const char* oldp, const char* newp){
     if(dent_write_back(&nl)!=0) return -1;
     loc.raw[0]=DENT_FREE;
     if(dent_write_back(&loc)!=0) return -1;
+    inode_move(loc.clus, loc.off, ec, eo, newp);
     if(isd && fc>=2 && parent!=oparent){                        /* fix ".." */
         if(sec_read(clus_lba(fc), g_sec)!=0) return -1;
         uint8_t* dd=g_sec+32;
@@ -656,6 +712,9 @@ static vfs_fs_ops_t fat32_ops = {
 int fat32_mount(const char* dev_name, const char* mount_point){
     block_dev_t* dev = block_find(dev_name);
     if(!dev) return -1;
+    // One FAT32 volume at a time (the driver state is global): a second mount
+    // would re-point the attached volume's g_dev, geometry and inode pool.
+    if(vfs_mount_point_of(&fat32_ops)) return -1;
     // Probe into locals: a rejected device must not clobber the geometry (or
     // g_dev) of a volume that is already mounted.
     static uint8_t bs[SECSZ];

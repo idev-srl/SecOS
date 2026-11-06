@@ -21,6 +21,7 @@
 #include "block.h"
 #include "debugcon.h"
 #include "heap.h"
+#include "pagecache.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -400,8 +401,10 @@ static uint32_t alloc_inode(int is_dir){
     }
     return 0;
 }
+static void vslot_drop_cache(uint32_t ino);
 static void free_inode(uint32_t ino, int is_dir){
     if(ino==0) return;
+    vslot_drop_cache(ino);   /* the number (and its VFS slot) may go to a new file */
     uint32_t g=(ino-1)/g_inodes_per_group, i=(ino-1)%g_inodes_per_group;
     uint32_t bmp=gd_inode_bitmap(g); if(!bmp) return;
     if(blk_read(bmp,g_xb)!=0) return;
@@ -847,6 +850,14 @@ static e2_vslot_t* vslot_find(uint32_t ino){
     return NULL;
 }
 
+/* An on-disk inode was freed: a later file that gets the same number shares
+ * its VFS slot, so the old file's cached pages must go now (kernel-internal
+ * vfs_remove callers don't invalidate before removing). */
+static void vslot_drop_cache(uint32_t ino){
+    e2_vslot_t* s=vslot_find(ino);
+    if(s) pagecache_invalidate(&s->v, 0, 1ULL<<62);
+}
+
 static vfs_inode_t* vino_alloc(const char* path){
     int idx=g_vused;
     if(idx/E2_VCHUNK >= E2_VCHUNKS_MAX){ debugcon_writestring("[EXT2] VFS inode pool full\n"); return NULL; }
@@ -917,7 +928,7 @@ static vfs_inode_t* e2_lookup(const char* path){
     if(v){ const char* np=path&&path[0]?path:"/"; size_t k=0; for(; np[k] && k<sizeof(v->path)-1; k++) v->path[k]=np[k]; v->path[k]=0; }
     else v=vino_alloc(path&&path[0]?path:"/");
     if(!v) return NULL;
-    v->type=isd?VFS_NODE_DIR:VFS_NODE_FILE; v->size=sz;
+    v->type=isd?VFS_NODE_DIR:VFS_NODE_FILE; v->size=sz; v->ino=ino;
     // [M26] Populate POSIX metadata from the on-disk inode (standard ext2 layout:
     // i_mode@0, i_uid@2, i_atime@8, i_ctime@12, i_mtime@16, i_gid@24, i_links@26).
     uint8_t in[256];

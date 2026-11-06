@@ -30,6 +30,8 @@ typedef struct vfs_inode {
     uint32_t uid, gid;         // owner / group
     uint64_t atime, mtime, ctime; // unix seconds
     uint32_t nlink;            // hard-link count
+    uint64_t ino;              // st_ino: unique on its mount, stable where the FS
+                               // has a stable id (0 = none: the VFS derives one)
 } vfs_inode_t;
 
 // [M26] Attribute-change request for setattr (chmod/chown/utimes). Only the
@@ -115,6 +117,7 @@ typedef struct vfs_mount {
     const char* mount_point;      // e.g. "/"
     const vfs_fs_ops_t* ops;      // operations
     const char* fs_name;          // human label
+    uint64_t dev;                 // st_dev of every file on this mount
 } vfs_mount_t;
 
 // Initialize VFS (empty, no mounts)
@@ -179,3 +182,7 @@ int vfs_symlink(const char* target, const char* linkpath);
 int vfs_mount_count(void);
 int vfs_mount_info(int i, const char** mount_point, const char** fs_name);
 const vfs_fs_ops_t* vfs_mount_ops_at(int i);
+// st_dev of the mount behind `ops` (0 = not mounted), and the dev_t a block
+// device name maps to ("vda" -> 253:0, "sdb1" -> 8:17, ...).
+uint64_t vfs_dev_of_ops(const vfs_fs_ops_t* ops);
+uint64_t vfs_blkdev_id(const char* name);

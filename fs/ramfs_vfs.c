@@ -7,6 +7,7 @@
  */
 #include "vfs.h"
 #include "ramfs.h"
+#include "pagecache.h"
 #include <stddef.h>
 
 // Simple inode cache: build on lookup; no eviction.
@@ -24,6 +25,10 @@ static void cache_fix_after_remove(const ramfs_entry_t* gone){
     for(size_t i=0;i<inode_cache_used;i++){
         if(inode_cache[i].fs_data==(const void*)gone){
             inode_cache[i].fs_data=NULL; inode_cache[i].path[0]='?'; inode_cache[i].path[1]=0;
+            // A dead inode is recycled for the next file once the cache is
+            // full; its cached pages must not become that file's contents.
+            // (Kernel-internal vfs_remove callers don't invalidate first.)
+            pagecache_invalidate(&inode_cache[i], 0, 1ULL<<62);
         }
     }
 }

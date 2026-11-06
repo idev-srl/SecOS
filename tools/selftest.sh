@@ -2052,6 +2052,78 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# ============================================================================
+# MOUNT HARDENING GATE (fix/mount-hardening). Three bugs found by the M41 exFAT
+# work, all outside its driver:
+# (1) vfs_mount() stored the caller's mount-point pointer — a kernel-stack copy
+#     for SYS_MOUNT — so a userland `mount -t vfat|ext2` left a dangling entry
+#     (/proc/mounts garbage; a garbage mount point could shadow /bin). The VFS
+#     now owns the string. Also: a second fat32/ext2 instance is refused (it
+#     hijacked the attached one) and umount is -EBUSY while a file is open.
+# (2) fat32 page-cache staleness on inode-slot reuse (remount, >32 names,
+#     "f9" vs "F9" aliases); the VFS also drops an FS's pages on (un)mount.
+# (3) st_dev was one constant: per-mount ids now (block-backed = Linux dev_t).
+# One -DSECOS_HEAP_DEBUG run on q35/AHCI: vfat sda (boot /mnt), ext2 sdb,
+# exFAT sdc. BusyBox over the serial bash; heapcheck from the recovery shell.
+# ============================================================================
+MHLOG=/tmp/secos_selftest_mnt.log
+MHSER=/tmp/secos_selftest_mnt.ser
+echo "[selftest] Building mount-hardening disks + SECOS_HEAP_DEBUG image..."
+make clean >/dev/null 2>&1 || true
+MHD=mnt_hardening_disks; rm -rf "$MHD"; mkdir -p "$MHD/stage"
+printf 'hello from disk\n' > "$MHD/stage/hello.txt"
+if dd if=/dev/zero of="$MHD/fat.img" bs=1M count=64 status=none && mkfs.fat -F 32 -n SECOSDATA "$MHD/fat.img" >/dev/null \
+   && mcopy -i "$MHD/fat.img" "$MHD/stage/hello.txt" ::HELLO.TXT \
+   && dd if=/dev/zero of="$MHD/ext2.img" bs=1M count=64 status=none && mkfs.ext2 -q -L SECOSEXT -d "$MHD/stage" "$MHD/ext2.img" \
+   && bash tools/exfat-host.sh mkgood "$MHD/exfat.img" >/tmp/secos_selftest_mnt_disk.log 2>&1 \
+   && make iso CFLAGS_EXTRA=-DSECOS_HEAP_DEBUG >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] Running mount-hardening gate (q35, 3 SATA disks, serial bash, 200s)..."
+    : > "$MHLOG"
+    ( sleep 30
+      printf '  echo MH1-$(stat -c %%d /)-$(stat -c %%d /mnt)-$(stat -c %%d /proc)\r'; sleep 3
+      printf '  df /mnt | tail -1 | sed s/^/MH2-/\r'; sleep 3
+      printf '  mkdir -p /mnt/SUB /x /y /z /w && mount -t ext2 /dev/sdb /mnt/SUB && echo MH3-$(find /mnt -xdev | grep -ic hello)-$(find /mnt | grep -ic hello)-$(stat -c %%d /mnt/SUB)-$(df /mnt/SUB | tail -1 | cut -d" " -f1); umount /mnt/SUB\r'; sleep 6
+      printf '  umount /mnt; echo MH4-$?\r'; sleep 3
+      printf '  ok=0; for i in $(seq 50); do mount -t vfat /dev/sda /x; mount -t ext2 /dev/sdb /y; mount -t exfat /dev/sdc /z; m=$(cat /proc/mounts); case "$m" in *"/dev/sda /x vfat "*"/dev/sdb /y ext2 "*"/dev/sdc /z exfat "*) ok=$((ok+1));; esac; umount /x; umount /y; umount /z; case "$(cat /proc/mounts)" in *" /x "*|*" /y "*|*" /z "*) ok=$((ok-100));; esac; done; echo MH5-$ok-$(grep -vc "^[a-z/]* /[a-z]* [a-z0-9]* rw" /proc/mounts)\r'; sleep 45
+      printf '  mount -t vfat /dev/sda /x && for i in $(seq 40); do echo content-$i > /x/f$i; done; bad=0; for i in $(seq 40); do [ "$(cat /x/f$i)" = "content-$i" ] || bad=$((bad+1)); done; echo MH6-$bad\r'; sleep 12
+      printf '  umount /x; mount -t vfat /dev/sda /x; cat /x/f7 >/dev/null; umount /x; mount -t vfat /dev/sda /x; echo MH7-$(cat /x/f8)\r'; sleep 5
+      printf '  cat /x/F9 >/dev/null; echo changed-9 > /x/f9; echo MH8-$(cat /x/F9); umount /x\r'; sleep 4
+      printf '  mount -t ext2 /dev/sdb /y; exec 3</y/hello.txt; umount /y; echo MH9-$?; exec 3<&-; umount /y; echo MH10-$?\r'; sleep 4
+      printf '  mount -t ext2 /dev/sdb /y; mount -t ext2 /dev/sdb /w; echo MH11-$?-$(grep -c " /w " /proc/mounts)-$(cat /y/hello.txt); umount /y\r'; sleep 4
+      printf '  mount -t vfat /dev/sda /x/; echo MH12-$?-$(grep -c "^/dev/sda /x vfat" /proc/mounts); umount /x/; echo MH13-$?\r'; sleep 4
+      printf '  echo MHEND-$(ls /bin | wc -l)\r'; sleep 3
+      printf '  kill -9 1\r'; sleep 6
+      printf '  heapcheck\r'; sleep 4
+    ) | timeout 200 qemu-system-x86_64 -machine q35 -cdrom myos.iso -boot d -m 256M \
+        -drive file="$MHD/fat.img",format=raw,if=ide,index=0 \
+        -drive file="$MHD/ext2.img",format=raw,if=ide,index=1 \
+        -drive file="$MHD/exfat.img",format=raw,if=ide,index=3 \
+        -debugcon file:"$MHLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >"$MHSER" 2>&1
+    tr -d '\r' < "$MHSER" > "$MHSER.txt"; MHSER="$MHSER.txt"
+    # sda = 8:0 = 2048, sdb = 8:16 = 2064 (glibc makedev encoding)
+    read -r mh_r mh_m mh_p <<<"$(grep -a '^MH1-' "$MHSER" | head -1 | tr -d '\r' | cut -d- -f2- | tr - ' ')"
+    [[ -n "$mh_r" && "$mh_m" == "2048" && "$mh_r" != "$mh_m" && "$mh_p" != "$mh_r" && "$mh_p" != "$mh_m" ]]
+    check "MNT st_dev: / , /mnt (sda=8:0) and /proc differ (stat -c %d)" $?
+    grep -aq "^MH2-/dev/sda .* /mnt$" "$MHSER"; check "MNT df /mnt names /dev/sda, not /" $?
+    grep -aq "^MH3-1-2-2064-/dev/sdb$" "$MHSER"; check "MNT find -xdev stops at a nested mount; df/stat see ext2 on sdb" $?
+    grep -aq "^MH5-50-0$" "$MHSER"; check "MNT 50x mount/umount vfat+ext2+exfat from userland: /proc/mounts exact every time" $?
+    grep -aq "^MH6-0$" "$MHSER"; check "MNT fat32: 40 files written then read back (no stale page past the old 32-slot pool)" $?
+    grep -aq "^MH7-content-8$" "$MHSER"; check "MNT fat32: remount does not serve the previous file's cached pages" $?
+    grep -aq "^MH8-changed-9$" "$MHSER"; check "MNT fat32: f9/F9 share one inode (coherent cache)" $?
+    grep -aq "^MH9-1$" "$MHSER" && grep -aq "^MH10-0$" "$MHSER"; check "MNT umount -EBUSY with an open fd, succeeds once closed" $?
+    grep -aq "^MH11-[1-9][0-9]*-0-hello from disk$" "$MHSER"; check "MNT second ext2 mount refused, first one intact" $?
+    grep -aq "^MH12-0-1$" "$MHSER" && grep -aq "^MH13-0$" "$MHSER"; check "MNT mount/umount with a trailing slash" $?
+    grep -aq "^MHEND-[1-9][0-9]" "$MHSER"; check "MNT /bin still intact after the loop" $?
+    grep -aq "\[HEAP\] heapcheck: OK" "$MHLOG" && ! grep -aq "\[HEAP\] CORRUPTION DETECTED" "$MHLOG"
+    check "MNT heap-debug: no heap corruption, heapcheck OK" $?
+    ! grep -aq "\[EXC\]\|\[PANIC\]" "$MHLOG"; check "MNT no CPU exception or panic" $?
+else
+    echo "  [FAIL] mount-hardening image/disk build (see /tmp/secos_selftest_mnt_disk.log, /tmp/secos_selftest_build.log)"
+    FAIL=$((FAIL+1))
+fi
+rm -rf "$MHD"
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

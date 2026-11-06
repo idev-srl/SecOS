@@ -320,6 +320,10 @@ uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
         if (c->fds[fd].is_pipe || c->fds[fd].is_sock) return (uint64_t)-1;  // not a file
         vfs_inode_t* ino = (vfs_inode_t*)c->fds[fd].inode;
         if (!ino) return (uint64_t)-1;
+        // devfs/procfs/sysfs contents are generated and their inode slots are
+        // recycled per lookup: cached pages keyed by such a slot would later be
+        // served as another node's contents. Not mappable (Linux: -ENODEV).
+        if (!ino->ops || (ino->ops->flags & VFS_FS_NOCACHE)) return (uint64_t)(int64_t)-19;
         if (vma_add_file(&c->vmas, base, base + len, m18_prot_to_flags(prot), ino, 0) != 0)
             return (uint64_t)-1;
     }
@@ -705,11 +709,15 @@ static void stat_fill(const vfs_inode_t* ino, struct secos_stat* st){
     st->st_nlink = ino->nlink ? ino->nlink : 1;
     st->st_uid = ino->uid; st->st_gid = ino->gid;
     st->st_atime = ino->atime; st->st_mtime = ino->mtime; st->st_ctime = ino->ctime;
-    // [M39] A stable unique inode id (the inode pointer) so userland tree-walks —
-    // bash's getcwd compares (st_dev,st_ino) up the path — work. st_dev is a
-    // single constant (one logical FS namespace to userland).
-    st->st_dev = 1;
-    st->st_ino = (uint64_t)(uintptr_t)ino;
+    // Per-mount st_dev (the block device's dev_t, or an anonymous 0:N for a
+    // virtual FS), so df <path>, find -xdev, du -x and cp -a can tell mounts
+    // apart; it used to be one constant for every file. st_ino is the FS's own
+    // id where it has one (ext2 inode number, FAT/exFAT entry location), else
+    // the inode pointer — unique, which userland tree-walks (bash's getcwd
+    // compares (st_dev,st_ino) up the path) depend on.
+    st->st_dev = vfs_dev_of_ops(ino->ops);
+    if(!st->st_dev) st->st_dev = 1;
+    st->st_ino = ino->ino ? ino->ino : (uint64_t)(uintptr_t)ino;
     st->st_rdev = 0;
     st->st_blksize = 512;
     st->st_blocks = (int64_t)((ino->size + 511) / 512);
@@ -812,6 +820,12 @@ int ksys_mount(const char* dev, const char* target, const char* fstype){
     // Accept the devfs spelling ("/dev/vda") as well as the bare block name.
     if(dev[0]=='/'&&dev[1]=='d'&&dev[2]=='e'&&dev[3]=='v'&&dev[4]=='/') dev += 5;
     if(!block_find(dev)) return -1;                       // no such device
+    // Normalize the mount point like umount does ("/x/", relative paths), so
+    // the two agree on its spelling. The VFS copies it; `abs` may be a local.
+    char abs[256];
+    proc_resolve_path(sched_get_current(), target, abs, sizeof(abs));
+    if(abs[0]=='/' && abs[1]==0) return -1;               // never over the root
+    target = abs;
     int isfat = str_eq2(fstype,"fat32")||str_eq2(fstype,"vfat");
     int isext = str_eq2(fstype,"ext2")||str_eq2(fstype,"ext4")||str_eq2(fstype,"extN");
     int isexf = str_eq2(fstype,"exfat");
@@ -823,21 +837,52 @@ int ksys_mount(const char* dev, const char* target, const char* fstype){
     return -1;                                            // unknown fstype
 }
 void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
+// Is any process still holding a file of the filesystem behind `ops` (an open
+// fd or a file-backed mapping)? Detaching it would leave that vfs_inode_t*
+// bound to a slot the next mount of the same driver hands to another file.
+struct umount_busy { const vfs_fs_ops_t* ops; int busy; };
+static void umount_busy_cb(process_t* p, void* u){
+    struct umount_busy* b = (struct umount_busy*)u;
+    if(b->busy || p->state == PROC_ZOMBIE) return;
+    for(int i=0;i<32;i++){
+        struct proc_fd_entry* e = &p->fds[i];
+        if(!e->used || e->is_pipe || e->is_sock || !e->inode) continue;
+        if(((const vfs_inode_t*)e->inode)->ops == b->ops){ b->busy = 1; return; }
+    }
+    for(uint32_t i=0;i<p->vmas.count;i++){
+        const vma_t* v = &p->vmas.v[i];
+        if(v->type != VMA_TYPE_NONE && v->file_inode && v->file_inode->ops == b->ops){ b->busy = 1; return; }
+    }
+}
 int ksys_umount(const char* target){
     extern int vfs_unmount(const char*);
     // Normalize like every other path syscall ("/mnt/", "/mnt/.", relative
     // paths, "" -> cwd), so "/" cannot be reached under another spelling.
     char abs[256];
     proc_resolve_path(sched_get_current(), target, abs, sizeof(abs));
-    // Flush the filesystem before detaching it (exFAT clears VolumeDirty here,
-    // ext2/ext4 closes any open transaction), so a umount leaves it clean.
+    const vfs_fs_ops_t* ops = NULL;
     {
         int n = vfs_mount_count();
         for(int i=0;i<n;i++){
             const char* mp=0; const char* fsn=0;
-            if(vfs_mount_info(i,&mp,&fsn)==0 && mp && str_eq2(mp,abs)){ vfs_sync_ops(vfs_mount_ops_at(i)); break; }
+            if(vfs_mount_info(i,&mp,&fsn)==0 && mp && str_eq2(mp,abs)){ ops = vfs_mount_ops_at(i); break; }
         }
     }
+    if(!ops) return -22;                                  // -EINVAL: not a mount point
+    // In use (open fd / file mapping): -EBUSY, like Linux without MNT_DETACH.
+    // An FS mounted twice is still reachable through its other mount point.
+    {
+        int uses = 0, n = vfs_mount_count();
+        for(int i=0;i<n;i++) if(vfs_mount_ops_at(i) == ops) uses++;
+        if(uses == 1){
+            struct umount_busy b = { ops, 0 };
+            process_foreach(umount_busy_cb, &b);
+            if(b.busy) return -16;
+        }
+    }
+    // Flush the filesystem before detaching it (exFAT clears VolumeDirty here,
+    // ext2/ext4 closes any open transaction), so a umount leaves it clean.
+    vfs_sync_ops(ops);
     return vfs_unmount(abs);
 }
 

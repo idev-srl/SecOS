@@ -10,6 +10,7 @@
  */
 #include "vfs.h"
 #include "spinlock.h"
+#include "pagecache.h"
 #include <stddef.h>
 
 #define VFS_MAX_MOUNTS 12   // [M23] root + /mnt + /dev + /proc + /sys + headroom
@@ -24,7 +25,77 @@ static spinlock_t g_mount_lock = SPINLOCK_INIT;
 
 static size_t str_len(const char* s){ size_t n=0; while(s[n]) n++; return n; }
 
-void vfs_init(void){ g_mount_count = 0; for(int i=0;i<VFS_MAX_MOUNTS;i++){ g_mounts[i].mount_point=NULL; g_mounts[i].ops=NULL; g_mounts[i].fs_name=NULL; } }
+// Mount-point strings are owned by the VFS. Callers pass whatever they have:
+// the mount syscall a kernel-stack copy of the user string, the shell its line
+// buffer. That pointer used to be stored verbatim, so a userland
+// `mount -t vfat|ext2 ... /x` left the table entry pointing at dead stack.
+// vfs_mount() now copies the path into one of these slots and vfs_unmount()
+// releases it. The slots are static, never freed memory, so a pointer handed
+// out by vfs_mount_info()/vfs_mount_point_of() stays a valid string even if it
+// races an unmount; it changes only when a later mount reuses the slot.
+#define VFS_MP_MAX 256
+static char    g_mp_store[VFS_MAX_MOUNTS][VFS_MP_MAX];
+static uint8_t g_mp_used[VFS_MAX_MOUNTS];
+
+static char* mp_store_get_nolock(void){
+    for(int i=0;i<VFS_MAX_MOUNTS;i++) if(!g_mp_used[i]){ g_mp_used[i]=1; return g_mp_store[i]; }
+    return NULL;
+}
+static void mp_store_put_nolock(const char* p){
+    for(int i=0;i<VFS_MAX_MOUNTS;i++) if(p==g_mp_store[i]){ g_mp_used[i]=0; return; }
+    // anything else is the root's string literal: nothing to release
+}
+
+// Device ids (st_dev). A block-backed mount gets the Linux dev_t of its device
+// (vda=253:0, sda=8:0, sdb1=8:17, nvme0n1=259:0, ...), stable across boots and
+// equal to what a Linux host would report. A virtual FS (ramfs, procfs, devfs,
+// sysfs) gets an anonymous 0:N, N counted per mount like Linux's anon bdevs.
+// Encoded like glibc makedev(), so major()/minor() in userland decode it.
+static uint64_t g_anon_minor = 16;     // 0:1/0:2 are the console/socket pseudo-devs
+static uint64_t vfs_makedev(uint64_t ma, uint64_t mi){
+    return ((ma & 0xfffULL) << 8) | ((ma & ~0xfffULL) << 32) | (mi & 0xffULL) | ((mi & ~0xffULL) << 12);
+}
+static uint64_t vfs_part_suffix(const char* t, uint64_t* part){
+    uint64_t v = 0;
+    if(!*t){ *part = 0; return 1; }
+    for(; *t; t++){ if(*t<'0' || *t>'9') return 0; v = v*10 + (uint64_t)(*t-'0'); }
+    *part = v; return v < 16;
+}
+uint64_t vfs_blkdev_id(const char* n){
+    if(!n || !n[0]) return 0;
+    uint64_t part = 0;
+    if((n[0]=='v' || n[0]=='s') && n[1]=='d' && n[2]>='a' && n[2]<='z'){
+        uint64_t ma = (n[0]=='v') ? 253 : 8;
+        if(vfs_part_suffix(n+3, &part)) return vfs_makedev(ma, (uint64_t)(n[2]-'a')*16 + part);
+    } else if(n[0]=='n' && n[1]=='v' && n[2]=='m' && n[3]=='e'){
+        // nvme<c>n<ns>[p<k>] -> 259:((c*16+ns-1)*16+k): deterministic (Linux
+        // allocates these minors dynamically)
+        const char* q = n + 4; uint64_t c = 0, ns = 0;
+        while(*q>='0' && *q<='9') c = c*10 + (uint64_t)(*q++ - '0');
+        if(*q=='n'){ q++; while(*q>='0' && *q<='9') ns = ns*10 + (uint64_t)(*q++ - '0'); }
+        if(*q=='p') q++;
+        if(ns && vfs_part_suffix(q, &part)) return vfs_makedev(259, ((c*16 + ns-1)*16 + part) & 0xfffff);
+    } else if(n[0]=='u' && n[1]=='s' && n[2]=='b' && n[3]>='0' && n[3]<='9'){
+        // USB mass storage is sd* on Linux: sdi.. here, clear of AHCI's sda..sdd
+        const char* q = n + 4; if(*q=='p') q++;
+        if(vfs_part_suffix(q, &part)) return vfs_makedev(8, (uint64_t)(n[3]-'0' + 8)*16 + part);
+    }
+    // Other names: a stable hash under a local/experimental major.
+    uint32_t h = 2166136261u; for(const char* q=n; *q; q++){ h ^= (uint8_t)*q; h *= 16777619u; }
+    return vfs_makedev(240, h & 0xfffff);
+}
+// st_dev for a new mount of `ops`: derived from its block device (->mntinfo
+// names it), else 0 = take an anonymous id. Called without g_mount_lock.
+static uint64_t vfs_dev_for(const vfs_fs_ops_t* ops){
+    const char* src = 0; const char* ty = 0;
+    if(ops && ops->mntinfo && ops->mntinfo(&src, &ty)==0 && src && src[0]){
+        if(src[0]=='/' && src[1]=='d' && src[2]=='e' && src[3]=='v' && src[4]=='/') src += 5;
+        return vfs_blkdev_id(src);
+    }
+    return 0;
+}
+
+void vfs_init(void){ g_mount_count = 0; for(int i=0;i<VFS_MAX_MOUNTS;i++){ g_mounts[i].mount_point=NULL; g_mounts[i].ops=NULL; g_mounts[i].fs_name=NULL; g_mounts[i].dev=0; g_mp_used[i]=0; } }
 
 // Locate/replace the root ("/") mount slot (lock-free leaf — caller holds
 // g_mount_lock).
@@ -35,12 +106,15 @@ static vfs_mount_t* find_mount_by_point_nolock(const char* mp){
 
 int vfs_mount_root(const vfs_fs_ops_t* ops, const char* fs_name){
     if(!ops || !fs_name) return -1;
+    uint64_t dev = vfs_dev_for(ops);
+    pagecache_invalidate_fs(ops);                // slots reused from an earlier mount
     uint64_t fl = spin_lock_irqsave(&g_mount_lock);
     if(find_mount_by_point_nolock("/")){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; } // already mounted
     if(g_mount_count >= VFS_MAX_MOUNTS){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
     g_mounts[g_mount_count].mount_point = "/";
     g_mounts[g_mount_count].ops = ops;
     g_mounts[g_mount_count].fs_name = fs_name;
+    g_mounts[g_mount_count].dev = dev ? dev : vfs_makedev(0, ++g_anon_minor);
     g_mount_count++;
     spin_unlock_irqrestore(&g_mount_lock, fl);
     return 0;
@@ -48,9 +122,18 @@ int vfs_mount_root(const vfs_fs_ops_t* ops, const char* fs_name){
 
 int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name){
     if(!ops || !fs_name) return -1;
+    uint64_t dev = vfs_dev_for(ops);
     uint64_t fl = spin_lock_irqsave(&g_mount_lock);
     vfs_mount_t* r = find_mount_by_point_nolock("/");
-    if(r){ r->ops = ops; r->fs_name = fs_name; spin_unlock_irqrestore(&g_mount_lock, fl); return 0; }
+    if(r){
+        const vfs_fs_ops_t* old = r->ops;
+        r->ops = ops; r->fs_name = fs_name;
+        if(dev) r->dev = dev;                    // virtual root keeps its anon id
+        spin_unlock_irqrestore(&g_mount_lock, fl);
+        if(old != ops) pagecache_invalidate_fs(old);
+        pagecache_invalidate_fs(ops);
+        return 0;
+    }
     spin_unlock_irqrestore(&g_mount_lock, fl);
     // vfs_mount_root takes g_mount_lock itself — call it OUTSIDE the lock (not
     // recursive). It re-checks for an existing root, so the drop/re-take is safe.
@@ -58,17 +141,33 @@ int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name){
 }
 
 // Mount a filesystem at an arbitrary absolute mount point (e.g. "/mnt").
+// The mount point is copied into VFS-owned storage (g_mp_store), so callers
+// may pass a temporary buffer. A trailing '/' is dropped so "/x/" and "/x"
+// name the same mount. fs_name must be a static string.
 int vfs_mount(const char* mount_point, const vfs_fs_ops_t* ops, const char* fs_name){
     if(!mount_point || !ops || !fs_name) return -1;
     if(mount_point[0] != '/') return -1;
+    char mp[VFS_MP_MAX]; size_t n = 0;
+    for(; mount_point[n]; n++){ if(n >= sizeof(mp)-1) return -1; mp[n] = mount_point[n]; }
+    while(n > 1 && mp[n-1]=='/') n--;
+    mp[n] = 0;
+    if(n == 1) return -1;                        // "/" goes through vfs_mount_root
+    uint64_t dev = vfs_dev_for(ops);
     uint64_t fl = spin_lock_irqsave(&g_mount_lock);
-    if(find_mount_by_point_nolock(mount_point)){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
+    if(find_mount_by_point_nolock(mp)){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
     if(g_mount_count >= VFS_MAX_MOUNTS){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
-    g_mounts[g_mount_count].mount_point = mount_point;
+    char* own = mp_store_get_nolock();
+    if(!own){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
+    for(size_t k=0;k<=n;k++) own[k] = mp[k];
+    g_mounts[g_mount_count].mount_point = own;
     g_mounts[g_mount_count].ops = ops;
     g_mounts[g_mount_count].fs_name = fs_name;
+    g_mounts[g_mount_count].dev = dev ? dev : vfs_makedev(0, ++g_anon_minor);
     g_mount_count++;
     spin_unlock_irqrestore(&g_mount_lock, fl);
+    // The FS may just have reset its inode pool, handing out vfs_inode_t slots
+    // an earlier mount used: the page cache must not serve that mount's pages.
+    pagecache_invalidate_fs(ops);
     return 0;
 }
 
@@ -82,7 +181,18 @@ int vfs_unmount(const char* mount_point){
     for(int i=0;i<g_mount_count;i++){
         const char* a=g_mounts[i].mount_point; const char* b=mount_point; size_t k=0; int eq=1;
         while(a[k]||b[k]){ if(a[k]!=b[k]){ eq=0; break; } k++; }
-        if(eq){ for(int j=i;j<g_mount_count-1;j++) g_mounts[j]=g_mounts[j+1]; g_mount_count--; spin_unlock_irqrestore(&g_mount_lock, fl); return 0; }
+        if(eq){
+            const vfs_fs_ops_t* ops = g_mounts[i].ops;
+            mp_store_put_nolock(a);
+            for(int j=i;j<g_mount_count-1;j++) g_mounts[j]=g_mounts[j+1];
+            g_mount_count--;
+            g_mounts[g_mount_count].mount_point=NULL; g_mounts[g_mount_count].ops=NULL; g_mounts[g_mount_count].fs_name=NULL;
+            int still = 0;                       // same FS still mounted elsewhere?
+            for(int j=0;j<g_mount_count;j++) if(g_mounts[j].ops==ops) still = 1;
+            spin_unlock_irqrestore(&g_mount_lock, fl);
+            if(!still) pagecache_invalidate_fs(ops);
+            return 0;
+        }
     }
     spin_unlock_irqrestore(&g_mount_lock, fl);
     return -1;
@@ -112,7 +222,7 @@ int vfs_unmount_all(void){
     for(int i=0;i<g_mount_count;i++){
         const char* mp = g_mounts[i].mount_point;
         if(mp[0]=='/' && mp[1]==0) g_mounts[w++] = g_mounts[i];   // keep the root
-        else n++;
+        else { mp_store_put_nolock(mp); n++; }
     }
     g_mount_count = w;
     spin_unlock_irqrestore(&g_mount_lock, fl);
@@ -482,6 +592,15 @@ const char* vfs_mount_point_of(const vfs_fs_ops_t* ops){
 int vfs_sync_ops(const vfs_fs_ops_t* ops){
     if(ops && ops->sync) return ops->sync();
     return 0;
+}
+
+// st_dev of the mount behind `ops` (0 if not mounted).
+uint64_t vfs_dev_of_ops(const vfs_fs_ops_t* ops){
+    uint64_t d = 0;
+    uint64_t fl = spin_lock_irqsave(&g_mount_lock);
+    for(int i=0;i<g_mount_count;i++) if(g_mounts[i].ops==ops){ d = g_mounts[i].dev; break; }
+    spin_unlock_irqrestore(&g_mount_lock, fl);
+    return d;
 }
 
 int vfs_mount_count(void){
