@@ -147,7 +147,7 @@ waitfor 'started sshd' 60
 HK2=$(hostkey)
 send 'poweroff'
 stop_vm 90; rc=$?
-grep -aEq "\[SYSROOT\] persistent root: written=0 unchanged=[1-9][0-9]* linked=0 stale_removed=0 configs_created=0 failed=0" "$W/p2.log"
+grep -aEq "\[SYSROOT\] persistent root: written=0 unchanged=[1-9][0-9]* linked=0 stale_removed=0 configs_created=0 modes_fixed=0 failed=0" "$W/p2.log"
 ok "boot 2 rewrites nothing (all system files unchanged)" $?
 grep -aq "^persist-data" "$W/p2.ser" && grep -aq "^hello-alice" "$W/p2.ser"; ok "boot 2 files in /root and /home persisted" $?
 grep -aq "\[KEYMAP\] /etc/vconsole.conf: KEYMAP=it (applied)" "$W/p2.log" && grep -aq "^it" "$W/p2.ser"
