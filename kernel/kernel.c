@@ -1308,183 +1308,16 @@ static void m24_run_demo(void) {
 #if M32_PKG_DEMO
 #include "../crypto/user_testpkg_spkg.h"
 #endif
-// [M31] coreutils — a busybox-style signed binary installed into /bin under each
-// applet name so `run /bin/ls /`, `run /bin/cat <f>`, etc. work out of the box.
-// [M32] also installs the signed init/service-manager + demo service.
-#include "../crypto/user_coreutils_elf.h"
-#include "../crypto/user_init_elf.h"
-#include "../crypto/user_svc_elf.h"
-#include "../crypto/user_sysfuzz_elf.h"
-#include "../crypto/user_uaccess_elf.h"
-#include "../crypto/user_abi_test_elf.h"
-#include "../crypto/user_ttytest_elf.h"
-#include "../crypto/user_ptytest_elf.h"
-#include "../crypto/user_kitest_elf.h"
-#include "../crypto/user_pipe_test_elf.h"
-static void coreutils_install(void) {
-    extern int vfs_create(const char*, const void*, size_t);
-    extern vfs_inode_t* vfs_lookup(const char*);
-    if (vfs_lookup("/bin/coreutils")) {        // already installed (persistent root)
-        debugcon_writestring("[M31] coreutils already in /bin\n"); return;
-    }
-    static const char* names[] = {
-        "coreutils","echo","cat","wc","head","tail","rev","nl","yes","seq",
-        "ls","mkdir","rm","touch","cp","basename","dirname","stat",
-        "true","false","uname","sleep","clear","hexdump","uptime","help","tty", 0
-    };
-    int ok = 0;
-    for (int i = 0; names[i]; i++) {
-        char path[64]; int p = 0;
-        const char* pre = "/bin/"; for (int k = 0; pre[k]; k++) path[p++] = pre[k];
-        const char* n = names[i]; for (int k = 0; n[k] && p < 60; k++) path[p++] = n[k];
-        path[p] = 0;
-        if (vfs_create(path, user_coreutils_elf, user_coreutils_elf_len) == 0) ok++;
-    }
-    debugcon_writestring("[M31] coreutils installed to /bin (applets="); debugcon_print_hex(ok);
-    debugcon_writestring(")\n");
-    // [M32] the init/service-manager + its demo service.
-    vfs_create("/bin/init", user_init_elf, user_init_elf_len);
-    vfs_create("/bin/svc",  user_svc_elf,  user_svc_elf_len);
-    debugcon_writestring("[M32] init + svc installed to /bin\n");
-    // [stress] seeded ring-3 syscall fuzzer (soak.sh / selftest fuzz gate)
-    vfs_create("/bin/sysfuzz", user_sysfuzz_elf, user_sysfuzz_elf_len);
-    // [uaccess] bad-user-pointer regression test (-EFAULT, never a ring-0 fault)
-    vfs_create("/bin/uaccess_test", user_uaccess_elf, user_uaccess_elf_len);
-    // [abi] wait-status / DF-on-entry / PROT_NONE regression test
-    vfs_create("/bin/abi_test", user_abi_test_elf, user_abi_test_elf_len);
-    // [tty] termios / raw mode / VMIN-VTIME / winsize regression test
-    vfs_create("/bin/ttytest", user_ttytest_elf, user_ttytest_elf_len);
-    // [pty] pseudo-terminal regression test; also /bin/script (bash on a pty)
-    vfs_create("/bin/ptytest", user_ptytest_elf, user_ptytest_elf_len);
-    vfs_create("/bin/script", user_ptytest_elf, user_ptytest_elf_len);
-    // kernel interfaces for userland tools (procfs/klog/time/statfs/poll/...)
-    vfs_create("/bin/kitest", user_kitest_elf, user_kitest_elf_len);
-    // [pipe] blocking-pipe integrity test (PIPE_BUF atomicity, full writes, EINTR/EPIPE)
-    vfs_create("/bin/pipe_test", user_pipe_test_elf, user_pipe_test_elf_len);
-}
-// [M40] GUI kernel interfaces: the fb/evdev demo (signed CAP_INPUT|CAP_DISPLAY),
-// the selftest program and its capability-less twin, and loadkeys. Installed
-// when missing, so a persistent root picks them up too.
-#include "../crypto/user_fbdemo_elf.h"
-#include "../crypto/user_guitest_elf.h"
-#include "../crypto/user_guitest_nocap_elf.h"
-#include "../crypto/user_loadkeys_elf.h"
-// Graphical UI (docs/GUI.md): the secwm compositor (also /bin/startgui) and
-// its confined SWP clients. -DSECOS_GUI_AUTOSTART creates /etc/gui-autostart,
-// which makes `startgui --auto` (the init hook) start the GUI at boot.
-#include "../crypto/user_secwm_elf.h"
-#include "../crypto/user_sysinfo_elf.h"
-#include "../crypto/user_swptest_elf.h"
-#include "../crypto/user_sysmon_elf.h"   // LVGL 9.2 system monitor (make port-lvgl)
-static void gui_install(void) {
-    extern int vfs_create(const char*, const void*, size_t);
-    extern vfs_inode_t* vfs_lookup(const char*);
-    if (!vfs_lookup("/bin/fbdemo")) vfs_create("/bin/fbdemo", user_fbdemo_elf, user_fbdemo_elf_len);
-    if (!vfs_lookup("/bin/guitest")) vfs_create("/bin/guitest", user_guitest_elf, user_guitest_elf_len);
-    if (!vfs_lookup("/bin/guitest_nocap"))
-        vfs_create("/bin/guitest_nocap", user_guitest_nocap_elf, user_guitest_nocap_elf_len);
-    if (!vfs_lookup("/bin/loadkeys")) vfs_create("/bin/loadkeys", user_loadkeys_elf, user_loadkeys_elf_len);
-    debugcon_writestring("[M40] fbdemo + guitest + loadkeys installed to /bin\n");
-    if (!vfs_lookup("/bin/secwm")) vfs_create("/bin/secwm", user_secwm_elf, user_secwm_elf_len);
-    if (!vfs_lookup("/bin/startgui")) vfs_create("/bin/startgui", user_secwm_elf, user_secwm_elf_len);
-    if (!vfs_lookup("/bin/sysinfo")) vfs_create("/bin/sysinfo", user_sysinfo_elf, user_sysinfo_elf_len);
-    if (!vfs_lookup("/bin/swptest")) vfs_create("/bin/swptest", user_swptest_elf, user_swptest_elf_len);
-    if (!vfs_lookup("/bin/sysmon")) vfs_create("/bin/sysmon", user_sysmon_elf, user_sysmon_elf_len);
-#ifdef SECOS_GUI_AUTOSTART
-    if (!vfs_lookup("/etc/gui-autostart")) vfs_create("/etc/gui-autostart", "1\n", 2);
-#endif
-    debugcon_writestring("[GUI] secwm + startgui + sysmon + sysinfo + swptest installed to /bin\n");
-}
-// BusyBox 1.36.1 from source (tools/port-busybox.sh): the signed multi-call
-// binary goes to /bin/busybox and a tiny signed stub (user/bbstub.c, re-execs
-// /bin/busybox with the same argv) is installed under every applet name, since
-// the ramfs root has no symlinks and SYS_SPAWN does not follow them. BusyBox
-// replaces the SecOS coreutils of the same name; /bin/help, /bin/coreutils and
-// /bin/bash (GNU bash) stay. -DSECOS_NO_BUSYBOX drops it.
-#ifndef SECOS_NO_BUSYBOX
-#include "../crypto/user_busybox_elf.h"
-#include "../crypto/user_bbstub_elf.h"
-#include "busybox_applets.h"
-static void busybox_install(void) {
-    extern vfs_inode_t* vfs_lookup(const char*);
-    extern int vfs_create(const char*, const void*, size_t);
-    extern int vfs_remove(const char*);
-    if (vfs_lookup("/bin/busybox")) {          // already installed (persistent root)
-        debugcon_writestring("[BB] busybox already in /bin\n"); return;
-    }
-    if (vfs_create("/bin/busybox", user_busybox_elf, user_busybox_elf_len) != 0) {
-        debugcon_writestring("[BB] FAIL: could not install /bin/busybox\n"); return;
-    }
-    int ok = 0;
-    for (int i = 0; busybox_applets[i]; i++) {
-        char path[64]; int p = 0;
-        const char* pre = "/bin/"; for (int k = 0; pre[k]; k++) path[p++] = pre[k];
-        for (int k = 0; busybox_applets[i][k] && p < 63; k++) path[p++] = busybox_applets[i][k];
-        path[p] = 0;
-        if (vfs_lookup(path)) vfs_remove(path);  // BusyBox wins over a same-named coreutils applet
-        if (vfs_create(path, user_bbstub_elf, user_bbstub_elf_len) == 0) ok++;
-    }
-    debugcon_writestring("[BB] installed BusyBox to /bin/busybox (applets=");
-    debugcon_print_hex(ok); debugcon_writestring(")\n");
-    // Single-user account database for id/whoami/ls -l/ps/tar (BusyBox parses
-    // /etc/passwd + /etc/group itself). Everything runs as root.
-    static const char pw[] = "root:x:0:0:root:/root:/bin/bash\n";
-    static const char gr[] = "root:x:0:\n";
-    if (!vfs_lookup("/etc/passwd")) vfs_create("/etc/passwd", pw, sizeof(pw) - 1);
-    if (!vfs_lookup("/etc/group"))  vfs_create("/etc/group", gr, sizeof(gr) - 1);
-}
-#endif
+// The signed system programs (coreutils, BusyBox, bash, lua, dropbear, init,
+// the GUI, ...) and the default /etc configuration are installed on the root
+// by kernel/sysroot.c (refresh policy for a persistent root included).
+#include "sysroot.h"
 extern void shell_init(void);
 extern void shell_run(void);
 extern void shell_run_line(const char* line);
-// [M39] GNU bash from source. Embedded signed ELF, installed to /bin/bash at boot
-// and launched as the interactive login shell (the SecOS kernel shell stays as
-// the lower-level fallback, reached when bash exits). -DSECOS_NO_BASH drops it.
-#ifndef SECOS_NO_BASH
-#include "../crypto/user_bash_elf.h"
-#endif
-#ifndef SECOS_NO_LUA
-#include "../crypto/user_lua_elf.h"      // [M34] installed to /bin/lua at boot
-#endif
-#include "../crypto/user_power_elf.h"    // /bin/{poweroff,reboot,halt,shutdown}
-// Dropbear SSH (tools/port-dropbear.sh): signed multi-call binary installed to
-// /bin/dropbearmulti (`dropbearmulti dropbear|dropbearkey|dbclient ...`).
-// Not started automatically. -DSECOS_NO_DROPBEAR drops it. See docs/SSH.md.
-#ifndef SECOS_NO_DROPBEAR
-#include "../crypto/user_dropbear_elf.h"
-#endif
-// Interface configuration (user/netcfg.c, SYS_NETCTL): /bin/{netcfg,ifup,ifdown,ifconfig}.
-#include "../crypto/user_netcfg_elf.h"
-// SSH public keys baked at build time (make SSH_AUTHORIZED_KEYS=...): generated
-// into build/ by tools/gen-authorized-keys.py; empty when the variable is unset.
-#include "../build/authorized_keys.h"
 // [M40] /bin/init is PID 1 (user/init.c). -DSECOS_NO_INIT boots straight into
-// bash as before. The default /etc/inittab (installed only when absent, so a
-// persistent root keeps its own) brings the network up, supervises sshd and
-// runs a respawning bash on the console. Format: docs/devlog/M40-init.md.
+// bash as before. The default /etc/inittab is installed by kernel/sysroot.c.
 #ifndef SECOS_NO_INIT
-static const char g_default_inittab[] =
-    "# /etc/inittab - SecOS init (PID 1). One entry per line:\n"
-    "#   <id>:<action>:<command> [args...]\n"
-    "# id       short name, used in messages and for /var/log/<id>.log\n"
-    "# action   sysinit   run at boot in file order and wait for it\n"
-    "#          respawn   own session, output to /var/log/<id>.log, restarted\n"
-    "#                    with backoff (1 s doubling to 30 s) when it exits\n"
-    "#          console   respawn on the console as session leader with the\n"
-    "#                    console as controlling tty and foreground group\n"
-    "#          once      start at boot, never restarted\n"
-    "#          shutdown  run (and waited for) when the system goes down\n"
-    "# The command is split on blanks and run directly (no shell, no quoting).\n"
-    "net:sysinit:/bin/ifup -t 10\n"
-    "sshd:respawn:/bin/dropbearmulti dropbear -F -R -p 22\n"
-    "console:console:/bin/bash -i\n"
-#ifdef SECOS_GUI_AUTOSTART
-    // Opt-in GUI at boot (docs/GUI.md): `once`, never respawn, so leaving the
-    // GUI returns to the console bash above. `--auto` makes it a no-op unless
-    // /etc/gui-autostart exists (created by gui_install() under the same flag).
-    "gui:once:/bin/startgui --auto\n"
-#endif
-    ;
 extern int shell_exec_foreground(const char* path, int argc, const char* const* argv,
                                  void (*created)(process_t*), int keep_running);
 static void init_mark_pid1(process_t* p) {
@@ -1522,152 +1355,8 @@ static trapframe_t m10_idle_tf;
 
 __attribute__((noreturn)) static void m10_shell_idle_entry(void) {
     shell_init();
-    coreutils_install();   // [M31] populate /bin with the signed coreutils applets
-    gui_install();         // [M40] /bin/fbdemo, /bin/guitest, /bin/loadkeys
-#ifndef SECOS_NO_BUSYBOX
-    busybox_install();     // BusyBox userland: /bin/busybox + one stub per applet
-#endif
-#ifndef SECOS_NO_BASH
-    // [M39] Install GNU bash to /bin/bash (idempotent).
-    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
-      if (!vfs_lookup("/bin/bash")) {
-          if (vfs_create("/bin/bash", user_bash_elf, user_bash_elf_len) == 0)
-              debugcon_writestring("[M39] installed GNU bash to /bin/bash\n");
-          else debugcon_writestring("[M39] FAIL: could not install /bin/bash\n");
-      }
-      // Line-editing defaults (only when absent: a persistent root keeps its
-      // own). TERM selects the built-in termcap entry of the console (any
-      // value but "dumb"); readline's inputrc adds the Home/End/Delete
-      // variants other terminals send (serial host terminals, VT220 style).
-      static const char bashrc[] =
-          "# /etc/bash.bashrc - read by every interactive bash (SecOS)\n"
-          "# bash sets TERM=dumb when it is unset: pick the console entry instead.\n"
-          "case \"$TERM\" in \"\"|dumb) export TERM=linux ;; esac\n"
-          "# The kernel starts bash with an empty environment: export a PATH and HOME\n"
-          "# so programs it runs (env, BusyBox, lua os.getenv) see them too.\n"
-          "export PATH=\"${PATH:-/bin:/usr/bin}\" HOME=\"${HOME:-/root}\"\n";
-      static const char inputrc[] =
-          "# /etc/inputrc - GNU readline defaults (SecOS console)\n"
-          "set enable-bracketed-paste off\n"
-          "set bell-style none\n"
-          "\"\\e[1~\": beginning-of-line\n"
-          "\"\\e[4~\": end-of-line\n"
-          "\"\\e[7~\": beginning-of-line\n"
-          "\"\\e[8~\": end-of-line\n"
-          "\"\\e[H\": beginning-of-line\n"
-          "\"\\e[F\": end-of-line\n"
-          "\"\\eOH\": beginning-of-line\n"
-          "\"\\eOF\": end-of-line\n"
-          "\"\\e[3~\": delete-char\n"
-          "\"\\e[2~\": overwrite-mode\n"
-          "\"\\e[1;5C\": forward-word\n"
-          "\"\\e[1;5D\": backward-word\n";
-      if (!vfs_lookup("/etc/bash.bashrc")) vfs_create("/etc/bash.bashrc", bashrc, sizeof(bashrc) - 1);
-      if (!vfs_lookup("/etc/inputrc")) vfs_create("/etc/inputrc", inputrc, sizeof(inputrc) - 1);
-    }
-#endif
-    // Orderly shutdown commands (one signed multi-call program, SYS_REBOOT).
-    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
-      static const char* const pw[] = { "/bin/poweroff", "/bin/reboot", "/bin/halt", "/bin/shutdown", 0 };
-      int ok = 0;
-      for (int i = 0; pw[i]; i++)
-          if (vfs_lookup(pw[i]) || vfs_create(pw[i], user_power_elf, user_power_elf_len) == 0) ok++;
-      debugcon_writestring(ok == 4 ? "[POWER] poweroff/reboot/halt/shutdown installed to /bin\n"
-                                   : "[POWER] FAIL: could not install the power commands\n"); }
-#ifndef SECOS_NO_LUA
-    // [M34] Install the signed lua 5.4.7 interpreter to /bin/lua (idempotent, also
-    // on a persistent root populated before lua was installed by default).
-    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
-      if (!vfs_lookup("/bin/lua")) {
-          if (vfs_create("/bin/lua", user_lua_elf, user_lua_elf_len) == 0)
-              debugcon_writestring("[M34] installed lua to /bin/lua\n");
-          else debugcon_writestring("[M34] FAIL: could not install /bin/lua\n");
-      } }
-#endif
-#ifndef SECOS_NO_DROPBEAR
-    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
-      extern int vfs_mkdir(const char*);
-      if (!vfs_lookup("/etc/dropbear")) vfs_mkdir("/etc/dropbear");
-      if (!vfs_lookup("/bin/dropbearmulti")) {
-          if (vfs_create("/bin/dropbearmulti", user_dropbear_elf, user_dropbear_elf_len) == 0)
-              debugcon_writestring("[SSH] installed dropbear to /bin/dropbearmulti\n");
-          else debugcon_writestring("[SSH] FAIL: could not install /bin/dropbearmulti\n");
-      } }
-#endif
-    // Network configuration commands (one signed multi-call program). The BusyBox
-    // ifconfig needs SIOCGIF* ioctls SecOS does not have, so netcfg's ifconfig
-    // view replaces it.
-    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
-      extern int vfs_remove(const char*);
-      static const char* const nc[] = { "/bin/netcfg", "/bin/ifup", "/bin/ifdown", "/bin/ifconfig", 0 };
-      int ok = 0;
-      for (int i = 0; nc[i]; i++) {
-          vfs_inode_t* ino = vfs_lookup(nc[i]);
-          if (ino && ino->size == user_netcfg_elf_len) { ok++; continue; }   // already ours
-          if (ino) vfs_remove(nc[i]);                // BusyBox stub or an older build
-          if (vfs_create(nc[i], user_netcfg_elf, user_netcfg_elf_len) == 0) ok++;
-      }
-      debugcon_writestring(ok == 4 ? "[NET] netcfg/ifup/ifdown/ifconfig installed to /bin\n"
-                                   : "[NET] FAIL: could not install netcfg\n"); }
-    // Baked SSH keys -> /root/.ssh/authorized_keys. An existing file (persistent
-    // root) keeps its lines; the baked block is appended when it is missing.
-    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
-      extern int vfs_mkdir(const char*); extern int vfs_write(const char*, size_t, const void*, size_t);
-      extern int vfs_read_all(const char*, void*, size_t);
-      if (!vfs_lookup("/var/log")) vfs_mkdir("/var/log");
-      static const char keys[] = SECOS_AUTHORIZED_KEYS;
-      const size_t klen = SECOS_AUTHORIZED_KEYS_LEN;
-      if (klen) {
-          const char* ak = "/root/.ssh/authorized_keys";
-          if (!vfs_lookup("/root/.ssh")) vfs_mkdir("/root/.ssh");
-          vfs_inode_t* ino = vfs_lookup(ak);
-          int done = 0;
-          if (!ino) {
-              done = vfs_create(ak, keys, klen) == 0;
-          } else if (ino->size < 65536) {
-              static char cur[65536];
-              int n = vfs_read_all(ak, cur, sizeof(cur));
-              int found = 0;
-              for (int i = 0; n > 0 && i + (int)klen <= n && !found; i++) {
-                  size_t j = 0; while (j < klen && cur[i + j] == keys[j]) j++;
-                  found = (j == klen);
-              }
-              done = found || vfs_write(ak, (size_t)(n > 0 ? n : 0), keys, klen) >= 0;
-          }
-          // Dropbear refuses keys under a home it does not trust: /root and
-          // ~/.ssh must be owned by root and not group/world-writable. A
-          // persistent root staged with `mkfs.ext4 -d` carries the build
-          // user's uid, so normalise owner and modes here.
-          { extern int vfs_setattr(const char*, const vfs_attr_t*, unsigned);
-            vfs_attr_t a; a.uid = 0; a.gid = 0; a.atime = a.mtime = 0;
-            a.mode = 0700; vfs_setattr("/root", &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID);
-            vfs_setattr("/root/.ssh", &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID);
-            a.mode = 0600; vfs_setattr(ak, &a, VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID); }
-          debugcon_writestring(done ? "[SSH] baked authorized_keys installed to /root/.ssh\n"
-                                    : "[SSH] FAIL: could not install the baked authorized_keys\n");
-      } else {
-          debugcon_writestring("[SSH] no baked authorized_keys (build with SSH_AUTHORIZED_KEYS=...)\n");
-      } }
-#ifndef SECOS_NO_INIT
-    { extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_create(const char*, const void*, size_t);
-      extern int vfs_remove(const char*);
-      // A persistent root populated by an older build may hold the M32 demo
-      // init: keep /bin/init in step with the embedded one.
-      vfs_inode_t* ino = vfs_lookup("/bin/init");
-      if (ino && ino->size != user_init_elf_len) { vfs_remove("/bin/init"); ino = NULL; }
-      if (!ino && vfs_create("/bin/init", user_init_elf, user_init_elf_len) != 0)
-          debugcon_writestring("[INIT] FAIL: could not install /bin/init\n");
-#ifdef SECOS_INIT_TAMPER_TEST
-      // Selftest hook: one flipped code byte, so the signature check refuses
-      // /bin/init and the boot must fall back to bash.
-      { extern int vfs_write(const char*, size_t, const void*, size_t);
-        uint8_t b = user_init_elf[0x1000] ^ 0x01;
-        vfs_write("/bin/init", 0x1000, &b, 1);
-        debugcon_writestring("[INIT] TEST: /bin/init tampered\n"); }
-#endif
-      if (!vfs_lookup("/etc/inittab"))
-          vfs_create("/etc/inittab", g_default_inittab, sizeof(g_default_inittab) - 1); }
-#endif
+    sysroot_provision();       // /bin programs + default /etc (kernel/sysroot.c)
+    sysroot_apply_settings();  // /etc/vconsole.conf KEYMAP=
 #if ENABLE_FB
     // Enable the RAM back buffer + auto-flush: rendering/scroll happen in RAM and
     // only the dirty rectangle is written to VRAM — fixes slow scroll on real HW.
@@ -2102,27 +1791,55 @@ static void kernel_main_phase2(void) {
             }
         }
     }
-    // [M23] Persistent root: if a SecOS ext2 *system* disk is present (it carries
-    // the marker file /.secosroot), mount it as the VFS root "/". Plain ext2/ext4
-    // *data* disks lack the marker and are never grabbed as root — so the boot
-    // self-tests (no system disk) keep the RAMFS root unchanged.
+    // [M23/M41] Persistent root: a SecOS system disk (an ext2/ext4 volume with
+    // the marker file /.secosroot) becomes the VFS root "/". Plain ext2/ext4
+    // *data* disks lack the marker and are never grabbed as root, so the boot
+    // self-tests (no system disk) keep the RAMFS root. A disk that is present
+    // but unusable (damaged superblock, unsupported features, bad checksums, a
+    // corrupt journal) is refused before anything is written: the boot falls
+    // back to RAMFS with a loud warning, and the disk is not mounted anywhere.
+    // Nothing is ever formatted here.
     int root_is_ext2 = 0;
+    const char* root_dev = 0;
+    const char* refused[8]; int nrefused = 0;
     {
         extern int ext2_mount_root(const char* dev_name);
+        extern const char* ext2_last_error(void);
         extern block_dev_t* block_find(const char* name);
         static const char* rc[] = { "vda","sda","sdb","sdc","sdd","nvme0n1","usb0" };
         for (unsigned i=0;i<sizeof(rc)/sizeof(rc[0]) && !root_is_ext2;i++) {
-            if (!block_find(rc[i])) continue;
-            if (ext2_mount_root(rc[i]) == 0) {
-                root_is_ext2 = 1;
-                terminal_writestring("[M23] persistent ext2/ext4 root mounted from ");
-                terminal_writestring(rc[i]); terminal_writestring("\n");
+            block_dev_t* bd = block_find(rc[i]);
+            if (!bd) continue;
+            int r = ext2_mount_root(rc[i]);
+            if (r == 0) {
+                root_is_ext2 = 1; root_dev = rc[i];
                 debugcon_writestring("[M23] persistent ext2/ext4 root on ");
                 debugcon_writestring(rc[i]); debugcon_writestring("\n");
-                // Refresh /VERSION on the persistent root (best-effort).
-                extern int vfs_remove(const char*); extern int vfs_create(const char*, const void*, size_t);
-                const char* ver = "VERSION=0.1.0-dev\nBUILD_TS=" BUILD_TS "\nGIT_HASH=" GIT_HASH "\n";
-                size_t vl=0; while(ver[vl]) vl++; vfs_remove("/VERSION"); vfs_create("/VERSION", ver, vl);
+                continue;
+            }
+            const char* why = 0;
+            if (r == -3) why = ext2_last_error();
+            else if (r == -1) {
+                // No primary superblock. A backup superblock (group 1) with the
+                // SECOSROOT label means a damaged system disk, not a blank one.
+                static uint8_t bs[1024];
+                static const uint64_t bk[] = { 262146ull /* 4 KiB blocks */, 16386ull /* 1 KiB */ };
+                for (unsigned k = 0; k < 2 && !why; k++) {
+                    if (bd->sector_count <= bk[k] + 2 || block_read(bd, bk[k], bs, 2) != 2) continue;
+                    if (bs[56] == 0x53 && bs[57] == 0xEF && bs[120]=='S' && bs[121]=='E' && bs[122]=='C' &&
+                        bs[123]=='O' && bs[124]=='S' && bs[125]=='R')
+                        why = "primary superblock damaged (backup found; repair with e2fsck)";
+                }
+            }
+            if (why) {
+                if (nrefused < 8) refused[nrefused++] = rc[i];
+                terminal_writestring("\n*** WARNING: the system disk "); terminal_writestring(rc[i]);
+                terminal_writestring(" is unusable: "); terminal_writestring(why);
+                terminal_writestring(".\n*** It was not mounted and nothing was written to it. Booting on a RAMFS\n"
+                                     "*** root: changes made now are LOST at reboot.\n\n");
+                debugcon_writestring("[ROOT] WARNING: system disk "); debugcon_writestring(rc[i]);
+                debugcon_writestring(" refused: "); debugcon_writestring(why);
+                debugcon_writestring(" -> RAMFS fallback, disk untouched\n");
             }
         }
     }
@@ -2132,8 +1849,48 @@ static void kernel_main_phase2(void) {
         if (vfs_mount_ramfs() == 0) terminal_writestring("[VFS] root RAMFS mounted\n");
         else terminal_writestring("[VFS] root RAMFS FAIL\n");
     }
+    sysroot_set_root(root_dev ? root_dev : "ramfs", root_is_ext2);
+    // Root health: which root, filesystem, journal, free space (console + debugcon).
+    {
+        extern int ext2_journal_state(void);
+        extern int ext2_has_csum(void);
+        if (root_is_ext2) {
+            const char* fst = "ext2";
+            vfs_inode_t* ri = vfs_lookup("/");
+            if (ri && ri->ops && ri->ops->mntinfo) ri->ops->mntinfo(0, &fst);
+            vfs_statfs_t st; uint64_t fmb = 0, tmb = 0;
+            if (vfs_statfs("/", &st) == 0) {
+                fmb = st.bavail * st.bsize / (1024 * 1024);
+                tmb = st.blocks * st.bsize / (1024 * 1024);
+            }
+            int js = ext2_journal_state();
+            const char* jt = js > 0 ? "journal on" : js < 0 ? "journal NOT written (unsupported format)" : "no journal";
+            terminal_writestring("[ROOT] persistent root: "); terminal_writestring(fst);
+            terminal_writestring(" on "); terminal_writestring(root_dev);
+            terminal_writestring(" ("); terminal_writestring(jt);
+            if (ext2_has_csum()) terminal_writestring(", metadata_csum");
+            terminal_writestring("), "); print_dec(fmb); terminal_writestring(" MiB free of ");
+            print_dec(tmb); terminal_writestring(" MiB\n");
+            debugcon_writestring("[ROOT] persistent root fs="); debugcon_writestring(fst);
+            debugcon_writestring(" dev="); debugcon_writestring(root_dev);
+            debugcon_writestring(js > 0 ? " journal=on" : js < 0 ? " journal=unsupported" : " journal=none");
+            debugcon_writestring(ext2_has_csum() ? " csum=on" : " csum=off");
+            debugcon_writestring(" free_mib="); debugcon_print_hex(fmb);
+            debugcon_writestring(" total_mib="); debugcon_print_hex(tmb); debugcon_writestring("\n");
+            if (js <= 0) {
+                terminal_writestring("[ROOT] WARNING: writes to this root are not crash-safe\n");
+                debugcon_writestring("[ROOT] WARNING: root writes are not journalled\n");
+            }
+        } else {
+            terminal_writestring(nrefused ? "[ROOT] root: RAMFS (FALLBACK - system disk refused, see above)\n"
+                                          : "[ROOT] root: RAMFS (no system disk: changes are lost at reboot)\n");
+            debugcon_writestring(nrefused ? "[ROOT] root=ramfs (fallback: system disk refused)\n"
+                                          : "[ROOT] root=ramfs (no system disk)\n");
+        }
+    }
     // Mount a disk at /mnt: try FAT32, then ext2/ext4 (multi-mount). Skipped when
-    // an ext2 disk is already the persistent root (single-root model).
+    // an ext2 disk is already the persistent root (single-root model), and never
+    // a system disk refused above.
     if (!root_is_ext2) {
         extern int fat32_mount(const char* dev_name, const char* mount_point);
         extern int ext2_mount(const char* dev_name, const char* mount_point);
@@ -2149,6 +1906,10 @@ static void kernel_main_phase2(void) {
         const char* mounted_dev = 0;        // [M26] remember which device backs /mnt
         for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]) && !fsname; i++) {
             if (!block_find(cand[i])) continue;
+            int skip = 0;
+            for (int k = 0; k < nrefused; k++) { const char* a = refused[k]; const char* b = cand[i];
+                while (*a && *a == *b) { a++; b++; } if (*a == *b) skip = 1; }
+            if (skip) continue;
             if      (fat32_mount(cand[i], "/mnt") == 0) { fsname = "FAT32"; mounted_dev = cand[i]; }
             else if (ext2_mount (cand[i], "/mnt") == 0) { fsname = "extN";  mounted_dev = cand[i]; }
         }
@@ -2159,6 +1920,10 @@ static void kernel_main_phase2(void) {
             for (int bi = 0; bi < bn && !fsname; bi++) {
                 block_dev_t* bd = block_get(bi);
                 if (!bd) continue;
+                int skip = 0;
+                for (int k = 0; k < nrefused; k++) { const char* a = refused[k]; const char* b = bd->name;
+                    while (*a && *a == *b) { a++; b++; } if (*a == *b) skip = 1; }
+                if (skip) continue;
                 if      (fat32_mount(bd->name, "/mnt") == 0) { fsname = "FAT32"; mounted_dev = bd->name; }
                 else if (ext2_mount (bd->name, "/mnt") == 0) { fsname = "extN";  mounted_dev = bd->name; }
             }

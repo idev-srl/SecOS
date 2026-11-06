@@ -87,6 +87,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/tty.c \
 	$(KERNEL_DIR)/pty.c \
 	$(KERNEL_DIR)/power.c \
+	$(KERNEL_DIR)/sysroot.c \
 	$(KERNEL_DIR)/kclock.c \
 	$(KERNEL_DIR)/klog.c \
 	$(KERNEL_DIR)/kiface.c \
@@ -200,7 +201,7 @@ $(DRIVERS_DIR)/keymap.o: $(KEYMAP_STAMP)
 # Same for GUI_AUTOSTART, which only kernel/kernel.c reads.
 GUI_STAMP := .gui-autostart.stamp
 $(shell echo '$(GUI_DEF)' | cmp -s - $(GUI_STAMP) 2>/dev/null || echo '$(GUI_DEF)' > $(GUI_STAMP))
-$(KERNEL_DIR)/kernel.o: $(GUI_STAMP)
+$(KERNEL_DIR)/kernel.o $(KERNEL_DIR)/sysroot.o $(FS_DIR)/procfs.o: $(GUI_STAMP)
 
 $(DRIVERS_DIR)/%.o: $(DRIVERS_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
