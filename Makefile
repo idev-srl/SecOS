@@ -32,9 +32,14 @@ GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo NOHASH)
 # default is "us"; switch at runtime with `loadkeys it|us`.
 KEYMAP ?=
 KEYMAP_DEF := $(if $(KEYMAP),-DSECOS_KEYMAP_DEFAULT='"$(KEYMAP)"',)
+# GUI at boot (opt-in): `make iso GUI_AUTOSTART=1` adds `gui:once:/bin/startgui
+# --auto` to the default /etc/inittab and creates /etc/gui-autostart. Same as
+# CFLAGS_EXTRA=-DSECOS_GUI_AUTOSTART. The default boot stays the text console.
+GUI_AUTOSTART ?=
+GUI_DEF := $(if $(filter 1 yes y,$(GUI_AUTOSTART)),-DSECOS_GUI_AUTOSTART,)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
 		  -fstack-protector-strong $(INCLUDES) \
-		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(CFLAGS_EXTRA)
+		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(GUI_DEF) $(CFLAGS_EXTRA)
 # Header dependency tracking: every kernel object also depends on the headers it
 # includes (gcc writes foo.d next to foo.o). Without it, changing only a header
 # (e.g. a regenerated embedded program crypto/user_*_elf.h) left the objects that
@@ -192,6 +197,10 @@ $(ARCH_DIR)/%.o: $(ARCH_DIR)/%.c
 KEYMAP_STAMP := .keymap.stamp
 $(shell echo '$(KEYMAP)' | cmp -s - $(KEYMAP_STAMP) 2>/dev/null || echo '$(KEYMAP)' > $(KEYMAP_STAMP))
 $(DRIVERS_DIR)/keymap.o: $(KEYMAP_STAMP)
+# Same for GUI_AUTOSTART, which only kernel/kernel.c reads.
+GUI_STAMP := .gui-autostart.stamp
+$(shell echo '$(GUI_DEF)' | cmp -s - $(GUI_STAMP) 2>/dev/null || echo '$(GUI_DEF)' > $(GUI_STAMP))
+$(KERNEL_DIR)/kernel.o: $(GUI_STAMP)
 
 $(DRIVERS_DIR)/%.o: $(DRIVERS_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -699,11 +708,15 @@ run-ssh: iso
 # the guest pointer follows the host cursor without a mouse grab. Type
 # `startgui` at the bash prompt; Ctrl+Alt+Backspace leaves the GUI. Italian
 # keyboard: `make run-gui KEYMAP=it` (or `loadkeys it` in SecOS). Debugcon
-# (kernel log + GUI markers) goes to secos-gui.log.
+# (kernel log + GUI markers) goes to secos-gui.log. An e1000 NIC forwards host
+# port GUI_SSH_PORT (default 2222) to the guest's sshd (docs/SSH.md):
+#   make run-gui KEYMAP=it SSH_AUTHORIZED_KEYS=~/.ssh/id_ed25519.pub GUI_AUTOSTART=1
+GUI_SSH_PORT ?= 2222
 .PHONY: run-gui
 run-gui: iso
-	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -display gtk \
+	qemu-system-x86_64 -cdrom $(ISO) -boot d -m 512M -cpu max -display gtk \
 		-device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 \
+		-netdev user,id=n0,hostfwd=tcp::$(GUI_SSH_PORT)-:22 -device e1000,netdev=n0 \
 		-debugcon file:secos-gui.log -global isa-debugcon.iobase=0xe9
 
 # Run with a VNC server on :0 (connect a VNC viewer to localhost:5900)
@@ -714,7 +727,7 @@ run-vnc: iso
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
-	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)

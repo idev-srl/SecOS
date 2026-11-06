@@ -1477,7 +1477,14 @@ static const char g_default_inittab[] =
     "# The command is split on blanks and run directly (no shell, no quoting).\n"
     "net:sysinit:/bin/ifup -t 10\n"
     "sshd:respawn:/bin/dropbearmulti dropbear -F -R -p 22\n"
-    "console:console:/bin/bash -i\n";
+    "console:console:/bin/bash -i\n"
+#ifdef SECOS_GUI_AUTOSTART
+    // Opt-in GUI at boot (docs/GUI.md): `once`, never respawn, so leaving the
+    // GUI returns to the console bash above. `--auto` makes it a no-op unless
+    // /etc/gui-autostart exists (created by gui_install() under the same flag).
+    "gui:once:/bin/startgui --auto\n"
+#endif
+    ;
 extern int shell_exec_foreground(const char* path, int argc, const char* const* argv,
                                  void (*created)(process_t*), int keep_running);
 static void init_mark_pid1(process_t* p) {
