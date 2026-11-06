@@ -222,6 +222,21 @@ void exception_handler(struct registers* regs) {
 
     if (int_no == 14) { // Page Fault
         uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        // 0. [M44] SMAP violation: a ring-0 data access to a present user page
+        //    with RFLAGS.AC clear. The only sanctioned user accesses are the
+        //    uaccess primitives, which run with AC=1 (stac), so this is always a
+        //    kernel bug (a user pointer dereferenced directly). Never retry it
+        //    through demand paging / COW: panic with a clear diagnostic.
+        if ((regs->cs & 3) != 3 && g_smap_enabled && cr2 < USER_ADDR_MAX &&
+            (err_code & 0x1) && !(err_code & 0x10) && !(regs->rflags & (1ULL << 18))) {
+            debugcon_writestring("[SMAP] violation: ring-0 ");
+            debugcon_writestring((err_code & 0x2) ? "write" : "read");
+            debugcon_writestring(" of user address cr2="); debugcon_print_hex(cr2);
+            debugcon_writestring(" rip="); debugcon_print_hex(regs->rip);
+            debugcon_writestring(" (user pointer used outside copy_from/to_user)\n");
+            kernel_panic("SMAP violation: kernel touched user memory outside uaccess",
+                         __FILE__, __LINE__);
+        }
         // 1. Demand paging / COW first — also for ring-0 faults on user
         //    addresses (a not-yet-faulted syscall buffer, M14).
         if (vmm_try_handle_page_fault(cr2, err_code) == 0) return;

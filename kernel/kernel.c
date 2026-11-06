@@ -2317,15 +2317,16 @@ void cpu_enable_mitigations(void) {
     int smep = (b & (1u << 7))  ? 1 : 0;
     int smap = (b & (1u << 20)) ? 1 : 0;
     if (smep) cr4 |= (1UL << 20);             // CPUID.7:EBX.SMEP -> CR4.SMEP
-#ifdef SECOS_SMAP
-    /* SMAP is opt-in: enabling it system-wide requires every syscall that passes
-     * a user pointer into deep kernel code (e.g. SYS_OPEN -> vfs_lookup) to copy
-     * the buffer in first. The user_copy primitives already bracket their access
-     * with stac/clac; the full path audit is the remaining work. */
+#ifndef SECOS_NO_SMAP
+    /* [M44] SMAP is on by default whenever the CPU has it: a kernel access to a
+     * user page is legal only inside the uaccess primitives (mm/user_copy.c),
+     * which bracket it with stac/clac. Every kernel entry clears AC
+     * (SMAP_CLAC in arch/x86/*.asm), and a stray access panics with [SMAP]
+     * (kernel/panic.c). Opt out with -DSECOS_NO_SMAP. */
     if (smap) cr4 |= (1UL << 21);             // CPUID.7:EBX.SMAP -> CR4.SMAP
 #endif
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
-#ifdef SECOS_SMAP
+#ifndef SECOS_NO_SMAP
     if (smap) { g_smap_enabled = 1; __asm__ volatile("clac"); }
 #endif
     // CR0.WP: make ring-0 writes honour read-only PTEs. Without it a kernel
@@ -2344,8 +2345,15 @@ void cpu_enable_mitigations(void) {
     debugcon_writestring("[M36] mitigations: SMEP=");
     debugcon_writestring(smep ? "on" : "n/a");
     debugcon_writestring(" SMAP=");
-    debugcon_writestring(g_smap_enabled ? "on" : (smap ? "available(opt-in)" : "n/a"));
+    debugcon_writestring(g_smap_enabled ? "on" : (smap ? "off(SECOS_NO_SMAP)" : "n/a"));
     debugcon_writestring(" stack-canary=on WP=on\n");
+    static int smap_logged = 0;           // once (BSP); APs repeat the CR4 setup only
+    if (!smap_logged) {
+        smap_logged = 1;
+        debugcon_writestring(g_smap_enabled ? "[SMAP] enabled: kernel user access only via uaccess (stac/clac)\n"
+                             : (smap ? "[SMAP] supported but disabled (SECOS_NO_SMAP)\n"
+                                     : "[SMAP] not supported by this CPU (fallback: no SMAP)\n"));
+    }
 }
 
 // [M37] Measured boot. Compute a SHA-256 over the immutable kernel image

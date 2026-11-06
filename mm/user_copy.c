@@ -8,8 +8,8 @@
 
 /* [M36] SMAP: when enabled, the kernel may not touch user pages unless RFLAGS.AC
  * is set. These primitives are the sanctioned bridge, so they raise AC (stac)
- * around the access and clear it (clac) after. Dormant until SMAP is enabled
- * (g_smap_enabled, set by cpu_enable_mitigations under -DSECOS_SMAP). */
+ * around the access and clear it (clac) after. Dormant on CPUs without SMAP
+ * (g_smap_enabled, set by cpu_enable_mitigations unless -DSECOS_NO_SMAP). */
 extern int g_smap_enabled;
 static inline void ua_begin(void){ if (g_smap_enabled) __asm__ volatile("stac" ::: "cc"); }
 static inline void ua_end(void){ if (g_smap_enabled) __asm__ volatile("clac" ::: "cc"); }

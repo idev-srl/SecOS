@@ -45,6 +45,10 @@
  * header stays dependency-free. See the range-policy note above. */
 #define USER_ADDR_MIN  0x0000000100000000ULL
 
+/* [M44] Set by cpu_enable_mitigations() when CR4.SMAP is on (the default when
+ * the CPU supports it; -DSECOS_NO_SMAP opts out). */
+extern int g_smap_enabled;
+
 /* POSIX EFAULT (14) returned on invalid user address. */
 #define EFAULT 14
 /* POSIX ENAMETOOLONG (36): user string longer than the kernel buffer. */
