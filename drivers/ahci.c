@@ -17,7 +17,7 @@
 #include "io.h"
 #include "block.h"
 #include "debugcon.h"
-#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_extend_physmap
+#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_map_mmio
 #include <stddef.h>
 
 // ---- HBA / port registers ----
@@ -181,8 +181,8 @@ int ahci_init(void) {
     pci_enable_mem_and_busmaster(&dev);
     uint32_t abar_phys = pci_bar_mem(&dev, 5);
     if (abar_phys == 0) { debugcon_writestring("[AHCI] BAR5 not memory\n"); return -1; }
-    vmm_extend_physmap((uint64_t)abar_phys + 0x2000);
-    g_abar = (volatile uint8_t*)phys_to_virt(abar_phys);
+    g_abar = (volatile uint8_t*)pci_bar_map(&dev, 5, 0x2000);   // [M49] uncached
+    if (!g_abar) { debugcon_writestring("[AHCI] ABAR map failed\n"); return -1; }
 
     hw(HBA_GHC, hr(HBA_GHC) | GHC_AE);
     uint32_t pi = hr(HBA_PI);

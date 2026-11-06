@@ -556,8 +556,8 @@ int xhci_init(void) {
     pci_enable_mem_and_busmaster(&dev);
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[XHCI] BAR0 not memory\n"); return -1; }
-    vmm_extend_physmap(bar + 0x10000);
-    g_cap = (volatile uint8_t*)phys_to_virt(bar);
+    g_cap = (volatile uint8_t*)pci_bar_map(&dev, 0, 0x10000);   // [M49] uncached
+    if (!g_cap) { debugcon_writestring("[XHCI] BAR0 map failed\n"); return -1; }
 
     uint8_t caplen = (uint8_t)(cap_rd(CAP_CAPLENGTH) & 0xFF);
     g_op = g_cap + caplen;

@@ -27,7 +27,7 @@
 #include "pci.h"
 #include "io.h"
 #include "debugcon.h"
-#include "vmm.h"        /* phys_to_virt / kvirt_to_phys / vmm_extend_physmap */
+#include "vmm.h"        /* phys_to_virt / kvirt_to_phys / vmm_map_mmio */
 #include <stddef.h>
 
 /* ---- Supported PCI device IDs (vendor 0x8086) ---- */
@@ -300,8 +300,8 @@ int igc_init(void) {
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[IGC] BAR0 not memory\n"); return -1; }
     /* igc register space is 128 KB; map a generous window through the physmap. */
-    vmm_extend_physmap(bar + 0x20000);
-    g_bar = (volatile uint8_t*)phys_to_virt(bar);
+    g_bar = (volatile uint8_t*)pci_bar_map(&dev, 0, 0x20000);   /* [M49] uncached */
+    if (!g_bar) { debugcon_writestring("[IGC] BAR0 map failed\n"); return -1; }
 
     debugcon_writestring("[IGC] dev=0x"); debugcon_print_hex(dev.device_id);
     debugcon_writestring(" BAR=0x"); debugcon_print_hex(bar); debugcon_writestring("\n");

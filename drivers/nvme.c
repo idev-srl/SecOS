@@ -17,7 +17,7 @@
 #include "io.h"
 #include "block.h"
 #include "debugcon.h"
-#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_extend_physmap
+#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_map_mmio
 #include "idt.h"
 #include "lapic.h"
 #include <stddef.h>
@@ -191,8 +191,8 @@ int nvme_init(void) {
     pci_enable_mem_and_busmaster(&dev);
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[NVME] BAR0 not memory\n"); return -1; }
-    vmm_extend_physmap(bar + 0x2000);
-    g_bar = (volatile uint8_t*)phys_to_virt(bar);
+    g_bar = (volatile uint8_t*)pci_bar_map(&dev, 0, 0x2000);   // [M49] uncached
+    if (!g_bar) { debugcon_writestring("[NVME] BAR0 map failed\n"); return -1; }
 
     uint64_t cap = rd64(NVME_CAP);
     g_dstrd_bytes = 4u << ((cap >> 32) & 0xF);   // CAP.DSTRD

@@ -16,29 +16,19 @@
 static framebuffer_info_t g_fb;
 static int g_fb_ready = 0;
 static int g_fb_phys_only = 0; // set if high framebuffer physical address not yet virtually mapped
-// Forward declare phys_to_virt
-extern uint64_t phys_to_virt(uint64_t phys);
 void fb_apply_wc(void);   // forward: (re)apply framebuffer Write-Combining
 
 void fb_finalize_mapping(void) {
     if (!g_fb_ready) return;
-    if (!g_fb_phys_only) {
-        // [M44] A low framebuffer (< the old identity window) used to be
-        // addressed virt == phys. The identity map is retired after early boot:
-        // reach it through the physmap like any other (no WC retag here — the
-        // 2 MB physmap page may also hold RAM).
-        if (!g_fb.virt_addr) g_fb.virt_addr = phys_to_virt(g_fb.addr);
-        return;
-    }
-    // Ensure physmap covers the entire framebuffer
+    // [M49] The physmap maps RAM only: map the framebuffer explicitly,
+    // Write-Combining (see fb_apply_wc), at its physmap address. Only the
+    // framebuffer's own pages are retagged (a huge page shared with RAM is
+    // split), so a low framebuffer is handled like a high one.
     uint64_t fb_size = (uint64_t)g_fb.pitch * g_fb.height;
-    uint64_t fb_end = g_fb.addr + fb_size;
-    vmm_extend_physmap(fb_end);
-    // Assume physmap now covers the requested range
-    g_fb.virt_addr = phys_to_virt(g_fb.addr);
+    uint64_t v = vmm_map_mmio(g_fb.addr, fb_size ? fb_size : 0x1000, VMM_CACHE_WC);
+    if (!v) { terminal_writestring("[FB][ERR] framebuffer mapping failed\n"); return; }
+    g_fb.virt_addr = v;
     g_fb_phys_only = 0;
-    // [FB-WC] Map the framebuffer Write-Combining (see fb_apply_wc).
-    fb_apply_wc();
 }
 
 // [FB-WC] (Re)apply Write-Combining to the framebuffer: on real hardware the
