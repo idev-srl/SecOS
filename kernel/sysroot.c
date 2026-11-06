@@ -63,6 +63,7 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_ptytest_elf.h"
 #include "../crypto/user_kitest_elf.h"
 #include "../crypto/user_pipe_test_elf.h"
+#include "../crypto/user_netstress_elf.h"
 #include "../crypto/user_fbdemo_elf.h"
 #include "../crypto/user_guitest_elf.h"
 #include "../crypto/user_guitest_nocap_elf.h"
@@ -346,6 +347,7 @@ static void build_table(void){
     sf_alias("script", "ptytest", user_ptytest_elf, user_ptytest_elf_len, 0);
     sf_bin("kitest", user_kitest_elf, user_kitest_elf_len);
     sf_bin("pipe_test", user_pipe_test_elf, user_pipe_test_elf_len);
+    sf_bin("netstress", user_netstress_elf, user_netstress_elf_len);   // [M47]
     // [M40] GUI kernel-interface programs and the compositor + its clients.
     sf_bin("fbdemo", user_fbdemo_elf, user_fbdemo_elf_len);
     sf_bin("guitest", user_guitest_elf, user_guitest_elf_len);
