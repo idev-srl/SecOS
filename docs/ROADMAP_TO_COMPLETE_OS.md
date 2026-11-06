@@ -1,7 +1,8 @@
-# SECoS — Roadmap to a complete OS (no GUI)
+# SECoS — Roadmap to a complete OS
 
 _Strategic plan from the current state to a complete, networked, multi-process,
-secure operating system — headless (no GUI) for now._
+secure operating system. Written for a headless system; a GUI (secwm compositor,
+LVGL) shipped in M40 anyway (`docs/GUI.md`)._
 _Written 2026-06-18; realigned 2026-06-20; **realigned again 2026-11-04** to the
 commit history through M39 (selftest 182/182 at `e66a57f`). Companion to `ROADMAP_SECoS.md` (technical) and
 `docs/DEVELOPMENT_PLAN.md` (phases A–E)._
@@ -25,8 +26,8 @@ A system that:
 1. **survives misbehaving userspace** (a faulting/abusive process is killed, not
    the kernel); ✅ (M15)
 2. has a **real process model** — argv/env, exec, fork-or-spawn, signals,
-   blocking wait, pipes, a TTY with job control; ✅ (M16/M17/M19/M25/M30) —
-   _open:_ in-place `execve` (emulated today), raw-mode TTY, poll/select;
+   blocking wait, pipes, a TTY with job control; ✅ (M16/M17/M19/M25/M30, plus
+   in-place `execve`, raw-mode TTY, ptys and poll/select on `integ/phase2`);
 3. has a **complete virtual-memory API** — mmap/mprotect/brk, COW, shared memory,
    a unified page cache; ✅ (M18–M20) — `MAP_SHARED` still future;
 4. has a **mature storage stack** — permissions/ownership, symlinks, journaling /
@@ -38,7 +39,8 @@ A system that:
 7. ships a **usable userland** — a real libc, a shell, ported tools, an init /
    service manager; ✅ (M31/M32/M34/M39: libc, coreutils, signed packages,
    supervised init, lua + **GNU bash compiled from source**, bash as the boot
-   shell) — _open:_ PID-1 init at boot, more ports (sqlite, dash);
+   shell; M40: `/bin/init` as PID 1 with supervised services) — _open:_
+   multi-user login, more ports (sqlite, dash);
 8. keeps its **security identity central** — everything signed, capability-rooted
    permissions, exploit mitigations, an audit trail; ✅ (M35–M37 + M39: caps +
    `[AUDIT]` + key revocation, SMEP/canaries/full W^X, measured + UEFI secure boot,
@@ -212,19 +214,43 @@ init/reset/calibration/EDMA RX work on the real chip, but received frames fail C
 # ▶▶ REMAINING WORK
 
 Physical-hardware testing is **paused as of 2026-11-04**; current work targets
-items that can be validated in QEMU. The ordered plan and the real-HW-only list
-live in `TASKS.md`. In short:
+items that can be validated in QEMU. Since 2026-11-05 the work is organized in
+four phases toward "a system that really works"; the actionable checklist is in
+`TASKS.md`.
 
-1. **Selftest coverage M34–M39** + this docs realignment.
-2. **bash / shell usability:** real in-place `execve`, raw-mode termios in
-   `kernel/tty.c`, `poll`/`select`, wider `ioctl`, mid-path symlink following
-   (`fs/vfs.c`), per-pid `/proc/<pid>`.
-3. **Kernel robustness:** buddy/multi-frame heap, `MAP_SHARED` + shared text,
-   PID-1 init at boot, package keyring + revocation.
-4. **More source ports:** sqlite, dash.
-5. **Security depth:** SMAP by default, kernel KASLR.
-6. **SMP prep in QEMU `-smp 4`:** TLB shootdown, IPI reschedule — prerequisite to
-   re-enabling SMP by default (which itself needs real-HW re-validation).
+1. **Phase 1 — stability** (done, `integ/phase1`): soak harness, ring-3 syscall
+   fuzzer, heap integrity checks, and the bugs they found.
+2. **Phase 2 — bash usability** (done, `integ/phase2`): real in-place `execve`,
+   raw termios + readline, ptys + sessions, `poll`/`select`, per-pid `/proc`,
+   mid-path symlinks, BusyBox, Dropbear SSH. **Phase 2b** (done,
+   `integ/phase2b`): `/bin/init` as PID 1 (inittab, DHCP from user space,
+   supervised sshd, key baking, poweroff through init), GUI input + `/dev/fb0`,
+   the secwm compositor with terminals on ptys, LVGL 9.2.2.
+3. **Phase 3 — complete system.** Approved 2026-11-06, in this order:
+   1. **Persistent ext4 root by default** for QEMU and the ISO, so users, keys
+      and the SSH host key survive a reboot. The ext4 inode-slot reuse fix from
+      `feat/init-pid1` is its prerequisite (done).
+   2. **Real multi-user management:** enforce uid/gid and file modes (root
+      exempt); `login` with salted, hashed passwords in `/etc/shadow`;
+      `useradd`, `passwd`, `su` (sudo optional); a home directory per user; SSH
+      logs in as the matching user instead of always root. The model: **the code
+      signature still decides *which code* may run; the uid decides *who* may
+      access which files.** This **revises the M26 decision** ("POSIX metadata
+      stored and exposed, not enforced", because the signature was the only
+      trust boundary): the signature stays the boundary for code, and file
+      access gains a second, uid-based one.
+   3. **More filesystems:** exFAT read-write (the specification is public since
+      2019); NTFS read-only first, read-write later, probably by porting Linux
+      `ntfs3` (GPLv2) through a compat shim, as done for ath9k.
+
+   Phase 3 also keeps: init/services hardening (DHCP renewal, dependencies,
+   per-service limits), signed packages with a keyring + revocation, more ports
+   (sqlite, dash).
+4. **Phase 4 — hardening:** SMAP by default, kernel KASLR, removing the low
+   identity map from user address spaces, the exec confinement rule (a confined
+   process must not gain caps by exec'ing an ambient program), net stack
+   locking, and SMP (TLB shootdown, IPI reschedule — prerequisites for SMP by
+   default, which also needs real-HW re-validation).
 
 **Real-hardware-only (paused):** ath9k RX/TX/assoc, UEFI loader on real firmware
 (conflicting reports — re-verify), the SMP freeze, vmxnet3/igc/e1000e-MSI-X.
@@ -242,8 +268,9 @@ live in `TASKS.md`. In short:
   reproducible builds and two boot paths.
 - **WiFi radio** — blind register debugging on one real chip; parked.
 
-A GUI/display server, window system, and desktop userland are explicitly **out of
-scope here** and would be a later Phase M+.
+A GUI was out of scope for this roadmap; a first one shipped in M40 anyway
+(`/bin/secwm` + terminals + LVGL clients, `docs/GUI.md`). A fuller desktop
+userland would be a later phase.
 
 ## How this maps to the existing roadmap
 

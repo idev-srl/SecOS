@@ -2,7 +2,7 @@
 
 _Snapshot: realigned to the commit history through `ae2be37` (M39 + ath9k RX
 bring-up). Last full self-test **182/182** (at `e66a57f`)._
-_Last updated: 2026-11-06 (M40 GUI kernel interfaces on `feat/gui-input`)._
+_Last updated: 2026-11-06 (`integ/phase2b`: M40 init as PID 1 + GUI input + secwm compositor merged; Phase 3/4 plan approved)._
 
 This file tracks what is **done** vs **open**, and the planned order of work. The
 narrative handoff lives in `next_session.md`; the long-term plan in
@@ -18,16 +18,25 @@ serial). Real-hardware-only items are parked in their own section below and are
 resumed only when hardware testing restarts.
 
 ### Planned order (QEMU-validatable)
-1. **Selftest coverage M34–M39 + docs realignment** (in progress — this file,
-   `ROADMAP_TO_COMPLETE_OS.md`, `CLAUDE.md`, `docs/BASH_PORT.md`, `docs/devlog/M39.md`).
-2. **bash / shell usability:** done on `integ/phase2` (real `execve`, raw termios +
+The work is organized in four phases (user decision, 2026-11-05: "a system that
+really works"):
+
+1. **Phase 1 — stability:** bug-finding harness (soak, sysfuzz), heap integrity,
+   fix what they find. Done on `integ/phase1`; the soak and fuzzer keep running.
+2. **Phase 2 — bash usability:** done on `integ/phase2` (real `execve`, raw termios +
    readline, ptys + sessions, `poll`/`select`, per-pid `/proc`, mid-path symlinks,
-   BusyBox userland, Dropbear SSH with pty sessions).
-3. **Kernel robustness:** buddy heap, `MAP_SHARED`, ~~PID-1 init in boot~~ (done, M40), package
-   keyring + revocation.
-4. **More source ports:** sqlite, dash.
-5. **Security depth:** SMAP by default, kernel KASLR.
-6. **SMP prep** (TLB shootdown, IPIs) validated in QEMU `-smp 4`.
+   BusyBox userland, Dropbear SSH with pty sessions). **Phase 2b** (remote + GUI) done
+   on `integ/phase2b`: `/bin/init` as PID 1 with supervised sshd, GUI input/fb0, the
+   secwm compositor, LVGL.
+3. **Phase 3 — complete system** (approved 2026-11-06, in this order):
+   1. persistent ext4 root by default;
+   2. real multi-user management;
+   3. more filesystems (exFAT RW, NTFS RO then RW);
+   then init/services hardening, signed packages (keyring), more ports.
+   Details in the "Phase 3" section below.
+4. **Phase 4 — hardening:** SMAP by default, kernel KASLR, no identity map in user
+   address spaces, the exec confinement rule, net stack locking, SMP (TLB shootdown,
+   IPIs). Details in the "Phase 4" section below.
 
 ---
 
@@ -126,7 +135,8 @@ robustness and the paused real-hardware bring-up — see below.
       terminals = bash on locked ptys with job control, SWP client protocol over pipes
       with a confined-manifest client sandbox, LVGL 9.2.2 `/bin/sysmon`. `docs/GUI.md`,
       selftest "GUI compositor gate".
-- [ ] GUI: wire `startgui --auto` into the PID-1 init (`console::once:`), see `docs/GUI.md`.
+- [x] GUI autostart through init: `make iso GUI_AUTOSTART=1` adds `gui:once:/bin/startgui --auto`
+      to the default `/etc/inittab` (never respawned; leaving the GUI returns to the console bash).
 - [ ] GUI: clipboard (compositor-mediated, explicit user action only), terminal text selection.
 - [ ] GUI: shared-memory buffers for clients (memfd-style object passed at spawn, syscalls
       90-94) if a client needs more than pipe bandwidth.
@@ -134,10 +144,45 @@ robustness and the paused real-hardware bring-up — see below.
       wide (CJK) characters; blinking cursor.
 - [ ] GUI: software key autorepeat for USB keyboards (no host-side repeat yet).
 - [ ] GUI: client windows resizable (a CONFIGURE round trip); keyboard window move.
-- [ ] `/proc/meminfo` under UEFI reports MemFree/MemAvailable > MemTotal (PMM accounting).
+- [x] `/proc/meminfo` under UEFI reported MemFree > MemTotal: the PMM started all-free, so the
+      holes between EFI regions (loader data, ACPI, runtime services) were allocatable. Fixed in
+      `mm/pmm.c` (start all-used, free only the reported regions).
 - [ ] USB keyboard host-side autorepeat; keyboard LEDs (Caps/Num Lock).
 - [ ] fb0 double buffering / page flip (`yres_virtual > yres`), vsync; mode setting.
 - [ ] VT switching (several consoles / graphics sessions).
+
+### Phase 3 — complete system (approved 2026-11-06, in this order)
+1. [ ] **Persistent ext4 root by default** for QEMU (`make run*`) and the ISO: users,
+   keys, `/etc` and the SSH host key survive a reboot. Builds on `make sysdisk-ext4`,
+   `ext2_mount_root` + `/.secosroot` (M23/M33) and the init `/etc/inittab` "install
+   only when absent" rule. **Prerequisite (done):** the ext2/ext4 VFS inode-slot reuse
+   fix from `feat/init-pid1` (a service log fd once wrote into `/etc/passwd`). Open:
+   first-boot provisioning (create + format the root when no marked volume exists),
+   ISO + data-disk layout, host-key generation on first boot, fsck-on-dirty policy.
+2. [ ] **Real multi-user management.** Model: **the code signature still decides
+   *which code* may run; the uid decides *who* may access which files.** This
+   **revises the M26 decision** "POSIX metadata stored & exposed, not enforced":
+   - [ ] enforce uid/gid + file modes (owner/group/other rwx, directory x/w, sticky
+         `/tmp`) in the VFS; uid 0 (root) is exempt; per-process uid/gid/euid +
+         supplementary groups, inherited across fork/exec; `setuid`/`setgid` syscalls
+         (root only);
+   - [ ] `login` with salted, hashed passwords in `/etc/shadow` (mode 0600; a slow KDF,
+         e.g. PBKDF2-SHA-512 on the in-kernel/libc crypto, or yescrypt/bcrypt);
+         `useradd`, `passwd`, `su` (sudo optional);
+   - [ ] a home directory per user (`/home/<user>`, `/root` for root);
+   - [ ] SSH logs in as the matching user (Dropbear multi-user mode,
+         `~user/.ssh/authorized_keys`) instead of always root;
+   - [ ] init's console runs `login` (or a getty) instead of a root bash, opt-out for dev.
+3. [ ] **More filesystems:**
+   - [ ] **exFAT read-write** (the specification is public since 2019): boot-sector
+         checksum, FAT + allocation bitmap, up-case table, directory entry sets with
+         name hashes; validated host-side with `fsck.exfat`;
+   - [ ] **NTFS read-only first, read-write later** — probably by porting Linux `ntfs3`
+         (GPLv2) through a compat shim, as done for ath9k (`drivers/ath9k_port/`).
+4. [ ] **init / services hardening:** DHCP lease renewal, service dependencies beyond
+   file order, per-service caps/limits, a GUI session that survives a console logout.
+5. [ ] **Signed packages**: package keyring + revocation (see Kernel robustness).
+6. [ ] **More ports** (see More source ports).
 
 ### Kernel robustness
 - [ ] **Buddy / free-list heap** — `mm/heap.c` is still a single-lock first-fit list.
@@ -164,6 +209,22 @@ robustness and the paused real-hardware bring-up — see below.
 - [ ] ELF-base ASLR (needs PIE user binaries); CFI.
 - [ ] **Driver Space depth**: real `DRIVER_OP_MAP_MEM`; IRQ-to-driver (`IRQ_SUBSCRIBE` +
       IPC queue); DMA sandbox; auto-restart. (Ported ath9k currently runs ring-0.)
+
+### Phase 4 — hardening (after Phase 3)
+Collects the items below plus three that have no entry yet:
+- [ ] SMAP by default and kernel KASLR (see Security depth).
+- [ ] **No low identity map in user address spaces**: every user PML4 still carries
+      the supervisor-only 0–512 MB identity map (uaccess rejects aliasing pointers since
+      `c536c03`, but the mapping itself remains); move its users (virtio DMA, early frame
+      access) to the physmap and drop it from user spaces.
+- [ ] **Exec confinement rule**: a process's caps come only from its own image's
+      manifest (`kernel/process.c`), so a `CAP_ENFORCE`-confined process holding
+      `CAP_PROC` can exec or spawn an ambient program and leave its confinement. Rule
+      to enforce: the new image's caps are bounded by the caller's (confinement is
+      inherited).
+- [ ] **Net stack locking**: `net/` assumes one core (no locks around sockets, TCP
+      state, ARP/routing); lock it before SMP is turned on.
+- [ ] SMP: TLB shootdown, IPI reschedule, per-CPU run queues (see SMP prep).
 
 ### SMP prep (QEMU `-smp 4`)
 - [ ] **TLB shootdown infrastructure** (IPI-based) — prerequisite for re-enabling SMP by
