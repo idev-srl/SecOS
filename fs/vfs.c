@@ -24,7 +24,28 @@ static spinlock_t g_mount_lock = SPINLOCK_INIT;
 
 static size_t str_len(const char* s){ size_t n=0; while(s[n]) n++; return n; }
 
-void vfs_init(void){ g_mount_count = 0; for(int i=0;i<VFS_MAX_MOUNTS;i++){ g_mounts[i].mount_point=NULL; g_mounts[i].ops=NULL; g_mounts[i].fs_name=NULL; } }
+// Mount-point strings are owned by the VFS. Callers pass whatever they have:
+// the mount syscall a kernel-stack copy of the user string, the shell its line
+// buffer. That pointer used to be stored verbatim, so a userland
+// `mount -t vfat|ext2 ... /x` left the table entry pointing at dead stack.
+// vfs_mount() now copies the path into one of these slots and vfs_unmount()
+// releases it. The slots are static, never freed memory, so a pointer handed
+// out by vfs_mount_info()/vfs_mount_point_of() stays a valid string even if it
+// races an unmount; it changes only when a later mount reuses the slot.
+#define VFS_MP_MAX 256
+static char    g_mp_store[VFS_MAX_MOUNTS][VFS_MP_MAX];
+static uint8_t g_mp_used[VFS_MAX_MOUNTS];
+
+static char* mp_store_get_nolock(void){
+    for(int i=0;i<VFS_MAX_MOUNTS;i++) if(!g_mp_used[i]){ g_mp_used[i]=1; return g_mp_store[i]; }
+    return NULL;
+}
+static void mp_store_put_nolock(const char* p){
+    for(int i=0;i<VFS_MAX_MOUNTS;i++) if(p==g_mp_store[i]){ g_mp_used[i]=0; return; }
+    // anything else is the root's string literal: nothing to release
+}
+
+void vfs_init(void){ g_mount_count = 0; for(int i=0;i<VFS_MAX_MOUNTS;i++){ g_mounts[i].mount_point=NULL; g_mounts[i].ops=NULL; g_mounts[i].fs_name=NULL; g_mp_used[i]=0; } }
 
 // Locate/replace the root ("/") mount slot (lock-free leaf — caller holds
 // g_mount_lock).
@@ -58,13 +79,24 @@ int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name){
 }
 
 // Mount a filesystem at an arbitrary absolute mount point (e.g. "/mnt").
+// The mount point is copied into VFS-owned storage (g_mp_store), so callers
+// may pass a temporary buffer. A trailing '/' is dropped so "/x/" and "/x"
+// name the same mount. fs_name must be a static string.
 int vfs_mount(const char* mount_point, const vfs_fs_ops_t* ops, const char* fs_name){
     if(!mount_point || !ops || !fs_name) return -1;
     if(mount_point[0] != '/') return -1;
+    char mp[VFS_MP_MAX]; size_t n = 0;
+    for(; mount_point[n]; n++){ if(n >= sizeof(mp)-1) return -1; mp[n] = mount_point[n]; }
+    while(n > 1 && mp[n-1]=='/') n--;
+    mp[n] = 0;
+    if(n == 1) return -1;                        // "/" goes through vfs_mount_root
     uint64_t fl = spin_lock_irqsave(&g_mount_lock);
-    if(find_mount_by_point_nolock(mount_point)){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
+    if(find_mount_by_point_nolock(mp)){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
     if(g_mount_count >= VFS_MAX_MOUNTS){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
-    g_mounts[g_mount_count].mount_point = mount_point;
+    char* own = mp_store_get_nolock();
+    if(!own){ spin_unlock_irqrestore(&g_mount_lock, fl); return -1; }
+    for(size_t k=0;k<=n;k++) own[k] = mp[k];
+    g_mounts[g_mount_count].mount_point = own;
     g_mounts[g_mount_count].ops = ops;
     g_mounts[g_mount_count].fs_name = fs_name;
     g_mount_count++;
@@ -82,7 +114,14 @@ int vfs_unmount(const char* mount_point){
     for(int i=0;i<g_mount_count;i++){
         const char* a=g_mounts[i].mount_point; const char* b=mount_point; size_t k=0; int eq=1;
         while(a[k]||b[k]){ if(a[k]!=b[k]){ eq=0; break; } k++; }
-        if(eq){ for(int j=i;j<g_mount_count-1;j++) g_mounts[j]=g_mounts[j+1]; g_mount_count--; spin_unlock_irqrestore(&g_mount_lock, fl); return 0; }
+        if(eq){
+            mp_store_put_nolock(a);
+            for(int j=i;j<g_mount_count-1;j++) g_mounts[j]=g_mounts[j+1];
+            g_mount_count--;
+            g_mounts[g_mount_count].mount_point=NULL; g_mounts[g_mount_count].ops=NULL; g_mounts[g_mount_count].fs_name=NULL;
+            spin_unlock_irqrestore(&g_mount_lock, fl);
+            return 0;
+        }
     }
     spin_unlock_irqrestore(&g_mount_lock, fl);
     return -1;
@@ -112,7 +151,7 @@ int vfs_unmount_all(void){
     for(int i=0;i<g_mount_count;i++){
         const char* mp = g_mounts[i].mount_point;
         if(mp[0]=='/' && mp[1]==0) g_mounts[w++] = g_mounts[i];   // keep the root
-        else n++;
+        else { mp_store_put_nolock(mp); n++; }
     }
     g_mount_count = w;
     spin_unlock_irqrestore(&g_mount_lock, fl);
