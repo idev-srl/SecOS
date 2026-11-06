@@ -54,6 +54,8 @@
 #include "fbdev.h"      // [M40] KDSETMODE console handoff, KDSKBLAYOUT
 #include "keyboard.h"   // [M40] keymap selection
 #include "debugcon.h"
+#include "cred.h"
+#include "../fs/vfs.h"
 
 extern int  keyboard_getc_raw(void);
 extern bool keyboard_input_pending_noirq(void);
@@ -650,7 +652,18 @@ int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) {
 
 /* [M40] Console-only requests: graphics handoff (KDSETMODE/KDGETMODE, see
  * drivers/fbdev.c) and the keyboard layout (KDSKBLAYOUT/KDGKBLAYOUT). */
+/* [M42] Global console state (layout, graphics mode): root, or the user the
+ * console belongs to (login chowns /dev/console to whoever logs in there). */
+static int console_owner_ok(void) {
+    extern process_t* sched_get_current(void);
+    extern vfs_inode_t* vfs_lookup(const char*);
+    process_t* c = sched_get_current();
+    if (cred_is_root(c)) return 1;
+    vfs_inode_t* con = vfs_lookup("/dev/console");
+    return con && con->uid == c->cred.euid;
+}
 static int console_kd_ioctl(uint64_t cmd, uint64_t arg) {
+    if ((cmd == KDSKBLAYOUT || cmd == KDSETMODE) && !console_owner_ok()) return -1;   /* -EPERM */
     if (cmd == KDSKBLAYOUT) {
         char name[16];
         int i = 0;
