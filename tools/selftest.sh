@@ -2185,6 +2185,85 @@ else
     FAIL=$((FAIL+1))
 fi
 rm -rf "$MHD"
+# ============================================================================
+# READ-ONLY MOUNT GATE ([M46], docs/devlog/M46-exec-confinement.md): `mount -o
+# ro` for FAT32 and ext2/ext4 (EROFS on every change, nothing written to the
+# disk), `mount -o remount,ro|rw`, and ext4 `ro,noload` (no journal replay; a
+# plain ro mount replays a dirty journal, as Linux does). q35/AHCI: vfat sda
+# (boot /mnt), clean ext4 sdb (must stay byte-identical), a dirty-journal ext4
+# sdc (the boot root probe must not replay it) and an ext4 sdd for remount.
+# ============================================================================
+ROD=/tmp/secos_selftest_ro
+ROLOG=/tmp/secos_selftest_ro.log
+ROSER=/tmp/secos_selftest_ro.ser
+echo "[selftest] Building read-only mount disks + default image..."
+make clean >/dev/null 2>&1 || true
+rm -rf "$ROD"; mkdir -p "$ROD/stage" "$ROD/jstage"
+printf 'hello from disk\n' > "$ROD/stage/hello.txt"
+printf 'OLDOLDOLDOLD\n' > "$ROD/jstage/target.bin"
+if dd if=/dev/zero of="$ROD/fat.img" bs=1M count=64 status=none && mkfs.fat -F 32 -n SECOSDATA "$ROD/fat.img" >/dev/null \
+   && mcopy -i "$ROD/fat.img" "$ROD/stage/hello.txt" ::HELLO.TXT \
+   && dd if=/dev/zero of="$ROD/ext4.img" bs=1M count=64 status=none && mkfs.ext4 -q -F -L SECOSRO -d "$ROD/stage" "$ROD/ext4.img" \
+   && cp "$ROD/ext4.img" "$ROD/ext4rw.img" \
+   && mke2fs -F -q -t ext4 -O has_journal,^metadata_csum,^64bit -b 1024 -d "$ROD/jstage" "$ROD/jrnl.img" 16384 >/dev/null \
+   && python3 tools/mk_dirty_journal.py "$ROD/jrnl.img" /target.bin NEW >/dev/null 2>&1 \
+   && make iso >/tmp/secos_selftest_build.log 2>&1; then
+    ro_md5=$(md5sum < "$ROD/ext4.img")
+    echo "[selftest] Running read-only mount gate (q35, 4 SATA disks, serial bash, 120s)..."
+    : > "$ROLOG"
+    ( sleep 30
+      printf '  umount /mnt; mkdir -p /x /y /z /w; echo RO0-$?\r'; sleep 3
+      printf '  mount -t vfat -o ro /dev/sda /x && echo RO1-$(cat /x/hello.txt)-$(grep -c "^/dev/sda /x vfat ro" /proc/mounts)\r'; sleep 3
+      printf '  touch /x/new 2>/tmp/e; echo RO2-$?-$(ls /x | grep -ci new)-$(grep -c "Read-only file system" /tmp/e)\r'; sleep 3
+      printf '  rm -f /x/hello.txt; mkdir /x/d 2>/dev/null; mv /x/hello.txt /x/h2 2>/dev/null; echo RO3-$(cat /x/hello.txt)-$(ls /x | grep -c "^d$")\r'; sleep 3
+      printf '  mount -o remount,rw /x && echo hi > /x/new && echo RO4-$(cat /x/new)-$(grep -c "^/dev/sda /x vfat rw" /proc/mounts)\r'; sleep 3
+      printf '  mount -o remount,ro /x && (echo z > /x/new) 2>/dev/null; echo RO5-$?-$(cat /x/new)-$(grep -c "^/dev/sda /x vfat ro" /proc/mounts); umount /x\r'; sleep 3
+      printf '  mount -t ext4 -o ro /dev/sdb /y && echo RO6-$(cat /y/hello.txt)-$(grep -c "^/dev/sdb /y ext4 ro" /proc/mounts)\r'; sleep 3
+      printf '  mkdir /y/d 2>/dev/null; echo RO7-$?; (echo x > /y/hello.txt) 2>/dev/null; echo RO8-$?-$(cat /y/hello.txt)\r'; sleep 3
+      printf '  chmod 600 /y/hello.txt 2>/dev/null; echo RO9-$?; ln -s a /y/l 2>/dev/null; echo RO10-$?; umount /y; echo RO11-$?\r'; sleep 3
+      printf '  mount -t ext4 -o ro /dev/sdd /w && mount -o remount,rw /w && echo w > /w/w.txt && echo RO12-$(cat /w/w.txt)-$(grep -c "^/dev/sdd /w ext4 rw" /proc/mounts)\r'; sleep 3
+      printf '  mount -o remount,ro /w && touch /w/w2 2>/dev/null; echo RO13-$?-$(grep -c "^/dev/sdd /w ext4 ro" /proc/mounts); umount /w\r'; sleep 3
+      printf '  mount -t ext4 -o noload /dev/sdc /z 2>/dev/null && echo RO14-0 || echo RO14-1\r'; sleep 3
+      printf '  mount -t ext4 -o ro,noload /dev/sdc /z && echo RO15-$(head -c 3 /z/target.bin)\r'; sleep 3
+      printf '  mount -o remount,rw /z 2>/dev/null && echo RO16-0 || echo RO16-1; umount /z\r'; sleep 3
+      printf '  mount -t ext4 -o ro /dev/sdc /z && echo RO17-$(head -c 3 /z/target.bin); umount /z; echo ROEND\r'; sleep 4
+    ) | timeout 120 qemu-system-x86_64 -machine q35 -cdrom myos.iso -boot d -m 256M \
+        -drive file="$ROD/fat.img",format=raw,if=ide,index=0 \
+        -drive file="$ROD/ext4.img",format=raw,if=ide,index=1 \
+        -drive file="$ROD/jrnl.img",format=raw,if=ide,index=3 \
+        -drive file="$ROD/ext4rw.img",format=raw,if=ide,index=4 \
+        -debugcon file:"$ROLOG" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -display none -serial stdio >"$ROSER" 2>&1
+    tr -d '\r' < "$ROSER" > "$ROSER.txt"; ROSER="$ROSER.txt"
+    ro() { grep -aq "^$1\$" "$ROSER"; check "RO $2" $?; }
+    ro "RO1-hello from disk-1" "vfat: mount -o ro, /proc/mounts says ro"
+    ro "RO2-1-0-1"             "vfat ro: touch fails with EROFS, no file created"
+    ro "RO3-hello from disk-0" "vfat ro: rm/mkdir/mv refused, file intact"
+    ro "RO4-hi-1"              "vfat: mount -o remount,rw, then a write works"
+    ro "RO5-1-hi-1"            "vfat: mount -o remount,ro, then writes fail again"
+    ro "RO6-hello from disk-1" "ext4: mount -o ro, /proc/mounts says ro"
+    ro "RO7-1"                 "ext4 ro: mkdir refused"
+    ro "RO8-1-hello from disk" "ext4 ro: write refused, file intact"
+    ro "RO9-1"                 "ext4 ro: chmod refused"
+    ro "RO10-1"                "ext4 ro: symlink refused"
+    ro "RO11-0"                "ext4 ro: umount"
+    [[ "$(md5sum < "$ROD/ext4.img")" == "$ro_md5" ]]; check "RO ext4 ro mount wrote nothing (image byte-identical)" $?
+    ro "RO12-w-1"              "ext4: ro then remount,rw, a write works"
+    ro "RO13-1-1"              "ext4: remount,ro refuses writes again"
+    [[ "$(debugfs -R 'cat /w.txt' "$ROD/ext4rw.img" 2>/dev/null)" == "w" ]] && e2fsck -fn "$ROD/ext4rw.img" >/dev/null 2>&1
+    check "RO ext4 remounted volume: the rw write is on disk, e2fsck-clean" $?
+    ro "RO14-1"                "ext4: noload without ro is refused (EINVAL)"
+    ro "RO15-OLD"              "ext4 ro,noload: the dirty journal is not replayed (boot probe left it too)"
+    ro "RO16-1"                "ext4: remount,rw of a noload mount with a dirty journal is refused"
+    ro "RO17-NEW"              "ext4 ro: a dirty journal is replayed (Linux semantics)"
+    e2fsck -fn "$ROD/jrnl.img" >/dev/null 2>&1; check "RO replayed journal volume e2fsck-clean" $?
+    grep -aq "^ROEND" "$ROSER"; check "RO script completed" $?
+    ! grep -aq "\[EXC\]\|\[PANIC\]" "$ROLOG"; check "RO no CPU exception or panic" $?
+else
+    echo "  [FAIL] read-only mount image/disk build (see /tmp/secos_selftest_build.log)"
+    FAIL=$((FAIL+1))
+fi
+rm -rf "$ROD"
 # ---- M42: NTFS read-only (host-made image, listing vs ntfs-3g, corrupt images) ----
 # The image is made by the real host tools (mkntfs + ntfs-3g in a user
 # namespace, tools/ntfs-host.sh); ntfs-3g's listing of it (type, size and
