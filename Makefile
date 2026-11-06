@@ -266,8 +266,47 @@ iso: $(KERNEL)
 # kernel includes the committed crypto/user_*_elf.h, so this only needs to run
 # when a user program changes (keeps the kernel build python-free).
 USER_CFLAGS = -ffreestanding -nostdlib -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 -Wall -Iuser -Iuser/include -ffunction-sections -fdata-sections
+# crypt()/crypt_r() from musl 1.2.5 (MIT, third_party/musl-crypt/, unmodified;
+# refresh with tools/vendor-musl-crypt.sh) + user/crypt_glue.c + the pwhash
+# helpers (user/pwhash.c), archived as user/libcrypt.a - the SecOS -lcrypt.
+# Put it last on the link line (after the program objects). Being an archive,
+# only programs that call crypt()/crypt_r()/secos_* pull it in, so programs
+# with their own crypt stub (busybox_compat.c, dropbear_compat.c) are
+# unaffected. musl's internal <crypt.h> must win over user/include/crypt.h
+# for the vendored files, hence the include order.
+# Host KAT: tools/crypt_kat/run.sh.
+MUSL_CRYPT      = third_party/musl-crypt
+LIBCRYPT        = user/libcrypt.a
+LIBCRYPT_CFLAGS = -I$(MUSL_CRYPT)/src/include -Iuser/musl-crypt-compat $(USER_CFLAGS) -Wno-sign-compare -Wno-missing-braces
+LIBCRYPT_VENDOR = crypt crypt_sha256 crypt_sha512 crypt_blowfish
+.PHONY: libcrypt
+libcrypt:
+	mkdir -p user/cryptobj
+	rm -f user/cryptobj/*.o
+	for f in $(LIBCRYPT_VENDOR); do \
+	    $(CC) $(LIBCRYPT_CFLAGS) -c $(MUSL_CRYPT)/src/crypt/$$f.c -o user/cryptobj/musl_$$f.o || exit 1; \
+	done
+	$(CC) $(LIBCRYPT_CFLAGS) -c user/crypt_glue.c -o user/cryptobj/crypt_glue.o
+	$(CC) $(USER_CFLAGS)     -c user/pwhash.c     -o user/cryptobj/pwhash.o
+	rm -f $(LIBCRYPT)
+	ar rcs $(LIBCRYPT) user/cryptobj/*.o
+# Signed in-guest crypt() known-answer test -> user/crypt_test.elf (+ the
+# embeddable crypto/user_crypt_test_elf.h). `make crypt-test` builds it on its
+# own (the selftest crypt gate runs it from an ext2 data disk at /mnt).
+.PHONY: crypt-test crypt-test-link
+crypt-test: libcrypt
+	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note.S       -o user/note.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c   -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c       -o user/libc.o
+	$(MAKE) --no-print-directory crypt-test-link
+crypt-test-link:
+	$(CC) $(USER_CFLAGS) -c user/crypt_test.c -o user/crypt_test.o
+	$(LD) --gc-sections -T user/user.ld -o user/crypt_test.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/crypt_test.o $(LIBCRYPT)
+	python3 tools/secos-sign user/crypt_test.elf --dev
+	python3 tools/elf2h.py user/crypt_test.elf user_crypt_test_elf crypto/user_crypt_test_elf.h
 .PHONY: user-progs
-user-progs:
+user-progs: libcrypt
 	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
 	$(CC) $(USER_CFLAGS) -c user/note.S       -o user/note.o
 	$(CC) $(USER_CFLAGS) -c user/note_driver.S -o user/note_driver.o
@@ -455,6 +494,8 @@ user-progs:
 	$(LD) --gc-sections -T user/user.ld -o user/ptytest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/ptytest.o
 	python3 tools/secos-sign user/ptytest.elf --dev
 	python3 tools/elf2h.py user/ptytest.elf user_ptytest_elf crypto/user_ptytest_elf.h
+	# [crypt] crypt()/pwhash known-answer test (musl SHA-crypt + bcrypt vectors)
+	$(MAKE) --no-print-directory crypt-test-link
 	# [M40] GUI kernel interfaces: /dev/fb0 + /dev/input/eventN demo and test
 	# (signed with the CAP_INPUT|CAP_DISPLAY manifest), a capability-less twin
 	# of the test (refusals), and loadkeys (console keyboard layout)
