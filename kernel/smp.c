@@ -103,6 +103,9 @@ void ap_entry(void) {
 #ifdef SECOS_B3_BLKSTRESS
         { extern void blkstress_ap(cpu_t*); blkstress_ap(c); }                    // [M50 B3]
 #endif
+#ifdef SECOS_VFS_TEST
+        { extern void vfstest_ap(cpu_t*); vfstest_ap(c); }                        // [M51 C1]
+#endif
         sched_reap_zombies();
         cpu_wait_irq();
     }
