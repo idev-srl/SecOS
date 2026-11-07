@@ -86,6 +86,18 @@ static const uint16_t g_bkl_free_d3[] = {
     SYS_LINK, SYS_TRUNCATE, SYS_RMDIR, SYS_ACCESS,
 };
 
+/* D4: read/write/ioctl/poll, which dispatch on the fd type: files (page cache
+ * or the driver under its lock, user copies through a bounce buffer outside
+ * every lock), pipes (g_pipe_lock), sockets (net_lock), ptys (g_pty_lock),
+ * the console line discipline (tty_con_lock; its waits hold no klock),
+ * devfs nodes (no devfs klock on the console/tty paths; /dev/random in
+ * 256-byte csprng chunks; raw block nodes under the base disk's lock),
+ * evdev (g_input_lock), fb0 (stateless; KD mode under con_lock), procfs and
+ * sysfs (their own locks, generated into kernel buffers). */
+static const uint16_t g_bkl_free_d4[] = {
+    SYS_READ, SYS_WRITE, SYS_IOCTL, SYS_POLL,
+};
+
 static void bkl_mask_clear(const uint16_t* nums, unsigned n) {
     for (unsigned i = 0; i < n; i++)
         if (nums[i] < SYSCALL_BKL_NR)
@@ -104,6 +116,7 @@ void bkl_init_mode(void) {
     extern int kernel_cmdline_has(const char* word);
     BKL_MASK_CLEAR(g_bkl_free_d1);
     BKL_MASK_CLEAR(g_bkl_free_d3);
+    BKL_MASK_CLEAR(g_bkl_free_d4);
     if (kernel_cmdline_has("bkl=off")) g_bkl_mode = 0;
     else if (kernel_cmdline_has("bkl=on")) g_bkl_mode = 1;
     else g_bkl_mode = BKL_MODE_DEFAULT;
