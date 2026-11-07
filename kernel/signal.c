@@ -78,7 +78,7 @@ int signal_take_stop(process_t* p) {
     for (int s = 1; s < NSIG; s++) {
         if (!((deliverable >> s) & 1)) continue;
         if (s == SIGSTOP || (sig_default_stop(s) && p->sig_handler[s] == SIG_DFL)) {
-            p->sig_pending &= ~SIGBIT(s);
+            __atomic_and_fetch(&p->sig_pending, ~SIGBIT(s), __ATOMIC_SEQ_CST);   // [M48] other CPUs post concurrently
             return s;
         }
     }
@@ -102,8 +102,8 @@ int signal_post(process_t* p, int sig) {
 
     // SIGCONT cancels pending stops and resumes a stopped process.
     if (sig == SIGCONT) {
-        p->sig_pending &= ~(SIGBIT(SIGSTOP) | SIGBIT(SIGTSTP) |
-                            SIGBIT(SIGTTIN) | SIGBIT(SIGTTOU));
+        __atomic_and_fetch(&p->sig_pending, ~(SIGBIT(SIGSTOP) | SIGBIT(SIGTSTP) |
+                            SIGBIT(SIGTTIN) | SIGBIT(SIGTTOU)), __ATOMIC_SEQ_CST);
         if (p->state == PROC_STOPPED && sched_wake_task(p, PROC_STOPPED)) {
             // waitpid(WCONTINUED) report + SIGCHLD to the parent (POSIX).
             p->stop_report = 0; p->cont_report = 1;
@@ -115,9 +115,9 @@ int signal_post(process_t* p, int sig) {
     // pending SIGKILL is acted on at its next kernel exit.
     if (sig == SIGKILL && p->state == PROC_STOPPED && sched_wake_task(p, PROC_STOPPED)) p->stop_report = 0;
     // A stop signal cancels a pending SIGCONT.
-    if (sig_default_stop(sig)) p->sig_pending &= ~SIGBIT(SIGCONT);
+    if (sig_default_stop(sig)) __atomic_and_fetch(&p->sig_pending, ~SIGBIT(SIGCONT), __ATOMIC_SEQ_CST);
 
-    p->sig_pending |= SIGBIT(sig);
+    __atomic_or_fetch(&p->sig_pending, SIGBIT(sig), __ATOMIC_SEQ_CST);   // [M48] atomic: ISRs and other CPUs post too
     sched_wake_note();      // [M48] a task deciding to block right now re-checks
 
     int deliverable = (sig == SIGKILL || sig == SIGSTOP) ||
@@ -209,7 +209,7 @@ void signal_dispatch(trapframe_t* tf) {
             if (cur->sigsusp_active) { cur->sig_blocked = cur->sigsusp_saved; cur->sigsusp_active = 0; }
             return;
         }
-        cur->sig_pending &= ~SIGBIT(sig);
+        __atomic_and_fetch(&cur->sig_pending, ~SIGBIT(sig), __ATOMIC_SEQ_CST);
 
         uint64_t disp = cur->sig_handler[sig];
 
