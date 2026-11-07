@@ -147,11 +147,31 @@ struct klock* lock;    /* the instance's K30 klock (LK_K30_FS) */
   The driver's own lock must then cover truncate against append.
 - A driver's mount routine **may** call `vfs_mount*` while holding its
   K30 lock. It must **not** call `vfs_unmount*`, which can take K20.
-- **Readdir callbacks run inside the FS**, under its lock once it has one.
-  A callback must not call back into the VFS or copy to user space.
-  `ksys_getdents` already buffers into kernel memory. The kernel shell's
-  `vls`/`ls` callbacks call `pager_print`, which can wait for a key with
-  the FS lock held; C2/D must buffer there.
+- **Readdir callbacks are called with no FS lock held** (rule in
+  `fs/vfs.h` on `readdir`, agreed with C2). The driver collects the
+  entries under its lock and emits them after it unlocks. A callback may
+  block (the kernel shell's `vls`/`ls` page and wait for a key) or call
+  back into the VFS. The VFS keeps only the mount ref across the listing.
+- **`mntinfo` must be lock-free**: no klock, no blocking, stable strings.
+  procfs `gen_mounts` calls it under `g_proc_lock` (a spinlock), and
+  `vfs_dev_for` calls it during mount.
+- **`setattr` fallback.** For an FS without `->setattr` (procfs and sysfs
+  today; ramfs and devfs have their own since C2), `vfs_setattr` looks the
+  inode up first, then writes mode/uid/gid/times under `ops->lock` when it
+  is set.
+- **ramfs (C2) integration.** C2 handles appends inside
+  `ramfs_vfs_write_locked` with an offset sentinel
+  (`offset == VFS_OFF_APPEND → e->size`). This branch does not define
+  `VFS_OFF_APPEND`, because `->write` cannot return the offset the data
+  landed at. The integrator wires ramfs with:
+  - `.lock = <the ramfs klock>`;
+  - `.append = ramfs_vfs_append`, written as
+    `lock; off = e->size; r = ramfs_vfs_write_locked(ino, off, buf, len); *at = off; unlock`
+    (or by passing the sentinel and reading `e->size` before the write,
+    still under the lock).
+
+  ramfs is only the root and is never unmounted, so draining is a no-op
+  for it.
 - **Never clear `ino->ops`** on a shared inode in lookup or readdir. ramfs
   did this (`ino->ops = NULL` in `ramfs_vfs_lookup` and in its readdir).
   The VFS restamps the field after every lookup, but an fd on another CPU
@@ -248,9 +268,8 @@ disk. Both runs: `RESULT PASS`, no `[EXC]`, no `[LOCKDEP]`, no
 - **The K25 fallback serializes all appends system-wide** for FSes without
   `->append`. C2–C4 should implement `->append`. ramfs and ext4 matter most
   (logs).
-- **`vfs_setattr` fallback.** For FSes without `setattr` it writes the
-  shared in-memory inode (mode, uid, times) under a mount ref only.
-  C2 (ramfs/devfs) should move it under their lock or provide `setattr`.
+- **`vfs_setattr` fallback.** It takes `ops->lock` only once the drivers
+  set `.lock`; until then it is a bare write under a mount ref.
 - **Drain timeout.** It is 5 s. A ref leak shows up as every umount of that
   mount returning EBUSY with the `[VFS] umount: …did not drain` line, not as
   a hang.

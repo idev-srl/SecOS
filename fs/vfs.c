@@ -453,8 +453,8 @@ int vfs_readdir(const char* path, vfs_iter_cb cb, void* user){
     // list the canonical target. Plain directories keep their exact path.
     vfs_inode_t* d = vfs_lookup(path);
     if((!d || d->type!=VFS_NODE_DIR) && path && path[0]=='/' && vfs_walk(path, cp, sizeof(cp), 1)==0) path = cp;
-    // The callback runs inside the filesystem (under its instance lock once
-    // the driver has one): it must not call back into the VFS.
+    // The callback is called by the driver with NO FS lock held (contract in
+    // vfs.h); only this mount's ref is held across the whole listing.
     vfs_mref_t m;
     if(vfs_resolve(path, rel, sizeof(rel), &m)) return -1;
     int r = m.ops->readdir ? m.ops->readdir(rel, cb, user) : -1;
@@ -822,7 +822,11 @@ static int vfs_setattr_mnt(const vfs_mref_t* m, const char* cp, const char* rel,
     // A filesystem with no on-disk metadata (ramfs, devfs incl. /dev/pts, the
     // virtual ones): keep the change on the in-memory inode, like devtmpfs, so
     // chmod/chown succeed (sshd/login chmod the pty slave) and stat shows them.
+    // [M51 C1] The fields live in the driver's inode: written under its
+    // instance lock (ops->lock) when it has one. The lookup runs first and
+    // outside it (the driver's lookup takes that lock itself).
     vfs_inode_t* ino=vfs_lookup(cp); if(!ino) return -2;
+    if(m->ops->lock) klock_lock(m->ops->lock);
     if(valid & VFS_ATTR_MODE){
         uint32_t t = ino->mode & 0170000u;
         if(!t) t = ino->type==VFS_NODE_DIR ? 0040000u : ino->type==VFS_NODE_SYMLINK ? 0120000u : 0100000u;
@@ -832,6 +836,7 @@ static int vfs_setattr_mnt(const vfs_mref_t* m, const char* cp, const char* rel,
     if(valid & VFS_ATTR_GID)   ino->gid = a->gid;
     if(valid & VFS_ATTR_ATIME) ino->atime = a->atime;
     if(valid & VFS_ATTR_MTIME) ino->mtime = a->mtime;
+    if(m->ops->lock) klock_unlock(m->ops->lock);
     return 0;
 }
 int vfs_readlink(const char* path, char* buf, size_t len){

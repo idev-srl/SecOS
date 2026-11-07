@@ -81,6 +81,10 @@ typedef struct vfs_fs_ops {
     // Lookup path (absolute, no trailing slash except root). Returns NULL if not found.
     vfs_inode_t* (*lookup)(const char* path);
     // Iterate direct children of a directory path.
+    // [M51 C1] The driver must call `cb` with its instance lock NOT held
+    // (collect the entries under the lock, emit them after unlocking): a
+    // callback may block (the kernel shell's ls pages and waits for a key)
+    // or call back into the VFS.
     int (*readdir)(const char* dir_path, vfs_iter_cb cb, void* user);
     // Read file contents into buffer, returns bytes read or -1.
     int (*read)(vfs_inode_t* inode, size_t offset, void* buf, size_t len);
@@ -97,7 +101,8 @@ typedef struct vfs_fs_ops {
     // Truncate file
     int (*truncate)(const char* path, size_t new_size);
     // [M26] Change attributes (mode/uid/gid/times); `valid` = VFS_ATTR_* bitmask.
-    // NULL = no on-disk metadata: vfs_setattr updates the in-memory inode. Returns 0/-1.
+    // NULL = no on-disk metadata: vfs_setattr updates the in-memory inode
+    // (under `lock` below when set, after the lookup). Returns 0/-1.
     int (*setattr)(const char* path, const vfs_attr_t* a, unsigned valid);
     // [M26] Read a symlink's target into buf (NUL-terminated). Returns length or -1.
     int (*readlink)(const char* path, char* buf, size_t len);
@@ -114,6 +119,8 @@ typedef struct vfs_fs_ops {
     int (*statfs)(vfs_statfs_t* st);
     // Mount-table info for /proc/mounts: backing device name + filesystem type
     // ("ext4", "vfat", ...). NULL = virtual FS (the mount's fs name is used).
+    // [M51 C1] Must be lock-free (no klock, no blocking): procfs calls it
+    // under its g_proc_lock spinlock. Return pointers to stable strings.
     int (*mntinfo)(const char** source, const char** fstype);
     // [M46] mount -o remount,ro|rw: switch the mounted volume. 0 or -errno
     // (-EROFS: the device or the volume cannot be written). NULL = unsupported.
@@ -125,6 +132,10 @@ typedef struct vfs_fs_ops {
     // "fresh ->lookup(ino->path) size, then ->write" under its own
     // vfs_append_lock (K25), which serializes every appender of every
     // filesystem without ->append (and their truncates) system-wide.
+    // A driver whose write_locked already understands an "append" offset
+    // sentinel wraps it: lock(); off = <size>; r = write_locked(ino, off, ..);
+    // *at = off; unlock(); — `at` must be the real offset (the fd offset and
+    // the page-cache invalidation range come from it).
     int (*append)(vfs_inode_t* inode, const void* buf, size_t len, uint64_t* at);
     // [M51 C1] The driver instance's K30 klock (LK_K30_FS), or NULL. The VFS
     // never holds it while calling an op (every exported op takes it
