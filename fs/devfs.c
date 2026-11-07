@@ -33,6 +33,7 @@
 #include "process.h"
 #include "cred.h"
 #include "heap.h"
+#include "spinlock.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -48,11 +49,29 @@ struct dev_node {
     block_dev_t* blk;     // for DEV_BLOCK
 };
 
+/*
+ * [M51 C2] The node table is built when devfs is mounted (all boot-time
+ * drivers are up by then) instead of lazily on the first access, which could
+ * run on two CPUs at once. Node i and its inode are filled completely before
+ * g_nnodes is raised past it (release store; readers load it with acquire), so
+ * lookups and listings read the table without a lock. Nothing in a published
+ * node or its inode changes afterwards except mode/uid/gid (chmod/chown, e.g.
+ * login chowning /dev/console), which devfs_setattr writes under g_devfs_lock.
+ * Block devices registered after the mount (shell `usbrescan`) are appended by
+ * devfs_sync_blocks under the same lock -- the old lazy build never showed
+ * them. The lock is a leaf-ish spinlock (S15): inside it only the block
+ * registry (S64) is taken, and devfs never calls the pty/input namespaces
+ * (S10/S15) while holding it.
+ */
 #define DEVFS_MAX 24
 static struct dev_node g_nodes[DEVFS_MAX];
-static int g_nnodes;
+static volatile int g_nnodes;
 static vfs_inode_t g_inodes[DEVFS_MAX + 1];   // +1 for the root dir
-static int g_built;
+static int g_blk_seen;                        // block_count() the table reflects
+static spinlock_t g_devfs_lock = SPINLOCK_INIT_CLASS(LK_S15_SUBSYS, "devfs");
+static vfs_fs_ops_t devfs_ops;
+
+static int nnodes(void) { return __atomic_load_n(&g_nnodes, __ATOMIC_ACQUIRE); }
 
 static void sset(char* d, const char* s) { int i=0; while(s[i] && i<15){ d[i]=s[i]; i++; } d[i]=0; }
 static int seq(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
@@ -75,25 +94,62 @@ static uint32_t dev_mode(enum dev_kind k, uint32_t* gid) {
     }
     return 0020600;
 }
+static uint64_t dev_size(const struct dev_node* d) {
+    if (d->kind == DEV_BLOCK && d->blk) return d->blk->sector_count * (uint64_t)d->blk->sector_size;
+    return 0;   // char devices report size 0
+}
+
+// Append one node with its complete inode, then publish it. Caller holds
+// g_devfs_lock (or is the mount, before devfs is reachable).
 static void add(const char* name, enum dev_kind k, block_dev_t* b) {
-    if (g_nnodes >= DEVFS_MAX) return;
-    sset(g_nodes[g_nnodes].name, name);
-    g_nodes[g_nnodes].kind = k;
-    g_nodes[g_nnodes].blk = b;
+    int i = g_nnodes;
+    if (i >= DEVFS_MAX) return;
+    sset(g_nodes[i].name, name);
+    g_nodes[i].kind = k;
+    g_nodes[i].blk = b;
+    vfs_inode_t* ino = &g_inodes[i];
+    ino->path[0]='/'; int p=1;
+    for (int j=0; g_nodes[i].name[j] && p<255; j++) ino->path[p++]=g_nodes[i].name[j];
+    ino->path[p]=0;
+    ino->type = VFS_NODE_FILE;
+    ino->size = dev_size(&g_nodes[i]);
+    ino->fs_data = &g_nodes[i];
+    ino->ops = &devfs_ops;
     uint32_t gid;
-    g_inodes[g_nnodes].mode = dev_mode(k, &gid);   // kept across lookups; chmod/chown change it
-    g_inodes[g_nnodes].uid = 0;
-    g_inodes[g_nnodes].gid = gid;
-    g_inodes[g_nnodes].nlink = 1;
-    g_nnodes++;
+    ino->mode = dev_mode(k, &gid);   // kept across lookups; chmod/chown change it
+    ino->uid = 0;
+    ino->gid = gid;
+    ino->nlink = 1;
+    __atomic_store_n(&g_nnodes, i + 1, __ATOMIC_RELEASE);
+}
+static int has_blk(const block_dev_t* b) {
+    for (int i=0;i<g_nnodes;i++) if (g_nodes[i].kind == DEV_BLOCK && g_nodes[i].blk == b) return 1;
+    return 0;
+}
+// Append block devices registered since the table was last synced (the
+// registry only grows). Cheap when nothing changed: one block_count().
+static void devfs_sync_blocks(void) {
+    int n = block_count();
+    if (n == __atomic_load_n(&g_blk_seen, __ATOMIC_ACQUIRE)) return;
+    uint64_t fl = spin_lock_irqsave(&g_devfs_lock);
+    n = block_count();
+    for (int i = 0; i < n; i++) {
+        block_dev_t* b = block_get(i);
+        if (b && b->name && !has_blk(b)) add(b->name, DEV_BLOCK, b);
+    }
+    __atomic_store_n(&g_blk_seen, n, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&g_devfs_lock, fl);
 }
 
 // Build the device table from the synthetic char devices + every registered
-// block device. Called lazily on first VFS access (so all drivers are up).
+// block device. Called once, from devfs_mount.
 static void devfs_build(void) {
-    if (g_built) return;
-    g_built = 1;
-    g_nnodes = 0;
+    uint64_t fl = spin_lock_irqsave(&g_devfs_lock);
+    if (g_nnodes) { spin_unlock_irqrestore(&g_devfs_lock, fl); return; }
+    vfs_inode_t* root = &g_inodes[DEVFS_MAX];
+    root->path[0]='/'; root->path[1]=0; root->type=VFS_NODE_DIR; root->size=0; root->fs_data=NULL;
+    root->ops = &devfs_ops;
+    root->mode = 0040755; root->uid = root->gid = 0; root->nlink = 2;   // [M43] /dev: root 0755
     add("null", DEV_NULL, NULL);
     add("zero", DEV_ZERO, NULL);
     add("full", DEV_FULL, NULL);
@@ -112,35 +168,20 @@ static void devfs_build(void) {
         block_dev_t* b = block_get(i);
         if (b && b->name) add(b->name, DEV_BLOCK, b);
     }
+    __atomic_store_n(&g_blk_seen, n, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&g_devfs_lock, fl);
 }
 
-static uint64_t dev_size(const struct dev_node* d) {
-    if (d->kind == DEV_BLOCK && d->blk) return d->blk->sector_count * (uint64_t)d->blk->sector_size;
-    return 0;   // char devices report size 0
-}
-
-// Fill an inode for node index i (or the root when i<0).
-static vfs_inode_t* fill_inode(int i) {
-    vfs_inode_t* ino = &g_inodes[i < 0 ? DEVFS_MAX : i];
-    if (i < 0) {
-        ino->path[0]='/'; ino->path[1]=0; ino->type=VFS_NODE_DIR; ino->size=0; ino->fs_data=NULL;
-        ino->mode = 0040755; ino->uid = ino->gid = 0; ino->nlink = 2;   // [M43] /dev: root 0755
-        return ino;
-    }
-    ino->path[0]='/'; int k=1; const char* s=g_nodes[i].name;
-    for (int j=0; s[j] && k<255; j++) ino->path[k++]=s[j]; ino->path[k]=0;
-    ino->type = VFS_NODE_FILE;
-    ino->size = dev_size(&g_nodes[i]);
-    ino->fs_data = &g_nodes[i];
-    return ino;
-}
+// The inode of node index i (or the root when i<0): fully built at add().
+static vfs_inode_t* node_inode(int i) { return &g_inodes[i < 0 ? DEVFS_MAX : i]; }
 
 static int find_node(const char* rel) {
     // rel is "/name"; skip the leading slash.
     if (!rel || rel[0] != '/') return -2;
     if (rel[1] == 0) return -1;             // root dir
     const char* name = rel + 1;
-    for (int i=0;i<g_nnodes;i++) {
+    int n = nnodes();
+    for (int i=0;i<n;i++) {
         if (!seq(g_nodes[i].name, name)) continue;
         if (g_nodes[i].kind == DEV_FB && !fbdev_present()) return -2;
         return i;
@@ -149,28 +190,52 @@ static int find_node(const char* rel) {
 }
 
 static vfs_inode_t* devfs_lookup(const char* rel) {
-    devfs_build();
     vfs_inode_t* pt = pty_devfs_lookup(rel);           /* /pts, /pts/N */
     if (pt) return pt;
     vfs_inode_t* in = input_devfs_lookup(rel);         /* /input, /input/eventN */
     if (in) return in;
+    devfs_sync_blocks();
     int i = find_node(rel);
     if (i == -2) return NULL;
-    return fill_inode(i);
+    return node_inode(i);
 }
 
+// The callbacks run with no devfs lock held (published nodes never change).
 static int devfs_readdir(const char* dir, vfs_iter_cb cb, void* user) {
-    devfs_build();
     if (!cb) return -1;
     if (dir && seq(dir, "/pts")) return pty_devfs_readdir(cb, user);
     if (dir && seq(dir, "/input")) return input_devfs_readdir(dir, (input_iter_cb)cb, user);
     if (!(dir && dir[0]=='/' && dir[1]==0)) return -1;   // only the root dir, /pts and /input list
-    for (int i=0;i<g_nnodes;i++) {
+    devfs_sync_blocks();
+    int n = nnodes();
+    for (int i=0;i<n;i++) {
         if (g_nodes[i].kind == DEV_FB && !fbdev_present()) continue;
-        cb(fill_inode(i), user);
+        cb(node_inode(i), user);
     }
     cb(pty_devfs_lookup("/pts"), user);
     input_devfs_readdir("/", (input_iter_cb)cb, user);
+    return 0;
+}
+
+// [M51 C2] chmod/chown/utimes on a device node: devfs keeps the metadata in
+// the node's inode (as the VFS fallback did), written under g_devfs_lock. The
+// lookup runs before the lock: /pts/N and /input/eventN inodes belong to
+// kernel/pty.c and drivers/input.c, whose own locks rank below this one.
+static int devfs_setattr(const char* rel, const vfs_attr_t* a, unsigned valid) {
+    if (!a) return -1;
+    vfs_inode_t* ino = devfs_lookup(rel);
+    if (!ino) return -2;                                           // -ENOENT
+    uint64_t fl = spin_lock_irqsave(&g_devfs_lock);
+    if (valid & VFS_ATTR_MODE) {
+        uint32_t t = ino->mode & 0170000u;
+        if (!t) t = ino->type==VFS_NODE_DIR ? 0040000u : ino->type==VFS_NODE_SYMLINK ? 0120000u : 0100000u;
+        ino->mode = t | (a->mode & 07777u);
+    }
+    if (valid & VFS_ATTR_UID)   ino->uid = a->uid;
+    if (valid & VFS_ATTR_GID)   ino->gid = a->gid;
+    if (valid & VFS_ATTR_ATIME) ino->atime = a->atime;
+    if (valid & VFS_ATTR_MTIME) ino->mtime = a->mtime;
+    spin_unlock_irqrestore(&g_devfs_lock, fl);
     return 0;
 }
 
@@ -331,9 +396,11 @@ static vfs_fs_ops_t devfs_ops = {
     .remove = devfs_ro_remove,
     .rename = devfs_ro_rename,
     .truncate = devfs_ro_trunc,
+    .setattr = devfs_setattr,
 };
 
 int devfs_mount(const char* mount_point) {
     extern int vfs_mount(const char*, const vfs_fs_ops_t*, const char*);
+    devfs_build();                    // [M51 C2] once, before /dev is reachable
     return vfs_mount(mount_point, &devfs_ops, "devfs");
 }
