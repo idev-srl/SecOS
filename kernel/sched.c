@@ -333,14 +333,24 @@ int sched_count_alive_user(void) {
     return c.n;
 }
 
+// [M52 D6] Teardown takes the kernel lock only with bkl=on. Everything it
+// touches has its own lock since phases B/C: fd objects (pipe, socket, pty,
+// input refs, each under its own lock; a file fd holds no FS reference),
+// driver bindings (driver_if_lock), the address space and frames (mm_lock,
+// PMM), the process table, parent wake-ups and re-parenting (proc_lock),
+// the console handoff (con_lock). A dying task is RUNNING and on its CPU,
+// so no wake-up CAS can move it, and the reaper only takes detached zombies.
+static inline void teardown_bkl_lock(void)   { if (g_bkl_mode) bkl_lock(); }
+static inline void teardown_bkl_unlock(void) { if (g_bkl_mode) bkl_unlock(); }
+
 void sched_reap_zombies(void) {
     // [M48] Reap every zombie that no CPU is on any more (process_reap_one
     // checks on_cpu and detaches it under the proc lock), from any CPU.
     process_t* z;
     while ((z = process_reap_one()) != NULL) {
-        bkl_lock();                     // [M48] teardown touches VFS/pty/console state
+        teardown_bkl_lock();            // [M48] bkl=on: as before
         process_destroy(z);             // frees space/tables/kstack/tf (zombie != current)
-        bkl_unlock();
+        teardown_bkl_unlock();
         process_reap_done();            // only now is its memory back in the PMM
     }
 }
@@ -372,7 +382,7 @@ void sched_exit_current(trapframe_t* tf) {
     (void)tf;
     process_t* cur = cur_task();
     if (!cur || cur == idle_of_cpu()) return;
-    bkl_lock();                        // [M48] teardown below; switch_to drops it
+    teardown_bkl_lock();               // [M48] bkl=on only (M52); switch_to drops it
     debugcon_writestring("[SCHED] exit ");
     debugcon_print_hex(cur->pid);
     debugcon_writestring("\n");
@@ -404,7 +414,7 @@ void sched_kill_current(int sig) {
         debugcon_kflush();
         for (;;) __asm__ volatile("cli; hlt");
     }
-    bkl_lock();                        // [M48] teardown below; switch_to drops it
+    teardown_bkl_lock();               // [M48] bkl=on only (M52); switch_to drops it
     debugcon_writestring("[KILL] pid=");
     debugcon_print_hex(cur->pid);
     debugcon_writestring(" sig=");
@@ -432,7 +442,7 @@ void sched_stop_current(trapframe_t* tf) {
     if (!cur || cur == idle_of_cpu()) {
         for (;;) __asm__ volatile("cli; hlt");
     }
-    bkl_lock();                        // [M48] notify paths below; switch_to drops it
+    teardown_bkl_lock();               // [M48] bkl=on only (M52); switch_to drops it
     debugcon_writestring("[STOP] pid=");
     debugcon_print_hex(cur->pid);
     debugcon_writestring("\n");
