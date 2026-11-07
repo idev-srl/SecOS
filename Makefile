@@ -63,6 +63,7 @@ SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.a
           $(ARCH_DIR)/uaccess.asm
 SRC_C   = \
 	$(KERNEL_DIR)/kernel.c \
+	$(KERNEL_DIR)/bkl.c \
 	$(ARCH_DIR)/idt.c $(ARCH_DIR)/tss.c $(ARCH_DIR)/context_switch.c \
 	$(ARCH_DIR)/lapic.c \
 	$(ARCH_DIR)/acpi.c \

@@ -23,6 +23,7 @@
 #include "vmm.h"
 #include "percpu.h"
 #include "lapic.h"
+#include "bkl.h"
 
 extern uint64_t timer_get_ticks(void);
 
@@ -168,6 +169,10 @@ static void switch_to(process_t* next) {
     __asm__ volatile ("cli" ::: "memory");
     cpu_t* me = this_cpu();
     process_t* prev = me->current;
+    // [M48] A task leaving the CPU mid-syscall (block/exit/kill/stop/yield)
+    // gives up the kernel lock; it re-runs its syscall from the start. (An
+    // idle task holding it is never switched away: see the tick.)
+    if (prev && prev != me->idle_task) bkl_drop_for(prev);
     { extern void kiface_count_switch(void); kiface_count_switch(); }   // /proc/stat ctxt
     fpu_switch(prev, next, me->idle_task);
     me->current = next;
@@ -229,6 +234,10 @@ void sched_on_timer_tick(trapframe_t* tf) {
     int from_user = ((tf->cs & 3) == 3);
 
     if (cur == me->idle_task) {
+        // [M48] ... unless it holds the kernel lock (a kernel-shell command or
+        // a reap in progress): the lock belongs to the idle task, which must
+        // finish its critical section first.
+        if (bkl_held_by(cur)) return;
         // Idle is always safe to preempt: hand the CPU to a runnable user task.
         // Save idle's interrupted context so that returning to it (after the
         // user task exits) resumes where it was — this lets the interactive
@@ -266,6 +275,7 @@ void sched_on_resched_ipi(trapframe_t* tf) {
     lapic_eoi();                       // before a switch that never returns here
     process_t* cur = me->current;
     if (!me->idle_task || !cur || cur != me->idle_task) return;
+    if (bkl_held_by(cur)) return;      // idle in a kernel-lock section: next tick
     process_t* next = claim_next(NULL);
     if (next) { if (cur->tf) save_tf(cur, tf); switch_to(next); }
 }
@@ -323,7 +333,10 @@ void sched_reap_zombies(void) {
     // checks on_cpu and detaches it under the proc lock), from any CPU.
     process_t* z;
     while ((z = process_reap_one()) != NULL) {
+        bkl_lock();                     // [M48] teardown touches VFS/pty/console state
         process_destroy(z);             // frees space/tables/kstack/tf (zombie != current)
+        bkl_unlock();
+        process_reap_done();            // only now is its memory back in the PMM
     }
 }
 
@@ -355,6 +368,7 @@ void sched_exit_current(trapframe_t* tf) {
     (void)tf;
     process_t* cur = cur_task();
     if (!cur || cur == idle_of_cpu()) return;
+    bkl_lock();                        // [M48] teardown below; switch_to drops it
     debugcon_writestring("[SCHED] exit ");
     debugcon_print_hex(cur->pid);
     debugcon_writestring("\n");
@@ -386,6 +400,7 @@ void sched_kill_current(int sig) {
         debugcon_kflush();
         for (;;) __asm__ volatile("cli; hlt");
     }
+    bkl_lock();                        // [M48] teardown below; switch_to drops it
     debugcon_writestring("[KILL] pid=");
     debugcon_print_hex(cur->pid);
     debugcon_writestring(" sig=");
@@ -411,6 +426,7 @@ void sched_stop_current(trapframe_t* tf) {
     if (!cur || cur == idle_of_cpu()) {
         for (;;) __asm__ volatile("cli; hlt");
     }
+    bkl_lock();                        // [M48] notify paths below; switch_to drops it
     debugcon_writestring("[STOP] pid=");
     debugcon_print_hex(cur->pid);
     debugcon_writestring("\n");
@@ -440,6 +456,7 @@ void sched_block_current(trapframe_t* tf) {
     if (sched_wake_seq() != cur->wake_snap) {
         process_unlock_irqrestore(fl);
         cur->wake_snap = sched_wake_seq();
+        bkl_drop_for(cur);             // back to ring 3 without passing syscall_handler's unlock
         arch_iret_to_tf(cur->tf);      // re-execute the rewound `int 0x80`
     }
     cur->state = PROC_BLOCKED;

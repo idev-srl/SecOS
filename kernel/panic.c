@@ -246,7 +246,22 @@ void exception_handler(struct registers* regs) {
         }
         // 1. Demand paging / COW first — also for ring-0 faults on user
         //    addresses (a not-yet-faulted syscall buffer, M14).
-        if (vmm_try_handle_page_fault(cr2, err_code) == 0) return;
+        //    [M48] A user-address fault walks the task's VMAs and may read a
+        //    file (file-backed mmap): under the kernel lock (recursive when the
+        //    fault comes from a syscall's user access).
+        {
+            int handled;
+            if (cr2 < USER_ADDR_MAX) {
+                extern void bkl_lock(void); extern void bkl_lock_enable_irq(void);
+                extern void bkl_unlock(void);
+                if ((regs->cs & 3) == 3) bkl_lock_enable_irq(); else bkl_lock();
+                handled = (vmm_try_handle_page_fault(cr2, err_code) == 0);
+                bkl_unlock();
+            } else {
+                handled = (vmm_try_handle_page_fault(cr2, err_code) == 0);
+            }
+            if (handled) return;
+        }
         // 2. Exception fixup: a ring-0 fault on a USER address raised by a
         //    registered user-access instruction (copy_from/to_user,
         //    strncpy_from_user) resumes at its fixup, which returns -EFAULT to

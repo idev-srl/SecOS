@@ -20,6 +20,7 @@
 #include "cap.h"
 #include "user_copy.h"
 #include "power.h"
+#include "bkl.h"
 
 #ifdef SYSCALL_DEBUG
 #include "terminal.h"
@@ -62,7 +63,19 @@ static struct proc_fd_entry* sock_wait_fd(process_t* cur, uint64_t num, uint64_t
 #define SOCK_O_NONBLOCK 0x800
 #define SOCK_WAIT_TICKS 2   // re-check readiness every ~2 ms (no RX wakeup hook yet)
 
+static uint64_t syscall_handler_body(trapframe_t* tf);
+
+// [M48] Every syscall body runs under the kernel lock (kernel/bkl.h). Paths
+// that never come back here (exit, block, stop, kill, a yield that switched)
+// drop it in switch_to().
 uint64_t syscall_handler(trapframe_t* tf) {
+    bkl_lock_enable_irq();
+    uint64_t r = syscall_handler_body(tf);
+    bkl_unlock();
+    return r;
+}
+
+static uint64_t syscall_handler_body(trapframe_t* tf) {
     process_t* cur = sched_get_current();
     uint64_t num = tf->rax;
     // Re-run of a blocking syscall a caught signal woke (see process.h)?

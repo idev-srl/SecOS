@@ -14,6 +14,7 @@
 #include "vmm.h" // user-space API types/defines
 #include "process.h" // process_t
 #include "sched.h"   // [M30] reap/count for job control
+#include "bkl.h"     // [M48] commands run under the kernel lock
 #include "signal.h"  // [M30] foreground pgid + SIGCONT/SIGKILL
 #include "elf.h" // PF_R PF_X
 #include "mm/elf_manifest.h" // SECOS_NOTE_TYPE e flags manifest
@@ -97,6 +98,7 @@ static void cmd_clear(void);
 static void sh_help(const char* a); // forward wrapper
 static void sh_clear(const char* a); // forward wrapper
 static void execute_command(char* line); // forward dispatcher
+static void sh_wait_tick(void);           // [M48] hlt without the kernel lock
 static void shell_ps_list(void); // forward ps listing
 static void sh_echo(const char* a);
 static void sh_info(const char* a);
@@ -188,7 +190,9 @@ static void pager_prompt_more(void){
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
     terminal_writestring("--More--(SPACE=page, ENTER=line, q=quit)");
     terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
+    uint32_t bd = bkl_suspend();   // [M48] waiting for a key: let tasks run syscalls
     while(1){ char c = keyboard_getchar(); if(c=='q'||c=='Q'){ pager_quit=1; break; } if(c==' '){ pager_line_budget = (int)pager_page_lines; break; } if(c=='\n'){ pager_line_budget = 1; break; } }
+    bkl_resume(bd);
     terminal_writestring("\n");
 }
 static void pager_print(const char* line){ if(pager_quit) return; terminal_writestring(line); terminal_writestring("\n"); if(--pager_line_budget <=0 && pager_enabled) pager_prompt_more(); }
@@ -1535,7 +1539,7 @@ static void sh_stress(const char* a){
     terminal_writestring(" cpu(s); waiting...\n");
     // Wait until they all finish (we run as idle; the scheduler runs them on every
     // core in parallel). Reap zombies so the proc table frees up.
-    while(sched_count_alive_user() > base){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
+    while(sched_count_alive_user() > base){ sh_wait_tick(); sched_reap_zombies(); }
     sched_reap_zombies();
     terminal_writestring("[stress] all "); print_dec(spawned); terminal_writestring(" done\n");
 }
@@ -1638,7 +1642,7 @@ static int job_wait_foreground(uint32_t pgid, const uint32_t* pids, int npid){
             __asm__ volatile("sti");   // re-enable IRQs before returning: the shell
             return stopped>0 ? 1 : 0;  // hlt-waits for the keyboard with IF set
         }
-        __asm__ volatile("sti; hlt");
+        sh_wait_tick();
     }
 }
 
@@ -1650,6 +1654,14 @@ static uint8_t g_job_spawn_buf[2*1024*1024]; // 2 MB: GNU bash with readline is 
 // first. The hold (NEW -> BLOCKED) is kept so a SIGKILL from the failure path
 // below can still make a never-started stage runnable to die; release flips
 // only what was held, so a process that already ran is never resurrected.
+// [M48] A command waiting for its children (or a key) must not keep the
+// kernel lock: they need it for every syscall.
+static void sh_wait_tick(void){
+    uint32_t d = bkl_suspend();
+    __asm__ volatile("sti; hlt");
+    bkl_resume(d);
+}
+
 static int sh_hold_new(process_t* p){
     return __sync_bool_compare_and_swap(&p->state, PROC_NEW, PROC_BLOCKED);
 }
@@ -1749,7 +1761,7 @@ static void run_job(char* line, int background){
     return;
 fail:
     for(int i=0;i<created;i++) if(procs[i]){ signal_post(procs[i],9/*SIGKILL*/); sh_release(procs[i], held[i]); }
-    for(int spin=0; spin<2000 && sched_count_alive_user()>0; spin++){ __asm__ volatile("sti; hlt"); sched_reap_zombies(); }
+    for(int spin=0; spin<2000 && sched_count_alive_user()>0; spin++){ sh_wait_tick(); sched_reap_zombies(); }
 }
 
 // Boot-time launcher (kernel/kernel.c: /bin/init as PID 1). Load and verify one
@@ -2069,7 +2081,15 @@ static void sh_pinfo(const char* a){
 
 // (Tabella gia' definita sopra)
 
+static void execute_command_locked(char* line);
+// [M48] A kernel-shell command runs under the kernel lock, like a syscall:
+// it uses the same VFS / process / TTY code that tasks on other CPUs use.
 static void execute_command(char* line) {
+    bkl_lock();
+    execute_command_locked(line);
+    bkl_unlock();
+}
+static void execute_command_locked(char* line) {
     while(*line==' ') line++;
     if (!*line) return;
     keyboard_clear_break();   // fresh Ctrl-C state for this command (builtins poll it)
