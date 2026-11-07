@@ -15,6 +15,7 @@
 #include "vfs.h"
 #include "ramfs.h"
 #include "pagecache.h"
+#include "process.h"   // [M52 D3] fd tables / file mappings: busy dead inodes
 #include <stddef.h>
 
 #define RLOCK()   klock_lock(ramfs_fs_lock())
@@ -50,6 +51,46 @@ static void cache_fix_after_remove(const ramfs_entry_t* gone){
     }
 }
 
+// [M52 D3] Dead inodes still held by an open fd or a file mapping: recycling
+// one would re-point that fd at the next file. The fd tables and VMA sets are
+// read under each owner's mm_lock (K30 ramfs -> S30 proc_lock -> S35 mm_lock,
+// the order procfs/sysfs use for their pools). Only runs once the cache is
+// full and a new entry needs a slot.
+#define RAMFS_BUSY_WORDS ((INODE_CACHE_N + 63) / 64)
+struct ramfs_busy { uint64_t m[RAMFS_BUSY_WORDS]; };
+static void ramfs_busy_mark(struct ramfs_busy* b, const void* p){
+    const vfs_inode_t* ino = (const vfs_inode_t*)p;
+    if(ino < &inode_cache[0] || ino >= &inode_cache[INODE_CACHE_N]) return;
+    size_t i = (size_t)(ino - &inode_cache[0]);
+    b->m[i / 64] |= 1ull << (i % 64);
+}
+static void ramfs_busy_cb(process_t* p, void* u){
+    struct ramfs_busy* b = (struct ramfs_busy*)u;
+    uint64_t fl = mm_lock(p);
+    for(int i=0;i<32;i++){
+        const struct proc_fd_entry* f = &p->fds[i];
+        if(!f->used || f->is_pipe || f->is_sock || !f->inode) continue;
+        ramfs_busy_mark(b, f->inode);
+    }
+    for(uint32_t i=0;i<p->vmas.count;i++){
+        const vma_t* v = &p->vmas.v[i];
+        if(v->type != VMA_TYPE_NONE && v->file_inode) ramfs_busy_mark(b, v->file_inode);
+    }
+    mm_unlock(p, fl);
+}
+static vfs_inode_t* recycle_dead_locked(void){
+    RAMFS_LOCKED();
+    int any = 0;
+    for(size_t i=0;i<inode_cache_used && !any;i++) if(inode_is_dead(&inode_cache[i])) any = 1;
+    if(!any) return NULL;
+    struct ramfs_busy b;
+    for(size_t w=0; w<RAMFS_BUSY_WORDS; w++) b.m[w] = 0;
+    process_foreach(ramfs_busy_cb, &b);
+    for(size_t i=0;i<inode_cache_used;i++)
+        if(inode_is_dead(&inode_cache[i]) && !((b.m[i / 64] >> (i % 64)) & 1)) return &inode_cache[i];
+    return NULL;   // every dead inode is still open: no slot (the lookup fails)
+}
+
 static vfs_inode_t* inode_from_entry_locked(const ramfs_entry_t* e){
     RAMFS_LOCKED();
     if(!e) return NULL;
@@ -62,9 +103,9 @@ static vfs_inode_t* inode_from_entry_locked(const ramfs_entry_t* e){
     if(!ino && inode_cache_used < INODE_CACHE_N){
         ino = &inode_cache[inode_cache_used++]; fresh = 1;
     }
-    // Cache full: recycle a dead inode. Fresh slots go first so a dead inode an
-    // fd may still hold is recycled as late as possible.
-    if(!ino) for(size_t i=0;i<inode_cache_used;i++) if(inode_is_dead(&inode_cache[i])){ ino=&inode_cache[i]; fresh=1; break; }
+    // Cache full: recycle a dead inode that no fd or mapping holds ([M52 D3];
+    // fresh slots go first). None free: no inode, the lookup fails.
+    if(!ino){ ino = recycle_dead_locked(); if(ino) fresh = 1; }
     if(!ino) return NULL;
     // [M43] The cached inode is the ramfs's only copy of mode/uid/gid (chmod and
     // chown land here through ramfs_vfs_setattr). A slot bound to a new entry
@@ -232,24 +273,73 @@ static int ramfs_vfs_truncate(const char* path, size_t ns){
 // [M51 C2] chmod/chown/utimes: ramfs keeps no metadata of its own, so this is
 // what the VFS fallback did (update the cached inode), but under the lock that
 // also rebinds and resets cache slots.
+static void ramfs_attr_apply_locked(vfs_inode_t* ino, const vfs_attr_t* a, unsigned valid){
+    RAMFS_LOCKED();
+    if(valid & VFS_ATTR_MODE){
+        uint32_t t = ino->mode & 0170000u;
+        if(!t) t = ino->type==VFS_NODE_DIR ? 0040000u : 0100000u;
+        ino->mode = t | (a->mode & 07777u);
+    }
+    if(valid & VFS_ATTR_UID)   ino->uid = a->uid;
+    if(valid & VFS_ATTR_GID)   ino->gid = a->gid;
+    if(valid & VFS_ATTR_ATIME) ino->atime = a->atime;
+    if(valid & VFS_ATTR_MTIME) ino->mtime = a->mtime;
+}
 static int ramfs_vfs_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
     if(!path || !a) return -1;
     RLOCK();
     vfs_inode_t* ino = ramfs_vfs_lookup_locked(path);
-    if(ino){
-        if(valid & VFS_ATTR_MODE){
-            uint32_t t = ino->mode & 0170000u;
-            if(!t) t = ino->type==VFS_NODE_DIR ? 0040000u : 0100000u;
-            ino->mode = t | (a->mode & 07777u);
-        }
-        if(valid & VFS_ATTR_UID)   ino->uid = a->uid;
-        if(valid & VFS_ATTR_GID)   ino->gid = a->gid;
-        if(valid & VFS_ATTR_ATIME) ino->atime = a->atime;
-        if(valid & VFS_ATTR_MTIME) ino->mtime = a->mtime;
-    }
+    if(ino) ramfs_attr_apply_locked(ino, a, valid);
     RUNLOCK();
     return ino ? 0 : -2;                                           // -ENOENT
 }
+
+// [M52 D3] Inode-keyed ops: the entry an open fd's inode is bound to
+// (fs_data), whatever it is called now. A dead inode (its file was removed;
+// the entry slot may hold another file by now) fails with -1.
+static int ramfs_inode_ours_locked(const vfs_inode_t* ino){
+    return ino >= &inode_cache[0] && ino < &inode_cache[inode_cache_used];
+}
+static int ramfs_vfs_ftruncate(vfs_inode_t* ino, size_t ns){
+    RLOCK();
+    int r = -1;
+    ramfs_entry_t* e = (ino && ramfs_inode_ours_locked(ino)) ? (ramfs_entry_t*)ino->fs_data : NULL;
+    if(e && ino->type==VFS_NODE_FILE){
+        r = ramfs_truncate_entry_locked(e, ns);
+        // Same reason as the write: keep every cached size of the entry current.
+        for(size_t i=0; r==0 && i<inode_cache_used; i++)
+            if(inode_cache[i].fs_data==(void*)e && inode_cache[i].size!=e->size) inode_cache[i].size=e->size;
+    }
+    RUNLOCK();
+    return r;
+}
+static int ramfs_vfs_fsetattr(vfs_inode_t* ino, const vfs_attr_t* a, unsigned valid){
+    if(!ino || !a) return -1;
+    RLOCK();
+    int r = (ramfs_inode_ours_locked(ino) && !inode_is_dead(ino)) ? 0 : -1;
+    if(r == 0) ramfs_attr_apply_locked(ino, a, valid);
+    RUNLOCK();
+    return r;
+}
+// create/mkdir + attributes in one lock section: the entry and its inode (the
+// only copy of its owner and mode) appear together. No inode slot for it:
+// the entry is taken back and the create fails.
+static int ramfs_make_attr(const char* path, const vfs_attr_t* a, unsigned valid, int dir){
+    if(!path) return -1;
+    const char* p = path[0]=='/' ? path+1 : path;
+    RLOCK();
+    int r = -1;
+    if(!ramfs_find_locked(p)) r = dir ? ramfs_mkdir_locked(p) : ramfs_add_locked(p, "", 0);
+    if(r == 0){
+        vfs_inode_t* ino = inode_from_entry_locked(ramfs_find_locked(p));
+        if(ino){ if(a) ramfs_attr_apply_locked(ino, a, valid); }
+        else { (void)(dir ? ramfs_rmdir_locked(p) : ramfs_remove_locked(p)); r = -1; }
+    }
+    RUNLOCK();
+    return r;
+}
+static int ramfs_vfs_create_attr(const char* path, const vfs_attr_t* a, unsigned valid){ return ramfs_make_attr(path, a, valid, 0); }
+static int ramfs_vfs_mkdir_attr(const char* path, const vfs_attr_t* a, unsigned valid){ return ramfs_make_attr(path, a, valid, 1); }
 
 // statfs: like tmpfs, the size is the file data plus the free RAM it can still
 // grow into; inodes are the fixed entry table.
@@ -281,6 +371,10 @@ static vfs_fs_ops_t ramfs_ops = {
     .truncate = ramfs_vfs_truncate,
     .setattr = ramfs_vfs_setattr,
     .append = ramfs_vfs_append,
+    .ftruncate = ramfs_vfs_ftruncate,       // [M52 D3]
+    .fsetattr = ramfs_vfs_fsetattr,
+    .create_attr = ramfs_vfs_create_attr,
+    .mkdir_attr = ramfs_vfs_mkdir_attr,
     // .lock is ramfs_fs_lock(), set at run time (not a constant expression)
 };
 

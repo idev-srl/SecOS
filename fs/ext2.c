@@ -885,7 +885,11 @@ static int split_parent(const char* path, uint32_t* parent_ino, char* comp, size
 // fixed 32-slot pool reused its last slot for every further file: on a
 // persistent root a service's log fd ended up writing into /etc/passwd.)
 // Slots come in kmalloc'd chunks; a remount reuses the chunks.
-typedef struct { uint32_t ino; uint32_t size; int is_dir; } e2_node_t;
+// [M52 D3] When its on-disk inode is freed (last link gone) the slot is
+// marked dead and never bound again: the number may go to a new file, which
+// gets a fresh slot, and an fd still holding the old one gets -1 from every
+// operation instead of reaching the new file.
+typedef struct { uint32_t ino; uint32_t size; int is_dir; int dead; } e2_node_t;
 typedef struct { vfs_inode_t v; e2_node_t n; } e2_vslot_t;
 #define E2_VCHUNK      64
 #define E2_VCHUNKS_MAX 512                 /* 32768 distinct inodes per mount */
@@ -895,7 +899,7 @@ static int         g_vused;
 static e2_vslot_t* vslot(int i){ return &g_vchunk[i/E2_VCHUNK][i%E2_VCHUNK]; }
 
 static e2_vslot_t* vslot_find(uint32_t ino){
-    for(int i=0;i<g_vused;i++){ e2_vslot_t* s=vslot(i); if(s->n.ino==ino) return s; }
+    for(int i=0;i<g_vused;i++){ e2_vslot_t* s=vslot(i); if(!s->n.dead && s->n.ino==ino) return s; }
     return NULL;
 }
 
@@ -904,7 +908,21 @@ static e2_vslot_t* vslot_find(uint32_t ino){
  * vfs_remove callers don't invalidate before removing). */
 static void vslot_drop_cache(uint32_t ino){
     e2_vslot_t* s=vslot_find(ino);
-    if(s) pagecache_invalidate(&s->v, 0, 1ULL<<62);
+    if(!s) return;
+    pagecache_invalidate(&s->v, 0, 1ULL<<62);
+    s->n.dead=1; s->v.size=0; s->n.size=0;   /* [M52 D3] see e2_node_t */
+}
+
+/* [M52 D3] The live on-disk inode behind an open fd's slot, or 0: the slot is
+ * dead (unlinked) or the on-disk inode has no links any more. `in` gets the
+ * raw inode. */
+static uint32_t vslot_live_ino(const vfs_inode_t* v, uint8_t* in){
+    if(!g_mounted || !v || !v->fs_data) return 0;
+    const e2_node_t* nd=(const e2_node_t*)v->fs_data;
+    if(nd->dead || !nd->ino) return 0;
+    if(inode_read(nd->ino, in)!=0) return 0;
+    if(rd16(in+26)==0 || rd16(in+0)==0) return 0;          /* links_count / mode */
+    return nd->ino;
 }
 
 static vfs_inode_t* vino_alloc(const char* path){
@@ -1079,35 +1097,65 @@ static int e2op_readdir(const char* dir_path, vfs_iter_cb cb, void* user){
 
 static int e2_read_locked(vfs_inode_t* v, size_t off, void* buf, size_t len){
     if(!g_mounted||!v||v->type!=VFS_NODE_FILE) return -1;
+    if(((e2_node_t*)v->fs_data)->dead) return -1;   /* [M52 D3] unlinked: the number may be reused */
     return file_read(((e2_node_t*)v->fs_data)->ino, off, buf, len);
 }
 
 /* [M26] chmod/chown/utimes: patch the on-disk inode metadata in place. The mode
  * change preserves the S_IFMT type bits (chmod sets only the low 12 perm bits).
  * e2fsck-clean: we only touch fields, never the block map. */
-static int e2_setattr_locked(const char* path, const vfs_attr_t* a, unsigned valid){
-    if(!g_mounted || !path || !a) return -1;
-    int isd; uint32_t ino=path_to_ino(path,&isd,NULL);
-    if(!ino) return -1;
-    uint8_t in[256]; if(inode_read(ino,in)!=0) return -1;
+static void e2_attr_apply(uint8_t* in, const vfs_attr_t* a, unsigned valid){
     if(valid&VFS_ATTR_MODE){ uint16_t old=rd16(in+0); wr16(in+0,(uint16_t)((old&S_IFMT)|(a->mode&0x0FFF))); }
     if(valid&VFS_ATTR_UID){  wr16(in+2,  (uint16_t)a->uid); wr16(in+120, (uint16_t)(a->uid>>16)); }
     if(valid&VFS_ATTR_GID){  wr16(in+24, (uint16_t)a->gid); wr16(in+122, (uint16_t)(a->gid>>16)); }
     if(valid&VFS_ATTR_ATIME) wr32(in+8,  (uint32_t)a->atime);
     if(valid&VFS_ATTR_MTIME) wr32(in+16, (uint32_t)a->mtime);
+}
+/* [M52 D3] Inode-number core shared by the path op and the fd op (`in` holds
+ * the raw inode, already read). The cached slot follows the on-disk change,
+ * so an fstat of the fd sees it before the next lookup. */
+static int e2_setattr_ino_locked(uint32_t ino, uint8_t* in, const vfs_attr_t* a, unsigned valid){
+    e2_attr_apply(in, a, valid);
     e2_stamp(in,0,1,0);                                   /* ctime: attributes changed */
-    return inode_write(ino,in);
+    if(inode_write(ino,in)!=0) return -1;
+    e2_vslot_t* s=vslot_find(ino);
+    if(s){
+        vfs_inode_t* v=&s->v;
+        v->mode=rd16(in+0);
+        v->uid=(uint32_t)rd16(in+2) | ((uint32_t)rd16(in+120)<<16);
+        v->gid=(uint32_t)rd16(in+24) | ((uint32_t)rd16(in+122)<<16);
+        v->atime=rd32(in+8); v->ctime=rd32(in+12); v->mtime=rd32(in+16);
+    }
+    return 0;
+}
+static int e2_setattr_locked(const char* path, const vfs_attr_t* a, unsigned valid){
+    if(!g_mounted || !path || !a) return -1;
+    int isd; uint32_t ino=path_to_ino(path,&isd,NULL);
+    if(!ino) return -1;
+    uint8_t in[256]; if(inode_read(ino,in)!=0) return -1;
+    return e2_setattr_ino_locked(ino, in, a, valid);
+}
+/* [M52 D3] fchmod/fchown/futimes: the inode the fd's slot is bound to. */
+static int e2_fsetattr_locked(vfs_inode_t* v, const vfs_attr_t* a, unsigned valid){
+    if(!a) return -1;
+    uint8_t in[256]; uint32_t ino=vslot_live_ino(v, in);
+    if(!ino) return -1;
+    return e2_setattr_ino_locked(ino, in, a, valid);
 }
 static int e2_write_locked(vfs_inode_t* v, size_t off, const void* data, size_t len){
     if(!g_mounted||!v||v->type!=VFS_NODE_FILE) return -1;
     e2_node_t* nd=(e2_node_t*)v->fs_data;
+    if(nd->dead) return -1;                          /* [M52 D3] unlinked: see e2_node_t */
     int r=file_write(nd->ino, off, data, len);
     if(r>=0){ uint8_t in[256]; if(inode_read(nd->ino,in)==0){ nd->size=inode_size_lo(in); v->size=nd->size; } }
     return r;
 }
 
-/* Create a regular file (optionally with initial data). */
-static int e2_create_locked(const char* path, const void* initial, size_t size){
+/* Create a regular file (optionally with initial data). [M52 D3] `a`/`valid`
+ * (optional) are stamped on the new inode before it is linked into its
+ * directory: nobody can find it with the default owner and mode. */
+static int e2_create_attr_locked(const char* path, const void* initial, size_t size,
+                                 const vfs_attr_t* a, unsigned valid){
     if(!g_mounted||!path) return -1;
     if(path_to_ino(path,NULL,NULL)) return -1; /* exists */
     uint32_t parent; char comp[128];
@@ -1126,14 +1174,18 @@ static int e2_create_locked(const char* path, const void* initial, size_t size){
         wr16(inode+46, 0);                       /* eh_depth */
     }
     e2_stamp(inode,1,1,1);
+    if(a) e2_attr_apply(inode, a, valid);
     if(inode_write(nino, inode)!=0) return -1;
     if(dir_add(parent, comp, e2_strlen(comp), nino, DT_REG)!=0) return -1;
     if(e2_adjust_links(parent, 0)!=0) return -1;          /* parent mtime/ctime */
     if(initial && size>0){ if(file_write(nino, 0, initial, size)<0) return -1; }
     return 0;
 }
+static int e2_create_locked(const char* path, const void* initial, size_t size){
+    return e2_create_attr_locked(path, initial, size, NULL, 0);
+}
 
-static int e2_mkdir_locked(const char* path){
+static int e2_mkdir_attr_locked(const char* path, const vfs_attr_t* a, unsigned valid){
     if(!g_mounted||!path) return -1;
     if(path_to_ino(path,NULL,NULL)) return -1;
     uint32_t parent; char comp[128];
@@ -1155,11 +1207,13 @@ static int e2_mkdir_locked(const char* path){
     wr32(inode+28, g_sec_per_blk);
     wr32(inode+40, db); /* i_block[0] */
     e2_stamp(inode,1,1,1);
+    if(a) e2_attr_apply(inode, a, valid);                 /* [M52 D3] before it is linked */
     if(inode_write(nino, inode)!=0) return -1;
     if(dir_add(parent, comp, e2_strlen(comp), nino, DT_DIR)!=0) return -1;
     /* bump parent link count (the new ".."), stamp its mtime/ctime */
     return e2_adjust_links(parent, +1);
 }
+static int e2_mkdir_locked(const char* path){ return e2_mkdir_attr_locked(path, NULL, 0); }
 
 /* Unmap every file block >= keep from a depth-0 extent node (inline root or a
  * leaf block), freeing the data blocks. Returns the entries left. */
@@ -1275,13 +1329,10 @@ static int e2_remove_locked(const char* path){
 /* Shrink or grow (sparse) a regular file. Freed blocks are unmapped from the
  * depth-0 extent tree or the direct/single-indirect map; the tail of the last
  * kept block is zeroed so a later grow reads zeros (POSIX). */
-static int e2_truncate_locked(const char* path, size_t new_size){
-    if(!g_mounted||!path) return -1;
-    int isd; uint32_t sz; uint32_t ino=path_to_ino(path,&isd,&sz);
-    if(!ino||isd) return -1;
+/* [M52 D3] Inode-number core: `inode` holds the raw inode of `ino`. */
+static int e2_truncate_ino_locked(uint32_t ino, uint8_t* inode, size_t new_size){
     if(new_size>0xFFFFFFFFu) return -1;
-    uint8_t inode[256]; if(inode_read(ino,inode)!=0) return -1;
-    if((rd16(inode+0)&S_IFMT)==S_IFLNK) return -1;
+    if((rd16(inode+0)&S_IFMT)!=S_IFREG) return -1;       /* dir / symlink / special */
     int ext = (rd32(inode+32)&EXT4_EXTENTS_FL) ? 1 : 0;
     uint32_t old=inode_size_lo(inode);
     if(new_size<old){
@@ -1311,7 +1362,25 @@ static int e2_truncate_locked(const char* path, size_t new_size){
     wr32(inode+4,(uint32_t)new_size);
     wr32(inode+28, inode_data_blocks(inode, (uint32_t)new_size)*g_sec_per_blk);
     e2_stamp(inode,0,1,1);
-    return inode_write(ino, inode);
+    if(inode_write(ino, inode)!=0) return -1;
+    /* every fd on the file sees the new size (the slot is shared) */
+    e2_vslot_t* s=vslot_find(ino);
+    if(s){ s->n.size=(uint32_t)new_size; s->v.size=new_size; }
+    return 0;
+}
+static int e2_truncate_locked(const char* path, size_t new_size){
+    if(!g_mounted||!path) return -1;
+    int isd; uint32_t ino=path_to_ino(path,&isd,NULL);
+    if(!ino||isd) return -1;
+    uint8_t inode[256]; if(inode_read(ino,inode)!=0) return -1;
+    return e2_truncate_ino_locked(ino, inode, new_size);
+}
+/* [M52 D3] ftruncate: the inode the fd's slot is bound to, whatever its name
+ * now; -1 once it was unlinked (dead slot / no links). */
+static int e2_ftruncate_locked(vfs_inode_t* v, size_t new_size){
+    uint8_t inode[256]; uint32_t ino=vslot_live_ino(v, inode);
+    if(!ino) return -1;
+    return e2_truncate_ino_locked(ino, inode, new_size);
 }
 
 /* Directory-entry file type for an on-disk inode mode. */
@@ -1444,13 +1513,18 @@ static int e2j_truncate_locked(const char* p, size_t s){ E2_RO_CHECK(); jt_begin
 static int e2j_setattr_locked(const char* p, const vfs_attr_t* a, unsigned v){ E2_RO_CHECK(); jt_begin(); int r=e2_setattr_locked(p,a,v); return jt_finish(r, r==0); }
 static int e2j_symlink_locked(const char* t, const char* l){ E2_RO_CHECK(); jt_begin(); int r=e2_symlink_locked(t,l); return jt_finish(r, r==0); }
 static int e2j_link_locked(const char* o, const char* n){ E2_RO_CHECK(); jt_begin(); int r=e2_link_locked(o,n); return jt_finish(r, r==0); }
+/* [M52 D3] inode-keyed ops and create/mkdir with attributes */
+static int e2j_ftruncate_locked(vfs_inode_t* v, size_t s){ E2_RO_CHECK(); jt_begin(); int r=e2_ftruncate_locked(v,s); return jt_finish(r, r==0); }
+static int e2j_fsetattr_locked(vfs_inode_t* v, const vfs_attr_t* a, unsigned va){ E2_RO_CHECK(); jt_begin(); int r=e2_fsetattr_locked(v,a,va); return jt_finish(r, r==0); }
+static int e2j_create_attr_locked(const char* p, const vfs_attr_t* a, unsigned va){ E2_RO_CHECK(); jt_begin(); int r=e2_create_attr_locked(p,NULL,0,a,va); return jt_finish(r, r==0); }
+static int e2j_mkdir_attr_locked(const char* p, const vfs_attr_t* a, unsigned va){ E2_RO_CHECK(); jt_begin(); int r=e2_mkdir_attr_locked(p,a,va); return jt_finish(r, r==0); }
 /* [M51 C3] append != 0: write at the current end of file, read from the
  * on-disk inode in the same lock hold as the write (atomic O_APPEND: two
  * appenders never pick the same offset). *at (optional) gets the offset used. */
 static int e2j_write_at_locked(vfs_inode_t* v, size_t off, int append, const void* d, size_t l, size_t* at){
     E2_RO_CHECK();
     if(append){
-        if(!g_mounted||!v||v->type!=VFS_NODE_FILE) return -1;
+        if(!g_mounted||!v||v->type!=VFS_NODE_FILE||((e2_node_t*)v->fs_data)->dead) return -1;
         uint8_t in[256]; if(inode_read(((e2_node_t*)v->fs_data)->ino, in)!=0) return -1;
         off=inode_size_lo(in);
     }
@@ -1499,6 +1573,10 @@ static int e2op_symlink(const char* t, const char* l){ int r; E2_WRAP(e2j_symlin
 static int e2op_sync(void){ int r; E2_WRAP(e2_sync_locked()); return r; }
 static int e2op_link(const char* o, const char* n){ int r; E2_WRAP(e2j_link_locked(o,n)); return r; }
 static int e2op_statfs(vfs_statfs_t* st){ int r; E2_WRAP(e2_statfs_locked(st)); return r; }
+static int e2op_ftruncate(vfs_inode_t* v, size_t sz){ int r; E2_WRAP(e2j_ftruncate_locked(v,sz)); return r; }
+static int e2op_fsetattr(vfs_inode_t* v, const vfs_attr_t* a, unsigned va){ int r; E2_WRAP(e2j_fsetattr_locked(v,a,va)); return r; }
+static int e2op_create_attr(const char* p, const vfs_attr_t* a, unsigned va){ int r; E2_WRAP(e2j_create_attr_locked(p,a,va)); return r; }
+static int e2op_mkdir_attr(const char* p, const vfs_attr_t* a, unsigned va){ int r; E2_WRAP(e2j_mkdir_attr_locked(p,a,va)); return r; }
 /* ->mntinfo is the one lock-free entry point: the /proc/mounts generator calls
  * it under procfs's spinlock (S15), where a klock must not be taken. It only
  * reads words that change at mount time (g_mounted, g_dev, g_use_extents,
@@ -1526,6 +1604,8 @@ static vfs_fs_ops_t ext2_ops = {
     .readlink=e2op_readlink, .symlink=e2op_symlink, .sync=e2op_sync,
     .link=e2op_link, .statfs=e2op_statfs, .mntinfo=e2op_mntinfo, .remount=e2op_remount,
     .lock = &g_e2_lock, .append = ext2_append,      /* [M51 C1] contract */
+    .ftruncate=e2op_ftruncate, .fsetattr=e2op_fsetattr,             /* [M52 D3] */
+    .create_attr=e2op_create_attr, .mkdir_attr=e2op_mkdir_attr,
 };
 /* For in-kernel tests that drive the driver directly (mount-relative paths). */
 const vfs_fs_ops_t* ext2_vfs_ops(void){ return &ext2_ops; }
