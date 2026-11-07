@@ -120,6 +120,13 @@ int killpg(int pgrp, int sig){
 }
 int setsid(void){ return (int)__se(secos_syscall(85 /*SYS_SETSID*/, 0, 0, 0, 0, 0)); }
 int getsid(int pid){ return (int)__se(secos_syscall(86 /*SYS_GETSID*/, pid, 0, 0, 0, 0)); }
+/* SYS_SCHED_GETAFFINITY (91), the raw Linux syscall: fills the first bytes of
+ * `mask` (a CPU-index bit mask) and returns how many, or -1 + errno (EINVAL:
+ * len too small or not a multiple of 8). The libc-level sched_getaffinity
+ * zeroes the rest of the caller's set. pid 0 = caller. */
+long secos_sched_getaffinity(int pid, unsigned long len, void* mask){
+    return __se(secos_syscall(91 /*SYS_SCHED_GETAFFINITY*/, pid, (long)len, (long)mask, 0, 0));
+}
 /* sigsuspend (SYS_SIGSUSPEND 58): atomically install 'mask' and block until a
  * signal is delivered; the previous mask is restored after the handler ran.
  * Always returns -1/EINTR, as POSIX requires. */

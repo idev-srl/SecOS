@@ -205,6 +205,11 @@ void smp_stop_others(void) {
     }
 }
 
+/* CPU index i is running the kernel (the BSP always is). */
+int smp_cpu_online(uint32_t i) {
+    return i == 0 || (i < smp_cpu_count() && cpu_by_index(i)->online);
+}
+
 uint32_t smp_online_count(void) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < smp_cpu_count(); i++)

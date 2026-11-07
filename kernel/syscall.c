@@ -23,6 +23,7 @@
 #include "tty.h"
 #include "input.h"            // [M40] /dev/input/eventN clients
 #include "fbdev.h"            // [M40] /dev/fb0
+#include "percpu.h"           // SMP_MAX_CPUS, smp_cpu_count (sched_getaffinity)
 
 extern uint64_t timer_get_ticks(void);
 void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
@@ -1665,6 +1666,21 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
             return (uint64_t)(cap_effective(c) | (c->cap_enforce ? (1u << 30) : 0)
                               | (c->no_new_privs ? (1u << 29) : 0));
         return (uint64_t)(int64_t)-22;
+    }
+    case SYS_SCHED_GETAFFINITY: {
+        uint64_t mask[SMP_MAX_CPUS / 64];
+        uint32_t words = (smp_cpu_count() + 63) / 64;
+        if (words == 0) words = 1;
+        if (words > SMP_MAX_CPUS / 64) words = SMP_MAX_CPUS / 64;
+        uint64_t need = (uint64_t)words * 8;
+        if (a1 < need || (a1 & 7)) return (uint64_t)(int64_t)-22;   // -EINVAL
+        uint32_t pid = (uint32_t)a0;
+        if ((int)a0 < 0) return (uint64_t)(int64_t)-3;    // -ESRCH
+        if (pid == 0) { process_t* c = sched_get_current(); if (!c) return (uint64_t)(int64_t)-3; pid = c->pid; }
+        if (process_get_affinity(pid, mask, words) != 0) return (uint64_t)(int64_t)-3;
+        if (!user_range_valid((void*)a2, need) || copy_to_user((void*)a2, mask, need) != 0)
+            return (uint64_t)(int64_t)-EFAULT;
+        return need;
     }
     case SYS_FCNTL:   return (uint64_t)(int64_t)ksys_fcntl((int)a0, (int)a1, (long)a2);
     case SYS_GETPGID: {                       // job control (bash getpgrp/getpgid)

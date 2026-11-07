@@ -180,6 +180,31 @@ int process_set_pin(uint32_t pid, int32_t cpu) {
     return r;
 }
 
+// sched_getaffinity: the CPUs `pid` may run on, as a bit mask
+// over CPU indexes (bit i of mask[i / 64]): its pinned CPU when it has a hard
+// affinity, else every online CPU (the soft home CPU is no restriction).
+// `nwords` 64-bit words are written. Returns 0, or -3 when no such pid.
+int process_get_affinity(uint32_t pid, uint64_t* mask, uint32_t nwords) {
+    for (uint32_t w = 0; w < nwords; w++) mask[w] = 0;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    process_t* p = NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (proc_table[i] && proc_table[i]->pid == pid) { p = proc_table[i]; break; }
+    int r = -3;
+    if (p) {
+        uint32_t n = smp_cpu_count();
+        if (n > nwords * 64) n = nwords * 64;
+        for (uint32_t c = 0; c < n; c++) {
+            if (!smp_cpu_online(c)) continue;
+            if (p->cpu_pin >= 0 && (uint32_t)p->cpu_pin != c) continue;
+            mask[c / 64] |= 1ULL << (c % 64);
+        }
+        r = 0;
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return r;
+}
+
 // A table index doubles as the process's kernel-stack slot. The reaper detaches
 // a zombie from the table (process_reap_one) before process_destroy() unmaps
 // its kernel stack, so the index stays reserved here until then: otherwise

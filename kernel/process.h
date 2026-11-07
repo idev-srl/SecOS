@@ -229,6 +229,7 @@ void     process_reap_done(void);          // a process_reap_one() zombie has be
 uint64_t process_lock_irqsave(void);       // the process-table lock (for the
 void     process_unlock_irqrestore(uint64_t); //  scheduler's block/claim steps)
 int      process_set_pin(uint32_t pid, int32_t cpu); // hard affinity; -1 clears
+int      process_get_affinity(uint32_t pid, uint64_t* mask, uint32_t nwords); // sched_getaffinity
 int process_destroy(process_t* p);
 void process_release_pipes(process_t* p); // drop pipe ends + sockets at exit (EOF to peers)
 // PID 1: the kernel records /bin/init's pid; exiting processes' children are
