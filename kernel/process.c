@@ -37,7 +37,7 @@ static int proc_inited = 0;
 // respect to the CPU that picks a task. Process teardown frees a process_t only
 // after detaching it from the table under this lock, and only once no CPU is
 // on it (process_reap_one).
-static spinlock_t proc_lock = SPINLOCK_INIT;
+static spinlock_t proc_lock = SPINLOCK_INIT_CLASS(LK_S30_PROC, "proc");
 extern uint64_t timer_get_ticks(void);
 static uint32_t affinity_rotor = 0;
 

@@ -21,7 +21,7 @@ static int         g_mount_count = 0;
 // resolution, which calls into filesystems that block on I/O. The lookup helper
 // has a _nolock leaf so mount/unmount can hold the lock while using it (the lock
 // is not recursive).
-static spinlock_t g_mount_lock = SPINLOCK_INIT;
+static spinlock_t g_mount_lock = SPINLOCK_INIT_CLASS(LK_S20_MOUNT, "mount");
 
 static size_t str_len(const char* s){ size_t n=0; while(s[n]) n++; return n; }
 

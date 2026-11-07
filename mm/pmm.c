@@ -47,7 +47,7 @@
 extern void print_hex(uint64_t value);
 
 // [M29] One lock guards the whole allocator. Uncontended on the single-core path.
-static spinlock_t pmm_lock = SPINLOCK_INIT;
+static spinlock_t pmm_lock = SPINLOCK_INIT_CLASS(LK_S75_PMM, "pmm");
 
 // ---- geometry ----
 #define PMM_SECTION_SHIFT   18                              // 2^18 frames = 1 GiB

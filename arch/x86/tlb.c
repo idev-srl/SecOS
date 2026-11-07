@@ -19,7 +19,7 @@ extern uint64_t ktime_us(void);
 /* Non-zero while a request is in flight: spin loops poll tlb_poll() then. */
 volatile uint32_t g_tlb_inflight;
 
-static spinlock_t tlb_lock = SPINLOCK_INIT;
+static spinlock_t tlb_lock = SPINLOCK_INIT_CLASS(LK_S62_TLB, "tlb");
 static struct {
     uint64_t pml4;      /* user space: its PML4 physical address           */
     uint64_t va;        /* first page                                      */

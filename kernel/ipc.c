@@ -18,7 +18,7 @@ typedef struct {
 #include <stdint.h>
 static ipc_channel_t g_chan[IPC_NUM_CHANNELS];
 static int g_inited;
-static spinlock_t g_ipc_lock = SPINLOCK_INIT;   // guards g_chan[] rings
+static spinlock_t g_ipc_lock = SPINLOCK_INIT_CLASS(LK_S15_SUBSYS, "ipc");   // guards g_chan[] rings
 
 void ipc_init(void) {
     for (int i = 0; i < IPC_NUM_CHANNELS; i++) {

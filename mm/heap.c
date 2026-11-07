@@ -103,7 +103,7 @@
 // [M29] One lock guards the whole free list (kmalloc/kfree/expand). Uncontended
 // on the single-core path. expand_heap() calls the PMM under this lock, but the
 // PMM has its own separate lock, so there is no nesting on the same lock.
-static spinlock_t heap_lock = SPINLOCK_INIT;
+static spinlock_t heap_lock = SPINLOCK_INIT_CLASS(LK_S70_HEAP, "heap");
 
 typedef struct heap_block {
     uint32_t magic;

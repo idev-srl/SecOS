@@ -27,7 +27,7 @@
 // [M29] One spinlock guards both the input ring buffer and the modifier state.
 // keyboard_handler runs in interrupt context, so the irqsave variants are used
 // everywhere to stay atomic against this CPU's own ISR as well as other CPUs.
-static spinlock_t kbd_lock = SPINLOCK_INIT;
+static spinlock_t kbd_lock = SPINLOCK_INIT_CLASS(LK_S50_KBD, "kbd");
 
 // Circular input buffer
 static uint8_t input_buffer[BUFFER_SIZE];

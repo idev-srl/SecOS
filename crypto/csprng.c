@@ -34,7 +34,7 @@ static int      g_ready;
 static int      g_has_rdrand, g_has_rdseed;
 static volatile uint64_t g_irq_acc[8];
 static volatile uint32_t g_irq_n;
-static spinlock_t g_lock = SPINLOCK_INIT;   /* SMP: one generator state */
+static spinlock_t g_lock = SPINLOCK_INIT_CLASS(LK_S64_LEAF, "csprng");   /* SMP: one generator state */
 
 static inline uint64_t rdtsc64(void){
     uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo;

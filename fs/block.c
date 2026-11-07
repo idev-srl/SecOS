@@ -12,7 +12,7 @@
 // (virtio-blk / AHCI / NVMe) each drive a single polled queue/port, so two CPUs
 // must not enter a device read/write concurrently. irqsave keeps the polled
 // hardware op atomic against this CPU's ISRs too.
-static spinlock_t block_io_lock = SPINLOCK_INIT;
+static spinlock_t block_io_lock = SPINLOCK_INIT_CLASS(LK_S42_BLOCK_IO, "block-io");
 
 // Base disks (vda/sda../nvme0n1/usb0) + their MBR/GPT partition sub-devices
 // (usb0p1, sda1, ...) all live here, so this must be comfortably > a few disks.

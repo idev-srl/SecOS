@@ -22,7 +22,7 @@ typedef struct {
 
 static pc_entry_t pc[PC_ENTRIES];
 static uint32_t   pc_clock = 0;   // FIFO eviction hand
-static spinlock_t pc_lock = SPINLOCK_INIT;   // guards pc[] + pc_clock
+static spinlock_t pc_lock = SPINLOCK_INIT_CLASS(LK_S40_PAGECACHE, "pagecache");   // guards pc[] + pc_clock
 
 // Fill frame 'phys' with file bytes [off, off+4096), zero-padded past EOF.
 static void pc_fill(vfs_inode_t* ino, uint64_t off, uint64_t phys) {

@@ -62,7 +62,7 @@ typedef struct pty {
 } pty_t;
 
 static pty_t* g_pty[PTY_MAX];
-static spinlock_t g_pty_lock = SPINLOCK_INIT;
+static spinlock_t g_pty_lock = SPINLOCK_INIT_CLASS(LK_S10_TTY, "pty");
 vfs_inode_t g_pty_dir_inode;
 
 /* ---- helpers ----------------------------------------------------------------- */

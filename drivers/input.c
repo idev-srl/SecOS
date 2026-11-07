@@ -49,7 +49,7 @@ typedef struct evdev_client {
     struct k_input_event ring[EVDEV_RING];
 } evdev_client_t;
 
-static spinlock_t g_input_lock = SPINLOCK_INIT;
+static spinlock_t g_input_lock = SPINLOCK_INIT_CLASS(LK_S15_SUBSYS, "input");
 static input_dev_t* g_dev[INPUT_MAX_DEV];
 static int g_ndev;
 static vfs_inode_t g_dev_ino[INPUT_MAX_DEV];   /* base nodes /input/eventN */

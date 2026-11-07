@@ -464,7 +464,7 @@ static char        g_genbuf[16384];
 static vfs_inode_t g_ipool[64];
 static uint64_t    g_ikey[64];
 static int         g_inext;
-static spinlock_t  g_proc_lock = SPINLOCK_INIT;
+static spinlock_t  g_proc_lock = SPINLOCK_INIT_CLASS(LK_S15_SUBSYS, "procfs");
 
 static int is_link(int k){ return k==PK_SELF||k==PK_PID_CWD||k==PK_PID_EXE||k==PK_PID_ROOT||k==PK_PID_FD; }
 /* [M48] /proc/smp: per-CPU scheduler and IPI counters (SecOS-specific). */

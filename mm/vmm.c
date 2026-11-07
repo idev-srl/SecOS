@@ -26,7 +26,7 @@ extern void print_hex(uint64_t value);
 // the shared kernel page table (the `stress 16` panic: vmm_map -3 / "already
 // mapped"). This lock serializes those edits. (User address spaces are per-CPU and
 // need no such lock; this is the one shared-kernel-PT mutation on the hot path.)
-static spinlock_t kstack_lock = SPINLOCK_INIT;
+static spinlock_t kstack_lock = SPINLOCK_INIT_CLASS(LK_S60_KSTACK, "kstack");
 
 // Basic page table constants
 #define PAGE_SIZE 4096ULL
@@ -1180,7 +1180,7 @@ static uint64_t g_pm_tables = 0;      // page-table frames owned by the physmap
 static uint64_t g_pm_leaves[3];       // leaves: [0]=4K [1]=2M [2]=1G
 static int      g_pm_maxphy = 36;     // CPU physical address bits
 static int      g_pm_la57 = 0;        // CPU supports 5-level paging (not used)
-static spinlock_t g_pm_lock = SPINLOCK_INIT;
+static spinlock_t g_pm_lock = SPINLOCK_INIT_CLASS(LK_S60_KSTACK, "physmap");
 
 static inline uint64_t* pm_tab(uint64_t phys) {
     return physmap_initialized ? (uint64_t*)phys_to_virt(phys) : (uint64_t*)phys;

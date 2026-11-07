@@ -40,7 +40,7 @@ static int split(const char* rel, char comp[SYSFS_MAXC][32]) {
 // inode pointer lookup returned, so lookups hand out pool slots keyed by path
 // (an fd's inode is recycled only after SYSFS_NINO other distinct paths;
 // readdir entries are transient — callers copy the name).
-static spinlock_t g_sysfs_lock;
+static spinlock_t g_sysfs_lock = SPINLOCK_INIT_CLASS(LK_S15_SUBSYS, "sysfs");
 static char g_genbuf[1024];   // cpulist of 256 CPUs with gaps fits
 #define SYSFS_NINO 32
 static vfs_inode_t g_ipool[SYSFS_NINO];

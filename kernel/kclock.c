@@ -15,7 +15,7 @@ extern uint32_t timer_get_frequency(void);
 
 static int        g_kclock_ready;
 static uint64_t   g_real_base_ns;   /* REALTIME = g_real_base_ns + mono */
-static spinlock_t g_kclock_lock = SPINLOCK_INIT;
+static spinlock_t g_kclock_lock = SPINLOCK_INIT_CLASS(LK_S64_LEAF, "kclock");
 
 uint64_t kclock_mono_ns(void) {
     uint64_t ns = ktime_ns();

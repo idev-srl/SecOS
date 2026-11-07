@@ -25,7 +25,7 @@ struct pipe {
 };
 
 static struct pipe g_pipes[PIPE_MAX];
-static spinlock_t g_pipe_lock = SPINLOCK_INIT;   // guards g_pipes[] state
+static spinlock_t g_pipe_lock = SPINLOCK_INIT_CLASS(LK_S15_SUBSYS, "pipe");   // guards g_pipes[] state
 
 extern void sched_wake_pipe(void* p);
 
