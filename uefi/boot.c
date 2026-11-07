@@ -60,6 +60,26 @@ static int uefi_nokaslr(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
     return kaslr_cmdline_nokaslr(buf, n);
 }
 
+// [M50] The load options as an ASCII command line for the kernel (bkl=,
+// nosmp, /proc/cmdline). Stops at the first NUL; anything outside printable
+// ASCII (binary optional data of a firmware boot entry) becomes a space.
+// Returns the length (0 = none).
+static uint64_t uefi_cmdline(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, char* out, uint64_t cap) {
+    EFI_LOADED_IMAGE_PROTOCOL* li = NULL;
+    EFI_HANDLE_PROTOCOL hp = (EFI_HANDLE_PROTOCOL)st->BootServices->HandleProtocol;
+    out[0] = 0;
+    if (!hp || hp(image, &EFI_LOADED_IMAGE_PROTOCOL_GUID, (void**)&li) != EFI_SUCCESS || !li) return 0;
+    if (!li->LoadOptions || li->LoadOptionsSize < 2) return 0;
+    uint64_t n = li->LoadOptionsSize / 2, k = 0;
+    const CHAR16* w = (const CHAR16*)li->LoadOptions;
+    for (uint64_t i = 0; i < n && k + 1 < cap; i++) {
+        if (w[i] == 0) break;
+        out[k++] = (w[i] >= 0x20 && w[i] < 0x7F) ? (char)w[i] : ' ';
+    }
+    out[k] = 0;
+    return k;
+}
+
 // [M45] 64 bits from EFI_RNG_PROTOCOL (default algorithm), 0 if unavailable.
 static uint64_t uefi_rng64(EFI_SYSTEM_TABLE* st, int* ok) {
     EFI_RNG_PROTOCOL* rng = NULL;
@@ -297,6 +317,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     uint64_t final_map_size = alloc_buf_size; uint64_t final_map_key=0; uint64_t final_desc_size=0; uint32_t final_desc_ver=0;
     fb_bar(fb_base, fb_pitch_px, fb_w, 2, 0x00FFFF00); // stage3: yellow = page tables built, about to EBS
     puts16(SystemTable, WIDE("[BOOT] Calling ExitBootServices\r\n"));
+    // [M50] Read the load options while boot services still exist.
+    static char saved_cmdline[sizeof(((struct secos_boot_info*)0)->cmdline)];
+    uint64_t saved_cmdline_len = uefi_cmdline(ImageHandle, SystemTable, saved_cmdline,
+                                              sizeof(saved_cmdline));
     EFI_STATUS ebs = EFI_INVALID_PARAMETER;
     for (int _att = 0; _att < 8 && ebs == EFI_INVALID_PARAMETER; _att++) {
         final_map_size = alloc_buf_size; // reset to full buffer capacity each attempt
@@ -330,6 +354,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     bootinfo.mem_desc_size    = desc_size;
     bootinfo.mem_desc_version = desc_ver;
     bootinfo.flags           |= (1ULL<<1); // bit1 memory map valida
+    for (uint64_t i = 0; i < sizeof(bootinfo.cmdline); i++)        // [M50]
+        bootinfo.cmdline[i] = (i < saved_cmdline_len) ? saved_cmdline[i] : 0;
+    if (saved_cmdline_len) bootinfo.flags |= SECOS_BOOTINFO_F_CMDLINE;
 
     // Fase 6: Salta al kernel
     if (!kernel_entry) {

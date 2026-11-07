@@ -328,6 +328,9 @@ iso: $(KERNEL)
 	echo 'menuentry "SecOS x64 (single CPU: nosmp)" {' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '    multiboot2 /boot/kernel.bin nosmp' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'menuentry "SecOS x64 (kernel lock: bkl=on)" {' >> $(ISODIR)/boot/grub/grub.cfg
+	echo '    multiboot2 /boot/kernel.bin bkl=on' >> $(ISODIR)/boot/grub/grub.cfg
+	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue --output=$(ISO) $(ISODIR) 2>&1 | tee grub-mkrescue.log
 	@echo "ISO creata: $(ISO)"
 	@echo "Verifica contenuto ISO..."

@@ -26,7 +26,14 @@ struct secos_boot_info {
     uint64_t mem_map_key;             // Key for ExitBootServices (informativo per kernel)
     uint64_t acpi_rsdp;               // [M28] ACPI RSDP physical address (0 if not found)
     // Future extensions: SMBIOS, RNG seed, etc.
-    uint64_t flags;                   // Misc flags (bit0: GOP valid, bit1: memory map valid)
+    uint64_t flags;                   // Misc flags (bit0: GOP valid, bit1: memory map valid,
+                                      //  bit2: cmdline valid)
+    // [M50] The loader's own UEFI load options as ASCII (e.g. `BOOTX64.EFI
+    // bkl=on nokaslr` from the UEFI shell, or a boot entry's optional data):
+    // the kernel treats it as its boot command line (/proc/cmdline, nosmp,
+    // bkl=). NUL-terminated; non-printable characters become spaces.
+    char     cmdline[128];
 };
+#define SECOS_BOOTINFO_F_CMDLINE (1ULL << 2)
 
 #endif // SECOS_BOOTINFO_H

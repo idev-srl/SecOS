@@ -2597,8 +2597,17 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         g_uefi_bootinfo  = *(struct secos_boot_info*)multiboot_info;
         g_multiboot_info = (uint64_t)&g_uefi_bootinfo;
         multiboot_info   = (uint64_t)&g_uefi_bootinfo; // keep the local in sync for PMM below
+        // [M50] The loader's load options are the boot command line.
+        if (g_uefi_bootinfo.flags & SECOS_BOOTINFO_F_CMDLINE) {
+            uint32_t k = 0;
+            for (; k < sizeof(g_uefi_bootinfo.cmdline) && k < sizeof(g_kcmdline) - 1 &&
+                   g_uefi_bootinfo.cmdline[k]; k++)
+                g_kcmdline[k] = g_uefi_bootinfo.cmdline[k];
+            g_kcmdline[k] = 0;
+        }
     }
 #endif
+    bkl_init_mode();   // [M50] bkl=on|off (default on)
 
     terminal_writestring("Multiboot magic: "); print_hex(multiboot_magic);
     terminal_writestring("  info: "); print_hex(multiboot_info); terminal_writestring("\n");
