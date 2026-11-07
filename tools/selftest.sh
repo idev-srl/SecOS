@@ -80,7 +80,9 @@ fi
 
 echo "[selftest] Running (mb2, ${TIMEOUT}s)..."
 # smoke.sh exits 0 when the kernel stays alive to the timeout (no triple fault).
-if ! tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$LOG" >/dev/null 2>&1; then
+# [M48] One CPU: the M7 demo is two tasks handing one CPU back and forth with
+# SYS_YIELD; with a second CPU each would simply run on its own.
+if ! QEMU_SMP=1 tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$LOG" >/dev/null 2>&1; then
     echo "[selftest] FAIL — kernel did not stay alive (triple fault / crash)"
     FAIL=$((FAIL+1))
 fi
