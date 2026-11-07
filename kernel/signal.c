@@ -19,7 +19,6 @@
 #define INT32_MIN_ (-2147483647 - 1)
 
 extern process_t* sched_get_current(void);
-extern process_t* process_find_by_pid(uint32_t pid);
 extern void process_foreach(void (*cb)(process_t*, void*), void* user);
 extern void sched_kill_current(int sig) __attribute__((noreturn));
 extern void sched_stop_current(trapframe_t* tf) __attribute__((noreturn));
@@ -142,7 +141,9 @@ int signal_post(process_t* p, int sig) {
 }
 
 // Collect the group under proc_lock, post outside it: signal_post may look up
-// the parent (SIGCONT -> SIGCHLD), which takes proc_lock again.
+// the parent (SIGCONT -> SIGCHLD), which takes proc_lock again. [M50-B1] Each
+// collected target is held by a reference (taken under proc_lock, inside the
+// callback) until it has been posted, so the reaper cannot free it meanwhile.
 #define PG_MAX 64
 // sender != NULL: kill(2) from a process -- only targets it may signal are
 // collected (kernel/cred.c: cred_may_signal); NULL = kernel-originated (Ctrl-C).
@@ -156,11 +157,16 @@ static void pg_cb(process_t* p, void* u) {
         return;
     }
     if (c->all && c->sender && p->pid == 1 && !cred_is_root(c->sender)) return;
-    c->t[c->n++] = p;
+    c->t[c->n++] = process_get(p);
+}
+static void put_collected(struct pg_ctx* c) {
+    for (int i = 0; i < c->n; i++) process_put(c->t[i]);
+    c->n = 0;
 }
 static int post_collected(struct pg_ctx* c, int sig) {
     int n = 0;
     for (int i = 0; i < c->n; i++) if (signal_post(c->t[i], sig) == 0) n++;
+    put_collected(c);
     return n;
 }
 int signal_post_pgid(uint32_t pgid, int sig) {
@@ -185,7 +191,7 @@ static int signal_post_checked(process_t* sender, uint32_t pgid, int all, int si
     if (!all) c.skip = 0;
     process_foreach(pg_cb, &c);
     *denied = c.denied;
-    if (sig == 0) return c.n;                        // existence/permission probe only
+    if (sig == 0) { int n = c.n; put_collected(&c); return n; }   // existence/permission probe only
     return post_collected(&c, sig);
 }
 
@@ -336,11 +342,19 @@ long ksys_kill(int pid, int sig) {
         if (n > 0) return 0;
         return denied ? -1 : -3;
     }
-    process_t* t = process_find_by_pid((uint32_t)pid);
+    process_t* t = process_get_by_pid((uint32_t)pid);   // [M50-B1] held until posted
     if (!t) return -3;
-    if (t->state != PROC_ZOMBIE && !cred_may_signal(cur, t, sig)) return -1;   // -EPERM
-    if (sig == 0 || t->state == PROC_ZOMBIE) return 0;   // exists (a zombie until reaped)
-    return signal_post(t, sig) == 0 ? 0 : -3;
+    // The target's credentials are read under proc_lock (process_set_cred).
+    uint64_t fl = process_lock_irqsave();
+    int zombie = (t->state == PROC_ZOMBIE);
+    int may = zombie || cred_may_signal(cur, t, sig);
+    process_unlock_irqrestore(fl);
+    long r;
+    if (!may) r = -1;                                    // -EPERM
+    else if (sig == 0 || zombie) r = 0;                  // exists (a zombie until reaped)
+    else r = signal_post(t, sig) == 0 ? 0 : -3;
+    process_put(t);
+    return r;
 }
 
 // [M30] setpgid(pid, pgid): pid 0 = caller; pgid 0 = the target's own pid (make
@@ -349,16 +363,18 @@ long ksys_kill(int pid, int sig) {
 long ksys_setpgid(int pid, int pgid) {
     process_t* cur = sched_get_current();
     if (!cur) return -1;
-    process_t* t = (pid == 0) ? cur : process_find_by_pid((uint32_t)pid);
+    process_t* t = (pid == 0) ? process_get(cur) : process_get_by_pid((uint32_t)pid);
     if (!t) return -3;                                   // -ESRCH
+    long r = 0;
     // [M43] POSIX: only the caller itself or one of its children (fork or
     // spawn), in the caller's session; a root caller may move anything (the
     // kernel shell builds pipelines that way).
     if (t != cur && !cred_is_root(cur) &&
-        !((t->ppid == cur->pid || t->spawner_pid == cur->pid) && t->sid == cur->sid)) return -3;
-    if (pgid < 0) return -22;                            // -EINVAL
-    t->pgid = (pgid == 0) ? t->pid : (uint32_t)pgid;
-    return 0;
+        !((t->ppid == cur->pid || t->spawner_pid == cur->pid) && t->sid == cur->sid)) r = -3;
+    else if (pgid < 0) r = -22;                          // -EINVAL
+    else t->pgid = (pgid == 0) ? t->pid : (uint32_t)pgid;
+    process_put(t);
+    return r;
 }
 
 long ksys_sigprocmask(int how, uint64_t set, uint64_t* oldset_user) {
@@ -379,7 +395,10 @@ long ksys_sigprocmask(int how, uint64_t set, uint64_t* oldset_user) {
 // getpgid(pid): pid 0 = caller. -ESRCH(3) for an unknown pid.
 long ksys_getpgid(int pid) {
     process_t* cur = sched_get_current();
-    process_t* t = (pid == 0) ? cur : process_find_by_pid((uint32_t)pid);
+    if (pid == 0) return cur ? (long)cur->pgid : -3;
+    process_t* t = process_get_by_pid((uint32_t)pid);
     if (!t) return -3;
-    return (long)t->pgid;
+    long g = (long)t->pgid;
+    process_put(t);
+    return g;
 }

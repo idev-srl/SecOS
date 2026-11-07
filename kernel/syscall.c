@@ -256,10 +256,9 @@ long ksys_execve(struct trapframe* tf, uint64_t upath, uint64_t uargv, uint64_t 
 // Poll variant (used by the kernel shell): 0 if the pid has exited (ZOMBIE) or
 // is gone; 1 if still running. User processes use the blocking SYS_WAIT instead.
 int ksys_wait(int pid){
-    extern process_t* process_find_by_pid(uint32_t);
-    process_t* t = process_find_by_pid((uint32_t)pid);
-    if(!t) return 0;
-    return (t->state == PROC_ZOMBIE) ? 0 : 1;
+    int st = process_pid_state((uint32_t)pid);   // [M50-B1] no pointer escapes
+    if(st < 0) return 0;
+    return (st == PROC_ZOMBIE) ? 0 : 1;
 }
 
 // [M17] Non-blocking recv attempt used by the blocking SYS_MSG_RECV path in

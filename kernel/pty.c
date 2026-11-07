@@ -30,7 +30,6 @@
 #include "../mm/user_copy.h"
 
 extern process_t* sched_get_current(void);
-extern process_t* process_find_by_pid(uint32_t pid);
 extern void process_foreach(void (*cb)(process_t*, void*), void* user);
 extern int devfs_is_ptmx(void* inode);
 extern int devfs_is_devtty(void* inode);
@@ -562,9 +561,12 @@ long ksys_setsid(void) {
 }
 long ksys_getsid(int pid) {
     process_t* c = sched_get_current();
-    process_t* t = (pid == 0) ? c : process_find_by_pid((uint32_t)pid);
+    if (pid == 0) return c ? (long)c->sid : E_SRCH;
+    process_t* t = process_get_by_pid((uint32_t)pid);   // [M50-B1]
     if (!t) return E_SRCH;
-    return (long)t->sid;
+    long sid = (long)t->sid;
+    process_put(t);
+    return sid;
 }
 
 /* ---- devfs glue --------------------------------------------------------------------- */

@@ -183,12 +183,14 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
     // re-runs on wake) instead of busy-polling. A woken waiter finds its result
     // pre-delivered (wait_ready) because the child may already be reaped.
     if (num == SYS_WAIT) {
-        extern process_t* process_find_by_pid(uint32_t);
         if (cur && cur->wait_ready) {
             cur->wait_ready = 0;
             ret = (uint64_t)(int64_t)cur->wait_result;
         } else {
-            process_t* child = process_find_by_pid((uint32_t)tf->rdi);
+            // [M50-B1] The reference keeps the child alive while we look at
+            // it; it is dropped on every path (sched_block_current does not
+            // return, so drop it before blocking).
+            process_t* child = process_get_by_pid((uint32_t)tf->rdi);
             if (!child) {
                 ret = (uint64_t)(int64_t)-1;            // no such pid
             } else if (cur && child->ppid != cur->pid && child->spawner_pid != cur->pid) {
@@ -202,6 +204,7 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
             } else if (cur && sig_interrupted(cur, tf)) {
                 ret = (uint64_t)(int64_t)(-4);          // [M30] EINTR: a signal is pending
             } else if (cur) {
+                process_put(child); child = NULL;
                 cur->wait_pid = (int)tf->rdi;
                 cur->wait_ready = 0;
                 tf->rip -= 2;                           // re-run `int 0x80` on wake
@@ -210,15 +213,13 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
             } else {
                 ret = (uint64_t)(int64_t)-1;
             }
+            process_put(child);
         }
     }
     // [M39] SYS_WAITANY: waitpid(-1) — reap ANY child (bash's wait_for loop uses
     // it). Returns the child's pid (status written to *rdi), 0 if WNOHANG and no
     // child has exited yet, or -ECHILD(-10) if the caller has no children.
     else if (num == SYS_WAITANY) {
-        extern process_t* process_find_zombie_child(uint32_t);
-        extern int process_has_children(uint32_t);
-        extern process_t* process_take_jobctl_child(uint32_t, int, int, int*);
         int* ustatus = (int*)tf->rdi;
         int opts     = (int)tf->rsi;
         int wnohang  = opts & 1;             // WNOHANG
@@ -226,20 +227,21 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
         int wcont    = opts & 8;             // WCONTINUED: report resumed children
         if (!cur) { ret = (uint64_t)(int64_t)-10; }
         else {
-            process_t* z = process_find_zombie_child(cur->pid);
-            process_t* j = 0; int jst = 0;
+            // [M50-B1] Collected under proc_lock: only pid + status come out
+            // (once collected, the reaper may free the zombie on another CPU).
+            uint32_t zpid = 0; int code = 0;
+            int z = process_collect_zombie_child(cur->pid, &zpid, &code);
+            uint32_t j = 0; int jst = 0;
             if (!z && (wuntrace || wcont))
                 j = process_take_jobctl_child(cur->pid, wuntrace, wcont, &jst);
             if (z) {
-                int code = z->exit_code;
-                z->collected = 1;            // reapable now
                 if (ustatus && user_range_valid(ustatus, sizeof(int)))
                     copy_to_user(ustatus, &code, sizeof(int));
-                ret = (uint64_t)(int64_t)(int)z->pid;
+                ret = (uint64_t)(int64_t)(int)zpid;
             } else if (j) {                  // stopped (sig<<8|0x7f) / continued (0xffff)
                 if (ustatus && user_range_valid(ustatus, sizeof(int)))
                     copy_to_user(ustatus, &jst, sizeof(int));
-                ret = (uint64_t)(int64_t)(int)j->pid;
+                ret = (uint64_t)(int64_t)(int)j;
             } else if (!process_has_children(cur->pid)) {
                 ret = (uint64_t)(int64_t)-10;        // ECHILD
             } else if (wnohang) {
