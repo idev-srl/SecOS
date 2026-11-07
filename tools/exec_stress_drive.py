@@ -94,10 +94,13 @@ def main():
     # more syscalls run at once). Sample MemFree + Slab (frames used outside
     # the heap: a frame leak) and SUnreclaim (bytes in heap blocks: a kmalloc
     # leak) and check each; a kernel without the fields reports Slab 0.
+    # Three samples a second apart, the best of each: a zombie not reaped yet
+    # still holds its pinned image (bash: ~1.1 MB of heap).
     def memfree():
-        done, out = run("echo MF-$(grep -E '^(MemFree|Slab|SUnreclaim):' /proc/meminfo | tr -s ' ' | cut -d' ' -f2 | tr '\\n' '-')KB", 60)
+        done, out = run("for i in 1 2 3; do echo MF-$(grep -E '^(MemFree|Slab|SUnreclaim):' /proc/meminfo | tr -s ' ' | cut -d' ' -f2 | tr '\\n' '-')KB; sleep 1; done", 60)
         m = re.findall(r"MF-(\d+)-(\d+)-(\d+)-KB", out)
-        if done and m: return (int(m[-1][0]) + int(m[-1][1]), int(m[-1][2]), int(m[-1][0]))
+        if done and m:
+            return (max(int(a) + int(b) for a, b, _ in m), min(int(c) for _, _, c in m), max(int(a) for a, _, _ in m))
         m = re.findall(r"MF-(\d+)-KB", out)
         return (int(m[-1]), 0, int(m[-1])) if done and m else None
     def finish():
