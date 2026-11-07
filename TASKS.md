@@ -36,8 +36,8 @@ really works"):
    Details in the "Phase 3" section below.
 4. **Phase 4 — hardening: DONE** on `integ/phase4` (M44–M49): SMAP by default, no
    identity map, kernel KASLR, exec confinement, net stack locking, SMP on by default,
-   big memory. Caveat: SMP relies on a kernel-wide lock (`kernel/bkl.c`) until the
-   VFS/filesystems/TTY have their own locks. Details in the "Phase 4" section below.
+   big memory. The SMP stop-gap kernel lock (`kernel/bkl.c`) is off by default since
+   M52 (`bkl=on` = fallback GRUB entry). Details in the "Phase 4" section below.
 5. **Phase 5 — isolated drivers** (approved 2026-11-07): IOMMU (Intel VT-d first,
    QEMU `-device intel-iommu`; AMD-Vi later) → IRQ delivery to ring-3 Driver Space
    drivers → kernel-granted DMA buffers confined by the IOMMU → move a first real
@@ -98,6 +98,7 @@ really works"):
 | M49 | Big memory: physmap to 64 TiB (1 GiB pages, RAM only), sectioned PMM, `vmm_map_mmio`, DMA32 zone | ✅ done (Phase 4) |
 | M50 | Lock core (BKL removal phase A): `klock`, lock levels, lockdep (`-DSECOS_LOCKDEP`, `/proc/lockstat`), BKL on klock, `bkl=on\|off` + `syscall_bkl_mask`; phase B: process refs + `mm_lock`, page-cache fill unlocked, per-disk block + xHCI locks | ✅ done |
 | M51 | BKL removal phase C: VFS namespace lock + unmount draining + atomic O_APPEND, per-FS instance klocks (ramfs, ext4, fat32, exfat, ntfs), devfs/procfs/sysfs, TTY/pty, exec/sysroot/pkg locks; `make locktests` | ✅ done |
+| M52 | BKL removal phase D: every syscall, user faults and teardown off the BKL, races it hid fixed, inode-keyed FS ops; default `bkl=off` (fallback `bkl=on`); `make bklstress`, scaling report | ✅ done |
 
 **Phases done:** A–E (M0–M13), F (M15–M17), G (M18–M20), H (M26–M27, + M33),
 I (M28–M29, SMP opt-in), J/networking (M24), K (M31–M32, M34, bash in M39),
@@ -286,7 +287,17 @@ robustness and the paused real-hardware bring-up — see below.
         refs/drain + atomic O_APPEND (C1), ramfs/devfs/procfs/sysfs locks (C2), ext2/ext4 lock
         (C3), fat32/exfat/ntfs locks (C4), TTY/pty locks (C5), exec/sysroot/pkg/misc (C6);
         `make locktests` runs every forced lock test.
-  - [ ] Phase D: clear `syscall_bkl_mask` subsystem by subsystem, then default `bkl=off`.
+  - [x] Phase D (M52, `integ/bkl-off`, `docs/devlog/M52-bkl-removal.md`): D1–D6 took every
+        syscall, user faults and teardown off the BKL (with `bkl=off`), fixing the races the
+        BKL hid (EMBRYO state, lost SIGCONT/SIGKILL vs stop, waitpid collection, setpgid/setsid,
+        open-vs-umount pin, O_TRUNC/truncate/chmod on the checked inode, atomic create
+        attributes, pty slot lifetime, spawn set-id TOCTOU, csprng chunks); D7 default
+        `bkl=off`, GRUB fallback entry "big kernel lock, bkl=on"; `make bklstress`,
+        `tools/bkl_bench.py`. The kernel shell keeps the BKL as its own lock.
+  - [ ] D8 (after real-HW validation: ASUS GUI + SSH + `stress 32` with `bkl=off`): delete the BKL.
+  - [ ] Follow-ups from M52: unlink/rename/link act by name after the permission check
+        (low-risk TOCTOU); `heap_lock` and the per-volume ext4 lock are the next bottlenecks
+        (see the M52 scaling report); ext2 unlink-while-open returns EIO (no orphan list).
 - [ ] NUMA awareness; buddy allocator for contiguous runs (M49 PMM search is linear and
       cannot cross a 1 GiB section); physmap + kernel-heap randomization.
 - [ ] Real-HW re-validation of SMP / x2APIC / shootdown (paused, see below).
