@@ -25,6 +25,7 @@
 #include "debugcon.h"
 #include "terminal.h"
 #include "power.h"
+#include "bkl.h"
 #include "../fs/vfs.h"
 
 extern void process_foreach(void (*cb)(process_t*, void*), void* user);
@@ -77,6 +78,12 @@ static void power_final(int cmd) {
         debugcon_writestring("[POWER] final phase already running on another CPU\n");
         for (;;) __asm__ volatile("sti; hlt");
     }
+    // [M52] Park whatever still runs under the kernel lock (the kernel shell,
+    // a syscall still in syscall_bkl_mask) before the final sync: it is never
+    // released. Syscalls off the BKL are drained per mount by
+    // vfs_unmount_all; a write to the root after its sync is lost, as with
+    // `reboot -f` (the journal keeps the root consistent).
+    bkl_lock();
     debugcon_writestring("[POWER] syncing filesystems\n");
     int n = vfs_sync_all();
     debugcon_writestring("[POWER] synced "); debugcon_print_hex((uint64_t)n);
