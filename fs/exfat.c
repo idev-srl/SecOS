@@ -1250,10 +1250,10 @@ static int ex_rename_locked(const char* oldp, const char* newp){
     return 0;
 }
 
-static int ex_truncate_locked(const char* path, size_t new_size){
-    if(!V.mounted || V.ro || !path) return -1;
-    exobj_t o;
-    if(ex_resolve(path, &o) != 0 || (o.attr & AT_DIR) || o.is_root || o.bad) return -1;
+/* [M52 D3] Truncate core: the file object `o` (fresh from its entry set). */
+static int ex_truncate_obj_locked(exobj_t* op, size_t new_size){
+    exobj_t o = *op;
+    if((o.attr & AT_DIR) || o.is_root || o.bad) return -1;
     if(st_validate(&o.st) != 0) return -1;
     if((uint64_t)new_size > ((uint64_t)V.ccount << V.cb_shift)) return -1;
     if(vol_dirty() != 0) return -1;
@@ -1283,11 +1283,16 @@ static int ex_truncate_locked(const char* path, size_t new_size){
     }
     return 0;
 }
-
-static int ex_setattr_locked(const char* path, const vfs_attr_t* a, unsigned valid){
-    if(!V.mounted || !path || !a) return -1;
+static int ex_truncate_locked(const char* path, size_t new_size){
+    if(!V.mounted || V.ro || !path) return -1;
     exobj_t o;
     if(ex_resolve(path, &o) != 0) return -1;
+    return ex_truncate_obj_locked(&o, new_size);
+}
+
+/* [M52 D3] Setattr core: the object `o` (fresh from its entry set). */
+static int ex_setattr_obj_locked(exobj_t* op, const vfs_attr_t* a, unsigned valid){
+    exobj_t o = *op;
     if(o.is_root) return 0;
     if(!(valid & (VFS_ATTR_MODE | VFS_ATTR_MTIME | VFS_ATTR_ATIME))) return 0;  /* no owners on exFAT */
     if(V.ro || vol_dirty() != 0) return -1;
@@ -1302,7 +1307,53 @@ static int ex_setattr_locked(const char* path, const vfs_attr_t* a, unsigned val
     if(valid & VFS_ATTR_MTIME){ wr32(r + 12, ts_from_unix(a->mtime)); r[21] = 0; r[23] = 0x80; }
     if(valid & VFS_ATTR_ATIME){ wr32(r + 16, ts_from_unix(a->atime)); r[24] = 0x80; }
     wr16(r + 2, set_csum(r, as.cnt));
-    return dent_wr(&o.dir, o.slot, r);
+    if(dent_wr(&o.dir, o.slot, r) != 0) return -1;
+    /* keep cached nodes of this entry in step (a later write stores attr) */
+    for(int i = 0; i < g_vused; i++){
+        exslot_t* x = vslot(i);
+        if(!x->n.dead && same_loc(&x->n.o, o.dir.first, o.slot)){
+            exobj_t* c = &x->n.o;
+            c->attr = rd16(r + 4);
+            c->tm = rd32(r + 12); c->ta = rd32(r + 16);
+            c->tm10 = r[21]; c->um = r[23]; c->ua = r[24];
+            ino_fill(&x->v, c);
+        }
+    }
+    return 0;
+}
+static int ex_setattr_locked(const char* path, const vfs_attr_t* a, unsigned valid){
+    if(!V.mounted || !path || !a) return -1;
+    exobj_t o;
+    if(ex_resolve(path, &o) != 0) return -1;
+    return ex_setattr_obj_locked(&o, a, valid);
+}
+
+/* [M52 D3] The entry set an open fd's node is bound to (a rename retargets
+ * the node: nodes_moved), re-read from disk so the fields are current. -1 if
+ * the node is dead (unlinked / replaced) or the set cannot be read back. */
+static int ex_node_obj_locked(vfs_inode_t* ino, exobj_t* out){
+    if(!ex_attached() || !ino || !ino->fs_data) return -1;
+    exnode_t* n = (exnode_t*)ino->fs_data;
+    if(n->dead) return -1;
+    if(n->o.is_root){ obj_root(out); return 0; }
+    static exset_t ns;
+    exst_t d = n->o.dir;
+    if(set_read(&d, n->o.slot, &ns) != 0) return -1;
+    obj_from_set(out, &n->o.dir, &ns);
+    return 0;
+}
+static int ex_ftruncate_locked(vfs_inode_t* ino, size_t new_size){
+    if(V.ro) return -30;                                  /* -EROFS */
+    exobj_t o;
+    if(ex_node_obj_locked(ino, &o) != 0) return -1;
+    return ex_truncate_obj_locked(&o, new_size);
+}
+static int ex_fsetattr_locked(vfs_inode_t* ino, const vfs_attr_t* a, unsigned valid){
+    if(V.ro) return -30;                                  /* -EROFS */
+    if(!a) return -1;
+    exobj_t o;
+    if(ex_node_obj_locked(ino, &o) != 0) return -1;
+    return ex_setattr_obj_locked(&o, a, valid);
 }
 
 static int ex_statfs_locked(vfs_statfs_t* st){
@@ -1348,6 +1399,8 @@ static int ex_rename(const char* a, const char* b){ EX_LOCK(); int r = ex_rename
 static int ex_truncate(const char* p, size_t n){ EX_LOCK(); int r = ex_truncate_locked(p, n); EX_UNLOCK(); return r; }
 static int ex_setattr(const char* p, const vfs_attr_t* a, unsigned v){ EX_LOCK(); int r = ex_setattr_locked(p, a, v); EX_UNLOCK(); return r; }
 static int ex_sync(void){ EX_LOCK(); int r = ex_sync_locked(); EX_UNLOCK(); return r; }
+static int ex_ftruncate(vfs_inode_t* i, size_t n){ EX_LOCK(); int r = ex_ftruncate_locked(i, n); EX_UNLOCK(); return r; }
+static int ex_fsetattr(vfs_inode_t* i, const vfs_attr_t* a, unsigned v){ EX_LOCK(); int r = ex_fsetattr_locked(i, a, v); EX_UNLOCK(); return r; }
 static int ex_statfs(vfs_statfs_t* st){ EX_LOCK(); int r = ex_statfs_locked(st); EX_UNLOCK(); return r; }
 /* mntinfo takes no lock: procfs calls it under g_proc_lock (a spinlock, no
  * klock may be taken inside). g_devname is stable while mounted. */
@@ -1371,6 +1424,7 @@ static vfs_fs_ops_t exfat_ops = {
     .truncate = ex_truncate, .setattr = ex_setattr, .sync = ex_sync,
     .statfs = ex_statfs, .mntinfo = ex_mntinfo,
     .lock = &g_ex_lock, .append = exfat_append,     /* [M51 C1] contract */
+    .ftruncate = ex_ftruncate, .fsetattr = ex_fsetattr,   /* [M52 D3] */
 };
 
 int exfat_is_mounted(void){ EX_LOCK(); int r = ex_attached(); EX_UNLOCK(); return r; }
