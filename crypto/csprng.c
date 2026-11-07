@@ -111,7 +111,23 @@ void csprng_init(void){
     spin_unlock_irqrestore(&g_lock, f);
 }
 
+/* [M52] One request: at most CSPRNG_CHUNK bytes per lock hold. The lock is
+ * irqsave (the timer IRQ stirs the pool), so a large /dev/random read used
+ * to keep interrupts off for its whole length (64 KiB = 2048 SHA-256 blocks,
+ * milliseconds without a tick on that CPU) and every other caller waiting.
+ * Each chunk is its own request, with its own rekey. */
+#define CSPRNG_CHUNK 256
+static void csprng_get_chunk(void* out, size_t len);
 void csprng_get(void* out, size_t len){
+    uint8_t* o = (uint8_t*)out;
+    while (len){
+        size_t n = len < CSPRNG_CHUNK ? len : CSPRNG_CHUNK;
+        csprng_get_chunk(o, n);
+        o += n; len -= n;
+    }
+}
+
+static void csprng_get_chunk(void* out, size_t len){
     uint64_t f = spin_lock_irqsave(&g_lock);
     init_locked();
     if (g_since_reseed >= CSPRNG_RESEED_BYTES) reseed();
