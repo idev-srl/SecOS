@@ -2203,6 +2203,16 @@ static void sh_pinfo(const char* a){
 static void execute_command_locked(char* line);
 // [M48] A kernel-shell command runs under the kernel lock, like a syscall:
 // it uses the same VFS / process / TTY code that tasks on other CPUs use.
+// [M52 D6] It keeps it in both modes. With bkl=off no syscall, fault or
+// teardown takes the BKL any more, so it serializes only the kernel shell
+// (its globals: cwd, jobs, pager, the job spawn buffer) and the final phase
+// of a poweroff; tasks on other CPUs never wait for it. It stays the BKL
+// rather than a new klock because the shell's waits (pager, sh_wait_tick,
+// the network commands' cpu_wait_irq) need the one klock that may be held
+// across a wait and suspended (bkl_suspend), and as K0 it nests outside
+// every lock the commands take. What a command shares with tasks goes
+// through their locks: ramfs entries are copied under ramfs_fs_lock, mounts
+// run under vfs_ns_lock, a held child's fds are written under its mm_lock.
 static void execute_command(char* line) {
     bkl_lock();
     execute_command_locked(line);

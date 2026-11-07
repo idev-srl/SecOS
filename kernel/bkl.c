@@ -109,6 +109,17 @@ static const uint16_t g_bkl_free_d5[] = {
     SYS_FORK, SYS_SPAWN, SYS_EXECVE, SYS_MOUNT, SYS_UMOUNT,
 };
 
+/* D6: exit (its teardown takes the BKL only with bkl=on, kernel/sched.c).
+ * After D6 no syscall takes the BKL with bkl=off. The bits still set are
+ * numbers no syscall uses (they return -ENOSYS at once): they stay set so a
+ * syscall added later starts under the BKL until it has been audited and
+ * listed here.
+ *
+ * g_bkl_keep puts a syscall back under the BKL with bkl=off (a hidden BKL
+ * dependency found later can be parked here without a redesign). Empty. */
+static const uint16_t g_bkl_free_d6[] = { SYS_EXIT };
+static const uint16_t g_bkl_keep[] = { 0xFFFF };   /* 0xFFFF: no entry */
+
 static void bkl_mask_clear(const uint16_t* nums, unsigned n) {
     for (unsigned i = 0; i < n; i++)
         if (nums[i] < SYSCALL_BKL_NR)
@@ -129,13 +140,17 @@ void bkl_init_mode(void) {
     BKL_MASK_CLEAR(g_bkl_free_d3);
     BKL_MASK_CLEAR(g_bkl_free_d4);
     BKL_MASK_CLEAR(g_bkl_free_d5);
+    BKL_MASK_CLEAR(g_bkl_free_d6);
+    for (unsigned i = 0; i < sizeof(g_bkl_keep) / sizeof(g_bkl_keep[0]); i++)
+        if (g_bkl_keep[i] < SYSCALL_BKL_NR)
+            syscall_bkl_mask[g_bkl_keep[i] >> 6] |= 1ULL << (g_bkl_keep[i] & 63);
     if (kernel_cmdline_has("bkl=off")) g_bkl_mode = 0;
     else if (kernel_cmdline_has("bkl=on")) g_bkl_mode = 1;
     else g_bkl_mode = BKL_MODE_DEFAULT;
     debugcon_writestring(g_bkl_mode ? "[BKL] kernel lock mode: bkl=on"
                                     : "[BKL] kernel lock mode: bkl=off");
     debugcon_writestring(BKL_MODE_DEFAULT == g_bkl_mode ? " (default)" : " (boot word)");
-    debugcon_writestring(", syscalls still under the BKL: ");
+    debugcon_writestring(", syscall numbers under the BKL (unused ones included): ");
     debugcon_print_hex(syscall_bkl_mask_count());
     debugcon_writestring("/0x100\n");
 }
