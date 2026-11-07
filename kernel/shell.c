@@ -945,7 +945,7 @@ static void sh_blk(const char* a){ (void)a;
         if(cnt * d->sector_size > sizeof(s)) cnt = sizeof(s) / d->sector_size;
         if(cnt==0) cnt=1;
         for(uint32_t k=0;k<sizeof(s);k++) s[k]=0;
-        int rr = d->read(d, 0, s, cnt);
+        int rr = block_read(d, 0, s, cnt);
         if(rr<0){ terminal_writestring("[READ FAILED]\n"); continue; }
         const char* fs;
         if(s[450]==0xEE || (s[512]=='E'&&s[513]=='F'&&s[514]=='I'&&s[515]==' ')) fs="GPT (boot disk, skipped)";

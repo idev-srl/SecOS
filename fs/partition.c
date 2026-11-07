@@ -31,14 +31,15 @@ static int part_read(block_dev_t* d, uint64_t lba, void* buf, uint32_t count){
     partition_dev_t* p = (partition_dev_t*)d;
     if(count == 0) return 0;
     if(lba + count > d->sector_count) return -1;       /* bound to the partition */
-    return p->parent->read(p->parent, p->start_lba + lba, buf, count);
+    /* [M50 B3] block_read() already holds the parent disk's lock. */
+    return block_read_locked(p->parent, p->start_lba + lba, buf, count);
 }
 static int part_write(block_dev_t* d, uint64_t lba, const void* buf, uint32_t count){
     partition_dev_t* p = (partition_dev_t*)d;
     if(count == 0) return 0;
     if(lba + count > d->sector_count) return -1;
     if(!p->parent->write) return -1;
-    return p->parent->write(p->parent, p->start_lba + lba, buf, count);
+    return block_write_locked(p->parent, p->start_lba + lba, buf, count);
 }
 
 /* Register one partition sub-device "<parent>p<num>" covering [start, start+count). */
@@ -58,6 +59,7 @@ static int add_partition(block_dev_t* parent, uint64_t start, uint64_t count, in
     p->name[n] = 0;
 
     p->parent        = parent;
+    p->dev.parent      = parent;                         /* [M50 B3] shares its lock */
     p->start_lba     = start;
     p->dev.name        = p->name;
     p->dev.sector_size = parent->sector_size;
