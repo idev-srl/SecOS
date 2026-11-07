@@ -620,12 +620,23 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
         if (len < 0 || len > 0xFFFFFFFFll) { r = NEG(E_INVAL); break; }
         if (a0) {
             if ((e = ki_user_path(c, a0, p0, sizeof(p0)))) { r = NEG(-e); break; }
-            { char cp[256];                               /* [M43] write permission on the file */
-              if ((e = cred_check_path(c, p0, 1, MAY_WRITE, cp, sizeof(cp), 0))) { r = NEG(-e); break; }
-              for (int i = 0; i < 256; i++) { p0[i] = cp[i]; if (!cp[i]) break; } }
-            ki_pagecache_drop_path(p0);
-            e = vfs_truncate(p0, (size_t)len);
-            if (e == 0) { vfs_inode_t* ino = vfs_lookup_follow(p0); if (ino) pagecache_invalidate(ino, 0, 1ULL << 62); }
+            /* [M43] write permission on the file. [M52] Then truncate the
+             * inode that passed the check, pinned (vfs_ftruncate): a second
+             * lookup by name could land on whatever a concurrent rename put
+             * there (a symlink to a file the caller may not write). */
+            char cp[256]; vfs_inode_t* ci = 0;
+            if ((e = cred_check_path(c, p0, 1, MAY_WRITE, cp, sizeof(cp), &ci))) { r = NEG(-e); break; }
+            vfs_pin_t pin = VFS_PIN_INIT;
+            vfs_inode_t* ino = vfs_lookup_pin(cp, &pin);
+            if (!ino) e = -2;                                         /* -ENOENT: gone meanwhile */
+            else if (ino != ci && (e = cred_inode_perm(c, ino, MAY_WRITE))) { }
+            else if (ino->type == VFS_NODE_DIR) e = -21;              /* -EISDIR */
+            else if (!ino->ops || !ino->ops->truncate) e = -22;
+            else {
+                e = vfs_ftruncate(ino, (size_t)len);
+                if (e == 0) pagecache_invalidate(ino, 0, 1ULL << 62);
+            }
+            vfs_unpin(&pin);
         } else {
             vfs_inode_t* ino;
             if ((e = ki_fd_file(c, (int)a2, &ino))) { r = NEG(-e); break; }

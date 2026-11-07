@@ -445,6 +445,21 @@ vfs_inode_t* vfs_lookup(const char* path){
     return ino;
 }
 
+// [M52] Lookup that keeps the mount's ref until vfs_unpin: an unmount drains
+// it, so the inode cannot be detached between the lookup and whatever the
+// caller installs from it (open's fd: the busy check that follows the drain
+// then sees the fd). NULL (no ref held) if nothing is there.
+vfs_inode_t* vfs_lookup_pin(const char* path, vfs_pin_t* pin){
+    vfs_mref_t m;
+    vfs_inode_t* ino = vfs_lookup_ref(path, &m);
+    if(!ino){ vfs_mput(&m); if(pin) pin->sid = -1; return NULL; }
+    if(pin) pin->sid = m.sid; else vfs_mput(&m);
+    return ino;
+}
+void vfs_unpin(vfs_pin_t* pin){
+    if(pin && pin->sid >= 0){ __atomic_sub_fetch(&g_sid_active[pin->sid], 1, __ATOMIC_ACQ_REL); pin->sid = -1; }
+}
+
 int vfs_walk(const char* path, char* out, size_t outsz, int follow_final);
 int vfs_readdir(const char* path, vfs_iter_cb cb, void* user){
     if(!cb) return -1;

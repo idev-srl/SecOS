@@ -191,6 +191,12 @@ int vfs_sync_all(void);
 int vfs_unmount_all(void);
 // Lookup inode by absolute path
 vfs_inode_t* vfs_lookup(const char* path);
+// [M52] Lookup + keep the mount's ref (an unmount waits for it) until
+// vfs_unpin. NULL leaves no ref. Pins nest; every pin is unpinned once.
+typedef struct vfs_pin { int sid; } vfs_pin_t;
+#define VFS_PIN_INIT { -1 }
+vfs_inode_t* vfs_lookup_pin(const char* path, vfs_pin_t* pin);
+void vfs_unpin(vfs_pin_t* pin);
 // Lookup following symlinks in every component, the final one included
 // (bounded hop count). Used by stat/open/chdir.
 vfs_inode_t* vfs_lookup_follow(const char* path);

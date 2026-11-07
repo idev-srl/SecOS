@@ -595,41 +595,50 @@ static int fd_abs_path(int fd, char* out, int cap){
 
 // open() follows symlinks in every path component (final one included), honours
 // O_EXCL (0x80) with O_CREAT, and creates with mode & ~umask (0 = 0666).
-int ksys_open_mode(const char* path, int flags, uint32_t mode){
+// [M52] Runs without the kernel lock, so nothing here may look the path up
+// again after the permission check: the inode that was checked is the one
+// truncated and installed. The mount stays pinned from the lookup to the fd
+// install, so an unmount on another CPU either waits for the open or makes
+// it fail, and never detaches a filesystem an fd is about to point into.
+static int open_check_existing(process_t* c, vfs_inode_t* ino, int flags){
+    int acc = flags & 3, mask = 0;
+    if(acc != 1) mask |= MAY_READ;                                           // O_RDONLY / O_RDWR
+    if(acc != 0 || (flags & 0x200)) mask |= MAY_WRITE;                       // O_WRONLY / O_RDWR / O_TRUNC
+    if(ino->type == VFS_NODE_DIR && (mask & MAY_WRITE)) return -21;          // -EISDIR
+    // [M42] Read-only filesystem: no write access, no O_TRUNC (-EROFS,
+    // also for root and before the permission bits, as on Linux).
+    int pe = cred_inode_perm(c, ino, mask); if(pe) return pe;
+    if(ino->type==VFS_NODE_FILE && ino->ops && (ino->ops->flags & VFS_FS_RDONLY) && (mask & MAY_WRITE))
+        return -30;                                                          // kernel callers too
+    return 0;
+}
+// Look `path` up again with the pin moved to the new result.
+static vfs_inode_t* open_repin(const char* path, vfs_pin_t* pin){
+    vfs_unpin(pin);
+    return vfs_lookup_pin(path, pin);
+}
+static int ksys_open_pinned(process_t* c, const char* path, int flags, uint32_t mode, int lerr,
+                            vfs_pin_t* pin){
     extern int vfs_create(const char*, const void*, size_t);
-    extern int vfs_truncate(const char*, size_t);
-    extern process_t* sched_get_current(void);
-    extern void kiface_apply_create_mode(const char*, uint32_t, int);
-    process_t* c=sched_get_current(); if(!c) return -1;
-    (void)kiface_apply_create_mode;
-    char ap[256]; proc_resolve_path(c, path, ap, sizeof(ap));             // [M39] cwd-relative
-    // [M43] Resolve with search permission on every component, then check
-    // the access the open asks for (read/write by owner/group/other; O_TRUNC
-    // needs write), or, to create, write+search on the parent directory.
-    char rp[256];
-    int lerr = cred_resolve(c, ap, 1, rp, sizeof(rp)); path = rp;
-    if(lerr) return lerr;                                                    // -EACCES/-ENOENT/-ENOTDIR/-ELOOP
-    vfs_inode_t* ino=vfs_lookup(path);
+    vfs_inode_t* ino=vfs_lookup_pin(path, pin);
     if(ino && (flags & 0x40) && (flags & 0x80)) return -17;                  // O_EXCL: -EEXIST
+    int created = 0;
     if(!ino && (flags & 0x40) && (lerr==0 || lerr==-2)){                     // O_CREAT
         int ce = cred_may_create(c, path); if(ce) return ce;                 // -EROFS before -EACCES
         int cr = vfs_create(path,"",0);
-        if(cr==0){ cred_apply_new(c, path, mode, 0); ino=vfs_lookup(path); }
+        if(cr==0){ cred_apply_new(c, path, mode, 0); ino=open_repin(path, pin); created = ino != NULL; }
         else if(cr==-30) return -30;                                         // -EROFS
-    } else if(ino){
-        int acc = flags & 3, mask = 0;
-        if(acc != 1) mask |= MAY_READ;                                       // O_RDONLY / O_RDWR
-        if(acc != 0 || (flags & 0x200)) mask |= MAY_WRITE;                   // O_WRONLY / O_RDWR / O_TRUNC
-        if(ino->type == VFS_NODE_DIR && (mask & MAY_WRITE)) return -21;      // -EISDIR
-        // [M42] Read-only filesystem: no write access, no O_TRUNC (-EROFS,
-        // also for root and before the permission bits, as on Linux).
-        int pe = cred_inode_perm(c, ino, mask); if(pe) return pe;
-        if(ino->type==VFS_NODE_FILE && ino->ops && (ino->ops->flags & VFS_FS_RDONLY) && (mask & MAY_WRITE))
-            return -30;                                                      // kernel callers too
+        else {
+            // Lost a race with another creator: open what is there now,
+            // like an open of an existing file (O_EXCL: -EEXIST).
+            ino=open_repin(path, pin);
+            if(ino && (flags & 0x80)) return -17;
+        }
     }
     if(!ino) return lerr ? lerr : -2;   // [M39] -ENOENT so libc can set errno (bash rcfile probing)
-    if((flags & 0x200) && ino->size){                                        // O_TRUNC
-        vfs_truncate(path,0); ino=vfs_lookup_follow(path); if(!ino) return -1;
+    if(!created){ int e = open_check_existing(c, ino, flags); if(e) return e; }
+    if((flags & 0x200) && ino->type==VFS_NODE_FILE && ino->size){            // O_TRUNC
+        if(vfs_ftruncate(ino, 0) != 0) return -1;                            // this inode, not the name
         pagecache_invalidate(ino, 0, 1ULL<<62);
     }
     // /dev/ptmx -> a new pty master, /dev/tty -> the controlling terminal,
@@ -646,6 +655,22 @@ int ksys_open_mode(const char* path, int flags, uint32_t mode){
     c->fds[fd].cloexec = (flags & K_O_CLOEXEC) ? 1 : 0;     // O_CLOEXEC
     c->fds[fd].flags = flags & ~K_O_CLOEXEC;                // F_GETFL: status flags only
     return fd;
+}
+int ksys_open_mode(const char* path, int flags, uint32_t mode){
+    extern process_t* sched_get_current(void);
+    process_t* c=sched_get_current(); if(!c) return -1;
+    char ap[256]; proc_resolve_path(c, path, ap, sizeof(ap));             // [M39] cwd-relative
+    // [M43] Resolve with search permission on every component, then check
+    // the access the open asks for (read/write by owner/group/other; O_TRUNC
+    // needs write), or, to create, write+search on the parent directory.
+    char rp[256];
+    int lerr = cred_resolve(c, ap, 1, rp, sizeof(rp));
+    if(lerr) return lerr;                                                    // -EACCES/-ENOENT/-ENOTDIR/-ELOOP
+    // The pin is dropped here, after the fd is installed (or the open failed).
+    vfs_pin_t pin = VFS_PIN_INIT;
+    int r = ksys_open_pinned(c, rp, flags, mode, lerr, &pin);
+    vfs_unpin(&pin);
+    return r;
 }
 int ksys_open(const char* path, int flags){ return ksys_open_mode(path, flags, 0); }
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
