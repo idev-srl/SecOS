@@ -63,7 +63,7 @@ run() {
                   --rounds 2 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
               rm -f "$OUT/$r.w"/*.img; return $rc ;;
         fsr4) timeout 2400 python3 tools/fs_stress_drive.py --boot 600 --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
-                  --ramroot --target /tmp --rounds 2 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
+                  --ramroot --workers 3 --iters 1500 --target /tmp --rounds 2 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
               rm -f "$OUT/$r.w"/*.img; return $rc ;;
         fsx4|fse4) local k=vfat; [ "$r" = fse4 ] && k=exfat
               timeout 3600 python3 tools/fs_stress_drive.py --boot 600 --iso "$ISO" --smp 4 --work "$OUT/$r.w" \

@@ -239,7 +239,7 @@ def main():
             run(vm, "root-is-ramfs", "grep -q ' / ramfs ' /proc/mounts && echo ROOT-$((6*7))", ["ROOT-42"], 60, absent=())
         else:
             run(vm, "root-is-ext4", "grep -q ' / ext4 ' /proc/mounts && echo ROOT-$((6*7))", ["ROOT-42"], 60, absent=())
-        nopt = ""
+        nopt = "-n " if o.ramroot else ""   # ramfs: no symlinks / hard links
         if o.data:
             fst = "vfat" if o.data == "vfat" else "exfat"
             run(vm, f"mount-{o.data}",
