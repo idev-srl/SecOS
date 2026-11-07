@@ -422,6 +422,8 @@ void sched_kill_current(int sig) {
     switch_to(next_or_idle(cur));      // NORETURN
 }
 
+#define SIGBIT_SCHED(n) (1ULL << (n))     // signal.h's SIGBIT (SIGCONT 18, SIGKILL 9)
+void sched_notify_parent_cont(process_t* child);
 // [M30] Stop the current process (SIGSTOP/SIGTSTP): save its ring-3 context,
 // mark it PROC_STOPPED (the scheduler skips it until SIGCONT flips it READY),
 // notify the parent, and switch away. Mirrors sched_block_current. NORETURN.
@@ -438,9 +440,19 @@ void sched_stop_current(trapframe_t* tf) {
     cur->stop_report = 1;              // waitpid(WUNTRACED) reports it once
     cur->cont_report = 0;
     if (cur->stop_sig <= 0) cur->stop_sig = 19 /*SIGSTOP*/;
-    cur->state = PROC_STOPPED;         // on_cpu still held until switch_to leaves it
+    __atomic_store_n(&cur->state, PROC_STOPPED, __ATOMIC_SEQ_CST);   // on_cpu held until switch_to
     notify_parent_sigchld(cur);
     sched_wake_parent_waitany(cur->ppid);   // a blocked waitpid(-1, WUNTRACED)
+    // [M52] A SIGCONT / SIGKILL posted between the dequeue of our stop signal
+    // and the store above saw us RUNNING and did not resume us (signal_post
+    // re-checks after setting its bit; we check after storing STOPPED).
+    {
+        uint64_t pend = __atomic_load_n(&cur->sig_pending, __ATOMIC_SEQ_CST);
+        if ((pend & (SIGBIT_SCHED(18) | SIGBIT_SCHED(9))) && sched_wake_task(cur, PROC_STOPPED)) {
+            cur->stop_report = 0;
+            if (pend & SIGBIT_SCHED(18)) { cur->cont_report = 1; sched_notify_parent_cont(cur); }
+        }
+    }
     switch_to(next_or_idle(cur));      // NORETURN
 }
 
@@ -500,7 +512,14 @@ static void wake_wp_cb(process_t* p, void* u) {
         p->wait_result = w->code;
         p->wait_ready  = 1;
         p->wait_pid    = -1;
-        if (wake_locked(p, &w->k)) w->woke++;
+        // [M52] The status is delivered as soon as wait_ready is set: the
+        // waiter consumes it on its next SYS_WAIT whoever makes it runnable.
+        // signal_post can flip BLOCKED -> READY from outside proc_lock and
+        // win the CAS below; counting only our own wake left the zombie
+        // uncollected (a later waitpid(-1) reported it twice, or it lingered
+        // until the parent exited).
+        w->woke++;
+        wake_locked(p, &w->k);
     }
 }
 // [M39] Returns the number of waiters woken (0 = no parent was blocked on this

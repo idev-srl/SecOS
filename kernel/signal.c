@@ -131,6 +131,20 @@ int signal_post(process_t* p, int sig) {
 
     __atomic_or_fetch(&p->sig_pending, SIGBIT(sig), __ATOMIC_SEQ_CST);   // [M48] atomic: ISRs and other CPUs post too
     sched_wake_note();      // [M48] a task deciding to block right now re-checks
+    // [M52] A stop that raced the checks above: the target dequeued its stop
+    // signal while RUNNING, we saw RUNNING, then it went STOPPED. It looks at
+    // its pending set after storing STOPPED (sched_stop_current) and we look
+    // at its state after setting the bit, so one of the two sees the other
+    // and the CAS lets only one of them resume it.
+    if ((sig == SIGCONT || sig == SIGKILL) && p->state == PROC_STOPPED &&
+        sched_wake_task(p, PROC_STOPPED)) {
+        p->stop_report = 0;
+        if (sig == SIGCONT) {
+            p->cont_report = 1;
+            extern void sched_notify_parent_cont(process_t*);
+            sched_notify_parent_cont(p);
+        }
+    }
 
     int deliverable = (sig == SIGKILL || sig == SIGSTOP) ||
                       !((p->sig_blocked >> sig) & 1);
@@ -311,9 +325,11 @@ long ksys_sigreturn(trapframe_t* tf) {
     cur->sig_blocked = sf.saved_mask;
     {   // [M48] Restore the interrupted FPU/SSE state. Reserved MXCSR bits would
         // make fxrstor #GP in the kernel: mask them with the CPU's MXCSR_MASK.
-        static uint32_t mxcsr_mask;
+        // [M52] The probe buffer is per call: two CPUs may run this at once
+        // (the mask itself is the same value on every CPU).
+        static volatile uint32_t mxcsr_mask;
         if (!mxcsr_mask) {
-            static uint8_t probe[512] __attribute__((aligned(16)));
+            uint8_t probe[512] __attribute__((aligned(16)));
             __asm__ volatile("fxsave64 %0" : "=m"(probe));
             uint32_t m = *(uint32_t*)(probe + 28);
             mxcsr_mask = m ? m : 0xFFBFu;
@@ -381,10 +397,16 @@ long ksys_setpgid(int pid, int pgid) {
     // [M43] POSIX: only the caller itself or one of its children (fork or
     // spawn), in the caller's session; a root caller may move anything (the
     // kernel shell builds pipelines that way).
+    // [M52] Check and store under proc_lock: without the BKL the target can
+    // run setsid() on another CPU between the two (a session leader whose
+    // pgid != pid). The readers of pgid/sid (signal_post_pgid, the tty
+    // checks) take proc_lock too.
+    uint64_t fl = process_lock_irqsave();
     if (t != cur && !cred_is_root(cur) &&
         !((t->ppid == cur->pid || t->spawner_pid == cur->pid) && t->sid == cur->sid)) r = -3;
     else if (pgid < 0) r = -22;                          // -EINVAL
     else t->pgid = (pgid == 0) ? t->pid : (uint32_t)pgid;
+    process_unlock_irqrestore(fl);
     process_put(t);
     return r;
 }

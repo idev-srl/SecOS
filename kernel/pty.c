@@ -550,11 +550,16 @@ long ksys_setsid(void) {
     process_t* c = sched_get_current();
     if (!c || c->pid == 0) return E_PERM;
     struct pg_find f = { c->pid, 0, 0 };            /* sid 0: any session */
-    process_foreach(pg_find_cb, &f);
+    /* [M52] The check and the sid/pgid stores in one proc_lock section: a
+     * parent's setpgid() on another CPU checks our sid and stores our pgid
+     * under the same lock. ctty_drop (g_pty_lock, S10) runs after it: it
+     * does not look at the session (no leader hangup here). */
+    uint64_t fl = process_lock_irqsave();
+    process_foreach_locked(pg_find_cb, &f);
+    if (!f.found) { c->sid = c->pid; c->pgid = c->pid; }
+    process_unlock_irqrestore(fl);
     if (f.found) return E_PERM;                       /* already a group leader (POSIX) */
     ctty_drop(c, 0);
-    c->sid = c->pid;
-    c->pgid = c->pid;
     c->ctty = NULL;
     c->ctty_detached = 1;                             /* a new session has no terminal */
     return (long)c->sid;
