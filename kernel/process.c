@@ -148,9 +148,17 @@ int process_count_runnable(void) {
     return n;
 }
 
+// [M48] Zombies detached by process_reap_one() whose process_destroy() has not
+// finished yet (it runs outside proc_lock, possibly on another CPU). Counted by
+// process_count_all() so "the table is empty" really means every teardown is
+// done: the M29-3 leak check sampled free memory while another CPU was still
+// freeing a detached zombie's address space and kernel stack.
+static volatile int g_reaping;
+void process_reap_done(void) { __atomic_sub_fetch(&g_reaping, 1, __ATOMIC_SEQ_CST); }
+
 int process_count_all(void) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
-    int n = 0;
+    int n = g_reaping;
     for (int i = 0; i < MAX_PROCESSES; i++) if (proc_table[i]) n++;
     spin_unlock_irqrestore(&proc_lock, fl);
     return n;
@@ -342,7 +350,7 @@ process_t* process_reap_one(void) {
             }
             if (!parent_alive) reapable = 1;   // orphan -> safe to reap
         }
-        if (reapable) { proc_table[i] = NULL; z = p; break; }
+        if (reapable) { proc_table[i] = NULL; z = p; __atomic_add_fetch(&g_reaping, 1, __ATOMIC_SEQ_CST); break; }
     }
     spin_unlock_irqrestore(&proc_lock, fl);
     return z;

@@ -224,7 +224,8 @@ process_t* process_reap_one(void); // [M48] detach+return one reapable, off-CPU 
 process_t* process_claim_next(uint32_t cpu, process_t* after); // pick+claim (RUNNING, on_cpu)
 uint32_t process_pick_home(void);          // least-loaded online CPU for a new task
 int      process_count_runnable(void);     // READY tasks not on any CPU
-int      process_count_all(void);          // every task in the table (incl. zombies)
+int      process_count_all(void);          // every task in the table (incl. zombies) + teardowns in flight
+void     process_reap_done(void);          // a process_reap_one() zombie has been destroyed
 uint64_t process_lock_irqsave(void);       // the process-table lock (for the
 void     process_unlock_irqrestore(uint64_t); //  scheduler's block/claim steps)
 int      process_set_pin(uint32_t pid, int32_t cpu); // hard affinity; -1 clears
