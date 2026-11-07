@@ -11,6 +11,7 @@
 #include "ed25519.h"
 #include "secos_pubkey.h"
 #include "debugcon.h"
+#include "klock.h"
 
 extern int vfs_create(const char*, const void*, size_t);
 extern int vfs_mkdir(const char*);
@@ -38,7 +39,26 @@ static int magic_ok(const char* m) {
     return 1;
 }
 
+/* [M51-C6] pkg_lock (K11, same level as sysroot_lock: the two are never
+ * nested) makes one install one critical section: two installs never
+ * interleave their files, so a later package's file always wins as a whole.
+ * pkg_install has no static state of its own; the lock is about the VFS
+ * result. Inside it: VFS create/mkdir only (K20/K30 and below). The package
+ * buffer is the caller's and must not change during the install: it is
+ * verified, then unpacked from the same bytes (all callers pass a kernel
+ * buffer: the embedded test package, the kernel shell's file copy). */
+static klock_t pkg_lock = KLOCK_INIT(LK_K11_SYSROOT, "pkg");
+
+static int pkg_install_locked(const void* buf, size_t len);
 int pkg_install(const void* buf, size_t len) {
+    klock_lock(&pkg_lock);
+    int r = pkg_install_locked(buf, len);
+    klock_unlock(&pkg_lock);
+    return r;
+}
+
+static int pkg_install_locked(const void* buf, size_t len) {
+    KLOCK_ASSERT_HELD(&pkg_lock);
     const uint8_t* b = (const uint8_t*)buf;
     if (len < sizeof(struct spkg_hdr)) return -1;
     const struct spkg_hdr* h = (const struct spkg_hdr*)b;
@@ -46,7 +66,9 @@ int pkg_install(const void* buf, size_t len) {
 
     uint64_t sig_off = h->sig_offset;
     uint32_t n = h->file_count;
-    if (sig_off + 64 > len) { debugcon_writestring("[PKG] truncated\n"); return -1; }
+    /* [M51-C6] Overflow-safe: a sig_offset near 2^64 used to wrap the sum and
+     * pass, sending the hash past the end of the buffer. */
+    if (len < 64 || sig_off > (uint64_t)len - 64) { debugcon_writestring("[PKG] truncated\n"); return -1; }
     if ((uint64_t)sizeof(struct spkg_hdr) + (uint64_t)n * sizeof(struct spkg_ent) > sig_off) {
         debugcon_writestring("[PKG] bad table\n"); return -1;
     }
@@ -74,7 +96,9 @@ int pkg_install(const void* buf, size_t len) {
             vfs_mkdir(path); done++;        /* mkdir is idempotent enough here */
             continue;
         }
-        if (e->data_offset + e->data_size > sig_off) { debugcon_writestring("[PKG] bad entry bounds\n"); return -1; }
+        if (e->data_offset > sig_off || e->data_size > sig_off - e->data_offset) {   /* overflow-safe */
+            debugcon_writestring("[PKG] bad entry bounds\n"); return -1;
+        }
         if (vfs_create(path, b + e->data_offset, (size_t)e->data_size) == 0) done++;
     }
     debugcon_writestring("[PKG] installed entries=0x"); debugcon_print_hex((uint64_t)done);
