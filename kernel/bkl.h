@@ -30,12 +30,13 @@
  * may be held across cpu_wait_irq() and copy_to/from_user.
  *
  * [M50] Boot word `bkl=on|off` (MB2 command line, UEFI load options) sets
- * g_bkl_mode. Default and today's only safe value: on. `bkl=off` prints a
- * warning and still takes the BKL for every syscall whose bit is set in
- * syscall_bkl_mask[] — all of them until the BKL removal (docs/
- * BKL_REMOVAL_PLAN.md, phase D) clears bits one subsystem at a time. The other
- * call sites (faults, teardown, kernel shell) take it in both modes until
- * phase D removes them.
+ * g_bkl_mode; without one the build default applies (Makefile BKL_DEFAULT,
+ * [M52]). `bkl=on` takes the BKL for every syscall, fault, teardown and
+ * kernel-shell command, exactly as M48 did: the fallback. `bkl=off` takes it
+ * only for the syscalls whose bit is still set in syscall_bkl_mask[] (phase D
+ * of docs/BKL_REMOVAL_PLAN.md clears bits one subsystem at a time, see
+ * docs/devlog/M52-bkl-removal.md) and at the call sites phase D has not
+ * removed yet.
  *
  * SPDX-License-Identifier: MIT
  */

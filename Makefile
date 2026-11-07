@@ -48,9 +48,16 @@ GUI_DEF := $(if $(filter 1 yes y,$(GUI_AUTOSTART)),-DSECOS_GUI_AUTOSTART,)
 # secos.console= hint on /proc/cmdline.
 CONSOLE ?= login
 CONSOLE_DEF := $(if $(filter root,$(CONSOLE)),-DSECOS_CONSOLE_ROOT,)
+# [M52] Kernel lock mode when the command line has neither `bkl=on` nor
+# `bkl=off` (kernel/bkl.c). `make iso BKL_DEFAULT=off` builds an image that
+# boots without the BKL on the syscalls phase D took off it; the GRUB menu keeps
+# an entry with the other mode. Read from the environment too, so
+# `BKL_DEFAULT=off tools/selftest.sh` runs every gate in the other mode.
+BKL_DEFAULT ?= on
+BKL_DEF := $(if $(filter off,$(BKL_DEFAULT)),-DSECOS_BKL_DEFAULT_OFF,)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
 		  -fstack-protector-strong -mstack-protector-guard=global $(INCLUDES) \
-		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(GUI_DEF) $(CONSOLE_DEF) $(CFLAGS_EXTRA)
+		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(GUI_DEF) $(CONSOLE_DEF) $(BKL_DEF) $(CFLAGS_EXTRA)
 # Header dependency tracking: every kernel object also depends on the headers it
 # includes (gcc writes foo.d next to foo.o). Without it, changing only a header
 # (e.g. a regenerated embedded program crypto/user_*_elf.h) left the objects that
@@ -249,6 +256,10 @@ $(KERNEL_DIR)/kernel.o $(KERNEL_DIR)/sysroot.o $(FS_DIR)/procfs.o: $(GUI_STAMP)
 CONSOLE_STAMP := .console.stamp
 $(shell echo '$(CONSOLE_DEF)' | cmp -s - $(CONSOLE_STAMP) 2>/dev/null || echo '$(CONSOLE_DEF)' > $(CONSOLE_STAMP))
 $(KERNEL_DIR)/sysroot.o $(FS_DIR)/procfs.o: $(CONSOLE_STAMP)
+# Same for BKL_DEFAULT (kernel/bkl.c only).
+BKL_STAMP := .bkl-default.stamp
+$(shell echo '$(BKL_DEF)' | cmp -s - $(BKL_STAMP) 2>/dev/null || echo '$(BKL_DEF)' > $(BKL_STAMP))
+$(KERNEL_DIR)/bkl.o: $(BKL_STAMP)
 
 $(DRIVERS_DIR)/%.o: $(DRIVERS_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -1005,7 +1016,7 @@ locktests:
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
-	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP) $(CONSOLE_STAMP)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP) $(CONSOLE_STAMP) $(BKL_STAMP)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin $(BOOT_DIR)/kaslr_core.raw.o
 	rm -f build/kernel.pass1.elf build/kernel.pass2.elf $(KASLR_BIN) $(KASLR_OBJ)
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log

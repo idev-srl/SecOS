@@ -65,7 +65,7 @@ for r in ssd4 ssd8 nsd4 off4 prd8; do
 done
 grep -aq "\[LDTEST\] all 0x000000000000000A/0x000000000000000A" "$OUT/ssd4.log"
 chk "ssd4 lockdep catches all 10 boot negative controls" $?
-grep -aq "\[BKL\] WARNING: bkl=off" "$OUT/off4.log"; chk "off4 bkl=off boot word recognised" $?
+grep -aq "\[BKL\] kernel lock mode: bkl=off (boot word)" "$OUT/off4.log"; chk "off4 bkl=off boot word recognised" $?
 grep -aq "\[BKL\] kernel lock mode: bkl=on" "$OUT/ssd4.log"; chk "ssd4 default mode is bkl=on" $?
 grep -ah "\[LOCKDEP\]\|\[LOCK\] BUG" "$OUT"/*.log 2>/dev/null | sort | uniq -c | head -20
 echo "[lockdep] RESULT pass=$pass fail=$fail (logs in $OUT)"

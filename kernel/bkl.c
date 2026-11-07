@@ -47,19 +47,24 @@ int g_bkl_mode = 1;
 uint64_t syscall_bkl_mask[SYSCALL_BKL_WORDS] = { ALL64, ALL64, ALL64, ALL64 };
 typedef char syscall_bkl_mask_init_covers_all[(SYSCALL_BKL_WORDS == 4) ? 1 : -1];
 
+/* [M52] The mode when the command line names none (Makefile BKL_DEFAULT). */
+#ifdef SECOS_BKL_DEFAULT_OFF
+#define BKL_MODE_DEFAULT 0
+#else
+#define BKL_MODE_DEFAULT 1
+#endif
+
 void bkl_init_mode(void) {
     extern int kernel_cmdline_has(const char* word);
     if (kernel_cmdline_has("bkl=off")) g_bkl_mode = 0;
-    else g_bkl_mode = 1;                 /* bkl=on, or nothing: the default */
-    if (!g_bkl_mode) {
-        debugcon_writestring("[BKL] WARNING: bkl=off requested. The BKL removal is not "
-                             "complete: syscalls in syscall_bkl_mask (");
-        debugcon_print_hex(syscall_bkl_mask_count());
-        debugcon_writestring(" of 0x100) still take the kernel lock, as do faults, "
-                             "teardown and the kernel shell.\n");
-    } else {
-        debugcon_writestring("[BKL] kernel lock mode: bkl=on\n");
-    }
+    else if (kernel_cmdline_has("bkl=on")) g_bkl_mode = 1;
+    else g_bkl_mode = BKL_MODE_DEFAULT;
+    debugcon_writestring(g_bkl_mode ? "[BKL] kernel lock mode: bkl=on"
+                                    : "[BKL] kernel lock mode: bkl=off");
+    debugcon_writestring(BKL_MODE_DEFAULT == g_bkl_mode ? " (default)" : " (boot word)");
+    debugcon_writestring(", syscalls still under the BKL: ");
+    debugcon_print_hex(syscall_bkl_mask_count());
+    debugcon_writestring("/0x100\n");
 }
 
 int syscall_needs_bkl(uint64_t num) {
