@@ -996,6 +996,12 @@ run-vnc: iso $(ROOT_DEP)
 lockdep-check:
 	tools/lockdep_check.sh
 
+# [M51] Every forced-concurrency lock test (B2, B3, C1-C6) on a lockdep build
+# at -smp 4, one image per test (tools/locktests.sh).
+.PHONY: locktests
+locktests:
+	tools/locktests.sh
+
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
