@@ -771,14 +771,22 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
             // O_APPEND: every write goes to the current end of file (POSIX).
             // The offset is per-fd, so writers sharing a log through fork
             // (a daemon and its children) overwrote each other's lines.
-            // The fd's inode does not track writes made through other fds
-            // (ramfs keeps the size in its entry), so look the size up fresh.
+            // [M51 C1] The end of file is resolved and written in one
+            // critical section (vfs_append: the driver's ->append under its
+            // instance lock, or the VFS fallback under vfs_append_lock), so
+            // two appenders can never both pick the same offset. The fd
+            // table and its offset are per process and a process runs on
+            // one CPU at a time (no threads), so they need no lock.
+            size_t off;
             if(c->fds[fd].flags & 0x400){
-                vfs_inode_t* cur = vfs_lookup(ino->path);
-                c->fds[fd].offset = (cur == ino || (cur && cur->fs_data == ino->fs_data)) ? cur->size : ino->size;
+                uint64_t at = 0;
+                r = vfs_append(ino, u.p, (size_t)want, &at);
+                off = (size_t)at;
+                if(r>0) c->fds[fd].offset = at;
+            } else {
+                off = c->fds[fd].offset;
+                r = ino->ops->write(ino, off, u.p, (size_t)want);
             }
-            size_t off=c->fds[fd].offset;
-            r=ino->ops->write(ino, off, u.p, (size_t)want);
             if(r>0){ c->fds[fd].offset += (uint64_t)r; pagecache_invalidate(ino, off, (uint64_t)r); }
         } else {
             // [M9] fd 1 (stdout) / 2 (stderr) with no redirection -> console,
@@ -1026,7 +1034,17 @@ static int ksys_remount(const char* target, const char* opts){
     if(!ops->remount) return -CRED_EINVAL;
     return ops->remount(ro);
 }
+static int ksys_mount_opts_locked(const char* dev, const char* target, const char* fstype, const char* opts);
+// [M51 C1] The whole mount — the driver's probe, its vfs_mount, a remount —
+// runs under vfs_ns_lock, so two mounts (or a mount and a umount) never
+// interleave their filesystem I/O or their "already mounted?" checks.
 int ksys_mount_opts(const char* dev, const char* target, const char* fstype, const char* opts){
+    vfs_ns_lock();
+    int r = ksys_mount_opts_locked(dev, target, fstype, opts);
+    vfs_ns_unlock();
+    return r;
+}
+static int ksys_mount_opts_locked(const char* dev, const char* target, const char* fstype, const char* opts){
     extern void* block_find(const char* name);
     extern int fat32_mount(const char*, const char*);
     extern int ext2_mount(const char*, const char*);
@@ -1103,6 +1121,12 @@ static void umount_busy_cb(process_t* p, void* u){
     }
     mm_unlock(p, fl);
 }
+static int umount_is_busy(const vfs_fs_ops_t* ops, void* ctx){
+    (void)ctx;
+    struct umount_busy b = { ops, 0 };
+    process_foreach(umount_busy_cb, &b);
+    return b.busy;
+}
 int ksys_umount(const char* target){
     extern int vfs_unmount(const char*);
     // Normalize like every other path syscall ("/mnt/", "/mnt/.", relative
@@ -1119,21 +1143,14 @@ int ksys_umount(const char* target){
         }
     }
     if(!ops) return -22;                                  // -EINVAL: not a mount point
-    // In use (open fd / file mapping): -EBUSY, like Linux without MNT_DETACH.
-    // An FS mounted twice is still reachable through its other mount point.
-    {
-        int uses = 0, n = vfs_mount_count();
-        for(int i=0;i<n;i++) if(vfs_mount_ops_at(i) == ops) uses++;
-        if(uses == 1){
-            struct umount_busy b = { ops, 0 };
-            process_foreach(umount_busy_cb, &b);
-            if(b.busy) return -16;
-        }
-    }
-    // Flush the filesystem before detaching it (exFAT clears VolumeDirty here,
-    // ext2/ext4 closes any open transaction), so a umount leaves it clean.
-    vfs_sync_ops(ops);
-    return vfs_unmount(abs);
+    // [M51 C1] Under vfs_ns_lock: drain the operations in flight on the
+    // mount, then the open-fd / file-mapping check (-EBUSY, like Linux
+    // without MNT_DETACH; only for the FS's last mount), then sync (exFAT
+    // clears VolumeDirty, ext2/ext4 closes any open transaction) and detach.
+    vfs_ns_lock();
+    int r = vfs_unmount_ex(abs, umount_is_busy, NULL, VFS_UMOUNT_SYNC);
+    vfs_ns_unlock();
+    return r == -1 ? -22 : r;                             // raced another umount: EINVAL
 }
 
 // [M26] Copy a NUL-terminated user string into a kernel buffer (bounded,
