@@ -83,6 +83,7 @@ SRC_C   = \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
 	$(MM_DIR)/vma.c \
 	$(MM_DIR)/pagecache.c \
+	$(MM_DIR)/pagecache_test.c \
 	$(MM_DIR)/elf.c \
 	$(MM_DIR)/elf_unload.c \
 	$(MM_DIR)/elf_manifest.c \
