@@ -12,6 +12,7 @@
 #   c4         -DSECOS_C4_FSSTRESS     tools/c4_fs_drive.py (FAT32/exFAT/NTFS) (C4)
 #   tty        -DSECOS_TTY_TEST        tools/tty_stress_drive.py --tttest (C5)
 #   exec       -DSECOS_EXEC_TEST       tools/exec_stress_drive.py        (C6)
+#   fsops      -DSECOS_FSOPS_TEST      boot, ext4/FAT32/exFAT /mnt, [FSOPS] (D3)
 # A test passes when its driver/marker says so and its debugcon log has no
 # [LOCKDEP], [LOCK] BUG, panic or CPU exception. The images are built one
 # after the other (the tree has one object set), then run LOCKTESTS_JOBS at a
@@ -27,7 +28,7 @@ OUT=${1:-$(mktemp -d /tmp/secos_locktests.XXXXXX)}
 mkdir -p "$OUT"
 export PYENV_VERSION=${PYENV_VERSION:-3.11.8}
 JOBS=${LOCKTESTS_JOBS:-3}
-ALL="pagecache b3 vfs fsvirt ext4 c4 tty exec"
+ALL="pagecache b3 vfs fsvirt ext4 c4 tty exec fsops"
 TESTS=${*:-$ALL}
 
 flag_of() {
@@ -36,6 +37,7 @@ flag_of() {
         vfs) echo SECOS_VFS_TEST ;; fsvirt) echo SECOS_FSVIRT_TEST ;;
         ext4) echo SECOS_EXT4_LOCKTEST ;; c4) echo SECOS_C4_FSSTRESS ;;
         tty) echo SECOS_TTY_TEST ;; exec) echo SECOS_EXEC_TEST ;;
+        fsops) echo SECOS_FSOPS_TEST ;;
         *) return 1 ;;
     esac
 }
@@ -91,6 +93,20 @@ run_test() {
                    cat "$OUT/vfs-fat32.out" "$OUT/vfs-ext2.out" >"$OUT/vfs.out"
                    rm -f "$d"/*.img; return $r ;;
         fsvirt)    boot_marker fsvirt "$iso" FSVT 600 ;;
+        fsops)     local d="$OUT/fsops" r=0 k; mkdir -p "$d"
+                   rm -f "$d"/*.img
+                   truncate -s 64M "$d/ext4.img"; mkfs.ext4 -q -F -L FSOPS "$d/ext4.img"
+                   truncate -s 64M "$d/fat.img"; mkfs.fat -F 32 -n FSOPS "$d/fat.img" >/dev/null
+                   tools/exfat-host.sh mkfs "$d/exfat.img" 64 >/dev/null 2>&1 || r=1
+                   for k in ext4 fat exfat; do
+                       boot_marker fsops-$k "$iso" FSOPS 300 -drive file="$d/$k.img",if=virtio,format=raw || r=1
+                   done
+                   e2fsck -fn "$d/ext4.img" >"$d/ext4.fsck" 2>&1 || r=1
+                   fsck.vfat -n "$d/fat.img" >"$d/fat.fsck" 2>&1 || r=1
+                   tools/exfat-host.sh fsck "$d/exfat.img" >"$d/exfat.fsck" 2>&1 || r=1
+                   python3 -I tools/exfat_img.py deepcheck "$d/exfat.img" >>"$d/exfat.fsck" 2>&1 || r=1
+                   cat "$OUT"/fsops-*.log >"$OUT/fsops.log"; cat "$OUT"/fsops-*.out >"$OUT/fsops.out"
+                   [ $r = 0 ] && [ -z "${KEEP_IMAGES:-}" ] && rm -f "$d"/*.img; return $r ;;
         ext4)      timeout 1200 tools/ext4_lock_test.sh "$iso" 4 "$OUT/ext4" >"$OUT/$t.out" 2>&1; local r=$?
                    cat "$OUT"/ext4/*.log >"$OUT/$t.log" 2>/dev/null; rm -f "$OUT"/ext4/*.img; return $r ;;
         c4)        mkdir -p "$OUT/c4"
