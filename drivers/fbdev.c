@@ -25,6 +25,7 @@
 #include "fbdev.h"
 #include "fb.h"
 #include "fb_console.h"
+#include "vt.h"              /* con_lock: KD mode switches [M51-C6] */
 #include "cap.h"
 #include "process.h"
 #include "sched.h"
@@ -231,13 +232,21 @@ int64_t fbdev_mmap(struct process* cp, uint64_t len, int prot, int flags, uint64
     return (int64_t)base;
 }
 
-/* ---- console mode (KDSETMODE) ------------------------------------------------------ */
+/* ---- console mode (KDSETMODE) ------------------------------------------------------
+ * [M51-C6] g_kd_mode / g_kd_owner and the fb console's graphics flag change
+ * together under con_lock (drivers/vt.c), the console output lock: a mode
+ * switch and the repaint of the text console it triggers are one section, so
+ * no kernel/TTY output on another CPU lands between "text again" and the
+ * repaint, and two switches (a KDSETMODE racing the graphics owner's exit)
+ * cannot apply their mode and their repaint in different orders. con_lock is
+ * raw, recursive and bounded, interrupts off: a repaint is one full-screen
+ * draw, already done with the console locked by every other console path. */
 static int g_kd_mode = KD_TEXT;
 static uint32_t g_kd_owner;          /* pid that switched to KD_GRAPHICS */
 
 int vtcon_mode(void) { return g_kd_mode; }
 
-static void set_text(const char* why, uint32_t pid) {
+static void set_text_locked(const char* why, uint32_t pid) {
     if (g_kd_mode == KD_TEXT) return;
     g_kd_mode = KD_TEXT; g_kd_owner = 0;
 #if ENABLE_FB
@@ -253,19 +262,21 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
     process_t* c = sched_get_current();
     switch (cmd) {
     case KDGETMODE: {
-        int m = g_kd_mode;
-        return copy_to_user((void*)arg, &m, sizeof(m)) ? E_FAULT : 0;
+        int m = __atomic_load_n(&g_kd_mode, __ATOMIC_RELAXED);
+        return copy_to_user((void*)arg, &m, sizeof(m)) ? E_FAULT : 0;   /* no lock held */
     }
     case KDSETMODE:
         if (arg == KD_GRAPHICS) {
             /* Blanking the console is a display privilege. */
             if (!cap_check_explicit(c, CAP_DISPLAY, 53 /*SYS_IOCTL*/, "KD_GRAPHICS")) return E_PERM;
             uint32_t pid = c ? c->pid : 0;
-            if (g_kd_mode == KD_GRAPHICS && g_kd_owner == pid) return 0;
+            uint64_t lf = con_lock();
+            if (g_kd_mode == KD_GRAPHICS && g_kd_owner == pid) { con_unlock(lf); return 0; }
             g_kd_mode = KD_GRAPHICS; g_kd_owner = pid;
 #if ENABLE_FB
             fb_console_set_graphics(1);
 #endif
+            con_unlock(lf);
             debugcon_writestring("[VT] graphics mode (owner pid="); debugcon_print_hex(pid);
             debugcon_writestring(")\n");
             return 0;
@@ -275,9 +286,14 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
              * may take the screen back: any console user forcing text mode
              * would scribble the console over a compositor. */
             uint32_t pid = c ? c->pid : 0;
+            uint64_t lf = con_lock();
             if (g_kd_mode == KD_GRAPHICS && pid != g_kd_owner &&
-                !cap_check_explicit(c, CAP_DISPLAY, 53 /*SYS_IOCTL*/, "KD_TEXT")) return E_PERM;
-            set_text("KD_TEXT", pid);
+                !cap_check_explicit(c, CAP_DISPLAY, 53 /*SYS_IOCTL*/, "KD_TEXT")) {
+                con_unlock(lf);
+                return E_PERM;
+            }
+            set_text_locked("KD_TEXT", pid);
+            con_unlock(lf);
             return 0;
         }
         return E_INVAL;
@@ -288,6 +304,9 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
 
 void vtcon_proc_exit(struct process* pp) {
     process_t* p = (process_t*)pp;
-    if (!p || g_kd_mode != KD_GRAPHICS || p->pid != g_kd_owner) return;
-    set_text("graphics owner exited", p->pid);
+    if (!p || __atomic_load_n(&g_kd_mode, __ATOMIC_RELAXED) != KD_GRAPHICS) return;   /* fast path */
+    uint64_t lf = con_lock();
+    if (g_kd_mode == KD_GRAPHICS && p->pid == g_kd_owner)
+        set_text_locked("graphics owner exited", p->pid);
+    con_unlock(lf);
 }
