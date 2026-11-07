@@ -162,7 +162,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     // child would: without this `cd /tmp; tar cf a.tar f1` ran tar in "/".
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0) p->ki.umask = sp->ki.umask;
-      if (sp && sp->pid != 0) p->cred = sp->cred;          // [M43] same user as the spawner
+      if (sp && sp->pid != 0) process_set_cred(p, &sp->cred);   // [M43] same user as the spawner
       cred_exec_setid(p, fmode, fuid, fgid, setid_allowed(p, fmode, setid_fs, bound.valid && bound.nnp)); }
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0 && sp->cwd[0]) {

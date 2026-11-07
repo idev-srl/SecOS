@@ -295,17 +295,23 @@ static void cred_log(const process_t* p, const char* what){
     debugcon_writestring("\n");
 }
 
+/* [M50-B1] Credential writes: the owner builds the new set on a copy and
+ * publishes it under proc_lock (process_set_cred), so a cross-process reader
+ * (kill permission, /proc owner) never sees a half-updated set. Only the owner
+ * writes its own cred, so its own unlocked reads stay consistent. */
 int cred_exec_setid(process_t* p, uint32_t fmode, uint32_t fuid, uint32_t fgid, int allowed){
-    uint32_t oe = p->cred.euid, og = p->cred.egid;
+    struct proc_cred nc = p->cred;
+    uint32_t oe = nc.euid, og = nc.egid;
     int want = (fmode & S_ISUID_) || ((fmode & S_ISGID_) && (fmode & 0010u));
     if(want && allowed){
-        if(fmode & S_ISUID_) p->cred.euid = fuid;
-        if((fmode & S_ISGID_) && (fmode & 0010u)) p->cred.egid = fgid;
+        if(fmode & S_ISUID_) nc.euid = fuid;
+        if((fmode & S_ISGID_) && (fmode & 0010u)) nc.egid = fgid;
     } else if(want){
         debugcon_writestring("[CRED] set-id bit ignored (not on the root fs, no SETID manifest, or no_new_privs)\n");
     }
-    p->cred.suid = p->cred.euid;                          /* POSIX: saved = effective after exec */
-    p->cred.sgid = p->cred.egid;
+    nc.suid = nc.euid;                                    /* POSIX: saved = effective after exec */
+    nc.sgid = nc.egid;
+    process_set_cred(p, &nc);
     int changed = (p->cred.euid != oe || p->cred.egid != og);
     if(changed) cred_log(p, "set-id exec");
     return changed;
@@ -331,8 +337,12 @@ long cred_syscall(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2){
     extern process_t* sched_get_current(void);
     process_t* c = sched_get_current();
     if(!c) return -CRED_EINVAL;
-    struct proc_cred* cr = &c->cred;
+    /* [M50-B1] Work on a copy; a successful set*id publishes it under proc_lock
+     * (process_set_cred) before it is logged. */
+    struct proc_cred nc = c->cred;
+    struct proc_cred* cr = &nc;
     int priv = cr->euid == 0;                             /* CAP_SETUID/CAP_SETGID == root */
+#define CRED_COMMIT(what) do { process_set_cred(c, &nc); cred_log(c, what); } while (0)
     switch(num){
     case SYS_GETUID: case SYS_GETGID: {
         uint32_t v[3];
@@ -346,27 +356,27 @@ long cred_syscall(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2){
     case SYS_SETUID: {
         uint32_t u = (uint32_t)a0;
         if(u == CRED_UNCHANGED) return -CRED_EINVAL;
-        if(priv){ cr->ruid = cr->euid = cr->suid = u; cred_log(c, "setuid"); return 0; }
-        if(u == cr->ruid || u == cr->suid){ cr->euid = u; cred_log(c, "setuid"); return 0; }
+        if(priv){ cr->ruid = cr->euid = cr->suid = u; CRED_COMMIT("setuid"); return 0; }
+        if(u == cr->ruid || u == cr->suid){ cr->euid = u; CRED_COMMIT("setuid"); return 0; }
         return -CRED_EPERM;
     }
     case SYS_SETGID: {
         uint32_t g = (uint32_t)a0;
         if(g == CRED_UNCHANGED) return -CRED_EINVAL;
-        if(priv){ cr->rgid = cr->egid = cr->sgid = g; cred_log(c, "setgid"); return 0; }
-        if(g == cr->rgid || g == cr->sgid){ cr->egid = g; cred_log(c, "setgid"); return 0; }
+        if(priv){ cr->rgid = cr->egid = cr->sgid = g; CRED_COMMIT("setgid"); return 0; }
+        if(g == cr->rgid || g == cr->sgid){ cr->egid = g; CRED_COMMIT("setgid"); return 0; }
         return -CRED_EPERM;
     }
     case SYS_SETRESUID: {
         uint32_t ids[3] = { cr->ruid, cr->euid, cr->suid };
         long r = set_res(c, ids, (uint32_t)a0, (uint32_t)a1, (uint32_t)a2, priv, "setresuid");
-        if(r == 0){ cr->ruid = ids[0]; cr->euid = ids[1]; cr->suid = ids[2]; cred_log(c, "setresuid"); }
+        if(r == 0){ cr->ruid = ids[0]; cr->euid = ids[1]; cr->suid = ids[2]; CRED_COMMIT("setresuid"); }
         return r;
     }
     case SYS_SETRESGID: {
         uint32_t ids[3] = { cr->rgid, cr->egid, cr->sgid };
         long r = set_res(c, ids, (uint32_t)a0, (uint32_t)a1, (uint32_t)a2, priv, "setresgid");
-        if(r == 0){ cr->rgid = ids[0]; cr->egid = ids[1]; cr->sgid = ids[2]; cred_log(c, "setresgid"); }
+        if(r == 0){ cr->rgid = ids[0]; cr->egid = ids[1]; cr->sgid = ids[2]; CRED_COMMIT("setresgid"); }
         return r;
     }
     case SYS_GETGROUPS: {
@@ -385,10 +395,11 @@ long cred_syscall(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2){
         if(n && copy_from_user(g, (const void*)a1, (size_t)n * sizeof(uint32_t)) != 0) return -CRED_EFAULT;
         for(int64_t i=0;i<n;i++) cr->groups[i] = g[i];
         cr->ngroups = (uint32_t)n;
-        cred_log(c, "setgroups");
+        CRED_COMMIT("setgroups");
         return 0;
     }
     }
+#undef CRED_COMMIT
     (void)a2;
     return -38; /* ENOSYS */
 }
