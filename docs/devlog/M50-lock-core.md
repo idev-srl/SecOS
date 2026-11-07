@@ -456,3 +456,62 @@ Plan inaccuracies found on the way:
 - `make lockdep-check`: 15/15 (ssd4, ssd8, nsd4, off4). A first run gave
   13/15 (ssd8 step + marker). It ran while other QEMU runs and builds loaded
   the host, its logs were lost in a private /tmp, and a clean rerun passed.
+
+## Fair klock (`fix/klock-fair`)
+
+**Symptom.** On lockdep builds of the M50 B3 gate (`-smp 4`, dd storm on
+usb0/sda/sdb1/nvme0n1 plus USB keys) about one run in five reported
+`[LOCKDEP] stuck on klock bkl ... pid 0`: an idle-context BKL waiter (AP
+reaping, kernel shell) spun for more than 2 s. Already present on B2+B3
+without B1.
+
+**Root cause.** The klock wait was test-and-CAS: waiters spun until `owner`
+was NULL, then raced to CAS it. Nothing ordered them, so the CPU that had
+just released the lock (a task going straight into its next syscall) or
+whichever waiter saw the release first could win again and again. Under the
+storm the BKL is taken back to back for 10–34 ms at a time (execve's
+signature check, fork, disk syscalls; ~75–85 % of acquisitions contended),
+and the idle waiter, which also takes interrupts while it spins, kept
+losing. An idle waiter could moreover be preempted mid-wait (it held
+nothing), which stretched its measured wait further.
+
+**Design: a ticket lock.** `klock_t` gains `next` and `serving`. An acquirer
+takes `next` (atomic fetch-add) and owns the lock once `serving` equals its
+ticket; every release path (unlock, `klock_unlock_to_user`, `bkl_drop_for`
+in `switch_to`, `bkl_suspend`) clears `owner` and bumps `serving`, which
+only the holder writes. Unchanged: BKL owner recursion is checked before a
+ticket is taken (the owner never queues behind itself); the caller's IF is
+restored exactly; a waiter spins with IF on when the caller had it on,
+answers TLB shootdowns and (BKL only) polls the USB keyboard every 1 ms;
+per-task depth accounting and lockdep hooks are the same. `klock_trylock`
+CASes `next` from `serving` to `serving + 1`, so it succeeds only when the
+lock is free and nobody is queued: it never joins or jumps the queue.
+
+**No wedged queue.** A ticket must only be held by a task that is spinning
+for it, or every later waiter stalls. A user task in ring 0 is never
+preempted, no waiter calls into the scheduler, and the only task that can
+be preempted in ring 0 is the idle task. So the waiter sets
+`klock_task_t.spinning` in the same IF-off window in which it takes its
+ticket, and the tick and the reschedule IPI leave the idle task alone while
+`klock_task_busy()` (a klock held or a ticket queued). `switch_to` reports
+(`[LOCK] BUG` / lockdep) a task that would leave with a ticket. Trade-off:
+an idle task waiting for a klock no longer hands its CPU to a runnable task
+until it gets the lock, which it now does in bounded time (at most the
+holds queued ahead of it). The lockdep stuck report also prints the queue
+length.
+
+**Numbers** (`/proc/lockstat` after the B3 storm, lockdep build, `-smp 4`,
+now printed by `blk_stress_drive.py` as `[BSD] lockstat ...`):
+
+| | runs | stuck reports | BKL contended / acquired | max BKL wait |
+|---|---|---|---|---|
+| before (84a8c82) | 8 | 0 here (1 in 5 in B1's runs) | ~90 k / ~118 k | 100 ms – **2.86 s** (median ~0.6 s) |
+| after | 12 in a row | 0 | ~109 k / ~125 k | **32 – 52 ms** |
+
+All 12 runs passed 31/31, keys included.
+
+**Verification.** `-Wall -Wextra`: 41 warnings in the normal and the lockdep
+build (baseline). Lockdep B3 gate 12/12 in a row (above). PROCRACE
+(lockdep, `-smp 4` and `-smp 8`): 8/8 each. M48 on the normal build: 4 CPUs
+online, TLB shootdown selftest PASS, SMP stress `-smp 4` and `-smp 8` 17/17
+each. `make lockdep-check`: 18/18. No `[LOCKDEP]` or `[LOCK] BUG` anywhere.
