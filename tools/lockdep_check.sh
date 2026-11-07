@@ -8,6 +8,8 @@
 #   ssd4, ssd8  tools/smp_stress_drive.py at -smp 4 and -smp 8
 #   nsd4        tools/net_stress_drive.py at -smp 4 with e1000e (MSI-X NAPI)
 #   off4        the same image booted with `bkl=off`, smp_stress_drive --quick
+#   prd8        tools/proc_race_drive.py at -smp 8 (M50 B1: process refcounts,
+#               mm_lock; kill -0 + /proc/<pid> readers vs fork/exit/mmap churn)
 # Every driver step must pass and every debugcon log must be free of
 # [LOCKDEP], "[LOCK] BUG", panics and CPU exceptions. ~25 minutes.
 #
@@ -34,7 +36,7 @@ sed -i 's|^    multiboot2 /boot/kernel.bin$|    multiboot2 /boot/kernel.bin bkl=
     "$OUT/iso_off/boot/grub/grub.cfg"
 grub-mkrescue --output="$OUT/ld_off.iso" "$OUT/iso_off" >/dev/null 2>&1 || { echo "[lockdep] grub-mkrescue failed"; exit 2; }
 
-echo "[lockdep] running ssd4, ssd8, nsd4, off4 in parallel..."
+echo "[lockdep] running ssd4, ssd8, nsd4, off4, prd8 in parallel..."
 timeout 1500 python3 tools/smp_stress_drive.py --iso "$OUT/ld.iso" --smp 4 \
     --log "$OUT/ssd4.log" >"$OUT/ssd4.out" 2>&1 &
 timeout 1500 python3 tools/smp_stress_drive.py --iso "$OUT/ld.iso" --smp 8 \
@@ -43,6 +45,8 @@ timeout 900 python3 tools/net_stress_drive.py --iso "$OUT/ld.iso" --smp 4 --nic 
     --key "$OUT/id" --log "$OUT/nsd4.log" --out "$OUT/nsd4.out" >/dev/null 2>&1 &
 timeout 1500 python3 tools/smp_stress_drive.py --iso "$OUT/ld_off.iso" --smp 4 --quick \
     --log "$OUT/off4.log" >"$OUT/off4.out" 2>&1 &
+timeout 1200 python3 tools/proc_race_drive.py --iso "$OUT/ld.iso" --smp 8 --secs 20 --runs 3 \
+    --log "$OUT/prd8.log" >"$OUT/prd8.out" 2>&1 &
 wait
 
 pass=0; fail=0
@@ -53,7 +57,9 @@ for r in ssd4 ssd8 off4; do
 done
 grep -q "^\[NSD\] RESULT " "$OUT/nsd4.out"; chk "nsd4 driver ran to completion" $?
 ! grep -q "^\[NSD\] .* FAIL" "$OUT/nsd4.out"; chk "nsd4 every step passed" $?
-for r in ssd4 ssd8 nsd4 off4; do
+grep -q "^\[PRD\] RESULT " "$OUT/prd8.out"; chk "prd8 driver ran to completion" $?
+! grep -q "^\[PRD\] .* FAIL" "$OUT/prd8.out"; chk "prd8 every step passed" $?
+for r in ssd4 ssd8 nsd4 off4 prd8; do
     ! grep -aq "\[LOCKDEP\]\|\[LOCK\] BUG\|PANIC\|\[EXC\]" "$OUT/$r.log"
     chk "$r no lockdep report, panic or CPU exception" $?
 done

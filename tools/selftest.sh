@@ -3013,6 +3013,42 @@ else
     check "M48 gate build" 1
 fi
 
+# ---- PROCRACE GATE [M50 B1]: process lifetime + address-space locking ----
+# A -DSECOS_LOCKDEP image (lock validator, kfree poisoning with 0x6B) with
+# CONSOLE=root, driven by tools/proc_race_drive.py at -smp 4 and -smp 8 in
+# parallel: /bin/smptest procrace (8 readers doing kill -0 and reading
+# /proc/<pid>/{status,maps,stat} of random pids against 4 churners forking
+# workers that mmap/mprotect/munmap/brk, orphan grandchildren and get
+# SIGKILLed), a bash-level variant of the same race, MemFree steady across
+# the measured runs, and a debugcon log free of [LOCKDEP], [LOCK] BUG, heap
+# corruption, panics and CPU exceptions.
+echo "[selftest] PROCRACE gate: proc-lifetime race, -smp 4/8, lockdep (mb2, ~300s)..."
+make clean >/dev/null 2>&1 || true
+if make iso CONSOLE=root CFLAGS_EXTRA="-DSECOS_LOCKDEP" >/tmp/secos_selftest_build.log 2>&1; then
+    PRDIR=$(mktemp -d /tmp/secos_selftest_procrace.XXXXXX)
+    cp myos.iso "$PRDIR/pr.iso"
+    for n in 4 8; do
+        timeout 1200 python3 tools/proc_race_drive.py --iso "$PRDIR/pr.iso" --smp "$n" --secs 20 --runs 3 \
+            --log "$PRDIR/prd$n.log" > "$PRDIR/prd$n.out" 2>&1 &
+    done
+    wait
+    for n in 4 8; do
+        while IFS= read -r l; do
+            case "$l" in
+                "[PRD] RESULT "*|"[PRD] memfree "*|"[PRD] note "*) ;;
+                "[PRD] "*" OK"*)   x=${l#\[PRD\] }; check "PROCRACE smp$n ${x%% OK*}" 0 ;;
+                "[PRD] "*" FAIL"*) x=${l#\[PRD\] }; check "PROCRACE smp$n ${x%% FAIL*}" 1; echo "    $l" | cut -c1-200 ;;
+            esac
+        done <"$PRDIR/prd$n.out"
+        grep -q "^\[PRD\] RESULT " "$PRDIR/prd$n.out"; check "PROCRACE smp$n driver ran to completion" $?
+        cp "$PRDIR/prd$n.out" "/tmp/secos_selftest_procrace_prd$n.out"; cp "$PRDIR/prd$n.log" "/tmp/secos_selftest_procrace_prd$n.log"
+    done
+    rm -rf "$PRDIR"
+else
+    echo "[selftest] PROCRACE BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "PROCRACE gate build" 1
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
