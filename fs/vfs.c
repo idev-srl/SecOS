@@ -755,15 +755,25 @@ int vfs_truncate(const char* path, size_t new_size){
     return r;
 }
 
-// [M51 C1] ftruncate of an open file (the fd pins the mount: no ref needed).
-// Updates the cached size like the old open-coded kiface path did.
+// [M51 C1, M52 D3] ftruncate of an open file (the fd pins the mount: no ref
+// needed). Inode-keyed: ->ftruncate acts on the object behind `ino` even
+// after a rename put another file under ino->path; only a driver without it
+// gets the old path fallback (ino->path, mount-relative). Serialized against
+// the fallback O_APPEND path (vfs_append) of a filesystem without ->append.
+// On success the cached size is updated and the inode's cached pages dropped
+// (a shrink must not leave a stale tail; a grow must read zeros).
 int vfs_ftruncate(vfs_inode_t* ino, size_t new_size){
-    if(!ino || !ino->ops || !ino->ops->truncate) return -1;
-    int al = !ino->ops->append;
+    const vfs_fs_ops_t* ops = ino ? ino->ops : NULL;    // one read: see vfs_append
+    if(!ops) return -1;
+    if(ino->type==VFS_NODE_DIR) return -21;               // EISDIR
+    if(ops->flags & VFS_FS_RDONLY) return -30;            // EROFS
+    if(!ops->ftruncate && !ops->truncate) return -1;
+    int al = !ops->append;
     if(al) klock_lock(&g_vfs_append_lock);
-    int r = ino->ops->truncate(ino->path, new_size);
+    int r = ops->ftruncate ? ops->ftruncate(ino, new_size) : ops->truncate(ino->path, new_size);
     if(r == 0) ino->size = new_size;
     if(al) klock_unlock(&g_vfs_append_lock);
+    if(r == 0) pagecache_invalidate(ino, 0, 1ULL<<62);
     return r;
 }
 
@@ -839,6 +849,48 @@ static int vfs_setattr_mnt(const vfs_mref_t* m, const char* cp, const char* rel,
     if(m->ops->lock) klock_unlock(m->ops->lock);
     return 0;
 }
+// [M52 D3] setattr of an open file (fchmod/fchown/futimes). ->fsetattr acts
+// on the object behind `ino`; without it the mount point + ino->path is
+// handed to the path-based setattr (no final-symlink follow), which is what
+// the syscall layer did before. The fd pins the mount.
+int vfs_fsetattr(vfs_inode_t* ino, const vfs_attr_t* a, unsigned valid){
+    const vfs_fs_ops_t* ops = ino ? ino->ops : NULL;
+    if(!ops || !a) return -1;
+    if(ops->flags & VFS_FS_RDONLY) return -30;            // EROFS
+    if(ops->fsetattr) return ops->fsetattr(ino, a, valid);
+    const char* mp = vfs_mount_point_of(ops);
+    if(!mp) return -1;
+    char cp[VFS_PATH]; size_t o = 0;
+    if(!(mp[0]=='/' && mp[1]==0)) for(size_t i=0; mp[i] && o<sizeof(cp)-1; i++) cp[o++]=mp[i];
+    for(size_t i=0; ino->path[i] && o<sizeof(cp)-1; i++) cp[o++]=ino->path[i];
+    if(o==0) cp[o++]='/';
+    cp[o]=0;
+    return vfs_lsetattr(cp, a, valid);
+}
+
+// [M52 D3] create / mkdir with the attributes in place from the start. A
+// driver with ->create_attr / ->mkdir_attr makes the object and stamps its
+// owner and mode in one critical section; the fallback (filesystems whose
+// owners come from the mount, or that keep them in memory only) creates and
+// then sets the attributes, as the syscall layer did before.
+static int vfs_make_attr(const char* path, const vfs_attr_t* a, unsigned valid, int dir){
+    char cp[VFS_PATH]; int e=vfs_canon_entry(path, cp, sizeof(cp)); if(e) return e;
+    char rel[256]; vfs_mref_t m; if(vfs_resolve(cp, rel, sizeof(rel), &m)) return -1;
+    int r;
+    if(m.ops->flags & VFS_FS_RDONLY) r = -30;             // EROFS
+    else if(dir && m.ops->mkdir_attr) r = m.ops->mkdir_attr(rel, a, valid);
+    else if(!dir && m.ops->create_attr) r = m.ops->create_attr(rel, a, valid);
+    else {
+        r = dir ? (m.ops->mkdir ? m.ops->mkdir(rel) : -1)
+                : (m.ops->create ? m.ops->create(rel, "", 0) : -1);
+        if(r == 0 && a && valid) (void)vfs_setattr_mnt(&m, cp, rel, a, valid);
+    }
+    vfs_mput(&m);
+    return r;
+}
+int vfs_create_attr(const char* path, const vfs_attr_t* a, unsigned valid){ return vfs_make_attr(path, a, valid, 0); }
+int vfs_mkdir_attr(const char* path, const vfs_attr_t* a, unsigned valid){ return vfs_make_attr(path, a, valid, 1); }
+
 int vfs_readlink(const char* path, char* buf, size_t len){
     char cp[VFS_PATH];
     if(vfs_canon_entry(path, cp, sizeof(cp))!=0) return -1;

@@ -137,6 +137,31 @@ typedef struct vfs_fs_ops {
     // *at = off; unlock(); — `at` must be the real offset (the fd offset and
     // the page-cache invalidation range come from it).
     int (*append)(vfs_inode_t* inode, const void* buf, size_t len, uint64_t* at);
+    // [M52 D3] Inode-keyed operations. The syscall layer runs on several CPUs
+    // at once, so an operation on an open fd must reach the object the fd
+    // holds, never "whatever is called ino->path now" (a rename may have
+    // moved the file and put another one under that name, and the slot's
+    // path is not rewritten by every driver on rename). All optional: NULL =
+    // the VFS falls back to the path-based op on mount point + ino->path.
+    // Each one is a single critical section under the driver's instance
+    // lock (one JBD2 transaction on ext3/ext4). Return 0, -30 (EROFS: the
+    // volume is read-only) or -1 (the object is gone — unlinked, replaced by
+    // a rename, or its slot no longer maps to a live object — or any other
+    // error). They never act on another object than the one `ino` names.
+    //   ftruncate: resize the regular file behind `ino`, updating every
+    //              cached size of it (ino->size included).
+    int (*ftruncate)(vfs_inode_t* ino, size_t new_size);
+    //   fsetattr:  setattr of the object behind `ino` (chmod/chown/utimes
+    //              of an fd), same field rules as ->setattr.
+    int (*fsetattr)(vfs_inode_t* ino, const vfs_attr_t* a, unsigned valid);
+    //   create_attr / mkdir_attr: create an empty regular file / a directory
+    //              at the mount-relative `path` (fail if it exists) whose
+    //              attributes already are `a`/`valid` when it first becomes
+    //              visible (no window where another process can open it with
+    //              the default root:root 0644/0755). VFS_ATTR_MODE gives the
+    //              permission bits (the type bits come from the op).
+    int (*create_attr)(const char* path, const vfs_attr_t* a, unsigned valid);
+    int (*mkdir_attr)(const char* path, const vfs_attr_t* a, unsigned valid);
     // [M51 C1] The driver instance's K30 klock (LK_K30_FS), or NULL. The VFS
     // never holds it while calling an op (every exported op takes it
     // itself); vfs_unmount takes and releases it once after draining, as a
@@ -229,9 +254,27 @@ int vfs_write(const char* path, size_t offset, const void* data, size_t len);
 // [M51 C1] Atomic O_APPEND write to an open file (ops->append, or the VFS
 // fallback under vfs_append_lock). Bytes written or <0; *at = where they went.
 int vfs_append(vfs_inode_t* ino, const void* buf, size_t len, uint64_t* at);
-// [M51 C1] ftruncate of an open file (serialized against vfs_append's
-// fallback; updates ino->size on success). 0 or <0 from ->truncate.
+// [M51 C1, M52 D3] ftruncate of an open file: acts on the object `ino`
+// holds whatever its current name (ops->ftruncate; drivers without it fall
+// back to ->truncate on ino->path). Serialized against vfs_append's fallback;
+// updates ino->size and drops the inode's cached pages on success (callers
+// may still invalidate, harmless). The open fd pins the mount: no mount ref.
+// 0, -30 (EROFS: read-only mount), -21 (EISDIR), -1 (no truncate op, the
+// object is gone — unlinked/replaced — or I/O error).
 int vfs_ftruncate(vfs_inode_t* ino, size_t new_size);
+// [M52 D3] setattr of an open file (fchmod/fchown/futimes), inode-keyed like
+// vfs_ftruncate (ops->fsetattr, else the path-based setattr on the mount
+// point + ino->path, without following a final symlink). 0, -30 (EROFS),
+// -1 (gone / error), -2 (fallback: the path no longer resolves).
+int vfs_fsetattr(vfs_inode_t* ino, const vfs_attr_t* a, unsigned valid);
+// [M52 D3] Create an empty regular file / a directory with its attributes
+// applied in the same driver critical section (ops->create_attr/mkdir_attr),
+// else vfs_create(path,"",0) / vfs_mkdir(path) followed by vfs_lsetattr (a
+// filesystem without per-file owners: FAT32/exFAT take them from the mount).
+// Same return codes as vfs_create / vfs_mkdir: 0, -30 (EROFS), -1 (exists or
+// other error), or a path-walk -errno.
+int vfs_create_attr(const char* path, const vfs_attr_t* a, unsigned valid);
+int vfs_mkdir_attr(const char* path, const vfs_attr_t* a, unsigned valid);
 // Mkdir
 int vfs_mkdir(const char* path);
 // Remove
