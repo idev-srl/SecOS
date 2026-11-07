@@ -24,10 +24,13 @@
  * net_rx (driver RX), net_tick, the socket layer, netctl, DHCP/DNS clients,
  * the shell helpers (net_ping_*, tcp_connect/..., udp_send).
  *
- * -DSECOS_LOCKDEP_LITE records the levels held per CPU and panics on an
- * out-of-order or recursive acquisition, on an out-of-order release, and on a
- * net lock taken with interrupts enabled; NET_ASSERT_STACK_LOCKED() checks
- * that internals are entered with the stack lock held.
+ * [M50] The net locks are classified spinlocks (levels LK_N0..LK_N3 in
+ * kernel/lock_order.h) checked by the generic validator: -DSECOS_LOCKDEP (the
+ * M47 -DSECOS_LOCKDEP_LITE is an alias) panics on an out-of-order or recursive
+ * acquisition, on interrupts re-enabled while one is held and on any net lock
+ * still held across a switch / wait / return to ring 3;
+ * NET_ASSERT_STACK_LOCKED() checks that internals are entered with the stack
+ * lock held.
  */
 #ifndef NET_LOCK_H
 #define NET_LOCK_H
@@ -51,11 +54,13 @@ void     netlk_release(net_spinlock_t* lk, uint64_t flags);
 uint64_t net_lock(void);
 void     net_unlock(uint64_t flags);
 
-#ifdef SECOS_LOCKDEP_LITE
+/* A static net lock: NET_SPINLOCK_INIT(NETLK_TICK, "net-tick"). */
+#define NET_SPINLOCK_INIT(netlk, nm) { SPINLOCK_INIT_CLASS(LK_N0_NET_TICK + (netlk), (nm)), (netlk), (nm) }
+
+#ifdef SECOS_LOCKDEP
 int  net_stack_lock_held(void);     /* by this CPU */
 #define NET_ASSERT_STACK_LOCKED() \
-    do { if (!net_stack_lock_held()) netlk_bug("stack lock not held", __func__); } while (0)
-void netlk_bug(const char* what, const char* where) __attribute__((noreturn));
+    do { if (!net_stack_lock_held()) lockdep_report("net stack lock not held", __func__); } while (0)
 #else
 #define NET_ASSERT_STACK_LOCKED() do { } while (0)
 #endif

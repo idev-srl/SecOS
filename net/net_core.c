@@ -148,7 +148,7 @@ extern void tcp_tick(void) __attribute__((weak));
 
 // Timer tick (IRQ context). [M47] One CPU at a time: protocol timers must not
 // run twice per tick if several CPUs deliver the tick callback.
-static net_spinlock_t g_tick_lock = { SPINLOCK_INIT, NETLK_TICK, "net-tick" };
+static net_spinlock_t g_tick_lock = NET_SPINLOCK_INIT(NETLK_TICK, "net-tick");
 void net_tick(void) {
     uint64_t tfl;
     if (!netlk_try(&g_tick_lock, &tfl)) return;     /* another CPU runs this tick */

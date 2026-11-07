@@ -2889,7 +2889,7 @@ fi
 
 # ============================================================================
 # NETSMP GATE [M47]: network stack locking under SMP. An image built with
-# -DSECOS_SMP_AT_BOOT -DSECOS_LOCKDEP_LITE (lock-order checker on) and a baked
+# -DSECOS_SMP_AT_BOOT -DSECOS_LOCKDEP (lock validator on, M50) and a baked
 # throwaway SSH key is driven by tools/net_stress_drive.py three times in
 # parallel: -smp 4 with e1000e (MSI-X NAPI RX), -smp 4 with e1000 (polled RX)
 # and -smp 1 with e1000e. Each run: /bin/netstress client workers (forked,
@@ -2908,7 +2908,7 @@ else
     NSDIR=$(mktemp -d /tmp/secos_selftest_netsmp.XXXXXX)
     ssh-keygen -q -t ed25519 -N '' -C secos-netsmp-selftest -f "$NSDIR/id"
     make clean >/dev/null 2>&1 || true
-    if make iso CFLAGS_EXTRA="-DSECOS_LOCKDEP_LITE" \
+    if make iso CFLAGS_EXTRA="-DSECOS_LOCKDEP" \
             SSH_AUTHORIZED_KEYS="$NSDIR/id.pub" >/tmp/secos_selftest_build.log 2>&1; then
         cp myos.iso "$NSDIR/netsmp.iso"
         for cfg in "smp4-msix 4 e1000e" "smp4-poll 4 e1000" "smp1-msix 1 e1000e"; do
