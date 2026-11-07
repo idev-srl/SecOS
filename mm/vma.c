@@ -222,21 +222,21 @@ static int vma_same(const vma_t* a, const vma_t* b) {
 int vma_fault_in_live(vmm_space_t* space, vma_set_t* set, spinlock_t* mm, uint64_t addr) {
     if (!space || !set || !mm) return -1;
     uint64_t pg = addr & ~0xFFFULL;
-    uint64_t fl = spin_lock_irqsave(mm);
+    spin_lock(mm);
     const vma_t* v = vma_find(set, pg);
-    if (!v || (v->flags & VMM_FLAG_PROTNONE)) { spin_unlock_irqrestore(mm, fl); return -1; }
+    if (!v || (v->flags & VMM_FLAG_PROTNONE)) { spin_unlock(mm); return -1; }
     if (v->type == VMA_TYPE_PHYS) {             // nothing to fill: install now
         int r = vma_map_phys_page(space, v, pg);
-        spin_unlock_irqrestore(mm, fl);
+        spin_unlock(mm);
         return (r == -3) ? 0 : r;
     }
     vma_t snap = *v;
-    spin_unlock_irqrestore(mm, fl);
+    spin_unlock(mm);
 
     void* frame = vma_fill_frame(&snap, pg);   // may read the page cache: unlocked
     if (!frame) return -3;
 
-    fl = spin_lock_irqsave(mm);
+    spin_lock(mm);
     v = vma_find(set, pg);
     int r;
     if (!v || !vma_same(v, &snap)) {
@@ -245,7 +245,7 @@ int vma_fault_in_live(vmm_space_t* space, vma_set_t* set, spinlock_t* mm, uint64
         r = vmm_map_in_space(space, pg, (uint64_t)frame & ADDRESS_MASK, snap.flags);
         if (r == -3) r = 1;                     // installed by someone else: fine
     }
-    spin_unlock_irqrestore(mm, fl);
+    spin_unlock(mm);
     if (r != 0) pmm_free_frame(frame);
     return r > 0 ? 0 : r;
 }

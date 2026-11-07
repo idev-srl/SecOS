@@ -211,24 +211,29 @@ typedef struct process {
     // is that process, holds proc_lock (process_foreach callbacks), or created
     // it and has not published it yet.
     volatile uint32_t refs;
-    // [M50-B1] Address-space lock (LK_S35_MM, irqsave): the VMA set, the user
+    // [M50-B1] Address-space lock (LK_S35_MM): the VMA set, the user
     // page tables of 'space' and the 'space' / 'image' pointers. The owner
     // takes it for every edit (mmap/munmap/mprotect/brk, exec swap, fork copy,
     // the PTE install of a fault); other tasks take it to read (procfs, umount).
     // Rules: never held across a page-cache/FS call, a user copy, or anything
     // that takes proc_lock (S30 < S35); see mm_lock()/mm_unlock() below.
+    // It is NOT irqsave: no interrupt handler takes it, so a holder keeps the
+    // caller's IF (a multi-ms fork walk must not hold off the BSP tick).
     spinlock_t mm_lock;
 } process_t;
 
-// [M50-B1] mm_lock helpers (see process_t.mm_lock).
-static inline uint64_t mm_lock(process_t* p) { return spin_lock_irqsave(&p->mm_lock); }
-static inline void mm_unlock(process_t* p, uint64_t fl) { spin_unlock_irqrestore(&p->mm_lock, fl); }
-// Let interrupts (and the BSP tick) in during a long page-table loop: drop and
+// [M50-B1] mm_lock helpers (see process_t.mm_lock). The lock keeps the
+// caller's interrupt state; the uint64_t is kept so call sites read like the
+// other lock helpers (and could go back to irqsave in one place).
+static inline uint64_t mm_lock(process_t* p) { spin_lock(&p->mm_lock); return 0; }
+static inline void mm_unlock(process_t* p, uint64_t fl) { (void)fl; spin_unlock(&p->mm_lock); }
+// Let a waiter (procfs, umount) in during a long page-table loop: drop and
 // retake the lock. Only for loops whose state does not depend on the lock
 // staying held (the owner is the only writer of its own VMAs).
 static inline void mm_relax(process_t* p, uint64_t* fl) {
-    spin_unlock_irqrestore(&p->mm_lock, *fl);
-    *fl = spin_lock_irqsave(&p->mm_lock);
+    spin_unlock(&p->mm_lock);
+    spin_lock(&p->mm_lock);
+    *fl = 0;
 }
 #define MM_ASSERT_HELD(p) SPIN_ASSERT_HELD(&(p)->mm_lock)
 

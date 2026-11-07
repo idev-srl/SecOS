@@ -952,10 +952,12 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     // Driver bindings have their own lock (driver_if_lock, S15 < S35): drop
     // them before taking mm_lock.
     driver_remove_all_bindings(p);
-    // [M50-B1] The space / VMA / image swap is one mm_lock section (it also
-    // keeps interrupts off across the CR3 switch, like the old cli): a
+    // [M50-B1] The space / VMA / image swap is one mm_lock section: a
     // cross-process reader sees either the old image or the new one.
+    // Interrupts stay off across it (the CR3 switch), like the old cli.
     uint64_t fl = mm_lock(p);
+    uint64_t irqf;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(irqf) : : "memory");
     vmm_space_t* old_space = p->space;
     uint8_t*     old_image = p->image;
     void*        old_mf    = p->manifest;
@@ -980,6 +982,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     p->user_mem_bytes = im.footprint;
     p->mapped_page_count = (uint32_t)(im.footprint / 4096ULL);
     p->regs.rip = im.entry; p->regs.rsp = rsp;
+    __asm__ volatile("push %0; popfq" : : "r"(irqf) : "memory", "cc");
     mm_unlock(p, fl);
     kfree(nv);
     // Tear down the old user image: every present leaf frame is unref'd (pages
