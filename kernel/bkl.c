@@ -9,6 +9,26 @@
 
 klock_t g_bkl = KLOCK_INIT_RECURSIVE(LK_K0_BKL, "bkl");
 
+/* [M50] A task spinning for the BKL (interrupts on) polls the USB HID
+ * keyboard, at most once a millisecond system-wide. The console reader is the
+ * only regular poller (keyboard_has_char / keyboard_getc_raw), and it must
+ * win the BKL first; with fork, exec (signature check) and disk syscalls
+ * holding the BKL for 10-30 ms back to back, the poll gap grew past the
+ * ~30 ms a key stays pressed, and QEMU's usb-kbd (like a real keyboard
+ * report) then never shows that key: keystrokes were lost under load (M50 B3
+ * gate). usb_hid_poll() only trylocks the HID and xHCI locks, so it never
+ * waits here; nothing is held while it runs (the BKL is the outermost lock). */
+extern void usb_hid_poll(void);
+extern uint64_t tsc_read(void);
+extern uint64_t tsc_hz(void);
+static volatile uint64_t g_bkl_poll_tsc;
+void bkl_wait_poll(void) {
+    uint64_t hz = tsc_hz(), now = tsc_read(), last = g_bkl_poll_tsc;
+    if (!hz || now - last < hz / 1000) return;
+    if (!__sync_bool_compare_and_swap(&g_bkl_poll_tsc, last, now)) return;   /* another CPU polls */
+    usb_hid_poll();
+}
+
 void bkl_lock(void)            { klock_lock(&g_bkl); }
 void bkl_lock_enable_irq(void) { klock_lock_irq_on(&g_bkl); }
 void bkl_unlock(void)          { klock_unlock(&g_bkl); }

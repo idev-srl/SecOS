@@ -56,6 +56,9 @@ extern klock_t g_bkl;
  * taking its timer ticks. Both return with the caller's IF unchanged. */
 void bkl_lock(void);
 void bkl_lock_enable_irq(void);
+/* Called by klock.c while a task spins for the BKL with interrupts on:
+ * polls the USB HID keyboard (rate-limited, see bkl.c). */
+void bkl_wait_poll(void);
 void bkl_unlock(void);
 
 /* Release completely / take back `depth` levels: for a kernel-context waiter

@@ -9,6 +9,7 @@
 #include "process.h"
 #include "spinlock.h"   /* cpu_relax_poll */
 #include "debugcon.h"
+#include "bkl.h"     /* bkl_wait_poll */
 
 extern uint64_t tsc_read(void);
 extern uint64_t tsc_hz(void);
@@ -119,6 +120,7 @@ static void kl_acquire(klock_t* l, int irq_on) {
             if (spin_on) __asm__ volatile ("sti" ::: "memory");
             while (l->owner) {
                 cpu_relax_poll();
+                if (spin_on && l->recursive) bkl_wait_poll();   /* only the BKL */
 #ifdef SECOS_LOCKDEP
                 lockdep_klock_wait(l, t0, &reported);
 #endif
