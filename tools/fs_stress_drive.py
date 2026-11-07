@@ -20,7 +20,8 @@
 #
 # The target directory is a parameter (--target, default /root) so the same
 # driver aims fsstress at another mount (ramfs: --target /tmp).
-# [M52] --data vfat|exfat attaches a SATA data disk (q35 AHCI, sda) with a fresh
+# [M52] --data vfat|exfat moves the root to SATA (q35 AHCI, sda) and adds a
+# data disk (sdb) with a fresh
 # FAT32 / exFAT volume, mounts it at /mnt, runs fsstress -n there (no
 # symlinks / hard links / modes) and checks it on the host after the
 # poweroff: fsck.vfat -n, or fsck.exfat -n + tools/exfat_img.py deepcheck.
@@ -46,10 +47,14 @@ class VM:
     def __init__(self, o, disk, log, data=None):
         self.log = log
         open(log, "w").close()
-        # The data disk is SATA (q35 AHCI, sda): the kernel drives one virtio disk.
-        extra = ["-machine", "q35", "-drive", f"file={data},if=ide,index=0,format=raw"] if data else []
-        cmd = [o.qemu, "-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp),
-               "-drive", f"file={disk},if=virtio,format=raw"] + extra + [
+        # With a data disk both disks are SATA (q35 AHCI: root sda, data sdb):
+        # the kernel drives one virtio disk and probes AHCI only without it.
+        if data:
+            disks = ["-machine", "q35", "-drive", f"file={disk},if=ide,index=0,format=raw",
+                     "-drive", f"file={data},if=ide,index=1,format=raw"]
+        else:
+            disks = ["-drive", f"file={disk},if=virtio,format=raw"]
+        cmd = [o.qemu, "-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp)] + disks + [
                "-nic", "none",
                "-debugcon", "file:" + log, "-global", "isa-debugcon.iobase=0xe9",
                "-no-reboot", "-display", "none", "-serial", "stdio"]
@@ -225,7 +230,7 @@ def main():
         if o.data:
             fst = "vfat" if o.data == "vfat" else "exfat"
             run(vm, f"mount-{o.data}",
-                f"(grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sda /mnt) && "
+                f"(grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sdb /mnt) && "
                 f"grep ' /mnt ' /proc/mounts && echo MNT-$((6*7))", ["MNT-42"], 120, absent=())
             nopt = "-n "
         if o.data and o.mount_race:
@@ -236,11 +241,11 @@ def main():
             n = o.mount_race
             run(vm, "mount-race",
                 f"mkdir -p /mnt; k=0; for i in $(seq 1 {n}); do "
-                f"grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sda /mnt 2>/dev/null; "
+                f"grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sdb /mnt 2>/dev/null; "
                 f"( for j in 1 2 3 4; do echo r$i$j > /mnt/mr$j 2>/dev/null; cat /mnt/mr$j >/dev/null 2>&1; "
                 f"ls /mnt >/dev/null 2>&1; done ) & ( exec 3</mnt/mr1 2>/dev/null; sleep 0.0$((i%7)); exec 3<&- ) & "
                 f"umount /mnt 2>/dev/null && k=$((k+1)); wait; done; "
-                f"grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sda /mnt; rm -f /mnt/mr*; "
+                f"grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sdb /mnt; rm -f /mnt/mr*; "
                 f"grep -q ' /mnt ' /proc/mounts && echo MR-$((6*7))-umounts=$k", ["MR-42"], 900, absent=())
         for k in range(o.rounds):
             s = seed + k

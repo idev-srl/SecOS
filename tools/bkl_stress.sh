@@ -13,8 +13,8 @@
 #   fsd4   tools/fs_stress_drive.py            -smp 4, ext4 root, then e2fsck -fn
 #   fsd8   tools/fs_stress_drive.py            -smp 8, ext4 root, then e2fsck -fn
 #   fsr4   tools/fs_stress_drive.py            -smp 4, ramfs /tmp
-#   fsx4   tools/fs_stress_drive.py --data vfat  -smp 4, FAT32 sda, fsck.vfat -n
-#   fse4   tools/fs_stress_drive.py --data exfat -smp 4, exFAT sda, fsck.exfat -n
+#   fsx4   tools/fs_stress_drive.py --data vfat  -smp 4, FAT32 sdb, fsck.vfat -n
+#   fse4   tools/fs_stress_drive.py --data exfat -smp 4, exFAT sdb, fsck.exfat -n
 #   fsc4   tools/fs_stress_drive.py --crash 3  -smp 4, kill -9 + journal replay
 # A run passes when its driver says so and its debugcon log has no [LOCKDEP],
 # "[LOCK] BUG", panic or CPU exception.
