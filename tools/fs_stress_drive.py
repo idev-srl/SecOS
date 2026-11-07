@@ -225,11 +225,23 @@ def main():
         vm.kill()
         report(f"{tag}-killed-mid-run", alive and m is None and "PASS" not in vm.out(since) and
                "FAIL" not in vm.out(since), f"after {delay:.1f}s {m or ''}")
+        # The host's own recovery must agree: e2fsck -fy on a copy may replay
+        # the journal and must leave nothing else to fix.
+        hc = img + ".host"
+        subprocess.run(["cp", "--sparse=always", img, hc])
+        r = subprocess.run(["e2fsck", "-fy", hc], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        hrep = "journal replayed" if b"recovering journal" in r.stdout else "journal clean"
+        good, why = fsck_clean(hc, os.path.join(work, f"{tag}.hostfsck"))
+        fixed = re.search(rb"Fix\?|Clear\?|Salvage\?|Recreate\?|Relocate\?", r.stdout)
+        report(f"{tag}-host-replay-clean", r.returncode in (0, 1) and not fixed and good,
+               f"{hrep} {why} {'(e2fsck -fy had to fix something)' if fixed else ''}".strip())
+        os.unlink(hc)
         vm, good = boot(f"{tag}-replay")
         if not good: vm.kill(); finish()
         d = vm.dlog()
         rec = re.search(r"\[M27\] journal recover: txns=0x([0-9A-Fa-f]+)", d)
-        print(f"[FSD] {tag} journal recover txns={int(rec.group(1), 16) if rec else 0}", flush=True)
+        print(f"[FSD] {tag} kernel journal replay: " +
+              (f"txns={int(rec.group(1), 16)}" if rec else "journal was empty"), flush=True)
         run(vm, f"{tag}-root-is-ext4", "grep -q ' / ext4 ' /proc/mounts && echo ROOT-$((6*7))", ["ROOT-42"], 60, absent=())
         run(vm, f"{tag}-log-intact",
             f"for b in {o.target}/fss.*; do /bin/fsstress -c $b; done",
