@@ -612,10 +612,31 @@ static void fill_node(vfs_inode_t* ino, uint64_t key, const char* path){
     else { int n=gen_key(key); ino->size = n>0 ? (size_t)n : 0; }
 }
 
+/* Slots an open fd still points at. Recycling one made a later read() of that
+ * fd return another node's contents (found by the M50 proc-race stress:
+ * /proc/N/status reading as /proc/loadavg). Runs under g_proc_lock; the fd
+ * tables are read under proc_lock (S15 -> S30). */
+struct pool_busy { uint64_t mask; };
+static void pool_busy_cb(process_t* p, void* u){
+    struct pool_busy* b=(struct pool_busy*)u;
+    for(int i=0;i<32;i++){
+        const struct proc_fd_entry* e=&p->fds[i];
+        if(!e->used || e->is_pipe || e->is_sock || !e->inode) continue;
+        const vfs_inode_t* ino=(const vfs_inode_t*)e->inode;
+        if(ino>=&g_ipool[0] && ino<&g_ipool[64]) b->mask |= 1ull << (ino-&g_ipool[0]);
+    }
+}
+
 static vfs_inode_t* pool_get(uint64_t key, const char* path){
     int slot=-1;
     for(int i=0;i<64;i++) if(g_ikey[i]==key){ slot=i; break; }
-    if(slot<0){ slot=g_inext; g_inext=(g_inext+1)%64; g_ikey[slot]=key; }
+    if(slot<0){
+        struct pool_busy b={0};
+        process_foreach(pool_busy_cb, &b);
+        slot=g_inext;                            /* all 64 open: recycle anyway */
+        for(int k=0;k<64;k++){ int c=(g_inext+k)%64; if(!((b.mask>>c)&1)){ slot=c; break; } }
+        g_inext=(slot+1)%64; g_ikey[slot]=key;
+    }
     fill_node(&g_ipool[slot], key, path);
     return &g_ipool[slot];
 }
