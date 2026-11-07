@@ -56,6 +56,16 @@ void lapic_send_init(uint32_t dest_apic_id);
 void lapic_send_sipi(uint32_t dest_apic_id, uint8_t vector);
 void lapic_ipi(uint32_t dest_apic_id, uint8_t vector);
 
+/* [M48] Inter-processor interrupt vectors (high priority class 0xF). */
+#define VEC_IPI_TLB      0xF0   /* TLB shootdown request (arch/x86/tlb.c)        */
+#define VEC_IPI_RESCHED  0xF1   /* kick an idle CPU into the scheduler           */
+#define VEC_IPI_STOP     0xF2   /* panic: park this CPU (cli; hlt)               */
+
+/* [M48] 1 when the Local APICs run in x2APIC (MSR) mode: chosen at
+ * lapic_enable() when the CPU supports it (or the firmware enabled it);
+ * -DSECOS_NO_X2APIC keeps xAPIC. APIC IDs above 254 need x2APIC. */
+int lapic_x2apic_mode(void);
+
 /* Start this CPU's LAPIC timer at `hz` on the scheduler-tick vector (used by APs,
  * which calibrate off the BSP's already-computed period). Requires lapic_enable(). */
 void lapic_timer_start_this_cpu(uint32_t hz);

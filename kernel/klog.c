@@ -5,6 +5,8 @@
  */
 #include "klog.h"
 #include "debugcon.h"   /* debugcon_putchar_raw */
+#include "spinlock.h"   /* cpu_relax_poll */
+#include "percpu.h"     /* [M48] per-CPU line buffers */
 
 extern uint64_t ktime_ns(void);
 
@@ -26,7 +28,7 @@ static int klock(uint64_t* fl) {
     __asm__ volatile ("pushfq; pop %0; cli" : "=r"(*fl) :: "memory");
     for (uint32_t i = 0; i < 2000000u; i++) {
         if (__sync_lock_test_and_set(&g_klock, 1) == 0) return 1;
-        __asm__ volatile ("pause");
+        cpu_relax_poll();                   /* [M48] keep answering TLB shootdowns */
     }
     __asm__ volatile ("push %0; popfq" :: "r"(*fl) : "memory", "cc");
     return 0;
@@ -77,14 +79,86 @@ static void commit_line(void) {
     g_nrec++;
 }
 
+/* ---- [M48] debugcon line lock ----
+ * One lock serializes every whole line written to port 0xE9 (kernel lines
+ * from the per-CPU buffers below and the user-console mirror). Bounded like
+ * klock(): a CPU that died holding it must not silence the others' last
+ * words, so after a long spin the writer proceeds unlocked (bit 63 of the
+ * returned flags, always 0 in RFLAGS, records "not held"). */
+#define DBG_NOT_HELD (1ULL << 63)
+static volatile uint32_t g_dbglock;
+uint64_t debugcon_line_lock(void) {
+    uint64_t fl;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
+    for (uint32_t i = 0; i < 20000000u; i++) {
+        if (__sync_lock_test_and_set(&g_dbglock, 1) == 0) return fl;
+        cpu_relax_poll();
+    }
+    return fl | DBG_NOT_HELD;
+}
+void debugcon_line_unlock(uint64_t fl) {
+    if (!(fl & DBG_NOT_HELD)) __sync_lock_release(&g_dbglock);
+    fl &= ~DBG_NOT_HELD;
+    __asm__ volatile ("push %0; popfq" :: "r"(fl) : "memory", "cc");
+}
+
+/* ---- [M48] line-atomic kernel debugcon output ----
+ * With one CPU a byte goes straight to 0xE9 + the log (early boot, panics and
+ * the single-core configuration behave exactly as before). With several CPUs
+ * each CPU builds its current line in its cpu_t (interrupts off while
+ * appending, so this CPU's own ISRs cannot tear the buffer) and emits it whole
+ * under the line lock at '\n' or when full. A partial line is emitted by the
+ * owning CPU's own timer tick once it is DCK_HOLD_TICKS old, or explicitly by
+ * debugcon_kflush() (panic/exception paths). */
+#define DCK_HOLD_TICKS 20
+extern uint64_t timer_get_ticks(void);
+static void dck_emit_locked(const char* b, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) { debugcon_putchar_raw(b[i]); klog_putc(b[i]); }
+}
+static void dck_flush_cpu(cpu_t* c) {
+    if (!c->dbg_n) return;
+    uint64_t f = debugcon_line_lock();
+    dck_emit_locked(c->dbg_line, c->dbg_n);
+    c->dbg_n = 0;
+    debugcon_line_unlock(f);
+}
+static inline void dck_put(cpu_t* c, char ch) {
+    if (c->dbg_n == 0) c->dbg_since = timer_get_ticks();
+    c->dbg_line[c->dbg_n++] = ch;
+    if (ch == '\n' || c->dbg_n == sizeof(c->dbg_line)) dck_flush_cpu(c);
+}
+void debugcon_kputc(char ch) {
+    if (g_cpu_count <= 1) { debugcon_putchar_raw(ch); klog_putc(ch); return; }
+    uint64_t fl;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
+    dck_put(this_cpu(), ch);
+    __asm__ volatile ("push %0; popfq" :: "r"(fl) : "memory", "cc");
+}
+void debugcon_kwrite(const char* s) {
+    if (g_cpu_count <= 1) { while (*s) { debugcon_putchar_raw(*s); klog_putc(*s); s++; } return; }
+    uint64_t fl;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
+    cpu_t* c = this_cpu();
+    while (*s) dck_put(c, *s++);
+    __asm__ volatile ("push %0; popfq" :: "r"(fl) : "memory", "cc");
+}
+void debugcon_kflush(void) {
+    uint64_t fl;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
+    dck_flush_cpu(this_cpu());
+    __asm__ volatile ("push %0; popfq" :: "r"(fl) : "memory", "cc");
+}
+/* Timer tick (every CPU, interrupts off): emit this CPU's stale partial line. */
+void debugcon_ktick(uint64_t now) {
+    cpu_t* c = this_cpu();
+    if (c->dbg_n && now - c->dbg_since >= DCK_HOLD_TICKS) dck_flush_cpu(c);
+}
+
 /* ---- [M46] line-buffered mirror of the user console (see klog.h) ---- */
 #define DCU_MAX 256
 static char     g_dcu[DCU_MAX];
 static int      g_dcu_n;
 static uint64_t g_dcu_since;                 /* tick of the first held byte */
-extern uint64_t debugcon_line_lock(void);
-extern void     debugcon_line_unlock(uint64_t);
-extern uint64_t timer_get_ticks(void);
 static void dcu_flush_locked(void) {
     for (int i = 0; i < g_dcu_n; i++) debugcon_putchar_raw(g_dcu[i]);
     g_dcu_n = 0;

@@ -60,6 +60,7 @@ static volatile uint32_t* g_lapic;   /* mapped LAPIC base, NULL until enabled */
 static volatile uint32_t* g_ioapic;  /* mapped IOAPIC base, NULL until routed  */
 static int g_apic_mode;              /* 1 once the APIC owns hardware IRQs      */
 static uint32_t g_timer_init;        /* periodic LAPIC-timer count (BSP-calibrated) */
+static int g_x2apic;                 /* [M48] 1 = LAPICs run in x2APIC (MSR) mode   */
 
 static inline void outb(uint16_t port, uint8_t v) {
     __asm__ volatile ("outb %0, %1" : : "a"(v), "Nd"(port));
@@ -83,6 +84,39 @@ static inline void cpuid_get(uint32_t leaf, uint32_t* a, uint32_t* b,
     __asm__ volatile ("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf));
 }
 
+/* [M48] Local APIC register access. In xAPIC mode the registers are MMIO at
+ * the mapped base; in x2APIC mode each 16-byte-spaced register is the MSR
+ * 0x800 + (offset >> 4) and the MMIO window is dead. Every LAPIC access goes
+ * through these two helpers so the mode switch is transparent. */
+#define IA32_APIC_BASE_EXTD (1u << 10)
+#define X2APIC_MSR(reg)     (0x800u + ((reg) >> 4))
+static inline uint32_t lapic_rd(uint32_t reg) {
+    if (g_x2apic) return (uint32_t)rdmsr(X2APIC_MSR(reg));
+    return g_lapic[reg / 4];
+}
+static inline void lapic_wr(uint32_t reg, uint32_t v) {
+    if (g_x2apic) wrmsr(X2APIC_MSR(reg), v);
+    else          g_lapic[reg / 4] = v;
+}
+
+int lapic_x2apic_mode(void) { return g_x2apic; }
+
+/* Decide (once, on the BSP) whether to run the LAPICs in x2APIC mode: when the
+ * CPU supports it (CPUID.01H:ECX[21]) — required for APIC IDs > 254 — or when
+ * the firmware already switched it on (leaving x2APIC needs a full disable, so
+ * honour it). -DSECOS_NO_X2APIC forces xAPIC where the firmware allows. */
+static void lapic_choose_mode(void) {
+    uint32_t a, b, c, d;
+    cpuid_get(1, &a, &b, &c, &d);
+    int supported = (c >> 21) & 1;
+    int fw_on = (rdmsr(IA32_APIC_BASE_MSR) & IA32_APIC_BASE_EXTD) != 0;
+#ifdef SECOS_NO_X2APIC
+    g_x2apic = fw_on;
+#else
+    g_x2apic = supported || fw_on;
+#endif
+}
+
 int lapic_is_enabled(void) { return g_lapic != NULL; }
 
 int lapic_enable(void) {
@@ -99,24 +133,28 @@ int lapic_enable(void) {
     /* Read the APIC base MSR, set the global enable bit, write it back. The base
      * physical address lives in bits 12.. (we keep whatever firmware set). */
     uint64_t base = rdmsr(IA32_APIC_BASE_MSR);
+    lapic_choose_mode();
     base |= APIC_BASE_ENABLE;
-    wrmsr(IA32_APIC_BASE_MSR, base);
+    wrmsr(IA32_APIC_BASE_MSR, base);              /* xAPIC enable first ...   */
+    if (g_x2apic) wrmsr(IA32_APIC_BASE_MSR, base | IA32_APIC_BASE_EXTD); /* ... then x2APIC */
 
     uint64_t phys = base & 0xFFFFF000ull;
+    // TODO(M48/bigmem integration): map the LAPIC with vmm_map_mmio() (uncached
+    // MMIO mapping from feat/bigmem) instead of the deprecated physmap shim.
     vmm_extend_physmap(phys + 0x1000);
-    g_lapic = (volatile uint32_t*)phys_to_virt(phys);
+    g_lapic = (volatile uint32_t*)phys_to_virt(phys);   /* unused in x2APIC mode */
 
     /* Software-enable the LAPIC via the Spurious Interrupt Vector Register. */
-    g_lapic[LAPIC_REG_SVR / 4] = LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR;
+    lapic_wr(LAPIC_REG_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR);
 
     debugcon_writestring("[MSIX] LAPIC enabled base=0x"); debugcon_print_hex(phys);
-    debugcon_writestring(" id=0x"); debugcon_print_hex(g_lapic[LAPIC_REG_ID / 4] >> 24);
-    debugcon_writestring(" (NOT TESTED)\n");
+    debugcon_writestring(" id=0x"); debugcon_print_hex(lapic_get_id());
+    debugcon_writestring(g_x2apic ? " mode=x2apic\n" : " mode=xapic\n");
     return 0;
 }
 
 void lapic_eoi(void) {
-    if (g_lapic) g_lapic[LAPIC_REG_EOI / 4] = 0;
+    if (g_lapic) lapic_wr(LAPIC_REG_EOI, 0);
 }
 
 /* ============================ M28-2: APIC switchover ====================== */
@@ -125,7 +163,7 @@ int apic_mode_active(void) { return g_apic_mode; }
 
 /* EOI a legacy IRQ to whichever controller currently owns it. */
 void irq_eoi(void) {
-    if (g_apic_mode) g_lapic[LAPIC_REG_EOI / 4] = 0;   /* LAPIC EOI */
+    if (g_apic_mode) lapic_wr(LAPIC_REG_EOI, 0);   /* LAPIC EOI */
     else             outb(0x20, 0x20);                 /* 8259 master EOI */
 }
 
@@ -150,6 +188,7 @@ static void ioapic_route_irq(uint8_t irq, uint8_t vector, uint8_t dest_apic_id) 
         if (gsi >= t->ioapics[i].gsi_base) { base = t->ioapics[i].base; gsi_base = t->ioapics[i].gsi_base; }
     uint32_t idx = gsi - gsi_base;
 
+    // TODO(M48/bigmem integration): vmm_map_mmio() for the IOAPIC too.
     vmm_extend_physmap(base + 0x1000);
     g_ioapic = (volatile uint32_t*)phys_to_virt(base);
 
@@ -177,7 +216,7 @@ static void ioapic_route_irq(uint8_t irq, uint8_t vector, uint8_t dest_apic_id) 
  * `hz` on VEC_TIMER. Returns the per-second LAPIC tick count, or 0 on failure. */
 static uint64_t lapic_timer_start(uint32_t hz) {
     /* Accept all interrupt priorities. */
-    g_lapic[LAPIC_REG_TPR / 4] = 0;
+    lapic_wr(LAPIC_REG_TPR, 0);
 
     /* PIT channel 2: gate on (bit0), speaker off (bit1). OUT2 status = port 0x61 bit5. */
     uint8_t p61 = inb(0x61);
@@ -190,13 +229,13 @@ static uint64_t lapic_timer_start(uint32_t hz) {
     outb(0x42, (uint8_t)(cnt >> 8));
 
     /* LAPIC one-shot, /16, masked, counting from the max so we can measure decay. */
-    g_lapic[LAPIC_REG_TIMER_DIV / 4]  = LAPIC_TIMER_DIV_16;
-    g_lapic[LAPIC_REG_LVT_TIMER / 4]  = LAPIC_LVT_MASKED | VEC_TIMER;
-    g_lapic[LAPIC_REG_TIMER_INIT / 4] = 0xFFFFFFFFu;
+    lapic_wr(LAPIC_REG_TIMER_DIV, LAPIC_TIMER_DIV_16);
+    lapic_wr(LAPIC_REG_LVT_TIMER, LAPIC_LVT_MASKED | VEC_TIMER);
+    lapic_wr(LAPIC_REG_TIMER_INIT, 0xFFFFFFFFu);
 
     /* Wait for PIT ch2 to reach terminal count (OUT goes high). */
     while (!(inb(0x61) & 0x20)) { }
-    uint32_t cur = g_lapic[LAPIC_REG_TIMER_CUR / 4];
+    uint32_t cur = lapic_rd(LAPIC_REG_TIMER_CUR);
     uint32_t elapsed = 0xFFFFFFFFu - cur;        /* LAPIC ticks in ~10 ms */
     if (elapsed == 0) return 0;
 
@@ -207,9 +246,9 @@ static uint64_t lapic_timer_start(uint32_t hz) {
     /* Program periodic at `hz`, unmasked, on VEC_TIMER. Remember the count so APs
      * can start their own LAPIC timer at the same rate without recalibrating. */
     g_timer_init = init;
-    g_lapic[LAPIC_REG_TIMER_DIV / 4]  = LAPIC_TIMER_DIV_16;
-    g_lapic[LAPIC_REG_LVT_TIMER / 4]  = LAPIC_TIMER_PERIODIC | VEC_TIMER;
-    g_lapic[LAPIC_REG_TIMER_INIT / 4] = init;
+    lapic_wr(LAPIC_REG_TIMER_DIV, LAPIC_TIMER_DIV_16);
+    lapic_wr(LAPIC_REG_LVT_TIMER, LAPIC_TIMER_PERIODIC | VEC_TIMER);
+    lapic_wr(LAPIC_REG_TIMER_INIT, init);
 
     debugcon_writestring("[APIC] LAPIC timer hz="); debugcon_print_hex(hz);
     debugcon_writestring(" ticks/s="); debugcon_print_hex(ticks_per_sec);
@@ -274,7 +313,7 @@ void irq_enable_aux(void) {
 }
 /* End-of-interrupt for IRQ12: LAPIC, or slave + master 8259. */
 void irq_eoi_aux(void) {
-    if (g_apic_mode) g_lapic[LAPIC_REG_EOI / 4] = 0;
+    if (g_apic_mode) lapic_wr(LAPIC_REG_EOI, 0);
     else { outb(0xA0, 0x20); outb(0x20, 0x20); }
 }
 
@@ -282,6 +321,7 @@ void irq_eoi_aux(void) {
 
 uint32_t lapic_get_id(void) {
     if (!g_lapic) return 0;
+    if (g_x2apic) return (uint32_t)rdmsr(X2APIC_MSR(LAPIC_REG_ID));   /* full 32-bit ID */
     return g_lapic[LAPIC_REG_ID / 4] >> 24;
 }
 
@@ -292,17 +332,33 @@ uint32_t lapic_get_id(void) {
 void lapic_enable_this_cpu(void) {
     uint64_t base = rdmsr(IA32_APIC_BASE_MSR);
     wrmsr(IA32_APIC_BASE_MSR, base | APIC_BASE_ENABLE);
-    if (g_lapic) g_lapic[LAPIC_REG_SVR / 4] = LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR;
+    if (g_x2apic && !(base & IA32_APIC_BASE_EXTD))       /* [M48] same mode as the BSP */
+        wrmsr(IA32_APIC_BASE_MSR, base | APIC_BASE_ENABLE | IA32_APIC_BASE_EXTD);
+    if (g_lapic) lapic_wr(LAPIC_REG_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR);
 }
 
 static void icr_wait_idle(void) {
+    if (g_x2apic) return;                 /* x2APIC ICR writes complete synchronously */
     while (g_lapic[LAPIC_REG_ICR_LO / 4] & ICR_DELIVERY_PENDING) __asm__ volatile ("pause");
 }
 
+/* Fire one IPI. Interrupts are held off around the ICR access: in xAPIC mode
+ * it is a two-register sequence (destination, then command) that an IPI sent
+ * from an interrupt handler on this same CPU must not split. In x2APIC mode it
+ * is one 64-bit MSR write with a full 32-bit destination. */
 static void icr_send(uint32_t dest_apic_id, uint32_t low) {
-    g_lapic[LAPIC_REG_ICR_HI / 4] = dest_apic_id << 24;   /* destination field */
-    g_lapic[LAPIC_REG_ICR_LO / 4] = low;                  /* writing LOW fires it */
-    icr_wait_idle();
+    uint64_t fl;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(fl) :: "memory");
+    if (g_x2apic) {
+        __asm__ volatile ("mfence" ::: "memory");   /* x2APIC ICR writes are not serializing */
+        wrmsr(X2APIC_MSR(LAPIC_REG_ICR_LO), ((uint64_t)dest_apic_id << 32) | low);
+    } else {
+        icr_wait_idle();
+        g_lapic[LAPIC_REG_ICR_HI / 4] = dest_apic_id << 24;   /* destination field */
+        g_lapic[LAPIC_REG_ICR_LO / 4] = low;                  /* writing LOW fires it */
+        icr_wait_idle();
+    }
+    __asm__ volatile ("push %0; popfq" :: "r"(fl) : "memory", "cc");
 }
 
 void lapic_send_init(uint32_t dest_apic_id) {
@@ -323,8 +379,8 @@ void lapic_ipi(uint32_t dest_apic_id, uint8_t vector) {
 void lapic_timer_start_this_cpu(uint32_t hz) {
     (void)hz;
     if (!g_lapic || !g_timer_init) return;
-    g_lapic[LAPIC_REG_TPR / 4]        = 0;
-    g_lapic[LAPIC_REG_TIMER_DIV / 4]  = LAPIC_TIMER_DIV_16;
-    g_lapic[LAPIC_REG_LVT_TIMER / 4]  = LAPIC_TIMER_PERIODIC | VEC_TIMER;
-    g_lapic[LAPIC_REG_TIMER_INIT / 4] = g_timer_init;
+    lapic_wr(LAPIC_REG_TPR, 0);
+    lapic_wr(LAPIC_REG_TIMER_DIV, LAPIC_TIMER_DIV_16);
+    lapic_wr(LAPIC_REG_LVT_TIMER, LAPIC_TIMER_PERIODIC | VEC_TIMER);
+    lapic_wr(LAPIC_REG_TIMER_INIT, g_timer_init);
 }

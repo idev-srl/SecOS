@@ -27,12 +27,16 @@ static tss_t tss;
 // [M29] Per-CPU GDT + TSS for the application processors (the BSP uses the globals
 // above). Each AP must have its own TSS so a ring-3->ring-0 transition lands on
 // that core's kernel stack (rsp0), not a shared one.
+// [M48] Allocated per AP when it comes up (sized by the MADT CPU count, not by
+// SMP_MAX_CPUS).
 #define GDT_RAW_SZ (5 * sizeof(gdt_entry_t) + sizeof(gdt_tss_entry_t))
-static gdt_entry_t     ap_gdt_entries[SMP_MAX_CPUS][5];
-static gdt_tss_entry_t ap_gdt_tss[SMP_MAX_CPUS];
-static uint8_t         ap_gdt_raw[SMP_MAX_CPUS][GDT_RAW_SZ];
-static gdt_ptr_t       ap_gdt_ptr[SMP_MAX_CPUS];
-static tss_t           ap_tss[SMP_MAX_CPUS];
+typedef struct ap_desc {
+    gdt_entry_t     gdt_entries[5];
+    gdt_tss_entry_t gdt_tss;
+    uint8_t         gdt_raw[GDT_RAW_SZ];
+    gdt_ptr_t       gdt_ptr;
+    tss_t           tss;
+} ap_desc_t;
 
 // M2: IST virtual top addresses (set by tss_init, returned by tss_get_ist_bases)
 static uint64_t m2_ist1_top = 0;
@@ -138,8 +142,10 @@ void tss_init(uint64_t kernel_rsp0) {
 void tss_setup_ap(uint32_t idx, uint64_t kstack_top) {
     if (idx >= SMP_MAX_CPUS) return;
     extern void* kmalloc(unsigned long);
-    tss_t* t = &ap_tss[idx];
-    for (int i = 0; i < (int)sizeof(tss_t); i++) ((uint8_t*)t)[i] = 0;
+    ap_desc_t* d = (ap_desc_t*)kmalloc(sizeof(ap_desc_t));
+    if (!d) { terminal_writestring("[SMP] AP GDT/TSS alloc failed\n"); for (;;) __asm__ volatile ("cli; hlt"); }
+    for (int i = 0; i < (int)sizeof(ap_desc_t); i++) ((uint8_t*)d)[i] = 0;
+    tss_t* t = &d->tss;
     t->rsp0 = kstack_top;
     // Per-AP IST stacks (heap-backed; grow down from the top of each block).
     #define AP_IST_SZ 0x2000ull
@@ -150,8 +156,7 @@ void tss_setup_ap(uint32_t idx, uint64_t kstack_top) {
     t->ist2 = i2 ? i2 + AP_IST_SZ : kstack_top;
     t->ist3 = i3 ? i3 + AP_IST_SZ : kstack_top;
     t->iomap_base = sizeof(tss_t);
-    build_and_load_gdt(ap_gdt_entries[idx], &ap_gdt_tss[idx], ap_gdt_raw[idx],
-                       &ap_gdt_ptr[idx], t);
+    build_and_load_gdt(d->gdt_entries, &d->gdt_tss, d->gdt_raw, &d->gdt_ptr, t);
     this_cpu()->tss = t;
 }
 

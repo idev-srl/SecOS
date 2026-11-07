@@ -34,9 +34,14 @@
 #define VMM_FLAG_DEVICE    (1ULL<<11)
 #define VMM_FLAG_NOEXEC    (1ULL<<63) // NX bit (requires EFER.NXE enabled)
 
-// Address space structure (currently only physical PML4 pointer)
+// Address space structure.
+// [M48] active_cpus: bit n set while CPU n has this space's CR3 loaded
+// (maintained by vmm_switch_space). A TLB shootdown for a user space only
+// interrupts the CPUs in this set; the kernel space ignores it (shared by all).
+#define VMM_CPU_MASK_WORDS 4   // 256 CPUs = SMP_MAX_CPUS (arch/x86/percpu.h)
 typedef struct vmm_space {
     uint64_t pml4_phys;  // Physical frame of PML4
+    volatile uint64_t active_cpus[VMM_CPU_MASK_WORDS];
 } vmm_space_t;
 
 // Virtual base of physmap (chosen in unused high area)

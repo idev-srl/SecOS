@@ -41,6 +41,27 @@ export CONSOLE=root
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# [M48] SMP is on by default, so the gates run multicore: a qemu-system-x86_64
+# shim (first in PATH, so the Python drivers get it too) adds
+# -smp $SELFTEST_SMP to every QEMU started without an explicit -smp. A gate
+# whose demo needs one CPU (strict ordering of two cooperating tasks) passes
+# -smp 1 itself, or sets QEMU_SMP=1 for a helper (tools/smoke.sh) that starts
+# QEMU. SELFTEST_SMP=1 runs the whole suite single-core.
+SELFTEST_SMP=${SELFTEST_SMP:-2}
+if [[ "$SELFTEST_SMP" != 1 ]]; then
+    QSHIM=$(mktemp -d /tmp/secos_selftest_qemu.XXXXXX)
+    REALQ=$(command -v qemu-system-x86_64)
+    cat > "$QSHIM/qemu-system-x86_64" <<EOF
+#!/bin/bash
+for a in "\$@"; do [[ "\$a" == -smp ]] && exec "$REALQ" "\$@"; done
+exec "$REALQ" -smp "\${QEMU_SMP:-$SELFTEST_SMP}" "\$@"
+EOF
+    chmod +x "$QSHIM/qemu-system-x86_64"
+    export PATH="$QSHIM:$PATH"
+    trap 'rm -rf "$QSHIM"' EXIT
+    echo "[selftest] QEMU guests run with -smp $SELFTEST_SMP unless a gate says otherwise"
+fi
+
 LOG=/tmp/secos_selftest.log
 PASS=0
 FAIL=0
@@ -59,7 +80,9 @@ fi
 
 echo "[selftest] Running (mb2, ${TIMEOUT}s)..."
 # smoke.sh exits 0 when the kernel stays alive to the timeout (no triple fault).
-if ! tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$LOG" >/dev/null 2>&1; then
+# [M48] One CPU: the M7 demo is two tasks handing one CPU back and forth with
+# SYS_YIELD; with a second CPU each would simply run on its own.
+if ! QEMU_SMP=1 tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$LOG" >/dev/null 2>&1; then
     echo "[selftest] FAIL — kernel did not stay alive (triple fault / crash)"
     FAIL=$((FAIL+1))
 fi
@@ -654,7 +677,7 @@ fi
 M28LOG=/tmp/secos_selftest_m28.log
 echo "[selftest] Building M28 image (ACPI discovery + AP bring-up at boot)..."
 make clean >/dev/null 2>&1 || true
-if ! make iso CFLAGS_EXTRA="-DSECOS_SMP_AT_BOOT" >/tmp/secos_selftest_build.log 2>&1; then
+if ! make iso >/tmp/secos_selftest_build.log 2>&1; then
     echo "[selftest] M28 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     tail -20 /tmp/secos_selftest_build.log >&2; exit 2
 fi
@@ -681,7 +704,7 @@ grep -q "\[SMP\] online cpus=0x0000000000000002" "$M28LOG"; check "M29-2 AP come
 M29LOG=/tmp/secos_selftest_m29.log
 echo "[selftest] Building M29 image (M8 workload, multicore)..."
 make clean >/dev/null 2>&1 || true
-if ! make iso CFLAGS_EXTRA="-DM8_SCHED_DEMO=1 -DDEV_ALLOW_UNSIGNED -DSECOS_SMP_AT_BOOT" >/tmp/secos_selftest_build.log 2>&1; then
+if ! make iso CFLAGS_EXTRA="-DM8_SCHED_DEMO=1 -DDEV_ALLOW_UNSIGNED" >/tmp/secos_selftest_build.log 2>&1; then
     echo "[selftest] M29 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
     tail -20 /tmp/secos_selftest_build.log >&2; exit 2
 fi
@@ -2677,7 +2700,7 @@ else
     NSDIR=$(mktemp -d /tmp/secos_selftest_netsmp.XXXXXX)
     ssh-keygen -q -t ed25519 -N '' -C secos-netsmp-selftest -f "$NSDIR/id"
     make clean >/dev/null 2>&1 || true
-    if make iso CFLAGS_EXTRA="-DSECOS_SMP_AT_BOOT -DSECOS_LOCKDEP_LITE" \
+    if make iso CFLAGS_EXTRA="-DSECOS_LOCKDEP_LITE" \
             SSH_AUTHORIZED_KEYS="$NSDIR/id.pub" >/tmp/secos_selftest_build.log 2>&1; then
         cp myos.iso "$NSDIR/netsmp.iso"
         for cfg in "smp4-msix 4 e1000e" "smp4-poll 4 e1000" "smp1-msix 1 e1000e"; do
@@ -2706,6 +2729,74 @@ else
         check "NETSMP gate build" 1
     fi
     rm -rf "$NSDIR"
+fi
+
+# ---- M48 GATE: SMP for real (TLB shootdown, IPIs, migration, x2APIC) ----
+# The default image (SMP on, no define needed) on -smp 4: all CPUs online,
+# the boot TLB-shootdown selftest (with its negative control), then the serial
+# stress session tools/smp_stress_drive.py on -smp 4 and -smp 8 (CPU-bound
+# jobs, pipelines, fork/exec bursts, FPU across migration + signal handlers,
+# parallel syscall fuzzers; /proc/smp must show migrations and reschedule
+# IPIs, no shootdown timeouts). The same image booted through the GRUB
+# "nosmp" entry keeps a single CPU. x2APIC mode is exercised only when
+# SECOS_QEMU_X2APIC names a QEMU whose TCG supports it (QEMU >= 9).
+echo "[selftest] M48 gate: SMP (shootdown selftest, stress -smp 4/8, nosmp)..."
+M48LOG=/tmp/secos_selftest_m48.log
+make clean >/dev/null 2>&1 || true
+if make iso >/tmp/secos_selftest_build.log 2>&1; then
+    M48DIR=$(mktemp -d /tmp/secos_selftest_m48.XXXXXX)
+    cp myos.iso "$M48DIR/smp.iso"
+    run_iso "$M48LOG" 40 -smp 4
+    grep -q "\[SMP\] online cpus=0x0000000000000004" "$M48LOG"; check "M48 default image brings all 4 CPUs online" $?
+    grep -q "\[M48\] TLB shootdown selftest PASS" "$M48LOG"; check "M48 TLB shootdown reaches every AP (boot selftest)" $?
+    grep -q "\[M48\] TLB selftest: .* without stale=0x000000000000000[1-9]" "$M48LOG"
+    check "M48 TLB selftest negative control sees stale entries without a shootdown" $?
+    grep -q "\[SMP\] cpu=0x000000000000000[1-3] run pid=" "$M48LOG"; check "M48 user tasks run on the APs" $?
+    ! grep -q "\[EXC\]\|\[PANIC\]\|\[TLB\] BUG\|shootdown timeout" "$M48LOG"; check "M48 no exception, panic or shootdown timeout at boot (-smp 4)" $?
+    for n in 4 8; do
+        timeout 1500 python3 tools/smp_stress_drive.py --iso "$M48DIR/smp.iso" --smp "$n" \
+            --log "$M48DIR/ssd$n.log" > "$M48DIR/ssd$n.out" 2>&1 &
+    done
+    wait
+    for n in 4 8; do
+        while IFS= read -r l; do
+            case "$l" in
+                "[SSD] RESULT "*) ;;
+                "[SSD] "*" OK"*)   x=${l#\[SSD\] }; check "M48 smp$n ${x%% OK*}" 0 ;;
+                "[SSD] "*" FAIL"*) x=${l#\[SSD\] }; check "M48 smp$n ${x%% FAIL*}" 1; echo "    $l" | cut -c1-200 ;;
+            esac
+        done <"$M48DIR/ssd$n.out"
+        grep -q "^\[SSD\] RESULT " "$M48DIR/ssd$n.out"; check "M48 smp$n stress driver ran to completion" $?
+        cp "$M48DIR/ssd$n.out" "/tmp/secos_selftest_m48_ssd$n.out"; cp "$M48DIR/ssd$n.log" "/tmp/secos_selftest_m48_ssd$n.log"
+    done
+    # nosmp: the same image through the second GRUB entry (command line "nosmp").
+    cp -r isodir "$M48DIR/iso_nosmp"
+    sed -i 's/^set default=0/set default=1/; s/^set timeout=3/set timeout=0/' "$M48DIR/iso_nosmp/boot/grub/grub.cfg"
+    if grub-mkrescue --output="$M48DIR/nosmp.iso" "$M48DIR/iso_nosmp" >/dev/null 2>&1; then
+        : > "$M48LOG.nosmp"
+        timeout 30 qemu-system-x86_64 -cdrom "$M48DIR/nosmp.iso" -boot d -m 256M -smp 4 \
+            -debugcon file:"$M48LOG.nosmp" -global isa-debugcon.iobase=0xe9 -no-reboot -display none >/dev/null 2>&1
+        grep -q "\[SMP\] nosmp on the command line" "$M48LOG.nosmp"; check "M48 nosmp boot word keeps the APs parked" $?
+        ! grep -q "\[SMP\] online cpus=" "$M48LOG.nosmp"; check "M48 nosmp: no AP brought up" $?
+        grep -q "\[INIT\] /bin/init started" "$M48LOG.nosmp"; check "M48 nosmp: system boots to init on one CPU" $?
+    else
+        check "M48 nosmp ISO build" 1
+    fi
+    if [[ -n "${SECOS_QEMU_X2APIC:-}" && -x "$SECOS_QEMU_X2APIC" ]]; then
+        : > "$M48LOG.x2apic"
+        timeout 120 "$SECOS_QEMU_X2APIC" -cdrom "$M48DIR/smp.iso" -boot d -m 1G -smp 8 -cpu max,+x2apic \
+            -debugcon file:"$M48LOG.x2apic" -global isa-debugcon.iobase=0xe9 -no-reboot -display none >/dev/null 2>&1
+        grep -q "mode=x2apic" "$M48LOG.x2apic"; check "M48 x2APIC mode enabled (-cpu max,+x2apic)" $?
+        grep -q "\[SMP\] online cpus=0x0000000000000008" "$M48LOG.x2apic"; check "M48 x2APIC: 8 CPUs online" $?
+        grep -q "\[M48\] TLB shootdown selftest PASS" "$M48LOG.x2apic"; check "M48 x2APIC: shootdown IPIs delivered" $?
+        grep -q "\[INIT\] /bin/init started" "$M48LOG.x2apic"; check "M48 x2APIC: boots to init" $?
+    else
+        echo "  [SKIP] M48 x2APIC (set SECOS_QEMU_X2APIC to a QEMU >= 9 binary)"
+    fi
+    rm -rf "$M48DIR"
+else
+    echo "[selftest] M48 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "M48 gate build" 1
 fi
 
 echo "[selftest] ---"

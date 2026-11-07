@@ -57,6 +57,8 @@
 // Defined in arch/x86/idt_asm.asm.
 extern void trampoline_switch_stack(uint64_t new_rsp, void (*fn)(void));
 
+int kernel_cmdline_has(const char* word);   // [M48] boot command line (below)
+
 static void print_banner(void) {
     terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
     terminal_writestring("==================================\n");
@@ -111,7 +113,7 @@ static void m8_build_elf(void) {
 static void m8_spawn_round(void) {
     for (int i = 0; i < M8_NPROC; i++) {
         process_t* p = process_create_from_elf(m8_elf, 512);
-        if (p) p->state = PROC_READY;
+        if (p) sched_make_ready(p);
     }
 }
 
@@ -126,7 +128,12 @@ __attribute__((noreturn)) static void m8_idle_entry(void) {
         if (m8_round == 0) {
             debugcon_writestring("[M8] round 1: spawning\n");
             m8_spawn_round(); m8_round = 1;
-        } else if (alive == 0 && m8_round <= M8_ROUNDS) {
+        } else if (alive == 0 && process_count_all() == 0 && m8_round <= M8_ROUNDS) {
+            // [M48] Measure only once every zombie is reaped. "alive == 0"
+            // alone (the M29-3 flake) let a round end while zombies whose last
+            // CPU had not yet switched off them were still unreaped, holding
+            // their address space and kernel stack: free memory then differed
+            // between rounds depending on timing.
             m8_free[m8_round] = pmm_get_free_memory();
             debugcon_writestring("[M8] round "); debugcon_print_hex((uint64_t)m8_round);
             debugcon_writestring(" complete, free="); debugcon_print_hex(m8_free[m8_round]);
@@ -206,7 +213,7 @@ __attribute__((noreturn)) static void m9_idle_entry(void) {
             debugcon_writestring("[M9] loaded /bin/hello from VFS, bytes=");
             debugcon_print_hex((uint64_t)(uint32_t)n); debugcon_writestring("\n");
             process_t* p = (n > 0) ? process_create_from_elf(m9_loadbuf, (size_t)n) : 0;
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M9] spawned signed hello\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M9] spawned signed hello\n"); }
             else   { debugcon_writestring("[M9] FAIL: signed hello not loaded/refused\n"); }
         } else if (sched_count_alive_user() == 0 && !m9_done) {
             m9_done = 1;
@@ -280,10 +287,10 @@ static void m11_spawn(const char* path, const char* what) {
     debugcon_writestring("\n");
     process_t* p = (n > 0) ? process_create_from_elf(m11_loadbuf, (size_t)n) : 0;
     if (p) {
-        p->state = PROC_READY;
         debugcon_writestring("[M11] spawned "); debugcon_writestring(what);
         debugcon_writestring(" proc_type="); debugcon_print_hex((uint64_t)(uint32_t)p->proc_type);
         debugcon_writestring("\n");
+        sched_make_ready(p);              // last: it may run (and exit) at once on another CPU
     } else {
         debugcon_writestring("[M11] FAIL: "); debugcon_writestring(what);
         debugcon_writestring(" not loaded/refused\n");
@@ -356,7 +363,7 @@ static int     m13_step = 0, m13_done = 0;
 
 static void m13_spawn(const uint8_t* img, size_t len, const char* what) {
     process_t* p = process_create_from_elf(img, len);
-    if (p) { p->state = PROC_READY;
+    if (p) { sched_make_ready(p);
         debugcon_writestring("[M13] spawned "); debugcon_writestring(what); debugcon_writestring("\n");
     } else {
         debugcon_writestring("[M13] FAIL: "); debugcon_writestring(what); debugcon_writestring(" not loaded\n");
@@ -430,7 +437,7 @@ __attribute__((noreturn)) static void m34_idle_entry(void) {
             m34_step = 1;
             debugcon_writestring("[M34] loading signed lua interpreter (lua 5.4.7)\n");
             process_t* p = process_create_from_elf(user_lua_elf, user_lua_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M34] lua spawned, running demo script\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M34] lua spawned, running demo script\n"); }
             else    debugcon_writestring("[M34] FAIL: lua ELF not loaded\n");
         } else if (m34_step == 1 && sched_count_alive_user() == 0) {
             m34_step = 2;
@@ -480,7 +487,7 @@ __attribute__((noreturn)) static void m35_idle_entry(void) {
             m35_step = 1;
             debugcon_writestring("[M35] loading signed CONFINED program\n");
             process_t* p = process_create_from_elf(user_m35caps_elf, user_m35caps_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M35] confined program spawned\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M35] confined program spawned\n"); }
             else    debugcon_writestring("[M35] FAIL: confined ELF not loaded\n");
         } else if (m35_step == 1 && sched_count_alive_user() == 0) {
             m35_step = 2;
@@ -613,7 +620,7 @@ __attribute__((noreturn)) static void m14_idle_entry(void) {
                 debugcon_writestring(" mapped at load=");
                 debugcon_print_hex((uint64_t)mapped);
                 debugcon_writestring("\n");
-                m14_proc->state = PROC_READY; // let the scheduler run it
+                sched_make_ready(m14_proc); // let the scheduler run it
             }
         } else if (m14_step == 1 && m14_proc && sched_count_alive_user() == 0 && !m14_done) {
             m14_step = 2; m14_done = 1;
@@ -663,7 +670,7 @@ static int m15_step = 0, m15_done = 0;
 
 static void m15_spawn(const uint8_t* img, size_t len, const char* what) {
     process_t* p = process_create_from_elf(img, len);
-    if (p) { p->state = PROC_READY;
+    if (p) { sched_make_ready(p);
         debugcon_writestring("[M15] spawned "); debugcon_writestring(what); debugcon_writestring("\n");
     } else {
         debugcon_writestring("[M15] FAIL: "); debugcon_writestring(what); debugcon_writestring(" not loaded\n");
@@ -740,7 +747,7 @@ __attribute__((noreturn)) static void m16_idle_entry(void) {
             else
                 debugcon_writestring("[M16] FAIL: could not place child ELF\n");
             process_t* p = process_create_from_elf(user_m16_parent_elf, user_m16_parent_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M16] spawned parent\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M16] spawned parent\n"); }
             else   debugcon_writestring("[M16] FAIL: parent not loaded\n");
         } else if (m16_step == 1 && sched_count_alive_user() == 0 && !m16_done) {
             m16_done = 1;
@@ -789,7 +796,7 @@ static process_t* m17_consumer = 0;
 
 static process_t* m17_spawn(const uint8_t* img, size_t len, const char* what) {
     process_t* p = process_create_from_elf(img, len);
-    if (p) { p->state = PROC_READY; debugcon_writestring("[M17] spawned "); debugcon_writestring(what); debugcon_writestring("\n"); }
+    if (p) { sched_make_ready(p); debugcon_writestring("[M17] spawned "); debugcon_writestring(what); debugcon_writestring("\n"); }
     else   { debugcon_writestring("[M17] FAIL: "); debugcon_writestring(what); debugcon_writestring("\n"); }
     return p;
 }
@@ -861,7 +868,7 @@ __attribute__((noreturn)) static void m18_idle_entry(void) {
             m18_step = 1;
             debugcon_writestring("[M18] --- malloc/mmap/mprotect ---\n");
             process_t* p = process_create_from_elf(user_m18_mem_elf, user_m18_mem_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M18] spawned m18_mem\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M18] spawned m18_mem\n"); }
             else   debugcon_writestring("[M18] FAIL: m18_mem not loaded\n");
         } else if (m18_step == 1 && sched_count_alive_user() == 0 && !m18_done) {
             m18_done = 1;
@@ -913,7 +920,7 @@ __attribute__((noreturn)) static void m19_idle_entry(void) {
             m19_step = 1;
             debugcon_writestring("[M19] --- copy-on-write fork ---\n");
             process_t* p = process_create_from_elf(user_m19_fork_elf, user_m19_fork_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M19] spawned m19_fork\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M19] spawned m19_fork\n"); }
             else   debugcon_writestring("[M19] FAIL: m19_fork not loaded\n");
         } else if (m19_step == 1 && sched_count_alive_user() == 0 && !m19_done) {
             m19_done = 1;
@@ -984,7 +991,7 @@ __attribute__((noreturn)) static void execve_idle_entry(void) {
             execve_install();
             static const char* const argv[] = { "exectest", 0 };
             process_t* p = process_create_from_elf_args(user_exectest_elf, user_exectest_elf_len, 1, argv);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[EXECVE] spawned exectest\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[EXECVE] spawned exectest\n"); }
             else   debugcon_writestring("[EXECVE] FAIL: exectest not loaded\n");
         } else if (execve_step == 1 && sched_count_alive_user() == 0 && !execve_done) {
             execve_done = 1;
@@ -1032,7 +1039,7 @@ __attribute__((noreturn)) static void m25_idle_entry(void) {
             m25_step = 1;
             debugcon_writestring("[M25] --- anonymous pipes ---\n");
             process_t* p = process_create_from_elf(user_m25_pipe_elf, user_m25_pipe_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M25] spawned m25_pipe\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M25] spawned m25_pipe\n"); }
             else   debugcon_writestring("[M25] FAIL: m25_pipe not loaded\n");
         } else if (m25_step == 1 && sched_count_alive_user() == 0 && !m25_done) {
             m25_done = 1;
@@ -1084,7 +1091,7 @@ __attribute__((noreturn)) static void m30_idle_entry(void) {
             m30_step = 1;
             debugcon_writestring("[M30] --- signals ---\n");
             process_t* p = process_create_from_elf(user_m30_sig_elf, user_m30_sig_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M30] spawned m30_sig\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M30] spawned m30_sig\n"); }
             else   debugcon_writestring("[M30] FAIL: m30_sig not loaded\n");
         } else if (m30_step == 1 && sched_count_alive_user() == 0 && !m30_done) {
             m30_done = 1;
@@ -1129,7 +1136,7 @@ __attribute__((noreturn)) static void m39_idle_entry(void) {
             m39_step = 1;
             debugcon_writestring("[M39] --- POSIX shell foundation ---\n");
             process_t* p = process_create_from_elf(user_m39_posix_elf, user_m39_posix_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M39] spawned m39_posix\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M39] spawned m39_posix\n"); }
             else   debugcon_writestring("[M39] FAIL: m39_posix not loaded\n");
         } else if (m39_step == 1 && sched_count_alive_user() == 0 && !m39_done) {
             m39_done = 1;
@@ -1175,7 +1182,7 @@ __attribute__((noreturn)) static void m39b_idle_entry(void) {
             extern process_t* process_create_from_elf_args(const void*, unsigned long, int, const char* const[]);
             static const char* const argv[] = { "bash", "-i", 0 };
             process_t* p = process_create_from_elf_args(user_bash_elf, user_bash_elf_len, 2, argv);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M39] spawned bash\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M39] spawned bash\n"); }
             else   debugcon_writestring("[M39] FAIL: bash not loaded\n");
         } else if (m39b_step == 1 && sched_count_alive_user() == 0 && !m39b_done) {
             m39b_done = 1;
@@ -1233,7 +1240,7 @@ __attribute__((noreturn)) static void m20_idle_entry(void) {
             else
                 debugcon_writestring("[M20] FAIL: could not write /m20.txt\n");
             process_t* p = process_create_from_elf(user_m20_mmap_elf, user_m20_mmap_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M20] spawned m20_mmap\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M20] spawned m20_mmap\n"); }
             else   debugcon_writestring("[M20] FAIL: m20_mmap not loaded\n");
         } else if (m20_step == 1 && sched_count_alive_user() == 0 && !m20_done) {
             m20_done = 1;
@@ -1281,7 +1288,7 @@ __attribute__((noreturn)) static void m23_idle_entry(void) {
             m23_step = 1;
             debugcon_writestring("[M23] --- POSIX FS personality demo ---\n");
             process_t* p = process_create_from_elf(user_m23_fs_elf, user_m23_fs_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M23] spawned m23_fs\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M23] spawned m23_fs\n"); }
             else   debugcon_writestring("[M23] FAIL: m23_fs not loaded\n");
         } else if (m23_step == 1 && sched_count_alive_user() == 0 && !m23_done) {
             m23_done = 1;
@@ -1331,13 +1338,13 @@ __attribute__((noreturn)) static void m24_idle_entry(void) {
             m24_step = 1;
             debugcon_writestring("[M24] --- CAP_NET granted (socket allowed) ---\n");
             process_t* p = process_create_from_elf(user_m24net_elf, user_m24net_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M24] spawned m24_net (CAP_NET)\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M24] spawned m24_net (CAP_NET)\n"); }
             else   debugcon_writestring("[M24] FAIL: m24_net not loaded\n");
         } else if (m24_step == 1 && sched_count_alive_user() == 0) {
             m24_step = 2;
             debugcon_writestring("[M24] --- no CAP_NET (socket denied) ---\n");
             process_t* p = process_create_from_elf(user_m24nonet_elf, user_m24nonet_elf_len);
-            if (p) { p->state = PROC_READY; debugcon_writestring("[M24] spawned m24_nonet (no cap)\n"); }
+            if (p) { sched_make_ready(p); debugcon_writestring("[M24] spawned m24_nonet (no cap)\n"); }
             else   debugcon_writestring("[M24] FAIL: m24_nonet not loaded\n");
         } else if (m24_step == 2 && sched_count_alive_user() == 0 && !m24_done) {
             m24_done = 1;
@@ -1409,7 +1416,7 @@ static void init_kill_orphans(void) {
     process_foreach(init_pids_cb, &l);
     for (int i = 0; i < l.n; i++) {
         process_t* p = process_find_by_pid(l.pid[i]);
-        if (p) { signal_post(p, 9 /*SIGKILL*/); if (p->state == PROC_STOPPED) p->state = PROC_READY; }
+        if (p) signal_post(p, 9 /*SIGKILL*/);   // also resumes a stopped one
     }
     for (int spin = 0; spin < 3000 && sched_count_alive_user() > 0; spin++) {
         __asm__ volatile("sti; hlt");
@@ -1720,8 +1727,19 @@ static void kernel_main_phase2(void) {
     // expose. The default boot stays single-core + stable (with the modern LAPIC
     // timer). Bring the cores up on demand with the shell `smp` command, or build
     // with -DSECOS_SMP_AT_BOOT to start them at boot (QEMU/VMware testing).
-#ifdef SECOS_SMP_AT_BOOT
-    { extern void smp_init(void); smp_init(); }
+    // [M48] SMP is on by default: TLB shootdown, reschedule IPIs and migration
+    // make multicore safe (docs/devlog/M48-smp.md). Opt out at build time with
+    // -DSECOS_NO_SMP or at boot with the `nosmp` command-line word (the GRUB
+    // menu has a "single CPU" entry); the shell `smp` command can still bring
+    // the APs up later. -DSECOS_SMP_AT_BOOT (the old opt-in) is now a no-op.
+#ifndef SECOS_NO_SMP
+    if (kernel_cmdline_has("nosmp")) {
+        debugcon_writestring("[SMP] nosmp on the command line: APs stay parked\n");
+    } else {
+        extern void smp_init(void); smp_init();
+    }
+#else
+    debugcon_writestring("[SMP] built with SECOS_NO_SMP: single CPU\n");
 #endif
 
 #if M4_SELFTEST_ENABLE
@@ -1832,7 +1850,7 @@ static void kernel_main_phase2(void) {
             debugcon_writestring("[M7] FAILED to create ring3 processes\n");
         } else {
             p1->state = PROC_RUNNING;
-            p2->state = PROC_READY;
+            sched_make_ready(p2);
             sched_set_current(p1);
 
             debugcon_writestring("[M7] p1 pid=");
@@ -2377,6 +2395,20 @@ static void kernel_main_phase2(void) {
 // Globals saved in phase1 for use in phase2 (framebuffer init)
 uint32_t g_multiboot_magic = 0;
 uint64_t g_multiboot_info  = 0;
+char     g_kcmdline[256];          // [M48] boot command line (Multiboot2 tag 1)
+
+// [M48] Is `word` a whitespace-separated token of the boot command line?
+int kernel_cmdline_has(const char* word) {
+    const char* s = g_kcmdline;
+    while (*s) {
+        while (*s == ' ') s++;
+        const char* w = word; const char* t = s;
+        while (*w && *t == *w) { t++; w++; }
+        if (!*w && (*t == 0 || *t == ' ')) return 1;
+        while (*s && *s != ' ') s++;
+    }
+    return 0;
+}
 
 // [M31] Kernel verbosity gate (see kverbose.h). Quiet by default so the shell
 // shows only program output; the `verbose` command flips it.
@@ -2496,6 +2528,25 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // Save for phase2 (framebuffer)
     g_multiboot_magic = multiboot_magic;
     g_multiboot_info  = multiboot_info;
+    // [M48] Keep the Multiboot2 command line (tag type 1): `nosmp` keeps the
+    // APs parked. Read now, while the boot identity map still covers the info.
+    if (multiboot_magic == MULTIBOOT2_BOOTLOADER_MAGIC && multiboot_info) {
+        const uint8_t* mb = (const uint8_t*)multiboot_info;
+        uint32_t total = *(const uint32_t*)mb;
+        uint32_t off = 8;
+        while (off + 8 <= total && total < (1u << 20)) {
+            uint32_t ty = *(const uint32_t*)(mb + off), sz = *(const uint32_t*)(mb + off + 4);
+            if (ty == 0 || sz < 8) break;
+            if (ty == 1) {
+                uint32_t k = 0;
+                for (const char* c = (const char*)(mb + off + 8); *c && k < sizeof(g_kcmdline) - 1 && k < sz - 8; c++)
+                    g_kcmdline[k++] = *c;
+                g_kcmdline[k] = 0;
+                break;
+            }
+            off += (sz + 7) & ~7u;
+        }
+    }
 
 #if CONFIG_UEFI
     // [UEFI-FIX] The bootinfo struct lives in the loader's memory, which real

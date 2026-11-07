@@ -61,8 +61,10 @@ static void parse_madt(uint64_t madt){
         const uint8_t* e = t+off;
         switch(type){
             case 0:                                        /* Processor Local APIC */
-                if((rd32(e+4) & 1) && g_topo.cpu_count < ACPI_MAX_CPUS)   /* enabled */
-                    g_topo.lapic_ids[g_topo.cpu_count++] = e[3];          /* apic_id */
+                if((rd32(e+4) & 1) && e[3] != 0xFF) {                     /* enabled */
+                    if(g_topo.cpu_count < ACPI_MAX_CPUS) g_topo.lapic_ids[g_topo.cpu_count++] = e[3];
+                    else g_topo.cpus_dropped++;
+                }
                 break;
             case 1:                                        /* IOAPIC */
                 if(g_topo.ioapic_count < ACPI_MAX_IOAPICS){
@@ -83,6 +85,16 @@ static void parse_madt(uint64_t madt){
             case 5:                                        /* LAPIC Address Override (64-bit) */
                 g_topo.lapic_base = rd64(e+4);
                 break;
+            case 9: {                                      /* [M48] Processor Local x2APIC */
+                uint32_t id = rd32(e+4);
+                int dup = 0;
+                for(uint32_t k=0; k<g_topo.cpu_count; k++) if(g_topo.lapic_ids[k] == id) dup = 1;
+                if(!dup && (rd32(e+8) & 1)) {
+                    if(g_topo.cpu_count < ACPI_MAX_CPUS) g_topo.lapic_ids[g_topo.cpu_count++] = id;
+                    else g_topo.cpus_dropped++;
+                }
+                break;
+            }
             default: break;
         }
         off += elen;
@@ -197,6 +209,10 @@ int acpi_init(uint64_t rsdp_hint){
     g_topo.bsp_lapic_id = g_topo.lapic_ids[0];
     g_topo.found = 1;
 
+    if(g_topo.cpus_dropped){
+        debugcon_writestring("[ACPI] WARN: CPUs beyond the kernel limit left offline: ");
+        debugcon_print_hex(g_topo.cpus_dropped); debugcon_writestring("\n");
+    }
     debugcon_writestring("[ACPI] CPUs="); debugcon_print_hex(g_topo.cpu_count);
     debugcon_writestring(" lapic="); debugcon_print_hex(g_topo.lapic_base);
     debugcon_writestring(" ioapics="); debugcon_print_hex(g_topo.ioapic_count);

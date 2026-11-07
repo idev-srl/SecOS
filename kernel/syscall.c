@@ -168,8 +168,9 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
           int i = 0; for (; sp->cwd[i] && i < (int)sizeof(p->cwd) - 1; i++) p->cwd[i] = sp->cwd[i];
           p->cwd[i] = 0;
       } }
-    p->state = PROC_READY;
-    return (int)p->pid;
+    int pid = (int)p->pid;            // read before publishing: it may exit and be reaped at once
+    sched_make_ready(p);              // [M48] publish only now: fully wired
+    return pid;
 }
 int ksys_spawn(const char* path){ return ksys_spawn_argv(path, 0, (const char* const*)0); }
 

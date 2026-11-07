@@ -63,11 +63,13 @@ SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.a
           $(ARCH_DIR)/uaccess.asm
 SRC_C   = \
 	$(KERNEL_DIR)/kernel.c \
+	$(KERNEL_DIR)/bkl.c \
 	$(ARCH_DIR)/idt.c $(ARCH_DIR)/tss.c $(ARCH_DIR)/context_switch.c \
 	$(ARCH_DIR)/lapic.c \
 	$(ARCH_DIR)/acpi.c \
 	$(ARCH_DIR)/tsc.c \
 	$(ARCH_DIR)/percpu.c \
+	$(ARCH_DIR)/tlb.c \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c $(DRIVERS_DIR)/vt.c \
@@ -287,6 +289,9 @@ iso: $(KERNEL)
 	echo 'menuentry "SecOS x64" {' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '    multiboot2 /boot/kernel.bin' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'menuentry "SecOS x64 (single CPU: nosmp)" {' >> $(ISODIR)/boot/grub/grub.cfg
+	echo '    multiboot2 /boot/kernel.bin nosmp' >> $(ISODIR)/boot/grub/grub.cfg
+	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue --output=$(ISO) $(ISODIR) 2>&1 | tee grub-mkrescue.log
 	@echo "ISO creata: $(ISO)"
 	@echo "Verifica contenuto ISO..."
@@ -479,6 +484,11 @@ user-progs: libcrypt
 	$(LD) --gc-sections -T user/user.ld -o user/sysfuzz.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/sysfuzz.o
 	python3 tools/secos-sign user/sysfuzz.elf --dev
 	python3 tools/elf2h.py user/sysfuzz.elf user_sysfuzz_elf crypto/user_sysfuzz_elf.h
+	# [M48] SMP regression checks (FPU across migration + signals, fork bursts)
+	$(CC) $(USER_CFLAGS) -c user/smptest.c     -o user/smptest.o
+	$(LD) --gc-sections -T user/user.ld -o user/smptest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/smptest.o
+	python3 tools/secos-sign user/smptest.elf --dev
+	python3 tools/elf2h.py user/smptest.elf user_smptest_elf crypto/user_smptest_elf.h
 	# [uaccess] bad-user-pointer -EFAULT regression test (selftest uaccess gate)
 	$(CC) $(USER_CFLAGS) -c user/uaccess_test.c -o user/uaccess_test.o
 	$(LD) --gc-sections -T user/user.ld -o user/uaccess_test.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/uaccess_test.o
@@ -554,7 +564,7 @@ user-progs: libcrypt
 	$(MAKE) --no-print-directory gui-progs
 	$(MAKE) --no-print-directory acct-progs
 	$(MAKE) --no-print-directory m46-progs
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + smptest + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
 
 # [M46] Exec confinement selftest (docs/devlog/M46-exec-confinement.md): one
 # source, three signed manifests -- m46conf (confined driver), m46probe (ambient

@@ -21,6 +21,9 @@
 #include "process.h"
 #include "trapframe.h"
 #include "tss.h"
+#include "tlb.h"
+
+void smp_tlb_selftest_ap(cpu_t* c);
 #include <stddef.h>
 
 /* Trampoline blob (objcopy of the flat binary) + its load/parameter addresses. */
@@ -50,52 +53,156 @@ static void ap_udelay(uint64_t us) {
 static volatile uint8_t* lowp(uint64_t phys) { return (volatile uint8_t*)phys_to_virt(phys); }
 
 /* Per-AP idle task (a ring-0 kernel context). When a core has no runnable user
- * task pinned to it, it runs its idle loop; the LAPIC timer preempts idle to a
- * user task and returns here when that task blocks/exits. */
-static process_t ap_idle[SMP_MAX_CPUS];
-static trapframe_t ap_idle_tf[SMP_MAX_CPUS];
-
+ * task, it runs its idle loop; the LAPIC timer (or a reschedule IPI) preempts
+ * idle to a user task and returns here when that task blocks/exits. [M48] The
+ * PCB and its trapframe are allocated per AP in smp_init (sized by the MADT). */
+extern void* kmalloc(unsigned long);
 extern void lapic_timer_start_this_cpu(uint32_t);
 extern void sched_reap_zombies(void);
+#define AP_SWITCH_STACK_SIZE 0x2000ull   /* private stack for the final switch step */
 
 /* AP 64-bit entry: bring this core fully online and enter the scheduler.
- *  1. enable its Local APIC + load the shared IDT
+ *  1. enable its Local APIC (x2APIC first if the BSP chose it: this_cpu()
+ *     reads the APIC ID in that mode) + load the shared IDT
  *  2. build its own GDT/TSS/IST (ring-3 entry lands on this core's kernel stack)
- *  3. install a per-core idle task as `current`/`idle_task`
- *  4. start its LAPIC timer and run the idle loop — the timer tick schedules any
- *     user task pinned (cpu_affinity) to this core. */
+ *  3. install the per-core idle task as `current`/`idle_task`
+ *  4. start its LAPIC timer and run the idle loop — the timer tick and the
+ *     reschedule IPI pick runnable user tasks (any home; see kernel/sched.c). */
 void ap_entry(void) {
     /* [M44] Leave the trampoline CR3 (kernel high half + the boot identity map
      * the real-mode stub needed) for the kernel CR3 at once: from here on the
      * AP runs high only, and the identity map exists nowhere it can reach. */
-    vmm_switch_space(vmm_get_kernel_space());
+    { uint64_t k = vmm_get_kernel_space()->pml4_phys;
+      __asm__ volatile ("mov %0, %%cr3" :: "r"(k) : "memory"); }
+    lapic_enable_this_cpu();
     cpu_t* c = this_cpu();
+    vmm_switch_space(vmm_get_kernel_space());   /* records the active space */
     extern void cpu_enable_sse(void);
     extern void cpu_enable_mitigations(void);
-    cpu_enable_sse();                    // [M34] SSE for ring-3 tasks pinned to this AP
+    cpu_enable_sse();                    // [M34] SSE for ring-3 tasks on this AP
     cpu_enable_mitigations();            // [M36] SMEP (+SMAP) on this AP too
-    lapic_enable_this_cpu();
+    vmm_pat_init();                      // [M48] same PAT (WC slot) as the BSP: tasks migrate
     idt_ap_load();
     tss_setup_ap(c->index, c->kstack_top);
 
-    process_t* idle = &ap_idle[c->index];
-    trapframe_t* tf = &ap_idle_tf[c->index];
-    for (int i = 0; i < (int)sizeof(*idle); i++) ((uint8_t*)idle)[i] = 0;
-    for (int i = 0; i < (int)sizeof(*tf); i++) ((uint8_t*)tf)[i] = 0;
+    process_t* idle = (process_t*)c->idle_task;   /* allocated by smp_init */
+    c->current = idle;
+    c->in_idle = 1;
+    c->slice_left = 0;
+
+    __sync_synchronize();
+    c->online = 1;
+    lapic_timer_start_this_cpu(1000);
+    __asm__ volatile ("sti");
+    for (;;) { smp_tlb_selftest_ap(c); sched_reap_zombies(); __asm__ volatile ("hlt"); }
+}
+
+/* ---- [M48] TLB shootdown selftest (boot, >= 2 CPUs online) ----
+ * The BSP maps a scratch kernel page (the last kernel-stack slot, unused at
+ * boot) to frame A and has every AP read it, so each AP caches the
+ * translation. It then remaps the page to frame B WITH a shootdown: every AP
+ * must now read B. As a negative control it remaps to frame C WITHOUT the
+ * shootdown: an AP still holding the old translation reads B, which shows the
+ * test can see a missing invalidation (QEMU's per-vCPU soft TLB keeps stale
+ * entries exactly like hardware). APs participate from their idle loop. */
+static volatile struct {
+    uint32_t phase;            /* 0 idle, 1..3 = read round n                */
+    uint64_t va;
+    volatile uint64_t seen[3]; /* per round: APs that answered               */
+    volatile uint64_t good[3]; /* per round: APs that read the expected value */
+    uint64_t expect[3];
+} g_tlbt;
+void smp_tlb_selftest_ap(cpu_t* c) {
+    uint32_t ph = g_tlbt.phase;
+    if (!ph || ph > 3) return;
+    static volatile uint8_t done[3][SMP_MAX_CPUS];
+    if (done[ph - 1][c->index]) return;
+    uint64_t v = *(volatile uint64_t*)g_tlbt.va;
+    if (v == g_tlbt.expect[ph - 1]) __atomic_add_fetch(&g_tlbt.good[ph - 1], 1, __ATOMIC_SEQ_CST);
+    done[ph - 1][c->index] = 1;
+    __atomic_add_fetch(&g_tlbt.seen[ph - 1], 1, __ATOMIC_SEQ_CST);
+}
+static int tlbt_round(uint32_t ph, uint64_t want, uint32_t naps) {
+    g_tlbt.expect[ph - 1] = want;
+    __sync_synchronize();
+    g_tlbt.phase = ph;
+    uint64_t t0 = ktime_us();
+    while (g_tlbt.seen[ph - 1] < naps && ktime_us() - t0 < 2000000ULL)
+        __asm__ volatile ("sti; hlt");               /* APs answer on their next tick */
+    return (int)g_tlbt.seen[ph - 1];
+}
+void smp_tlb_selftest(void) {
+    extern uint64_t vmm_alloc_kernel_stack_for_slot(uint32_t);
+    extern int vmm_free_kernel_stack_for_slot(uint32_t);
+    extern int vmm_selftest_remap(uint64_t, uint64_t, int);
+    uint32_t naps = smp_online_count() - 1;
+    static int done_once;
+    // Boot only: the scratch slot is free while no process exists (a later
+    // shell `smp` may run with the table full).
+    if (naps == 0 || done_once || process_count_all() != 0) return;
+    done_once = 1;
+    uint64_t top = vmm_alloc_kernel_stack_for_slot(M5_MAX_KSTACK_SLOTS - 1);
+    void* fb = pmm_alloc_frame(); void* fc = pmm_alloc_frame();
+    if (!top || !fb || !fc) { debugcon_writestring("[M48] TLB selftest: no scratch page\n"); return; }
+    uint64_t va = top - 0x1000ULL;                   /* top page of the slot */
+    *(volatile uint64_t*)va = 0xAAAAAAAAAAAAAAAAULL;
+    *(volatile uint64_t*)phys_to_virt((uint64_t)fb) = 0xBBBBBBBBBBBBBBBBULL;
+    *(volatile uint64_t*)phys_to_virt((uint64_t)fc) = 0xCCCCCCCCCCCCCCCCULL;
+    uint64_t fa = vmm_translate(va) & ~0xFFFULL;
+    g_tlbt.va = va;
+    tlbt_round(1, 0xAAAAAAAAAAAAAAAAULL, naps);      /* APs cache va -> A */
+    vmm_selftest_remap(va, (uint64_t)fb, 1);         /* va -> B, shot down */
+    int seen2 = tlbt_round(2, 0xBBBBBBBBBBBBBBBBULL, naps);
+    vmm_selftest_remap(va, (uint64_t)fc, 0);         /* va -> C, NOT shot down */
+    tlbt_round(3, 0xCCCCCCCCCCCCCCCCULL, naps);
+    g_tlbt.phase = 0;
+    debugcon_writestring("[M48] TLB selftest: aps="); debugcon_print_hex(naps);
+    debugcon_writestring(" with-shootdown fresh="); debugcon_print_hex(g_tlbt.good[1]);
+    debugcon_writestring("/"); debugcon_print_hex((uint64_t)seen2);
+    debugcon_writestring(" without stale="); debugcon_print_hex(g_tlbt.seen[2] - g_tlbt.good[2]);
+    debugcon_writestring("\n");
+    debugcon_writestring(g_tlbt.good[1] == naps && (uint64_t)seen2 == naps
+                         ? "[M48] TLB shootdown selftest PASS\n" : "[M48] TLB shootdown selftest FAIL\n");
+    /* Put frame A back so the slot frees what it allocated, then retire it
+     * (the broken remap above left stale entries: flush them everywhere). */
+    vmm_selftest_remap(va, fa, 1);
+    vmm_free_kernel_stack_for_slot(M5_MAX_KSTACK_SLOTS - 1);
+    tlb_shootdown_kernel(top - M5_KSTACK_SLOT_SIZE, M5_KSTACK_SLOT_PAGES);
+    pmm_free_frame(fb); pmm_free_frame(fc);
+}
+
+/* Allocate an AP's idle PCB + trapframe + switch stack. */
+static int ap_alloc_idle(cpu_t* c) {
+    process_t* idle = (process_t*)kmalloc(sizeof(process_t));
+    trapframe_t* tf = (trapframe_t*)kmalloc(sizeof(trapframe_t));
+    void* sw = pmm_alloc_contiguous(AP_SWITCH_STACK_SIZE / PMM_FRAME_SIZE);
+    if (!idle || !tf || !sw) return -1;
+    for (unsigned i = 0; i < sizeof(*idle); i++) ((uint8_t*)idle)[i] = 0;
+    for (unsigned i = 0; i < sizeof(*tf); i++) ((uint8_t*)tf)[i] = 0;
     idle->pid = 0;                       /* idle tasks are not in the proc table */
     idle->space = vmm_get_kernel_space();
     idle->kstack_top = c->kstack_top;
     idle->tf = tf;
     idle->state = PROC_RUNNING;
     idle->cpu_affinity = c->index;
+    idle->cpu_pin = (int32_t)c->index;
     c->idle_task = idle;
-    c->current = idle;
-    c->slice_left = 0;
+    c->switch_stack_top = (uint64_t)phys_to_virt((uint64_t)sw) + AP_SWITCH_STACK_SIZE;
+    return 0;
+}
 
-    c->online = 1;
-    lapic_timer_start_this_cpu(1000);
-    __asm__ volatile ("sti");
-    for (;;) { sched_reap_zombies(); __asm__ volatile ("hlt"); }
+uint32_t smp_cpu_lapic_id(uint32_t i) { return cpu_by_index(i)->lapic_id; }
+
+/* [M48] Panic: park every other online CPU (VEC_IPI_STOP: cli; hlt forever) so
+ * the panic report is the last thing the machine does. A CPU running with
+ * interrupts off parks once it enables them again. */
+void smp_stop_others(void) {
+    if (g_cpu_count <= 1) return;
+    cpu_t* me = this_cpu();
+    for (uint32_t i = 0; i < g_cpu_count; i++) {
+        cpu_t* c = cpu_by_index(i);
+        if (c != me && c->online) lapic_ipi(c->lapic_id, VEC_IPI_STOP);
+    }
 }
 
 uint32_t smp_online_count(void) {
@@ -132,11 +239,15 @@ void smp_init(void) {
         int idx = smp_register_cpu(id);
         if (idx < 0) continue;
 
+        if (cpu_by_index(idx)->online) continue;      /* already up (shell `smp` twice) */
         /* Per-AP kernel stack (contiguous frames, addressed via the physmap). */
         void* base = pmm_alloc_contiguous(AP_KSTACK_SIZE / PMM_FRAME_SIZE);
         if (!base) { debugcon_writestring("[SMP] AP kstack alloc failed\n"); continue; }
         uint64_t stack_top = (uint64_t)phys_to_virt((uint64_t)base) + AP_KSTACK_SIZE;
         cpu_by_index(idx)->kstack_top = stack_top;
+        if (ap_alloc_idle(cpu_by_index(idx)) != 0) {
+            debugcon_writestring("[SMP] AP idle/switch-stack alloc failed\n"); continue;
+        }
         *(volatile uint64_t*)lowp(AP_PARAM_STACK) = stack_top;
 
         /* INIT, then two STARTUP IPIs at vector (0x8000 >> 12). */
@@ -147,7 +258,7 @@ void smp_init(void) {
         lapic_send_sipi(id, (uint8_t)(AP_TRAMPOLINE_PHYS >> 12));
 
         int online = 0;
-        for (int spins = 0; spins < 100 && !online; spins++) {
+        for (int spins = 0; spins < 200 && !online; spins++) {
             if (cpu_by_index(idx)->online) online = 1; else ap_udelay(1000);
         }
         debugcon_writestring(online ? "[SMP] cpu online lapic_id=" : "[SMP] cpu TIMEOUT lapic_id=");
@@ -157,4 +268,5 @@ void smp_init(void) {
     debugcon_writestring("[SMP] online cpus=");
     debugcon_print_hex(smp_online_count());
     debugcon_writestring("\n");
+    smp_tlb_selftest();
 }

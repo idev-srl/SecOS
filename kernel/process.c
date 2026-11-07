@@ -24,18 +24,21 @@
 #include "fbdev.h"      // [M40] graphics-owner exit -> text console
 
 #define MAX_PROCESSES 32
-static process_t* proc_table[MAX_PROCESSES];
+static process_t* volatile proc_table[MAX_PROCESSES];
 static uint32_t next_pid = 1;
 static int proc_inited = 0;
 
-// [M29] One lock guards the process table, next_pid and the affinity rotor. It
+// [M29] One lock guards the process table, next_pid and the home rotor. It
 // is taken around the whole process_foreach() iteration (so the table cannot be
 // mutated mid-scan); the scheduler's foreach callbacks therefore must NOT call
 // any proc_lock-taking function (they don't — only read/write process fields).
-// Process teardown frees a process_t only after detaching it from the table
-// under this lock (process_reap_one), and only its affinity CPU reaps it, so no
-// other CPU ever dereferences a freed entry.
+// [M48] It also serializes every scheduling claim (process_claim_next) and the
+// RUNNING -> BLOCKED step, so state changes made by wake-ups are atomic with
+// respect to the CPU that picks a task. Process teardown frees a process_t only
+// after detaching it from the table under this lock, and only once no CPU is
+// on it (process_reap_one).
 static spinlock_t proc_lock = SPINLOCK_INIT;
+extern uint64_t timer_get_ticks(void);
 static uint32_t affinity_rotor = 0;
 
 int process_init_system(void) {
@@ -53,13 +56,128 @@ static uint32_t alloc_pid(void) {
     return pid;
 }
 
-// [M29] Round-robin a new process onto an online CPU (1 CPU -> always 0).
-static uint32_t pick_affinity(void) {
-    uint32_t n = smp_online_count(); if (n == 0) n = 1;
+// [M48] Push on create/fork: a new task's home is the online CPU with the
+// fewest runnable (NEW/READY/RUNNING) tasks homed on it; ties rotate so a burst
+// spreads out. Any idle CPU may still pull it later.
+uint32_t process_pick_home(void) {
+    uint32_t n = smp_cpu_count(); if (n == 0) n = 1;
+    if (n > SMP_MAX_CPUS) n = SMP_MAX_CPUS;
+    static uint16_t load[SMP_MAX_CPUS];
     uint64_t fl = spin_lock_irqsave(&proc_lock);
-    uint32_t a = affinity_rotor++ % n;
+    for (uint32_t c = 0; c < n; c++) load[c] = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = proc_table[i];
+        if (!p || p->cpu_affinity >= n) continue;
+        if (p->state == PROC_NEW || p->state == PROC_READY || p->state == PROC_RUNNING)
+            load[p->cpu_affinity]++;
+    }
+    uint32_t best = 0, best_load = 0xFFFFFFFFu;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t c = (affinity_rotor + k) % n;
+        if (!cpu_by_index(c)->online) continue;
+        if (load[c] < best_load) { best = c; best_load = load[c]; }
+    }
+    affinity_rotor++;
     spin_unlock_irqrestore(&proc_lock, fl);
-    return a;
+    return best;
+}
+
+uint64_t process_lock_irqsave(void) { return spin_lock_irqsave(&proc_lock); }
+void process_unlock_irqrestore(uint64_t fl) { spin_unlock_irqrestore(&proc_lock, fl); }
+
+// [M48] Choose and claim the next task for CPU `cpu`. Eligible: READY, not on
+// any CPU (on_cpu == 0: whoever ran it last has fully switched off it), and
+// allowed by its hard pin. Round-robin in table order starting just after
+// `after`. Tasks homed on `cpu` win; otherwise the first eligible task of any
+// other CPU is pulled (load balancing: an idle or quantum-expired CPU never
+// sits on runnable work). The claim (RUNNING + on_cpu + new home) happens
+// under proc_lock, so two CPUs can never claim the same task.
+process_t* process_claim_next(uint32_t cpu, process_t* after) {
+    // Lock-free peek first: idle CPUs call this on every tick, and with many
+    // CPUs taking proc_lock just to find nothing became the bottleneck. A
+    // stale read (an entry being freed is still mapped heap memory) can only
+    // miss a task that the next tick or a reschedule IPI picks up.
+    {
+        int any = 0;
+        for (int i = 0; i < MAX_PROCESSES && !any; i++) {
+            process_t* p = proc_table[i];
+            if (p && p != after && p->state == PROC_READY && !p->on_cpu) any = 1;
+        }
+        if (!any) return NULL;
+    }
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    int start = 0;
+    if (after) {
+        for (int i = 0; i < MAX_PROCESSES; i++) if (proc_table[i] == after) { start = i + 1; break; }
+    }
+    process_t* home = NULL; process_t* any = NULL;
+    uint64_t now = timer_get_ticks();
+    uint32_t ncpu = smp_cpu_count();
+    for (int k = 0; k < MAX_PROCESSES && !home; k++) {
+        process_t* p = proc_table[(start + k) % MAX_PROCESSES];
+        if (!p || p == after || p->state != PROC_READY || p->on_cpu) continue;
+        if (p->cpu_pin >= 0 && (uint32_t)p->cpu_pin != cpu) continue;
+        if (p->cpu_affinity == cpu) { home = p; continue; }
+        if (any) continue;
+        // Pull another CPU's task only when that CPU cannot run it soon: it is
+        // busy with something else, offline, or the task has already waited a
+        // couple of ticks. An idle home CPU was kicked and picks it itself
+        // (keeps a waking task on its warm CPU instead of ping-ponging).
+        if (p->cpu_affinity < ncpu) {
+            cpu_t* h = cpu_by_index(p->cpu_affinity);
+            if (h->online && h->in_idle && p->ready_tick && now - p->ready_tick < 2) continue;
+        }
+        any = p;
+    }
+    process_t* r = home ? home : any;
+    if (r) {
+        r->state = PROC_RUNNING;
+        r->on_cpu = 1;
+        if (r->cpu_affinity != cpu) { r->cpu_affinity = cpu; this_cpu()->nr_migrations++; }
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return r;
+}
+
+int process_count_runnable(void) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    int n = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (proc_table[i] && proc_table[i]->state == PROC_READY && !proc_table[i]->on_cpu) n++;
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return n;
+}
+
+// [M48] Zombies detached by process_reap_one() whose process_destroy() has not
+// finished yet (it runs outside proc_lock, possibly on another CPU). Counted by
+// process_count_all() so "the table is empty" really means every teardown is
+// done: the M29-3 leak check sampled free memory while another CPU was still
+// freeing a detached zombie's address space and kernel stack.
+static volatile int g_reaping;
+void process_reap_done(void) { __atomic_sub_fetch(&g_reaping, 1, __ATOMIC_SEQ_CST); }
+
+int process_count_all(void) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    int n = g_reaping;
+    for (int i = 0; i < MAX_PROCESSES; i++) if (proc_table[i]) n++;
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return n;
+}
+
+int process_set_pin(uint32_t pid, int32_t cpu) {
+    if (cpu >= 0 && ((uint32_t)cpu >= smp_cpu_count() || !cpu_by_index((uint32_t)cpu)->online)) return -22;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    int r = -3;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = proc_table[i];
+        if (p && p->pid == pid) {
+            p->cpu_pin = cpu;
+            if (cpu >= 0) p->cpu_affinity = (uint32_t)cpu;
+            r = 0; break;
+        }
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return r;
 }
 
 // A table index doubles as the process's kernel-stack slot. The reaper detaches
@@ -127,10 +245,9 @@ void process_foreach(void (*cb)(process_t*, void*), void* user) {
     spin_unlock_irqrestore(&proc_lock, fl);
 }
 
-// [M29] Atomically detach one reapable ZOMBIE pinned to `affinity` from the table
-// and return it (the caller frees it via process_destroy outside the lock). Only
-// the zombie's own affinity CPU reaps, and only once it has switched off the
-// zombie's kernel stack (idle context), so the freed stack is never in use.
+// [M29/M48] Atomically detach one reapable ZOMBIE from the table and return it
+// (the caller frees it via process_destroy outside the lock); see
+// process_reap_one() for when a zombie is off every CPU.
 // [M39] wait-any support: find an uncollected ZOMBIE child of `ppid`, and report
 // whether `ppid` has any still-living children. Used by SYS_WAITANY (bash's
 // waitpid(-1) pattern).
@@ -210,12 +327,14 @@ int process_has_children(uint32_t ppid) {
     return n;
 }
 
-process_t* process_reap_one(uint32_t affinity) {
+process_t* process_reap_one(void) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     process_t* z = NULL;
     for (int i=0;i<MAX_PROCESSES;i++) {
         process_t* p = proc_table[i];
-        if (!p || p->state != PROC_ZOMBIE || p->cpu_affinity != affinity) continue;
+        // [M48] Any CPU may reap a zombie once its last CPU has switched off it
+        // (on_cpu == 0): its kernel stack, CR3 and FPU image are no longer in use.
+        if (!p || p->state != PROC_ZOMBIE || p->on_cpu) continue;
         // [M39] Unix zombie semantics: keep a zombie until its parent collects the
         // status via wait() — otherwise a parent that forks and continues (bash
         // subshells/pipelines) races this reaper and its SYS_WAIT(pid) finds the
@@ -231,7 +350,7 @@ process_t* process_reap_one(uint32_t affinity) {
             }
             if (!parent_alive) reapable = 1;   // orphan -> safe to reap
         }
-        if (reapable) { proc_table[i] = NULL; z = p; break; }
+        if (reapable) { proc_table[i] = NULL; z = p; __atomic_add_fetch(&g_reaping, 1, __ATOMIC_SEQ_CST); break; }
     }
     spin_unlock_irqrestore(&proc_lock, fl);
     return z;
@@ -501,7 +620,8 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->image_size = im.image_size;
 
     p->pid = alloc_pid();
-    p->cpu_affinity = pick_affinity();   // [M29] pin to an online CPU
+    p->cpu_affinity = process_pick_home();   // [M48] home CPU (soft; may migrate)
+    p->cpu_pin = -1; p->on_cpu = 0; p->wake_snap = 0; p->ready_tick = 0; p->smp_logged = 0;
     p->space = space;
     p->entry = entry;
     p->stack_top = st_top;
@@ -813,14 +933,15 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
 // address space is COW-shared (vmm_fork_space); the pinned image + manifest are
 // copied (the child owns them); a fresh kernel stack + trapframe are allocated.
 // Driver privilege is NOT inherited (children are plain users). Returns the child
-// (PROC_READY) or NULL.
+// (PROC_NEW: the caller makes it runnable with sched_make_ready) or NULL.
 process_t* process_fork(process_t* parent, trapframe_t* tf) {
     if (!parent || !parent->space || !tf) return NULL;
     process_t* c = (process_t*)kmalloc(sizeof(process_t));
     if (!c) return NULL;
     *c = *parent;                              // shallow-copy all fields (incl. VMAs, fds)
     c->pid = alloc_pid();
-    c->cpu_affinity = pick_affinity();         // [M29] spread the child across CPUs
+    c->cpu_affinity = process_pick_home();     // [M48] push the child to the least-loaded CPU
+    c->on_cpu = 0; c->wake_snap = 0; c->ready_tick = 0; c->smp_logged = 0;   // cpu_pin is inherited
     c->space = NULL; c->image = NULL; c->manifest = NULL; c->tf = NULL;
     c->kstack_top = 0; c->kstack_slot = 0; c->mapped_pages = NULL;
     c->sig_eintr_rip = 0; c->sig_rerun_eintr = 0;
@@ -894,7 +1015,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     }
     debugcon_writestring("[FORK] parent="); debugcon_print_hex(parent->pid);
     debugcon_writestring(" -> child="); debugcon_print_hex(c->pid); debugcon_writestring("\n");
-    c->state = PROC_READY;
+    c->state = PROC_NEW;                       // [M48] the caller publishes it (sched_make_ready)
     return c;
 }
 
