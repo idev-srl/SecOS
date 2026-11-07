@@ -19,8 +19,12 @@
 #             poweroff, and `e2fsck -fn` must be clean after every iteration.
 #
 # The target directory is a parameter (--target, default /root) so the same
-# driver can aim fsstress at another mount later (FAT32 /mnt, ramfs /tmp...);
-# --disk-kind ext4root is the only disk layout wired so far.
+# driver aims fsstress at another mount (ramfs: --target /tmp).
+# [M52] --data vfat|exfat attaches a second virtio disk (vdb) with a fresh
+# FAT32 / exFAT volume, mounts it at /mnt, runs fsstress -n there (no
+# symlinks / hard links / modes) and checks it on the host after the
+# poweroff: fsck.vfat -n, or fsck.exfat -n + tools/exfat_img.py deepcheck.
+# Every round prints its wall time and ops/s (workers * iters / time).
 # The debugcon log must stay free of kernel fault and lockdep markers.
 #
 # Output: one "[FSD] <step> OK|FAIL ..." line per step and "[FSD] RESULT ok=N
@@ -39,11 +43,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class VM:
-    def __init__(self, o, disk, log):
+    def __init__(self, o, disk, log, data=None):
         self.log = log
         open(log, "w").close()
+        extra = ["-drive", f"file={data},if=virtio,format=raw"] if data else []
         cmd = [o.qemu, "-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp),
-               "-drive", f"file={disk},if=virtio,format=raw",
+               "-drive", f"file={disk},if=virtio,format=raw"] + extra + [
                "-nic", "none",
                "-debugcon", "file:" + log, "-global", "isa-debugcon.iobase=0xe9",
                "-no-reboot", "-display", "none", "-serial", "stdio"]
@@ -131,12 +136,24 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--qemu", default="qemu-system-x86_64")
     ap.add_argument("--boot", type=float, default=300)
+    ap.add_argument("--data", choices=["vfat", "exfat"], default=None)
     o = ap.parse_args()
     seed = o.seed if o.seed is not None else int(time.time()) % 100000
     rng = random.Random(seed)
     work = o.work or os.path.join("/tmp", f"secos_fsd.{os.getpid()}")
     os.makedirs(work, exist_ok=True)
     img = os.path.join(work, "root.img")
+    data = os.path.join(work, "data.img") if o.data else None
+    if o.data:
+        if o.target == "/root": o.target = "/mnt"
+        if os.path.exists(data): os.unlink(data)
+        if o.data == "vfat":
+            subprocess.run(["truncate", "-s", "512M", data])
+            dr = subprocess.run(["mkfs.fat", "-F", "32", "-n", "FSD", data],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        else:
+            dr = subprocess.run(["bash", os.path.join(REPO, "tools", "exfat-host.sh"), "mkfs", data, "512"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if os.path.exists(img): os.unlink(img)
     r = subprocess.run(["bash", os.path.join(REPO, "tools", "mkroot.sh"), img, "1G"],
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -150,6 +167,8 @@ def main():
         print(f"[FSD] RESULT ok={ok} fail={fail} seed={seed} work={work}", flush=True)
         sys.exit(0 if fail == 0 else 1)
     report("mkroot", r.returncode == 0 and os.path.exists(img), r.stdout.decode(errors="replace")[-200:])
+    if o.data:
+        report(f"mkfs-{o.data}", dr.returncode == 0 and os.path.exists(data), dr.stdout.decode(errors="replace")[-200:])
     if fail: finish()
     print(f"[FSD] seed={seed} smp={o.smp} target={o.target} workers={o.workers} iters={o.iters}", flush=True)
 
@@ -178,7 +197,7 @@ def main():
         return done and not m and not miss and not extra, body
 
     def boot(tag):
-        vm = VM(o, img, os.path.join(work, f"{tag}.log"))
+        vm = VM(o, img, os.path.join(work, f"{tag}.log"), data)
         good = vm.wait_prompt(o.boot)
         report(f"{tag}-boot-prompt", good)
         if good: time.sleep(1.0)
@@ -200,13 +219,37 @@ def main():
         vm, good = boot("run")
         if not good: vm.kill(); finish()
         run(vm, "root-is-ext4", "grep -q ' / ext4 ' /proc/mounts && echo ROOT-$((6*7))", ["ROOT-42"], 60, absent=())
+        nopt = ""
+        if o.data:
+            fst = "vfat" if o.data == "vfat" else "exfat"
+            run(vm, f"mount-{o.data}",
+                f"(grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/vdb /mnt) && "
+                f"grep ' /mnt ' /proc/mounts && echo MNT-$((6*7))", ["MNT-42"], 120, absent=())
+            nopt = "-n "
         for k in range(o.rounds):
             s = seed + k
-            run(vm, f"fsstress-{k}", f"/bin/fsstress {o.target} {o.workers} {o.iters} {s}",
-                [f"[fsstress] {o.target}/fss.", " PASS workers="], 3000)
+            t0 = time.time()
+            good, _ = run(vm, f"fsstress-{k}", f"/bin/fsstress {nopt}{o.target} {o.workers} {o.iters} {s}",
+                          [f"[fsstress] {o.target}/fss.", " PASS workers="], 3000)
+            el = time.time() - t0
+            if good:
+                print(f"[FSD] perf round={k} smp={o.smp} target={o.target} workers={o.workers} "
+                      f"iters={o.iters} secs={el:.1f} ops/s={o.workers * o.iters / el:.1f}", flush=True)
         run(vm, "no-leftovers", f"n=$(ls {o.target} | grep -c '^fss[.]'); echo LEFT-$n", ["LEFT-0"], 60, absent=())
+        if o.data:
+            run(vm, "umount-data", "sync; umount /mnt && echo UMNT-$((6*7))", ["UMNT-42"], 120, absent=())
         poweroff(vm, "run")
         fsck("run")
+        if o.data == "vfat":
+            fr = subprocess.run(["fsck.vfat", "-n", data], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            report("data-fsck.vfat-clean", fr.returncode == 0, fr.stdout.decode(errors="replace").strip()[-300:])
+        elif o.data == "exfat":
+            fr = subprocess.run(["bash", os.path.join(REPO, "tools", "exfat-host.sh"), "fsck", data],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            report("data-fsck.exfat-clean", fr.returncode == 0, fr.stdout.decode(errors="replace").strip()[-300:])
+            dc = subprocess.run(["python3", "-I", os.path.join(REPO, "tools", "exfat_img.py"), "deepcheck", data],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            report("data-exfat-deepcheck-clean", dc.returncode == 0, dc.stdout.decode(errors="replace").strip()[-300:])
         finish()
 
     # ---- crash-consistency iterations ----

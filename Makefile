@@ -1013,6 +1013,14 @@ lockdep-check:
 locktests:
 	tools/locktests.sh
 
+# [M52] Phase D userland stress on a lockdep image (smp/proc-race/net/tty/
+# exec/fsstress on ext4, ramfs, FAT32, exFAT, crash replay), kernel lock off
+# by default; `make bklstress BKLSTRESS_MODE=on` runs it with the BKL on.
+BKLSTRESS_MODE ?= off
+.PHONY: bklstress
+bklstress:
+	tools/bkl_stress.sh --mode $(BKLSTRESS_MODE)
+
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
