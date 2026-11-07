@@ -363,6 +363,9 @@ void lockdep_klock_wait(klock_t* l, uint64_t t0, int* reported) {
     uint64_t id;
     const char* k = klock_owner_desc(l, &id);
     ld_stuck("klock", l->name, k, id, tsc_read() - l->t_acq);
+    debugcon_writestring("[LOCKDEP]   klock queue: waiters=");
+    debugcon_print_hex((uint32_t)(l->next - l->serving));
+    debugcon_writestring("\n");
 }
 
 /* ---- user copies ---------------------------------------------------------- */

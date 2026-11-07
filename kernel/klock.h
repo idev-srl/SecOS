@@ -36,9 +36,14 @@
  *   - never held across copy_to/from_user (a fault on a file-backed mmap
  *     re-enters the filesystem) — except the BKL
  *   - unlock only by the owner*
- * While a task holds any klock its CPU does not preempt it (only the idle task
- * can be preempted in ring 0: the tick and the reschedule IPI check
- * klock_depth()).
+ * While a task holds any klock, or waits in a klock's queue, its CPU does not
+ * preempt it (only the idle task can be preempted in ring 0: the tick and the
+ * reschedule IPI check klock_task_busy()).
+ *
+ * [M50] Fair: waiters are served in FIFO order (ticket lock). The M48/M50
+ * test-and-CAS loop let a CPU that released the lock win it straight back,
+ * so a waiter could starve behind back-to-back holders (an idle-context BKL
+ * waiter spun > 2 s behind exec/fork syscalls holding it 10-30 ms each).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -51,6 +56,12 @@ struct process;
 
 typedef struct klock {
     void* volatile owner;      /* owning task / cpu_t, NULL = free           */
+    /* [M50] FIFO ticket queue: an acquirer takes `next` and owns the lock
+     * when `serving` reaches its ticket; release bumps `serving`. Free when
+     * next == serving. A ticket is only ever held by a task that is spinning
+     * for it (klock_task_t.spinning keeps the scheduler away), so the queue
+     * cannot wedge behind a descheduled waiter. */
+    volatile uint32_t next, serving;
     uint32_t depth;            /* recursion depth (owner only)               */
     uint16_t level;            /* LK_K* (lock_order.h)                       */
     uint8_t  recursive;        /* 1 = the owner may take it again (BKL only) */
@@ -61,8 +72,8 @@ typedef struct klock {
     uint64_t n_acq, n_contended, max_wait_cyc;
 } klock_t;
 
-#define KLOCK_INIT(lvl, nm)           { 0, 0, (lvl), 0, 0, (nm), 0, 0, 0, 0 }
-#define KLOCK_INIT_RECURSIVE(lvl, nm) { 0, 0, (lvl), 1, 0, (nm), 0, 0, 0, 0 }
+#define KLOCK_INIT(lvl, nm)           { 0, 0, 0, 0, (lvl), 0, 0, (nm), 0, 0, 0, 0 }
+#define KLOCK_INIT_RECURSIVE(lvl, nm) { 0, 0, 0, 0, (lvl), 1, 0, (nm), 0, 0, 0, 0 }
 
 /* The klocks a task (or a CPU before its scheduler runs) holds. Embedded in
  * process_t (`klk`) and cpu_t (`klk`). */
@@ -70,12 +81,17 @@ typedef struct klock {
 typedef struct klock_task {
     uint32_t depth;                 /* distinct klocks held (recursion = 1);
                                        held[0..min(depth,KLOCK_STACK)) valid */
-    uint32_t pad;
+    uint32_t spinning;              /* queued on a klock's ticket (0/1)       */
     klock_t* held[KLOCK_STACK];     /* in acquisition order                   */
 } klock_task_t;
 
+/* Must the scheduler leave this task on its CPU? Holding a klock, or queued
+ * for one (a ticket held by a task that does not spin would stall every
+ * later waiter). Only the idle task can be preempted in ring 0 at all. */
+static inline int klock_task_busy(const klock_task_t* t) { return t->depth || t->spinning; }
+
 static inline void klock_task_reset(klock_task_t* t) {
-    t->depth = 0; t->pad = 0;
+    t->depth = 0; t->spinning = 0;
     for (int i = 0; i < KLOCK_STACK; i++) t->held[i] = 0;
 }
 

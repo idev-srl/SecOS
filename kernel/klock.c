@@ -83,15 +83,21 @@ static void kl_forget(klock_task_t* t, klock_t* l) {
 }
 
 void klock_init(klock_t* l, uint16_t level, const char* name, int recursive) {
-    l->owner = 0; l->depth = 0; l->level = level; l->recursive = recursive ? 1 : 0;
+    l->owner = 0; l->next = 0; l->serving = 0; l->depth = 0; l->level = level; l->recursive = recursive ? 1 : 0;
     l->reg = 0; l->name = name; l->t_acq = 0;
     l->n_acq = l->n_contended = l->max_wait_cyc = 0;
 }
 
 /* ---- acquire / release ---------------------------------------------------- */
 /* Every ownership change happens with interrupts off on this CPU, so the tick
- * (which reads klock_depth to decide whether it may preempt the idle task)
- * never sees a lock owned but not yet counted. */
+ * (which reads klock_task_busy to decide whether it may preempt the idle task)
+ * never sees a lock owned, or a ticket queued, but not yet counted.
+ *
+ * Ticket order: a ticket is taken with interrupts off and t->spinning set in
+ * the same IF-off window, so the idle task cannot be preempted while it holds
+ * a ticket it is not spinning for; a user task in ring 0 is never preempted
+ * at all, and no waiter calls into the scheduler. Recursion (BKL) is checked
+ * before taking a ticket, so the owner never queues behind itself. */
 static void kl_acquire(klock_t* l, int irq_on) {
     uint64_t rf = kl_save_cli();
     cpu_t* c = this_cpu();
@@ -107,31 +113,34 @@ static void kl_acquire(klock_t* l, int irq_on) {
 #ifdef SECOS_LOCKDEP
     lockdep_klock_before(l, t);
 #endif
-    if (!__sync_bool_compare_and_swap(&l->owner, (void*)0, me)) {
-        /* Contended: wait with interrupts on when the caller had them on (or
-         * asked for it), so this CPU keeps taking ticks and IPIs; claim with
-         * them off; return with the caller's IF exactly as it was. */
+    uint32_t ticket = __atomic_fetch_add(&l->next, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&l->serving, __ATOMIC_ACQUIRE) != ticket) {
+        /* Contended: wait our turn with interrupts on when the caller had
+         * them on (or asked for it), so this CPU keeps taking ticks and IPIs;
+         * the turn cannot pass us by (only the holder advances `serving`, and
+         * the holder ahead of us hands it to exactly our ticket); return with
+         * the caller's IF exactly as it was. */
         uint64_t t0 = tsc_read();
         int spin_on = irq_on || (rf & RF_IF);
 #ifdef SECOS_LOCKDEP
         int reported = 0;
 #endif
-        for (;;) {
-            if (spin_on) __asm__ volatile ("sti" ::: "memory");
-            while (l->owner) {
-                cpu_relax_poll();
-                if (spin_on && l->recursive) bkl_wait_poll();   /* only the BKL */
+        t->spinning = 1;                  /* set with IF off: see above */
+        if (spin_on) __asm__ volatile ("sti" ::: "memory");
+        while (__atomic_load_n(&l->serving, __ATOMIC_ACQUIRE) != ticket) {
+            cpu_relax_poll();
+            if (spin_on && l->recursive) bkl_wait_poll();   /* only the BKL */
 #ifdef SECOS_LOCKDEP
-                lockdep_klock_wait(l, t0, &reported);
+            lockdep_klock_wait(l, t0, &reported);
 #endif
-            }
-            __asm__ volatile ("cli" ::: "memory");
-            if (__sync_bool_compare_and_swap(&l->owner, (void*)0, me)) break;
         }
+        __asm__ volatile ("cli" ::: "memory");
+        t->spinning = 0;
         uint64_t w = tsc_read() - t0;
         l->n_contended++;
         if (w > l->max_wait_cyc) l->max_wait_cyc = w;
     }
+    l->owner = me;                        /* ours since serving == ticket */
     l->depth = 1;
     l->t_acq = tsc_read();
     l->n_acq++;
@@ -155,7 +164,11 @@ int klock_trylock(klock_t* l) {
         kl_restore(rf);
         return 1;
     }
-    if (!__sync_bool_compare_and_swap(&l->owner, (void*)0, me)) { kl_restore(rf); return 0; }
+    /* Free means no holder and no queue (next == serving): take the next
+     * ticket only then, so a trylock never jumps or joins the queue. */
+    uint32_t s = __atomic_load_n(&l->serving, __ATOMIC_ACQUIRE);
+    if (!__sync_bool_compare_and_swap(&l->next, s, s + 1)) { kl_restore(rf); return 0; }
+    l->owner = me;
     l->depth = 1;
     l->t_acq = tsc_read();
     l->n_acq++;
@@ -169,6 +182,8 @@ static void kl_release_locked(klock_t* l, klock_task_t* t) {
     kl_forget(t, l);
     l->depth = 0;
     __atomic_store_n(&l->owner, (void*)0, __ATOMIC_RELEASE);
+    /* Hand the lock to the next ticket (only the holder writes `serving`). */
+    __atomic_store_n(&l->serving, l->serving + 1, __ATOMIC_RELEASE);
 }
 
 void klock_unlock(klock_t* l) {
@@ -322,6 +337,8 @@ void klock_on_switch(struct process* prev, struct process* idle) {
     if (prev && prev->klk.depth)
         klock_bug("klock held across switch_to",
                   prev->klk.held[0] ? prev->klk.held[0]->name : "?");
+    if (prev && prev->klk.spinning)
+        klock_bug("klock ticket held across switch_to (queue would stall)", "?");
 #ifdef SECOS_LOCKDEP
     lockdep_cpu_reset();
 #endif

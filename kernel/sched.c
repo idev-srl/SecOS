@@ -240,8 +240,9 @@ void sched_on_timer_tick(trapframe_t* tf) {
         // [M48] ... unless it holds the kernel lock (a kernel-shell command or
         // a reap in progress): the lock belongs to the idle task, which must
         // finish its critical section first.
-        // [M50] Any klock, not just the BKL (klock_depth counts them all).
-        if (cur->klk.depth) return;
+        // [M50] Any klock, not just the BKL, and never while queued for one
+        // (a preempted ticket holder would stall the lock's FIFO queue).
+        if (klock_task_busy(&cur->klk)) return;
         // Idle is always safe to preempt: hand the CPU to a runnable user task.
         // Save idle's interrupted context so that returning to it (after the
         // user task exits) resumes where it was — this lets the interactive
@@ -279,7 +280,7 @@ void sched_on_resched_ipi(trapframe_t* tf) {
     lapic_eoi();                       // before a switch that never returns here
     process_t* cur = me->current;
     if (!me->idle_task || !cur || cur != me->idle_task) return;
-    if (cur->klk.depth) return;        // idle in a klock section: next tick
+    if (klock_task_busy(&cur->klk)) return;   // idle holds / waits for a klock: next tick
     process_t* next = claim_next(NULL);
     if (next) { if (cur->tf) save_tf(cur, tf); switch_to(next); }
 }
