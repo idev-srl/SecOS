@@ -199,6 +199,43 @@ static void pager_prompt_more(void){
 static void pager_print(const char* line){ if(pager_quit) return; terminal_writestring(line); terminal_writestring("\n"); if(--pager_line_budget <=0 && pager_enabled) pager_prompt_more(); }
 static void pager_end(void){ (void)0; }
 
+// [M51 B4] Directory listings are collected first and paged afterwards. The
+// pager waits for a key (with the BKL suspended), and a readdir callback runs
+// inside the filesystem's operation: once the filesystems have their own
+// locks (BKL removal phase C) a prompt there would wait with one held, and
+// with the BKL suspended another task could change the directory under the
+// walk. So readdir callbacks only append lines here.
+#define SH_LINES_MAX (1024u * 1024u)
+typedef struct { char* buf; size_t len, cap; int trunc; } sh_lines_t;
+static void sh_lines_add(sh_lines_t* L, const char* s){
+    size_t n = 0; while(s[n]) n++;
+    if(L->trunc) return;
+    if(L->len + n + 1 > L->cap){
+        size_t nc = L->cap ? L->cap * 2 : 4096;
+        while(nc < L->len + n + 1) nc *= 2;
+        if(nc > SH_LINES_MAX){ L->trunc = 1; return; }
+        char* nb = (char*)kmalloc(nc);
+        if(!nb){ L->trunc = 1; return; }
+        for(size_t i=0;i<L->len;i++) nb[i]=L->buf[i];
+        if(L->buf) kfree(L->buf);
+        L->buf = nb; L->cap = nc;
+    }
+    for(size_t i=0;i<n;i++) L->buf[L->len++]=s[i];
+    L->buf[L->len++]='\n';
+}
+// Page the collected lines (no filesystem call is in progress) and free them.
+static void sh_lines_page(sh_lines_t* L){
+    size_t i = 0;
+    while(i < L->len && !pager_should_stop()){
+        size_t j = i; while(j < L->len && L->buf[j] != '\n') j++;
+        L->buf[j] = 0; pager_print(L->buf + i);
+        i = j + 1;
+    }
+    if(L->trunc && !pager_should_stop()) pager_print("... (listing truncated)");
+    if(L->buf) kfree(L->buf);
+    L->buf = NULL; L->len = L->cap = 0; L->trunc = 0;
+}
+
 static const struct shell_cmd shell_cmds[] = {
     // --- user-facing (shown in `help`) ---
     {"help",      sh_help,      "list commands (help -l for descriptions)"},
@@ -905,18 +942,23 @@ static void sh_rftree(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MA
 static void sh_rfusage(const char* a){ (void)a; const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n = ramfs_list(arr,RAMFS_MAX_FILES); size_t bytes=0; size_t files=0; size_t dirs=0; for(size_t i=0;i<n;i++){ if(arr[i]->flags & 2) dirs++; else { files++; bytes += arr[i]->size; } } terminal_writestring("[rfusage] files="); print_dec(files); terminal_writestring(" dirs="); print_dec(dirs); terminal_writestring(" total_bytes="); print_dec(bytes); terminal_writestring(" slots_used="); print_dec(n); terminal_writestring(" slots_free="); print_dec(RAMFS_MAX_FILES - n); terminal_writestring("\n"); }
 // ---- VFS commands ----
 static void vls_cb(const vfs_inode_t* child, void* user){
-    (void)user;
-    terminal_writestring("  ");
-    terminal_writestring(child->path);
+    // [M51 B4] collect only; sh_vls pages after the walk
+    char line[300]; int k=0;
+    line[k++]=' '; line[k++]=' ';
+    for(int j=0; child->path[j] && k<260; j++) line[k++]=child->path[j];
     if(child->type==VFS_NODE_DIR){
-        terminal_writestring("/\n");
+        line[k++]='/';
     } else {
-        terminal_writestring("  ");
-        print_dec(child->size);
-        terminal_writestring(" bytes\n");
+        line[k++]=' '; line[k++]=' ';
+        char d[24]; int n=0; uint64_t v=child->size;
+        do { d[n++]=(char)('0'+v%10); v/=10; } while(v);
+        while(n) line[k++]=d[--n];
+        const char* b=" bytes"; for(int j=0;b[j];j++) line[k++]=b[j];
     }
+    line[k]=0;
+    sh_lines_add((sh_lines_t*)user, line);
 }
-static void sh_vls(const char* a){ while(*a==' ') a++; char path[256]; size_t pi=0; while(*a && pi<sizeof(path)-1) path[pi++]=*a++; path[pi]=0; if(pi==0){ path[0]='/'; path[1]=0; } extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*); extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* dir = vfs_lookup(path); if(dir && dir->type!=VFS_NODE_DIR){ terminal_writestring("[vls] not a directory\n"); return; } terminal_writestring("[vls] "); terminal_writestring(path); terminal_writestring("\n"); pager_begin(); vfs_readdir(path, vls_cb, NULL); pager_end(); }
+static void sh_vls(const char* a){ while(*a==' ') a++; char path[256]; size_t pi=0; while(*a && pi<sizeof(path)-1) path[pi++]=*a++; path[pi]=0; if(pi==0){ path[0]='/'; path[1]=0; } extern int vfs_readdir(const char*, void(*)(const vfs_inode_t*, void*), void*); extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* dir = vfs_lookup(path); if(dir && dir->type!=VFS_NODE_DIR){ terminal_writestring("[vls] not a directory\n"); return; } terminal_writestring("[vls] "); terminal_writestring(path); terminal_writestring("\n"); sh_lines_t L = {0}; vfs_readdir(path, vls_cb, &L); pager_begin(); sh_lines_page(&L); pager_end(); }
 static void sh_vcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vcat <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); extern int vfs_read_all(const char*, void*, size_t); vfs_inode_t* ino=vfs_lookup(a); if(!ino || ino->type!=VFS_NODE_FILE){ terminal_writestring("[vcat] file not found\n"); return; } char buf[1024]; if(ino->size >= sizeof(buf)){ terminal_writestring("[vcat] file too large for buffer\n"); return; } int r=vfs_read_all(a,buf,sizeof(buf)); if(r<0){ terminal_writestring("[vcat] read fail\n"); return; } for(int i=0;i<r;i++) terminal_putchar(buf[i]); if(r==0) terminal_writestring("(empty)\n"); }
 static void sh_vinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vinfo <path>\n"); return; } extern vfs_inode_t* vfs_lookup(const char*); vfs_inode_t* ino=vfs_lookup(a); if(!ino){ terminal_writestring("[vinfo] not found\n"); return; } terminal_writestring("Path: "); terminal_writestring(ino->path); terminal_writestring("\nType: "); terminal_writestring(ino->type==VFS_NODE_DIR?"DIR":"FILE"); terminal_writestring("\nSize: "); print_dec(ino->size); terminal_writestring(" bytes\n"); }
 static void sh_vpwd(const char* a){ (void)a; terminal_writestring("(vpwd uses RAMFS CWD) "); path_print_cwd(); }
@@ -1229,12 +1271,13 @@ static void sh_cd(const char* a){
     size_t i=0; while(p[i] && i<sizeof(g_cwd)-1){ g_cwd[i]=p[i]; i++; } g_cwd[i]=0;
 }
 
-// readdir callback: print just the basename (with trailing '/' for dirs).
-static void ls_cb(const vfs_inode_t* c, void* u){ (void)u;
+// readdir callback: collect just the basename (with trailing '/' for dirs);
+// [M51 B4] sh_ls pages once the walk is over.
+static void ls_cb(const vfs_inode_t* c, void* u){
     const char* b=c->path; for(const char* q=c->path;*q;q++) if(*q=='/') b=q+1;
     char line[280]; int k=0; for(int j=0;b[j] && k<260;j++) line[k++]=b[j];
     if(c->type==VFS_NODE_DIR && k<278) line[k++]='/';
-    line[k]=0; pager_print(line);
+    line[k]=0; sh_lines_add((sh_lines_t*)u, line);
 }
 
 static void sh_ls(const char* a){
@@ -1245,7 +1288,9 @@ static void sh_ls(const char* a){
     vfs_inode_t* ino = vfs_lookup(p);
     if(!ino){ terminal_writestring("ls: cannot access '"); terminal_writestring(p); terminal_writestring("'\n"); return; }
     if(ino->type!=VFS_NODE_DIR){ terminal_writestring(p); terminal_writestring("\n"); return; }
-    pager_begin(); vfs_readdir(p, ls_cb, NULL); pager_end();
+    sh_lines_t L = {0};
+    vfs_readdir(p, ls_cb, &L);
+    pager_begin(); sh_lines_page(&L); pager_end();
 }
 
 static void sh_cat(const char* a){
