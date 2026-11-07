@@ -30,6 +30,10 @@ void heap_print_stats(void);
 // builds). Returns 0 when sound; corruption panics with a diagnostic.
 int heap_check(void);
 
+// [M51-C6] Bytes in use, and the footprint (all blocks + headers) the heap
+// holds from the PMM. Either pointer may be NULL.
+void heap_usage(uint64_t* used, uint64_t* footprint);
+
 // heap_check() plus a printed summary (shell `heapcheck`).
 void heap_check_report(void);
 

@@ -2244,6 +2244,10 @@ static void kernel_main_phase2(void) {
     // [M50 B3] Block/USB lock stress on every CPU at once (fs/blkstress.c).
     { extern void blkstress_run(void); blkstress_run(); }
 #endif
+#ifdef SECOS_EXEC_TEST
+    // [M51 C6] Signed-image loads on every CPU at once (kernel/exec_test.c).
+    { extern void exectest_run(void); exectest_run(); }
+#endif
 #if M41_EXFAT_DEMO
     // [M41] exFAT self-test, once /mnt and /proc are mounted: the good image on
     // vda, or the corrupt-image suite when AHCI disks are attached.

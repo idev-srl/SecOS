@@ -110,6 +110,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/kaslr.c \
 	$(KERNEL_DIR)/pkg.c \
 	$(KERNEL_DIR)/selftest.c \
+	$(KERNEL_DIR)/exec_test.c \
 	user/testdriver.c \
 	$(LIB_DIR)/terminal.c \
 	$(FS_DIR)/ramfs.c \
