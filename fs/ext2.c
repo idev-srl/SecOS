@@ -975,7 +975,15 @@ static vfs_inode_t* e2_lookup_locked(const char* path){
     // a write through one name must be seen by a read through another.
     e2_vslot_t* slot=vslot_find(ino);
     vfs_inode_t* v=slot?&slot->v:NULL;
-    if(v){ const char* np=path&&path[0]?path:"/"; size_t k=0; for(; np[k] && k<sizeof(v->path)-1; k++) v->path[k]=np[k]; v->path[k]=0; }
+    if(v){
+        /* [M51 C3] Rewrite the cached path only when it really changes (a hard
+         * link looked up by its other name): procfs and the syscalls read
+         * ino->path without this lock, so an identical rewrite must not tear it. */
+        const char* np=path&&path[0]?path:"/";
+        size_t k=0; while(np[k] && k<sizeof(v->path)-1 && v->path[k]==np[k]) k++;
+        int same = (v->path[k]==0 && (np[k]==0 || k==sizeof(v->path)-1));
+        if(!same){ for(k=0; np[k] && k<sizeof(v->path)-1; k++) v->path[k]=np[k]; v->path[k]=0; }
+    }
     else v=vino_alloc(path&&path[0]?path:"/");
     if(!v) return NULL;
     v->type=isd?VFS_NODE_DIR:VFS_NODE_FILE; v->size=sz; v->ino=ino;
