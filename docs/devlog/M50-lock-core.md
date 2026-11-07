@@ -95,7 +95,7 @@ from the plan table, both because the code already nests these locks:
 | `tlb_lock` at S60 with `kstack_lock`, `g_pm_lock` | `LK_S62_TLB` | `vmm_selftest_remap` (and `TLB_KSTACK_EAGER`) shoot down under `kstack_lock` |
 | kclock, csprng at S60 | `LK_S64_LEAF` | leaf locks; keeps S60 for page-table locks |
 | `heap_lock → pmm_lock` both "S70" | `LK_S70_HEAP` < `LK_S75_PMM` | `expand_heap` calls the PMM under `heap_lock` |
-| `block_io_lock` (missing) | `LK_S42_BLOCK_IO` | still taken under `pc_lock` until B2 moves FS reads out of it; B3 deletes it |
+| `block_io_lock` (missing) | `LK_S42_BLOCK_IO` | was taken under `pc_lock`; since B2 it no longer nests there (see below), the level only keeps it classified until B3 deletes it |
 
 Every existing spinlock is classified with `SPINLOCK_INIT_CLASS(level,
 "name")`: tlb, proc, pty, heap, pipe, kclock, pagecache, kstack, physmap,
@@ -199,3 +199,118 @@ Everything else stayed silent.
   unchanged against `stub/`: an FS that starts using `klock.h` needs a stub
   `klock.h` there.
 - Run `make lockdep-check` (≈25 min) on every phase B/C/D branch.
+
+## B2 — page-cache fill without `pc_lock` (`feat/pagecache-fill`)
+
+Plan §4 Phase B2. Before: `pagecache_get_phys_nolock` called
+`ino->ops->read` with the irqsave `pc_lock` held — every cache miss ran the
+filesystem and the (polled) block driver with interrupts off on that CPU and
+put `pc_lock` *above* every FS and block lock, which would deadlock as soon as
+the FS locks of phase C exist (a write path takes K30 and then invalidates
+under S40). `pagecache_get_phys` also handed its caller a cache frame that
+another CPU could evict and free while the caller (the file-mmap fault) was
+still copying it.
+
+### Design (`mm/pagecache.{c,h}`)
+- **Slot states** `FREE` / `FILLING` / `VALID`, plus a per-slot `seq`
+  (bumped on every state change), `owner` and `stale` bit. `pc_lock` guards
+  only the index, the FIFO hand and the counters.
+- **Miss:** reserve a `FILLING` slot for (inode, offset) owned by the calling
+  task (the CPU before its scheduler runs), drop the lock, allocate a private
+  frame, fill it through `ops->read`, copy the caller's bytes out of it, re-lock
+  and publish (`VALID`) — unless the slot went stale, in which case the frame
+  is freed and the slot released. A failed `ops->read` is returned as an error
+  and never cached (it used to be cached as a zero page).
+- **Invalidation** (`pagecache_invalidate`, `pagecache_invalidate_fs`): frees
+  overlapping `VALID` pages (frames freed after unlocking, in batches of 16)
+  and sets `stale` on overlapping `FILLING` slots. Every write, O_TRUNC,
+  ftruncate, rename, unlink and inode-slot reuse already invalidates *after*
+  the change, so: a fill reserved after the invalidation reads the new bytes;
+  a fill reserved before it is doomed and not published; a page published
+  before it is dropped by it. No stale page can survive a completed write.
+  The plan asked for a per-inode generation; it is kept per in-flight fill
+  instead, which is the same check with no field in `vfs_inode_t` (shared
+  with C1) and range-precise: a fill only exists as a `FILLING` slot, so the
+  slot is the one place an invalidation must reach, and a write to page 7
+  does not throw away a concurrent fill of page 0.
+- **Eviction** skips `FILLING` slots (the frame belongs to the filler). With
+  all 128 slots filling the miss reads directly, uncached.
+- **Second misser** for a page being filled: drops the lock and spins on the
+  slot's `seq` (caller's IF, `cpu_relax_poll` = pause + `tlb_poll`), then
+  looks again. The wait is bounded (`PC_WAIT_US` = 20 ms total per call):
+  past it the misser reads the page itself without caching. A task that misses
+  *its own* fill (re-entry) reads directly at once. So no wait can deadlock,
+  whatever the filler does (an IF-off waiter on the BSP stops the tick, but
+  the filler needs neither the tick nor that CPU, and the bound covers the
+  rest).
+- **No frame leaves the cache:** bytes are copied out under `pc_lock`
+  (`pagecache_read` page by page, new `pagecache_copy_page` for one page).
+  `pagecache_get_phys` is gone; its only caller, the M20 file-backed mmap
+  fault (`mm/vma.c` `vma_fault_in`), now calls `pagecache_copy_page` into the
+  new private frame. The fault path and `read()` still take their bytes from
+  the same cache pages, so M20 coherence is unchanged.
+- `pagecache_get_stats()` — hits, misses, published, discarded, waits,
+  wait_timeouts, direct, evictions, invalidations, doomed, and the current
+  valid/filling census (used by the self-test).
+
+### Lock order after B2
+`pc_lock` (S40) has only the PMM (S75) inside it and never an FS/block call,
+so it nests *inside* the FS (K30) and block (K40) locks — the plan's
+"write: K30 → K40, invalidate (S40) inside K30" is now legal. `block_io_lock`
+no longer nests inside S40; it keeps `LK_S42_BLOCK_IO` only to stay
+classified until B3 replaces it with the per-disk K40 `blkdev->lock` (B2 did
+not move it). `kernel/lock_order.h` says so.
+
+### Tests
+- **Forced interleavings** (`mm/pagecache_test.c`, `-DSECOS_PAGECACHE_TEST`,
+  23 checks, `[PCTEST] DONE ok=0x17 fail=0`): `pagecache_test_fill_hook` runs
+  between a fill's FS read and its publication. On the BSP: a write +
+  invalidate (fill discarded, next read sees the new bytes), the negative
+  control (`pagecache_test_nostale`: the stale page *is* served, proving the
+  test sees the bug), `invalidate_fs` during a fill, a recursive miss on the
+  own fill (direct read, no self-wait), a 140-page read through the full
+  cache during a fill (the FILLING slot survives eviction). Against an AP,
+  driven from its idle loop (`kernel/smp.c`, only with the define): a remote
+  write + invalidate, a second misser that really waits and then hits the
+  published page, a waiter that times out and reads directly, a remote
+  `invalidate_fs`.
+- **`/bin/pcstress`** (`user/pcstress.c`, signed) + `tools/pc_stress_drive.py`:
+  two files per directory, one writer each (overwrite in place, O_TRUNC +
+  rewrite, O_APPEND, ftruncate shrink, ftruncate grow), lock-step checkers
+  that verify every completed write through `read()` *and* a fresh
+  MAP_PRIVATE mmap from their own processes, and unsynchronised hammers that
+  keep the cache full of the previous version (every page they see must be a
+  whole, well-formed page of the right file and index). Run on the ramfs
+  `/tmp` and a default `mkfs.ext4` `/mnt` at once, -smp 4, then umount and
+  host `e2fsck -fn`. With the BKL on this mostly checks serialized coherence
+  (invalidate-after-write vs a hot cache); the hook test covers the races.
+- Selftest gate **"M50 PAGECACHE"** (`tools/selftest.sh`, last gate): one
+  `CONSOLE=root -DSECOS_PAGECACHE_TEST -DSECOS_LOCKDEP` image, the driver
+  with `--pctest`.
+
+### What the stress found
+- **ramfs inode size lagged behind writes** (`fs/ramfs_vfs.c`, pre-existing,
+  independent of B2): `ramfs_write` grew the entry but the cached
+  `vfs_inode_t.size` only changed at the next lookup. A file-mmap fault in that
+  window filled the page by the old size (zero-padded) and cached it; the
+  write's invalidation had already run, so read() and mmap both kept serving
+  it. read() clamps to the same stale size, which is why M20 never saw it.
+  pcstress caught it on the first run (a writer's own check after an O_TRUNC
+  rewrite); fixed by updating `inode->size` in `ramfs_vfs_write`. fat32,
+  exfat and ext2 already update the inode size on write.
+- The first driver version ran out of process slots (`MAX_PROCESSES` 32,
+  init/bash included): a checker fork failed and its writer waited forever.
+  pcstress now fails cleanly on a fork error, and the gate sizes its runs to
+  fit (2 × 9 processes in parallel, then 15 at a time).
+
+### Verification (B2)
+- `-Wall -Wextra`: 41 warnings, identical to the baseline, in the normal and
+  the `-DSECOS_LOCKDEP -DSECOS_PAGECACHE_TEST` builds; none in the touched
+  files.
+- `[PCTEST]` 23/23 on -smp 4 (lockdep build), lockdep silent.
+- `tools/pc_stress_drive.py --pctest --rounds 200` on -smp 4: 10/10 (both
+  pcstress runs on ramfs + ext4, host `e2fsck -fn` clean).
+- `make lockdep-check`: 15/15.
+- From `tools/selftest.sh`: M10 × {fat32, ext2, ext4}, M20, the M41
+  persistent-root gate (`persist_test.sh`, incl. kill -9 crash runs) and the
+  M41 exFAT gate: 127/127.
