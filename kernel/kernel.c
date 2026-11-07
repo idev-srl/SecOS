@@ -156,7 +156,7 @@ __attribute__((noreturn)) static void m8_idle_entry(void) {
                 m8_round = M8_ROUNDS + 1; // sentinel: idle quietly hereafter
             }
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -222,7 +222,7 @@ __attribute__((noreturn)) static void m9_idle_entry(void) {
             m9_done = 1;
             debugcon_writestring("[M9] user program exited; DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -316,7 +316,7 @@ __attribute__((noreturn)) static void m11_idle_entry(void) {
             m11_done = 1;
             debugcon_writestring("[M11] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -396,7 +396,7 @@ __attribute__((noreturn)) static void m13_idle_entry(void) {
             m13_done = 1;
             debugcon_writestring("[M13] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -446,7 +446,7 @@ __attribute__((noreturn)) static void m34_idle_entry(void) {
             m34_step = 2;
             debugcon_writestring("[M34] DONE (lua interpreter ran to completion)\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 static void m34_run_demo(void) {
@@ -498,7 +498,7 @@ __attribute__((noreturn)) static void m35_idle_entry(void) {
             debugcon_print_hex(cap_audit_total());
             debugcon_writestring("\n[M35] DONE (least privilege enforced + audited)\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 static void m35_run_demo(void) {
@@ -558,7 +558,7 @@ __attribute__((noreturn)) static void m46_idle_entry(void) {
             m46_step = 3;
             debugcon_writestring("[M46] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 static void m46_run_demo(void) {
@@ -629,7 +629,7 @@ __attribute__((noreturn)) static void m14_idle_entry(void) {
             m14_step = 2; m14_done = 1;
             debugcon_writestring("[M14] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -696,7 +696,7 @@ __attribute__((noreturn)) static void m15_idle_entry(void) {
             m15_done = 1;
             debugcon_writestring("[M15] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -756,7 +756,7 @@ __attribute__((noreturn)) static void m16_idle_entry(void) {
             m16_done = 1;
             debugcon_writestring("[M16] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -825,7 +825,7 @@ __attribute__((noreturn)) static void m17_idle_entry(void) {
             m17_done = 1;
             debugcon_writestring("[M17] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -877,7 +877,7 @@ __attribute__((noreturn)) static void m18_idle_entry(void) {
             m18_done = 1;
             debugcon_writestring("[M18] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -929,7 +929,7 @@ __attribute__((noreturn)) static void m19_idle_entry(void) {
             m19_done = 1;
             debugcon_writestring("[M19] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -1000,7 +1000,7 @@ __attribute__((noreturn)) static void execve_idle_entry(void) {
             execve_done = 1;
             debugcon_writestring("[EXECVE] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -1048,7 +1048,7 @@ __attribute__((noreturn)) static void m25_idle_entry(void) {
             m25_done = 1;
             debugcon_writestring("[M25] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -1100,7 +1100,7 @@ __attribute__((noreturn)) static void m30_idle_entry(void) {
             m30_done = 1;
             debugcon_writestring("[M30] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -1145,7 +1145,7 @@ __attribute__((noreturn)) static void m39_idle_entry(void) {
             m39_done = 1;
             debugcon_writestring("[M39] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 static void m39_run_demo(void) {
@@ -1191,7 +1191,7 @@ __attribute__((noreturn)) static void m39b_idle_entry(void) {
             m39b_done = 1;
             debugcon_writestring("[M39] bash DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 static void m39b_run_demo(void) {
@@ -1249,7 +1249,7 @@ __attribute__((noreturn)) static void m20_idle_entry(void) {
             m20_done = 1;
             debugcon_writestring("[M20] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 
@@ -1297,7 +1297,7 @@ __attribute__((noreturn)) static void m23_idle_entry(void) {
             m23_done = 1;
             debugcon_writestring("[M23] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 static void m23_run_demo(void) {
@@ -1353,7 +1353,7 @@ __attribute__((noreturn)) static void m24_idle_entry(void) {
             m24_done = 1;
             debugcon_writestring("[M24] DONE\n");
         }
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
 }
 static void m24_run_demo(void) {
@@ -1422,7 +1422,7 @@ static void init_kill_orphans(void) {
         if (p) signal_post(p, 9 /*SIGKILL*/);   // also resumes a stopped one
     }
     for (int spin = 0; spin < 3000 && sched_count_alive_user() > 0; spin++) {
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
         sched_reap_zombies();
     }
 }

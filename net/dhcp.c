@@ -14,6 +14,7 @@
 #include "udp.h"
 #include "debugcon.h"
 #include <stddef.h>
+#include "klock.h"   /* [M50] cpu_wait_irq */
 
 extern uint64_t timer_get_ticks(void);
 
@@ -258,6 +259,6 @@ int dhcp_configure(net_dev_t* dev) {
     if (dhcp_start(dev) < 0) return -1;
     int ph;
     while ((ph = dhcp_poll(dev)) == DHCP_PH_DISCOVER || ph == DHCP_PH_REQUEST)
-        __asm__ volatile ("sti; hlt");   /* the tick drives RX and the deadlines */
+        cpu_wait_irq();   /* the tick drives RX and the deadlines */
     return ph == DHCP_PH_BOUND ? 0 : -1;
 }

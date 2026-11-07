@@ -7,6 +7,7 @@
 #include "shell.h"
 #include "keyboard.h"
 #include "terminal.h"
+#include "klock.h"   /* [M50] cpu_wait_irq */
 #include "timer.h"
 #include "pmm.h"
 #include "heap.h"
@@ -1658,7 +1659,7 @@ static uint8_t g_job_spawn_buf[2*1024*1024]; // 2 MB: GNU bash with readline is 
 // kernel lock: they need it for every syscall.
 static void sh_wait_tick(void){
     uint32_t d = bkl_suspend();
-    __asm__ volatile("sti; hlt");
+    cpu_wait_irq();
     bkl_resume(d);
 }
 

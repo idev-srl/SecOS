@@ -56,6 +56,7 @@
 #include "debugcon.h"
 #include "cred.h"
 #include "../fs/vfs.h"
+#include "klock.h"   /* [M50] cpu_wait_irq */
 
 extern int  keyboard_getc_raw(void);
 extern bool keyboard_input_pending_noirq(void);
@@ -391,7 +392,7 @@ static void pull_input(struct tty* t) {
             uint32_t hz = timer_get_frequency(); if (!hz) hz = 1000;
             uint64_t wait = hz / 100 + 1;              /* ~10 ms */
             while (!keyboard_input_pending_noirq() && timer_get_ticks() - t0 < wait)
-                __asm__ volatile ("sti; hlt");
+                cpu_wait_irq();
         }
     }
 }
@@ -460,7 +461,7 @@ static int wait_input(struct tty* t, process_t* cur, int mode) {
         cur->wait_tty = 1;                              /* armed; tty_wake_readers() */
         return TTY_WOULDBLOCK;
     }
-    __asm__ volatile ("sti; hlt");
+    cpu_wait_irq();
     return 0;
 }
 

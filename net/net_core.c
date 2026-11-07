@@ -89,6 +89,7 @@ static net_dev_t* g_irq_dev;
 #include "idt.h"
 #include "lapic.h"
 #include "pci.h"
+#include "klock.h"   /* [M50] cpu_wait_irq */
 
 net_irq_mode_t net_request_irq(net_dev_t* dev) {
     if (!dev || !dev->poll) { if (dev) dev->irq_mode = NET_IRQ_NONE; return NET_IRQ_NONE; }
@@ -206,10 +207,10 @@ uint64_t net_tsc_per_us(void) {
       if (hz) { cached = hz / 1000000u; if (!cached) cached = 1; return cached; } }
     extern uint64_t timer_get_ticks(void);
     uint64_t t = timer_get_ticks();
-    while (timer_get_ticks() == t) __asm__ volatile("sti; hlt");  // align to a tick edge
+    while (timer_get_ticks() == t) cpu_wait_irq();  // align to a tick edge
     uint64_t start_tick = timer_get_ticks();
     uint64_t start_tsc = rdtsc();
-    while (timer_get_ticks() < start_tick + 100) __asm__ volatile("sti; hlt"); // 100 ms
+    while (timer_get_ticks() < start_tick + 100) cpu_wait_irq(); // 100 ms
     uint64_t cyc = rdtsc() - start_tsc;
     cached = cyc / 100000;                       // cycles per us (100 ms = 100000 us)
     if (!cached) cached = 1;
@@ -249,7 +250,7 @@ int net_ping_rtt(uint32_t dst_ip, uint16_t seq, uint64_t* rtt_tsc) {
         lk_arp_request(d, nexthop);
         uint64_t adl = timer_get_ticks() + 1000;
         while (timer_get_ticks() < adl && lk_arp_lookup(nexthop, mac) != 0)
-            __asm__ volatile("sti; hlt");
+            cpu_wait_irq();
         if (lk_arp_lookup(nexthop, mac) != 0) return -1;
     }
     uint32_t before = icmp_echo_replies();
@@ -261,7 +262,7 @@ int net_ping_rtt(uint32_t dst_ip, uint16_t seq, uint64_t* rtt_tsc) {
     // the CPU so the host/NIC delivers the RX DMA — no tight RDT hammering (which
     // could wedge the ring during the longer wait for an off-subnet reply).
     while (icmp_echo_replies() == before) {
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
         if (timer_get_ticks() >= deadline) return -1;
     }
     if (rtt_tsc) *rtt_tsc = rdtsc() - t0;
@@ -321,7 +322,7 @@ int net_ping_test(uint32_t dst_ip) {
     lk_arp_request(d, nexthop);
     uint64_t deadline = timer_get_ticks() + 1000;       // ~1 s at 1 kHz
     while (timer_get_ticks() < deadline && lk_arp_lookup(nexthop, mac) != 0)
-        __asm__ volatile ("hlt");
+        cpu_wait_irq();
     if (lk_arp_lookup(nexthop, mac) != 0) { debugcon_writestring("[NET] ARP timeout (no peer)\n"); return -1; }
     debugcon_writestring("[NET] ARP resolved\n");
 
@@ -329,7 +330,7 @@ int net_ping_test(uint32_t dst_ip) {
     lk_echo(d, dst_ip, 1, 1);
     deadline = timer_get_ticks() + 1000;
     while (timer_get_ticks() < deadline && icmp_echo_replies() == before)
-        __asm__ volatile ("hlt");
+        cpu_wait_irq();
     int ok = icmp_echo_replies() > before;
     debugcon_writestring(ok ? "[NET] PING OK\n" : "[NET] PING timeout\n");
     return ok ? 0 : -1;

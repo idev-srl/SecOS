@@ -25,6 +25,7 @@
 
 void smp_tlb_selftest_ap(cpu_t* c);
 #include <stddef.h>
+#include "klock.h"   /* [M50] cpu_wait_irq */
 
 /* Trampoline blob (objcopy of the flat binary) + its load/parameter addresses. */
 extern uint8_t _binary_ap_trampoline_bin_start[];
@@ -94,7 +95,7 @@ void ap_entry(void) {
     c->online = 1;
     lapic_timer_start_this_cpu(1000);
     __asm__ volatile ("sti");
-    for (;;) { smp_tlb_selftest_ap(c); sched_reap_zombies(); __asm__ volatile ("hlt"); }
+    for (;;) { smp_tlb_selftest_ap(c); sched_reap_zombies(); cpu_wait_irq(); }
 }
 
 /* ---- [M48] TLB shootdown selftest (boot, >= 2 CPUs online) ----
@@ -128,7 +129,7 @@ static int tlbt_round(uint32_t ph, uint64_t want, uint32_t naps) {
     g_tlbt.phase = ph;
     uint64_t t0 = ktime_us();
     while (g_tlbt.seen[ph - 1] < naps && ktime_us() - t0 < 2000000ULL)
-        __asm__ volatile ("sti; hlt");               /* APs answer on their next tick */
+        cpu_wait_irq();               /* APs answer on their next tick */
     return (int)g_tlbt.seen[ph - 1];
 }
 void smp_tlb_selftest(void) {

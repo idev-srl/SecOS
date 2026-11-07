@@ -19,6 +19,7 @@
 #include "input.h"    // [M40] evdev node for the PS/2 keyboard
 #include "keymap.h"   // [M40] keyboard layouts (us, it)
 #include "ps2mouse.h" // [M40] AUX bytes that reach the keyboard IRQ
+#include "klock.h"   /* [M50] cpu_wait_irq */
 
 #define KEYBOARD_DATA_PORT 0x60
 #define BUFFER_SIZE 256
@@ -408,7 +409,7 @@ static int raw_wait(void) {
     for (;;) {
         int c = keyboard_getc_raw();
         if (c >= 0) return c;
-        __asm__ volatile ("hlt");  // Wait for interrupt (timer wakes ~1kHz to poll serial)
+        cpu_wait_irq();  // Wait for interrupt (timer wakes ~1kHz to poll serial)
     }
 }
 
@@ -424,7 +425,7 @@ char keyboard_getchar(void) {
         int nx = buffer_peek();
         if (nx < 0) {
             for (int spin = 0; spin < 20 && !keyboard_input_pending_noirq(); spin++)
-                __asm__ volatile ("hlt");
+                cpu_wait_irq();
             if (!keyboard_input_pending_noirq()) return 0x1B;
         }
         int c2 = raw_wait();

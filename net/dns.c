@@ -12,6 +12,7 @@
 #include "udp.h"
 #include "debugcon.h"
 #include <stddef.h>
+#include "klock.h"   /* [M50] cpu_wait_irq */
 
 extern uint64_t timer_get_ticks(void);
 
@@ -125,7 +126,7 @@ int dns_resolve(net_dev_t* dev, const char* name, uint32_t* out_ip) {
         net_unlock(fl);
         uint64_t deadline = timer_get_ticks() + 1500;
         while (timer_get_ticks() < deadline && !st.got)
-            __asm__ volatile ("sti; hlt");
+            cpu_wait_irq();
         fl = net_lock();
         if (st.got && st.ip) resolved = 1;
         net_unlock(fl);

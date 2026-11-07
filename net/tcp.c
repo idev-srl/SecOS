@@ -23,6 +23,7 @@
 #include "heap.h"
 #include "../crypto/csprng.h"
 #include <stddef.h>
+#include "klock.h"   /* [M50] cpu_wait_irq */
 
 extern uint64_t timer_get_ticks(void);
 
@@ -537,7 +538,7 @@ tcp_conn_t* tcp_connect(net_dev_t* dev, uint32_t dip, uint16_t dport){
         net_unlock(fl);
         if(st==TCP_ESTABLISHED) return c;
         if(rst || st==TCP_CLOSED) break;
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
     fl=net_lock();
     tcp_free(c);
@@ -554,7 +555,7 @@ int tcp_send_all(tcp_conn_t* c, const void* data, uint32_t len){
         net_unlock(fl);
         if(n<0) return -1;
         off+=(uint32_t)n;
-        if(off<len) __asm__ volatile("sti; hlt");   /* tx buffer full: let ACKs drain it */
+        if(off<len) cpu_wait_irq();   /* tx buffer full: let ACKs drain it */
     }
     return off==len?0:-1;
 }
@@ -567,7 +568,7 @@ int tcp_recv_block(tcp_conn_t* c, void* buf, uint32_t len, uint32_t ms){
         net_unlock(fl);
         if(n>0) return n;
         if(n<0) return 0;                            /* peer closed, drained = EOF */
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
     return 0;
 }
@@ -622,7 +623,7 @@ void tcp_close(tcp_conn_t* c){
         tcp_state_t st=c->state;
         net_unlock(fl);
         if(st==TCP_CLOSED || st==TCP_TIME_WAIT) break;
-        __asm__ volatile("sti; hlt");
+        cpu_wait_irq();
     }
     fl=net_lock();
     tcp_free(c);

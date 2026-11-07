@@ -8,6 +8,7 @@
 #include "sched.h"
 #include "trapframe.h"
 #include "percpu.h"
+#include "klock.h"   /* [M50] cpu_wait_irq */
 
 #define PIT_CHANNEL0 0x40
 #define PIT_COMMAND  0x43
@@ -105,7 +106,7 @@ int timer_register_tick_callback(timer_tick_cb_t cb) {
 void timer_sleep(uint32_t ticks) {
     uint64_t target = timer_ticks + ticks;
     while (timer_ticks < target) {
-        __asm__ volatile ("hlt");  // Attendi interrupt
+        cpu_wait_irq();  // wait for the next interrupt
     }
 }
 
