@@ -224,23 +224,25 @@ typedef struct process {
     // the PTE install of a fault); other tasks take it to read (procfs, umount).
     // Rules: never held across a page-cache/FS call, a user copy, or anything
     // that takes proc_lock (S30 < S35); see mm_lock()/mm_unlock() below.
-    // It is NOT irqsave: no interrupt handler takes it, so a holder keeps the
-    // caller's IF (a multi-ms fork walk must not hold off the BSP tick).
+    // [M52] irqsave. No interrupt handler takes it, but procfs, sysfs, the
+    // umount busy check and ramfs take it under proc_lock (S30 -> S35), and
+    // the timer tick and the keyboard IRQ take proc_lock: a holder with IF
+    // on that took the tick while another CPU waited for this mm_lock under
+    // proc_lock deadlocked both CPUs (seen at -smp 8 once syscalls ran off
+    // the BKL: CPU A holds mm, its tick spins on proc; CPU B holds proc,
+    // spins on mm). The cost: the BSP tick waits behind a long fork walk.
     spinlock_t mm_lock;
 } process_t;
 
-// [M50-B1] mm_lock helpers (see process_t.mm_lock). The lock keeps the
-// caller's interrupt state; the uint64_t is kept so call sites read like the
-// other lock helpers (and could go back to irqsave in one place).
-static inline uint64_t mm_lock(process_t* p) { spin_lock(&p->mm_lock); return 0; }
-static inline void mm_unlock(process_t* p, uint64_t fl) { (void)fl; spin_unlock(&p->mm_lock); }
+// [M50-B1] mm_lock helpers (see process_t.mm_lock). [M52] irqsave.
+static inline uint64_t mm_lock(process_t* p) { return spin_lock_irqsave(&p->mm_lock); }
+static inline void mm_unlock(process_t* p, uint64_t fl) { spin_unlock_irqrestore(&p->mm_lock, fl); }
 // Let a waiter (procfs, umount) in during a long page-table loop: drop and
 // retake the lock. Only for loops whose state does not depend on the lock
 // staying held (the owner is the only writer of its own VMAs).
 static inline void mm_relax(process_t* p, uint64_t* fl) {
-    spin_unlock(&p->mm_lock);
-    spin_lock(&p->mm_lock);
-    *fl = 0;
+    spin_unlock_irqrestore(&p->mm_lock, *fl);    // interrupts get in here
+    *fl = spin_lock_irqsave(&p->mm_lock);
 }
 #define MM_ASSERT_HELD(p) SPIN_ASSERT_HELD(&(p)->mm_lock)
 
