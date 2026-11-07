@@ -903,23 +903,56 @@ static void sh_logo(const char* a){
     terminal_writestring("Usage: logo on|off|redraw\n");
 }
 // RAMFS: lista file
-static void sh_rfls(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else path_resolve("",abs); const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n; if(abs[0]==0){ n=ramfs_list_path("",arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS root ("); } else { n=ramfs_list_path(abs,arr,RAMFS_MAX_FILES); terminal_writestring("RAMFS list '"); terminal_writestring(abs); terminal_writestring("' ("); } print_dec(n); terminal_writestring("):\n"); pager_begin(); for(size_t i=0;i<n;i++){ if(pager_should_stop()) break; const ramfs_entry_t* e=arr[i]; char line[RAMFS_NAME_MAX+32]; int k=0; line[k++]=' '; line[k++]=' '; const char* nm=e->name; while(*nm && k < (int)sizeof(line)-10) line[k++]=*nm++; if(e->flags & 2 && k < (int)sizeof(line)-2) { line[k++]='/'; line[k++]=' '; } else { line[k++]=' '; line[k++]=' '; } // size
-        line[k]=0; terminal_writestring(line); print_dec(e->size); terminal_writestring(" bytes\n"); if(--pager_line_budget <=0 && pager_enabled && !pager_should_stop()) pager_prompt_more(); }
-    pager_end(); }
+// [M52] The rf* debug commands read ramfs entries: with syscalls off the BKL
+// a process may change them meanwhile, so each command copies what it shows
+// under ramfs_fs_lock() and prints (or pages) after dropping it.
+static void rf_entry_line(const ramfs_entry_t* e, sh_lines_t* L){
+    char line[RAMFS_NAME_MAX+48]; int k=0; line[k++]=' '; line[k++]=' ';
+    const char* nm=e->name; while(*nm && k < (int)sizeof(line)-34) line[k++]=*nm++;
+    if(e->flags & 2){ line[k++]='/'; line[k++]=' '; } else { line[k++]=' '; line[k++]=' '; }
+    char d[24]; int n=0; uint64_t v=e->size; do { d[n++]=(char)('0'+v%10); v/=10; } while(v);
+    while(n) line[k++]=d[--n];
+    const char* b=" bytes"; for(int q=0;b[q];q++) line[k++]=b[q];
+    line[k]=0; sh_lines_add(L, line);
+}
+static void sh_rfls(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else path_resolve("",abs);
+    const ramfs_entry_t* arr[RAMFS_MAX_FILES]; sh_lines_t L = {0};
+    klock_lock(ramfs_fs_lock());
+    size_t n = ramfs_list_path_locked(abs[0] ? abs : "", arr, RAMFS_MAX_FILES);
+    for(size_t i=0;i<n;i++) rf_entry_line(arr[i], &L);
+    klock_unlock(ramfs_fs_lock());
+    if(abs[0]==0) terminal_writestring("RAMFS root ("); else { terminal_writestring("RAMFS list '"); terminal_writestring(abs); terminal_writestring("' ("); }
+    print_dec(n); terminal_writestring("):\n");
+    pager_begin(); sh_lines_page(&L); pager_end(); }
 // RAMFS: crea directory
 static void sh_rfmkdir(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfmkdir <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); if(ramfs_mkdir(abs)==0) terminal_writestring("[rfmkdir] OK\n"); else terminal_writestring("[rfmkdir] FAIL\n"); }
 // RAMFS: rimuovi directory (vuota)
 static void sh_rfrmdir(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfrmdir <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); if(ramfs_rmdir(abs)==0) terminal_writestring("[rfrmdir] OK\n"); else terminal_writestring("[rfrmdir] FAIL (not empty / missing)\n"); }
 // RAMFS: cat file
-static void sh_rfcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfcat <name>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); const ramfs_entry_t* e = ramfs_find(abs); if(!e){ terminal_writestring("[rfcat] file not found\n"); return; }
-    for(size_t i=0;i<e->size;i++) terminal_putchar((char)e->data[i]);
-    if(e->size==0) terminal_writestring("[rfcat] (empty)\n");
+static void sh_rfcat(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfcat <name>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs);
+    klock_lock(ramfs_fs_lock());
+    const ramfs_entry_t* e = ramfs_find_locked(abs);
+    size_t sz = e ? e->size : 0; char* copy = 0; int found = e != 0;
+    if(e && sz){ copy = (char*)kmalloc(sz); if(copy) for(size_t i=0;i<sz;i++) copy[i]=(char)e->data[i]; }
+    klock_unlock(ramfs_fs_lock());
+    if(!found){ terminal_writestring("[rfcat] file not found\n"); return; }
+    if(sz && !copy){ terminal_writestring("[rfcat] out of memory\n"); return; }
+    for(size_t i=0;i<sz;i++) terminal_putchar(copy[i]);
+    if(copy) kfree(copy);
+    if(sz==0) terminal_writestring("[rfcat] (empty)\n");
 }
 // RAMFS: info file
-static void sh_rfinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfinfo <name>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); const ramfs_entry_t* e = ramfs_find(abs); if(!e){ terminal_writestring("[rfinfo] file not found\n"); return; }
-    terminal_writestring("Name: "); terminal_writestring(e->name); terminal_writestring("\nSize: "); print_dec(e->size); terminal_writestring(" bytes\n");
+static void sh_rfinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfinfo <name>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs);
+    char name[RAMFS_NAME_MAX]; uint8_t first[32]; size_t sz = 0, show = 0;
+    klock_lock(ramfs_fs_lock());
+    const ramfs_entry_t* e = ramfs_find_locked(abs);
+    if(e){ size_t i=0; for(; e->name[i] && i<RAMFS_NAME_MAX-1; i++) name[i]=e->name[i]; name[i]=0;
+           sz = e->size; show = sz < 32 ? sz : 32; for(i=0;i<show;i++) first[i]=e->data[i]; }
+    klock_unlock(ramfs_fs_lock());
+    if(!e){ terminal_writestring("[rfinfo] file not found\n"); return; }
+    terminal_writestring("Name: "); terminal_writestring(name); terminal_writestring("\nSize: "); print_dec(sz); terminal_writestring(" bytes\n");
     // Show first 32 bytes hex
-    terminal_writestring("First bytes: "); size_t show = e->size < 32 ? e->size : 32; for(size_t i=0;i<show;i++){ uint8_t b=e->data[i]; char hx[]="0123456789ABCDEF"; terminal_putchar(hx[b>>4]); terminal_putchar(hx[b&0xF]); terminal_putchar(' '); } terminal_writestring("\n");
+    terminal_writestring("First bytes: "); for(size_t i=0;i<show;i++){ uint8_t b=first[i]; char hx[]="0123456789ABCDEF"; terminal_putchar(hx[b>>4]); terminal_putchar(hx[b&0xF]); terminal_putchar(' '); } terminal_writestring("\n");
 }
 // RAMFS: aggiungi file (rfadd nome contenuto)
 static void sh_rfadd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfadd <name> <content>\n"); return; } char name[RAMFS_NAME_MAX]; size_t ni=0; while(a[0] && a[0]!=' ' && ni<RAMFS_NAME_MAX-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(name[0]==0){ terminal_writestring("[rfadd] empty name\n"); return; } if(!*a){ terminal_writestring("[rfadd] missing content\n"); return; } size_t len=0; while(a[len]) len++; char abs[RAMFS_NAME_MAX]; path_resolve(name,abs); if(ramfs_find(abs)){ terminal_writestring("[rfadd] already exists\n"); return; } if(ramfs_add(abs,a,len)==0){ terminal_writestring("[rfadd] OK\n"); } else terminal_writestring("[rfadd] FAIL\n"); }
@@ -935,11 +968,19 @@ static void sh_rftruncate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_
 static void sh_rfcd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: rfcd <path>\n"); return; } char abs[RAMFS_NAME_MAX]; path_resolve(a,abs); int d=ramfs_is_dir(abs); if(d==1){ size_t i=0; while(abs[i] && i<RAMFS_NAME_MAX-1){ shell_cwd[i]=abs[i]; i++; } shell_cwd[i]=0; terminal_writestring("[rfcd] OK\n"); } else if(d==0){ terminal_writestring("[rfcd] not a directory\n"); } else terminal_writestring("[rfcd] not found\n"); }
 // RAMFS: mostra working directory
 static void sh_rfpwd(const char* a){ (void)a; terminal_writestring("CWD: "); path_print_cwd(); }
-// RAMFS: stampa albero ricorsivo
-static void rftree_print(const char* path,int depth){ const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n = (path && path[0])? ramfs_list_path(path,arr,RAMFS_MAX_FILES) : ramfs_list_path("",arr,RAMFS_MAX_FILES); for(size_t i=0;i<n;i++){ if(pager_should_stop()) return; const ramfs_entry_t* e=arr[i]; const char* last=e->name; for(const char* p=e->name; *p; p++){ if(*p=='/') last=p+1; } char line[RAMFS_NAME_MAX+16]; int k=0; for(int d=0; d<depth && k < (int)sizeof(line)-4; d++){ line[k++]=' '; line[k++]=' '; line[k++]='|'; line[k++]=' '; } if(i+1<n){ line[k++]='|'; line[k++]='-'; line[k++]=' '; } else { line[k++]='`'; line[k++]='-'; line[k++]=' '; } const char* q=last; while(*q && k < (int)sizeof(line)-2) line[k++]=*q++; if(e->flags & 2 && k < (int)sizeof(line)-2) line[k++]='/'; line[k]=0; pager_print(line); if((e->flags & 2) && !pager_should_stop()) rftree_print(e->name, depth+1); } }
-static void sh_rftree(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else abs[0]=0; if(abs[0] && ramfs_is_dir(abs)!=1){ terminal_writestring("[rftree] not a directory\n"); return; } terminal_writestring("[rftree] tree:\n"); pager_begin(); rftree_print(abs,0); pager_end(); }
+// RAMFS: stampa albero ricorsivo (collected under the ramfs lock, then paged)
+static void rftree_collect(const char* path,int depth, sh_lines_t* L){ if(depth > 16) return; const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n = ramfs_list_path_locked((path && path[0]) ? path : "", arr, RAMFS_MAX_FILES); for(size_t i=0;i<n;i++){ const ramfs_entry_t* e=arr[i]; const char* last=e->name; for(const char* p=e->name; *p; p++){ if(*p=='/') last=p+1; } char line[RAMFS_NAME_MAX+16]; int k=0; for(int d=0; d<depth && k < (int)sizeof(line)-4; d++){ line[k++]=' '; line[k++]=' '; line[k++]='|'; line[k++]=' '; } if(i+1<n){ line[k++]='|'; line[k++]='-'; line[k++]=' '; } else { line[k++]='`'; line[k++]='-'; line[k++]=' '; } const char* q=last; while(*q && k < (int)sizeof(line)-2) line[k++]=*q++; if(e->flags & 2 && k < (int)sizeof(line)-2) line[k++]='/'; line[k]=0; sh_lines_add(L, line); if(e->flags & 2) rftree_collect(e->name, depth+1, L); } }
+static void sh_rftree(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else abs[0]=0; if(abs[0] && ramfs_is_dir(abs)!=1){ terminal_writestring("[rftree] not a directory\n"); return; } terminal_writestring("[rftree] tree:\n");
+    sh_lines_t L = {0};
+    klock_lock(ramfs_fs_lock()); rftree_collect(abs, 0, &L); klock_unlock(ramfs_fs_lock());
+    pager_begin(); sh_lines_page(&L); pager_end(); }
 // RAMFS: uso totale
-static void sh_rfusage(const char* a){ (void)a; const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n = ramfs_list(arr,RAMFS_MAX_FILES); size_t bytes=0; size_t files=0; size_t dirs=0; for(size_t i=0;i<n;i++){ if(arr[i]->flags & 2) dirs++; else { files++; bytes += arr[i]->size; } } terminal_writestring("[rfusage] files="); print_dec(files); terminal_writestring(" dirs="); print_dec(dirs); terminal_writestring(" total_bytes="); print_dec(bytes); terminal_writestring(" slots_used="); print_dec(n); terminal_writestring(" slots_free="); print_dec(RAMFS_MAX_FILES - n); terminal_writestring("\n"); }
+static void sh_rfusage(const char* a){ (void)a; const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t bytes=0; size_t files=0; size_t dirs=0;
+    klock_lock(ramfs_fs_lock());
+    size_t n = ramfs_list_locked(arr,RAMFS_MAX_FILES);
+    for(size_t i=0;i<n;i++){ if(arr[i]->flags & 2) dirs++; else { files++; bytes += arr[i]->size; } }
+    klock_unlock(ramfs_fs_lock());
+    terminal_writestring("[rfusage] files="); print_dec(files); terminal_writestring(" dirs="); print_dec(dirs); terminal_writestring(" total_bytes="); print_dec(bytes); terminal_writestring(" slots_used="); print_dec(n); terminal_writestring(" slots_free="); print_dec(RAMFS_MAX_FILES - n); terminal_writestring("\n"); }
 // ---- VFS commands ----
 static void vls_cb(const vfs_inode_t* child, void* user){
     // [M51 B4] collect only; sh_vls pages after the walk
@@ -966,7 +1007,7 @@ static void sh_vmount(const char* a){ (void)a; terminal_writestring("[vmount] ro
 static void sh_vcreate(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vcreate <path> <content>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(!*a){ terminal_writestring("[vcreate] missing content\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_create(const char*, const void*, size_t); if(vfs_create(name,data,len)==0) terminal_writestring("[vcreate] OK\n"); else terminal_writestring("[vcreate] FAIL\n"); }
 static void sh_vwrite(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vwrite <path> <offset> <data>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vwrite] missing offset\n"); return; } size_t off=0; while(*a>='0'&&*a<='9'){ off=off*10+(*a-'0'); a++; } while(*a==' ') a++; if(!*a){ terminal_writestring("[vwrite] missing data\n"); return; } const char* data=a; size_t len=0; while(data[len]) len++; extern int vfs_write(const char*, size_t, const void*, size_t); int r=vfs_write(name,off,data,len); if(r>=0){ terminal_writestring("[vwrite] wrote "); print_dec(r); terminal_writestring(" bytes\n"); } else terminal_writestring("[vwrite] FAIL\n"); }
 static void sh_vtruncate2(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: vtruncate <path> <size>\n"); return; } char name[256]; size_t ni=0; while(*a && *a!=' ' && ni<sizeof(name)-1){ name[ni++]=*a++; } name[ni]=0; while(*a==' ') a++; if(*a<'0'||*a>'9'){ terminal_writestring("[vtruncate] missing size\n"); return; } size_t sz=0; while(*a>='0'&&*a<='9'){ sz=sz*10+(*a-'0'); a++; } extern int vfs_truncate(const char*, size_t); if(vfs_truncate(name,sz)==0) terminal_writestring("[vtruncate] OK\n"); else terminal_writestring("[vtruncate] FAIL\n"); }
-static void sh_ext2mount(const char* a){ while(*a==' ') a++; const char* mp = (*a) ? a : "/mnt"; extern int ext2_mount(const char* dev_name, const char* mount_point); if(ext2_mount("vda", mp)==0){ terminal_writestring("[ext2mount] ext2/ext4 mounted at "); terminal_writestring(mp); terminal_writestring("\n"); } else terminal_writestring("[ext2mount] mount failed\n"); }
+static void sh_ext2mount(const char* a){ while(*a==' ') a++; const char* mp = (*a) ? a : "/mnt"; extern int ext2_mount(const char* dev_name, const char* mount_point); vfs_ns_lock(); int mr=ext2_mount("vda", mp); vfs_ns_unlock(); if(mr==0){ terminal_writestring("[ext2mount] ext2/ext4 mounted at "); terminal_writestring(mp); terminal_writestring("\n"); } else terminal_writestring("[ext2mount] mount failed\n"); }
 // [M22] blk: list every detected block device (virtio/AHCI/NVMe/USB) and probe
 // sector 0 for a filesystem signature. Output goes to the shell (serial/FB), so
 // it works on VMware where the debugcon driver markers are not visible.
@@ -999,7 +1040,12 @@ static void sh_blk(const char* a){ (void)a;
 }
 // [M22] mountdev <dev> [mp]: try to mount a named device (FAT32 then ext2/4) at a
 // mount point (default /mnt2 to avoid clashing with the boot /mnt). Diagnostic.
-static void sh_mountdev(const char* a){
+// [M52] The driver mount routines run under vfs_ns_lock, like SYS_MOUNT's:
+// the "one ext/exFAT volume at a time" driver state and the per-driver mount
+// options must not interleave with a mount syscall on another CPU.
+static void sh_mountdev_locked(const char* a);
+static void sh_mountdev(const char* a){ vfs_ns_lock(); sh_mountdev_locked(a); vfs_ns_unlock(); }
+static void sh_mountdev_locked(const char* a){
     while(*a==' ') a++;
     if(!*a){ terminal_writestring("Usage: mountdev <dev> [mountpoint]\n  e.g. mountdev nvme0n1 /mnt2 ; then: vls /mnt2\n"); return; }
     char dev[32]; size_t i=0; while(*a && *a!=' ' && i<sizeof(dev)-1) dev[i++]=*a++; dev[i]=0;
