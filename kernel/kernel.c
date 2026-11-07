@@ -2244,6 +2244,10 @@ static void kernel_main_phase2(void) {
     // [M50 B3] Block/USB lock stress on every CPU at once (fs/blkstress.c).
     { extern void blkstress_run(void); blkstress_run(); }
 #endif
+#ifdef SECOS_FSVIRT_TEST
+    // [M51 C2] ramfs / procfs locks under real concurrency (fs/fsvirt_test.c).
+    { extern void fsvirt_selftest(void); fsvirt_selftest(); }
+#endif
 #if M41_EXFAT_DEMO
     // [M41] exFAT self-test, once /mnt and /proc are mounted: the good image on
     // vda, or the corrupt-image suite when AHCI disks are attached.
