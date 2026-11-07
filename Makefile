@@ -49,12 +49,17 @@ GUI_DEF := $(if $(filter 1 yes y,$(GUI_AUTOSTART)),-DSECOS_GUI_AUTOSTART,)
 CONSOLE ?= login
 CONSOLE_DEF := $(if $(filter root,$(CONSOLE)),-DSECOS_CONSOLE_ROOT,)
 # [M52] Kernel lock mode when the command line has neither `bkl=on` nor
-# `bkl=off` (kernel/bkl.c). `make iso BKL_DEFAULT=off` builds an image that
-# boots without the BKL on the syscalls phase D took off it; the GRUB menu keeps
-# an entry with the other mode. Read from the environment too, so
-# `BKL_DEFAULT=off tools/selftest.sh` runs every gate in the other mode.
-BKL_DEFAULT ?= on
+# `bkl=off` (kernel/bkl.c). Default off: no syscall, user fault or teardown
+# takes the big kernel lock (docs/devlog/M52-bkl-removal.md). The third GRUB
+# entry boots the other mode: "fallback: big kernel lock (bkl=on)" serializes
+# every syscall as M48 did, if a problem shows up on some machine. `make iso
+# BKL_DEFAULT=on` builds the old default. Read from the environment too, so
+# `BKL_DEFAULT=on tools/selftest.sh` runs every gate in the other mode.
+BKL_DEFAULT ?= off
 BKL_DEF := $(if $(filter off,$(BKL_DEFAULT)),-DSECOS_BKL_DEFAULT_OFF,)
+BKL_ALT := $(if $(filter off,$(BKL_DEFAULT)),on,off)
+comma := ,
+BKL_ALT_LABEL := $(if $(filter off,$(BKL_DEFAULT)),fallback: big kernel lock$(comma) bkl=on,no big kernel lock: bkl=off)
 CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
 		  -fstack-protector-strong -mstack-protector-guard=global $(INCLUDES) \
 		  -DBUILD_TS="\"$(BUILD_TS)\"" -DGIT_HASH="\"$(GIT_HASH)\"" $(KEYMAP_DEF) $(GUI_DEF) $(CONSOLE_DEF) $(BKL_DEF) $(CFLAGS_EXTRA)
@@ -348,8 +353,8 @@ iso: $(KERNEL)
 	echo 'menuentry "SecOS x64 (single CPU: nosmp)" {' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '    multiboot2 /boot/kernel.bin nosmp' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
-	echo 'menuentry "SecOS x64 (kernel lock: bkl=on)" {' >> $(ISODIR)/boot/grub/grub.cfg
-	echo '    multiboot2 /boot/kernel.bin bkl=on' >> $(ISODIR)/boot/grub/grub.cfg
+	echo 'menuentry "SecOS x64 ($(BKL_ALT_LABEL))" {' >> $(ISODIR)/boot/grub/grub.cfg
+	echo '    multiboot2 /boot/kernel.bin bkl=$(BKL_ALT)' >> $(ISODIR)/boot/grub/grub.cfg
 	echo '}' >> $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue --output=$(ISO) $(ISODIR) 2>&1 | tee grub-mkrescue.log
 	@echo "ISO creata: $(ISO)"
