@@ -59,17 +59,17 @@ run() {
         esd8) timeout 1800 python3 tools/exec_stress_drive.py --iso "$ISO" --smp 8 --count 500 \
                   --log "$log" >"$out" 2>&1 ;;
         fsd4|fsd8) local n=${r#fsd}
-              timeout 3600 python3 tools/fs_stress_drive.py --iso "$ISO" --smp "$n" --work "$OUT/$r.w" \
+              timeout 3600 python3 tools/fs_stress_drive.py --boot 600 --iso "$ISO" --smp "$n" --work "$OUT/$r.w" \
                   --rounds 2 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
               rm -f "$OUT/$r.w"/*.img; return $rc ;;
-        fsr4) timeout 2400 python3 tools/fs_stress_drive.py --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
+        fsr4) timeout 2400 python3 tools/fs_stress_drive.py --boot 600 --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
                   --target /tmp --rounds 2 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
               rm -f "$OUT/$r.w"/*.img; return $rc ;;
         fsx4|fse4) local k=vfat; [ "$r" = fse4 ] && k=exfat
-              timeout 3600 python3 tools/fs_stress_drive.py --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
+              timeout 3600 python3 tools/fs_stress_drive.py --boot 600 --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
                   --data "$k" --rounds 2 --mount-race 40 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
               rm -f "$OUT/$r.w"/*.img; return $rc ;;
-        fsc4) timeout 3600 python3 tools/fs_stress_drive.py --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
+        fsc4) timeout 3600 python3 tools/fs_stress_drive.py --boot 600 --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
                   --crash 3 >"$out" 2>&1; local rc=$?; cat "$OUT/$r.w"/*.log >"$log" 2>/dev/null
               rm -f "$OUT/$r.w"/*.img "$OUT/$r.w"/*.img.host; return $rc ;;
         *) echo "unknown run $r" >"$out"; return 2 ;;
