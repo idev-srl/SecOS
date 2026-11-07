@@ -9,7 +9,10 @@
 
 #define AUDIT_RING 64
 static cap_audit_rec_t g_audit[AUDIT_RING];
-static uint64_t        g_audit_head;   /* total records ever written */
+/* Total records ever written. [M50-B1] A writer claims its slot with an
+ * atomic fetch_add (concurrent syscalls on several CPUs audit at once); a
+ * record's seq is stored last, so a reader can tell a slot being rewritten. */
+static uint64_t        g_audit_head;
 
 const char* cap_name(uint32_t cap) {
     switch (cap) {
@@ -42,11 +45,12 @@ static void copy_name(char* dst, const char* src) {
 }
 
 void cap_audit(uint32_t pid, uint32_t cap, uint64_t syscall_num, const char* name, int allowed) {
-    cap_audit_rec_t* r = &g_audit[g_audit_head % AUDIT_RING];
+    uint64_t seq = __atomic_fetch_add(&g_audit_head, 1, __ATOMIC_RELAXED);
+    cap_audit_rec_t* r = &g_audit[seq % AUDIT_RING];
     r->pid = pid; r->cap = cap; r->syscall_num = syscall_num;
-    r->allowed = allowed; r->seq = g_audit_head;
+    r->allowed = allowed;
     copy_name(r->name, name);
-    g_audit_head++;
+    __atomic_store_n(&r->seq, seq, __ATOMIC_RELEASE);
     /* Mirror to debugcon: denials always, grants only when verbose. */
     if (!allowed || g_kverbose) {
         debugcon_writestring("[AUDIT] pid=");
@@ -79,16 +83,17 @@ int cap_check_explicit(const process_t* p, uint32_t cap, uint64_t syscall_num, c
 }
 
 int cap_audit_dump(cap_audit_rec_t* out, int max) {
-    int n = (g_audit_head < (uint64_t)AUDIT_RING) ? (int)g_audit_head : AUDIT_RING;
+    uint64_t head = __atomic_load_n(&g_audit_head, __ATOMIC_ACQUIRE);   /* one snapshot */
+    int n = (head < (uint64_t)AUDIT_RING) ? (int)head : AUDIT_RING;
     if (n > max) n = max;
     /* copy oldest..newest of the last n records */
-    uint64_t start = g_audit_head - (uint64_t)n;
+    uint64_t start = head - (uint64_t)n;
     for (int i = 0; i < n; i++)
         out[i] = g_audit[(start + i) % AUDIT_RING];
     return n;
 }
 
-uint64_t cap_audit_total(void) { return g_audit_head; }
+uint64_t cap_audit_total(void) { return __atomic_load_n(&g_audit_head, __ATOMIC_ACQUIRE); }
 
 /* ---- [M46] Exec confinement ------------------------------------------------
  * Rule: once a process has no_new_privs (automatic for every confined program,
