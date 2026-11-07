@@ -15,6 +15,7 @@ typedef enum { VFS_NODE_FILE=1, VFS_NODE_DIR=2, VFS_NODE_SYMLINK=3 } vfs_node_ty
 
 // Forward decl filesystem ops
 struct vfs_fs_ops;
+struct klock;                  // kernel/klock.h (an FS-instance lock, [M51 C1])
 
 // Generic VFS inode representation
 typedef struct vfs_inode {
@@ -80,6 +81,10 @@ typedef struct vfs_fs_ops {
     // Lookup path (absolute, no trailing slash except root). Returns NULL if not found.
     vfs_inode_t* (*lookup)(const char* path);
     // Iterate direct children of a directory path.
+    // [M51 C1] The driver must call `cb` with its instance lock NOT held
+    // (collect the entries under the lock, emit them after unlocking): a
+    // callback may block (the kernel shell's ls pages and waits for a key)
+    // or call back into the VFS.
     int (*readdir)(const char* dir_path, vfs_iter_cb cb, void* user);
     // Read file contents into buffer, returns bytes read or -1.
     int (*read)(vfs_inode_t* inode, size_t offset, void* buf, size_t len);
@@ -96,7 +101,8 @@ typedef struct vfs_fs_ops {
     // Truncate file
     int (*truncate)(const char* path, size_t new_size);
     // [M26] Change attributes (mode/uid/gid/times); `valid` = VFS_ATTR_* bitmask.
-    // NULL = no on-disk metadata: vfs_setattr updates the in-memory inode. Returns 0/-1.
+    // NULL = no on-disk metadata: vfs_setattr updates the in-memory inode
+    // (under `lock` below when set, after the lookup). Returns 0/-1.
     int (*setattr)(const char* path, const vfs_attr_t* a, unsigned valid);
     // [M26] Read a symlink's target into buf (NUL-terminated). Returns length or -1.
     int (*readlink)(const char* path, char* buf, size_t len);
@@ -113,10 +119,30 @@ typedef struct vfs_fs_ops {
     int (*statfs)(vfs_statfs_t* st);
     // Mount-table info for /proc/mounts: backing device name + filesystem type
     // ("ext4", "vfat", ...). NULL = virtual FS (the mount's fs name is used).
+    // [M51 C1] Must be lock-free (no klock, no blocking): procfs calls it
+    // under its g_proc_lock spinlock. Return pointers to stable strings.
     int (*mntinfo)(const char** source, const char** fstype);
     // [M46] mount -o remount,ro|rw: switch the mounted volume. 0 or -errno
     // (-EROFS: the device or the volume cannot be written). NULL = unsupported.
     int (*remount)(int ro);
+    // [M51 C1] Atomic O_APPEND: write `len` bytes at the current end of file,
+    // resolved under the driver's instance lock in the same critical section
+    // as the write; *at = the offset the data landed at. Returns bytes
+    // written or <0 like ->write. NULL = the VFS falls back to
+    // "fresh ->lookup(ino->path) size, then ->write" under its own
+    // vfs_append_lock (K25), which serializes every appender of every
+    // filesystem without ->append (and their truncates) system-wide.
+    // A driver whose write_locked already understands an "append" offset
+    // sentinel wraps it: lock(); off = <size>; r = write_locked(ino, off, ..);
+    // *at = off; unlock(); — `at` must be the real offset (the fd offset and
+    // the page-cache invalidation range come from it).
+    int (*append)(vfs_inode_t* inode, const void* buf, size_t len, uint64_t* at);
+    // [M51 C1] The driver instance's K30 klock (LK_K30_FS), or NULL. The VFS
+    // never holds it while calling an op (every exported op takes it
+    // itself); vfs_unmount takes and releases it once after draining, as a
+    // barrier for calls that reached the driver through an open file's
+    // ino->ops. Must not be held by the caller of vfs_mount*/vfs_unmount*.
+    struct klock* lock;
 } vfs_fs_ops_t;
 
 // Mount record (single root for now)
@@ -125,6 +151,8 @@ typedef struct vfs_mount {
     const vfs_fs_ops_t* ops;      // operations
     const char* fs_name;          // human label
     uint64_t dev;                 // st_dev of every file on this mount
+    uint8_t sid;                  // [M51 C1] stable slot: mount-point string,
+                                  // in-flight op refs, draining flag (vfs.c)
 } vfs_mount_t;
 
 // Initialize VFS (empty, no mounts)
@@ -136,7 +164,27 @@ int vfs_replace_root(const vfs_fs_ops_t* ops, const char* fs_name);
 // Mount a filesystem at an absolute mount point (e.g. "/mnt"). Returns 0 success.
 int vfs_mount(const char* mount_point, const vfs_fs_ops_t* ops, const char* fs_name);
 // Unmount the filesystem at the given mount point. Returns 0 success.
+// Takes vfs_ns_lock unless the caller holds it, drains in-flight operations
+// (see vfs_unmount_ex), never syncs.
 int vfs_unmount(const char* mount_point);
+// [M51 C1] The full unmount: marks the mount draining (new resolutions of
+// paths below it fail), waits for the operations in flight on it (refs taken
+// by every path-based VFS entry point; -EBUSY after 5 s), takes+releases
+// ops->lock, then — when this is the FS's last mount — asks `busy(ops,ctx)`
+// (non-zero = an open fd / file mapping still uses it -> -EBUSY, mount left
+// as it was) and, with VFS_UMOUNT_SYNC, runs ops->sync before detaching.
+// 0, -1 (not mounted / root) or -16.
+typedef int (*vfs_busy_cb)(const struct vfs_fs_ops* ops, void* ctx);
+#define VFS_UMOUNT_SYNC 0x1
+int vfs_unmount_ex(const char* mount_point, vfs_busy_cb busy, void* ctx, unsigned flags);
+// [M51 C1] vfs_ns_lock (K20) serializes namespace changes that do FS I/O:
+// the mount/umount/remount syscalls hold it around the driver's mount routine
+// (or remount hook) and the unmount. vfs_mount/vfs_mount_root/
+// vfs_replace_root do NOT take it (drivers call them from inside their mount
+// routine): their callers are expected to hold it once the BKL is gone.
+void vfs_ns_lock(void);
+void vfs_ns_unlock(void);
+int  vfs_ns_held(void);
 // Sync every mounted filesystem (ops->sync). Returns how many were synced.
 int vfs_sync_all(void);
 // Unmount every mount except the root "/" (shutdown). Returns how many.
@@ -178,6 +226,12 @@ int vfs_read_all(const char* path, void* buf, size_t bufsize);
 int vfs_create(const char* path, const void* data, size_t size);
 // Write file
 int vfs_write(const char* path, size_t offset, const void* data, size_t len);
+// [M51 C1] Atomic O_APPEND write to an open file (ops->append, or the VFS
+// fallback under vfs_append_lock). Bytes written or <0; *at = where they went.
+int vfs_append(vfs_inode_t* ino, const void* buf, size_t len, uint64_t* at);
+// [M51 C1] ftruncate of an open file (serialized against vfs_append's
+// fallback; updates ino->size on success). 0 or <0 from ->truncate.
+int vfs_ftruncate(vfs_inode_t* ino, size_t new_size);
 // Mkdir
 int vfs_mkdir(const char* path);
 // Remove

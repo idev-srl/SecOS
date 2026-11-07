@@ -32,6 +32,9 @@
 #define LK_K10_EXEC        10   /* exec_lock: g_spawn_buf / exec staging (B5)   */
 #define LK_K11_SYSROOT     11   /* sysroot_lock, pkg_lock (C6)                  */
 #define LK_K20_VFS_NS      20   /* vfs_ns_lock: mount/umount/remount (C1)       */
+#define LK_K25_VFS_APPEND  25   /* vfs_append_lock: O_APPEND/truncate fallback
+                                   for an FS without ->append; the FS (K30)
+                                   is called inside it (C1)                     */
 #define LK_K30_FS          30   /* one per FS driver instance (C2-C4)           */
 #define LK_K35_USB_ENUM    35   /* xhci_enum_lock: USB enumeration incl. hubs;
                                    registers usbN disks and reads them (B3)     */

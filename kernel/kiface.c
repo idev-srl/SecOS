@@ -623,8 +623,7 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
             if ((e = ki_fd_file(c, (int)a2, &ino))) { r = NEG(-e); break; }
             if (!(c->fds[(int)a2].flags & 3)) { r = NEG(E_INVAL); break; }   /* not open for writing */
             if (ino->type != VFS_NODE_FILE || !ino->ops || !ino->ops->truncate) { r = NEG(E_INVAL); break; }
-            e = ino->ops->truncate(ino->path, (size_t)len);
-            if (e == 0) ino->size = (size_t)len;
+            e = vfs_ftruncate(ino, (size_t)len);          /* [M51 C1] vs O_APPEND */
             pagecache_invalidate(ino, 0, 1ULL << 62);
         }
         r = e < 0 ? (e == -1 ? NEG(5) : NEG(-e)) : 0;

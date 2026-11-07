@@ -82,7 +82,9 @@ static vfs_inode_t* ramfs_vfs_lookup(const char* path){
         return NULL;
     }
     vfs_inode_t* ino = inode_from_entry(e);
-    if(ino) ino->ops = NULL; // will be set by mount init externally if needed
+    // [M51 C1] ino->ops is left as the VFS stamped it (always &ramfs_ops): an
+    // open fd on this file may be reading it on another CPU, and clearing it
+    // here made that fd's ino->ops->write a NULL call.
     return ino;
 }
 
@@ -96,7 +98,7 @@ static void ramfs_vfs_iter_children(const char* dir_path, vfs_iter_cb cb, void* 
         // strip leading '/'
         const char* p = dir_path; if(p[0]=='/') p++; n = ramfs_list_path(p, arr, RAMFS_MAX_FILES);
     }
-    for(size_t i=0;i<n;i++){ vfs_inode_t* ino = inode_from_entry(arr[i]); if(ino){ ino->ops=NULL; cb(ino,user); } }
+    for(size_t i=0;i<n;i++){ vfs_inode_t* ino = inode_from_entry(arr[i]); if(ino) cb(ino,user); }
 }
 
 static int ramfs_vfs_readdir(const char* dir_path, vfs_iter_cb cb, void* user){ if(!cb) return -1; ramfs_vfs_iter_children(dir_path, cb, user); return 0; }
