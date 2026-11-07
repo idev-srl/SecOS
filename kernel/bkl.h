@@ -1,5 +1,5 @@
 /*
- * bkl.h — the kernel lock (M48).
+ * bkl.h — the kernel lock (M48), a recursive level-K0 klock since M50.
  *
  * Before SMP was on by default, every syscall ran with interrupts off on the
  * only CPU running user code, so the subsystems written for that model —
@@ -10,7 +10,7 @@
  * file corrupted the heap). Until each of them gets its own locking, one
  * recursive lock serializes kernel work done on behalf of tasks:
  *
- *   - every syscall body (syscall_handler),
+ *   - every syscall body (syscall_handler; per syscall: syscall_bkl_mask),
  *   - user-address page faults (demand paging, COW, file-backed mmap),
  *   - process teardown (exit/kill/reap),
  *   - kernel-shell commands (the idle task on the boot CPU).
@@ -22,24 +22,38 @@
  * take it.
  *
  * Ownership is per TASK (the CPU's current process, or the CPU itself before
- * the scheduler runs), not per CPU: the idle task is preemptible in ring 0,
- * so the scheduler never preempts an idle task that holds the lock, and a
- * task that blocks, exits or is killed while holding it drops it in
- * switch_to(). A blocked task re-runs its syscall from the start, so it never
- * needs the lock back mid-body.
+ * the scheduler runs), not per CPU (kernel/klock.h): the idle task is
+ * preemptible in ring 0, so the scheduler never preempts an idle task that
+ * holds a klock, and a task that blocks, exits or is killed while holding the
+ * BKL drops it in switch_to(). A blocked task re-runs its syscall from the
+ * start, so it never needs the lock back mid-body. It is the only klock that
+ * may be held across cpu_wait_irq() and copy_to/from_user.
+ *
+ * [M50] Boot word `bkl=on|off` (MB2 command line, UEFI load options) sets
+ * g_bkl_mode. Default and today's only safe value: on. `bkl=off` prints a
+ * warning and still takes the BKL for every syscall whose bit is set in
+ * syscall_bkl_mask[] — all of them until the BKL removal (docs/
+ * BKL_REMOVAL_PLAN.md, phase D) clears bits one subsystem at a time. The other
+ * call sites (faults, teardown, kernel shell) take it in both modes until
+ * phase D removes them.
  *
  * SPDX-License-Identifier: MIT
  */
 #ifndef BKL_H
 #define BKL_H
 #include <stdint.h>
+#include "klock.h"
 
 struct process;
 
-/* Take the lock (recursive for the owning task). Spins with the interrupt
- * flag as the caller has it; bkl_lock_enable_irq() spins with interrupts on
- * (only for callers that hold no spinlock: syscall and user-fault entry), so a
- * CPU waiting for a long syscall elsewhere keeps taking its timer ticks. */
+/* The lock itself (for KLOCK_ASSERT_HELD(&g_bkl) and /proc/lockstat). */
+extern klock_t g_bkl;
+
+/* Take the lock (recursive for the owning task). bkl_lock spins with the
+ * interrupt flag as the caller has it; bkl_lock_enable_irq spins with
+ * interrupts on (only for callers that hold no spinlock: syscall and
+ * user-fault entry), so a CPU waiting for a long syscall elsewhere keeps
+ * taking its timer ticks. Both return with the caller's IF unchanged. */
 void bkl_lock(void);
 void bkl_lock_enable_irq(void);
 void bkl_unlock(void);
@@ -56,5 +70,20 @@ void bkl_drop_for(struct process* p);
 
 /* Does `p` (a task, or NULL for "this CPU's current") hold the lock? */
 int bkl_held_by(struct process* p);
+
+/* ---- [M50] mode + per-syscall mask ---- */
+#define SYSCALL_BKL_NR    256          /* syscall numbers covered by the mask */
+#define SYSCALL_BKL_WORDS (SYSCALL_BKL_NR / 64)
+extern int g_bkl_mode;                 /* 1 = bkl=on (default), 0 = bkl=off   */
+extern uint64_t syscall_bkl_mask[SYSCALL_BKL_WORDS];   /* bit set = takes the BKL */
+
+void bkl_init_mode(void);              /* reads the boot command line         */
+int  syscall_needs_bkl(uint64_t num);  /* 1 when mode is on, the bit is set or num is out of range */
+uint32_t syscall_bkl_mask_count(void); /* bits set in syscall_bkl_mask        */
+
+/* syscall_handler: take the BKL if `num` needs it (returns 1 then) / release
+ * it and check that the task goes back to ring 3 holding no klock. */
+int  bkl_syscall_enter(uint64_t num);
+void bkl_syscall_exit(int taken);
 
 #endif /* BKL_H */

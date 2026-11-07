@@ -15,6 +15,7 @@
 #include "fb_console.h"
 #include "kverbose.h"
 #include "../mm/user_copy.h"
+#include "bkl.h"
 #include <stdint.h>
 
 // [M45] KASLR: log kernel-image addresses as they are in kernel.bin.
@@ -256,8 +257,6 @@ void exception_handler(struct registers* regs) {
         {
             int handled;
             if (cr2 < USER_ADDR_MAX) {
-                extern void bkl_lock(void); extern void bkl_lock_enable_irq(void);
-                extern void bkl_unlock(void);
                 if ((regs->cs & 3) == 3) bkl_lock_enable_irq(); else bkl_lock();
                 handled = (vmm_try_handle_page_fault(cr2, err_code) == 0);
                 bkl_unlock();

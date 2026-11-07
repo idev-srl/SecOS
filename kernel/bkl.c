@@ -1,69 +1,66 @@
 /*
- * bkl.c — the kernel lock (M48). See bkl.h.
+ * bkl.c — the kernel lock (M48) on top of klock (M50). See bkl.h.
  *
  * SPDX-License-Identifier: MIT
  */
 #include "bkl.h"
-#include "percpu.h"
-#include "spinlock.h"
+#include "klock.h"
 #include "debugcon.h"
 
-static void* volatile g_bkl_owner;   /* owning task (or cpu_t before the scheduler) */
-static uint32_t g_bkl_depth;         /* recursion depth, touched by the owner only  */
+klock_t g_bkl = KLOCK_INIT_RECURSIVE(LK_K0_BKL, "bkl");
 
-static inline void* bkl_self(void) {
-    cpu_t* c = this_cpu();
-    return c->current ? (void*)c->current : (void*)c;
-}
+void bkl_lock(void)            { klock_lock(&g_bkl); }
+void bkl_lock_enable_irq(void) { klock_lock_irq_on(&g_bkl); }
+void bkl_unlock(void)          { klock_unlock(&g_bkl); }
 
-static void bkl_acquire(int spin_irq_on) {
-    void* me = bkl_self();
-    if (g_bkl_owner == me) { g_bkl_depth++; return; }
-    for (;;) {
-        if (!g_bkl_owner && __sync_bool_compare_and_swap(&g_bkl_owner, (void*)0, me)) {
-            g_bkl_depth = 1;
-            return;
-        }
-        if (spin_irq_on) __asm__ volatile ("sti" ::: "memory");
-        while (g_bkl_owner) cpu_relax_poll();
-        if (spin_irq_on) __asm__ volatile ("cli" ::: "memory");
+uint32_t bkl_suspend(void)          { return klock_suspend(&g_bkl); }
+void     bkl_resume(uint32_t depth) { klock_resume(&g_bkl, depth); }
+void     bkl_drop_for(struct process* p) { klock_drop_owner(&g_bkl, p); }
+int      bkl_held_by(struct process* p)  { return klock_owned_by(&g_bkl, p); }
+
+/* ---- [M50] mode + per-syscall mask ---- */
+int g_bkl_mode = 1;
+
+/* Every syscall still needs the BKL: phase D of the BKL removal clears bits
+ * here one subsystem at a time, once that subsystem has its own locks. */
+#define ALL64 0xFFFFFFFFFFFFFFFFULL
+uint64_t syscall_bkl_mask[SYSCALL_BKL_WORDS] = { ALL64, ALL64, ALL64, ALL64 };
+typedef char syscall_bkl_mask_init_covers_all[(SYSCALL_BKL_WORDS == 4) ? 1 : -1];
+
+void bkl_init_mode(void) {
+    extern int kernel_cmdline_has(const char* word);
+    if (kernel_cmdline_has("bkl=off")) g_bkl_mode = 0;
+    else g_bkl_mode = 1;                 /* bkl=on, or nothing: the default */
+    if (!g_bkl_mode) {
+        debugcon_writestring("[BKL] WARNING: bkl=off requested. The BKL removal is not "
+                             "complete: syscalls in syscall_bkl_mask (");
+        debugcon_print_hex(syscall_bkl_mask_count());
+        debugcon_writestring(" of 0x100) still take the kernel lock, as do faults, "
+                             "teardown and the kernel shell.\n");
+    } else {
+        debugcon_writestring("[BKL] kernel lock mode: bkl=on\n");
     }
 }
 
-void bkl_lock(void) { bkl_acquire(0); }
-void bkl_lock_enable_irq(void) { bkl_acquire(1); }
-
-static void bkl_release(void) {
-    g_bkl_depth = 0;
-    __atomic_store_n(&g_bkl_owner, (void*)0, __ATOMIC_RELEASE);
+int syscall_needs_bkl(uint64_t num) {
+    if (g_bkl_mode || num >= SYSCALL_BKL_NR) return 1;
+    return (int)((syscall_bkl_mask[num >> 6] >> (num & 63)) & 1);
 }
 
-void bkl_unlock(void) {
-    if (g_bkl_owner != bkl_self()) {
-        static int warned;
-        if (!warned) { warned = 1; debugcon_writestring("[BKL] BUG: unlock by a non-owner\n"); }
-        return;
-    }
-    if (--g_bkl_depth == 0) bkl_release();
+uint32_t syscall_bkl_mask_count(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < SYSCALL_BKL_WORDS; i++)
+        for (uint64_t w = syscall_bkl_mask[i]; w; w &= w - 1) n++;
+    return n;
 }
 
-uint32_t bkl_suspend(void) {
-    if (g_bkl_owner != bkl_self()) return 0;
-    uint32_t d = g_bkl_depth;
-    bkl_release();
-    return d;
+int bkl_syscall_enter(uint64_t num) {
+    if (!syscall_needs_bkl(num)) return 0;
+    klock_lock_irq_on(&g_bkl);
+    return 1;
 }
 
-void bkl_resume(uint32_t depth) {
-    if (!depth) return;
-    bkl_acquire(0);
-    g_bkl_depth = depth;
-}
-
-void bkl_drop_for(struct process* p) {
-    if (p && g_bkl_owner == (void*)p) bkl_release();
-}
-
-int bkl_held_by(struct process* p) {
-    return g_bkl_owner == (p ? (void*)p : bkl_self());
+void bkl_syscall_exit(int taken) {
+    if (taken) klock_unlock_to_user(&g_bkl);    /* unlock + check in one step */
+    else klock_check_user_return("syscall exit");
 }

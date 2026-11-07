@@ -67,11 +67,13 @@ static uint64_t syscall_handler_body(trapframe_t* tf);
 
 // [M48] Every syscall body runs under the kernel lock (kernel/bkl.h). Paths
 // that never come back here (exit, block, stop, kill, a yield that switched)
-// drop it in switch_to().
+// drop it in switch_to(). [M50] Per syscall: syscall_bkl_mask (all set today,
+// so bkl=off still serializes every syscall). The exit also checks that the
+// task goes back to ring 3 holding no klock.
 uint64_t syscall_handler(trapframe_t* tf) {
-    bkl_lock_enable_irq();
+    int bkl = bkl_syscall_enter(tf->rax);
     uint64_t r = syscall_handler_body(tf);
-    bkl_unlock();
+    bkl_syscall_exit(bkl);
     return r;
 }
 
