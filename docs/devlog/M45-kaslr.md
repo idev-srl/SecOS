@@ -39,8 +39,15 @@ the image stays below 512 MiB.
 
 1. **Pass 1**: `ld --emit-relocs` keeps the relocation sections in the output.
 2. The tool walks every `.rela.*` of an allocated section and keeps the
-   absolute relocations whose target `S+A` is a high-half address:
-   `R_X86_64_64` and `R_X86_64_32S` (≈2070 + 5700 = ~7770 fields today).
+   absolute relocations (`R_X86_64_64`, `R_X86_64_32S`, `R_X86_64_32`) whose
+   **symbol** lies in the slid high-half image (≈2130 × 64-bit + 5720 × 32-bit
+   = ~7850 fields today). The symbol, not `S+A`, decides: GCC folds
+   expressions such as `(uint64_t)&dma_buf - KERNEL_VMA_BASE` (the inlined
+   `kvirt_to_phys`) into the addend, so `S+A` is a small physical value that
+   must still move with the image. A first version classified by `S+A`, missed
+   those 62 fields, and every static DMA buffer got a physical address off by
+   the slide (virtio-blk/AHCI/NVMe/xHCI timeouts); the full selftest caught it.
+   A PC-relative reference across the low/high boundary is a hard error.
    PC-relative ones (`PC32/PLT32/PC64`) need nothing, because the whole image
    moves together; absolute references to **low** `.boot` symbols (e.g. the
    boot GDT) stay as they are. Every value is cross-checked against the linked

@@ -2,9 +2,10 @@
 """kaslr-relocs.py — build the kernel KASLR relocation table (M45).
 
 The kernel is linked once with `ld --emit-relocs` (pass 1). This tool walks the
-kept relocation sections and records every ABSOLUTE reference whose target is a
-high-half kernel address (R_X86_64_64 and R_X86_64_32S with S+A >= the link
-base): those are the fields the boot relocator must add the slide to.
+kept relocation sections and records every ABSOLUTE reference (R_X86_64_64,
+R_X86_64_32S, R_X86_64_32) whose SYMBOL lies in the slid high-half image: those
+are the fields the boot relocator must add the slide to. The symbol, not S+A,
+decides: `&buf - KERNEL_VMA` folded into an addend still moves with the image.
 PC-relative relocations (PC32/PLT32/...) need no fixup because the whole image
 moves as one block; absolute references to LOW (.boot) symbols stay as they are.
 
@@ -131,7 +132,14 @@ def extract(path):
             r_offset, r_info, r_addend = struct.unpack_from("<QQq", elf.d, rs["off"] + k * 24)
             rtype = r_info & 0xFFFFFFFF
             symi = r_info >> 32
-            if rtype == R_X86_64_NONE or rtype in PC_RELATIVE:
+            if rtype == R_X86_64_NONE:
+                continue
+            if rtype in PC_RELATIVE:
+                # S+A-P is slide-invariant only if S and P move together.
+                shndx, svalue, _ = syms[symi]
+                if shndx != SHN_ABS and shndx != SHN_UNDEF and \
+                        (svalue >= LINK_BASE) != (r_offset >= LINK_BASE):
+                    die("PC-relative reference across the low/high boundary at 0x%x" % r_offset)
                 continue
             if rtype in (R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_REX_GOTPCRELX):
                 die("GOT relocation in a -fno-pic kernel at 0x%x" % r_offset)
@@ -151,16 +159,19 @@ def extract(path):
                 stored = struct.unpack_from("<I", elf.d, foff)[0]
             if stored != value:
                 die("field at 0x%x holds 0x%x, expected S+A=0x%x" % (r_offset, stored, value))
-            if value < LINK_BASE:
-                continue                       # low (.boot) or small absolute: fixed
+            # Classify by the SYMBOL, not by S+A: the compiler folds expressions
+            # such as `(uint64_t)&buf - KERNEL_VMA_BASE` (or a physmap offset)
+            # into the addend, so S+A can be a small or wrapped value while it
+            # still moves with the image (it is S+slide+A at run time).
             if shndx == SHN_ABS:
-                n_abs_high += 1                # an absolute constant, not an address
+                if svalue >= LINK_BASE:
+                    n_abs_high += 1            # an absolute constant, not an address
                 continue
-            if rtype == R_X86_64_32:
-                die("R_X86_64_32 to high address 0x%x at 0x%x" % (value, r_offset))
-            if value > LINK_BASE + WINDOW:
-                die("absolute reference 0x%x at 0x%x is outside the 512 MiB window"
-                    % (value, r_offset))
+            if svalue < LINK_BASE:
+                continue                       # low (.boot) symbol: does not move
+            if svalue > LINK_BASE + WINDOW:
+                die("reference to 0x%x at 0x%x is outside the 512 MiB window"
+                    % (svalue, r_offset))
             phys = elf.va_to_phys(r_offset, width)
             if phys > 0x7FFFFFFF - 8:
                 die("field physical address 0x%x does not fit the table" % phys)

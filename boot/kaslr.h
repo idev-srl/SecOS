@@ -17,7 +17,7 @@
  * Layout (little endian):
  *   struct kaslr_hdr                 (56 bytes)
  *   uint32_t entries[hdr.count]      sorted by address; bit 31 = 32-bit field
- *                                    (R_X86_64_32S), else 64-bit (R_X86_64_64);
+ *                                    (R_X86_64_32S/32), else 64-bit (R_X86_64_64);
  *                                    bits 0..30 = physical address of the field.
  *
  * The `slide`, `source` and `state` header fields are zero in the file and
