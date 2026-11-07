@@ -12,7 +12,7 @@
 #   esd8   tools/exec_stress_drive.py          -smp 8, 500 parallel `bash -c true`
 #   fsd4   tools/fs_stress_drive.py            -smp 4, ext4 root, then e2fsck -fn
 #   fsd8   tools/fs_stress_drive.py            -smp 8, ext4 root, then e2fsck -fn
-#   fsr4   tools/fs_stress_drive.py            -smp 4, ramfs /tmp
+#   fsr4   tools/fs_stress_drive.py --ramroot  -smp 4, ramfs root (no disk), /tmp
 #   fsx4   tools/fs_stress_drive.py --data vfat  -smp 4, FAT32 sdb, fsck.vfat -n
 #   fse4   tools/fs_stress_drive.py --data exfat -smp 4, exFAT sdb, fsck.exfat -n
 #   fsc4   tools/fs_stress_drive.py --crash 3  -smp 4, kill -9 + journal replay
@@ -63,7 +63,7 @@ run() {
                   --rounds 2 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
               rm -f "$OUT/$r.w"/*.img; return $rc ;;
         fsr4) timeout 2400 python3 tools/fs_stress_drive.py --boot 600 --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
-                  --target /tmp --rounds 2 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
+                  --ramroot --target /tmp --rounds 2 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
               rm -f "$OUT/$r.w"/*.img; return $rc ;;
         fsx4|fse4) local k=vfat; [ "$r" = fse4 ] && k=exfat
               timeout 3600 python3 tools/fs_stress_drive.py --boot 600 --iso "$ISO" --smp 4 --work "$OUT/$r.w" \

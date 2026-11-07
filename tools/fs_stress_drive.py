@@ -53,7 +53,7 @@ class VM:
             disks = ["-machine", "q35", "-drive", f"file={disk},if=ide,index=0,format=raw",
                      "-drive", f"file={data},if=ide,index=1,format=raw"]
         else:
-            disks = ["-drive", f"file={disk},if=virtio,format=raw"]
+            disks = [] if o.ramroot else ["-drive", f"file={disk},if=virtio,format=raw"]
         cmd = [o.qemu, "-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp)] + disks + [
                "-nic", "none",
                "-debugcon", "file:" + log, "-global", "isa-debugcon.iobase=0xe9",
@@ -151,6 +151,9 @@ def main():
     ap.add_argument("--boot", type=float, default=300)
     ap.add_argument("--data", choices=["vfat", "exfat"], default=None)
     ap.add_argument("--mount-race", type=int, default=0)
+    # [M52] No disk: the root is ramfs (on a persistent root /tmp is just a
+    # directory of the ext4 volume), fsstress runs on it, no fsck.
+    ap.add_argument("--ramroot", action="store_true")
     o = ap.parse_args()
     seed = o.seed if o.seed is not None else int(time.time()) % 100000
     rng = random.Random(seed)
@@ -232,7 +235,10 @@ def main():
     if o.crash == 0:
         vm, good = boot("run")
         if not good: vm.kill(); finish()
-        run(vm, "root-is-ext4", "grep -q ' / ext4 ' /proc/mounts && echo ROOT-$((6*7))", ["ROOT-42"], 60, absent=())
+        if o.ramroot:
+            run(vm, "root-is-ramfs", "grep -q ' / ramfs ' /proc/mounts && echo ROOT-$((6*7))", ["ROOT-42"], 60, absent=())
+        else:
+            run(vm, "root-is-ext4", "grep -q ' / ext4 ' /proc/mounts && echo ROOT-$((6*7))", ["ROOT-42"], 60, absent=())
         nopt = ""
         if o.data:
             fst = "vfat" if o.data == "vfat" else "exfat"
@@ -267,7 +273,7 @@ def main():
         if o.data:
             run(vm, "umount-data", "sync; umount /mnt && echo UMNT-$((6*7))", ["UMNT-42"], 120, absent=())
         poweroff(vm, "run")
-        fsck("run")
+        if not o.ramroot: fsck("run")
         if o.data == "vfat":
             fr = subprocess.run(["fsck.vfat", "-n", data], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             report("data-fsck.vfat-clean", fr.returncode == 0, fr.stdout.decode(errors="replace").strip()[-300:])

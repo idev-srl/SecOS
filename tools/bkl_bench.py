@@ -5,7 +5,8 @@
 #   exec      4 parallel loops of `bash -c true` (execs/s);
 #   pipe      4 parallel loops of `seq 1 2000 | cat | wc -l` (pipelines/s);
 #   fsstress  /bin/fsstress on the ext4 root, W workers x I iters (iters/s);
-#   ramfs     the same fsstress on /tmp (ramfs);
+#   fsstress2 a second fsstress run (on a persistent root /tmp is ext4 too;
+#             ramfs is measured with fs_stress_drive.py --ramroot);
 # and prints /proc/lockstat at the end (the most contended locks). Every
 # number is wall time measured in the guest (/proc/uptime). The boot word is
 # chosen with a GRUB entry rewrite of a copy of the ISO tree, so one build
@@ -127,7 +128,7 @@ def main():
     timed("pipe", " ".join(f"( for i in $(seq 1 {per}); do seq 1 2000 | cat | wc -l >/dev/null; done ) &"
                           for _ in range(4)) + " wait", 4 * per, "pipelines/s")
     timed("fsstress", f"/bin/fsstress /root {o.workers} {o.iters} 4242", o.workers * o.iters, "iters/s")
-    timed("ramfs", f"/bin/fsstress /tmp {o.workers} {o.iters} 4343", o.workers * o.iters, "iters/s")
+    timed("fsstress2", f"/bin/fsstress /tmp {o.workers} {o.iters} 4343", o.workers * o.iters, "iters/s")
     done, out = run("cat /proc/lockstat", 60)
     rows = []
     for line in out.splitlines():
