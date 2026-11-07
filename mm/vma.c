@@ -146,24 +146,21 @@ uint64_t vma_total_bytes(const vma_set_t* s) {
     return total;
 }
 
-int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr) {
-    if (!space || !v) return -1;
-    uint64_t pg = addr & ~0xFFFULL;
-    if (pg < v->start || pg >= v->end) return -2;
-    if (v->flags & VMM_FLAG_PROTNONE) return -4;   // reserved, inaccessible
+// [M40] Device memory: map the backing physical page directly (no frame
+// allocation). DEVICE keeps the PMM away from it; PWT selects PAT slot 1
+// (Write-Combining once fb_apply_wc/vmm_pat_init ran). Never executable: the
+// VMA flags already carry NX (mmap/mprotect refuse PROT_EXEC here).
+static int vma_map_phys_page(vmm_space_t* space, const vma_t* v, uint64_t pg) {
+    uint64_t phys = v->phys_base + (pg - v->start);
+    return vmm_map_in_space(space, pg, phys,
+                            v->flags | VMM_FLAG_DEVICE | VMM_FLAG_PWT | VMM_FLAG_NOEXEC);
+}
 
-    if (v->type == VMA_TYPE_PHYS) {
-        // [M40] Device memory: map the backing physical page directly (no frame
-        // allocation). DEVICE keeps the PMM away from it; PWT selects PAT slot 1
-        // (Write-Combining once fb_apply_wc/vmm_pat_init ran). Never executable:
-        // the VMA flags already carry NX (mmap/mprotect refuse PROT_EXEC here).
-        uint64_t phys = v->phys_base + (pg - v->start);
-        return vmm_map_in_space(space, pg, phys,
-                                v->flags | VMM_FLAG_DEVICE | VMM_FLAG_PWT | VMM_FLAG_NOEXEC);
-    }
-
+// Allocate a frame for page 'pg' of VMA 'v' and fill it (file content + zero /
+// pure zero). Touches no page table. Returns the frame or NULL.
+static void* vma_fill_frame(const vma_t* v, uint64_t pg) {
     void* frame = pmm_alloc_frame();
-    if (!frame) return -3;
+    if (!frame) return 0;
     uint64_t fphys = (uint64_t)frame & ADDRESS_MASK;
     // Fill the frame through the physmap (a kernel RW alias), so a code page can
     // be content-filled even though its USER mapping will be read-only (RX).
@@ -197,8 +194,58 @@ int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr) {
     } else {
         vma_memset(dst, 0, 0x1000);             // ANON: zero-fill
     }
+    return frame;
+}
 
-    int r = vmm_map_in_space(space, pg, fphys, v->flags);
+int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr) {
+    if (!space || !v) return -1;
+    uint64_t pg = addr & ~0xFFFULL;
+    if (pg < v->start || pg >= v->end) return -2;
+    if (v->flags & VMM_FLAG_PROTNONE) return -4;   // reserved, inaccessible
+    if (v->type == VMA_TYPE_PHYS) return vma_map_phys_page(space, v, pg);
+
+    void* frame = vma_fill_frame(v, pg);
+    if (!frame) return -3;
+    int r = vmm_map_in_space(space, pg, (uint64_t)frame & ADDRESS_MASK, v->flags);
     if (r != 0) { pmm_free_frame(frame); return r; }
     return 0;
+}
+
+static int vma_same(const vma_t* a, const vma_t* b) {
+    return a->start == b->start && a->end == b->end && a->flags == b->flags &&
+           a->type == b->type && a->file_base == b->file_base &&
+           a->file_off == b->file_off && a->file_pad == b->file_pad &&
+           a->file_len == b->file_len && a->file_inode == b->file_inode &&
+           a->file_voff == b->file_voff && a->phys_base == b->phys_base;
+}
+
+int vma_fault_in_live(vmm_space_t* space, vma_set_t* set, spinlock_t* mm, uint64_t addr) {
+    if (!space || !set || !mm) return -1;
+    uint64_t pg = addr & ~0xFFFULL;
+    uint64_t fl = spin_lock_irqsave(mm);
+    const vma_t* v = vma_find(set, pg);
+    if (!v || (v->flags & VMM_FLAG_PROTNONE)) { spin_unlock_irqrestore(mm, fl); return -1; }
+    if (v->type == VMA_TYPE_PHYS) {             // nothing to fill: install now
+        int r = vma_map_phys_page(space, v, pg);
+        spin_unlock_irqrestore(mm, fl);
+        return (r == -3) ? 0 : r;
+    }
+    vma_t snap = *v;
+    spin_unlock_irqrestore(mm, fl);
+
+    void* frame = vma_fill_frame(&snap, pg);   // may read the page cache: unlocked
+    if (!frame) return -3;
+
+    fl = spin_lock_irqsave(mm);
+    v = vma_find(set, pg);
+    int r;
+    if (!v || !vma_same(v, &snap)) {
+        r = -2;                                 // unmapped or changed meanwhile
+    } else {
+        r = vmm_map_in_space(space, pg, (uint64_t)frame & ADDRESS_MASK, snap.flags);
+        if (r == -3) r = 1;                     // installed by someone else: fine
+    }
+    spin_unlock_irqrestore(mm, fl);
+    if (r != 0) pmm_free_frame(frame);
+    return r > 0 ? 0 : r;
 }

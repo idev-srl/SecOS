@@ -49,6 +49,16 @@ static inline void spin_init_class(spinlock_t* l, uint16_t level, const char* na
     (void)level; (void)name;
 #endif
 }
+/* [M50-B1] A lock embedded in an object that is freed later (process_t.
+ * mm_lock): same class checks, but never entered in the /proc/lockstat
+ * registry, which keeps a pointer to every registered lock forever. */
+static inline void spin_init_class_dynamic(spinlock_t* l, uint16_t level, const char* name) {
+    spin_init_class(l, level, name);
+#ifdef SECOS_LOCKDEP
+    l->reg = 0xFF;
+    l->t_acq = 0; l->n_acq = 0; l->n_contended = 0; l->max_wait_cyc = 0;
+#endif
+}
 
 /* [M48] A CPU waiting for a lock keeps answering TLB shootdowns (see
  * arch/x86/tlb.h): the initiator may hold this very lock with interrupts off

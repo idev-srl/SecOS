@@ -241,24 +241,87 @@ static void proc_remove(process_t* p) {
     spin_unlock_irqrestore(&proc_lock, fl);
 }
 
+// [M50-B1] References. Taken under proc_lock, so a lookup can never race the
+// reaper's detach (process_reap_one checks refs under the same lock); dropped
+// with a plain atomic decrement: the reaper reads 0 only after the last user
+// is done with the process. A zombie skipped because of a reference is reaped
+// by the next sched_reap_zombies() (every fork/spawn, every idle loop).
+static inline void proc_ref_locked(process_t* p) {
+    __atomic_add_fetch(&p->refs, 1, __ATOMIC_RELAXED);
+}
+
+process_t* process_get(process_t* p) {
+    if (p) proc_ref_locked(p);
+    return p;
+}
+
+void process_put(process_t* p) {
+    if (!p) return;
+    uint32_t r = __atomic_sub_fetch(&p->refs, 1, __ATOMIC_RELEASE);
+    if (r == 0xFFFFFFFFu) {
+        __atomic_add_fetch(&p->refs, 1, __ATOMIC_RELAXED);
+        debugcon_writestring("[PROC] BUG: process_put without a reference\n");
+    }
+}
+
 process_t* process_get_last(void) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     process_t* best = NULL; uint32_t best_pid = 0;
     for (int i=0;i<MAX_PROCESSES;i++) {
         if (proc_table[i] && proc_table[i]->pid > best_pid) { best = proc_table[i]; best_pid = proc_table[i]->pid; }
     }
+    if (best) proc_ref_locked(best);
     spin_unlock_irqrestore(&proc_lock, fl);
     return best;
 }
 
-process_t* process_find_by_pid(uint32_t pid) {
+process_t* process_get_by_pid(uint32_t pid) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     process_t* r = NULL;
     for (int i=0;i<MAX_PROCESSES;i++) {
         if (proc_table[i] && proc_table[i]->pid == pid) { r = proc_table[i]; break; }
     }
+    if (r) proc_ref_locked(r);
     spin_unlock_irqrestore(&proc_lock, fl);
     return r;
+}
+
+int process_pid_state(uint32_t pid) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    int st = -1;
+    for (int i=0;i<MAX_PROCESSES;i++) {
+        if (proc_table[i] && proc_table[i]->pid == pid) { st = (int)proc_table[i]->state; break; }
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return st;
+}
+
+process_t* process_detach_unstarted(uint32_t pid) {
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    process_t* r = NULL;
+    for (int i=0;i<MAX_PROCESSES;i++) {
+        process_t* p = proc_table[i];
+        if (!p || p->pid != pid) continue;
+        // Never ran (no CPU has its stack or CR3) and nobody holds a pointer.
+        // Detached like a reaped zombie (proc_remove frees the kstack slot,
+        // the caller ends with process_reap_done()).
+        if (p->state == PROC_NEW && !p->on_cpu && p->refs == 0) {
+            p->state = PROC_ZOMBIE;
+            proc_table[i] = NULL;
+            __atomic_add_fetch(&g_reaping, 1, __ATOMIC_SEQ_CST);
+            r = p;
+        }
+        break;
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return r;
+}
+
+void process_set_cred(process_t* p, const struct proc_cred* cr) {
+    if (!p || !cr) return;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    p->cred = *cr;
+    spin_unlock_irqrestore(&proc_lock, fl);
 }
 
 void process_foreach(void (*cb)(process_t*, void*), void* user) {
@@ -270,39 +333,42 @@ void process_foreach(void (*cb)(process_t*, void*), void* user) {
     spin_unlock_irqrestore(&proc_lock, fl);
 }
 
-// [M29/M48] Atomically detach one reapable ZOMBIE from the table and return it
-// (the caller frees it via process_destroy outside the lock); see
-// process_reap_one() for when a zombie is off every CPU.
-// [M39] wait-any support: find an uncollected ZOMBIE child of `ppid`, and report
-// whether `ppid` has any still-living children. Used by SYS_WAITANY (bash's
-// waitpid(-1) pattern).
-process_t* process_find_zombie_child(uint32_t ppid) {
+// [M39] wait-any support (SYS_WAITANY, bash's waitpid(-1) pattern): collect an
+// uncollected ZOMBIE child of `ppid`. [M50-B1] Collected under proc_lock and
+// only its pid/status leave the lock: once collected, the reaper may free it.
+int process_collect_zombie_child(uint32_t ppid, uint32_t* pid, int* code) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
-    process_t* z = NULL;
+    int found = 0;
     for (int i=0;i<MAX_PROCESSES;i++) {
         process_t* p = proc_table[i];
-        if (p && p->ppid == ppid && p->state == PROC_ZOMBIE && !p->collected) { z = p; break; }
+        if (p && p->ppid == ppid && p->state == PROC_ZOMBIE && !p->collected) {
+            *pid = p->pid; *code = p->exit_code;
+            p->collected = 1;
+            found = 1;
+            break;
+        }
     }
     spin_unlock_irqrestore(&proc_lock, fl);
-    return z;
+    return found;
 }
 // Job control: find a child of `ppid` with an unreported stop (WUNTRACED) or
-// continue (WCONTINUED), consume the report, and return it; *status gets the
-// POSIX encoding: stopped = (sig << 8) | 0x7f, continued = 0xffff.
-process_t* process_take_jobctl_child(uint32_t ppid, int want_stop, int want_cont, int* status) {
+// continue (WCONTINUED), consume the report, and return its pid (0 = none);
+// *status gets the POSIX encoding: stopped = (sig << 8) | 0x7f, continued =
+// 0xffff.
+uint32_t process_take_jobctl_child(uint32_t ppid, int want_stop, int want_cont, int* status) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
-    process_t* r = NULL;
+    uint32_t r = 0;
     for (int i=0;i<MAX_PROCESSES && !r;i++) {
         process_t* p = proc_table[i];
         if (!p || p->ppid != ppid || p->state == PROC_ZOMBIE) continue;
         if (want_stop && p->stop_report && p->state == PROC_STOPPED) {
             p->stop_report = 0;
             *status = ((p->stop_sig & 0xff) << 8) | 0x7f;
-            r = p;
+            r = p->pid;
         } else if (want_cont && p->cont_report) {
             p->cont_report = 0;
             *status = 0xffff;
-            r = p;
+            r = p->pid;
         }
     }
     spin_unlock_irqrestore(&proc_lock, fl);
@@ -352,6 +418,8 @@ int process_has_children(uint32_t ppid) {
     return n;
 }
 
+// [M29/M48] Atomically detach one reapable ZOMBIE from the table and return it
+// (the caller frees it via process_destroy outside the lock).
 process_t* process_reap_one(void) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     process_t* z = NULL;
@@ -360,6 +428,9 @@ process_t* process_reap_one(void) {
         // [M48] Any CPU may reap a zombie once its last CPU has switched off it
         // (on_cpu == 0): its kernel stack, CR3 and FPU image are no longer in use.
         if (!p || p->state != PROC_ZOMBIE || p->on_cpu) continue;
+        // [M50-B1] Someone still holds a reference (procfs, kill, a waiter):
+        // keep it; a later reap pass frees it after the last process_put().
+        if (__atomic_load_n(&p->refs, __ATOMIC_ACQUIRE)) continue;
         // [M39] Unix zombie semantics: keep a zombie until its parent collects the
         // status via wait() — otherwise a parent that forks and continues (bash
         // subshells/pipelines) races this reaper and its SYS_WAIT(pid) finds the
@@ -631,6 +702,8 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     process_t* p = (process_t*)kmalloc(sizeof(process_t));
     if (!p) { terminal_writestring("[PROC] pcb alloc failed\n"); return NULL; }
     klock_task_reset(&p->klk);               // [M50] holds no klock
+    p->refs = 0;                             // [M50-B1] lifetime + address-space lock
+    spin_init_class_dynamic(&p->mm_lock, LK_S35_MM, "mm");
     p->mapped_pages = NULL;
     p->mapped_page_count = 0;
 
@@ -787,8 +860,16 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
                 blob[blen++] = 0;
             }
         }
-        if (blob && setup_user_args(space, &p->vmas, st_top, im.stack_lo, blob, blen,
-                                    argc, 0, &rsp, &argvp, &envp) == 0) {
+        // [M50-B1] p is already in the table (procfs can see it): fault the
+        // stack pages in under its mm_lock (anonymous pages, no page cache).
+        int sr = -1;
+        if (blob) {
+            uint64_t mfl = mm_lock(p);
+            sr = setup_user_args(space, &p->vmas, st_top, im.stack_lo, blob, blen,
+                                 argc, 0, &rsp, &argvp, &envp);
+            mm_unlock(p, mfl);
+        }
+        if (sr == 0) {
             p->tf->rsp = rsp;
             p->tf->rdi = (uint64_t)argc;
             p->tf->rsi = argvp;
@@ -868,13 +949,17 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     uint64_t mm  = USER_MMAP_BASE + aslr_slide(32ULL*1024*1024);
 
     // ---- 2. Point of no return: swap in the new image. ----
-    uint64_t fl;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl) : : "memory");
+    // Driver bindings have their own lock (driver_if_lock, S15 < S35): drop
+    // them before taking mm_lock.
+    driver_remove_all_bindings(p);
+    // [M50-B1] The space / VMA / image swap is one mm_lock section (it also
+    // keeps interrupts off across the CR3 switch, like the old cli): a
+    // cross-process reader sees either the old image or the new one.
+    uint64_t fl = mm_lock(p);
     vmm_space_t* old_space = p->space;
     uint8_t*     old_image = p->image;
     void*        old_mf    = p->manifest;
-    // Drop any device binding (and the driver type) of the old image first.
-    driver_remove_all_bindings(p);
+    // The driver type of the old image goes with it.
     p->proc_type = PROC_TYPE_USER; p->drv_dev_id = -1; p->drv_caps = 0;
     // Load the new CR3 before the old tables are freed. p is pinned to this CPU
     // (cpu_affinity), so no other core has the old space loaded or cached; the
@@ -895,7 +980,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     p->user_mem_bytes = im.footprint;
     p->mapped_page_count = (uint32_t)(im.footprint / 4096ULL);
     p->regs.rip = im.entry; p->regs.rsp = rsp;
-    __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc");
+    mm_unlock(p, fl);
     kfree(nv);
     // Tear down the old user image: every present leaf frame is unref'd (pages
     // still COW-shared with a fork relative stay with it), then the tables.
@@ -966,6 +1051,8 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     if (!c) return NULL;
     *c = *parent;                              // shallow-copy all fields (incl. VMAs, fds)
     klock_task_reset(&c->klk);                 // [M50] the parent's klocks (the BKL) are not the child's
+    c->refs = 0;                               // [M50-B1] the parent's references and its
+    spin_init_class_dynamic(&c->mm_lock, LK_S35_MM, "mm");   //  (maybe held) mm_lock are not copied
     c->pid = alloc_pid();
     c->cpu_affinity = process_pick_home();     // [M48] push the child to the least-loaded CPU
     c->on_cpu = 0; c->wake_snap = 0; c->ready_tick = 0; c->smp_logged = 0;   // cpu_pin is inherited
@@ -976,7 +1063,13 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     __asm__ volatile("fxsave64 %0" : "=m"(*(uint8_t(*)[512])c->fpu));
     c->fpu_valid = 1;
 
-    c->space = vmm_fork_space(parent->space);
+    {   // [M50-B1] Copy the VMA set and share the pages COW as one step under
+        // the parent's mm_lock (vmm_fork_space rewrites the parent's PTEs).
+        uint64_t mfl = mm_lock(parent);
+        c->vmas = parent->vmas;
+        c->space = vmm_fork_space(parent->space);
+        mm_unlock(parent, mfl);
+    }
     if (!c->space) { kfree(c); return NULL; }
 
     if (parent->image && parent->image_size) {

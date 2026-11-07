@@ -145,9 +145,22 @@ static void snap_cb(process_t* p, void* u){
     for(int i=0;i<256;i++){ s->cwd[i]=p->cwd[i]; if(!p->cwd[i]) break; }
     s->cwd[255]=0;
     s->utime=p->ki.utime_ticks; s->stime=p->ki.stime_ticks; s->start_ns=p->ki.start_ns; s->nvcsw=p->ki.nvcsw;
+    /* [M50-B1] The address space (VMA set, page tables, brk) under the
+     * target's mm_lock: it may munmap/brk/exec on another CPU meanwhile.
+     * proc_lock (S30, process_foreach) -> mm_lock (S35). */
+    uint64_t mfl = mm_lock(p);
     s->vsz = vma_total_bytes(&p->vmas);
     s->rss_pages = (p->state!=PROC_ZOMBIE && p->space) ? vmm_count_user_pages(p->space) : 0;
     s->brk_start=p->brk_start; s->brk_cur=p->brk_cur; s->stack_top=p->stack_top;
+    s->nvma=0;
+    for(uint32_t i=0;i<p->vmas.count && s->nvma<PS_MAXVMA;i++){
+        const vma_t* v=&p->vmas.v[i];
+        if(v->type==VMA_TYPE_NONE) continue;
+        s->vma[s->nvma].start=v->start; s->vma[s->nvma].end=v->end; s->vma[s->nvma].flags=v->flags;
+        s->vma[s->nvma].type=v->type; s->vma[s->nvma].has_inode = v->file_inode ? 1 : 0;
+        s->nvma++;
+    }
+    mm_unlock(p, mfl);
     s->sig_pending=p->sig_pending; s->sig_blocked=p->sig_blocked;
     s->sig_ign=0; s->sig_catch=0;
     for(int i=1;i<32;i++){ if(p->sig_handler[i]==1) s->sig_ign|=1ull<<(i-1); else if(p->sig_handler[i]>1) s->sig_catch|=1ull<<(i-1); }
@@ -166,14 +179,6 @@ static void snap_cb(process_t* p, void* u){
             int k=0; for(; ino->path[k] && k<127; k++) s->fd[i].path[k]=ino->path[k];
             s->fd[i].path[k]=0;
         }
-    }
-    s->nvma=0;
-    for(uint32_t i=0;i<p->vmas.count && s->nvma<PS_MAXVMA;i++){
-        const vma_t* v=&p->vmas.v[i];
-        if(v->type==VMA_TYPE_NONE) continue;
-        s->vma[s->nvma].start=v->start; s->vma[s->nvma].end=v->end; s->vma[s->nvma].flags=v->flags;
-        s->vma[s->nvma].type=v->type; s->vma[s->nvma].has_inode = v->file_inode ? 1 : 0;
-        s->nvma++;
     }
 }
 static int snap(uint32_t pid){
@@ -607,10 +612,31 @@ static void fill_node(vfs_inode_t* ino, uint64_t key, const char* path){
     else { int n=gen_key(key); ino->size = n>0 ? (size_t)n : 0; }
 }
 
+/* Slots an open fd still points at. Recycling one made a later read() of that
+ * fd return another node's contents (found by the M50 proc-race stress:
+ * /proc/N/status reading as /proc/loadavg). Runs under g_proc_lock; the fd
+ * tables are read under proc_lock (S15 -> S30). */
+struct pool_busy { uint64_t mask; };
+static void pool_busy_cb(process_t* p, void* u){
+    struct pool_busy* b=(struct pool_busy*)u;
+    for(int i=0;i<32;i++){
+        const struct proc_fd_entry* e=&p->fds[i];
+        if(!e->used || e->is_pipe || e->is_sock || !e->inode) continue;
+        const vfs_inode_t* ino=(const vfs_inode_t*)e->inode;
+        if(ino>=&g_ipool[0] && ino<&g_ipool[64]) b->mask |= 1ull << (ino-&g_ipool[0]);
+    }
+}
+
 static vfs_inode_t* pool_get(uint64_t key, const char* path){
     int slot=-1;
     for(int i=0;i<64;i++) if(g_ikey[i]==key){ slot=i; break; }
-    if(slot<0){ slot=g_inext; g_inext=(g_inext+1)%64; g_ikey[slot]=key; }
+    if(slot<0){
+        struct pool_busy b={0};
+        process_foreach(pool_busy_cb, &b);
+        slot=g_inext;                            /* all 64 open: recycle anyway */
+        for(int k=0;k<64;k++){ int c=(g_inext+k)%64; if(!((b.mask>>c)&1)){ slot=c; break; } }
+        g_inext=(slot+1)%64; g_ikey[slot]=key;
+    }
     fill_node(&g_ipool[slot], key, path);
     return &g_ipool[slot];
 }

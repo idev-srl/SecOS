@@ -61,7 +61,6 @@
 extern int  keyboard_getc_raw(void);
 extern bool keyboard_input_pending_noirq(void);
 extern process_t* sched_get_current(void);
-extern process_t* process_find_by_pid(uint32_t pid);
 extern uint64_t timer_get_ticks(void);
 extern uint32_t timer_get_frequency(void);
 extern void vt_set_reply_hook(void (*hook)(const char* s, int n));
@@ -149,8 +148,8 @@ void tty_set_fg(struct tty* t, uint32_t pgrp) {
 static void post_now(uint32_t id, int sig, int to_pid) {
     if (!id) return;
     if (to_pid) {
-        process_t* p = process_find_by_pid(id);
-        if (p) signal_post(p, sig);
+        process_t* p = process_get_by_pid(id);   // [M50-B1] held until posted
+        if (p) { signal_post(p, sig); process_put(p); }
     } else {
         signal_post_pgid(id, sig);
     }

@@ -8,6 +8,16 @@
 #include "process.h"
 #include "debugcon.h"
 #include "heap.h" // kmalloc/kfree
+#include "spinlock.h"
+
+// [M50-B1] driver_if_lock (LK_S15_SUBSYS, irqsave) guards the binding table,
+// the rate-limit table, the shadow registers and the audit ring. g_devices is
+// written once by driver_registry_init() and read-only afterwards. Callers
+// may hold the BKL; nothing inside takes a lock of a lower level (kmalloc's
+// heap_lock is S70) and no user memory is touched under it.
+static spinlock_t driver_if_lock = SPINLOCK_INIT_CLASS(LK_S15_SUBSYS, "driver-if");
+#define DIF_LOCK()     uint64_t dif_fl = spin_lock_irqsave(&driver_if_lock)
+#define DIF_UNLOCK()   spin_unlock_irqrestore(&driver_if_lock, dif_fl)
 
 static device_desc_t g_devices[MAX_DEVICES];
 static int g_device_count = 0;
@@ -38,10 +48,12 @@ int driver_register_binding_caps(process_t* p, int device_id, uint32_t caps){
     if(!dev) return DRV_ERR_DEVICE;
     // Never grant more than the device actually supports.
     caps &= dev->caps_mask;
+    DIF_LOCK();
     // Already bound: refresh granted caps (idempotent).
-    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id){ g_bindings[i].caps=caps; return DRV_OK; } }
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id){ g_bindings[i].caps=caps; DIF_UNLOCK(); return DRV_OK; } }
     // Find free slot
-    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(!g_bindings[i].proc){ g_bindings[i].proc=p; g_bindings[i].device_id=device_id; g_bindings[i].caps=caps; return DRV_OK; } }
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(!g_bindings[i].proc){ g_bindings[i].proc=p; g_bindings[i].device_id=device_id; g_bindings[i].caps=caps; DIF_UNLOCK(); return DRV_OK; } }
+    DIF_UNLOCK();
     return DRV_ERR_PERM; // no free slot
 }
 
@@ -54,25 +66,35 @@ int driver_register_binding(process_t* p, int device_id){
 
 int driver_remove_binding(process_t* p, int device_id){
     if(!p) return DRV_ERR_ARGS;
-    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id){ g_bindings[i].proc=NULL; g_bindings[i].device_id=-1; g_bindings[i].caps=0; return DRV_OK; } }
+    DIF_LOCK();
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id){ g_bindings[i].proc=NULL; g_bindings[i].device_id=-1; g_bindings[i].caps=0; DIF_UNLOCK(); return DRV_OK; } }
+    DIF_UNLOCK();
     return DRV_ERR_DEVICE; // binding not found
 }
 
 void driver_remove_all_bindings(process_t* p){
     if(!p) return;
+    DIF_LOCK();
     for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p){ g_bindings[i].proc=NULL; g_bindings[i].device_id=-1; g_bindings[i].caps=0; } }
+    DIF_UNLOCK();
 }
 
 int driver_is_bound(process_t* p, int device_id){
     if(!p) return 0;
-    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id) return 1; }
-    return 0;
+    int r = 0;
+    DIF_LOCK();
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id){ r = 1; break; } }
+    DIF_UNLOCK();
+    return r;
 }
 
 uint32_t driver_binding_caps(process_t* p, int device_id){
     if(!p) return 0;
-    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id) return g_bindings[i].caps; }
-    return 0;
+    uint32_t c = 0;
+    DIF_LOCK();
+    for(int i=0;i<MAX_DRIVER_BINDINGS;i++){ if(g_bindings[i].proc==p && g_bindings[i].device_id==device_id){ c = g_bindings[i].caps; break; } }
+    DIF_UNLOCK();
+    return c;
 }
 
 // Traduzione opcode -> capability bit
@@ -127,7 +149,16 @@ static void rl_init(void){ if(rl_inited) return; for(int i=0;i<RL_CAPACITY;i++){
 #define RL_WINDOW_TICKS 100ULL
 #define RL_MAX_CALLS    50
 extern uint64_t timer_get_ticks(void);
-int driver_rate_check(process_t* p, const driver_call_t* req){ rl_init(); if(!p||!req) return DRV_ERR_ARGS; uint64_t now = timer_get_ticks();
+static int driver_rate_check_locked(process_t* p, const driver_call_t* req, uint64_t now);
+int driver_rate_check(process_t* p, const driver_call_t* req){
+    if(!p||!req) return DRV_ERR_ARGS;
+    uint64_t now = timer_get_ticks();
+    DIF_LOCK();
+    int r = driver_rate_check_locked(p, req, now);
+    DIF_UNLOCK();
+    return r;
+}
+static int driver_rate_check_locked(process_t* p, const driver_call_t* req, uint64_t now){ rl_init();
     // Cerca entry
     rl_entry_t* slot=NULL; for(int i=0;i<RL_CAPACITY;i++){ if(rl_table[i].pid==p->pid && rl_table[i].device_id==req->device_id && rl_table[i].opcode==req->opcode){ slot=&rl_table[i]; break; } }
     if(!slot){ // trova slot libero
@@ -177,10 +208,17 @@ static int shadow_inited=0;
 static void shadow_init(void){ if(shadow_inited) return; for(int i=0;i<MAX_DEVICES;i++){ g_shadow[i].device_id=-1; g_shadow[i].buf=NULL; } shadow_inited=1; }
 static shadow_regs_t* shadow_get(int device_id){ shadow_init(); const device_desc_t* d=driver_get_device(device_id); if(!d) return NULL; for(int i=0;i<MAX_DEVICES;i++){ if(g_shadow[i].device_id==device_id) return &g_shadow[i]; } for(int i=0;i<MAX_DEVICES;i++){ if(g_shadow[i].device_id==-1){ g_shadow[i].device_id=device_id; g_shadow[i].base=d->reg_base; g_shadow[i].size=d->reg_size; g_shadow[i].buf=(uint8_t*)kmalloc(d->reg_size); if(g_shadow[i].buf){ for(uint64_t k=0;k<d->reg_size;k++) g_shadow[i].buf[k]=0; } return &g_shadow[i]; } } return NULL; }
 
-int read_hardware_register(int device_id, uint64_t addr, uint64_t* out_value){ if(!out_value) return DRV_ERR_ARGS; const device_desc_t* d=driver_get_device(device_id); if(!d) return DRV_ERR_DEVICE; if(addr<d->reg_base||addr>=d->reg_base+d->reg_size) return DRV_ERR_RANGE; shadow_regs_t* sh=shadow_get(device_id); if(!sh||!sh->buf) return DRV_ERR_PERM; uint64_t off = addr - d->reg_base; // emulate 8-byte read
+static int read_hw_reg_locked(int device_id, uint64_t addr, uint64_t* out_value){ if(!out_value) return DRV_ERR_ARGS; const device_desc_t* d=driver_get_device(device_id); if(!d) return DRV_ERR_DEVICE; if(addr<d->reg_base||addr>=d->reg_base+d->reg_size) return DRV_ERR_RANGE; shadow_regs_t* sh=shadow_get(device_id); if(!sh||!sh->buf) return DRV_ERR_PERM; uint64_t off = addr - d->reg_base; // emulate 8-byte read
  if(off+8 > d->reg_size) return DRV_ERR_RANGE; uint64_t val=0; for(int i=0;i<8;i++){ val |= ((uint64_t)sh->buf[off+i]) << (i*8); } *out_value=val; return DRV_OK; }
 
-int write_hardware_register(int device_id, uint64_t addr, uint64_t value){ const device_desc_t* d=driver_get_device(device_id); if(!d) return DRV_ERR_DEVICE; if(addr<d->reg_base||addr>=d->reg_base+d->reg_size) return DRV_ERR_RANGE; shadow_regs_t* sh=shadow_get(device_id); if(!sh||!sh->buf) return DRV_ERR_PERM; uint64_t off=addr - d->reg_base; if(off+8 > d->reg_size) return DRV_ERR_RANGE; for(int i=0;i<8;i++){ sh->buf[off+i] = (value >> (i*8)) & 0xFF; } return DRV_OK; }
+static int write_hw_reg_locked(int device_id, uint64_t addr, uint64_t value){ const device_desc_t* d=driver_get_device(device_id); if(!d) return DRV_ERR_DEVICE; if(addr<d->reg_base||addr>=d->reg_base+d->reg_size) return DRV_ERR_RANGE; shadow_regs_t* sh=shadow_get(device_id); if(!sh||!sh->buf) return DRV_ERR_PERM; uint64_t off=addr - d->reg_base; if(off+8 > d->reg_size) return DRV_ERR_RANGE; for(int i=0;i<8;i++){ sh->buf[off+i] = (value >> (i*8)) & 0xFF; } return DRV_OK; }
+
+int read_hardware_register(int device_id, uint64_t addr, uint64_t* out_value){
+    DIF_LOCK(); int r = read_hw_reg_locked(device_id, addr, out_value); DIF_UNLOCK(); return r;
+}
+int write_hardware_register(int device_id, uint64_t addr, uint64_t value){
+    DIF_LOCK(); int r = write_hw_reg_locked(device_id, addr, value); DIF_UNLOCK(); return r;
+}
 
 // Memory mapping (stub: validation only, no real mapping)
 int map_device_memory(process_t* p, int device_id, uint64_t phys_addr, size_t length, int flags){ (void)flags; if(!p) return DRV_ERR_ARGS; const device_desc_t* d=driver_get_device(device_id); if(!d) return DRV_ERR_DEVICE; if(length==0) length=0x1000; if((phys_addr & 0xFFF)!=0) return DRV_ERR_ARGS; if(phys_addr<d->mem_base || (phys_addr+length)>d->mem_base+d->mem_size) return DRV_ERR_RANGE; // TODO: use vmm to map into driver space
@@ -192,7 +230,8 @@ int unmap_device_memory(process_t* p, int device_id, uint64_t phys_addr, size_t 
 static driver_audit_entry_t audit_buf[DRIVER_AUDIT_CAPACITY];
 static int audit_index=0; static int audit_full=0;
 extern uint64_t timer_get_ticks(void); // ipotetica funzione globale
-void driver_audit_log(const driver_call_t* req, int result, process_t* p){ if(!req) return; driver_audit_entry_t e; e.tick=timer_get_ticks(); e.pid=p? (int)p->pid: -1; e.device_id=req->device_id; e.opcode=req->opcode; e.target=req->target; e.value=req->value; e.flags=req->flags; e.result=result; audit_buf[audit_index]=e; audit_index=(audit_index+1)%DRIVER_AUDIT_CAPACITY; if(audit_index==0) audit_full=1;
+void driver_audit_log(const driver_call_t* req, int result, process_t* p){ if(!req) return; driver_audit_entry_t e; e.tick=timer_get_ticks(); e.pid=p? (int)p->pid: -1; e.device_id=req->device_id; e.opcode=req->opcode; e.target=req->target; e.value=req->value; e.flags=req->flags; e.result=result;
+    { DIF_LOCK(); audit_buf[audit_index]=e; audit_index=(audit_index+1)%DRIVER_AUDIT_CAPACITY; if(audit_index==0) audit_full=1; DIF_UNLOCK(); }
     // [M11] Mirror every audited event to debugcon so the capability boundary is
     // verifiable non-interactively (denials are always audited; successes only
     // with DRV_FLAG_REQUIRE_AUDIT — see handle_driver_call).
@@ -202,5 +241,9 @@ void driver_audit_log(const driver_call_t* req, int result, process_t* p){ if(!r
     debugcon_writestring(" res="); debugcon_print_hex((uint64_t)(uint32_t)e.result);
     debugcon_writestring("\n");
 }
-int driver_audit_dump(driver_audit_entry_t* out_buf, int max){ if(!out_buf||max<=0) return 0; int count = audit_full? DRIVER_AUDIT_CAPACITY : audit_index; if(max>count) max=count; // copia partendo dall'entry più recente
- int written=0; for(int i=0;i<max;i++){ int idx = (audit_index - 1 - i); if(idx<0) idx += DRIVER_AUDIT_CAPACITY; out_buf[written++] = audit_buf[idx]; } return written; }
+int driver_audit_dump(driver_audit_entry_t* out_buf, int max){ if(!out_buf||max<=0) return 0;
+ DIF_LOCK();
+ int count = audit_full? DRIVER_AUDIT_CAPACITY : audit_index; if(max>count) max=count; // newest entry first
+ int written=0; for(int i=0;i<max;i++){ int idx = (audit_index - 1 - i); if(idx<0) idx += DRIVER_AUDIT_CAPACITY; out_buf[written++] = audit_buf[idx]; }
+ DIF_UNLOCK();
+ return written; }

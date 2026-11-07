@@ -114,6 +114,7 @@ void sched_set_current(process_t* p) {
 }
 void sched_set_idle(process_t* idle) {
     cpu_t* me = this_cpu();
+    if (idle) { idle->refs = 0; spin_init_class_dynamic(&idle->mm_lock, LK_S35_MM, "mm"); }
     me->idle_task = idle;
     me->in_idle = (me->current && me->current == idle);
 }
@@ -345,11 +346,10 @@ void sched_reap_zombies(void) {
 
 // [M30] Notify the parent of a child's exit/stop via SIGCHLD.
 static void notify_parent_sigchld(process_t* child) {
-    extern process_t* process_find_by_pid(uint32_t);
     extern int signal_post(process_t*, int);
     if (!child || child->ppid == 0) return;
-    process_t* parent = process_find_by_pid(child->ppid);
-    if (parent) signal_post(parent, 17 /*SIGCHLD*/);
+    process_t* parent = process_get_by_pid(child->ppid);   // [M50-B1]
+    if (parent) { signal_post(parent, 17 /*SIGCHLD*/); process_put(parent); }
 }
 
 // An exiting process's children go to init (PID 1). When init itself exits,

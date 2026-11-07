@@ -14,6 +14,7 @@
 #include "../mm/vma.h" // [M14] per-process VMAs for demand paging
 #include "cred.h"      // [M43] uid/gid credentials
 #include "klock.h"     // [M50] klock_task_t
+#include "spinlock.h"  // [M50-B1] mm_lock
 
 // [M11] Process privilege type. A "driver" is a Ring-3 process granted
 // capability-mediated hardware access (SYS_DRIVER). The claim is rooted in the
@@ -203,7 +204,33 @@ typedef struct process {
     // [M50] Klocks this task holds (kernel/klock.h). Never inherited: fork and
     // every creation path reset it (klock_task_reset).
     klock_task_t klk;
+    // [M50-B1] Lifetime: references taken by process_get_by_pid()/process_get()
+    // (under proc_lock) and dropped by process_put(). The reaper never frees a
+    // zombie whose refs > 0; the next sched_reap_zombies() after the last put
+    // does. A process_t* obtained any other way is only valid while the caller
+    // is that process, holds proc_lock (process_foreach callbacks), or created
+    // it and has not published it yet.
+    volatile uint32_t refs;
+    // [M50-B1] Address-space lock (LK_S35_MM, irqsave): the VMA set, the user
+    // page tables of 'space' and the 'space' / 'image' pointers. The owner
+    // takes it for every edit (mmap/munmap/mprotect/brk, exec swap, fork copy,
+    // the PTE install of a fault); other tasks take it to read (procfs, umount).
+    // Rules: never held across a page-cache/FS call, a user copy, or anything
+    // that takes proc_lock (S30 < S35); see mm_lock()/mm_unlock() below.
+    spinlock_t mm_lock;
 } process_t;
+
+// [M50-B1] mm_lock helpers (see process_t.mm_lock).
+static inline uint64_t mm_lock(process_t* p) { return spin_lock_irqsave(&p->mm_lock); }
+static inline void mm_unlock(process_t* p, uint64_t fl) { spin_unlock_irqrestore(&p->mm_lock, fl); }
+// Let interrupts (and the BSP tick) in during a long page-table loop: drop and
+// retake the lock. Only for loops whose state does not depend on the lock
+// staying held (the owner is the only writer of its own VMAs).
+static inline void mm_relax(process_t* p, uint64_t* fl) {
+    spin_unlock_irqrestore(&p->mm_lock, *fl);
+    *fl = spin_lock_irqsave(&p->mm_lock);
+}
+#define MM_ASSERT_HELD(p) SPIN_ASSERT_HELD(&(p)->mm_lock)
 
 int process_init_system(void); // initialize process table
 process_t* process_create_from_elf(const void* elf_buf, size_t size);
@@ -220,10 +247,31 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
                  const char* blob, uint64_t blen, int argc, int envc);
 void process_print(const process_t* p);
 int  process_manifest_setid(const process_t* p);   // [M43] MANIFEST_FLAG_SETID in the signed manifest
+// [M50-B1] Process references. process_get_by_pid() returns the process with a
+// reference held (NULL if no such pid; zombies are returned too); every
+// successful get is paired with process_put(). process_get(p) adds a reference
+// to a process the caller already knows is alive (itself, or inside a
+// process_foreach callback, which runs under proc_lock). process_get_last()
+// returns the highest pid with a reference held.
+process_t* process_get_by_pid(uint32_t pid);
+process_t* process_get(process_t* p);
+void       process_put(process_t* p);
 process_t* process_get_last(void);
-process_t* process_find_by_pid(uint32_t pid);
+int        process_pid_state(uint32_t pid);    // state of pid, -1 when gone (no pointer escapes)
+// Remove a process that never ran (PROC_NEW, off every CPU, no reference)
+// from the table and return it for process_destroy(); NULL otherwise.
+process_t* process_detach_unstarted(uint32_t pid);
 void process_foreach(void (*cb)(process_t*, void*), void* user);
-process_t* process_reap_one(void); // [M48] detach+return one reapable, off-CPU ZOMBIE
+process_t* process_reap_one(void); // [M48] detach+return one reapable, off-CPU, unreferenced ZOMBIE
+// [M39/M50-B1] wait-any: collect an uncollected zombie child of ppid (marks it
+// collected under proc_lock); 1 + *pid/*code when one was found, else 0.
+int        process_collect_zombie_child(uint32_t ppid, uint32_t* pid, int* code);
+// Job control: consume a stop/continue report of a child of ppid; its pid, or 0.
+uint32_t   process_take_jobctl_child(uint32_t ppid, int want_stop, int want_cont, int* status);
+int        process_has_children(uint32_t ppid);
+// [M50-B1] Credentials: cross-process readers (kill permission, procfs owner)
+// read p->cred under proc_lock; the owner writes it under proc_lock.
+void       process_set_cred(process_t* p, const struct proc_cred* cr);
 // [M48] SMP scheduler support (kernel/process.c).
 process_t* process_claim_next(uint32_t cpu, process_t* after); // pick+claim (RUNNING, on_cpu)
 uint32_t process_pick_home(void);          // least-loaded online CPU for a new task

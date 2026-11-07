@@ -1418,8 +1418,8 @@ static void init_kill_orphans(void) {
     struct init_pids l; l.n = 0;
     process_foreach(init_pids_cb, &l);
     for (int i = 0; i < l.n; i++) {
-        process_t* p = process_find_by_pid(l.pid[i]);
-        if (p) signal_post(p, 9 /*SIGKILL*/);   // also resumes a stopped one
+        process_t* p = process_get_by_pid(l.pid[i]);
+        if (p) { signal_post(p, 9 /*SIGKILL*/); process_put(p); }   // also resumes a stopped one
     }
     for (int spin = 0; spin < 3000 && sched_count_alive_user() > 0; spin++) {
         cpu_wait_irq();

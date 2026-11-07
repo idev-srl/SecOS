@@ -1597,7 +1597,6 @@ typedef struct {
 } job_t;
 static job_t g_jobs[JOB_MAX];
 
-extern process_t* process_find_by_pid(uint32_t);
 extern void* pipe_alloc(void);
 
 // Drop jobs whose every process has exited (reaped/gone).
@@ -1606,8 +1605,8 @@ static void job_gc(void){
         if(!g_jobs[j].used) continue;
         int alive=0;
         for(int i=0;i<g_jobs[j].npid;i++){
-            process_t* p=process_find_by_pid(g_jobs[j].pids[i]);
-            if(p && p->state!=PROC_ZOMBIE) alive++;
+            int st=process_pid_state(g_jobs[j].pids[i]);   // [M50-B1] no pointer kept
+            if(st>=0 && st!=PROC_ZOMBIE) alive++;
         }
         if(!alive) g_jobs[j].used=0;
     }
@@ -1633,9 +1632,9 @@ static int job_wait_foreground(uint32_t pgid, const uint32_t* pids, int npid){
         sched_reap_zombies();
         int running=0, stopped=0;
         for(int i=0;i<npid;i++){
-            process_t* p=process_find_by_pid(pids[i]);
-            if(!p || p->state==PROC_ZOMBIE) continue;     // gone
-            if(p->state==PROC_STOPPED) stopped++; else running++;
+            int st=process_pid_state(pids[i]);
+            if(st<0 || st==PROC_ZOMBIE) continue;         // gone
+            if(st==PROC_STOPPED) stopped++; else running++;
         }
         if(running==0){
             sched_reap_zombies();
@@ -1787,9 +1786,10 @@ int shell_exec_foreground(const char* path, int argc, const char* const* argv,
     for(;;){
         int stopped=job_wait_foreground(pid,&pid,1);
         if(!stopped || !keep_running) return stopped;
-        process_t* q=process_find_by_pid(pid);
+        process_t* q=process_get_by_pid(pid);
         if(!q) return 0;
         signal_post(q,18/*SIGCONT*/);
+        process_put(q);
     }
 }
 
@@ -1875,20 +1875,22 @@ static void sh_verbose(const char* a){
     terminal_writestring("verbose: "); terminal_writestring(g_kverbose?"on\n":"off\n");
 }
 // --- Driver space commands ---
-static void sh_drvreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev = dev*10 + (*a-'0'); a++; } extern int driver_register_binding(process_t*, int); extern const device_desc_t* driver_get_device(int); extern process_t* sched_get_current(void); extern process_t* process_get_last(void);
+static void sh_drvreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev = dev*10 + (*a-'0'); a++; } extern int driver_register_binding(process_t*, int); extern const device_desc_t* driver_get_device(int); extern process_t* sched_get_current(void);
+    process_t* ref = NULL;   // [M50-B1] the fallback target is held by a reference
     process_t* target = sched_get_current(); if(!target){ // fallback: last created process
-        target = process_get_last();
+        target = ref = process_get_last();
         if(target){ terminal_writestring("[drvreg] (fallback: using last process, no current)\n"); }
     }
     if(!target){ terminal_writestring("[drvreg] no process: run 'elfload' first\n"); return; }
-    if(!driver_get_device(dev)){ terminal_writestring("[drvreg] device not found\n"); return; }
+    if(!driver_get_device(dev)){ terminal_writestring("[drvreg] device not found\n"); process_put(ref); return; }
     int r = driver_register_binding(target, dev);
     // [M11] Manual/dev binding path: also mark the target a driver so SYS_DRIVER
     // (which now requires PROC_TYPE_DRIVER) accepts it. The signed-manifest path
     // is the production route; this is the interactive harness.
     if(r==DRV_OK){ target->proc_type = PROC_TYPE_DRIVER; target->drv_dev_id = dev; target->drv_caps = driver_binding_caps(target, dev); terminal_writestring("[drvreg] OK\n"); }
-    else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvreg] FAIL device\n"); else if(r==DRV_ERR_PERM) terminal_writestring("[drvreg] FAIL no slot\n"); else terminal_writestring("[drvreg] FAIL\n"); }
-static void sh_drvunreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvunreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev=dev*10+(*a-'0'); a++; } extern int driver_remove_binding(process_t*, int); extern process_t* sched_get_current(void); extern process_t* process_get_last(void); process_t* target = sched_get_current(); if(!target) target = process_get_last(); if(!target){ terminal_writestring("[drvunreg] no process (create with elfload)\n"); return; } int r=driver_remove_binding(target, dev); if(r==DRV_OK) terminal_writestring("[drvunreg] OK (removed)\n"); else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvunreg] FAIL binding not found\n"); else terminal_writestring("[drvunreg] FAIL\n"); }
+    else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvreg] FAIL device\n"); else if(r==DRV_ERR_PERM) terminal_writestring("[drvreg] FAIL no slot\n"); else terminal_writestring("[drvreg] FAIL\n");
+    process_put(ref); }
+static void sh_drvunreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvunreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev=dev*10+(*a-'0'); a++; } extern int driver_remove_binding(process_t*, int); extern process_t* sched_get_current(void); process_t* ref = NULL; process_t* target = sched_get_current(); if(!target) target = ref = process_get_last(); if(!target){ terminal_writestring("[drvunreg] no process (create with elfload)\n"); return; } int r=driver_remove_binding(target, dev); process_put(ref); if(r==DRV_OK) terminal_writestring("[drvunreg] OK (removed)\n"); else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvunreg] FAIL binding not found\n"); else terminal_writestring("[drvunreg] FAIL\n"); }
 static void sh_drvlog(const char* a){
     extern int driver_audit_dump(driver_audit_entry_t*, int);
     int only_errors=0; int filter_dev=-1; int filter_op=-1; int limit=32;
@@ -2003,7 +2005,19 @@ static void sh_elfload2(const char* a) {
     kfree(elf_buf); // buffer no longer needed
     if(!p) terminal_writestring("[ELFLOAD2] Failed\n"); else terminal_writestring("[ELFLOAD2] OK (process created)\n");
     }
-static void sh_elfunload(const char* a) { extern process_t* process_get_last(void); extern process_t* process_find_by_pid(uint32_t pid); extern int process_destroy(process_t* p); uint32_t pid=0; while(*a==' ') a++; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; } process_t* target = pid? process_find_by_pid(pid): process_get_last(); if(!target) terminal_writestring("[ELFUNLOAD] process not found\n"); else { int ur=process_destroy(target); if(ur==0) terminal_writestring("[ELFUNLOAD] OK (process destroyed)\n"); else terminal_writestring("[ELFUNLOAD] FAIL\n"); } }
+// [M50-B1] Only a process that never ran (elfload) and that nobody references
+// is destroyed here (process_detach_unstarted); a running one must be killed.
+static void sh_elfunload(const char* a) {
+    extern int process_destroy(process_t* p);
+    uint32_t pid=0; while(*a==' ') a++; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; }
+    if(!pid){ process_t* last = process_get_last(); if(last){ pid = last->pid; process_put(last); } }
+    if(!pid || process_pid_state(pid) < 0){ terminal_writestring("[ELFUNLOAD] process not found\n"); return; }
+    process_t* target = process_detach_unstarted(pid);
+    if(!target){ terminal_writestring("[ELFUNLOAD] FAIL (process already started: use kill)\n"); return; }
+    int ur=process_destroy(target);
+    process_reap_done();
+    if(ur==0) terminal_writestring("[ELFUNLOAD] OK (process destroyed)\n"); else terminal_writestring("[ELFUNLOAD] FAIL\n");
+}
 static void sh_ps(const char* a){ (void)a; pager_begin(); shell_ps_list(); pager_end(); }
 // [M30] kill [-SIG] <pid> | kill [-SIG] %job — send a signal (default SIGTERM).
 // Now signal-based (was a forced process_destroy): it works on blocked/stopped
@@ -2021,9 +2035,11 @@ static void sh_kill(const char* a){
         return;
     }
     uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; }
-    process_t* t=process_find_by_pid(pid);
+    process_t* t=process_get_by_pid(pid);
     if(!t){ terminal_writestring("[kill] PID not found\n"); return; }
-    if(signal_post(t,sig)==0) terminal_writestring("[kill] OK\n"); else terminal_writestring("[kill] FAIL\n");
+    int pr=signal_post(t,sig);
+    process_put(t);
+    if(pr==0) terminal_writestring("[kill] OK\n"); else terminal_writestring("[kill] FAIL\n");
 }
 // Helper per decodificare flags manifest
 static void decode_manifest_flags(uint32_t f, char* out, size_t cap) {
@@ -2048,11 +2064,10 @@ static void decode_manifest_flags(uint32_t f, char* out, size_t cap) {
 }
 
 static void sh_pinfo(const char* a){
-    extern process_t* process_find_by_pid(uint32_t pid);
     while(*a==' ') a++;
     if(!*a){ terminal_writestring("Usage: pinfo <pid>\n"); return; }
     uint32_t pid=0; while(*a>='0'&&*a<='9'){ pid=pid*10+(*a-'0'); a++; }
-    process_t* p = process_find_by_pid(pid);
+    process_t* p = process_get_by_pid(pid);   // [M50-B1] put at the end
     if(!p){ terminal_writestring("[PINFO] PID not found\n"); return; }
     char hx[]="0123456789ABCDEF"; char buf[64];
     terminal_writestring("[PINFO] PID="); for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->pid>>i)&0xF]);
@@ -2066,9 +2081,13 @@ static void sh_pinfo(const char* a){
     terminal_writestring("\n  RIP="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->regs.rip>>i)&0xF]);
     terminal_writestring(" RSP="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->regs.rsp>>i)&0xF]);
     terminal_writestring(" RFLAGS="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->regs.rflags>>i)&0xF]);
-    // Manifest
-    if(p->manifest){
-        elf_manifest_t* mf = (elf_manifest_t*)p->manifest;
+    // Manifest: copied under the target's mm_lock (exec swaps and frees it).
+    elf_manifest_t mfc; int has_mf = 0;
+    { uint64_t mfl = mm_lock(p);
+      if(p->manifest){ mfc = *(const elf_manifest_t*)p->manifest; has_mf = 1; }
+      mm_unlock(p, mfl); }
+    if(has_mf){
+        elf_manifest_t* mf = &mfc;
         terminal_writestring("\n  Manifest: version="); itoa(mf->version, buf, 10); terminal_writestring(buf);
         terminal_writestring(" max_mem="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(mf->max_mem>>i)&0xF]);
         terminal_writestring(" entry_hint="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(mf->entry_hint>>i)&0xF]);
@@ -2078,6 +2097,7 @@ static void sh_pinfo(const char* a){
         terminal_writestring("\n  Manifest: <none>");
     }
     terminal_writestring("\n");
+    process_put(p);
 }
 
 // (Tabella gia' definita sopra)

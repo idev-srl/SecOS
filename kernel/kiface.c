@@ -650,11 +650,15 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
          * "may my invoker do this?"): run the walk and the check with the
          * effective ids temporarily set to the real ones (no preemption in
          * a syscall, and the process runs on one CPU). */
-        uint32_t se = c->cred.euid, sg = c->cred.egid;
-        c->cred.euid = c->cred.ruid; c->cred.egid = c->cred.rgid;
+        /* [M50-B1] Each swap is published under proc_lock (process_set_cred);
+         * a cross-process reader may observe the real ids for the duration of
+         * the check, as with Linux's access() override credentials. */
+        struct proc_cred saved = c->cred, tmp = c->cred;
+        tmp.euid = tmp.ruid; tmp.egid = tmp.rgid;
+        process_set_cred(c, &tmp);
         vfs_inode_t* ino = 0;
         e = cred_check_path(c, p0, 1, mode, 0, 0, &ino);
-        c->cred.euid = se; c->cred.egid = sg;
+        process_set_cred(c, &saved);
         r = e ? NEG(-e) : 0;
         break;
     }

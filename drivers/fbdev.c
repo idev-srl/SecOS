@@ -202,21 +202,27 @@ int64_t fbdev_mmap(struct process* cp, uint64_t len, int prot, int flags, uint64
     len = (len + 0xFFFULL) & ~0xFFFULL;
     if (len == 0 || off >= size || len > size - off) return E_INVAL;   /* beyond the framebuffer */
 
-    uint64_t base = c->mmap_next;
-    if (base >= USER_MMAP_END || len > USER_MMAP_END - base) return E_NOMEM;
-    if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) return E_NOMEM;
-    uint64_t vf = VMM_FLAG_USER | VMM_FLAG_NOEXEC | ((prot & PROT_WRITE_) ? VMM_FLAG_RW : 0);
-    if (vma_add_phys(&c->vmas, base, base + len, vf, fi.addr + off) != 0) return E_NOMEM;
-    c->mmap_next = base + len;
-    /* Map it eagerly (the #PF path would also fault pages in one by one).
-     * PAT slot 1 = Write-Combining for the PWT-tagged PTEs. */
+    /* PAT slot 1 = Write-Combining for the PWT-tagged PTEs. */
     extern void vmm_pat_init(void);
     vmm_pat_init();
+    uint64_t vf = VMM_FLAG_USER | VMM_FLAG_NOEXEC | ((prot & PROT_WRITE_) ? VMM_FLAG_RW : 0);
+    /* [M50-B1] VMA edit + eager PTE install under the owner's mm_lock (device
+     * pages: no frame fill, no page cache). */
+    uint64_t mfl = mm_lock(c);
+    uint64_t base = c->mmap_next;
+    if (base >= USER_MMAP_END || len > USER_MMAP_END - base) { mm_unlock(c, mfl); return E_NOMEM; }
+    if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) { mm_unlock(c, mfl); return E_NOMEM; }
+    if (vma_add_phys(&c->vmas, base, base + len, vf, fi.addr + off) != 0) { mm_unlock(c, mfl); return E_NOMEM; }
+    c->mmap_next = base + len;
+    /* Map it eagerly (the #PF path would also fault pages in one by one). */
     const vma_t* v = vma_find(&c->vmas, base);
+    uint32_t n = 0;
     for (uint64_t va = base; v && va < base + len; va += 0x1000) {
         int r = vma_fault_in(c->space, v, va);
         if (r != 0 && r != -3) break;              /* -3: already mapped */
+        if ((++n & 255) == 0) mm_relax(c, &mfl);   /* only we edit our VMAs */
     }
+    mm_unlock(c, mfl);
     if (g_kverbose) {
         debugcon_writestring("[FB] mmap pid="); debugcon_print_hex(c->pid);
         debugcon_writestring(" va="); debugcon_print_hex(base);

@@ -162,7 +162,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     // child would: without this `cd /tmp; tar cf a.tar f1` ran tar in "/".
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0) p->ki.umask = sp->ki.umask;
-      if (sp && sp->pid != 0) p->cred = sp->cred;          // [M43] same user as the spawner
+      if (sp && sp->pid != 0) process_set_cred(p, &sp->cred);   // [M43] same user as the spawner
       cred_exec_setid(p, fmode, fuid, fgid, setid_allowed(p, fmode, setid_fs, bound.valid && bound.nnp)); }
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0 && sp->cwd[0]) {
@@ -256,10 +256,9 @@ long ksys_execve(struct trapframe* tf, uint64_t upath, uint64_t uargv, uint64_t 
 // Poll variant (used by the kernel shell): 0 if the pid has exited (ZOMBIE) or
 // is gone; 1 if still running. User processes use the blocking SYS_WAIT instead.
 int ksys_wait(int pid){
-    extern process_t* process_find_by_pid(uint32_t);
-    process_t* t = process_find_by_pid((uint32_t)pid);
-    if(!t) return 0;
-    return (t->state == PROC_ZOMBIE) ? 0 : 1;
+    int st = process_pid_state((uint32_t)pid);   // [M50-B1] no pointer escapes
+    if(st < 0) return 0;
+    return (st == PROC_ZOMBIE) ? 0 : 1;
 }
 
 // [M17] Non-blocking recv attempt used by the blocking SYS_MSG_RECV path in
@@ -302,26 +301,45 @@ static uint64_t m18_user_span(uint64_t addr, uint64_t len){
     return len;
 }
 
+// [M50-B1] brk/mmap/munmap/mprotect edit the caller's VMAs and page tables
+// under its mm_lock (cross-process readers: procfs, umount). Long PTE loops
+// mm_relax() every MM_RELAX_PAGES pages so interrupts get in; that is safe
+// because only the owner edits its own VMA set. Nothing in these sections
+// reaches the page cache, a filesystem or user memory.
+#define MM_RELAX_PAGES 256
+static void mm_unmap_range(process_t* c, uint64_t lo, uint64_t hi, uint64_t* fl){
+    uint32_t n = 0;
+    for (uint64_t va = lo & ~0xFFFULL; va < hi; va += 0x1000) {
+        vmm_unmap_in_space(c->space, va);
+        if ((++n % MM_RELAX_PAGES) == 0) mm_relax(c, fl);
+    }
+}
+
 uint64_t ksys_brk(uint64_t new_brk){
     process_t* c = sched_get_current();
     if (!c) return 0;
     if (new_brk == 0) return c->brk_cur;            // query current break
     new_brk = pgup(new_brk);
     if (new_brk < c->brk_start || new_brk >= USER_MMAP_BASE) return c->brk_cur;
+    uint64_t fl = mm_lock(c);
     uint64_t old = c->brk_cur;
-    if (new_brk == old) return old;
+    if (new_brk == old) { mm_unlock(c, fl); return old; }
     if (new_brk > old) {                            // grow
-        if (c->mem_limit && vma_total_bytes(&c->vmas) + (new_brk - old) > c->mem_limit)
+        if (c->mem_limit && vma_total_bytes(&c->vmas) + (new_brk - old) > c->mem_limit) {
+            mm_unlock(c, fl);
             return old;                             // would exceed signed mem limit
+        }
         // Extend the heap's LAST piece (mprotect may have split the heap) when
         // it is plain RW anon; otherwise add a fresh RW piece for [old, new).
         const uint64_t hf = VMM_FLAG_USER|VMM_FLAG_RW|VMM_FLAG_NOEXEC;
         vma_t* h = (old > c->brk_start) ? vma_find_mut(&c->vmas, old - 1) : 0;
         if (h && h->end == old && h->type == VMA_TYPE_ANON && h->flags == hf) h->end = new_brk;
-        else if (vma_add(&c->vmas, old, new_brk, hf, VMA_TYPE_ANON,0,0,0,0) != 0)
+        else if (vma_add(&c->vmas, old, new_brk, hf, VMA_TYPE_ANON,0,0,0,0) != 0) {
+            mm_unlock(c, fl);
             return old;
+        }
     } else {                                        // shrink
-        for (uint64_t va = new_brk; va < old; va += 0x1000) vmm_unmap_in_space(c->space, va);
+        mm_unmap_range(c, new_brk, old, &fl);
         for (uint32_t i = 0; i < c->vmas.count; i++) {   // trim every heap piece
             vma_t* v = &c->vmas.v[i];
             if (v->type == VMA_TYPE_NONE || v->end <= new_brk || v->start >= old) continue;
@@ -330,6 +348,7 @@ uint64_t ksys_brk(uint64_t new_brk){
         }
     }
     c->brk_cur = new_brk;
+    mm_unlock(c, fl);
     return new_brk;
 }
 
@@ -355,29 +374,37 @@ uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
         if (input_is_client(c->fds[fd].inode)) return (uint64_t)(int64_t)-19;   // -ENODEV
     }
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return (uint64_t)-1; // W^X
-    uint64_t base = c->mmap_next;
-    if (base >= USER_MMAP_END || len > USER_MMAP_END - base) return (uint64_t)-1; // arena exhausted (no wrap)
-    len = pgup(len);
-    if (len > USER_MMAP_END - base) return (uint64_t)-1;
-    if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) return (uint64_t)-1;
-    if (flags & MAP_ANONYMOUS) {
-        if (vma_add(&c->vmas, base, base + len, m18_prot_to_flags(prot), VMA_TYPE_ANON,0,0,0,0) != 0)
-            return (uint64_t)-1;
-    } else {
+    vfs_inode_t* ino = 0;
+    if (!(flags & MAP_ANONYMOUS)) {
         // [M20] File-backed mmap (MAP_PRIVATE) via the page cache, from offset 0.
         if (fd < 0 || fd >= 32 || !c->fds[fd].used) return (uint64_t)-1;
         if (c->fds[fd].is_pipe || c->fds[fd].is_sock) return (uint64_t)-1;  // not a file
-        vfs_inode_t* ino = (vfs_inode_t*)c->fds[fd].inode;
+        ino = (vfs_inode_t*)c->fds[fd].inode;
         if (!ino) return (uint64_t)-1;
         // devfs/procfs/sysfs contents are generated and their inode slots are
         // recycled per lookup: cached pages keyed by such a slot would later be
         // served as another node's contents. Not mappable (Linux: -ENODEV).
         if (!ino->ops || (ino->ops->flags & VFS_FS_NOCACHE)) return (uint64_t)(int64_t)-19;
+    }
+    uint64_t fl = mm_lock(c);
+    uint64_t base = c->mmap_next;
+    uint64_t r = (uint64_t)-1;
+    if (base >= USER_MMAP_END || len > USER_MMAP_END - base) goto out;  // arena exhausted (no wrap)
+    len = pgup(len);
+    if (len > USER_MMAP_END - base) goto out;
+    if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) goto out;
+    if (!ino) {
+        if (vma_add(&c->vmas, base, base + len, m18_prot_to_flags(prot), VMA_TYPE_ANON,0,0,0,0) != 0)
+            goto out;
+    } else {
         if (vma_add_file(&c->vmas, base, base + len, m18_prot_to_flags(prot), ino, 0) != 0)
-            return (uint64_t)-1;
+            goto out;
     }
     c->mmap_next = base + len;
-    return base;
+    r = base;
+out:
+    mm_unlock(c, fl);
+    return r;
 }
 
 int ksys_munmap(uint64_t addr, uint64_t len){
@@ -386,6 +413,7 @@ int ksys_munmap(uint64_t addr, uint64_t len){
     len = m18_user_span(addr, len);
     if (!len) return -1;                                     // EINVAL
     uint64_t end = addr + len;
+    uint64_t fl = mm_lock(c);
     // Every user page is VMA-backed (M14), so only VMA intersections can hold
     // present PTEs: unmap those instead of walking the whole (maybe huge) range.
     for (uint32_t i = 0; i < c->vmas.count; i++) {
@@ -393,7 +421,7 @@ int ksys_munmap(uint64_t addr, uint64_t len){
         if (v->type == VMA_TYPE_NONE || !(addr < v->end && v->start < end)) continue;
         uint64_t lo = addr > v->start ? addr : v->start;
         uint64_t hi = end  < v->end   ? end  : v->end;
-        for (uint64_t va = lo & ~0xFFFULL; va < hi; va += 0x1000) vmm_unmap_in_space(c->space, va);
+        mm_unmap_range(c, lo, hi, &fl);
     }
     for (uint32_t i = 0; i < c->vmas.count; i++) {
         vma_t* v = &c->vmas.v[i];
@@ -412,6 +440,7 @@ int ksys_munmap(uint64_t addr, uint64_t len){
                 vma_add(&c->vmas, end, old_end, v->flags, VMA_TYPE_ANON,0,0,0,0);
         }
     }
+    mm_unlock(c, fl);
     return 0;
 }
 
@@ -422,12 +451,14 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
     len = m18_user_span(addr, len);
     if (!len) return -1;                                        // EINVAL
     uint64_t end = addr + len;
-    if (!vma_overlaps(&c->vmas, addr, end)) return -1;          // must be backed
+    uint64_t fl = mm_lock(c);
+    int ret = -1;
+    if (!vma_overlaps(&c->vmas, addr, end)) goto out;           // must be backed
     // [M40] Device memory (the framebuffer) is never executable.
     if (prot & PROT_EXEC) {
         for (uint32_t i = 0; i < c->vmas.count; i++) {
             const vma_t* v = &c->vmas.v[i];
-            if (v->type == VMA_TYPE_PHYS && addr < v->end && v->start < end) return -1;
+            if (v->type == VMA_TYPE_PHYS && addr < v->end && v->start < end) goto out;
         }
     }
     uint64_t newf = m18_prot_to_flags(prot);
@@ -438,12 +469,12 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
     for (uint32_t i = 0; i < c->vmas.count; i++) {
         vma_t* v = &c->vmas.v[i];
         if (v->type == VMA_TYPE_NONE) continue;
-        if (v->start < addr && addr < v->end && vma_split(&c->vmas, v, addr) != 0) return -1;
+        if (v->start < addr && addr < v->end && vma_split(&c->vmas, v, addr) != 0) goto out;
     }
     for (uint32_t i = 0; i < c->vmas.count; i++) {
         vma_t* v = &c->vmas.v[i];
         if (v->type == VMA_TYPE_NONE) continue;
-        if (v->start < end && end < v->end && vma_split(&c->vmas, v, end) != 0) return -1;
+        if (v->start < end && end < v->end && vma_split(&c->vmas, v, end) != 0) goto out;
     }
     for (uint32_t i = 0; i < c->vmas.count; i++) {
         vma_t* v = &c->vmas.v[i];
@@ -456,9 +487,16 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
         if (v->type == VMA_TYPE_NONE || !(addr < v->end && v->start < end)) continue;
         uint64_t lo = addr > v->start ? addr : v->start;
         uint64_t hi = end  < v->end   ? end  : v->end;
-        for (uint64_t va = lo & ~0xFFFULL; va < hi; va += 0x1000) vmm_protect_in_space(c->space, va, newf);
+        uint32_t n = 0;
+        for (uint64_t va = lo & ~0xFFFULL; va < hi; va += 0x1000) {
+            vmm_protect_in_space(c->space, va, newf);
+            if ((++n % MM_RELAX_PAGES) == 0) mm_relax(c, &fl);
+        }
     }
-    return 0;
+    ret = 0;
+out:
+    mm_unlock(c, fl);
+    return ret;
 }
 void ksys_exit(int status){ (void)status; extern process_t* sched_get_current(void); extern int process_destroy(process_t*); process_t* c=sched_get_current(); if(c){ process_destroy(c); } }
 // [M38] open() now honours O_CREAT (0x40) / O_TRUNC (0x200) / O_APPEND (0x400),
@@ -1058,10 +1096,12 @@ static void umount_busy_cb(process_t* p, void* u){
         if(!e->used || e->is_pipe || e->is_sock || !e->inode) continue;
         if(((const vfs_inode_t*)e->inode)->ops == b->ops){ b->busy = 1; return; }
     }
+    uint64_t fl = mm_lock(p);            // [M50-B1] S30 (process_foreach) -> S35
     for(uint32_t i=0;i<p->vmas.count;i++){
         const vma_t* v = &p->vmas.v[i];
-        if(v->type != VMA_TYPE_NONE && v->file_inode && v->file_inode->ops == b->ops){ b->busy = 1; return; }
+        if(v->type != VMA_TYPE_NONE && v->file_inode && v->file_inode->ops == b->ops){ b->busy = 1; break; }
     }
+    mm_unlock(p, fl);
 }
 int ksys_umount(const char* target){
     extern int vfs_unmount(const char*);
