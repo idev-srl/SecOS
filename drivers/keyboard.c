@@ -150,8 +150,10 @@ static int buffer_peek(void) {
 }
 
 // [M22] Poll the USB HID keyboard (if present). Safe no-op when no USB keyboard
-// is attached. Driven from the input-wait path below, never from an ISR, so it
-// never races the event ring against an in-flight MSC/control transfer.
+// is attached. Driven from the input-wait path below, never from an ISR.
+// [M50 B3] Callable on any CPU at once: it only trylocks the HID and xHCI
+// locks, so it returns at once (no keystroke lost, the next poll collects it)
+// while another CPU polls or runs a USB Mass Storage transfer.
 extern void usb_hid_poll(void);
 
 // Check if buffer has characters

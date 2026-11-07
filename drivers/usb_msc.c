@@ -10,9 +10,16 @@
  * READ(10)/WRITE(10). FAT32/ext2/ext4 mount on top unchanged.
  *
  * Multiple devices are supported (usb0..usb3): each attached MSC interface gets
- * its own instance. The CBW/CSW/data scratch buffers are shared because all USB
- * transfers are polled and serialized (single xHCI event ring + block_io_lock),
- * so only one command is ever in flight at a time.
+ * its own instance with its own CBW/CSW/data DMA buffers.
+ *
+ * [M50 B3] Locking: one Bulk-Only command (CBW, data, CSW) is serialized per
+ * device by the device's block_dev_t klock (fs/block.h; every read/write comes
+ * through block_read/block_write). Each single xHCI transfer takes xhci_lock
+ * inside xhci.c, so a HID poll or another usbN can run between the three
+ * phases. Before block_register (during enumeration) the device is private to
+ * the enumerating task, which holds xhci_enum_lock. Error recovery reads the
+ * device's own completion code (xhci_dev_last_cc), never the controller-wide
+ * one another CPU may have just overwritten.
  */
 #include "usb.h"
 #include "block.h"
@@ -38,11 +45,16 @@ typedef struct {
 static msc_dev_t g_msc[MAX_MSC];
 static int g_nmsc = 0;
 
-// Shared transfer scratch (serialized access — one command in flight at a time).
-static uint8_t g_cbw[31] __attribute__((aligned(64)));
-static uint8_t g_csw[13] __attribute__((aligned(64)));
-static uint8_t g_data[32 * 1024] __attribute__((aligned(64)));
-#define DATA_BYTES sizeof(g_data)
+// Per-device transfer buffers (indexed like g_msc). The data buffer is aligned
+// to its size so a single TRB never crosses a 64 KiB boundary.
+static uint8_t g_cbw_all[MAX_MSC][64] __attribute__((aligned(64)));
+static uint8_t g_csw_all[MAX_MSC][64] __attribute__((aligned(64)));
+static uint8_t g_data_all[MAX_MSC][32 * 1024] __attribute__((aligned(32 * 1024)));
+#define DATA_BYTES sizeof(g_data_all[0])
+#define M_IDX(m)  ((int)((m) - g_msc))
+#define M_CBW(m)  (g_cbw_all[M_IDX(m)])
+#define M_CSW(m)  (g_csw_all[M_IDX(m)])
+#define M_DATA(m) (g_data_all[M_IDX(m)])
 
 static void put32le(uint8_t* p, uint32_t v) { p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]=v>>24; }
 static uint32_t get32be(const uint8_t* p) {
@@ -61,17 +73,19 @@ static void clear_halt(msc_dev_t* m, uint8_t ep) {
 // Per the BOT spec, a STALL on a bulk endpoint is recoverable: clear the halt and
 // (for the status phase) retry reading the CSW once.
 static int msc_cmd(msc_dev_t* m, int dir_in, const uint8_t* cdb, int cdblen, void* data, uint32_t dlen) {
-    for (int i = 0; i < 31; i++) g_cbw[i] = 0;
-    put32le(g_cbw, CBW_SIG);
-    put32le(g_cbw + 4, ++m->tag);
-    put32le(g_cbw + 8, dlen);
-    g_cbw[12] = dir_in ? 0x80 : 0x00;   // bmCBWFlags
-    g_cbw[13] = 0;                       // LUN 0
-    g_cbw[14] = (uint8_t)cdblen;
-    for (int i = 0; i < cdblen && i < 16; i++) g_cbw[15 + i] = cdb[i];
+    uint8_t* cbw = M_CBW(m);
+    uint8_t* csw = M_CSW(m);
+    for (int i = 0; i < 31; i++) cbw[i] = 0;
+    put32le(cbw, CBW_SIG);
+    put32le(cbw + 4, ++m->tag);
+    put32le(cbw + 8, dlen);
+    cbw[12] = dir_in ? 0x80 : 0x00;   // bmCBWFlags
+    cbw[13] = 0;                       // LUN 0
+    cbw[14] = (uint8_t)cdblen;
+    for (int i = 0; i < cdblen && i < 16; i++) cbw[15 + i] = cdb[i];
 
-    if (xhci_transfer(m->dev, m->ep_out, g_cbw, 31) != 31) {
-        if (xhci_last_cc() == XHCI_CC_STALL) clear_halt(m, m->ep_out);
+    if (xhci_transfer(m->dev, m->ep_out, cbw, 31) != 31) {
+        if (xhci_dev_last_cc(m->dev) == XHCI_CC_STALL) clear_halt(m, m->ep_out);
         return -1;
     }
     if (dlen > 0) {
@@ -79,22 +93,22 @@ static int msc_cmd(msc_dev_t* m, int dir_in, const uint8_t* cdb, int cdblen, voi
         int r = xhci_transfer(m->dev, ep, data, (int)dlen);
         if (r < 0) {
             // A stalled data phase is recoverable: clear it and still read the CSW.
-            if (xhci_last_cc() == XHCI_CC_STALL) clear_halt(m, ep);
+            if (xhci_dev_last_cc(m->dev) == XHCI_CC_STALL) clear_halt(m, ep);
             else return -1;
         }
     }
-    int got = xhci_transfer(m->dev, m->ep_in, g_csw, 13);
+    int got = xhci_transfer(m->dev, m->ep_in, csw, 13);
     if (got < 0) {
-        if (xhci_last_cc() == XHCI_CC_STALL) {
+        if (xhci_dev_last_cc(m->dev) == XHCI_CC_STALL) {
             clear_halt(m, m->ep_in);
-            got = xhci_transfer(m->dev, m->ep_in, g_csw, 13);   // retry CSW once
+            got = xhci_transfer(m->dev, m->ep_in, csw, 13);   // retry CSW once
         }
         if (got < 0) return -1;
     }
-    uint32_t sig = (uint32_t)g_csw[0] | ((uint32_t)g_csw[1] << 8) |
-                   ((uint32_t)g_csw[2] << 16) | ((uint32_t)g_csw[3] << 24);
+    uint32_t sig = (uint32_t)csw[0] | ((uint32_t)csw[1] << 8) |
+                   ((uint32_t)csw[2] << 16) | ((uint32_t)csw[3] << 24);
     if (sig != CSW_SIG) return -1;
-    return (g_csw[12] == 0) ? 0 : -1;    // bCSWStatus
+    return (csw[12] == 0) ? 0 : -1;    // bCSWStatus
 }
 
 static int scsi_test_unit_ready(msc_dev_t* m) {
@@ -103,36 +117,38 @@ static int scsi_test_unit_ready(msc_dev_t* m) {
 }
 static int scsi_request_sense(msc_dev_t* m) {
     uint8_t cdb[6] = {0x03, 0, 0, 0, 18, 0};
-    return msc_cmd(m, 1, cdb, 6, g_data, 18);
+    return msc_cmd(m, 1, cdb, 6, M_DATA(m), 18);
 }
 static int scsi_inquiry(msc_dev_t* m) {
     uint8_t cdb[6] = {0x12, 0, 0, 0, 36, 0};
-    return msc_cmd(m, 1, cdb, 6, g_data, 36);
+    return msc_cmd(m, 1, cdb, 6, M_DATA(m), 36);
 }
 static int scsi_read_capacity(msc_dev_t* m) {
     uint8_t cdb[10] = {0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    if (msc_cmd(m, 1, cdb, 10, g_data, 8) != 0) return -1;
-    uint32_t last_lba = get32be(g_data);
-    uint32_t blksz = get32be(g_data + 4);
+    if (msc_cmd(m, 1, cdb, 10, M_DATA(m), 8) != 0) return -1;
+    uint32_t last_lba = get32be(M_DATA(m));
+    uint32_t blksz = get32be(M_DATA(m) + 4);
     m->sector_count = (uint64_t)last_lba + 1;
     m->sector_size = blksz ? blksz : 512;
     return 0;
 }
 
 static int msc_rw(msc_dev_t* m, uint64_t lba, uint8_t* buf, uint32_t count, int write) {
+    uint8_t* dbuf = M_DATA(m);
+    KLOCK_ASSERT_HELD(&m->blk.lock);
     uint32_t per = DATA_BYTES / m->sector_size;
     uint32_t done = 0;
     while (done < count) {
         uint32_t chunk = count - done; if (chunk > per) chunk = per;
         uint32_t nbytes = chunk * m->sector_size;
-        if (write) for (uint32_t i = 0; i < nbytes; i++) g_data[i] = buf[done * m->sector_size + i];
+        if (write) for (uint32_t i = 0; i < nbytes; i++) dbuf[i] = buf[done * m->sector_size + i];
         uint32_t slba = (uint32_t)(lba + done);
         uint8_t cdb[10] = { (uint8_t)(write ? 0x2A : 0x28), 0,
                             (uint8_t)(slba >> 24), (uint8_t)(slba >> 16),
                             (uint8_t)(slba >> 8), (uint8_t)slba, 0,
                             (uint8_t)(chunk >> 8), (uint8_t)chunk, 0 };
-        if (msc_cmd(m, write ? 0 : 1, cdb, 10, g_data, nbytes) != 0) return -1;
-        if (!write) for (uint32_t i = 0; i < nbytes; i++) buf[done * m->sector_size + i] = g_data[i];
+        if (msc_cmd(m, write ? 0 : 1, cdb, 10, dbuf, nbytes) != 0) return -1;
+        if (!write) for (uint32_t i = 0; i < nbytes; i++) buf[done * m->sector_size + i] = dbuf[i];
         done += chunk;
     }
     return (int)count;
@@ -161,7 +177,7 @@ void usb_msc_attach(usb_device_t* d, const usb_endpoint_t* eps, int n, uint8_t i
     {
         uint8_t s[8], maxlun = 0;
         usb_setup(s, 0xA1, 0xFE, 0, iface, 1);
-        if (xhci_control(d, s, &maxlun, 1) < 0 && xhci_last_cc() == XHCI_CC_STALL)
+        if (xhci_control(d, s, &maxlun, 1) < 0 && xhci_dev_last_cc(d) == XHCI_CC_STALL)
             clear_halt(m, 0);
     }
 

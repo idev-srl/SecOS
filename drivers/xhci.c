@@ -10,6 +10,25 @@
  * gets an EP0 ring plus up to XHCI_EPR_PER_DEV data-endpoint rings. All DMA
  * structures are static, suitably aligned kernel buffers; physical addresses
  * come from kvirt_to_phys. Completions are found by draining the event ring.
+ *
+ * [M50 B3] Locking. Two locks:
+ *  - xhci_lock (spinlock, LK_S45_XHCI, irqsave): the command ring, the event
+ *    ring + its stash, every transfer ring, the input contexts, the DCBAA, the
+ *    32-bit bounce and g_ndev/g_dev[]. Every exported primitive takes it for
+ *    exactly one transfer or command (submit + polled wait), never across a
+ *    whole multi-transfer protocol exchange: a USB Mass Storage command is a
+ *    CBW, a data and a CSW transfer, so another CPU's HID poll can slip in
+ *    between them (the MSC exchange itself is serialized by the disk's
+ *    block_dev_t klock). The waits under it are bounded busy-polls of the
+ *    event ring (iteration count); they never need an interrupt or the
+ *    scheduler tick. The non-blocking HID path (xhci_submit,
+ *    xhci_poll_transfer) only TRIES the lock, so a keyboard poll from syscall
+ *    context on any CPU never spins behind a long bulk transfer.
+ *  - xhci_enum_lock (klock, LK_K35_USB_ENUM): one enumeration at a time (port
+ *    reset, slot setup, then the USB core's descriptor reads and class bind,
+ *    including hub fan-out). Port resets wait 10-200 ms of real time (TSC), so
+ *    this is a klock (IF on, holder not preempted) and xhci_lock is NOT held
+ *    across them.
  */
 #include "xhci.h"
 #include "usb.h"
@@ -20,6 +39,8 @@
 #include "idt.h"
 #include "lapic.h"
 #include "tsc.h"      // ktime_ms — real-time delays for port reset (real-HW timing)
+#include "spinlock.h"
+#include "klock.h"
 #include <stddef.h>
 
 // ---- Capability registers ----
@@ -112,9 +133,26 @@ static uint8_t g_bounce32[XHCI_BOUNCE_BYTES] __attribute__((aligned(4096)));
 
 static usb_device_t g_dev[MAX_DEV];
 static int g_ndev;
-static int g_last_cc;       // completion code of the most recent transfer
+static int g_last_cc;       // completion code of the most recent transfer (any device)
+
+// [M50 B3] See the header comment.
+static spinlock_t xhci_lock = SPINLOCK_INIT_CLASS(LK_S45_XHCI, "xhci");
+static klock_t xhci_enum_lock = KLOCK_INIT(LK_K35_USB_ENUM, "xhci-enum");
+
+static inline uint64_t xhci_lock_irqsave(void) { return spin_lock_irqsave(&xhci_lock); }
+static inline void xhci_unlock_irqrestore(uint64_t fl) { spin_unlock_irqrestore(&xhci_lock, fl); }
+// Take xhci_lock only if it is free; interrupts are off iff it was taken.
+static inline int xhci_trylock_irqsave(uint64_t* fl) {
+    uint64_t f;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    if (spin_trylock(&xhci_lock)) { *fl = f; return 1; }
+    __asm__ volatile ("push %0; popfq" :: "r"(f) : "memory", "cc");
+    return 0;
+}
+static inline void set_cc(usb_device_t* d, int cc) { g_last_cc = cc; if (d) d->last_cc = cc; }
 
 int xhci_last_cc(void) { return g_last_cc; }
+int xhci_dev_last_cc(const usb_device_t* d) { return d ? d->last_cc : g_last_cc; }
 
 // MSI-X plumbing (defined at end of file; NOT enabled by default).
 int  xhci_enable_irq(void);
@@ -246,6 +284,7 @@ static int evt_wait(uint32_t want_type, int slot, int dci, xhci_trb_t* out) {
 // Issue a command TRB and wait for its Command Completion Event. Returns the
 // completion code, with the slot id in *slot_out (if non-NULL).
 static int cmd_run(uint32_t p0, uint32_t p1, uint32_t st, uint32_t ctrl, int* slot_out) {
+    SPIN_ASSERT_HELD(&xhci_lock);
     ring_push(&g_cmd_ring, p0, p1, st, ctrl);
     ring_db(0, 0);
     xhci_trb_t ev;
@@ -267,16 +306,23 @@ static void xcopy(void* dst, const void* src, int n) {
 static int xhci_control_raw(usb_device_t* d, const void* setup, void* data, int len);
 
 int xhci_control(usb_device_t* d, const void* setup, void* data, int len) {
-    if (!needs_bounce(data, len)) return xhci_control_raw(d, setup, data, len);
-    if (len > XHCI_BOUNCE_BYTES) return -1;
-    int in = (((const uint8_t*)setup)[0] & 0x80) != 0;
-    if (!in) xcopy(g_bounce32, data, len);
-    int r = xhci_control_raw(d, setup, g_bounce32, len);
-    if (in && r > 0) xcopy(data, g_bounce32, r);
+    if (needs_bounce(data, len) && len > XHCI_BOUNCE_BYTES) return -1;
+    uint64_t fl = xhci_lock_irqsave();
+    int r;
+    if (!needs_bounce(data, len)) {
+        r = xhci_control_raw(d, setup, data, len);
+    } else {
+        int in = (((const uint8_t*)setup)[0] & 0x80) != 0;
+        if (!in) xcopy(g_bounce32, data, len);
+        r = xhci_control_raw(d, setup, g_bounce32, len);
+        if (in && r > 0) xcopy(data, g_bounce32, r);
+    }
+    xhci_unlock_irqrestore(fl);
     return r;
 }
 
 static int xhci_control_raw(usb_device_t* d, const void* setup, void* data, int len) {
+    SPIN_ASSERT_HELD(&xhci_lock);
     const uint8_t* s = (const uint8_t*)setup;
     int in = (s[0] & 0x80) != 0;
     // Setup stage (immediate data: the 8 setup bytes live in the TRB).
@@ -294,14 +340,15 @@ static int xhci_control_raw(usb_device_t* d, const void* setup, void* data, int 
     ring_db(d->slot_id, 1);   // EP0 doorbell, DCI 1
 
     xhci_trb_t ev;
-    if (!evt_wait(TRB_XFER_EVENT, d->slot_id, 1, &ev)) { g_last_cc = -1; return -1; }
+    if (!evt_wait(TRB_XFER_EVENT, d->slot_id, 1, &ev)) { set_cc(d, -1); return -1; }
     int cc = (ev.d[2] >> 24) & 0xFF;
-    g_last_cc = cc;
+    set_cc(d, cc);
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) return -1;
     return len;
 }
 
-int xhci_set_ep0_mps(usb_device_t* d, uint16_t mps) {
+static int set_ep0_mps_locked(usb_device_t* d, uint16_t mps) {
+    SPIN_ASSERT_HELD(&xhci_lock);
     uint8_t* in = d->input_ctx;
     zero(in, g_ctx_stride * 3);
     ctx_dw(in, 0)[1] = (1u << 1);                 // add A1 (EP0)
@@ -315,13 +362,20 @@ int xhci_set_ep0_mps(usb_device_t* d, uint16_t mps) {
                      TRB_TYPE(TRB_EVAL_CTX) | ((uint32_t)d->slot_id << 24), NULL);
     return (cc == CC_SUCCESS) ? 0 : -1;
 }
+int xhci_set_ep0_mps(usb_device_t* d, uint16_t mps) {
+    uint64_t fl = xhci_lock_irqsave();
+    int r = set_ep0_mps_locked(d, mps);
+    xhci_unlock_irqrestore(fl);
+    return r;
+}
 
 static uint8_t ep_dci(uint8_t addr) {
     uint8_t num = addr & 0x0F;
     return (uint8_t)(num * 2 + ((addr & 0x80) ? 1 : 0));
 }
 
-int xhci_configure_endpoints(usb_device_t* d, const usb_endpoint_t* eps, int n) {
+static int configure_endpoints_locked(usb_device_t* d, const usb_endpoint_t* eps, int n) {
+    SPIN_ASSERT_HELD(&xhci_lock);
     uint8_t* in = d->input_ctx;
     zero(in, sizeof(d_input[0]));
     uint32_t add = (1u << 0);    // A0 (slot context)
@@ -362,8 +416,15 @@ int xhci_configure_endpoints(usb_device_t* d, const usb_endpoint_t* eps, int n) 
                      TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot_id << 24), NULL);
     return (cc == CC_SUCCESS) ? 0 : -1;
 }
+int xhci_configure_endpoints(usb_device_t* d, const usb_endpoint_t* eps, int n) {
+    uint64_t fl = xhci_lock_irqsave();
+    int r = configure_endpoints_locked(d, eps, n);
+    xhci_unlock_irqrestore(fl);
+    return r;
+}
 
 static int submit_raw(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
+    SPIN_ASSERT_HELD(&xhci_lock);
     uint8_t dci = ep_dci(ep_addr);
     xhci_ring_t* r = NULL;
     for (int i = 0; i < d->n_epr; i++) if (d->epr[i].dci == dci) { r = &d->epr[i]; break; }
@@ -375,14 +436,28 @@ static int submit_raw(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
     return 0;
 }
 
+// [M50 B3] Non-blocking: -2 when xhci_lock is busy (the caller retries later).
 int xhci_submit(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
     if (needs_bounce(data, len)) return -1;   // [M49] async: no bounce possible
+    uint64_t fl;
+    if (!xhci_trylock_irqsave(&fl)) return -2;
     int r = submit_raw(d, ep_addr, data, len);
     if (r == 0) g_async[d->slot_id & 0xFF] |= (1u << ep_dci(ep_addr));
+    xhci_unlock_irqrestore(fl);
     return r;
 }
 
+static int poll_transfer_locked(usb_device_t* d, uint8_t ep_addr, int len, int* bytes);
+// [M50 B3] Non-blocking: 0 (nothing yet) also when xhci_lock is busy.
 int xhci_poll_transfer(usb_device_t* d, uint8_t ep_addr, int len, int* bytes) {
+    uint64_t fl;
+    if (!xhci_trylock_irqsave(&fl)) return 0;
+    int r = poll_transfer_locked(d, ep_addr, len, bytes);
+    xhci_unlock_irqrestore(fl);
+    return r;
+}
+static int poll_transfer_locked(usb_device_t* d, uint8_t ep_addr, int len, int* bytes) {
+    SPIN_ASSERT_HELD(&xhci_lock);
     uint8_t dci = ep_dci(ep_addr);
     xhci_trb_t ev;
     int found = stash_take(d->slot_id, dci, &ev);
@@ -395,13 +470,14 @@ int xhci_poll_transfer(usb_device_t* d, uint8_t ep_addr, int len, int* bytes) {
     if (!found) return 0;
     g_async[d->slot_id & 0xFF] &= ~(1u << dci);
     int cc = (ev.d[2] >> 24) & 0xFF;
-    g_last_cc = cc;
+    set_cc(d, cc);
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) { *bytes = -1; return 1; }
     *bytes = len - (int)(ev.d[2] & 0xFFFFFF);
     return 1;
 }
 
-int xhci_transfer(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
+static int transfer_locked(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
+    SPIN_ASSERT_HELD(&xhci_lock);
     void* buf = data;
     int in = (ep_addr & 0x80) != 0;
     if (needs_bounce(data, len)) {                // [M49] 32-bit-only controller
@@ -411,13 +487,19 @@ int xhci_transfer(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
     }
     if (submit_raw(d, ep_addr, buf, len) < 0) return -1;
     xhci_trb_t ev;
-    if (!evt_wait(TRB_XFER_EVENT, d->slot_id, ep_dci(ep_addr), &ev)) { g_last_cc = -1; return -1; }
+    if (!evt_wait(TRB_XFER_EVENT, d->slot_id, ep_dci(ep_addr), &ev)) { set_cc(d, -1); return -1; }
     int cc = (ev.d[2] >> 24) & 0xFF;
-    g_last_cc = cc;
+    set_cc(d, cc);
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) return -1;
     int got = len - (int)(ev.d[2] & 0xFFFFFF);
     if (buf != data && in && got > 0) xcopy(data, buf, got);
     return got;
+}
+int xhci_transfer(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
+    uint64_t fl = xhci_lock_irqsave();
+    int r = transfer_locked(d, ep_addr, data, len);
+    xhci_unlock_irqrestore(fl);
+    return r;
 }
 
 // Find the transfer ring serving a given DCI (1 = EP0).
@@ -427,7 +509,8 @@ static xhci_ring_t* ring_for_dci(usb_device_t* d, uint8_t dci) {
     return NULL;
 }
 
-int xhci_reset_endpoint(usb_device_t* d, uint8_t ep_addr) {
+static int reset_endpoint_locked(usb_device_t* d, uint8_t ep_addr) {
+    SPIN_ASSERT_HELD(&xhci_lock);
     uint8_t dci = (ep_addr == 0) ? 1 : ep_dci(ep_addr);
     xhci_ring_t* r = ring_for_dci(d, dci);
     if (!r) return -1;
@@ -442,6 +525,12 @@ int xhci_reset_endpoint(usb_device_t* d, uint8_t ep_addr) {
     cc = cmd_run((uint32_t)dq, (uint32_t)(dq >> 32), 0, TRB_TYPE(TRB_SET_TR_DEQ) |
                  ((uint32_t)dci << 16) | ((uint32_t)d->slot_id << 24), NULL);
     return (cc == CC_SUCCESS) ? 0 : -1;
+}
+int xhci_reset_endpoint(usb_device_t* d, uint8_t ep_addr) {
+    uint64_t fl = xhci_lock_irqsave();
+    int r = reset_endpoint_locked(d, ep_addr);
+    xhci_unlock_irqrestore(fl);
+    return r;
 }
 
 // Busy-wait `ms` milliseconds using the monotonic TSC clock (calibrated by M28-3,
@@ -488,10 +577,33 @@ static int port_reset(int p) {
 // describe the topology. For a root-port device (parent_slot==0, route==0, tier==0)
 // slot-context dword2 is left zero — byte-for-byte identical to the original code.
 // Returns the addressed device, or NULL on failure.
+// Slot setup runs under xhci_lock; the USB core's attach (more transfers, each
+// taking xhci_lock itself) runs after it is released.
+static usb_device_t* address_locked(int port, int speed, uint32_t route_string,
+                                    int root_port, int parent_slot,
+                                    int parent_port, int tier);
 static usb_device_t* xhci_address_common(int port, int speed, uint32_t route_string,
                                          int root_port, int parent_slot,
                                          int parent_port, int tier) {
     extern void usb_attach(usb_device_t* d);
+    KLOCK_ASSERT_HELD(&xhci_enum_lock);
+    uint64_t fl = xhci_lock_irqsave();
+    usb_device_t* d = address_locked(port, speed, route_string, root_port,
+                                     parent_slot, parent_port, tier);
+    xhci_unlock_irqrestore(fl);
+    if (!d) return NULL;
+    debugcon_writestring("[XHCI] port "); debugcon_print_hex((uint64_t)port);
+    debugcon_writestring(" slot "); debugcon_print_hex((uint64_t)d->slot_id);
+    debugcon_writestring(" speed "); debugcon_print_hex((uint64_t)speed);
+    if (route_string) { debugcon_writestring(" route 0x"); debugcon_print_hex((uint64_t)route_string); }
+    debugcon_writestring(" addressed\n");
+    usb_attach(d);   // USB core: descriptors, set config, class bind
+    return d;
+}
+static usb_device_t* address_locked(int port, int speed, uint32_t route_string,
+                                    int root_port, int parent_slot,
+                                    int parent_port, int tier) {
+    SPIN_ASSERT_HELD(&xhci_lock);
     if (g_ndev >= MAX_DEV) return NULL;
     // Enable a device slot.
     int slot = 0;
@@ -504,7 +616,7 @@ static usb_device_t* xhci_address_common(int port, int speed, uint32_t route_str
     d->route_string = route_string; d->root_port = root_port;
     d->parent_slot = parent_slot; d->parent_port = parent_port; d->tier = tier;
     d->input_ctx = d_input[g_ndev]; d->output_ctx = d_output[g_ndev];
-    d->n_epr = 0; d->class_id = 0; d->class_priv = NULL;
+    d->n_epr = 0; d->class_id = 0; d->class_priv = NULL; d->last_cc = 0;
     ring_init(&d->ep0, d_ep0[g_ndev], 1);
     zero(d->output_ctx, sizeof(d_output[0]));
     g_dcbaa[slot] = phys_of(d->output_ctx);
@@ -540,20 +652,15 @@ static usb_device_t* xhci_address_common(int port, int speed, uint32_t route_str
     cc = cmd_run((uint32_t)phys_of(in), (uint32_t)(phys_of(in) >> 32), 0,
                  TRB_TYPE(TRB_ADDRESS_DEV) | ((uint32_t)slot << 24), NULL);
     if (cc != CC_SUCCESS) { debugcon_writestring("[XHCI] address device failed\n"); return NULL; }
-
-    debugcon_writestring("[XHCI] port "); debugcon_print_hex((uint64_t)port);
-    debugcon_writestring(" slot "); debugcon_print_hex((uint64_t)slot);
-    debugcon_writestring(" speed "); debugcon_print_hex((uint64_t)speed);
-    if (route_string) { debugcon_writestring(" route 0x"); debugcon_print_hex((uint64_t)route_string); }
-    debugcon_writestring(" addressed\n");
     g_ndev++;
-    usb_attach(d);   // USB core: descriptors, set config, class bind
     return d;
 }
 
 // Has a root-port device already been addressed on this port? (so a re-scan after
 // hot-plug doesn't double-address an existing device).
+// g_dev[] only grows, and only under xhci_enum_lock, which the caller holds.
 static int root_port_has_dev(int p) {
+    KLOCK_ASSERT_HELD(&xhci_enum_lock);
     for (int i = 0; i < g_ndev; i++)
         if (g_dev[i].tier == 0 && g_dev[i].root_port == p) return 1;
     return 0;
@@ -561,13 +668,15 @@ static int root_port_has_dev(int p) {
 
 void xhci_enumerate(void) {
     if (!g_op) return;
+    klock_lock(&xhci_enum_lock);
     for (uint32_t p = 1; p <= g_max_ports && g_ndev < MAX_DEV; p++) {
         if (root_port_has_dev((int)p)) continue;
-        int speed = port_reset((int)p);
+        int speed = port_reset((int)p);   // PORTSC + real-time waits: no xhci_lock
         if (speed == 0) continue;
         // Root-port device: route 0, no parent, tier 0, root port == this port.
         xhci_address_common((int)p, speed, 0u, (int)p, 0, 0, 0);
     }
+    klock_unlock(&xhci_enum_lock);
 }
 
 // USB hub support (M22) — NOT YET TESTED on real hardware (no hub in QEMU CI).
@@ -705,9 +814,14 @@ void xhci_irq_handler(void) {
         // RW1C the interrupter's IP bit and re-arm IE.
         uint32_t iman = rt_rd(IR0_IMAN);
         rt_wr(IR0_IMAN, iman | IMAN_IP | IMAN_IE);
-        // Drain any pending events to clear EHB and advance ERDP.
-        xhci_trb_t ev;
-        while (evt_poll(&ev)) { /* consumed; ERDP advanced inside evt_poll */ }
+        // Drain any pending events to clear EHB and advance ERDP — only when no
+        // polled transfer owns the event ring ([M50 B3]: never spin in an IRQ).
+        uint64_t fl;
+        if (xhci_trylock_irqsave(&fl)) {
+            xhci_trb_t ev;
+            while (evt_poll(&ev)) { /* consumed; ERDP advanced inside evt_poll */ }
+            xhci_unlock_irqrestore(fl);
+        }
     }
     g_xhci_irq_count++;
     lapic_eoi();
