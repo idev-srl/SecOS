@@ -2081,9 +2081,13 @@ static void sh_pinfo(const char* a){
     terminal_writestring("\n  RIP="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->regs.rip>>i)&0xF]);
     terminal_writestring(" RSP="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->regs.rsp>>i)&0xF]);
     terminal_writestring(" RFLAGS="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->regs.rflags>>i)&0xF]);
-    // Manifest
-    if(p->manifest){
-        elf_manifest_t* mf = (elf_manifest_t*)p->manifest;
+    // Manifest: copied under the target's mm_lock (exec swaps and frees it).
+    elf_manifest_t mfc; int has_mf = 0;
+    { uint64_t mfl = mm_lock(p);
+      if(p->manifest){ mfc = *(const elf_manifest_t*)p->manifest; has_mf = 1; }
+      mm_unlock(p, mfl); }
+    if(has_mf){
+        elf_manifest_t* mf = &mfc;
         terminal_writestring("\n  Manifest: version="); itoa(mf->version, buf, 10); terminal_writestring(buf);
         terminal_writestring(" max_mem="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(mf->max_mem>>i)&0xF]);
         terminal_writestring(" entry_hint="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(mf->entry_hint>>i)&0xF]);

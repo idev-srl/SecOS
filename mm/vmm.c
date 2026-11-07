@@ -1128,6 +1128,7 @@ int vmm_cow_fault(vmm_space_t* space, uint64_t addr) {
         // later mprotect()ed read-only keeps its COW bit (it is still shared),
         // and a write to it is a real violation, not a copy request.
         process_t* cur = sched_get_current();
+        if (cur && cur->space == space) MM_ASSERT_HELD(cur);   // [M50-B1]
         const vma_t* v = (cur && cur->space == space) ? vma_find(&cur->vmas, va) : 0;
         if (!v || !(v->flags & VMM_FLAG_RW) || (v->flags & VMM_FLAG_PROTNONE)) return -1;
     }
@@ -1775,7 +1776,15 @@ int vmm_try_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     // copy-on-write -> give the writer a private copy and continue.
     if ((error_code & 1) && (error_code & 2)) {
         process_t* cur = sched_get_current();
-        if (cur && cur->space && vmm_cow_fault(cur->space, fault_addr) == 0) {
+        int cow = -1;
+        if (cur && cur->space) {
+            // [M50-B1] Check + copy + PTE swap as one mm_lock section (the copy
+            // source is a private frame, never the page cache).
+            uint64_t mfl = mm_lock(cur);
+            cow = vmm_cow_fault(cur->space, fault_addr);
+            mm_unlock(cur, mfl);
+        }
+        if (cow == 0) {
             if (g_kverbose) { debugcon_writestring("[COW] copy "); debugcon_print_hex(fault_addr & ~0xFFFULL);
                               debugcon_writestring("\n"); }
             return 0; // retry the write
@@ -1786,11 +1795,11 @@ int vmm_try_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
     if (!(error_code & 1)) {
         process_t* cur = sched_get_current();
         if (cur && cur->space) {
-            const vma_t* vv = vma_find(&cur->vmas, fault_addr);
             // A PROT_NONE region is reserved but inaccessible: never fault it in
             // (user access -> SIGSEGV, kernel uaccess -> -EFAULT via the fixup).
-            if (vv && !(vv->flags & VMM_FLAG_PROTNONE) &&
-                vma_fault_in(cur->space, vv, fault_addr) == 0) {
+            // [M50-B1] vma_fault_in_live: VMA lookup and PTE install under the
+            // owner's mm_lock, the frame fill (page cache) outside it.
+            if (vma_fault_in_live(cur->space, &cur->vmas, &cur->mm_lock, fault_addr) == 0) {
                 // Quiet success path (faults are frequent): a terse debugcon
                 // marker only, gated on verbosity (M34: a real program like lua
                 // faults in hundreds of pages and would drown its own output).

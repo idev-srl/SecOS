@@ -17,6 +17,7 @@
 #define VMA_H
 #include <stdint.h>
 #include "vmm.h"
+#include "spinlock.h"   // [M50-B1] the owner's mm_lock
 struct vfs_inode;
 
 #define VMA_MAX        64
@@ -83,7 +84,18 @@ int vma_add_phys(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags, uin
 
 // Materialize the page containing 'addr' in 'space' according to VMA 'v':
 // allocate a frame, fill it (file content + zero / pure zero), map it.
-// Returns 0 on success, negative on failure.
+// Returns 0 on success, negative on failure. [M50-B1] No locking: for a space
+// nobody else can see yet (process creation, exec staging) or a caller that
+// holds the owner's mm_lock and knows the fill does not reach the page cache.
 int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr);
+
+// [M50-B1] Demand-fault 'addr' of a LIVE address space (the #PF path): 'set'
+// and 'space' belong to a process whose mm_lock is 'mm'. The VMA is looked up
+// and copied under the lock, the frame is allocated and filled WITHOUT it
+// (a page-cache fill may call into a filesystem), then the lock is retaken,
+// the VMA re-checked (still there, unchanged) and the PTE installed. A page
+// some other path installed meanwhile counts as success. Must be called
+// without 'mm' held. Returns 0 on success, negative when not serviceable.
+int vma_fault_in_live(vmm_space_t* space, vma_set_t* set, spinlock_t* mm, uint64_t addr);
 
 #endif // VMA_H

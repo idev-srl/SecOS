@@ -860,8 +860,16 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
                 blob[blen++] = 0;
             }
         }
-        if (blob && setup_user_args(space, &p->vmas, st_top, im.stack_lo, blob, blen,
-                                    argc, 0, &rsp, &argvp, &envp) == 0) {
+        // [M50-B1] p is already in the table (procfs can see it): fault the
+        // stack pages in under its mm_lock (anonymous pages, no page cache).
+        int sr = -1;
+        if (blob) {
+            uint64_t mfl = mm_lock(p);
+            sr = setup_user_args(space, &p->vmas, st_top, im.stack_lo, blob, blen,
+                                 argc, 0, &rsp, &argvp, &envp);
+            mm_unlock(p, mfl);
+        }
+        if (sr == 0) {
             p->tf->rsp = rsp;
             p->tf->rdi = (uint64_t)argc;
             p->tf->rsi = argvp;
@@ -941,13 +949,17 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     uint64_t mm  = USER_MMAP_BASE + aslr_slide(32ULL*1024*1024);
 
     // ---- 2. Point of no return: swap in the new image. ----
-    uint64_t fl;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(fl) : : "memory");
+    // Driver bindings have their own lock (driver_if_lock, S15 < S35): drop
+    // them before taking mm_lock.
+    driver_remove_all_bindings(p);
+    // [M50-B1] The space / VMA / image swap is one mm_lock section (it also
+    // keeps interrupts off across the CR3 switch, like the old cli): a
+    // cross-process reader sees either the old image or the new one.
+    uint64_t fl = mm_lock(p);
     vmm_space_t* old_space = p->space;
     uint8_t*     old_image = p->image;
     void*        old_mf    = p->manifest;
-    // Drop any device binding (and the driver type) of the old image first.
-    driver_remove_all_bindings(p);
+    // The driver type of the old image goes with it.
     p->proc_type = PROC_TYPE_USER; p->drv_dev_id = -1; p->drv_caps = 0;
     // Load the new CR3 before the old tables are freed. p is pinned to this CPU
     // (cpu_affinity), so no other core has the old space loaded or cached; the
@@ -968,7 +980,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     p->user_mem_bytes = im.footprint;
     p->mapped_page_count = (uint32_t)(im.footprint / 4096ULL);
     p->regs.rip = im.entry; p->regs.rsp = rsp;
-    __asm__ volatile("push %0; popfq" : : "r"(fl) : "memory", "cc");
+    mm_unlock(p, fl);
     kfree(nv);
     // Tear down the old user image: every present leaf frame is unref'd (pages
     // still COW-shared with a fork relative stay with it), then the tables.
@@ -1051,7 +1063,13 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     __asm__ volatile("fxsave64 %0" : "=m"(*(uint8_t(*)[512])c->fpu));
     c->fpu_valid = 1;
 
-    c->space = vmm_fork_space(parent->space);
+    {   // [M50-B1] Copy the VMA set and share the pages COW as one step under
+        // the parent's mm_lock (vmm_fork_space rewrites the parent's PTEs).
+        uint64_t mfl = mm_lock(parent);
+        c->vmas = parent->vmas;
+        c->space = vmm_fork_space(parent->space);
+        mm_unlock(parent, mfl);
+    }
     if (!c->space) { kfree(c); return NULL; }
 
     if (parent->image && parent->image_size) {
