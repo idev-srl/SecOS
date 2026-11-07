@@ -95,7 +95,14 @@ void ap_entry(void) {
     c->online = 1;
     lapic_timer_start_this_cpu(1000);
     __asm__ volatile ("sti");
-    for (;;) { smp_tlb_selftest_ap(c); sched_reap_zombies(); cpu_wait_irq(); }
+    for (;;) {
+        smp_tlb_selftest_ap(c);
+#ifdef SECOS_B3_BLKSTRESS
+        { extern void blkstress_ap(cpu_t*); blkstress_ap(c); }                    // [M50 B3]
+#endif
+        sched_reap_zombies();
+        cpu_wait_irq();
+    }
 }
 
 /* ---- [M48] TLB shootdown selftest (boot, >= 2 CPUs online) ----

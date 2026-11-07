@@ -485,6 +485,33 @@ grep -q "\[M10\] disk mounted at /mnt fs=FAT32" "$M22ULOG"; check "M22 FAT32 mou
 grep -q "\[M10\] disk write+readback: OK" "$M22ULOG"; check "M22 USB write+readback persists" $?
 ! grep -q "\[EXC\]" "$M22ULOG"; check "no CPU exception ([EXC]) during M22 USB run" $?
 
+# ---- M50 B3: per-disk block locks + xHCI/HID locks under real concurrency ----
+# tools/blk_stress_drive.py on -smp 4 q35 with sda+sdb (AHCI, sdb1 = MBR
+# partition), nvme0n1 and usb0 (usb-storage next to a usb-kbd on qemu-xhci).
+# Phase 1: fs/blkstress.c (-DSECOS_B3_BLKSTRESS) runs disk hashes, writes and
+# devfs byte-stripe RMW on every CPU at once outside the BKL while the host
+# types on the USB keyboard; phase 2: parallel dd from bash plus typing.
+# Digests/md5s and every byte the guest wrote are compared with the images.
+echo "[selftest] Building M50 B3 block-stress image (-DSECOS_B3_BLKSTRESS)..."
+make clean >/dev/null 2>&1 || true
+if ! make iso CFLAGS_EXTRA=-DSECOS_B3_BLKSTRESS >/tmp/secos_selftest_build.log 2>&1; then
+    echo "[selftest] M50 B3 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
+fi
+BSDDIR=$(mktemp -d /tmp/secos_selftest_bsd.XXXXXX)
+echo "[selftest] Running M50 B3 block/USB lock stress (-smp 4)..."
+timeout 1200 python3 tools/blk_stress_drive.py --iso myos.iso --smp 4 --out "$BSDDIR" \
+    --log "$BSDDIR/debugcon.log" >"$BSDDIR/drive.out" 2>&1
+grep -q "^\[BSD\] RESULT " "$BSDDIR/drive.out"; check "M50 B3 block stress driver ran to completion" $?
+while IFS= read -r l; do
+    case "$l" in
+        "[BSD] RESULT "*) ;;
+        "[BSD] "*" OK"*)   x=${l#\[BSD\] }; check "M50 B3 ${x%% OK*}" 0 ;;
+        "[BSD] "*" FAIL"*) x=${l#\[BSD\] }; check "M50 B3 ${x%% FAIL*}" 1; echo "    $l" | cut -c1-200 ;;
+    esac
+done < "$BSDDIR/drive.out"
+rm -f "$BSDDIR"/*.img
+
 # ---- M23: POSIX FS personality (/dev, /proc, /sys + persistent ext2 root) ----
 M23LOG=/tmp/secos_selftest_m23.log
 M23RLOG=/tmp/secos_selftest_m23root.log

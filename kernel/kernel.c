@@ -2235,6 +2235,10 @@ static void kernel_main_phase2(void) {
             debugcon_writestring(vfs_lookup(bn)?"[M23] /dev block node present\n":"[M23] /dev block node MISSING\n");
         }
     }
+#ifdef SECOS_B3_BLKSTRESS
+    // [M50 B3] Block/USB lock stress on every CPU at once (fs/blkstress.c).
+    { extern void blkstress_run(void); blkstress_run(); }
+#endif
 #if M41_EXFAT_DEMO
     // [M41] exFAT self-test, once /mnt and /proc are mounted: the good image on
     // vda, or the corrupt-image suite when AHCI disks are attached.
