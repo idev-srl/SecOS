@@ -20,7 +20,7 @@
 #
 # The target directory is a parameter (--target, default /root) so the same
 # driver aims fsstress at another mount (ramfs: --target /tmp).
-# [M52] --data vfat|exfat attaches a second virtio disk (vdb) with a fresh
+# [M52] --data vfat|exfat attaches a SATA data disk (q35 AHCI, sda) with a fresh
 # FAT32 / exFAT volume, mounts it at /mnt, runs fsstress -n there (no
 # symlinks / hard links / modes) and checks it on the host after the
 # poweroff: fsck.vfat -n, or fsck.exfat -n + tools/exfat_img.py deepcheck.
@@ -46,7 +46,8 @@ class VM:
     def __init__(self, o, disk, log, data=None):
         self.log = log
         open(log, "w").close()
-        extra = ["-drive", f"file={data},if=virtio,format=raw"] if data else []
+        # The data disk is SATA (q35 AHCI, sda): the kernel drives one virtio disk.
+        extra = ["-machine", "q35", "-drive", f"file={data},if=ide,index=0,format=raw"] if data else []
         cmd = [o.qemu, "-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp),
                "-drive", f"file={disk},if=virtio,format=raw"] + extra + [
                "-nic", "none",
@@ -223,7 +224,7 @@ def main():
         if o.data:
             fst = "vfat" if o.data == "vfat" else "exfat"
             run(vm, f"mount-{o.data}",
-                f"(grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/vdb /mnt) && "
+                f"(grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sda /mnt) && "
                 f"grep ' /mnt ' /proc/mounts && echo MNT-$((6*7))", ["MNT-42"], 120, absent=())
             nopt = "-n "
         for k in range(o.rounds):
