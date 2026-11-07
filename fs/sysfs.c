@@ -15,6 +15,7 @@
 #include "block.h"
 #include "spinlock.h"
 #include "percpu.h"   // CPU count + online flags (/sys/devices/system/cpu)
+#include "process.h"  // [M51 C2] fd tables: pool slots held open
 #include <stddef.h>
 #include <stdint.h>
 
@@ -38,14 +39,13 @@ static int split(const char* rel, char comp[SYSFS_MAXC][32]) {
 // One lock guards the generation buffer and the inode pool: on SMP two
 // processes can look up or read sysfs at the same time. An open fd keeps the
 // inode pointer lookup returned, so lookups hand out pool slots keyed by path
-// (an fd's inode is recycled only after SYSFS_NINO other distinct paths;
-// readdir entries are transient — callers copy the name).
+// and never recycle a slot an fd holds while another is free (readdir entries
+// are transient — callers copy the name).
 static spinlock_t g_sysfs_lock = SPINLOCK_INIT_CLASS(LK_S15_SUBSYS, "sysfs");
 static char g_genbuf[1024];   // cpulist of 256 CPUs with gaps fits
 #define SYSFS_NINO 32
 static vfs_inode_t g_ipool[SYSFS_NINO];
 static int g_inext;
-static vfs_inode_t g_ent;     // readdir scratch entry
 
 static int gen_attr(block_dev_t* b, const char* attr) {
     uint64_t v;
@@ -122,11 +122,34 @@ static vfs_inode_t* fill(vfs_inode_t* ino, const char* path, vfs_node_type_t t, 
     ino->type=t; ino->size=size; ino->fs_data=fsd;
     return ino;
 }
-// Lookup result: the pool slot already holding `path`, else the next one.
+// [M51 C2] Pool slots an open fd still points at (procfs has the same rule):
+// recycling one made a later read() of that fd return another node, e.g. an
+// fd on /sys/block/vda/size reading /sys/devices/system/cpu/online. Runs under
+// g_sysfs_lock; the fd tables are read under proc_lock and the owner's
+// mm_lock (S15 -> S30 -> S35).
+static void pool_busy_cb(process_t* p, void* u){
+    uint32_t* mask=(uint32_t*)u;
+    uint64_t mfl = mm_lock(p);
+    for(int i=0;i<32;i++){
+        const struct proc_fd_entry* e=&p->fds[i];
+        if(!e->used || e->is_pipe || e->is_sock || !e->inode) continue;
+        const vfs_inode_t* ino=(const vfs_inode_t*)e->inode;
+        if(ino>=&g_ipool[0] && ino<&g_ipool[SYSFS_NINO]) *mask |= 1u << (ino-&g_ipool[0]);
+    }
+    mm_unlock(p, mfl);
+}
+// Lookup result: the pool slot already holding `path`, else the next one no
+// fd holds (all of them open: the next one anyway).
 static vfs_inode_t* mk(const char* path, vfs_node_type_t t, size_t size, void* fsd) {
     int slot=-1;
     for(int i=0;i<SYSFS_NINO;i++) if(g_ipool[i].path[0] && seq(g_ipool[i].path,path)){ slot=i; break; }
-    if(slot<0){ slot=g_inext; g_inext=(g_inext+1)%SYSFS_NINO; }
+    if(slot<0){
+        uint32_t busy=0;
+        process_foreach(pool_busy_cb, &busy);
+        slot=g_inext;
+        for(int k=0;k<SYSFS_NINO;k++){ int c=(g_inext+k)%SYSFS_NINO; if(!((busy>>c)&1)){ slot=c; break; } }
+        g_inext=(slot+1)%SYSFS_NINO;
+    }
     return fill(&g_ipool[slot], path, t, size, fsd);
 }
 // out = a + b + c, truncated to 47 characters (every sysfs path is shorter).
@@ -137,10 +160,8 @@ static void join(char* out, const char* a, const char* b, const char* c) {
     for (int j=0;c[j]&&k<47;j++) out[k++]=c[j];
     out[k]=0;
 }
-// Readdir entry (transient).
-static vfs_inode_t* ent(const char* path, vfs_node_type_t t, void* fsd) {
-    return fill(&g_ent, path, t, 0, fsd);
-}
+// Readdir entry (transient, the caller's scratch inode).
+#define ent(path, t, fsd) fill(scratch, (path), (t), 0, (fsd))
 
 static vfs_inode_t* sysfs_lookup_locked(const char* rel) {
     if (!rel || rel[0]!='/') return NULL;
@@ -169,7 +190,11 @@ static vfs_inode_t* sysfs_lookup_locked(const char* rel) {
     return NULL;
 }
 
-static int sysfs_readdir_locked(const char* dir, vfs_iter_cb cb, void* user) {
+// [M51 C2] No lock: a listing reads only the block registry (own lock) and the
+// CPU count, and builds each entry in the caller's scratch inode -- so the
+// callbacks, which may wait (the kernel shell's paged ls), never run under
+// g_sysfs_lock.
+static int sysfs_readdir_nolock(const char* dir, vfs_iter_cb cb, void* user, vfs_inode_t* scratch) {
     if (!cb || !dir) return -1;
     if (dir[0]=='/' && dir[1]==0) {
         cb(ent("/block", VFS_NODE_DIR,NULL), user);
@@ -251,10 +276,9 @@ static vfs_inode_t* sysfs_lookup(const char* rel) {
     return r;
 }
 static int sysfs_readdir(const char* dir, vfs_iter_cb cb, void* user) {
-    spin_lock(&g_sysfs_lock);       // the callbacks only copy names / count
-    int r = sysfs_readdir_locked(dir, cb, user);
-    spin_unlock(&g_sysfs_lock);
-    return r;
+    vfs_inode_t scratch;
+    for (size_t i=0;i<sizeof(scratch);i++) ((uint8_t*)&scratch)[i]=0;
+    return sysfs_readdir_nolock(dir, cb, user, &scratch);
 }
 static int sysfs_read(vfs_inode_t* inode, size_t off, void* buf, size_t len) {
     spin_lock(&g_sysfs_lock);

@@ -25,6 +25,7 @@
 #include "process.h"
 #include "cred.h"
 #include "spinlock.h"
+#include "heap.h"
 #include "kiface.h"
 #include "klog.h"
 #include "kclock.h"
@@ -142,13 +143,17 @@ static void snap_cb(process_t* p, void* u){
     s->comm[15]=0;
     s->cmdlen = p->ki.cmdline_len > sizeof(s->cmdline) ? (int)sizeof(s->cmdline) : p->ki.cmdline_len;
     for(int i=0;i<s->cmdlen;i++) s->cmdline[i]=p->ki.cmdline[i];
-    for(int i=0;i<256;i++){ s->cwd[i]=p->cwd[i]; if(!p->cwd[i]) break; }
-    s->cwd[255]=0;
     s->utime=p->ki.utime_ticks; s->stime=p->ki.stime_ticks; s->start_ns=p->ki.start_ns; s->nvcsw=p->ki.nvcsw;
     /* [M50-B1] The address space (VMA set, page tables, brk) under the
      * target's mm_lock: it may munmap/brk/exec on another CPU meanwhile.
-     * proc_lock (S30, process_foreach) -> mm_lock (S35). */
+     * proc_lock (S30, process_foreach) -> mm_lock (S35).
+     * [M51 C2] The cwd and the fd table too: their writers (chdir, the fd
+     * install/close/dup paths in kernel/syscall.c, exec's close-on-exec) store
+     * under the owner's mm_lock, so the copy below is never a half-written
+     * string or a torn fd entry (a pipe_t taken for a vfs_inode_t). */
     uint64_t mfl = mm_lock(p);
+    for(int i=0;i<256;i++){ s->cwd[i]=p->cwd[i]; if(!p->cwd[i]) break; }
+    s->cwd[255]=0;
     s->vsz = vma_total_bytes(&p->vmas);
     s->rss_pages = (p->state!=PROC_ZOMBIE && p->space) ? vmm_count_user_pages(p->space) : 0;
     s->brk_start=p->brk_start; s->brk_cur=p->brk_cur; s->stack_top=p->stack_top;
@@ -160,26 +165,30 @@ static void snap_cb(process_t* p, void* u){
         s->vma[s->nvma].type=v->type; s->vma[s->nvma].has_inode = v->file_inode ? 1 : 0;
         s->nvma++;
     }
+    s->on_console = (!p->fds[0].used) || (!p->fds[0].inode && !p->fds[0].is_pipe);
+    for(int i=0;i<32;i++){
+        struct proc_fd_entry e = p->fds[i];        /* one coherent copy */
+        s->fd[i].kind=FDK_NONE; s->fd[i].path[0]=0; s->fd[i].obj=0; s->fd[i].ops=0;
+        if(!e.used) continue;
+        if(e.is_pipe){ s->fd[i].kind=FDK_PIPE; s->fd[i].pipe_w=(uint8_t)e.pipe_w; s->fd[i].obj=e.inode; }
+        else if(e.is_sock){ s->fd[i].kind=FDK_SOCK; s->fd[i].obj=(void*)(uintptr_t)(e.is_sock-1); }
+        else if(!e.inode) s->fd[i].kind=FDK_TTY;
+        else {
+            /* The inode outlives the fd entry (FS inode slots are never freed
+             * while mounted). Its path is the FS's to rewrite (a rename, under
+             * the FS lock, which cannot be taken here): bounded copy, always
+             * terminated. */
+            const vfs_inode_t* ino=(const vfs_inode_t*)e.inode;
+            s->fd[i].kind=FDK_FILE; s->fd[i].ops=ino->ops;
+            int k=0; for(; k<127; k++){ char ch=((const volatile char*)ino->path)[k]; if(!ch) break; s->fd[i].path[k]=ch; }
+            s->fd[i].path[k]=0;
+        }
+    }
     mm_unlock(p, mfl);
     s->sig_pending=p->sig_pending; s->sig_blocked=p->sig_blocked;
     s->sig_ign=0; s->sig_catch=0;
     for(int i=1;i<32;i++){ if(p->sig_handler[i]==1) s->sig_ign|=1ull<<(i-1); else if(p->sig_handler[i]>1) s->sig_catch|=1ull<<(i-1); }
     s->umask=p->ki.umask; s->exit_code=p->exit_code;
-    s->on_console = (!p->fds[0].used) || (!p->fds[0].inode && !p->fds[0].is_pipe);
-    for(int i=0;i<32;i++){
-        struct proc_fd_entry* e=&p->fds[i];
-        s->fd[i].kind=FDK_NONE; s->fd[i].path[0]=0; s->fd[i].obj=0; s->fd[i].ops=0;
-        if(!e->used) continue;
-        if(e->is_pipe){ s->fd[i].kind=FDK_PIPE; s->fd[i].pipe_w=(uint8_t)e->pipe_w; s->fd[i].obj=e->inode; }
-        else if(e->is_sock){ s->fd[i].kind=FDK_SOCK; s->fd[i].obj=(void*)(uintptr_t)(e->is_sock-1); }
-        else if(!e->inode) s->fd[i].kind=FDK_TTY;
-        else {
-            const vfs_inode_t* ino=(const vfs_inode_t*)e->inode;
-            s->fd[i].kind=FDK_FILE; s->fd[i].ops=ino->ops;
-            int k=0; for(; ino->path[k] && k<127; k++) s->fd[i].path[k]=ino->path[k];
-            s->fd[i].path[k]=0;
-        }
-    }
 }
 static int snap(uint32_t pid){
     g_ps.found=0; g_ps_want=pid;
@@ -337,7 +346,9 @@ static void gen_mounts(struct sb* s){
         const char* type=mnt_type(fs?fs:"none");
         const char* src=type;                    /* virtual FS: source == type */
         int dev=0;
-        /* disk filesystems name their device + real type (ext4 vs ext2) */
+        /* disk filesystems name their device + real type (ext4 vs ext2).
+         * [M51 C2] Called under g_proc_lock (a spinlock): ->mntinfo must not
+         * take its filesystem's klock (it only returns constant strings). */
         const vfs_fs_ops_t* ops = vfs_mount_ops_at(i);
         if(ops && ops->mntinfo){ const char* a=0; const char* b=0; if(ops->mntinfo(&a,&b)==0){ if(a){ src=a; dev=1; } if(b) type=b; } }
         if(dev) sb_str(s,"/dev/");
@@ -619,12 +630,14 @@ static void fill_node(vfs_inode_t* ino, uint64_t key, const char* path){
 struct pool_busy { uint64_t mask; };
 static void pool_busy_cb(process_t* p, void* u){
     struct pool_busy* b=(struct pool_busy*)u;
+    uint64_t mfl = mm_lock(p);                   /* [M51 C2] fd-table writers hold it */
     for(int i=0;i<32;i++){
         const struct proc_fd_entry* e=&p->fds[i];
         if(!e->used || e->is_pipe || e->is_sock || !e->inode) continue;
         const vfs_inode_t* ino=(const vfs_inode_t*)e->inode;
         if(ino>=&g_ipool[0] && ino<&g_ipool[64]) b->mask |= 1ull << (ino-&g_ipool[0]);
     }
+    mm_unlock(p, mfl);
 }
 
 static vfs_inode_t* pool_get(uint64_t key, const char* path){
@@ -691,14 +704,20 @@ static vfs_inode_t* procfs_lookup(const char* rel){
     return r;
 }
 
+/* [M51 C2] The listing is collected under g_proc_lock into a per-call buffer
+ * and the callbacks run after it is dropped: a callback may wait (the kernel
+ * shell's ls pages its output and waits for a key), which is never allowed
+ * under a spinlock. */
+struct pd_list { uint64_t keys[128]; char names[128][24]; vfs_inode_t ent; };
 static int procfs_readdir(const char* dir, vfs_iter_cb cb, void* user){
-    if(!cb) return -1;
+    if(!cb || !dir) return -1;
+    struct pd_list* L = (struct pd_list*)kmalloc(sizeof(*L));
+    if(!L) return -1;
     spin_lock(&g_proc_lock);
     uint64_t key = path_key(dir);
     int k = K_KIND(key);
-    if(!key || !is_dir(k)){ spin_unlock(&g_proc_lock); return -1; }
-    static vfs_inode_t ent;                      /* transient (callers copy) */
-    static uint64_t keys[128]; int nk=0;
+    if(!key || !is_dir(k)){ spin_unlock(&g_proc_lock); kfree(L); return -1; }
+    uint64_t* keys = L->keys; int nk=0;
     if(k==PK_ROOT){
         for(int i=0;i<NTOP;i++) keys[nk++]=KEY(g_top[i].kind,0,0);
         process_t* c=sched_get_current(); if(c && c->pid) keys[nk++]=KEY(PK_SELF,0,0);
@@ -710,23 +729,23 @@ static int procfs_readdir(const char* dir, vfs_iter_cb cb, void* user){
         if(snap(K_PID(key)) && g_ps.inspect_ok)            /* [M43] fd/ is private */
             for(int i=0;i<32;i++) if(g_ps.fd[i].kind!=FDK_NONE) keys[nk++]=KEY(PK_PID_FD,K_PID(key),i);
     }
-    /* The callbacks only copy names (getdents) or count, so they run under the
-     * lock that also guards the static key/name tables. */
-    static char names[128][24];
-    for(int i=0;i<nk;i++) name_of(keys[i], names[i]);
+    for(int i=0;i<nk;i++) name_of(keys[i], L->names[i]);
+    spin_unlock(&g_proc_lock);
+    vfs_inode_t* ent = &L->ent;                  /* transient (callers copy) */
+    for(size_t j=0;j<sizeof(*ent);j++) ((uint8_t*)ent)[j]=0;
     for(int i=0;i<nk;i++){
         char path[256]; int o=0;
         for(int j=0; dir[j] && o<200; j++) path[o++]=dir[j];
         if(o==0 || path[o-1]!='/') path[o++]='/';
-        for(int j=0; names[i][j] && o<255; j++) path[o++]=names[i][j];
+        for(int j=0; L->names[i][j] && o<255; j++) path[o++]=L->names[i][j];
         path[o]=0;
         int kk=K_KIND(keys[i]);
-        for(int j=0;j<=o;j++) ent.path[j]=path[j];
-        ent.type = is_dir(kk) ? VFS_NODE_DIR : is_link(kk) ? VFS_NODE_SYMLINK : VFS_NODE_FILE;
-        ent.size = 0; ent.fs_data = (void*)(uintptr_t)keys[i]; ent.ops = NULL;
-        cb(&ent, user);
+        for(int j=0;j<=o;j++) ent->path[j]=path[j];
+        ent->type = is_dir(kk) ? VFS_NODE_DIR : is_link(kk) ? VFS_NODE_SYMLINK : VFS_NODE_FILE;
+        ent->size = 0; ent->fs_data = (void*)(uintptr_t)keys[i]; ent->ops = NULL;
+        cb(ent, user);
     }
-    spin_unlock(&g_proc_lock);
+    kfree(L);
     return 0;
 }
 
