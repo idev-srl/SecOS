@@ -293,7 +293,8 @@ static void op_listing(void) {
     while ((e = readdir(dp)) != 0) {
         const char* n = e->d_name;
         if (n[0] == '.') continue;
-        if (n[0] == 'f' && n[1] >= '0' && n[1] < '0' + NSLOT && n[2] == 0) seen[n[1] - '0']++;
+        /* FAT32 lists short names in upper case (F0..F7). */
+        if ((n[0] == 'f' || n[0] == 'F') && n[1] >= '0' && n[1] < '0' + NSLOT && n[2] == 0) seen[n[1] - '0']++;
         else fail("unexpected entry in own dir", 0, (unsigned long)(unsigned char)n[0], 0);
     }
     closedir(dp);
