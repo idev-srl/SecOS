@@ -14,7 +14,8 @@
  *           truncate half, unlink a third, mkdir/rmdir, verify every byte
  *           through read() and the page cache;
  *   APPEND  4 writers append 32-byte lines to one shared LOG.TXT through
- *           ops->write(ino, VFS_OFF_APPEND, ...): at the end the log must
+ *           fat32_append / exfat_append (C1's ops->append; the returned
+ *           offset must be line-aligned and grow): at the end the log must
  *           hold every line exactly once, in each writer's order, none torn;
  *   SHARED  4 writers create/write/rename/unlink in one shared directory
  *           (directory slot allocation, cluster allocation, FAT updates);
@@ -194,16 +195,21 @@ static void mkline(char* l, int fs, int w, int k) {
     l[7] = (char)('0' + k / 10 % 10); l[8] = (char)('0' + k % 10); l[9] = ' ';
     l[10] = fs ? 'X' : 'F'; l[11] = ' '; l[LINE - 1] = '\n';
 }
+/* The drivers' atomic-append entry points (C1's vfs_fs_ops.append). */
+static int (*const g_append[2])(vfs_inode_t*, const void*, size_t, uint64_t*) = { fat32_append, exfat_append };
 static void job_append(int fs, int w) {
     char p[64]; pcpy(p, g_root[fs]); cat(p, "/LOG.TXT");
     vfs_inode_t* ino = vfs_lookup(p);
     if (!ino || !ino->ops || !ino->ops->write) { fail("log lookup", p); return; }
     char l[LINE];
+    uint64_t last = 0;
     for (int k = 0; k < LOG_LINES; k++) {
         mkline(l, fs, w, k);
-        int r = ino->ops->write(ino, VFS_OFF_APPEND, l, LINE);
-        if (r != LINE) { fail("append", p); return; }
-        pagecache_invalidate(ino, 0, 1ULL << 40);
+        uint64_t at = ~0ULL;
+        int r = g_append[fs](ino, l, LINE, &at);
+        if (r != LINE || at == ~0ULL || at % LINE || (k && at <= last)) { fail("append", p); return; }
+        last = at;
+        pagecache_invalidate(ino, at, LINE);
     }
 }
 static void check_log(int fs, uint8_t* buf) {

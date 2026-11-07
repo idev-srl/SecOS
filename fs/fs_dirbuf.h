@@ -109,12 +109,4 @@ static inline void fs_set_path(char* dst, size_t cap, const char* src) {
     dst[k] = 0;
 }
 
-/* The VFS-side contract for an atomic O_APPEND write (C1) is
- * ops->write(ino, VFS_OFF_APPEND, ...): the driver resolves the offset to the
- * file's current size under its own lock. vfs.h defines the value once C1 is
- * merged; until then the drivers use this one (never a valid file offset). */
-#ifndef VFS_OFF_APPEND
-#define VFS_OFF_APPEND ((size_t)-1)
-#endif
-
 #endif /* FS_DIRBUF_H */

@@ -600,16 +600,17 @@ static int fat32_read_locked(vfs_inode_t* ino, size_t off, void* buf, size_t len
     return fat_read_file((fat_node_t*)ino->fs_data, off, buf, len);
 }
 
-/* off == VFS_OFF_APPEND: write at the file's current size, resolved here under
- * the lock (atomic O_APPEND); *at (if given) receives the offset used. The
- * slot's size is authoritative: one slot per directory entry, and every path
- * that changes the entry (write, truncate, rename, unlink) updates it. */
-static int fat32_write_at_locked(vfs_inode_t* ino, size_t off, const void* data, size_t len, size_t* at){
+/* append != 0: write at the file's current size, resolved here under the
+ * lock (atomic O_APPEND, C1's ops->append); *at (if given) receives the
+ * offset used. The slot's size is authoritative: one slot per directory
+ * entry, and every path that changes the entry (write, truncate, rename,
+ * unlink) updates it. */
+static int fat32_write_at_locked(vfs_inode_t* ino, size_t off, const void* data, size_t len, int append, uint64_t* at){
     if(!g_mounted || !ino || ino->type!=VFS_NODE_FILE) return -1;
     if(g_ro) return -30;                                  /* -EROFS */
     fat_node_t* nd = (fat_node_t*)ino->fs_data;
     if(nd->dead) return -1;                 /* unlinked: its entry slot may be reused */
-    if(off==VFS_OFF_APPEND) off = nd->size;
+    if(append) off = nd->size;
     if(at) *at = off;
     int r = fat_write_file(nd, off, data, len);
     if(r>=0) ino->size = nd->size;
@@ -818,7 +819,7 @@ static int fat32_readdir(const char* p, vfs_iter_cb cb, void* u){
     return r;
 }
 static int fat32_read(vfs_inode_t* i, size_t o, void* b, size_t l){ FAT_LOCK(); int r = fat32_read_locked(i, o, b, l); FAT_UNLOCK(); return r; }
-static int fat32_write(vfs_inode_t* i, size_t o, const void* d, size_t l){ FAT_LOCK(); int r = fat32_write_at_locked(i, o, d, l, NULL); FAT_UNLOCK(); return r; }
+static int fat32_write(vfs_inode_t* i, size_t o, const void* d, size_t l){ FAT_LOCK(); int r = fat32_write_at_locked(i, o, d, l, 0, NULL); FAT_UNLOCK(); return r; }
 static int fat32_create(const char* p, const void* d, size_t n){ FAT_LOCK(); int r = fat32_create_locked(p, d, n); FAT_UNLOCK(); return r; }
 static int fat32_mkdir(const char* p){ FAT_LOCK(); int r = fat32_mkdir_locked(p); FAT_UNLOCK(); return r; }
 static int fat32_remove(const char* p){ FAT_LOCK(); int r = fat32_remove_locked(p); FAT_UNLOCK(); return r; }
@@ -840,16 +841,14 @@ static vfs_fs_ops_t fat32_ops = {
     .setattr=fat32_setattr, .remount=fat32_remount
 };
 
-/* For the VFS (C1): the driver lock, e.g. to drain an unmount
- * (klock_lock(fat32_fs_lock()); klock_unlock(...) once the mount left the
- * table: every op that entered before has finished). Never call an op of this
- * driver while holding it. */
+/* For the VFS (C1, vfs_fs_ops.lock): the driver lock; vfs_unmount takes and
+ * releases it once as a drain barrier. Never call an op of this driver
+ * while holding it. */
 klock_t* fat32_fs_lock(void){ return &g_fat_lock; }
-/* Atomic append: write at the current end of file under the lock; *at gets
- * the offset the data landed at (for the caller's fd offset and page-cache
- * invalidation). Same as ops->write(ino, VFS_OFF_APPEND, ...) plus *at. */
-int fat32_write_append(vfs_inode_t* ino, const void* data, size_t len, size_t* at){
-    FAT_LOCK(); int r = fat32_write_at_locked(ino, VFS_OFF_APPEND, data, len, at); FAT_UNLOCK(); return r;
+/* C1's vfs_fs_ops.append: atomic O_APPEND, write at the current end of file
+ * under the lock; *at = the offset the data landed at. */
+int fat32_append(vfs_inode_t* ino, const void* data, size_t len, uint64_t* at){
+    FAT_LOCK(); int r = fat32_write_at_locked(ino, 0, data, len, 1, at); FAT_UNLOCK(); return r;
 }
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */

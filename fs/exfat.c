@@ -1129,16 +1129,16 @@ fail:
     return -1;
 }
 
-/* off == VFS_OFF_APPEND: write at the file's current size, resolved here under
- * the lock (atomic O_APPEND); *at (if given) receives the offset used. The
- * node's stream is authoritative: one node per entry set, refreshed by
- * write, truncate, rename and unlink. */
-static int ex_write_at_locked(vfs_inode_t* ino, size_t off, const void* data, size_t len, size_t* at){
+/* append != 0: write at the file's current size, resolved here under the
+ * lock (atomic O_APPEND, C1's ops->append); *at (if given) receives the
+ * offset used. The node's stream is authoritative: one node per entry set,
+ * refreshed by write, truncate, rename and unlink. */
+static int ex_write_at_locked(vfs_inode_t* ino, size_t off, const void* data, size_t len, int append, uint64_t* at){
     if(!ex_attached() || V.ro || !ino || ino->type != VFS_NODE_FILE || !ino->fs_data) return -1;
     exnode_t* n = (exnode_t*)ino->fs_data;
     if(node_ready(n) != 0) return -1;
     if(len > 0x7FFFFFFF) len = 0x7FFFFFFF;
-    if(off == VFS_OFF_APPEND) off = (size_t)n->o.st.size;
+    if(append) off = (size_t)n->o.st.size;
     if(at) *at = off;
     int r = obj_write(&n->o, off, (const uint8_t*)data, len);
     ino->size = (size_t)n->o.st.size;
@@ -1340,7 +1340,7 @@ static int ex_readdir(const char* p, vfs_iter_cb cb, void* u){
     return r;
 }
 static int ex_read(vfs_inode_t* i, size_t o, void* b, size_t l){ EX_LOCK(); int r = ex_read_locked(i, o, b, l); EX_UNLOCK(); return r; }
-static int ex_write(vfs_inode_t* i, size_t o, const void* d, size_t l){ EX_LOCK(); int r = ex_write_at_locked(i, o, d, l, NULL); EX_UNLOCK(); return r; }
+static int ex_write(vfs_inode_t* i, size_t o, const void* d, size_t l){ EX_LOCK(); int r = ex_write_at_locked(i, o, d, l, 0, NULL); EX_UNLOCK(); return r; }
 static int ex_create(const char* p, const void* d, size_t n){ EX_LOCK(); int r = ex_create_locked(p, d, n); EX_UNLOCK(); return r; }
 static int ex_mkdir(const char* p){ EX_LOCK(); int r = ex_mkdir_locked(p); EX_UNLOCK(); return r; }
 static int ex_remove(const char* p){ EX_LOCK(); int r = ex_remove_locked(p); EX_UNLOCK(); return r; }
@@ -1355,14 +1355,14 @@ static int ex_mntinfo(const char** s, const char** t){ return ex_mntinfo_locked(
 
 int exfat_sync(void){ return ex_sync(); }
 
-/* For the VFS (C1): the driver lock (e.g. to drain an unmount: lock + unlock
- * once the mount left the table). Never call an op of this driver while
- * holding it. */
+/* For the VFS (C1, vfs_fs_ops.lock): the driver lock; vfs_unmount takes and
+ * releases it once as a drain barrier. Never call an op of this driver
+ * while holding it. */
 klock_t* exfat_fs_lock(void){ return &g_ex_lock; }
-/* Atomic append: write at the current end of file under the lock; *at gets
- * the offset used. Same as ops->write(ino, VFS_OFF_APPEND, ...) plus *at. */
-int exfat_write_append(vfs_inode_t* ino, const void* data, size_t len, size_t* at){
-    EX_LOCK(); int r = ex_write_at_locked(ino, VFS_OFF_APPEND, data, len, at); EX_UNLOCK(); return r;
+/* C1's vfs_fs_ops.append: atomic O_APPEND, write at the current end of file
+ * under the lock; *at = the offset the data landed at. */
+int exfat_append(vfs_inode_t* ino, const void* data, size_t len, uint64_t* at){
+    EX_LOCK(); int r = ex_write_at_locked(ino, 0, data, len, 1, at); EX_UNLOCK(); return r;
 }
 
 static vfs_fs_ops_t exfat_ops = {
