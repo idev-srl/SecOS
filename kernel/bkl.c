@@ -98,6 +98,17 @@ static const uint16_t g_bkl_free_d4[] = {
     SYS_READ, SYS_WRITE, SYS_IOCTL, SYS_POLL,
 };
 
+/* D5: process creation and the namespace. fork/spawn/execve: pid, home CPU
+ * and the table under proc_lock, kernel stacks under kstack_lock, the
+ * address space under mm_lock, fd object refs under each object's lock, a
+ * new process is EMBRYO until it is built; spawn reads, checks and set-ids
+ * one pinned inode; exec images are per call (no shared staging buffer).
+ * mount/umount: under vfs_ns_lock (the kernel shell's mounts too), umount
+ * drains in-flight operations and then checks open fds and mappings. */
+static const uint16_t g_bkl_free_d5[] = {
+    SYS_FORK, SYS_SPAWN, SYS_EXECVE, SYS_MOUNT, SYS_UMOUNT,
+};
+
 static void bkl_mask_clear(const uint16_t* nums, unsigned n) {
     for (unsigned i = 0; i < n; i++)
         if (nums[i] < SYSCALL_BKL_NR)
@@ -117,6 +128,7 @@ void bkl_init_mode(void) {
     BKL_MASK_CLEAR(g_bkl_free_d1);
     BKL_MASK_CLEAR(g_bkl_free_d3);
     BKL_MASK_CLEAR(g_bkl_free_d4);
+    BKL_MASK_CLEAR(g_bkl_free_d5);
     if (kernel_cmdline_has("bkl=off")) g_bkl_mode = 0;
     else if (kernel_cmdline_has("bkl=on")) g_bkl_mode = 1;
     else g_bkl_mode = BKL_MODE_DEFAULT;
