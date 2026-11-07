@@ -33,6 +33,10 @@ int heap_check(void);
 // [M51-C6] Bytes in use, and the footprint (all blocks + headers) the heap
 // holds from the PMM. Either pointer may be NULL.
 void heap_usage(uint64_t* used, uint64_t* footprint);
+// [M52] Cheap counters (no walk, no lock): bytes in allocated blocks, and
+// bytes the heap took from the PMM (it never returns them: a high-water
+// mark). /proc/meminfo shows them as SUnreclaim and Slab.
+void heap_counters(uint64_t* in_use, uint64_t* from_pmm);
 
 // heap_check() plus a printed summary (shell `heapcheck`).
 void heap_check_report(void);

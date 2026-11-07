@@ -330,7 +330,11 @@ static uint64_t heap_seed(void) {
     return s ? s : 0x9E3779B97F4A7C15ULL;
 }
 
+// [M52] Bytes the heap holds from the PMM (it never gives frames back, so this
+// is its high-water mark). Updated under heap_lock; read without it.
+static volatile uint64_t g_heap_pmm_bytes;
 static void heap_track_region(uintptr_t base, size_t len) {
+    g_heap_pmm_bytes += len;
     if (heap_lo == 0 || base < heap_lo) heap_lo = base;
     if (base + len > heap_hi) heap_hi = base + len;
 }
@@ -806,6 +810,13 @@ static void hst(const char* name, int ok) {
 /* [M51-C6] Bytes in use and the heap's whole footprint (every block with its
  * header: the frames the heap took from the PMM, which it never gives back).
  * A leak check compares PMM free + footprint (frames not leaked) and used. */
+// [M52] O(1) figures for /proc/meminfo (no heap walk): bytes held from the
+// PMM and bytes in allocated blocks (block sizes, counted at kmalloc/kfree).
+void heap_counters(uint64_t* in_use, uint64_t* from_pmm) {
+    if (in_use) *in_use = total_allocated - total_freed;
+    if (from_pmm) *from_pmm = g_heap_pmm_bytes;
+}
+
 void heap_usage(uint64_t* used, uint64_t* footprint) {
     heap_walk_stats_t s = {0};
     uint64_t fl = spin_lock_irqsave(&heap_lock);

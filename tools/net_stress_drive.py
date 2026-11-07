@@ -199,8 +199,10 @@ def ssh(cmd, timeout=120):
 
 
 def stats(tag):
-    rc, o, e = ssh("/bin/netstress stats")
-    log("[NSD] stats %s rc=%d %s" % (tag, rc, o.strip()))
+    # [M52] Slab / SUnreclaim (kernel heap held from the PMM / in use) next to
+    # netstress's memfree: see the memfree check below.
+    rc, o, e = ssh("/bin/netstress stats; grep -E '^(Slab|SUnreclaim):' /proc/meminfo")
+    log("[NSD] stats %s rc=%d %s" % (tag, rc, " ".join(o.split())))
     d = {}
     for tok in o.split():
         if "=" in tok:
@@ -209,6 +211,10 @@ def stats(tag):
                 d[k] = int(v)
             except ValueError:
                 pass
+    for line in o.splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0] in ("Slab:", "SUnreclaim:") and f[1].isdigit():
+            d[f[0][:-1].lower()] = int(f[1])
     return d
 
 
@@ -324,12 +330,24 @@ try:
         if rnd == 1:
             first = cur
         else:
-            # The kernel heap keeps what it grew to (high-water mark), so allow
-            # some slack; a per-connection leak (128 KB of TCP buffers per
-            # connection, ~100 connections per round) would blow far past it.
-            drop = first.get("memfree", 0) - cur.get("memfree", 0)
+            # [M52] The kernel heap keeps every frame it ever took (a high-water
+            # mark): with more syscalls in flight at once it may grow by a few
+            # hundred kB in a later round, and MemFree alone counted that as a
+            # leak (2280 kB vs the 2048 kB limit, seen twice). Frames leaked
+            # outside the heap show in MemFree + Slab, heap blocks leaked in
+            # SUnreclaim; a per-connection leak (128 KB of TCP buffers per
+            # connection, ~100 connections per round) blows far past either.
+            def nonheap(d):
+                return d.get("memfree", 0) + d.get("slab", 0)
+            drop = nonheap(first) - nonheap(cur)
             check("r%d-memfree-stable" % rnd, "memfree" in cur and drop <= 2048,
-                  "after-r1=%s now=%s kB (drop %d kB)" % (first.get("memfree"), cur.get("memfree"), drop))
+                  "MemFree+Slab after-r1=%s now=%s kB (drop %d kB; MemFree %s -> %s, Slab %s -> %s)" %
+                  (nonheap(first), nonheap(cur), drop, first.get("memfree"), cur.get("memfree"),
+                   first.get("slab"), cur.get("slab")))
+            grow = cur.get("sunreclaim", 0) - first.get("sunreclaim", 0)
+            check("r%d-heap-in-use-stable" % rnd, grow <= 2048,
+                  "SUnreclaim after-r1=%s now=%s kB (grew %d kB)" %
+                  (first.get("sunreclaim"), cur.get("sunreclaim"), grow))
     rc, o, _ = ssh("echo NSD-ALIVE")
     check("alive-after", rc == 0 and "NSD-ALIVE" in o, "")
     log("[NSD] host counters %s" % counters)

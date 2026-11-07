@@ -244,7 +244,14 @@ static void gen_meminfo(struct sb* s){
     sb_kv_kb(s,"SwapTotal:",0);
     sb_kv_kb(s,"SwapFree:",0);
     sb_kv_kb(s,"Shmem:",0);
-    sb_kv_kb(s,"Slab:",0);
+    // [M52] The kernel heap: Slab = frames it holds from the PMM (never given
+    // back, a high-water mark), SUnreclaim = bytes in allocated blocks. A
+    // leak check compares MemFree + Slab (frames leaked outside the heap)
+    // and SUnreclaim (heap blocks leaked), not MemFree alone.
+    { uint64_t used = 0, held = 0; heap_counters(&used, &held);
+      sb_kv_kb(s,"Slab:",held/1024);
+      sb_kv_kb(s,"SReclaimable:",0);
+      sb_kv_kb(s,"SUnreclaim:",used/1024); }
 }
 static uint64_t idle_ticks_total(void){
     uint64_t t=0; kiface_cpu_stat_t c;

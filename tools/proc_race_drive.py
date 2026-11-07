@@ -81,10 +81,17 @@ def main():
         done = wait_for(sentinel, tmo, since)
         with lock: out = bytes(buf[since:]).decode("latin1")
         return done, out
+    # [M52] MemFree alone counts the kernel heap's growth as a leak, but the
+    # heap keeps every frame it ever took (a high-water mark that moves when
+    # more syscalls run at once). Sample MemFree + Slab (frames used outside
+    # the heap: a frame leak) and SUnreclaim (bytes in heap blocks: a kmalloc
+    # leak) and check each; a kernel without the fields reports Slab 0.
     def memfree():
-        done, out = run("echo MF-$(grep MemFree /proc/meminfo | tr -s ' ' | cut -d' ' -f2)-KB", 60)
+        done, out = run("echo MF-$(grep -E '^(MemFree|Slab|SUnreclaim):' /proc/meminfo | tr -s ' ' | cut -d' ' -f2 | tr '\\n' '-')KB", 60)
+        m = re.findall(r"MF-(\d+)-(\d+)-(\d+)-KB", out)
+        if done and m: return (int(m[-1][0]) + int(m[-1][1]), int(m[-1][2]), int(m[-1][0]))
         m = re.findall(r"MF-(\d+)-KB", out)
-        return int(m[-1]) if done and m else None
+        return (int(m[-1]), 0, int(m[-1])) if done and m else None
     def finish():
         report("no-kernel-fault", fault() is None, str(fault() or ""))
         p.kill()
@@ -130,9 +137,15 @@ def main():
         mf.append(v)
         print(f"[PRD] memfree after run {r+1}: {v} kB", flush=True)
         if fault(): break
-    good = len(mf) >= 2 and None not in mf and max(mf[1:]) - min(mf[1:]) <= MEMFREE_SLACK_KB \
-           if len(mf) > 2 else (len(mf) == 2 and None not in mf and abs(mf[1] - mf[0]) <= MEMFREE_SLACK_KB)
-    report("memfree-steady", bool(good), f"samples_kB={mf} slack={MEMFREE_SLACK_KB}")
+    def steady(vals):
+        if len(vals) < 2 or None in vals: return False
+        if len(vals) > 2: vals = vals[1:]
+        return max(vals) - min(vals) <= MEMFREE_SLACK_KB
+    good = None not in mf and steady([v[0] for v in mf])
+    report("memfree-steady", bool(good), f"MemFree+Slab_kB={[v and v[0] for v in mf]} "
+           f"MemFree_kB={[v and v[2] for v in mf]} slack={MEMFREE_SLACK_KB}")
+    good = None not in mf and steady([v[1] for v in mf])
+    report("heap-in-use-steady", bool(good), f"SUnreclaim_kB={[v and v[1] for v in mf]} slack={MEMFREE_SLACK_KB}")
     finish()
 
 if __name__ == "__main__":
