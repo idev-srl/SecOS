@@ -280,6 +280,7 @@ int        process_pid_state(uint32_t pid);    // state of pid, -1 when gone (no
 process_t* process_detach_unstarted(uint32_t pid);
 void process_foreach(void (*cb)(process_t*, void*), void* user);
 void process_foreach_locked(void (*cb)(process_t*, void*), void* user);   // proc_lock held
+int  process_inode_in_use(const void* ino);   // [M52] an fd or file mapping holds it
 process_t* process_reap_one(void); // [M48] detach+return one reapable, off-CPU, unreferenced ZOMBIE
 // [M39/M50-B1] wait-any: collect an uncollected zombie child of ppid (marks it
 // collected under proc_lock); 1 + *pid/*code when one was found, else 0.

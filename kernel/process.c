@@ -333,6 +333,29 @@ void process_set_cred(process_t* p, const struct proc_cred* cr) {
     spin_unlock_irqrestore(&proc_lock, fl);
 }
 
+// [M52] Does any process hold `ino` in its fd table or a file mapping? Read
+// under each owner's mm_lock (callable under an FS klock: K30 -> S30 -> S35).
+struct inode_use { const void* ino; int used; };
+static void inode_use_cb(process_t* p, void* u){
+    struct inode_use* x = (struct inode_use*)u;
+    if (x->used) return;
+    uint64_t fl = mm_lock(p);
+    for (int i = 0; i < 32 && !x->used; i++) {
+        const struct proc_fd_entry* f = &p->fds[i];
+        if (f->used && !f->is_pipe && !f->is_sock && f->inode == x->ino) x->used = 1;
+    }
+    for (uint32_t i = 0; i < p->vmas.count && !x->used; i++) {
+        const vma_t* v = &p->vmas.v[i];
+        if (v->type != VMA_TYPE_NONE && (const void*)v->file_inode == x->ino) x->used = 1;
+    }
+    mm_unlock(p, fl);
+}
+int process_inode_in_use(const void* ino){
+    struct inode_use x = { ino, 0 };
+    process_foreach(inode_use_cb, &x);
+    return x.used;
+}
+
 // [M52] The same walk for a caller that already holds proc_lock (a check and
 // the store it guards in one critical section).
 void process_foreach_locked(void (*cb)(process_t*, void*), void* user) {

@@ -925,9 +925,35 @@ static uint32_t vslot_live_ino(const vfs_inode_t* v, uint8_t* in){
     return nd->ino;
 }
 
+/* [M52] A dead slot that no fd or file mapping holds any more can be bound
+ * again: without this every unlinked file burned a slot for good, and after
+ * E2_VCHUNKS_MAX * E2_VCHUNK creates a mount could not look up new files.
+ * Tried before a new chunk is allocated (once per E2_VCHUNK fresh slots) and
+ * when the pool is full; its cached pages are dropped again (an in-flight
+ * fill of the old file is marked stale by that). */
+static e2_vslot_t* vslot_recycle_dead(void){
+    E2_HELD();
+    extern int process_inode_in_use(const void*);
+    for(int i=0;i<g_vused;i++){
+        e2_vslot_t* s=vslot(i);
+        if(!s->n.dead || process_inode_in_use(&s->v)) continue;
+        pagecache_invalidate(&s->v, 0, 1ULL<<62);
+        return s;
+    }
+    return NULL;
+}
+
 static vfs_inode_t* vino_alloc(const char* path){
     E2_HELD();
     int idx=g_vused;
+    e2_vslot_t* r = (idx % E2_VCHUNK == 0) ? vslot_recycle_dead() : NULL;
+    if(r){
+        mem_zero((uint8_t*)r, sizeof(*r));
+        vfs_inode_t* ino=&r->v;
+        size_t k=0; for(; path[k] && k<sizeof(ino->path)-1; k++) ino->path[k]=path[k]; ino->path[k]=0;
+        ino->fs_data=&r->n;
+        return ino;
+    }
     if(idx/E2_VCHUNK >= E2_VCHUNKS_MAX){ debugcon_writestring("[EXT2] VFS inode pool full\n"); return NULL; }
     if(!g_vchunk[idx/E2_VCHUNK]){
         g_vchunk[idx/E2_VCHUNK]=(e2_vslot_t*)kmalloc(sizeof(e2_vslot_t)*E2_VCHUNK);
