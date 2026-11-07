@@ -84,10 +84,35 @@ int ksys_getpid(void){ extern process_t* sched_get_current(void); process_t* c=s
 // [M10] Load + signature-verify a signed ELF from a VFS path and create a
 // process for it (PROC_READY so the scheduler can pick it up). The signing
 // gate inside process_create_from_elf refuses unsigned/tampered images.
-static uint8_t g_spawn_buf[2*1024*1024]; // 2 MB: GNU bash with readline is ~1.1 MB
-// [M16] Spawn with argv. The single static load buffer is safe because kernel
-// code is non-preemptible (preemption fires only on a ring-3 timer tick) and
-// process_create_from_elf_args copies/pins the image before returning.
+// [M16] Spawn with argv.
+// [M51-C6] Each spawn reads the file into its own kmalloc'd buffer, which the
+// new process takes over as its pinned image (process_create_from_elf_owned).
+// This replaces the static 2 MB g_spawn_buf (B5): with a shared buffer two
+// CPUs spawning at once would overwrite each other's image between the
+// signature check and the pin, and serializing them on an exec_lock would also
+// serialize the Ed25519 verify. Memory: a spawn holds at most one image of at
+// most SPAWN_MAX_IMAGE, never across a block (kernel code is not preemptible),
+// so at most one staging image per CPU is in flight, and it IS the pinned copy
+// the old code made anyway; the 2 MB of BSS is gone.
+#define SPAWN_MAX_IMAGE (16u * 1024u * 1024u)    // = EXEC_MAX_IMAGE (execve)
+
+// Read the whole regular file 'path' into a new kmalloc'd buffer. Returns the
+// byte count (> 0) and the buffer in *out, or -1 (nothing allocated).
+static int spawn_read_image(const char* path, uint8_t** out){
+    *out = 0;
+    vfs_inode_t* ino = vfs_lookup(path);
+    if(!ino || ino->type != VFS_NODE_FILE || !ino->ops || !ino->ops->read) return -1;
+    size_t size = ino->size;
+    if(size == 0 || size > SPAWN_MAX_IMAGE) return -1;
+    uint8_t* buf = (uint8_t*)kmalloc(size);
+    if(!buf) return -1;
+    int r = ino->ops->read(ino, 0, buf, size);
+    // A short read (the file shrank under us) loads what was read: the
+    // signature check decides whether that is a valid image.
+    if(r <= 0 || (size_t)r > size){ kfree(buf); return -1; }
+    *out = buf;
+    return r;
+}
 // [M39] A spawned child inherits the caller's stdio (fds 0/1/2), like a
 // fork+execve child would, so a spawned command whose caller redirected stdout
 // into a pipe or a file writes there and not to the console. Only 0/1/2 are
@@ -117,7 +142,6 @@ static int setid_allowed(process_t* p, uint32_t fmode, int setid_fs, int nnp){
 }
 
 int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
-    extern int vfs_read_all(const char*, void*, size_t);
     if(!path) return -1;
     // Follow symlinks like execve does: on a persistent root the multi-call
     // aliases are links (/bin/ls -> busybox); argv[0] keeps the name used.
@@ -135,9 +159,10 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     vfs_inode_t* fi = vfs_lookup(path);
     uint32_t fmode = fi ? cred_inode_mode(fi) : 0, fuid = fi ? fi->uid : 0, fgid = fi ? fi->gid : 0;
     int setid_fs = cred_on_root_mount(path);
-    int n = vfs_read_all(path, g_spawn_buf, sizeof(g_spawn_buf));
+    uint8_t* img = 0;
+    int n = spawn_read_image(path, &img);
     if(n <= 0) return -1;
-    process_t* p = process_create_from_elf_args(g_spawn_buf, (size_t)n, argc, argv);
+    process_t* p = process_create_from_elf_owned(img, (size_t)n, argc, argv);   // owns img
     if(!p) return -1;
     // [M46] Exec confinement: the child's caps are bounded by the spawner's
     // (no_new_privs spawner); such a child never gains a Driver Space binding.
