@@ -114,11 +114,11 @@ int ksys_getpid(void){ extern process_t* sched_get_current(void); process_t* c=s
 // the old code made anyway; the 2 MB of BSS is gone.
 #define SPAWN_MAX_IMAGE (16u * 1024u * 1024u)    // = EXEC_MAX_IMAGE (execve)
 
-// Read the whole regular file 'path' into a new kmalloc'd buffer. Returns the
-// byte count (> 0) and the buffer in *out, or -1 (nothing allocated).
-static int spawn_read_image(const char* path, uint8_t** out){
+// Read the whole regular file behind 'ino' into a new kmalloc'd buffer.
+// Returns the byte count (> 0) and the buffer in *out, or -1 (nothing
+// allocated). The caller pins the inode's mount.
+static int spawn_read_image(vfs_inode_t* ino, uint8_t** out){
     *out = 0;
-    vfs_inode_t* ino = vfs_lookup(path);
     if(!ino || ino->type != VFS_NODE_FILE || !ino->ops || !ino->ops->read) return -1;
     size_t size = ino->size;
     if(size == 0 || size > SPAWN_MAX_IMAGE) return -1;
@@ -169,18 +169,30 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     // file (root: at least one x bit); kernel-context spawns are not checked.
     process_t* caller = sched_get_current();
     char rp[256];
+    vfs_inode_t* xi = 0;
     if(path[0]=='/'){
-        vfs_inode_t* xi = 0;
         int e = cred_check_path(caller, path, 1, MAY_EXEC, rp, sizeof(rp), &xi);
         if(e) return e == -CRED_ENOENT ? -1 : e;
         if(xi->type != VFS_NODE_FILE) return -CRED_EACCES;
         path = rp;
     }
-    vfs_inode_t* fi = vfs_lookup(path);
-    uint32_t fmode = fi ? cred_inode_mode(fi) : 0, fuid = fi ? fi->uid : 0, fgid = fi ? fi->gid : 0;
+    // [M52] One pinned inode for the set-id bits, the owner and the image:
+    // three lookups by name let a rename on another CPU pair file A's
+    // set-id mode with file B's contents. A different inode than the one
+    // checked above (renamed meanwhile) is checked again.
+    vfs_pin_t pin = VFS_PIN_INIT;
+    vfs_inode_t* fi = vfs_lookup_pin(path, &pin);
+    if(!fi){ vfs_unpin(&pin); return -1; }
+    if(xi && fi != xi){
+        int e = cred_inode_perm(caller, fi, MAY_EXEC);
+        if(!e && fi->type != VFS_NODE_FILE) e = -CRED_EACCES;
+        if(e){ vfs_unpin(&pin); return e; }
+    }
+    uint32_t fmode = cred_inode_mode(fi), fuid = fi->uid, fgid = fi->gid;
     int setid_fs = cred_on_root_mount(path);
     uint8_t* img = 0;
-    int n = spawn_read_image(path, &img);
+    int n = spawn_read_image(fi, &img);
+    vfs_unpin(&pin);
     if(n <= 0) return -1;
     process_t* p = process_create_from_elf_owned(img, (size_t)n, argc, argv);   // owns img
     if(!p) return -1;
@@ -211,8 +223,10 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
       cred_exec_setid(p, fmode, fuid, fgid, setid_allowed(p, fmode, setid_fs, bound.valid && bound.nnp)); }
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0 && sp->cwd[0]) {
+          uint64_t fl = mm_lock(p);    // [M52] cwd writers publish under mm_lock (procfs reads it)
           int i = 0; for (; sp->cwd[i] && i < (int)sizeof(p->cwd) - 1; i++) p->cwd[i] = sp->cwd[i];
           p->cwd[i] = 0;
+          mm_unlock(p, fl);
       } }
     int pid = (int)p->pid;            // read before publishing: it may exit and be reaped at once
     sched_make_ready(p);              // [M48] publish only now: fully wired
@@ -1491,7 +1505,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
          * char*), or NULL for no args. Copy both the pointer array and each
          * string into the kernel (all user accesses validated/bounce-buffered). */
         const char* const* uargv = (const char* const*)a1;
-        static char argstore[SPAWN_MAX_ARGS][SPAWN_ARG_LEN];
+        char argstore[SPAWN_MAX_ARGS][SPAWN_ARG_LEN];   /* [M52] per call (1 KiB): was static, shared by every CPU */
         const char* kargv[SPAWN_MAX_ARGS];
         int argc = 0;
         if (uargv) {
