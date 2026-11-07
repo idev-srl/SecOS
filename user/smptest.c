@@ -22,6 +22,18 @@
  *     (_SC_NPROCESSORS_ONLN/_CONF), get_nprocs{,_conf} and the bits set by the
  *     sched_getaffinity syscall. Prints "[smptest] cpus=<n> onln=.. conf=..
  *     nprocs=.. conf_nprocs=.. affinity=.." and "[smptest] cpus PASS" / "FAIL".
+ *
+ *   smptest procrace [secs] [readers] [churners]
+ *     Process-lifetime race (M50 B1). `readers` children loop on random pids
+ *     around the live range: kill(pid, 0) and reads of /proc/<pid>/status,
+ *     /proc/<pid>/maps and /proc/<pid>/stat. `churners` children keep forking
+ *     short-lived workers that mmap/touch/mprotect/munmap (with splits),
+ *     grow and shrink the heap, sometimes leave an orphan grandchild for init
+ *     and sometimes are SIGKILLed mid-run; every worker's wait status is
+ *     checked. On a kernel without process references or the per-process
+ *     mm_lock this is a use-after-free of the process_t / its page tables
+ *     (heap poisoning turns that into a fault). Prints "[smptest] procrace
+ *     PASS ..." / "FAIL ...".
  */
 #include "libsecos.h"
 #include <signal.h>
@@ -29,6 +41,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/sysinfo.h>
+#include <stdio.h>
+#include <fcntl.h>
 
 #define P(s) write(1, s, strlen(s))
 
@@ -182,6 +196,130 @@ static int cmd_cpus(void) {
     return ok ? 0 : 1;
 }
 
+/* ---- procrace ------------------------------------------------------------ */
+static unsigned long g_rng;
+static unsigned long rnd(void) {
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
+    return g_rng;
+}
+
+/* Read a whole (small) file; bytes read or -1. */
+static int read_file(const char* path, char* buf, int cap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    int n = 0;
+    for (;;) {
+        long r = read(fd, buf + n, (size_t)(cap - 1 - n));
+        if (r <= 0) break;
+        n += (int)r;
+        if (n >= cap - 1) break;
+    }
+    close(fd);
+    buf[n] = 0;
+    return n;
+}
+
+/* Highest pid handed out so far: the 5th field of /proc/loadavg. */
+static long last_pid(void) {
+    char b[128];
+    if (read_file("/proc/loadavg", b, sizeof(b)) <= 0) return -1;
+    int f = 0; const char* q = b;
+    while (*q && f < 4) { if (*q == ' ') f++; q++; }
+    return (long)arg_num(q, 0);
+}
+
+static int race_reader(int idx, unsigned long deadline, int lo) {
+    g_rng = 0x9E3779B97F4A7C15ul ^ ((unsigned long)getpid() << 20) ^ (unsigned long)idx;
+    static char buf[8192];
+    char path[64];
+    int bad = 0, shown = 0;
+    unsigned long ops = 0;
+    while (getticks() < deadline) {
+        long hi = last_pid();
+        if (hi < lo) hi = lo;
+        int pid = lo + (int)(rnd() % (unsigned long)(hi - lo + 4));
+        kill(pid, 0);                                  /* ESRCH or 0, never a crash */
+        snprintf(path, sizeof(path), "/proc/%d/status", pid);
+        int n = read_file(path, buf, sizeof(buf));
+        if (n > 0 && strncmp(buf, "Name:", 5) != 0) {
+            bad++;
+            if (!shown++) { buf[40] = 0; P("[procrace] status mismatch: "); P(path); P(" -> "); P(buf); P("\n"); }
+        }
+        snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+        read_file(path, buf, sizeof(buf));
+        snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+        n = read_file(path, buf, sizeof(buf));
+        if (n > 0 && (buf[0] < '0' || buf[0] > '9')) {
+            bad++;
+            if (!shown++) { buf[40] = 0; P("[procrace] stat mismatch: "); P(path); P(" -> "); P(buf); P("\n"); }
+        }
+        ops++;
+    }
+    return bad ? 1 : (ops ? 0 : 2);
+}
+
+/* One short-lived worker: address-space churn, then exit(code). */
+static void race_worker(int code) {
+    const unsigned long PG = 4096;
+    char* a = (char*)mmap(0, 16 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (a && a != (char*)MAP_FAILED) {
+        for (int i = 0; i < 16; i++) a[i * PG] = (char)i;
+        mprotect(a + 4 * PG, 4 * PG, PROT_READ);       /* split in three */
+        munmap(a + 8 * PG, 4 * PG);                    /* hole: another split */
+        munmap(a, 16 * PG);
+    }
+    char* h = (char*)sbrk(64 * 1024);
+    if (h && h != (char*)-1) {
+        for (int i = 0; i < 16; i++) h[i * PG] = 1;
+        sbrk(-64 * 1024);
+    }
+    if ((code & 7) == 3) {                             /* an orphan for init to reap */
+        if (fork() == 0) _exit(0);
+    }
+    _exit(code);
+}
+
+static int race_churner(int idx, unsigned long deadline) {
+    g_rng = 0xD1B54A32D192ED03ul ^ ((unsigned long)getpid() << 24) ^ (unsigned long)idx;
+    int bad = 0; unsigned long rounds = 0;
+    while (getticks() < deadline) {
+        int code = (int)(rnd() & 0x3F);
+        int pid = fork();
+        if (pid == 0) race_worker(code);
+        if (pid < 0) { sleep_ticks(2); continue; }     /* process table full: retry */
+        int killed = (rnd() & 3) == 0;
+        if (killed) kill(pid, SIGKILL);
+        int st = waitpid(pid);
+        if (st != (code << 8) && !(killed && st == SIGKILL)) bad++;
+        rounds++;
+    }
+    return bad ? 1 : (rounds ? 0 : 2);
+}
+
+static int cmd_procrace(int secs, int nread, int nchurn) {
+    if (nread > 12) nread = 12;
+    if (nchurn > 6) nchurn = 6;
+    unsigned long deadline = getticks() + (unsigned long)secs * 1000ul;   /* 1 kHz tick */
+    int lo = getpid() > 8 ? getpid() - 8 : 1;
+    int pids[20], kind[20], n = 0, bad = 0, spawn_fail = 0;
+    for (int i = 0; i < nread + nchurn; i++) {
+        int pid = fork();
+        if (pid == 0) _exit(i < nread ? race_reader(i, deadline, lo) : race_churner(i, deadline));
+        if (pid < 0) { spawn_fail++; continue; }
+        pids[n] = pid; kind[n] = i < nread; n++;
+    }
+    int rbad = 0, cbad = 0;
+    for (int i = 0; i < n; i++) {
+        int st = waitpid(pids[i]);
+        if (st != 0) { bad++; if (kind[i]) rbad++; else cbad++; }
+    }
+    P(bad || spawn_fail ? "[smptest] procrace FAIL" : "[smptest] procrace PASS");
+    P(" readers="); put_dec((unsigned long)nread); P(" churners="); put_dec((unsigned long)nchurn);
+    P(" bad_readers="); put_dec((unsigned long)rbad); P(" bad_churners="); put_dec((unsigned long)cbad);
+    P(" spawn_fail="); put_dec((unsigned long)spawn_fail); P("\n");
+    return bad || spawn_fail ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     if (argc >= 2 && strcmp(argv[1], "fpu") == 0)
         return cmd_fpu((int)arg_num(argc > 2 ? argv[2] : 0, 8), arg_num(argc > 3 ? argv[3] : 0, 3000000));
@@ -189,6 +327,10 @@ int main(int argc, char** argv) {
         return cmd_burst((int)arg_num(argc > 2 ? argv[2] : 0, 20), (int)arg_num(argc > 3 ? argv[3] : 0, 12));
     if (argc >= 2 && strcmp(argv[1], "cpus") == 0)
         return cmd_cpus();
-    P("usage: smptest fpu [children] [iters] | burst [rounds] [width] | cpus\n");
+    if (argc >= 2 && strcmp(argv[1], "procrace") == 0)
+        return cmd_procrace((int)arg_num(argc > 2 ? argv[2] : 0, 20), (int)arg_num(argc > 3 ? argv[3] : 0, 8),
+                            (int)arg_num(argc > 4 ? argv[4] : 0, 4));
+    P("usage: smptest fpu [children] [iters] | burst [rounds] [width] | cpus"
+      " | procrace [secs] [readers] [churners]\n");
     return 2;
 }
