@@ -17,12 +17,19 @@ struct sched_param { int sched_priority; };
 #define CLONE_NEWUSER 0x10000000
 #define CLONE_NEWPID  0x20000000
 #define CLONE_NEWNET  0x40000000
-#define CPU_SETSIZE 64
-typedef struct { unsigned long bits[1]; } cpu_set_t;
-#define CPU_ZERO(s)  ((s)->bits[0] = 0)
-#define CPU_SET(c, s) ((s)->bits[0] |= (1UL << (c)))
-#define CPU_ISSET(c, s) (((s)->bits[0] >> (c)) & 1)
-#define CPU_COUNT(s) __builtin_popcountl((s)->bits[0])
+/* 1024 CPUs, as glibc/musl (the kernel supports up to 256). */
+#define CPU_SETSIZE 1024
+typedef struct { unsigned long bits[CPU_SETSIZE / 64]; } cpu_set_t;
+#define CPU_ZERO(s)  do { for (int __i = 0; __i < CPU_SETSIZE / 64; __i++) (s)->bits[__i] = 0; } while (0)
+#define CPU_SET(c, s) ((s)->bits[(c) / 64] |= (1UL << ((c) % 64)))
+#define CPU_CLR(c, s) ((s)->bits[(c) / 64] &= ~(1UL << ((c) % 64)))
+#define CPU_ISSET(c, s) (((s)->bits[(c) / 64] >> ((c) % 64)) & 1)
+#define CPU_COUNT(s) __cpu_count(s)
+static inline int __cpu_count(const cpu_set_t* s) {
+    int n = 0;
+    for (int i = 0; i < CPU_SETSIZE / 64; i++) n += __builtin_popcountl(s->bits[i]);
+    return n;
+}
 int sched_getparam(pid_t p, struct sched_param* sp);
 int sched_setparam(pid_t p, const struct sched_param* sp);
 int sched_getscheduler(pid_t p);
