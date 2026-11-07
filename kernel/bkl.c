@@ -72,6 +72,20 @@ static const uint16_t g_bkl_free_d1[] = {
     SYS_SETRESUID, SYS_SETRESGID, SYS_GETGROUPS, SYS_SETGROUPS,
 };
 
+/* D3: file syscalls. Every filesystem op runs under its driver's instance
+ * lock (M51 C2-C4), namespace changes under vfs_ns_lock with unmount
+ * draining (C1); open pins the mount until its fd is installed; O_APPEND
+ * resolves the end of file under the FS lock; open(O_TRUNC), truncate,
+ * chmod, chown and utimes act on the inode they checked (inode-keyed
+ * ftruncate/fsetattr), and new entries get their final attributes in the
+ * driver section that creates them. */
+static const uint16_t g_bkl_free_d3[] = {
+    SYS_OPEN, SYS_LSEEK, SYS_STAT, SYS_LSTAT, SYS_FSTAT, SYS_CHMOD, SYS_CHOWN,
+    SYS_UTIMES, SYS_READLINK, SYS_SYMLINK, SYS_GETDENTS, SYS_CREATE, SYS_MKDIR,
+    SYS_UNLINK, SYS_CHDIR, SYS_GETCWD, SYS_STATFS, SYS_SYNC, SYS_RENAME,
+    SYS_LINK, SYS_TRUNCATE, SYS_RMDIR, SYS_ACCESS,
+};
+
 static void bkl_mask_clear(const uint16_t* nums, unsigned n) {
     for (unsigned i = 0; i < n; i++)
         if (nums[i] < SYSCALL_BKL_NR)
@@ -89,6 +103,7 @@ static void bkl_mask_clear(const uint16_t* nums, unsigned n) {
 void bkl_init_mode(void) {
     extern int kernel_cmdline_has(const char* word);
     BKL_MASK_CLEAR(g_bkl_free_d1);
+    BKL_MASK_CLEAR(g_bkl_free_d3);
     if (kernel_cmdline_has("bkl=off")) g_bkl_mode = 0;
     else if (kernel_cmdline_has("bkl=on")) g_bkl_mode = 1;
     else g_bkl_mode = BKL_MODE_DEFAULT;
