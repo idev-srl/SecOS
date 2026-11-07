@@ -280,17 +280,26 @@ long ksys_execve(struct trapframe* tf, uint64_t upath, uint64_t uargv, uint64_t 
     char rp[256]; vfs_inode_t* ino = 0;
     { int e = cred_check_path(c, ap, 1, MAY_EXEC, rp, sizeof(rp), &ino);
       if(e){ kfree(blob); return e; } }
-    if(ino->type != VFS_NODE_FILE || !ino->ops || !ino->ops->read){ kfree(blob); return -EACCES; }
+    // [M52] Pin the mount while the image is read (an unmount drains it), and
+    // check again if the name now leads to another inode (renamed meanwhile).
+    vfs_pin_t pin = VFS_PIN_INIT;
+    { vfs_inode_t* pi = vfs_lookup_pin(rp, &pin);
+      int e = !pi ? -ENOENT : (pi != ino ? cred_inode_perm(c, pi, MAY_EXEC) : 0);
+      if(e){ vfs_unpin(&pin); kfree(blob); return e; }
+      ino = pi; }
+    if(ino->type != VFS_NODE_FILE || !ino->ops || !ino->ops->read){ vfs_unpin(&pin); kfree(blob); return -EACCES; }
     uint32_t fmode = cred_inode_mode(ino), fuid = ino->uid, fgid = ino->gid;
     int setid_fs = cred_on_root_mount(rp);
     size_t size = ino->size;
-    if(size == 0){ kfree(blob); return -ENOEXEC; }
-    if(size > EXEC_MAX_IMAGE){ kfree(blob); return -ENOMEM; }
+    if(size == 0){ vfs_unpin(&pin); kfree(blob); return -ENOEXEC; }
+    if(size > EXEC_MAX_IMAGE){ vfs_unpin(&pin); kfree(blob); return -ENOMEM; }
     // Private buffer (not the shared static spawn buffer: another CPU may be
     // spawning concurrently). It becomes the pinned image on success.
     uint8_t* img = (uint8_t*)kmalloc(size);
-    if(!img){ kfree(blob); return -ENOMEM; }
-    if(ino->ops->read(ino, 0, img, size) < 0){ kfree(img); kfree(blob); return -EACCES; }
+    if(!img){ vfs_unpin(&pin); kfree(blob); return -ENOMEM; }
+    int rd = ino->ops->read(ino, 0, img, size);
+    vfs_unpin(&pin);
+    if(rd < 0){ kfree(img); kfree(blob); return -EACCES; }
     debugcon_writestring("[EXEC] execve pid="); debugcon_print_hex(c->pid);
     debugcon_writestring(" path="); debugcon_writestring(rp); debugcon_writestring("\n");
     int nnp_before = c->no_new_privs;                             // [M46]
