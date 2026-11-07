@@ -680,12 +680,10 @@ static int fat32_remove_locked(const char* path){
     return dent_write_back(&loc);
 }
 
-static int fat32_truncate_locked(const char* path, size_t new_size){
-    if(g_ro) return -30;                                  /* -EROFS */
-    if(!g_mounted || !path) return -1;
-    uint32_t fc; uint32_t sz; int isd; dent_loc_t loc; loc.clus=0;
-    if(path_resolve(path, &fc, &sz, &isd, &loc)!=0) return -1;
-    if(isd || loc.clus==0) return -1;
+/* [M52 D3] Truncate core: the file whose entry is `loc` (raw bytes loaded),
+ * current chain head `fc`, size `sz`. */
+static int fat32_truncate_loc_locked(dent_loc_t* loc, uint32_t fc, uint32_t sz, size_t new_size){
+    if(new_size > 0xFFFFFFFFu) return -1;
     uint32_t need = (uint32_t)((new_size + g_clus_bytes - 1)/g_clus_bytes);
     if(new_size <= sz){
         /* shrink: free clusters beyond `need`, keep chain head */
@@ -708,15 +706,60 @@ static int fat32_truncate_locked(const char* path, size_t new_size){
     } else {
         if(fat_ensure_clusters(&fc, need)!=0) return -1;
     }
-    wr16(loc.raw+20,(uint16_t)(fc>>16)); wr16(loc.raw+26,(uint16_t)(fc&0xFFFF)); wr32(loc.raw+28,(uint32_t)new_size);
-    fat_stamp(loc.raw, 0);
-    int r = dent_write_back(&loc);
+    wr16(loc->raw+20,(uint16_t)(fc>>16)); wr16(loc->raw+26,(uint16_t)(fc&0xFFFF)); wr32(loc->raw+28,(uint32_t)new_size);
+    fat_stamp(loc->raw, 0);
+    int r = dent_write_back(loc);
     /* An fd open on the file keeps writing through its slot: give it the new
      * chain head and size (a shrink to 0 freed the old chain; the slot used
      * to keep pointing at it until the next lookup). */
-    fat_vslot_t* sl = fvslot_find(loc.clus, loc.off);
+    fat_vslot_t* sl = fvslot_find(loc->clus, loc->off);
     if(sl){ sl->n.first_cluster = fc; sl->n.size = (uint32_t)new_size; sl->v.size = new_size; }
     return r;
+}
+static int fat32_truncate_locked(const char* path, size_t new_size){
+    if(g_ro) return -30;                                  /* -EROFS */
+    if(!g_mounted || !path) return -1;
+    uint32_t fc; uint32_t sz; int isd; dent_loc_t loc; loc.clus=0;
+    if(path_resolve(path, &fc, &sz, &isd, &loc)!=0) return -1;
+    if(isd || loc.clus==0) return -1;
+    return fat32_truncate_loc_locked(&loc, fc, sz, new_size);
+}
+/* [M52 D3] The directory entry an open fd's slot is bound to (rename moves
+ * the slot with the entry: inode_move), loaded from disk. -1 if the slot is
+ * dead (unlinked / replaced), the root, or the entry no longer looks like a
+ * live file entry. */
+static int fat32_node_entry_locked(vfs_inode_t* ino, dent_loc_t* loc){
+    if(!g_mounted || !ino || !ino->fs_data) return -1;
+    fat_node_t* nd = (fat_node_t*)ino->fs_data;
+    if(nd->dead || nd->ent_clus==0 || !clus_valid(nd->ent_clus)) return -1;
+    if(nd->ent_off >= g_clus_bytes || (nd->ent_off & 31)) return -1;
+    loc->clus = nd->ent_clus; loc->off = nd->ent_off;
+    uint32_t sct = loc->off / g_bytes_per_sec, within = loc->off % g_bytes_per_sec;
+    if(sec_read(clus_lba(loc->clus) + sct, g_sec)!=0) return -1;
+    for(int i=0;i<32;i++) loc->raw[i] = g_sec[within+i];
+    uint8_t b0 = loc->raw[0];
+    if(b0==DENT_FREE || b0==DENT_END || loc->raw[11]==ATTR_LFN || (loc->raw[11] & ATTR_VOLUME)) return -1;
+    return 0;
+}
+static int fat32_ftruncate_locked(vfs_inode_t* ino, size_t new_size){
+    if(g_ro) return -30;                                  /* -EROFS */
+    dent_loc_t loc;
+    if(fat32_node_entry_locked(ino, &loc)!=0) return -1;
+    if(loc.raw[11] & ATTR_DIR) return -1;
+    uint32_t fc = ((uint32_t)rd16(loc.raw+20) << 16) | rd16(loc.raw+26);
+    return fat32_truncate_loc_locked(&loc, fc, rd32(loc.raw+28), new_size);
+}
+/* fchmod/fchown/futimes: nothing to store (as fat32_setattr), but the fd
+ * must still name a live entry. */
+static int fat32_fsetattr_locked(vfs_inode_t* ino, const vfs_attr_t* a, unsigned valid){
+    (void)a; (void)valid;
+    if(g_ro) return -30;                                  /* -EROFS */
+    if(!g_mounted || !ino || !ino->fs_data) return -1;
+    fat_node_t* nd = (fat_node_t*)ino->fs_data;
+    if(nd->dead) return -1;
+    if(nd->ent_clus==0) return 0;                         /* the root */
+    dent_loc_t loc;
+    return fat32_node_entry_locked(ino, &loc);
 }
 
 /* rename: an existing target (the VFS checked the type rules) is deleted
@@ -833,6 +876,8 @@ static int fat32_statfs(vfs_statfs_t* st){ FAT_LOCK(); int r = fat32_statfs_lock
 static int fat32_mntinfo(const char** s, const char** t){ return fat32_mntinfo_locked(s, t); }
 static int fat32_setattr(const char* p, const vfs_attr_t* a, unsigned v){ FAT_LOCK(); int r = fat32_setattr_locked(p, a, v); FAT_UNLOCK(); return r; }
 static int fat32_remount(int ro){ FAT_LOCK(); int r = fat32_remount_locked(ro); FAT_UNLOCK(); return r; }
+static int fat32_ftruncate(vfs_inode_t* i, size_t n){ FAT_LOCK(); int r = fat32_ftruncate_locked(i, n); FAT_UNLOCK(); return r; }
+static int fat32_fsetattr(vfs_inode_t* i, const vfs_attr_t* a, unsigned v){ FAT_LOCK(); int r = fat32_fsetattr_locked(i, a, v); FAT_UNLOCK(); return r; }
 
 static vfs_fs_ops_t fat32_ops = {
     .lookup=fat32_lookup, .readdir=fat32_readdir, .read=fat32_read, .write=fat32_write,
@@ -840,6 +885,7 @@ static vfs_fs_ops_t fat32_ops = {
     .truncate=fat32_truncate, .sync=fat32_sync, .statfs=fat32_statfs, .mntinfo=fat32_mntinfo,
     .setattr=fat32_setattr, .remount=fat32_remount,
     .lock = &g_fat_lock, .append = fat32_append,    /* [M51 C1] contract */
+    .ftruncate = fat32_ftruncate, .fsetattr = fat32_fsetattr,   /* [M52 D3] */
 };
 
 /* For the VFS (C1, vfs_fs_ops.lock): the driver lock; vfs_unmount takes and
