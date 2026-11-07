@@ -590,20 +590,16 @@ void proc_resolve_path(process_t* c, const char* in, char* out, int outsz){
     out[o]=0;
 }
 
-// [M43] The absolute path of an open file (for fchmod/fchown/futimes): the
-// inode keeps its mount-relative path. 0 or -errno (-EBADF / -EINVAL).
-static int fd_abs_path(int fd, char* out, int cap){
+// [M43] The inode of an open file, for fchmod/fchown/futimes. [M52] The
+// change is applied to this inode (cred_*_ino -> vfs_fsetattr), not to the
+// path it was opened by, which a rename may since have given to another
+// file. The fd pins its mount. 0 or -errno (-EBADF / -EINVAL).
+static int fd_attr_inode(int fd, vfs_inode_t** out){
     process_t* c=sched_get_current(); if(!c) return -9;
     if(fd<0||fd>=32||!c->fds[fd].used||c->fds[fd].is_pipe||c->fds[fd].is_sock||!c->fds[fd].inode) return -9;
     vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode;
-    const char* mp = ino->ops ? vfs_mount_point_of(ino->ops) : NULL;
-    if(pty_is_inode(ino)) mp = "/dev";
-    if(!mp) return -22;
-    int o=0;
-    if(!(mp[0]=='/' && mp[1]==0)) for(int i=0; mp[i] && o<cap-1; i++) out[o++]=mp[i];
-    for(int i=0; ino->path[i] && o<cap-1; i++) out[o++]=ino->path[i];
-    if(o==0) out[o++]='/';
-    out[o]=0;
+    if(!ino->ops) return -22;
+    *out = ino;
     return 0;
 }
 
@@ -633,14 +629,16 @@ static vfs_inode_t* open_repin(const char* path, vfs_pin_t* pin){
 }
 static int ksys_open_pinned(process_t* c, const char* path, int flags, uint32_t mode, int lerr,
                             vfs_pin_t* pin){
-    extern int vfs_create(const char*, const void*, size_t);
     vfs_inode_t* ino=vfs_lookup_pin(path, pin);
     if(ino && (flags & 0x40) && (flags & 0x80)) return -17;                  // O_EXCL: -EEXIST
     int created = 0;
     if(!ino && (flags & 0x40) && (lerr==0 || lerr==-2)){                     // O_CREAT
         int ce = cred_may_create(c, path); if(ce) return ce;                 // -EROFS before -EACCES
-        int cr = vfs_create(path,"",0);
-        if(cr==0){ cred_apply_new(c, path, mode, 0); ino=open_repin(path, pin); created = ino != NULL; }
+        // [M52] Created with its final mode/owner in the driver's critical
+        // section (vfs_create_attr): never visible root-owned 0644.
+        vfs_attr_t na; unsigned nv = cred_new_attr(c, path, mode, 0, &na);
+        int cr = vfs_create_attr(path, &na, nv);
+        if(cr==0){ ino=open_repin(path, pin); created = ino != NULL; }
         else if(cr==-30) return -30;                                         // -EROFS
         else {
             // Lost a race with another creator: open what is there now,
@@ -1049,25 +1047,21 @@ int ksys_getdents(const char* path, void* ubuf, int buflen){
     return n;
 }
 int ksys_create(const char* path){
-    extern int vfs_create(const char*, const void*, size_t);
     process_t* c=sched_get_current();
     char cp[256]; int e=cred_resolve(c, path, 0, cp, sizeof(cp)); if(e) return e;   // [M43]
     if(vfs_lookup(cp)) return -17;                                                   // -EEXIST
     if((e=cred_may_create(c, cp))) return e;
-    int r = vfs_create(cp, "", 0);
-    if(r==0) cred_apply_new(c, cp, 0, 0);
-    return r;
+    vfs_attr_t na; unsigned nv = cred_new_attr(c, cp, 0, 0, &na);   // [M52] one driver section
+    return vfs_create_attr(cp, &na, nv);
 }
 // mkdir(path, mode): w+x on the parent; owned by the creator, mode & ~umask.
 int ksys_mkdir_mode(const char* path, uint32_t mode){
-    extern int vfs_mkdir(const char*);
     process_t* c=sched_get_current();
     char cp[256]; int e=cred_resolve(c, path, 0, cp, sizeof(cp)); if(e) return e;   // [M43]
     if(vfs_lookup(cp)) return -17;                                                   // -EEXIST
     if((e=cred_may_create(c, cp))) return e;
-    int r = vfs_mkdir(cp);
-    if(r==0) cred_apply_new(c, cp, mode, 1);
-    return r;
+    vfs_attr_t na; unsigned nv = cred_new_attr(c, cp, mode, 1, &na);   // [M52] one driver section
+    return vfs_mkdir_attr(cp, &na, nv);
 }
 int ksys_mkdir(const char* path){ return ksys_mkdir_mode(path, 0); }
 int ksys_unlink(const char* path){
@@ -1589,7 +1583,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_CHMOD: {
         CAP_GATE(CAP_FS_WRITE, "chmod");  // [M35]
         char kp[256];
-        if (!a0) { int e = fd_abs_path((int)a2, kp, sizeof(kp)); if (e) return (uint64_t)(int64_t)e; }
+        if (!a0) { vfs_inode_t* fi; int e = fd_attr_inode((int)a2, &fi); if (e) return (uint64_t)(int64_t)e;
+                   return (uint64_t)(int64_t)cred_chmod_ino(sched_get_current(), fi, (uint32_t)a1); }
         else { char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
                proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp)); }  // cwd-relative
         return (uint64_t)(int64_t)ksys_chmod(kp, (uint32_t)a1);
@@ -1597,7 +1592,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_CHOWN: {
         CAP_GATE(CAP_FS_WRITE, "chown");  // [M35]
         char kp[256];
-        if (!a0) { int e = fd_abs_path((int)a3, kp, sizeof(kp)); if (e) return (uint64_t)(int64_t)e; }
+        if (!a0) { vfs_inode_t* fi; int e = fd_attr_inode((int)a3, &fi); if (e) return (uint64_t)(int64_t)e;
+                   return (uint64_t)(int64_t)cred_chown_ino(sched_get_current(), fi, (uint32_t)a1, (uint32_t)a2); }
         else { char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
                proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp)); }  // cwd-relative
         return (uint64_t)(int64_t)ksys_chown_ex(kp, (uint32_t)a1, (uint32_t)a2, a0 && (a4 & 1) ? 0 : 1);
@@ -1605,7 +1601,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_UTIMES: {
         CAP_GATE(CAP_FS_WRITE, "utimes"); // [M35]
         char kp[256];
-        if (!a0) { int e = fd_abs_path((int)a3, kp, sizeof(kp)); if (e) return (uint64_t)(int64_t)e; }
+        if (!a0) { vfs_inode_t* fi; int e = fd_attr_inode((int)a3, &fi); if (e) return (uint64_t)(int64_t)e;
+                   return (uint64_t)(int64_t)cred_utimes_ino(sched_get_current(), fi, (uint64_t)a1, (uint64_t)a2); }
         else { char kq[256]; if (copy_user_str((const char*)a0, kq, sizeof(kq)) != 0) return (uint64_t)(int64_t)-EFAULT;
                proc_resolve_path(sched_get_current(), kq, kp, sizeof(kp)); }  // cwd-relative
         return (uint64_t)(int64_t)ksys_utimes(kp, (uint64_t)a1, (uint64_t)a2);

@@ -184,7 +184,12 @@ void cred_new_owner(const process_t* c, const char* parent_canon,
     }
 }
 
-void cred_apply_new(const process_t* c, const char* canon, uint32_t mode, int is_dir){
+// [M52] The mode/owner/group a new file or directory gets (mode & ~umask,
+// the creator's ids, a set-gid parent's group), for vfs_create_attr /
+// vfs_mkdir_attr, which apply them in the driver's critical section that
+// creates the entry: created first and fixed up later, a new file existed
+// root-owned 0644 for a moment and another user could open it.
+unsigned cred_new_attr(const process_t* c, const char* canon, uint32_t mode, int is_dir, vfs_attr_t* a){
     uint32_t um = c ? c->ki.umask : 022;
     uint32_t want = ((mode ? mode : (is_dir ? 0777u : 0666u)) & 07777u) & ~um;
     char par[256]; parent_of(canon, par, sizeof(par));
@@ -193,19 +198,18 @@ void cred_apply_new(const process_t* c, const char* canon, uint32_t mode, int is
     if(sg && is_dir) want |= S_ISGID_;
     /* S_ISGID on a new file only if the caller is in its group (Linux). */
     if(!is_dir && (want & S_ISGID_) && !cred_is_root(c) && !cred_in_group(c, gid)) want &= ~S_ISGID_;
-    vfs_inode_t* ino = vfs_lookup(canon);
-    if(!ino) return;
-    uint32_t have = cred_inode_mode(ino) & 07777u;
-    unsigned valid = 0;
-    vfs_attr_t a; a.mode = want; a.uid = uid; a.gid = gid; a.atime = a.mtime = 0;
-    if(have != want || ino->mode == 0) valid |= VFS_ATTR_MODE;
-    if(ino->uid != uid) valid |= VFS_ATTR_UID;
-    if(ino->gid != gid) valid |= VFS_ATTR_GID;
-    if(valid) vfs_lsetattr(canon, &a, valid);
+    a->mode = want; a->uid = uid; a->gid = gid; a->atime = a->mtime = 0;
+    return VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID;
 }
 
-int cred_chmod(const process_t* c, const char* canon, uint32_t mode){
-    vfs_inode_t* ino = vfs_lookup(canon);
+/* [M52] chmod/chown/utimes check and change ONE inode: the path wrappers
+ * pin it (vfs_lookup_pin) and apply the change with vfs_fsetattr, so a
+ * rename on another CPU between the owner check and the change cannot
+ * redirect it to another file (a hard link or a swapped name). The fd
+ * forms (fchmod/fchown/futimes) call the _ino variants on the fd's inode. */
+static int cred_attr_result(int r){ return r < 0 ? (r == -1 ? -5 /*EIO*/ : r) : 0; }
+
+int cred_chmod_ino(const process_t* c, vfs_inode_t* ino, uint32_t mode){
     if(!ino) return -CRED_ENOENT;
     if(!cred_is_kernel(c) && ro_fs(ino)) return -CRED_EROFS;
     if(!cred_is_owner(c, ino)) return -CRED_EPERM;
@@ -213,12 +217,10 @@ int cred_chmod(const process_t* c, const char* canon, uint32_t mode){
     if(!cred_is_root(c) && (m & S_ISGID_) && ino->type != VFS_NODE_DIR && !cred_in_group(c, ino->gid))
         m &= ~S_ISGID_;
     vfs_attr_t a; a.mode = m; a.uid = a.gid = 0; a.atime = a.mtime = 0;
-    int r = vfs_lsetattr(canon, &a, VFS_ATTR_MODE);
-    return r < 0 ? (r == -1 ? -5 /*EIO*/ : r) : 0;
+    return cred_attr_result(vfs_fsetattr(ino, &a, VFS_ATTR_MODE));
 }
 
-int cred_chown(const process_t* c, const char* canon, uint32_t uid, uint32_t gid){
-    vfs_inode_t* ino = vfs_lookup(canon);
+int cred_chown_ino(const process_t* c, vfs_inode_t* ino, uint32_t uid, uint32_t gid){
     if(!ino) return -CRED_ENOENT;
     if(!cred_is_kernel(c) && ro_fs(ino)) return -CRED_EROFS;
     uint32_t ouid = ino->uid, ogid = ino->gid, omode = cred_inode_mode(ino);
@@ -241,12 +243,10 @@ int cred_chown(const process_t* c, const char* canon, uint32_t uid, uint32_t gid
         if(omode & 0010u) nm &= ~S_ISGID_;                /* S_ISGID without g+x = lock marker: kept */
         if(nm != (omode & 07777u)){ a.mode = nm; valid |= VFS_ATTR_MODE; }
     }
-    int r = vfs_lsetattr(canon, &a, valid);
-    return r < 0 ? (r == -1 ? -5 : r) : 0;
+    return cred_attr_result(vfs_fsetattr(ino, &a, valid));
 }
 
-int cred_utimes(const process_t* c, const char* canon, uint64_t at, uint64_t mt){
-    vfs_inode_t* ino = vfs_lookup(canon);
+int cred_utimes_ino(const process_t* c, vfs_inode_t* ino, uint64_t at, uint64_t mt){
     if(!ino) return -CRED_ENOENT;
     if(!cred_is_kernel(c) && ro_fs(ino)) return -CRED_EROFS;
     int now = (at == UTIME_NOW_SENTINEL && mt == UTIME_NOW_SENTINEL);
@@ -258,8 +258,26 @@ int cred_utimes(const process_t* c, const char* canon, uint64_t at, uint64_t mt)
     if(at == UTIME_NOW_SENTINEL) at = kclock_real_sec();
     if(mt == UTIME_NOW_SENTINEL) mt = kclock_real_sec();
     vfs_attr_t a; a.atime = at; a.mtime = mt; a.mode = 0; a.uid = a.gid = 0;
-    int r = vfs_lsetattr(canon, &a, VFS_ATTR_ATIME | VFS_ATTR_MTIME);
-    return r < 0 ? (r == -1 ? -5 : r) : 0;
+    return cred_attr_result(vfs_fsetattr(ino, &a, VFS_ATTR_ATIME | VFS_ATTR_MTIME));
+}
+
+int cred_chmod(const process_t* c, const char* canon, uint32_t mode){
+    vfs_pin_t pin = VFS_PIN_INIT;
+    int r = cred_chmod_ino(c, vfs_lookup_pin(canon, &pin), mode);
+    vfs_unpin(&pin);
+    return r;
+}
+int cred_chown(const process_t* c, const char* canon, uint32_t uid, uint32_t gid){
+    vfs_pin_t pin = VFS_PIN_INIT;
+    int r = cred_chown_ino(c, vfs_lookup_pin(canon, &pin), uid, gid);
+    vfs_unpin(&pin);
+    return r;
+}
+int cred_utimes(const process_t* c, const char* canon, uint64_t at, uint64_t mt){
+    vfs_pin_t pin = VFS_PIN_INIT;
+    int r = cred_utimes_ino(c, vfs_lookup_pin(canon, &pin), at, mt);
+    vfs_unpin(&pin);
+    return r;
 }
 
 int cred_may_signal(const process_t* s, const process_t* t, int sig){

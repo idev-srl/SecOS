@@ -52,6 +52,7 @@ struct proc_cred {
 
 struct process;
 struct vfs_inode;
+struct vfs_attr;
 
 /* Set every id to root, no supplementary groups (kernel-created processes). */
 void cred_init_root(struct proc_cred* cr);
@@ -98,9 +99,15 @@ int  cred_is_owner(const struct process* c, const struct vfs_inode* ino);
  * *inherit_sgid = 1 for a new directory under a set-gid directory. */
 void cred_new_owner(const struct process* c, const char* parent_canon,
                     uint32_t* uid, uint32_t* gid, int* inherit_sgid);
-/* Give the freshly created `canon` its owner/group and mode (& ~umask, plus the
- * set-gid inheritance). Kernel context: only the mode. */
-void cred_apply_new(const struct process* c, const char* canon, uint32_t mode, int is_dir);
+/* [M52] The attributes a new entry at `canon` gets (mode & ~umask, owner,
+ * group); returns the VFS_ATTR_* bits to apply (vfs_create_attr). */
+/* [M52] The same as cred_chmod/chown/utimes on an inode the caller pins
+ * (an open fd's): fchmod/fchown/futimes. */
+int cred_chmod_ino(const struct process* c, struct vfs_inode* ino, uint32_t mode);
+int cred_chown_ino(const struct process* c, struct vfs_inode* ino, uint32_t uid, uint32_t gid);
+int cred_utimes_ino(const struct process* c, struct vfs_inode* ino, uint64_t at, uint64_t mt);
+unsigned cred_new_attr(const struct process* c, const char* canon, uint32_t mode, int is_dir,
+                       struct vfs_attr* a);
 
 /* chmod/chown/utimes policy, then the attribute change. 0 or -errno. */
 int  cred_chmod(const struct process* c, const char* canon, uint32_t mode);
