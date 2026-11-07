@@ -40,6 +40,8 @@
 #include "debugcon.h"
 #include "heap.h"
 #include "mntopts.h"
+#include "fs_dirbuf.h"
+#include "klock.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -202,11 +204,45 @@ typedef struct nt_vol {
     nt_node_t* root;
     vfs_fs_ops_t ops;
     mntopts_t opt;                   /* owner/masks (NTFS ACLs are not mapped) */
+    /* [M51 C4] locking (the lock itself: g_vol_lock[], same index) */
+    int       claimed;               /* a mount owns the slot, vfs_mount pending */
+    uint8_t   bounce[4096];          /* dev_read ragged edges / boot sector */
 } nt_vol_t;
 
+/* ── Locking (M51 C4) ─────────────────────────────────────────────────────────
+ * One K30 klock PER VOLUME (g_vol_lock[i] for g_vol[i]), not one for the driver: every
+ * piece of mutable state belongs to one volume (caches, inode pool, hash,
+ * run lists, compression-unit buffers, and the bounce sector, which used to
+ * be one global and is now per volume), so readers of two NTFS volumes —
+ * e.g. two disks — run in parallel. What is shared: the mount-generation
+ * counter (atomic) and the staged mount options (the caller serializes a
+ * (set options, mount) pair: the BKL today, vfs_ns_lock after C1). A VFS
+ * inode belongs to exactly one volume for its whole life (slots are never
+ * moved between volumes and their chunks never freed), so nt_read finds the
+ * lock through node->v without holding anything. Every per-instance ops
+ * wrapper (NT_WRAP) and nt_read is `lock(v); r = x_locked(v); unlock(v);`.
+ * The stateless entries (the -EROFS stubs and sync, a no-op on a read-only
+ * driver) take no lock. Never two volume locks at once (mount claims a slot
+ * under that slot's lock only). Inside: block I/O (K40), kmalloc (S70),
+ * vfs_mount_point_of (S20). Never inside: vfs_mount() (K20 comes first),
+ * readdir callbacks (fs_dirbuf.h), user copies. -DSECOS_C4_NOLOCK compiles
+ * the locks out (negative control of the C4 stress test only). */
 static nt_vol_t g_vol[NTFS_MAX_VOLUMES];
+static klock_t  g_vol_lock[NTFS_MAX_VOLUMES] = {   /* apart, so g_vol stays in .bss */
+    KLOCK_INIT(LK_K30_FS, "ntfs0"), KLOCK_INIT(LK_K30_FS, "ntfs1"),
+    KLOCK_INIT(LK_K30_FS, "ntfs2"), KLOCK_INIT(LK_K30_FS, "ntfs3")
+};
+static klock_t* vol_lock(const nt_vol_t* v){ return &g_vol_lock[v - g_vol]; }
 static uint32_t g_gen_ctr;
-static uint8_t  g_bounce[4096];
+#ifdef SECOS_C4_NOLOCK
+#define NT_LOCK(v)   ((void)(v))
+#define NT_UNLOCK(v) ((void)(v))
+#define NT_HELD(v)   ((void)(v))
+#else
+#define NT_LOCK(v)   klock_lock(vol_lock(v))
+#define NT_UNLOCK(v) klock_unlock(vol_lock(v))
+#define NT_HELD(v)   KLOCK_ASSERT_HELD(vol_lock(v))
+#endif
 
 static int vol_attached(nt_vol_t* v){ return v->mounted && vfs_mount_point_of(&v->ops) != NULL; }
 
@@ -221,6 +257,7 @@ static void log_corrupt(nt_vol_t* v, const char* what, uint64_t val){
 /* Read `len` bytes at byte offset `off` of the volume. Aligned spans go
  * straight to the caller's buffer; ragged edges through a bounce sector. */
 static int dev_read(nt_vol_t* v, uint64_t off, void* buf, uint64_t len){
+    NT_HELD(v);
     if(off > v->vol_bytes || len > v->vol_bytes - off) return -1;
     uint8_t* out = (uint8_t*)buf;
     uint32_t ss = v->dss;
@@ -233,10 +270,10 @@ static int dev_read(nt_vol_t* v, uint64_t off, void* buf, uint64_t len){
             if(block_read(v->dev, lba, out, (uint32_t)n) != (int)n) return -1;
             out += n * ss; off += n * ss; len -= n * ss;
         } else {
-            if(block_read(v->dev, lba, g_bounce, 1) != 1) return -1;
+            if(block_read(v->dev, lba, v->bounce, 1) != 1) return -1;
             uint64_t n = ss - in;
             if(n > len) n = len;
-            mcopy(out, g_bounce + in, (size_t)n);
+            mcopy(out, v->bounce + in, (size_t)n);
             out += n; off += n; len -= n;
         }
     }
@@ -1020,6 +1057,7 @@ static int node_load(nt_vol_t* v, nt_node_t* n){
 
 /* Get (or load) the node for MFT record `recno` with sequence `seq`. */
 static nt_node_t* node_get(nt_vol_t* v, uint64_t recno, uint16_t seq, const char* path){
+    NT_HELD(v);
     int32_t h = (int32_t)(recno % NT_HASH);
     nt_slot_t* s = NULL;
     for(int32_t i = v->hash[h]; i >= 0; i = vslot(v, i)->n.hnext){
@@ -1047,11 +1085,7 @@ static nt_node_t* node_get(nt_vol_t* v, uint64_t recno, uint16_t seq, const char
         s->n.hnext = v->hash[h];
         v->hash[h] = idx;
     }
-    if(path){
-        size_t k = 0;
-        for(; path[k] && k < sizeof(s->vi.path) - 1; k++) s->vi.path[k] = path[k];
-        s->vi.path[k] = 0;
-    }
+    if(path) fs_set_path(s->vi.path, sizeof(s->vi.path), path);
     return &s->n;
 }
 static vfs_inode_t* node_vi(nt_node_t* n){ return &((nt_slot_t*)((uint8_t*)n - offsetof(nt_slot_t, n)))->vi; }
@@ -1116,13 +1150,13 @@ static void vi_fill(nt_node_t* n){
     vi->mtime = n->t_mod; vi->atime = n->t_acc; vi->ctime = n->t_chg;
 }
 
-static vfs_inode_t* nt_lookup(nt_vol_t* v, const char* path){
+static vfs_inode_t* nt_lookup_locked(nt_vol_t* v, const char* path){
     if(!vol_attached(v)) return NULL;
     nt_node_t* n;
     if(nt_resolve(v, path, &n) != 0) return NULL;
     if(n == v->root){
         vfs_inode_t* vi = node_vi(n);
-        vi->path[0] = '/'; vi->path[1] = 0;
+        fs_set_path(vi->path, sizeof(vi->path), "/");
     }
     vi_fill(n);
     return node_vi(n);
@@ -1185,7 +1219,7 @@ static int ix_walk(nt_walk_t* w, const uint8_t* buf, uint32_t blen, uint32_t hof
     }
 }
 
-static int nt_readdir(nt_vol_t* v, const char* path, vfs_iter_cb cb, void* user){
+static int nt_readdir_locked(nt_vol_t* v, const char* path, vfs_iter_cb cb, void* user){
     if(!vol_attached(v) || !cb) return -1;
     nt_node_t* d;
     if(nt_resolve(v, path, &d) != 0) return -1;
@@ -1257,11 +1291,15 @@ static int node_read(nt_node_t* n, size_t off, void* buf, size_t len){
 static int nt_read(vfs_inode_t* ino, size_t off, void* buf, size_t len){
     if(!ino || !ino->fs_data) return -1;
     nt_node_t* n = (nt_node_t*)ino->fs_data;
-    if(!node_ok(n)) return -1;
-    return node_read(n, off, buf, len);
+    nt_vol_t* v = n->v;                  /* fixed for the slot's lifetime */
+    if(!v) return -1;
+    NT_LOCK(v);
+    int r = node_ok(n) ? node_read(n, off, buf, len) : -1;
+    NT_UNLOCK(v);
+    return r;
 }
 
-static int nt_readlink(nt_vol_t* v, const char* path, char* buf, size_t len){
+static int nt_readlink_locked(nt_vol_t* v, const char* path, char* buf, size_t len){
     if(!vol_attached(v) || !buf || !len) return -1;
     nt_node_t* n;
     if(nt_resolve(v, path, &n) != 0 || n->kind != NK_LINK || !n->link) return -1;
@@ -1301,7 +1339,7 @@ static void count_free(nt_vol_t* v){
     attr_free(&a);
 }
 
-static int nt_statfs(nt_vol_t* v, vfs_statfs_t* st){
+static int nt_statfs_locked(nt_vol_t* v, vfs_statfs_t* st){
     if(!vol_attached(v) || !st) return -1;
     if(!v->free_known) count_free(v);
     st->type = NTFS_MAGIC;
@@ -1313,7 +1351,7 @@ static int nt_statfs(nt_vol_t* v, vfs_statfs_t* st){
     st->flags = 1;                                                   /* ST_RDONLY */
     return 0;
 }
-static int nt_mntinfo(nt_vol_t* v, const char** src, const char** type){
+static int nt_mntinfo_locked(nt_vol_t* v, const char** src, const char** type){
     if(!v->mounted) return -1;
     if(src) *src = v->devname;
     if(type) *type = "ntfs";
@@ -1330,6 +1368,21 @@ static int nt_ro_setattr(const char* p, const vfs_attr_t* a, unsigned v){ (void)
 static int nt_sync(void){ return 0; }
 
 /* Per-instance entry points (the VFS ops carry no context pointer). */
+static vfs_inode_t* nt_lookup(nt_vol_t* v, const char* p){ NT_LOCK(v); vfs_inode_t* r = nt_lookup_locked(v, p); NT_UNLOCK(v); return r; }
+static int nt_readdir(nt_vol_t* v, const char* p, vfs_iter_cb cb, void* u){
+    if(!cb) return -1;
+    fs_dirbuf_t db; fs_dirbuf_init(&db);
+    NT_LOCK(v); int r = nt_readdir_locked(v, p, fs_dirbuf_cb, &db); NT_UNLOCK(v);
+    if(r == 0) r = fs_dirbuf_replay(&db, cb, u);          /* callbacks run unlocked */
+    fs_dirbuf_free(&db);
+    return r;
+}
+static int nt_readlink(nt_vol_t* v, const char* p, char* b, size_t l){ NT_LOCK(v); int r = nt_readlink_locked(v, p, b, l); NT_UNLOCK(v); return r; }
+static int nt_statfs(nt_vol_t* v, vfs_statfs_t* s){ NT_LOCK(v); int r = nt_statfs_locked(v, s); NT_UNLOCK(v); return r; }
+/* mntinfo takes no lock: procfs calls it under g_proc_lock (a spinlock, no
+ * klock may be taken inside). devname is stable while mounted. */
+static int nt_mntinfo(nt_vol_t* v, const char** s, const char** t){ return nt_mntinfo_locked(v, s, t); }
+
 #define NT_WRAP(i) \
     static vfs_inode_t* nt_lookup##i(const char* p){ return nt_lookup(&g_vol[i], p); } \
     static int nt_readdir##i(const char* p, vfs_iter_cb cb, void* u){ return nt_readdir(&g_vol[i], p, cb, u); } \
@@ -1347,20 +1400,38 @@ static void ops_init(nt_vol_t* v){
     static int (*const rl[NTFS_MAX_VOLUMES])(const char*, char*, size_t) = { nt_readlink0, nt_readlink1, nt_readlink2, nt_readlink3 };
     static int (*const sf[NTFS_MAX_VOLUMES])(vfs_statfs_t*) = { nt_statfs0, nt_statfs1, nt_statfs2, nt_statfs3 };
     static int (*const mi[NTFS_MAX_VOLUMES])(const char**, const char**) = { nt_mntinfo0, nt_mntinfo1, nt_mntinfo2, nt_mntinfo3 };
+    /* Field by field, never zeroed first: an fd left over from an earlier
+     * mount of this slot may be calling through these pointers right now
+     * (it then fails cleanly on the generation check). Same values every
+     * time: they depend only on the slot index. */
     vfs_fs_ops_t* o = &v->ops;
-    mzero(o, sizeof(*o));
     o->flags = VFS_FS_NOCACHE | VFS_FS_RDONLY;   /* read errors must reach the caller */
     o->lookup = lk[v->idx]; o->readdir = rd[v->idx]; o->read = nt_read; o->write = nt_ro_write;
     o->create = nt_ro_create; o->mkdir = nt_ro_path; o->remove = nt_ro_path; o->rename = nt_ro_path2;
     o->truncate = nt_ro_trunc; o->setattr = nt_ro_setattr; o->readlink = rl[v->idx];
     o->symlink = nt_ro_path2; o->link = nt_ro_path2; o->sync = nt_sync;
     o->statfs = sf[v->idx]; o->mntinfo = mi[v->idx];
+    /* [M51 C1] the instance lock (unmount barrier); no ->append (read-only:
+     * the VFS fallback reaches ->write, which returns -EROFS) */
+    o->lock = &g_vol_lock[v->idx];
 }
 
 int ntfs_mounted_count(void){
     int n = 0;
-    for(int i = 0; i < NTFS_MAX_VOLUMES; i++) if(vol_attached(&g_vol[i])) n++;
+    for(int i = 0; i < NTFS_MAX_VOLUMES; i++){
+        NT_LOCK(&g_vol[i]);
+        if(vol_attached(&g_vol[i])) n++;
+        NT_UNLOCK(&g_vol[i]);
+    }
     return n;
+}
+
+/* For the VFS (C1): the lock of the instance behind `ops` (NULL if `ops` is
+ * not one of ours), e.g. to drain an unmount (lock + unlock once the mount
+ * left the table). Never call an op of that instance while holding it. */
+klock_t* ntfs_fs_lock(const vfs_fs_ops_t* ops){
+    for(int i = 0; i < NTFS_MAX_VOLUMES; i++) if(ops == &g_vol[i].ops) return &g_vol_lock[i];
+    return NULL;
 }
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */
@@ -1400,8 +1471,11 @@ static int boot_parse(const uint8_t* b, uint32_t dss, uint64_t dev_bytes, nt_geo
 int ntfs_probe(const char* dev_name){
     block_dev_t* dev = block_find(dev_name);
     if(!dev || dev->sector_size < 512 || dev->sector_size > 4096) return 0;
-    if(block_read(dev, 0, g_bounce, 1) != 1) return 0;
-    return !mcmp(g_bounce + 3, "NTFS    ", 8);
+    uint8_t* b = (uint8_t*)kmalloc(4096);           /* no volume, no lock: own buffer */
+    if(!b) return 0;
+    int r = block_read(dev, 0, b, 1) == 1 && !mcmp(b + 3, "NTFS    ", 8);
+    kfree(b);
+    return r;
 }
 
 /* Records 0..3 of the $MFT vs $MFTMirr: a damaged primary record is served
@@ -1532,9 +1606,10 @@ static void check_hiber(nt_vol_t* v){
 }
 
 static int mount_inner(nt_vol_t* v, block_dev_t* dev, const char* dev_name, const char* mount_point){
+    NT_HELD(v);
     uint32_t dss = dev->sector_size;
     uint64_t dev_bytes = dev->sector_count * dss;
-    static uint8_t b0[4096];
+    uint8_t* b0 = v->bounce;                     /* dev_read is not used until g is known */
     nt_geo_t g;
     int backup = 0;
     if(block_read(dev, 0, b0, 1) != 1) return -1;
@@ -1599,8 +1674,8 @@ static int mount_inner(nt_vol_t* v, block_dev_t* dev, const char* dev_name, cons
     for(k = 0; dev_name[k] && k < sizeof(v->devname) - 1; k++) v->devname[k] = dev_name[k];
     v->devname[k] = 0;
 
-    v->gen = ++g_gen_ctr;
-    if(!v->gen) v->gen = ++g_gen_ctr;
+    v->gen = __atomic_add_fetch(&g_gen_ctr, 1, __ATOMIC_RELAXED);
+    if(!v->gen) v->gen = __atomic_add_fetch(&g_gen_ctr, 1, __ATOMIC_RELAXED);
     v->root = node_get(v, REC_ROOT, 0, "/");
     if(!v->root || v->root->kind != NK_DIR || v->root->bad){ nt_log("root directory invalid - refused"); return -1; }
     check_hiber(v);
@@ -1629,16 +1704,33 @@ int ntfs_mount_opts(const char* dev_name, const char* mount_point, int want_rw){
     /* No signature probe here: a volume whose main boot sector is damaged is
      * still mounted from the backup copy. Other filesystems are refused by
      * boot_parse (OEM id + BPB checks) on both copies. */
+    /* Claim a free slot under that slot's lock alone (never two volume locks
+     * at once), build the volume under it, then attach with no lock held:
+     * vfs_mount takes the namespace lock (K20, C1), which comes before ours.
+     * `claimed` keeps other mounts off the slot until the table has it. */
     nt_vol_t* v = NULL;
-    for(int i = 0; i < NTFS_MAX_VOLUMES && !v; i++) if(!vol_attached(&g_vol[i])) v = &g_vol[i];
+    for(int i = 0; i < NTFS_MAX_VOLUMES && !v; i++){
+        nt_vol_t* c = &g_vol[i];
+        NT_LOCK(c);
+        if(!c->claimed && !vol_attached(c)){ c->claimed = 1; v = c; }
+        NT_UNLOCK(c);
+    }
     if(!v){ nt_log("all NTFS instances busy"); return -1; }
+    NT_LOCK(v);
     v->idx = (int)(v - g_vol);
     vol_release(v);
     ops_init(v);
     v->opt = opt;
-    if(mount_inner(v, dev, dev_name, mount_point) != 0){ vol_release(v); return -1; }
-    v->mounted = 1;
-    if(vfs_mount(v->mp, &v->ops, "ntfs") != 0){ vol_release(v); return -1; }
+    int r = mount_inner(v, dev, dev_name, mount_point);
+    if(r != 0) vol_release(v);
+    else v->mounted = 1;
+    NT_UNLOCK(v);
+    if(r == 0) r = vfs_mount(v->mp, &v->ops, "ntfs");
+    NT_LOCK(v);
+    if(r != 0) vol_release(v);
+    v->claimed = 0;
+    NT_UNLOCK(v);
+    if(r != 0) return -1;
     debugcon_writestring("[NTFS] mounted "); debugcon_writestring(v->devname);
     debugcon_writestring(" at "); debugcon_writestring(v->mp);
     debugcon_writestring(" (ro) v"); debugcon_print_hex(v->ver_major); debugcon_writestring(".");

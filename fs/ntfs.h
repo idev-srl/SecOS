@@ -31,3 +31,9 @@ int ntfs_probe(const char* dev_name);
 
 // Number of NTFS instances currently attached to the VFS.
 int ntfs_mounted_count(void);
+
+// [M51 C4] The K30 klock of the NTFS instance behind `ops` (NULL if `ops` is
+// not an NTFS instance): one lock per volume, e.g. to drain an unmount.
+struct klock;
+struct vfs_fs_ops;
+struct klock* ntfs_fs_lock(const struct vfs_fs_ops* ops);

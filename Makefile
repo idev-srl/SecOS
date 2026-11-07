@@ -124,6 +124,7 @@ SRC_C   = \
 	$(FS_DIR)/vfs_test.c \
 	$(FS_DIR)/fsvirt_test.c \
 	$(FS_DIR)/ext4locktest.c \
+	$(FS_DIR)/c4_fsstress.c \
 	$(FS_DIR)/ntfs.c \
 	$(FS_DIR)/ntfs_test.c \
 	$(FS_DIR)/ext2.c \

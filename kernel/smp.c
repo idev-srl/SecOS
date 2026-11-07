@@ -112,6 +112,9 @@ void ap_entry(void) {
 #ifdef SECOS_EXT4_LOCKTEST
         { extern void ext4locktest_ap(cpu_t*); ext4locktest_ap(c); }              // [M51 C3]
 #endif
+#ifdef SECOS_C4_FSSTRESS
+        { extern void c4_fsstress_ap(cpu_t*); c4_fsstress_ap(c); }                // [M51 C4]
+#endif
         sched_reap_zombies();
         cpu_wait_irq();
     }

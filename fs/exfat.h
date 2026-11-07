@@ -27,3 +27,11 @@ int exfat_is_mounted(void);
 
 // Flush and mark the volume clean (clears VolumeDirty). Same as ->sync.
 int exfat_sync(void);
+
+// [M51 C4] Hooks for C1's vfs_fs_ops.lock / .append (see fs/exfat.c
+// "Locking"): the driver's K30 klock, and an atomic O_APPEND write at the
+// current end of file under that lock (*at = offset written).
+struct klock;
+struct vfs_inode;
+struct klock* exfat_fs_lock(void);
+int exfat_append(struct vfs_inode* ino, const void* data, size_t len, uint64_t* at);

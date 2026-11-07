@@ -19,8 +19,19 @@
  * corrupt image is refused at mount or yields an error from the operation.
  *
  * Limitations: one mounted exFAT volume at a time; TexFAT (two FATs) and
- * volumes recovered from the backup boot region mount read-only; no locking
- * beyond the block layer (the kernel serializes FS calls today).
+ * volumes recovered from the backup boot region mount read-only.
+ *
+ * Locking (M51 C4): one K30 klock for the whole driver (one instance; V, the
+ * sector cache g_cbuf, g_bounce/g_zero, the up-case table, the bitmap state,
+ * the inode pool and the function-static scratch sets are all global). Every
+ * vfs_fs_ops entry and exported function is `lock(); r = x_locked();
+ * unlock();`; internal code calls only _locked functions (ex_rename replaces
+ * a target through ex_remove_locked). Taken inside it: block I/O (K40),
+ * kmalloc (S70), pagecache_invalidate (S40), vfs_mount_point_of (S20). Never
+ * under it: vfs_mount() (C1's namespace lock, K20, comes first), readdir
+ * callbacks (collected with fs_dirbuf.h, replayed unlocked), user copies.
+ * -DSECOS_C4_NOLOCK compiles the lock out (negative control of the C4 stress
+ * test only).
  *
  * Copyright (c) 2026 iDev srl
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
@@ -33,6 +44,8 @@
 #include "heap.h"
 #include "pagecache.h"
 #include "mntopts.h"
+#include "fs_dirbuf.h"
+#include "klock.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -114,6 +127,17 @@ static struct {
     exst_t   root;
 } V;
 
+static klock_t g_ex_lock = KLOCK_INIT(LK_K30_FS, "exfat");
+#ifdef SECOS_C4_NOLOCK
+#define EX_LOCK()   ((void)0)
+#define EX_UNLOCK() ((void)0)
+#define EX_HELD()   ((void)0)
+#else
+#define EX_LOCK()   klock_lock(&g_ex_lock)
+#define EX_UNLOCK() klock_unlock(&g_ex_lock)
+#define EX_HELD()   KLOCK_ASSERT_HELD(&g_ex_lock)
+#endif
+
 static char g_mp[256];           /* the VFS keeps our mount point pointer */
 static char g_devname[32];
 static uint16_t g_up[65536];     /* expanded up-case table */
@@ -122,10 +146,12 @@ static uint8_t  g_zero[EX_MAX_SS];
 
 /* ── Sector I/O + small write-through metadata cache ─────────────────────── */
 static int dev_rd(uint64_t fsec, void* buf, uint32_t n){
+    EX_HELD();
     if(fsec >= V.vol_len || n > V.vol_len - fsec) return -1;
     return block_read(V.dev, fsec * V.spf, buf, n * V.spf) == (int)(n * V.spf) ? 0 : -1;
 }
 static int dev_wr(uint64_t fsec, const void* buf, uint32_t n){
+    EX_HELD();
     if(V.ro) return -1;
     if(fsec >= V.vol_len || n > V.vol_len - fsec) return -1;
     return block_write(V.dev, fsec * V.spf, buf, n * V.spf) == (int)(n * V.spf) ? 0 : -1;
@@ -157,6 +183,7 @@ static int cache_slot(uint64_t lba, int* hit){
 /* Return the cached copy of fs sector `lba` (read on miss). At most the last
  * few returned pointers stay valid: callers copy out what they keep. */
 static uint8_t* sec_get(uint64_t lba){
+    EX_HELD();
     if(lba >= V.vol_len) return NULL;
     int hit, i = cache_slot(lba, &hit);
     if(hit) return g_cbuf[i];
@@ -943,6 +970,7 @@ static int same_loc(const exobj_t* a, uint32_t dfirst, uint32_t slot){
 }
 
 static vfs_inode_t* inode_get(const char* path, const exobj_t* o){
+    EX_HELD();
     exslot_t* s = NULL;
     for(int i = 0; i < g_vused && !s; i++){
         exslot_t* c = vslot(i);
@@ -965,13 +993,12 @@ static vfs_inode_t* inode_get(const char* path, const exobj_t* o){
         s->v.fs_data = &s->n;
     }
     vfs_inode_t* ino = &s->v;
-    size_t k = 0;
-    for(; path[k] && k < sizeof(ino->path) - 1; k++) ino->path[k] = path[k];
-    ino->path[k] = 0;
+    fs_set_path(ino->path, sizeof(ino->path), path);
     return ino;
 }
 /* An entry set moved or vanished: retarget / kill cached nodes. */
 static void nodes_moved(uint32_t odfirst, uint32_t oslot, const exobj_t* now){
+    EX_HELD();
     for(int i = 0; i < g_vused; i++){
         exnode_t* n = &vslot(i)->n;
         if(n->dead || !same_loc(&n->o, odfirst, oslot)) continue;
@@ -984,10 +1011,14 @@ static vfs_fs_ops_t exfat_ops;
 /* Owner/mode of the mounted volume (exFAT keeps none: fs/mntopts.h). */
 static mntopts_t g_xopt     = { 0, 0, 022, 0133, 0, 0 };
 static mntopts_t g_xopt_new = { 0, 0, 022, 0133, 0, 0 };   /* for the next mount */
+/* The (set options, mount) pair is one request: the caller serializes it
+ * (the BKL today, vfs_ns_lock after C1); the lock only keeps the copy whole. */
 int exfat_set_mount_options(const char* opts){
     mntopts_t o;
     if(mntopts_parse(opts, &o) != 0) return -1;
+    EX_LOCK();
     g_xopt_new = o;
+    EX_UNLOCK();
     return 0;
 }
 static int ex_attached(void){ return V.mounted && vfs_mount_point_of(&exfat_ops) != NULL; }
@@ -1006,7 +1037,7 @@ static void ino_fill(vfs_inode_t* ino, const exobj_t* o){
 }
 
 /* ── VFS operations ──────────────────────────────────────────────────────── */
-static vfs_inode_t* ex_lookup(const char* path){
+static vfs_inode_t* ex_lookup_locked(const char* path){
     if(!V.mounted) return NULL;
     exobj_t o;
     if(ex_resolve(path, &o) != 0) return NULL;
@@ -1040,7 +1071,7 @@ static int readdir_cb(exset_t* s, void* u){
     c->cb(&child, c->user);
     return 0;
 }
-static int ex_readdir(const char* dir_path, vfs_iter_cb cb, void* user){
+static int ex_readdir_locked(const char* dir_path, vfs_iter_cb cb, void* user){
     if(!V.mounted || !cb) return -1;
     exobj_t o;
     if(ex_resolve(dir_path, &o) != 0) return -1;
@@ -1068,7 +1099,7 @@ static int node_ready(exnode_t* n){
     return 0;
 }
 
-static int ex_read(vfs_inode_t* ino, size_t off, void* buf, size_t len){
+static int ex_read_locked(vfs_inode_t* ino, size_t off, void* buf, size_t len){
     if(!ex_attached() || !ino || ino->type != VFS_NODE_FILE || !ino->fs_data) return -1;
     exnode_t* n = (exnode_t*)ino->fs_data;
     if(node_ready(n) != 0) return -1;
@@ -1098,11 +1129,17 @@ fail:
     return -1;
 }
 
-static int ex_write(vfs_inode_t* ino, size_t off, const void* data, size_t len){
+/* append != 0: write at the file's current size, resolved here under the
+ * lock (atomic O_APPEND, C1's ops->append); *at (if given) receives the
+ * offset used. The node's stream is authoritative: one node per entry set,
+ * refreshed by write, truncate, rename and unlink. */
+static int ex_write_at_locked(vfs_inode_t* ino, size_t off, const void* data, size_t len, int append, uint64_t* at){
     if(!ex_attached() || V.ro || !ino || ino->type != VFS_NODE_FILE || !ino->fs_data) return -1;
     exnode_t* n = (exnode_t*)ino->fs_data;
     if(node_ready(n) != 0) return -1;
     if(len > 0x7FFFFFFF) len = 0x7FFFFFFF;
+    if(append) off = (size_t)n->o.st.size;
+    if(at) *at = off;
     int r = obj_write(&n->o, off, (const uint8_t*)data, len);
     ino->size = (size_t)n->o.st.size;
     return r;
@@ -1128,7 +1165,7 @@ static int ex_new_entry(const char* path, uint16_t attr, exst_t* st, exobj_t* ma
     return 0;
 }
 
-static int ex_create(const char* path, const void* initial, size_t size){
+static int ex_create_locked(const char* path, const void* initial, size_t size){
     if(!V.mounted || V.ro || !path) return -1;
     if(vol_dirty() != 0) return -1;
     exst_t st; mzero(&st, sizeof(st));
@@ -1138,7 +1175,7 @@ static int ex_create(const char* path, const void* initial, size_t size){
     return 0;
 }
 
-static int ex_mkdir(const char* path){
+static int ex_mkdir_locked(const char* path){
     if(!V.mounted || V.ro || !path) return -1;
     if(vol_dirty() != 0) return -1;
     exst_t st; mzero(&st, sizeof(st));
@@ -1151,7 +1188,7 @@ static int ex_mkdir(const char* path){
 
 static int any_cb(exset_t* s, void* u){ (void)s; (void)u; return 1; }
 
-static int ex_remove(const char* path){
+static int ex_remove_locked(const char* path){
     if(!V.mounted || V.ro || !path) return -1;
     exobj_t o;
     if(ex_resolve(path, &o) != 0 || o.is_root) return -1;
@@ -1171,7 +1208,7 @@ static int ex_remove(const char* path){
     return 0;
 }
 
-static int ex_rename(const char* oldp, const char* newp){
+static int ex_rename_locked(const char* oldp, const char* newp){
     if(!V.mounted || V.ro || !oldp || !newp) return -1;
     exobj_t o, parent, t;
     uint16_t nm[255]; uint32_t nl;
@@ -1184,7 +1221,7 @@ static int ex_rename(const char* oldp, const char* newp){
     if(ex_resolve(newp, &t) == 0 && !t.is_root){
         if(!same_loc(&t, o.dir.first, o.slot)){
             /* replace an existing target (the VFS checked the type rules) */
-            if(ex_remove(newp) != 0) return -1;
+            if(ex_remove_locked(newp) != 0) return -1;
             if(ex_resolve_parent(newp, &parent, nm, &nl) != 0) return -1;
             if(set_read(&o.dir, o.slot, &os) != 0) return -1;
         }
@@ -1213,7 +1250,7 @@ static int ex_rename(const char* oldp, const char* newp){
     return 0;
 }
 
-static int ex_truncate(const char* path, size_t new_size){
+static int ex_truncate_locked(const char* path, size_t new_size){
     if(!V.mounted || V.ro || !path) return -1;
     exobj_t o;
     if(ex_resolve(path, &o) != 0 || (o.attr & AT_DIR) || o.is_root || o.bad) return -1;
@@ -1247,7 +1284,7 @@ static int ex_truncate(const char* path, size_t new_size){
     return 0;
 }
 
-static int ex_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
+static int ex_setattr_locked(const char* path, const vfs_attr_t* a, unsigned valid){
     if(!V.mounted || !path || !a) return -1;
     exobj_t o;
     if(ex_resolve(path, &o) != 0) return -1;
@@ -1268,7 +1305,7 @@ static int ex_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
     return dent_wr(&o.dir, o.slot, r);
 }
 
-static int ex_statfs(vfs_statfs_t* st){
+static int ex_statfs_locked(vfs_statfs_t* st){
     if(!V.mounted || !st) return -1;
     st->type = EXFAT_MAGIC;
     st->bsize = st->frsize = V.cb;
@@ -1280,27 +1317,63 @@ static int ex_statfs(vfs_statfs_t* st){
     return 0;
 }
 
-int exfat_sync(void){
+static int ex_sync_locked(void){
     if(!V.mounted) return 0;
     return vol_clean();
 }
-static int ex_sync(void){ return exfat_sync(); }
 
-static int ex_mntinfo(const char** src, const char** type){
+static int ex_mntinfo_locked(const char** src, const char** type){
     if(!V.mounted) return -1;
     if(src) *src = g_devname;
     if(type) *type = "exfat";
     return 0;
 }
 
+/* ── Locked entry points (M51 C4) ────────────────────────────────────────── */
+static vfs_inode_t* ex_lookup(const char* p){ EX_LOCK(); vfs_inode_t* r = ex_lookup_locked(p); EX_UNLOCK(); return r; }
+static int ex_readdir(const char* p, vfs_iter_cb cb, void* u){
+    if(!cb) return -1;
+    fs_dirbuf_t db; fs_dirbuf_init(&db);
+    EX_LOCK(); int r = ex_readdir_locked(p, fs_dirbuf_cb, &db); EX_UNLOCK();
+    if(r == 0) r = fs_dirbuf_replay(&db, cb, u);          /* callbacks run unlocked */
+    fs_dirbuf_free(&db);
+    return r;
+}
+static int ex_read(vfs_inode_t* i, size_t o, void* b, size_t l){ EX_LOCK(); int r = ex_read_locked(i, o, b, l); EX_UNLOCK(); return r; }
+static int ex_write(vfs_inode_t* i, size_t o, const void* d, size_t l){ EX_LOCK(); int r = ex_write_at_locked(i, o, d, l, 0, NULL); EX_UNLOCK(); return r; }
+static int ex_create(const char* p, const void* d, size_t n){ EX_LOCK(); int r = ex_create_locked(p, d, n); EX_UNLOCK(); return r; }
+static int ex_mkdir(const char* p){ EX_LOCK(); int r = ex_mkdir_locked(p); EX_UNLOCK(); return r; }
+static int ex_remove(const char* p){ EX_LOCK(); int r = ex_remove_locked(p); EX_UNLOCK(); return r; }
+static int ex_rename(const char* a, const char* b){ EX_LOCK(); int r = ex_rename_locked(a, b); EX_UNLOCK(); return r; }
+static int ex_truncate(const char* p, size_t n){ EX_LOCK(); int r = ex_truncate_locked(p, n); EX_UNLOCK(); return r; }
+static int ex_setattr(const char* p, const vfs_attr_t* a, unsigned v){ EX_LOCK(); int r = ex_setattr_locked(p, a, v); EX_UNLOCK(); return r; }
+static int ex_sync(void){ EX_LOCK(); int r = ex_sync_locked(); EX_UNLOCK(); return r; }
+static int ex_statfs(vfs_statfs_t* st){ EX_LOCK(); int r = ex_statfs_locked(st); EX_UNLOCK(); return r; }
+/* mntinfo takes no lock: procfs calls it under g_proc_lock (a spinlock, no
+ * klock may be taken inside). g_devname is stable while mounted. */
+static int ex_mntinfo(const char** s, const char** t){ return ex_mntinfo_locked(s, t); }
+
+int exfat_sync(void){ return ex_sync(); }
+
+/* For the VFS (C1, vfs_fs_ops.lock): the driver lock; vfs_unmount takes and
+ * releases it once as a drain barrier. Never call an op of this driver
+ * while holding it. */
+klock_t* exfat_fs_lock(void){ return &g_ex_lock; }
+/* C1's vfs_fs_ops.append: atomic O_APPEND, write at the current end of file
+ * under the lock; *at = the offset the data landed at. */
+int exfat_append(vfs_inode_t* ino, const void* data, size_t len, uint64_t* at){
+    EX_LOCK(); int r = ex_write_at_locked(ino, 0, data, len, 1, at); EX_UNLOCK(); return r;
+}
+
 static vfs_fs_ops_t exfat_ops = {
     .lookup = ex_lookup, .readdir = ex_readdir, .read = ex_read, .write = ex_write,
     .create = ex_create, .mkdir = ex_mkdir, .remove = ex_remove, .rename = ex_rename,
     .truncate = ex_truncate, .setattr = ex_setattr, .sync = ex_sync,
-    .statfs = ex_statfs, .mntinfo = ex_mntinfo
+    .statfs = ex_statfs, .mntinfo = ex_mntinfo,
+    .lock = &g_ex_lock, .append = exfat_append,     /* [M51 C1] contract */
 };
 
-int exfat_is_mounted(void){ return ex_attached(); }
+int exfat_is_mounted(void){ EX_LOCK(); int r = ex_attached(); EX_UNLOCK(); return r; }
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */
 /* exFAT boot checksum over sectors 0..10 (VolumeFlags + PercentInUse skipped). */
@@ -1374,13 +1447,15 @@ static int boot_region_ok(block_dev_t* dev, uint32_t ss_shift, uint32_t base, ex
     return 0;
 }
 
-int exfat_probe(const char* dev_name){
+static int ex_probe_locked(const char* dev_name){
     block_dev_t* dev = block_find(dev_name);
     static uint8_t b[EX_MAX_SS];
+    EX_HELD();
     if(!dev || dev->sector_size < 512 || dev->sector_size > EX_MAX_SS) return 0;
     if(block_read(dev, 0, b, 1) != 1) return 0;
     return b[3] == 'E' && b[4] == 'X' && b[5] == 'F' && b[6] == 'A' && b[7] == 'T';
 }
+int exfat_probe(const char* dev_name){ EX_LOCK(); int r = ex_probe_locked(dev_name); EX_UNLOCK(); return r; }
 
 /* Read a FAT-chained metadata stream (bitmap / up-case) into memory. */
 static int meta_clusters(uint32_t first, uint64_t len, uint32_t* out, uint32_t n){
@@ -1427,12 +1502,14 @@ static int load_upcase(struct root_scan* rs){
     return 0;
 }
 
-int exfat_mount(const char* dev_name, const char* mount_point){
+static int g_mounting;            /* volume committed, vfs_mount still pending */
+static int ex_mount_locked(const char* dev_name, const char* mount_point){
+    EX_HELD();
     block_dev_t* dev = block_find(dev_name);
     if(!dev || !mount_point || mount_point[0] != '/') return -1;
     if(dev->sector_size < 512 || dev->sector_size > EX_MAX_SS || (dev->sector_size & (dev->sector_size - 1))) return -1;
-    if(ex_attached()) return -1;                      /* single instance busy */
-    if(!exfat_probe(dev_name)) return -1;
+    if(g_mounting || ex_attached()) return -1;        /* single instance busy */
+    if(!ex_probe_locked(dev_name)) return -1;
 
     /* Boot region: main, else the backup (then read-only). */
     exgeo_t g;
@@ -1541,7 +1618,10 @@ int exfat_mount(const char* dev_name, const char* mount_point){
     V.mounted = 1;
     g_xopt = g_xopt_new; mntopts_default(&g_xopt_new);    /* this mount's owner/masks */
     exfat_ops.flags = V.ro ? VFS_FS_RDONLY : 0;           /* EROFS before EACCES (kernel/cred.c) */
-    if(vfs_mount(g_mp, &exfat_ops, "exfat") != 0){ V.mounted = 0; return -1; }
+    g_mounting = 1;
+    return 0;
+}
+static void ex_mount_log(void){
     debugcon_writestring("[EXFAT] mounted "); debugcon_writestring(g_devname);
     debugcon_writestring(" at "); debugcon_writestring(g_mp);
     debugcon_writestring(V.ro ? " (ro)" : " (rw)");
@@ -1550,5 +1630,20 @@ int exfat_mount(const char* dev_name, const char* mount_point){
     debugcon_writestring(" free="); debugcon_print_hex(V.free);
     if(V.dirty_at_mount) debugcon_writestring(" [was dirty]");
     debugcon_writestring("\n");
-    return 0;
+}
+
+int exfat_mount(const char* dev_name, const char* mount_point){
+    EX_LOCK();
+    int r = ex_mount_locked(dev_name, mount_point);
+    EX_UNLOCK();
+    if(r != 0) return r;
+    /* vfs_mount runs unlocked: the namespace lock (K20, C1) comes before ours.
+     * g_mounting keeps a concurrent mount out until the table has us. */
+    r = vfs_mount(g_mp, &exfat_ops, "exfat");
+    EX_LOCK();
+    g_mounting = 0;
+    if(r != 0) V.mounted = 0;
+    else ex_mount_log();
+    EX_UNLOCK();
+    return r != 0 ? -1 : 0;
 }
