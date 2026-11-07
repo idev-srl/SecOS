@@ -10,7 +10,13 @@
  * logic can try each (on VMware the boot ESP and the data disk are both SATA, so
  * we must not assume the first port is the data disk). DMA structures are static,
  * aligned kernel buffers; physical addresses come from kvirt_to_phys. Transfers
- * bounce through a shared static buffer (commands are serialized + polled).
+ * bounce through a per-port static buffer (commands are polled).
+ *
+ * [M50 B3] Locking: AHCI ports are independent (own command list, FIS area,
+ * PxIS/PxCI/PxTFD registers), and every per-command structure — command table
+ * and DMA bounce — is per port too, so each disk is serialized only by its own
+ * block_dev_t lock (fs/block.h): two CPUs can drive sda and sdb at once. The
+ * HBA-global registers (GHC, PI, CAP) are touched only by ahci_init.
  */
 #include "ahci.h"
 #include "pci.h"
@@ -59,10 +65,10 @@
 // Per-port command list + received-FIS (the HBA reads these continuously).
 static uint8_t g_clb[AHCI_MAX_DISKS][1024] __attribute__((aligned(1024)));
 static uint8_t g_fis[AHCI_MAX_DISKS][256]  __attribute__((aligned(256)));
-// Shared (one command runs at a time): command table + DMA bounce.
-static uint8_t g_ctba[256]      __attribute__((aligned(128)));
-static uint8_t g_dma[64 * 1024] __attribute__((aligned(4096)));
-#define DMA_SECTORS (sizeof(g_dma) / 512)
+// Per port (one command in flight per port): command table + DMA bounce.
+static uint8_t g_ctba[AHCI_MAX_DISKS][256]      __attribute__((aligned(128)));
+static uint8_t g_dma[AHCI_MAX_DISKS][64 * 1024] __attribute__((aligned(4096)));
+#define DMA_SECTORS (sizeof(g_dma[0]) / 512)
 
 struct ahci_disk { int port; int idx; block_dev_t dev; };
 static struct ahci_disk g_disks[AHCI_MAX_DISKS];
@@ -97,29 +103,30 @@ static void port_rebase(int port, int idx) {
     port_start(port);
 }
 
-// Issue one ATA command on a disk's port/slot, single PRDT over g_dma.
+// Issue one ATA command on a disk's port/slot, single PRDT over its g_dma.
 static int ahci_cmd(struct ahci_disk* d, uint8_t cmd, uint64_t lba,
                     uint32_t count, uint32_t nbytes, int write) {
     int port = d->port;
+    uint8_t* ctba = g_ctba[d->idx];
     pw(port, PxIS, 0xFFFFFFFFu);
 
     uint32_t* hdr = (uint32_t*)g_clb[d->idx];   // command header, slot 0
-    uint64_t ctba = phys_of(g_ctba);
+    uint64_t ctba_phys = phys_of(ctba);
     hdr[0] = 5u | ((uint32_t)(write ? 1u : 0u) << 6) | (1u << 16); // CFL=5, W, PRDTL=1
     hdr[1] = 0;
-    hdr[2] = (uint32_t)ctba; hdr[3] = (uint32_t)(ctba >> 32);
+    hdr[2] = (uint32_t)ctba_phys; hdr[3] = (uint32_t)(ctba_phys >> 32);
     hdr[4] = hdr[5] = hdr[6] = hdr[7] = 0;
 
-    zero(g_ctba, sizeof(g_ctba));
-    uint8_t* cfis = g_ctba;                     // H2D register FIS
+    zero(ctba, sizeof(g_ctba[0]));
+    uint8_t* cfis = ctba;                       // H2D register FIS
     cfis[0] = 0x27; cfis[1] = 0x80; cfis[2] = cmd; cfis[3] = 0;
     cfis[4] = (uint8_t)lba; cfis[5] = (uint8_t)(lba >> 8); cfis[6] = (uint8_t)(lba >> 16);
     cfis[7] = 0x40;                             // LBA mode
     cfis[8] = (uint8_t)(lba >> 24); cfis[9] = (uint8_t)(lba >> 32); cfis[10] = (uint8_t)(lba >> 40);
     cfis[12] = (uint8_t)count; cfis[13] = (uint8_t)(count >> 8);
 
-    uint32_t* prdt = (uint32_t*)(g_ctba + 0x80);
-    uint64_t dba = phys_of(g_dma);
+    uint32_t* prdt = (uint32_t*)(ctba + 0x80);
+    uint64_t dba = phys_of(g_dma[d->idx]);
     prdt[0] = (uint32_t)dba; prdt[1] = (uint32_t)(dba >> 32);
     prdt[2] = 0; prdt[3] = (nbytes - 1) & 0x3FFFFF;
 
@@ -142,14 +149,15 @@ static struct ahci_disk* disk_of(block_dev_t* dev) {
 }
 
 static int ahci_rw(struct ahci_disk* d, uint64_t lba, uint8_t* buf, uint32_t count, int write) {
+    uint8_t* dma = g_dma[d->idx];
     uint32_t done = 0;
     while (done < count) {
         uint32_t chunk = count - done; if (chunk > DMA_SECTORS) chunk = DMA_SECTORS;
         uint32_t nbytes = chunk * 512;
-        if (write) for (uint32_t i = 0; i < nbytes; i++) g_dma[i] = buf[done * 512 + i];
+        if (write) for (uint32_t i = 0; i < nbytes; i++) dma[i] = buf[done * 512 + i];
         if (ahci_cmd(d, write ? ATA_WRITE_DMA_EX : ATA_READ_DMA_EX, lba + done, chunk, nbytes, write) != 0)
             return -1;
-        if (!write) for (uint32_t i = 0; i < nbytes; i++) buf[done * 512 + i] = g_dma[i];
+        if (!write) for (uint32_t i = 0; i < nbytes; i++) buf[done * 512 + i] = dma[i];
         done += chunk;
     }
     return (int)count;
@@ -166,11 +174,12 @@ static int ahci_write(block_dev_t* dev, uint64_t lba, const void* buf, uint32_t 
 
 static uint64_t ahci_identify(struct ahci_disk* d) {
     if (ahci_cmd(d, ATA_IDENTIFY, 0, 0, 512, 0) != 0) return 0;
+    const uint8_t* id = g_dma[d->idx];
     uint64_t lba48 = 0;
-    for (int i = 0; i < 8; i++) lba48 |= (uint64_t)g_dma[200 + i] << (8 * i);
+    for (int i = 0; i < 8; i++) lba48 |= (uint64_t)id[200 + i] << (8 * i);
     if (lba48) return lba48;
     uint32_t lba28 = 0;
-    for (int i = 0; i < 4; i++) lba28 |= (uint32_t)g_dma[120 + i] << (8 * i);
+    for (int i = 0; i < 4; i++) lba28 |= (uint32_t)id[120 + i] << (8 * i);
     return lba28;
 }
 
