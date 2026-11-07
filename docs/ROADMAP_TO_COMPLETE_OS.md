@@ -248,26 +248,55 @@ four phases toward "a system that really works"; the actionable checklist is in
    Phase 3 also keeps: init/services hardening (DHCP renewal, dependencies,
    per-service limits), signed packages with a keyring + revocation, more ports
    (sqlite, dash).
-4. **Phase 4 — hardening:** SMAP by default, kernel KASLR, removing the low
-   identity map from user address spaces, the exec confinement rule (a confined
-   process must not gain caps by exec'ing an ambient program), net stack
-   locking, and SMP (TLB shootdown, IPI reschedule — prerequisites for SMP by
-   default, which also needs real-HW re-validation).
+4. **Phase 4 — hardening: DONE** (integrated on `integ/phase4`, 2026-11-07).
+   M44 SMAP by default + low identity map removed (user spaces and, after early
+   boot, the kernel); M45 kernel KASLR (2 MiB slide, 768 slots, both boot
+   paths, randomized stack canary); M46 exec confinement (`no_new_privs`, caps
+   bounded across spawn/execve, SETID ignored); M47 network stack locking;
+   M48 SMP **on by default** (TLB shootdown, reschedule IPIs, migration,
+   x2APIC, 256 CPUs; `nosmp` / `-DSECOS_NO_SMP`); M49 big memory (64 TiB
+   physmap with 1 GiB pages, sectioned PMM, explicit MMIO mappings, DMA32
+   zone). **Caveat:** SMP correctness rests on a stop-gap kernel-wide lock
+   (`kernel/bkl.c`) around syscalls, user faults and teardown, because VFS,
+   the filesystems and the TTY layer have no locks of their own; user code
+   runs in parallel, kernel work on behalf of tasks is serialized. SMP still
+   needs real-HW re-validation (paused).
+5. **Phase 5 — isolated drivers** (approved): move drivers out of ring 0 into
+   Driver Space (M11) with hardware-enforced DMA isolation.
+   1. **IOMMU**: Intel VT-d first (DMAR parsing, root/context tables, second-
+      level page tables per device, fault reporting), testable in QEMU with
+      `-machine q35 -device intel-iommu`; AMD-Vi later.
+   2. **IRQ delivery to ring-3 drivers**: a Driver Space process subscribes to
+      its device's MSI/MSI-X vector and receives interrupts as IPC events
+      (mask in the kernel, unmask on the driver's ack).
+   3. **Kernel-granted DMA buffers confined by the IOMMU**: the driver asks the
+      kernel for DMA memory, the kernel maps it in the driver and in the
+      device's IOMMU domain only; the device cannot reach anything else.
+   4. **Move a first real driver to ring 3** (e1000 or USB HID), then the
+      others one by one (storage last; ported ath9k included).
+
+   Next items after (or alongside) Phase 5: per-filesystem / VFS / TTY locking
+   to **remove the kernel lock**; NUMA awareness; a **buddy allocator** for
+   contiguous allocations (the M49 PMM run search is linear and cannot cross a
+   1 GiB section); physmap and kernel-heap randomization (KASLR randomizes only
+   the kernel image).
 
 **Real-hardware-only (paused):** ath9k RX/TX/assoc, UEFI loader on real firmware
 (conflicting reports — re-verify), the SMP freeze, vmxnet3/igc/e1000e-MSI-X.
 
 ## Big rocks & risks (size honestly)
 
-- **SMP hardening** — M29 works in QEMU/VMware but froze real hardware under load.
-  **TLB shootdown** is absent (pinned per-CPU spaces) and is a hard prerequisite
-  for re-enabling SMP by default, task migration, `MAP_SHARED` across cores, or
-  any cross-core kernel-VA unmap.
+- **SMP hardening** — done in M48 (TLB shootdown, IPIs, migration; on by
+  default), but serialized by a kernel-wide lock until VFS/filesystems/TTY get
+  their own locks, and never re-run on the real hardware that froze under M29.
 - **In-place `execve`** — replaces the spawn+wait emulation; touches process
   identity, fd inheritance, signals and job control. Needed for correct bash
   semantics.
-- **Kernel KASLR** — relocation with `-mcmodel=kernel` vs measured boot,
-  reproducible builds and two boot paths.
+- **Kernel KASLR** — done in M45 (link-time relocation table, both boot paths,
+  measured boot / reproducible builds kept).
+- **IOMMU + ring-3 drivers** (Phase 5) — VT-d page tables, interrupt
+  remapping/delivery to user space, and per-driver DMA domains; a large new
+  trust surface.
 - **WiFi radio** — blind register debugging on one real chip; parked.
 
 A GUI was out of scope for this roadmap; a first one shipped in M40 anyway

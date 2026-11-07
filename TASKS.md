@@ -2,7 +2,7 @@
 
 _Snapshot: realigned to the commit history through `ae2be37` (M39 + ath9k RX
 bring-up). Last full self-test **182/182** (at `e66a57f`)._
-_Last updated: 2026-11-06 (`integ/phase2b`: M40 init as PID 1 + GUI input + secwm compositor merged; Phase 3/4 plan approved)._
+_Last updated: 2026-11-07 (`integ/phase4`: Phase 4 hardening merged — M44 SMAP + no identity map, M45 KASLR, M46 exec confinement, M47 net locking, M48 SMP on by default, M49 big memory; Phase 5 isolated drivers approved)._
 
 This file tracks what is **done** vs **open**, and the planned order of work. The
 narrative handoff lives in `next_session.md`; the long-term plan in
@@ -34,9 +34,15 @@ really works"):
    3. more filesystems (exFAT RW, NTFS RO then RW);
    then init/services hardening, signed packages (keyring), more ports.
    Details in the "Phase 3" section below.
-4. **Phase 4 — hardening:** SMAP by default, kernel KASLR, no identity map in user
-   address spaces, the exec confinement rule, net stack locking, SMP (TLB shootdown,
-   IPIs). Details in the "Phase 4" section below.
+4. **Phase 4 — hardening: DONE** on `integ/phase4` (M44–M49): SMAP by default, no
+   identity map, kernel KASLR, exec confinement, net stack locking, SMP on by default,
+   big memory. Caveat: SMP relies on a kernel-wide lock (`kernel/bkl.c`) until the
+   VFS/filesystems/TTY have their own locks. Details in the "Phase 4" section below.
+5. **Phase 5 — isolated drivers** (approved 2026-11-07): IOMMU (Intel VT-d first,
+   QEMU `-device intel-iommu`; AMD-Vi later) → IRQ delivery to ring-3 Driver Space
+   drivers → kernel-granted DMA buffers confined by the IOMMU → move a first real
+   driver (e1000 or USB HID) to ring 3, then the others one by one. See the
+   "Phase 5" section below.
 
 ---
 
@@ -68,7 +74,7 @@ really works"):
 | M27a | JBD2 journal **replay** (mount a dirty ext3/4 left by a crash) | ✅ done |
 | M27b | **Write-side journaling** (SecOS's own metadata writes crash-atomic) — **Phase H complete** | ✅ done |
 | M28 | **Modern platform** (Phase I pt1–3): ACPI discovery + **APIC switchover** (LAPIC timer + IOAPIC retire the 8259) + **TSC monotonic clock** | ✅ done |
-| M29 | **SMP / multicore** (Phase I final): per-CPU data, AP bring-up, CPU-pinned scheduling; verified on real VMware. **⚠ AP bring-up OFF by default since `3f776dd`** (froze the real ASUS under `stress 8`); opt-in via `-DSECOS_SMP_AT_BOOT` or shell `smp`; no TLB shootdown yet | ✅ done, **opt-in** |
+| M29 | **SMP / multicore** (Phase I final): per-CPU data, AP bring-up, CPU-pinned scheduling; verified on real VMware. Was off by default from `3f776dd` (froze the real ASUS under `stress 8`); **on by default again since M48** (TLB shootdown, IPIs, migration) | ✅ done (superseded by M48) |
 | M30 | **Signals + job control + shell pipelines**: POSIX signals for ring-3, Ctrl-C/Ctrl-Z, pipelines `a\|b`, `&`/`jobs`/`fg`/`bg`, signal-based `kill` | ✅ done |
 | M31 | **Real C library + coreutils** (Phase K): standard headers + `user/libc.c` (printf/string/stdlib/ctype/stdio/dirent); file syscalls (getdents/create/mkdir/unlink); 26-applet busybox-style coreutils installed to `/bin` | ✅ done |
 | M32 | **Signed packages + init** (Phase K): `.spkg` format (`tools/secos-pkg` + `kernel/pkg.c`, verify+unpack, tampered refused); supervised `init` service-manager + demo service | ✅ done |
@@ -79,6 +85,17 @@ really works"):
 | M37 | **Boot integrity** (Phase L): measured boot (kernel self-hash) + reproducible builds (`SOURCE_DATE_EPOCH`) | ✅ done |
 | M38 | **WiFi AR9565 (ath9k) scaffold + WPA2 crypto**: PCI attach/identify + PBKDF2 PMK + AES (KAT-validated) | ✅ scaffold + crypto done |
 | M39 | **Secure boot** (UEFI loader verifies kernel, `61f52c7`) + **full kernel W^X** + auditor (`021d445`) + **user ASLR** (`e5a991c`) + **WPA2 4-way supplicant** (`7ee71d1`) + **POSIX foundation** (syscalls 49–56: dup/dup2/chdir/getcwd/ioctl/getppid/waitany/fstat, cwd, termios, environ, emulated execve) + **GNU bash 5.2 from source = boot login shell** (`2881cf4`/`8762198`/`e66a57f`) + **ath9k_hw Linux driver port** (init/reset/cal/RX on real chip; RX CRC wall → parked). See `docs/devlog/M39.md` | ✅ done (WiFi radio parked) |
+
+| M40 | `/bin/init` as PID 1 + supervised sshd; GUI input/evdev + `/dev/fb0`; secwm compositor + LVGL | ✅ done |
+| M41 | Persistent ext4 root by default (`secos-root.img`, `kernel/sysroot.c`) + exFAT read-write | ✅ done |
+| M42 | NTFS read-only (`fs/ntfs.c`, LZNT1, reparse points) | ✅ done |
+| M43 | Multi-user: uid/gid + modes enforced, login/su/sudo/passwd, shadow | ✅ done |
+| M44 | SMAP by default + low identity map removed (user spaces and kernel) + canary via the global guard | ✅ done (Phase 4) |
+| M45 | Kernel KASLR: 2 MiB slide (768 slots), `.kaslr` relocation table, MB2 + UEFI, randomized canary; `nokaslr` | ✅ done (Phase 4) |
+| M46 | Exec confinement (`no_new_privs`, `SYS_PRCTL` 90) + ACPI S5 power-off + `mount -o ro`/remount | ✅ done (Phase 4) |
+| M47 | Network stack locking (tick gate / per-NIC RX+TX / stack lock hierarchy, lockdep-lite) | ✅ done (Phase 4) |
+| M48 | SMP on by default: TLB shootdown (IPI 0xF0), reschedule IPI (0xF1), migration, x2APIC, 256 CPUs, `/proc/smp`, `nosmp`; kernel lock (`kernel/bkl.c`) as stop-gap | ✅ done (Phase 4) |
+| M49 | Big memory: physmap to 64 TiB (1 GiB pages, RAM only), sectioned PMM, `vmm_map_mmio`, DMA32 zone | ✅ done (Phase 4) |
 
 **Phases done:** A–E (M0–M13), F (M15–M17), G (M18–M20), H (M26–M27, + M33),
 I (M28–M29, SMP opt-in), J/networking (M24), K (M31–M32, M34, bash in M39),
@@ -226,7 +243,7 @@ robustness and the paused real-hardware bring-up — see below.
 ### Kernel robustness
 - [ ] **Buddy / free-list heap** — `mm/heap.c` is still a single-lock first-fit list.
 - [ ] **`MAP_SHARED` + shared read-only text** — retire the M14 per-process pinned ELF
-      image via the M20 page cache (cross-core use needs TLB shootdown).
+      image via the M20 page cache (the TLB shootdown it needs exists since M48).
 - [x] **PID-1 init wired into boot** (M40, `docs/devlog/M40-init.md`): `/bin/init` is PID 1,
       reads `/etc/inittab`, takes a DHCP lease via `SYS_NETCTL` (95), supervises Dropbear,
       respawns the console bash, reaps orphans, orderly poweroff; keys baked with
@@ -241,36 +258,37 @@ robustness and the paused real-hardware bring-up — see below.
 - [ ] **dash** from source (signed).
 
 ### Security depth
-- [ ] **SMAP by default** — needs bounce-buffering in the read/write/send/recv fast paths
-      (they pass user buffers straight to vfs/pipe/socket); opt-in `-DSECOS_SMAP` today.
-- [ ] **Kernel KASLR** — deferred in M39 (relocation with `-mcmodel=kernel` vs measured
-      boot, reproducible builds, both boot paths).
+- [x] **SMAP by default** — M44 (opt-out `-DSECOS_NO_SMAP`).
+- [x] **Kernel KASLR** — M45 (opt-out `nokaslr` / `-DSECOS_NO_KASLR`).
 - [ ] ELF-base ASLR (needs PIE user binaries); CFI.
 - [ ] **Driver Space depth**: real `DRIVER_OP_MAP_MEM`; IRQ-to-driver (`IRQ_SUBSCRIBE` +
-      IPC queue); DMA sandbox; auto-restart. (Ported ath9k currently runs ring-0.)
+      IPC queue); DMA sandbox; auto-restart. (Ported ath9k currently runs ring-0.) Planned as Phase 5.
 
-### Phase 4 — hardening (after Phase 3)
-Collects the items below plus three that have no entry yet:
-- [ ] SMAP by default and kernel KASLR (see Security depth).
-- [ ] **No low identity map in user address spaces**: every user PML4 still carries
-      the supervisor-only 0–512 MB identity map (uaccess rejects aliasing pointers since
-      `c536c03`, but the mapping itself remains); move its users (virtio DMA, early frame
-      access) to the physmap and drop it from user spaces.
-- [ ] **Exec confinement rule**: a process's caps come only from its own image's
-      manifest (`kernel/process.c`), so a `CAP_ENFORCE`-confined process holding
-      `CAP_PROC` can exec or spawn an ambient program and leave its confinement. Rule
-      to enforce: the new image's caps are bounded by the caller's (confinement is
-      inherited).
-- [ ] **Net stack locking**: `net/` assumes one core (no locks around sockets, TCP
-      state, ARP/routing); lock it before SMP is turned on.
-- [ ] SMP: TLB shootdown, IPI reschedule, per-CPU run queues (see SMP prep).
+### Phase 4 — hardening — DONE (`integ/phase4`)
+- [x] SMAP by default (M44, `docs/devlog/M44-smap-identity.md`).
+- [x] No low identity map in user address spaces, retired from the kernel too (M44).
+- [x] Kernel KASLR (M45, `docs/devlog/M45-kaslr.md`).
+- [x] Exec confinement rule — `no_new_privs` (M46, `docs/devlog/M46-exec-confinement.md`).
+- [x] Net stack locking (M47, `docs/devlog/M47-net-locking.md`).
+- [x] SMP: TLB shootdown, IPI reschedule, migration, on by default (M48, `docs/devlog/M48-smp.md`).
+- [x] Big memory: 64 TiB physmap, sectioned PMM, explicit MMIO mappings (M49, `docs/devlog/M49-bigmem.md`).
+- [ ] **Remove the kernel lock** (`kernel/bkl.c`): per-filesystem / VFS / TTY / cred locking.
+- [ ] NUMA awareness; buddy allocator for contiguous runs (M49 PMM search is linear and
+      cannot cross a 1 GiB section); physmap + kernel-heap randomization.
+- [ ] Real-HW re-validation of SMP / x2APIC / shootdown (paused, see below).
 
-### SMP prep (QEMU `-smp 4`)
-- [ ] **TLB shootdown infrastructure** (IPI-based) — prerequisite for re-enabling SMP by
-      default, task migration, `MAP_SHARED` across cores, cross-core kernel-VA unmap.
-- [ ] **IPI-based reschedule** — a wake on another core preempts immediately (`lapic_ipi` exists).
-- [ ] **Per-CPU run queues**; then load balancing / task migration.
-- [ ] **debugcon line-locking everywhere** (only `switch_to`'s `[SMP]` line is atomic).
+### Phase 5 — isolated drivers (approved 2026-11-07)
+- [ ] **IOMMU**: Intel VT-d first (DMAR, root/context tables, per-device second-level
+      tables, fault reporting), QEMU `-machine q35 -device intel-iommu`; AMD-Vi later.
+- [ ] **IRQ delivery to ring-3 Driver Space drivers** (MSI/MSI-X vector → IPC event,
+      kernel masks, driver acks).
+- [ ] **Kernel-granted DMA buffers confined by the IOMMU** (mapped only in the driver
+      and in the device's IOMMU domain).
+- [ ] **First real driver in ring 3** (e1000 or USB HID), then the others one by one.
+
+### SMP prep (QEMU `-smp 4`) — done in M48
+- [x] TLB shootdown, IPI reschedule, logical per-CPU run queues + migration, line-atomic
+      debugcon (M48).
 
 ### Test coverage
 - [ ] **Selftest coverage for M34–M39** (lua, caps, mitigations, measured boot, WPA2 KATs,

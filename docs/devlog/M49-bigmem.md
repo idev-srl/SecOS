@@ -258,14 +258,10 @@ only what the kernel touches.
 
 ## 7. Open issues
 
-- `arch/x86/lapic.c` (owned by the SMP work) still maps the LAPIC and IOAPIC
-  through the deprecated `vmm_extend_physmap()` shim. It works (UC, page
-  inside its 2 MiB block), but it should move to
-  `vmm_map_mmio(base, 0x1000, VMM_CACHE_UC)`. The same applies to any new
-  caller on other branches.
-- No remote TLB shootdown on a physmap attribute change: fine at boot, but
-  needed if a driver maps or retags MMIO after the APs are up (`feat/smp`
-  hook).
+- Resolved in the Phase 4 integration (`integ/phase4`): the LAPIC/IOAPIC use
+  `vmm_map_mmio(…, VMM_CACHE_UC)`, and `pm_map_range` ends every change to a
+  live entry with a kernel TLB shootdown (`tlb_shootdown_kernel`), so MMIO
+  mapped or retagged after the APs are up is safe on every CPU.
 - `pmm_alloc_contiguous()` cannot return a run that crosses a 1 GiB section,
   and the run search is a linear word scan from the bottom of the zone. That
   is fine for the heap's multi-frame blocks, slow for very large runs on a

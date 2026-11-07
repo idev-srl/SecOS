@@ -948,10 +948,14 @@ run-ssh: iso $(ROOT_DEP)
 # secos-gui.log. An e1000 NIC forwards host port GUI_SSH_PORT (default 2222) to
 # the guest's sshd (docs/SSH.md):
 #   make run-gui KEYMAP=it SSH_AUTHORIZED_KEYS=~/.ssh/id_ed25519.pub GUI_AUTOSTART=1
+# GUI_SMP / GUI_MEM size the guest (SMP is on by default since M48):
+#   make run-gui GUI_SMP=4 GUI_MEM=2G
 GUI_SSH_PORT ?= 2222
+GUI_SMP ?= 2
+GUI_MEM ?= 512M
 .PHONY: run-gui
 run-gui: iso $(ROOT_DEP)
-	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -m 512M -cpu max -display gtk \
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -m $(GUI_MEM) -smp $(GUI_SMP) -cpu max -display gtk \
 		-device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 \
 		-netdev user,id=n0,hostfwd=tcp::$(GUI_SSH_PORT)-:22 -device e1000,netdev=n0 \
 		-debugcon file:secos-gui.log -global isa-debugcon.iobase=0xe9

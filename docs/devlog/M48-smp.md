@@ -287,8 +287,12 @@ framebuffer console).
 
 ## Integration notes
 
-- feat/bigmem: the LAPIC/IOAPIC still map through `vmm_extend_physmap()`
-  (TODO in `arch/x86/lapic.c`: switch to `vmm_map_mmio()`); a physmap cache
-  attribute change after the APs are up (`vmm_set_physmap_wc`) already goes
-  through `tlb_shootdown_kernel()`, keep that in the new physmap code.
-- CLAUDE.md's M29 line ("AP bring-up is OFF by default") is now outdated.
+- Resolved on `integ/phase4` (merge of feat/bigmem): the LAPIC and IOAPIC are
+  mapped with `vmm_map_mmio(base, 0x1000, VMM_CACHE_UC)`; every physmap
+  change that narrows or retags a live entry (`pm_map_range`, behind
+  `vmm_map_mmio` / `vmm_set_physmap_wc`, including huge-page splits) ends
+  with `tlb_shootdown_kernel()`; the COW-fork failure path keeps the parent
+  shootdown.
+- The M29 line in CLAUDE.md now says SMP is on by default.
+- Commit `31b4aa7` (kernel lock) does not build on its own; it needs
+  `e86085b`. History kept as is.
