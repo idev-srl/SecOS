@@ -138,6 +138,7 @@ def main():
     ap.add_argument("--qemu", default="qemu-system-x86_64")
     ap.add_argument("--boot", type=float, default=300)
     ap.add_argument("--data", choices=["vfat", "exfat"], default=None)
+    ap.add_argument("--mount-race", type=int, default=0)
     o = ap.parse_args()
     seed = o.seed if o.seed is not None else int(time.time()) % 100000
     rng = random.Random(seed)
@@ -227,6 +228,20 @@ def main():
                 f"(grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sda /mnt) && "
                 f"grep ' /mnt ' /proc/mounts && echo MNT-$((6*7))", ["MNT-42"], 120, absent=())
             nopt = "-n "
+        if o.data and o.mount_race:
+            # [M52] Plan test 5: umount racing opens, reads, writes and
+            # listings on other CPUs. Each umount must succeed or fail with
+            # EBUSY/EINVAL, never fault; the volume stays fsck-clean (below).
+            fst = "vfat" if o.data == "vfat" else "exfat"
+            n = o.mount_race
+            run(vm, "mount-race",
+                f"mkdir -p /mnt; k=0; for i in $(seq 1 {n}); do "
+                f"grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sda /mnt 2>/dev/null; "
+                f"( for j in 1 2 3 4; do echo r$i$j > /mnt/mr$j 2>/dev/null; cat /mnt/mr$j >/dev/null 2>&1; "
+                f"ls /mnt >/dev/null 2>&1; done ) & ( exec 3</mnt/mr1 2>/dev/null; sleep 0.0$((i%7)); exec 3<&- ) & "
+                f"umount /mnt 2>/dev/null && k=$((k+1)); wait; done; "
+                f"grep -q ' /mnt ' /proc/mounts || mount -t {fst} /dev/sda /mnt; rm -f /mnt/mr*; "
+                f"grep -q ' /mnt ' /proc/mounts && echo MR-$((6*7))-umounts=$k", ["MR-42"], 900, absent=())
         for k in range(o.rounds):
             s = seed + k
             t0 = time.time()

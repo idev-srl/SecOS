@@ -67,7 +67,7 @@ run() {
               rm -f "$OUT/$r.w"/*.img; return $rc ;;
         fsx4|fse4) local k=vfat; [ "$r" = fse4 ] && k=exfat
               timeout 3600 python3 tools/fs_stress_drive.py --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
-                  --data "$k" --rounds 2 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
+                  --data "$k" --rounds 2 --mount-race 40 >"$out" 2>&1; local rc=$?; cp "$OUT/$r.w/run.log" "$log" 2>/dev/null
               rm -f "$OUT/$r.w"/*.img; return $rc ;;
         fsc4) timeout 3600 python3 tools/fs_stress_drive.py --iso "$ISO" --smp 4 --work "$OUT/$r.w" \
                   --crash 3 >"$out" 2>&1; local rc=$?; cat "$OUT/$r.w"/*.log >"$log" 2>/dev/null
@@ -86,8 +86,8 @@ wait
 pass=0; fail=0
 chk() { if [ "$2" -eq 0 ]; then pass=$((pass+1)); echo "  [PASS] $1"; else fail=$((fail+1)); echo "  [FAIL] $1"; fi; }
 for r in $RUNS; do
-    [ "$(cat "$OUT/$r.rc" 2>/dev/null)" = 0 ]
-    chk "$r passed ($(grep -a 'RESULT' "$OUT/$r.out" 2>/dev/null | tail -n 1 | cut -c1-90))" $?
+    [ "$(cat "$OUT/$r.rc" 2>/dev/null)" = 0 ]; rc=$?    # before the $(...) below resets $?
+    chk "$r passed ($(grep -a 'RESULT' "$OUT/$r.out" 2>/dev/null | tail -n 1 | cut -c1-90))" $rc
     [ -s "$OUT/$r.log" ] && ! grep -aq "\[LOCKDEP\]\|\[LOCK\] BUG\|PANIC\|\[EXC\]" "$OUT/$r.log"
     chk "$r no lockdep report, panic or CPU exception" $?
 done

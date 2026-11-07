@@ -114,7 +114,8 @@ wait
 pass=0; fail=0
 chk() { if [ "$2" -eq 0 ]; then pass=$((pass+1)); echo "  [PASS] $1"; else fail=$((fail+1)); echo "  [FAIL] $1"; fi; }
 for t in $TESTS; do
-    [ "$(cat "$OUT/$t.rc" 2>/dev/null)" = 0 ]; chk "$t passed ($(grep -a 'RESULT' "$OUT/$t.out" 2>/dev/null | tail -n 1 | cut -c1-80))" $?
+    [ "$(cat "$OUT/$t.rc" 2>/dev/null)" = 0 ]; rc=$?    # before the $(...) below resets $?
+    chk "$t passed ($(grep -a 'RESULT' "$OUT/$t.out" 2>/dev/null | tail -n 1 | cut -c1-80))" $rc
     [ -s "$OUT/$t.log" ] && ! grep -aq "\[LOCKDEP\]\|\[LOCK\] BUG\|PANIC\|\[EXC\]" "$OUT/$t.log"
     chk "$t no lockdep report, panic or CPU exception" $?
 done
