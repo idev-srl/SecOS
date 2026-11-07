@@ -11,6 +11,12 @@
  * a static page-aligned kernel buffer; physical addresses come from
  * kvirt_to_phys. Transfers bounce through a shared 64 KB buffer described by a
  * PRP1 + PRP-list page. Registers the namespace as block device "nvme0n1".
+ *
+ * [M50 B3] Locking: one namespace on one I/O queue pair with one shared bounce,
+ * so the controller is one base disk serialized by its block_dev_t lock
+ * (fs/block.h). The admin queue is used only by nvme_init, before the disk is
+ * registered. Completions are polled (iteration-bounded), never interrupt- or
+ * tick-driven, so a CPU holding the lock always finishes on its own.
  */
 #include "nvme.h"
 #include "pci.h"

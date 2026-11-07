@@ -18,11 +18,25 @@
  *    buttons, X/Y (relative -> EV_REL, absolute -> EV_ABS with the logical
  *    range, as QEMU's usb-tablet), wheel and AC Pan, then each report is
  *    decoded field by field into evdev events.
+ *
+ * [M50 B3] Locking: hid_lock (spinlock, LK_S12_HID, irqsave) guards the slots
+ * (armed state, report buffers, the previous keyboard report) and g_nhid.
+ * usb_hid_poll() can be called from syscall context on any CPU at once (the
+ * console TTY wait, every evdev reader); it only TRIES hid_lock — a CPU that
+ * finds another one polling just returns, the other delivers the reports — and
+ * the xHCI calls it makes only try xhci_lock (xhci.h), so a poll never spins
+ * behind a long USB Mass Storage transfer. Reports are delivered under
+ * hid_lock (input_event -> input lock, keyboard_key_event -> kbd lock and,
+ * for ISIG, proc lock), which is why hid_lock sits below all of those.
+ * Attach runs under xhci_enum_lock (one enumeration at a time); its control
+ * transfers use the shared descriptor buffers below without hid_lock and it
+ * publishes the new slot under hid_lock.
  */
 #include "usb.h"
 #include "keyboard.h"
 #include "input.h"
 #include "debugcon.h"
+#include "spinlock.h"
 #include <stddef.h>
 
 #define HID_SET_PROTOCOL  0x0B
@@ -58,6 +72,7 @@ typedef struct {
 
 static hid_slot_t g_hid[HID_MAX];
 static int g_nhid;
+static spinlock_t hid_lock = SPINLOCK_INIT_CLASS(LK_S12_HID, "usb-hid");
 static uint8_t g_rep[HID_MAX][HID_REPORT_MAX] __attribute__((aligned(64)));
 static uint8_t g_rdesc[512] __attribute__((aligned(64)));
 static uint8_t g_strbuf[128] __attribute__((aligned(64)));
@@ -80,7 +95,11 @@ static void scpy(char* d, const char* s, int max) {
 }
 
 /* ---- keyboard ------------------------------------------------------------------- */
+static volatile uint32_t g_hid_keydowns;     /* [M50 B3] key presses seen (tests) */
+uint32_t usb_hid_keydowns(void) { return g_hid_keydowns; }
+
 static void kbd_key(hid_slot_t* h, int kc, int v) {
+    if (v) g_hid_keydowns++;                     /* under hid_lock */
     input_event(&h->in, EV_KEY, (uint16_t)kc, v);
     if (!input_grabbed(&h->in)) keyboard_key_event(kc, v);
 }
@@ -226,7 +245,19 @@ static void ptr_report(hid_slot_t* h, const uint8_t* rep, int len) {
 }
 
 /* ---- polling ------------------------------------------------------------------------- */
+// Take hid_lock only if it is free; interrupts are off iff it was taken.
+static int hid_trylock_irqsave(uint64_t* fl) {
+    uint64_t f;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    if (spin_trylock(&hid_lock)) { *fl = f; return 1; }
+    __asm__ volatile ("push %0; popfq" :: "r"(f) : "memory", "cc");
+    return 0;
+}
+
 void usb_hid_poll(void) {
+    if (!__atomic_load_n(&g_nhid, __ATOMIC_ACQUIRE)) return;   /* no HID: no lock */
+    uint64_t fl;
+    if (!hid_trylock_irqsave(&fl)) return;       /* another CPU is polling */
     for (int s = 0; s < g_nhid; s++) {
         hid_slot_t* h = &g_hid[s];
         if (!h->d) continue;
@@ -242,6 +273,7 @@ void usb_hid_poll(void) {
         }
         if (!h->armed && xhci_submit(h->d, h->ep, g_rep[s], h->mps) == 0) h->armed = 1;
     }
+    spin_unlock_irqrestore(&hid_lock, fl);
 }
 
 /* Product string (UTF-16LE string descriptor -> ASCII), or a generic name. */
@@ -263,6 +295,8 @@ static void dev_name(usb_device_t* d, char* out, int max, const char* fallback) 
 }
 
 void usb_hid_attach(usb_device_t* d, const usb_endpoint_t* eps, int n, uint8_t iface) {
+    /* g_nhid only grows, here, under xhci_enum_lock: slot g_nhid is ours until
+     * it is published below. */
     if (g_nhid >= HID_MAX) { debugcon_writestring("[HID] too many HID devices\n"); return; }
     uint8_t ep_in = 0; uint16_t mps = 8;
     for (int i = 0; i < n; i++)
@@ -310,11 +344,13 @@ void usb_hid_attach(usb_device_t* d, const usb_endpoint_t* eps, int n, uint8_t i
         dev_name(d, in->name, sizeof(in->name), abs ? "USB HID Tablet" : "USB HID Mouse");
     }
     in->poll = usb_hid_poll;
+    uint64_t fl = spin_lock_irqsave(&hid_lock);
     h->d = d; h->ep = ep_in; h->mps = mps; h->armed = 0;
     for (int i = 0; i < 8; i++) h->last[i] = 0;
-    g_nhid++;
     input_register(in);
-    if (xhci_submit(d, ep_in, g_rep[s], mps) == 0) h->armed = 1;
+    if (xhci_submit(d, ep_in, g_rep[s], mps) == 0) h->armed = 1;   /* else: next poll */
+    __atomic_store_n(&g_nhid, g_nhid + 1, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&hid_lock, fl);
     debugcon_writestring(h->kind == HID_KBD ? "[HID] boot keyboard ready ep=0x" : "[HID] pointer ready ep=0x");
     debugcon_print_hex(ep_in);
     debugcon_writestring(" fields="); debugcon_print_hex((uint64_t)h->nf);

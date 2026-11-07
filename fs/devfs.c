@@ -32,6 +32,7 @@
 #include "cap.h"
 #include "process.h"
 #include "cred.h"
+#include "heap.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -260,39 +261,57 @@ static int devfs_write(vfs_inode_t* inode, size_t off, const void* buf, size_t l
     return -1;
 }
 
-// Byte-addressed I/O over a sector device, via a one-sector bounce buffer for the
-// unaligned head/tail and whole-sector middle.
+// Byte-addressed I/O over a sector device: whole sectors straight to/from the
+// caller's (kernel) buffer, a one-sector bounce for the unaligned head/tail.
+// [M50 B3] Goes through the block layer and holds the base disk's lock for the
+// whole request, so a partial-sector read-modify-write is atomic against every
+// other user of the disk (and of its other partitions). The bounce is per call:
+// two CPUs can be in here at once for different disks.
+#define BLK_BYTE_IO_MAX_SECTORS 128
 static int blk_byte_io(block_dev_t* b, size_t off, void* buf, size_t len, int write) {
     if (!b) return -1;
+    if (write && !b->write) return -1;
     uint32_t ss = b->sector_size;
     uint64_t total = b->sector_count * (uint64_t)ss;
+    if (ss == 0 || ss > 4096) return -1;
     if (off >= total) return 0;
     if (off + len > total) len = (size_t)(total - off);
-    static uint8_t sec[4096];
-    if (ss > sizeof(sec)) return -1;
+    uint8_t* sec = 0;
+    if ((off % ss) || (len % ss)) {
+        sec = (uint8_t*)kmalloc(ss);
+        if (!sec) return -1;
+    }
     uint8_t* p = (uint8_t*)buf;
     size_t done = 0;
+    int err = 0;
+    block_lock(b);
     while (done < len) {
         uint64_t abs = off + done;
         uint64_t lba = abs / ss;
         uint32_t soff = (uint32_t)(abs % ss);
+        if (soff == 0 && len - done >= ss) {
+            // Whole-sector fast path: as many sectors as are left (capped).
+            uint64_t n = (len - done) / ss;
+            if (n > BLK_BYTE_IO_MAX_SECTORS) n = BLK_BYTE_IO_MAX_SECTORS;
+            int r = write ? block_write_locked(b, lba, p + done, (uint32_t)n)
+                          : block_read_locked(b, lba, p + done, (uint32_t)n);
+            if (r != (int)n) { err = 1; break; }
+            done += (size_t)n * ss;
+            continue;
+        }
         uint32_t chunk = ss - soff; if (chunk > len - done) chunk = (uint32_t)(len - done);
-        if (soff == 0 && chunk == ss) {
-            // Whole-sector fast path.
-            if (write) { if (!b->write || b->write(b, lba, p+done, 1) != 1) return -1; }
-            else       { if (b->read(b, lba, p+done, 1) != 1) return -1; }
+        if (block_read_locked(b, lba, sec, 1) != 1) { err = 1; break; }
+        if (write) {
+            for (uint32_t i=0;i<chunk;i++) sec[soff+i] = p[done+i];
+            if (block_write_locked(b, lba, sec, 1) != 1) { err = 1; break; }
         } else {
-            if (b->read(b, lba, sec, 1) != 1) return -1;
-            if (write) {
-                for (uint32_t i=0;i<chunk;i++) sec[soff+i] = p[done+i];
-                if (!b->write || b->write(b, lba, sec, 1) != 1) return -1;
-            } else {
-                for (uint32_t i=0;i<chunk;i++) p[done+i] = sec[soff+i];
-            }
+            for (uint32_t i=0;i<chunk;i++) p[done+i] = sec[soff+i];
         }
         done += chunk;
     }
-    return (int)done;
+    block_unlock(b);
+    if (sec) kfree(sec);
+    return err ? -1 : (int)done;
 }
 
 static int devfs_ro_create(const char* p, const void* d, size_t s){ (void)p;(void)d;(void)s; return -1; }

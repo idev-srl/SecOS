@@ -12,6 +12,10 @@
  * caller's buffer needs no contiguity guarantee. Requests are issued one at a
  * time and completion is polled on the used ring — no interrupts.
  *
+ * [M50 B3] Locking: one device, one virtqueue and one request header / bounce /
+ * status byte, all serialized by the block_dev_t lock of "vda" (fs/block.h);
+ * every entry point is reached through block_read / block_write.
+ *
  * Copyright (c) 2025 iDev srl
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT

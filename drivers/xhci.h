@@ -54,6 +54,7 @@ typedef struct usb_device {
     uint8_t  iproduct;        // [M40] iProduct string descriptor index (0 = none)
     void*    class_priv;      // bound class driver state
     int      class_id;        // USB_CLASS_* the core bound, or 0
+    int      last_cc;         // [M50 B3] completion code of this device's last transfer
 } usb_device_t;
 
 // A parsed endpoint from a configuration descriptor.
@@ -88,6 +89,8 @@ int xhci_transfer(usb_device_t* d, uint8_t ep_addr, void* data, int len);
 // (xhci_submit) and later check for its completion (xhci_poll_transfer, which
 // returns 1 and sets *bytes when the event is ready — -1 in *bytes on error —
 // else 0). Used to poll the HID keyboard without spinning in the wait loop.
+// [M50 B3] Both only TRY the controller lock: xhci_submit returns -2 and
+// xhci_poll_transfer 0 while another CPU runs a transfer; just retry later.
 int xhci_submit(usb_device_t* d, uint8_t ep_addr, void* data, int len);
 int xhci_poll_transfer(usb_device_t* d, uint8_t ep_addr, int len, int* bytes);
 
@@ -118,6 +121,9 @@ uint32_t xhci_route_append(uint32_t parent_route, int parent_tier, int down_port
 // Completion code of the most recent transfer (for error recovery decisions).
 #define XHCI_CC_STALL 6
 int xhci_last_cc(void);
+// [M50 B3] The same for one device: unlike xhci_last_cc it cannot be
+// overwritten by another CPU's transfer to another device.
+int xhci_dev_last_cc(const usb_device_t* d);
 
 // Recover a halted endpoint after a STALL: Reset Endpoint + reset its transfer
 // ring + Set TR Dequeue Pointer. ep_addr 0 means the control endpoint (EP0).

@@ -95,7 +95,7 @@ from the plan table, both because the code already nests these locks:
 | `tlb_lock` at S60 with `kstack_lock`, `g_pm_lock` | `LK_S62_TLB` | `vmm_selftest_remap` (and `TLB_KSTACK_EAGER`) shoot down under `kstack_lock` |
 | kclock, csprng at S60 | `LK_S64_LEAF` | leaf locks; keeps S60 for page-table locks |
 | `heap_lock → pmm_lock` both "S70" | `LK_S70_HEAP` < `LK_S75_PMM` | `expand_heap` calls the PMM under `heap_lock` |
-| `block_io_lock` (missing) | `LK_S42_BLOCK_IO` | was taken under `pc_lock`; since B2 it no longer nests there (see below), the level only keeps it classified until B3 deletes it |
+| `block_io_lock` (missing) | `LK_S42_BLOCK_IO` | was taken under `pc_lock` until B2 (which removed that nesting); deleted by B3 (see below), so the level no longer exists |
 
 Every existing spinlock is classified with `SPINLOCK_INIT_CLASS(level,
 "name")`: tlb, proc, pty, heap, pipe, kclock, pagecache, kstack, physmap,
@@ -257,9 +257,9 @@ still copying it.
 `pc_lock` (S40) has only the PMM (S75) inside it and never an FS/block call,
 so it nests *inside* the FS (K30) and block (K40) locks — the plan's
 "write: K30 → K40, invalidate (S40) inside K30" is now legal. `block_io_lock`
-no longer nests inside S40; it keeps `LK_S42_BLOCK_IO` only to stay
-classified until B3 replaces it with the per-disk K40 `blkdev->lock` (B2 did
-not move it). `kernel/lock_order.h` says so.
+no longer nests inside S40 (B2 did not move it; B3 deleted it and the
+`LK_S42_BLOCK_IO` level in favour of the per-disk K40 `blkdev->lock`, see
+below). `kernel/lock_order.h` says so.
 
 ### Tests
 - **Forced interleavings** (`mm/pagecache_test.c`, `-DSECOS_PAGECACHE_TEST`,
@@ -314,3 +314,145 @@ not move it). `kernel/lock_order.h` says so.
 - From `tools/selftest.sh`: M10 × {fat32, ext2, ext4}, M20, the M41
   persistent-root gate (`persist_test.sh`, incl. kill -9 crash runs) and the
   M41 exFAT gate: 127/127.
+
+## B3 — block and USB locks (`feat/block-locks`)
+
+Phase B step 3 of the plan. The BKL stays on by default, so nothing changes
+in behaviour. The block layer and the USB stack are now safe without it.
+
+### Lock design, per driver
+
+| Lock | Level | Type | Covers |
+|---|---|---|---|
+| `block_dev_t.lock` | K40 | klock, one per **base** disk | everything its driver does for that disk |
+| `xhci_enum_lock` | K35 (new) | klock | one USB enumeration (port reset, slot setup, descriptors, class bind, hubs) |
+| `hid_lock` | S12 (new) | spinlock irqsave, **trylock only** in the poll | HID slots, report delivery |
+| `xhci_lock` | S45 | spinlock irqsave | one xHCI transfer or command |
+| `g_devs_lock` | S64 | leaf spinlock | the block-device registry |
+
+- **Block layer** (`fs/block.{c,h}`). `block_dev_t` embeds a klock that is
+  initialized lazily on first use (`lock_state` 0→1→2), so drivers keep
+  their static initializers. A partition records its `parent`, and
+  `block_base()` resolves it, so `sdb1` and `sdb` share one lock. Every
+  caller goes through `block_read`/`block_write`. The partition callbacks
+  call `block_*_locked` on the parent, which asserts the lock. Multi-I/O
+  sections use `block_lock` + `block_*_locked`. The global irqsave
+  `block_io_lock` (S42) is deleted.
+- **AHCI.** The ports are independent: each has its own command list, FIS
+  area and PxIS/PxCI/PxTFD registers. Only the command table and the 64 KiB
+  bounce were shared, so they are now per port, and each SATA disk is
+  serialized only by its own lock: two CPUs drive `sda` and `sdb` at once.
+  HBA-global registers are touched only by `ahci_init`.
+- **NVMe.** One namespace, one I/O queue pair, one shared bounce. The
+  controller is a single base disk, and the admin queue is used only before
+  registration.
+- **virtio-blk.** One device, one virtqueue, one header/bounce/status byte.
+  The driver supports only `vda` (a singleton `g_vblk_dev`).
+- **USB Mass Storage.** A BOT command (CBW, data, CSW) is serialized by the
+  device's block lock. Each transfer takes `xhci_lock` on its own, so a HID
+  poll can run between the phases. CBW/CSW/data buffers are now per device
+  (the data buffer is aligned to its 32 KiB size, so a TRB never crosses
+  64 KiB). Stall recovery reads `xhci_dev_last_cc(dev)`. The global
+  `xhci_last_cc()` can be overwritten by another CPU's transfer.
+- **xHCI.** `xhci_lock` is held for exactly one transfer or command:
+  submit plus a polled `evt_wait`, bounded by an iteration count, never by an
+  interrupt or the tick. It covers the command/event rings, the stash, the
+  transfer rings, the contexts, the DCBAA and the 32-bit bounce. It is never
+  held across a multi-transfer exchange or across a port reset (10–200 ms of
+  TSC time). Those run under `xhci_enum_lock`, a klock, so the CPU keeps IF on
+  and is not preempted. `usb_attach` runs after the slot setup has released
+  `xhci_lock`. The gated MSI-X handler drains the event ring only if it gets
+  the lock (it never spins in an IRQ).
+- **HID.** `usb_hid_poll()` is called from syscall context on any CPU
+  (console TTY wait, every evdev reader). It only *tries* `hid_lock`: if
+  another CPU is already polling, it returns at once, and the other CPU
+  delivers the reports. `xhci_submit`/`xhci_poll_transfer` only try
+  `xhci_lock` (busy: -2 / "nothing yet"), so a keyboard poll never spins
+  behind a long MSC transfer. Reports are delivered under `hid_lock`
+  (`input_event` → S15, `keyboard_key_event` → S50 and S30 for ISIG), which
+  is why it sits at S12, below all of them.
+- **devfs raw I/O** (`/dev/<blk>`). It now goes through the block layer and
+  holds the disk lock for the whole request, so a partial-sector
+  read-modify-write is atomic against every other user of the disk and of its
+  other partitions. The static one-sector bounce became a per-call `kmalloc`,
+  and whole sectors move up to 128 at a time (it was one sector per driver
+  call).
+- **Polled waits under a K40 klock.** Every driver wait (AHCI PxCI/TFD, NVMe
+  CQ phase, virtio used ring, xHCI event ring) is a busy-poll of memory or
+  MMIO bounded by an iteration count, and xHCI port resets use the TSC. None
+  needs an IRQ that only arrives when the holder yields, and none needs the
+  scheduler tick. A klock holder is never preempted (`klk.depth`).
+
+### Order on the paths
+
+- Cache miss on a disk FS: (K30 FS, C3/C4) → K40 disk → S45 xhci (USB only).
+- devfs: K40 for the whole request.
+- Enumeration: K35 → K40 (partition probe of a new usbN) → S45; S12 at HID
+  attach.
+- HID poll: S12 (try) → S45 (try), then S15/S30/S50 for delivery.
+
+**On B3 alone a cache miss still runs `ops->read` under `pc_lock` (S40), so a
+disk-backed FS takes the K40 klock under a spinlock.** A release build does
+not mind (no contention while the BKL is on). A `-DSECOS_LOCKDEP` build
+reports "klock taken while holding a spinlock" as soon as a disk FS is read
+through the page cache. The ramfs-root lockdep-check images do not do this.
+B3 is therefore only merged together with B2 (`integ/bkl`, below).
+
+### Stress gate (`-DSECOS_B3_BLKSTRESS`, selftest "M50 B3")
+
+The syscall path still takes the BKL even with `bkl=off` (every mask bit is
+set), so a userland `dd` test serializes on the BKL and cannot show a missing
+block lock. The gate therefore has two phases:
+
+1. **Kernel, real concurrency** (`fs/blkstress.c`). At boot, the BSP and
+   every AP (from its idle loop) pull jobs from one queue outside the BKL:
+   SHA-256 of regions of `sda`, `sdb1`, `nvme0n1` and `usb0` with varying
+   chunk sizes for ≥3 rounds (every round must give the same digest), a
+   pattern written to `nvme0n1` and read back, and two jobs writing
+   interleaved 100-byte stripes of one `/dev/sdb1` region through devfs
+   (partial-sector RMW) while another job reads `sdb1`. All of this runs
+   while every CPU polls the USB keyboard between chunks, and the host types
+   a line over QMP.
+2. **Userland.** From bash: parallel `dd` reads of the four devices piped to
+   `md5sum`, plus two unaligned disk-to-disk copies (`bs=1000` into
+   `nvme0n1`, `bs=700` from `usb0` into `sdb1`), while a second line is typed
+   into a foreground `read`.
+
+`tools/blk_stress_drive.py` (q35 `-smp 4`: AHCI ×2 with an MBR on `sdb`,
+NVMe, usb-storage + usb-kbd on one qemu-xhci) compares every digest and md5
+with the image files. After QEMU quits, it also checks every byte the guest
+wrote and that the bytes around the writes are untouched. A
+`usb_hid_keydowns` counter proves the keys came over USB HID, not PS/2.
+QEMU 6.2's `input-send-event` rejects a non-display `device`, so the events
+go to the active keyboard, which is the usb-kbd.
+
+Plan inaccuracies found on the way:
+- `/dev/vdb` cannot exist: virtio-blk supports a single device, and with
+  virtio present `kernel.c` skips the AHCI/NVMe probes. The gate uses
+  sda/sdb/nvme0n1/usb0.
+- AHCI was not "one per port" until the shared command table/bounce were
+  split.
+- `usb_msc` shared its CBW/CSW/data buffers across devices, and its stall
+  recovery read the controller-wide completion code.
+- devfs raw I/O also used a static shared bounce (race between two disks
+  even with per-disk locks).
+- The fuzz harnesses needed a `stub/klock.h`.
+
+### Verification (B3)
+
+- `-Wall -Wextra`: 41 warnings in both the normal and the `-DSECOS_LOCKDEP`
+  build, the same as `feat/lock-core`, none in a touched file. The exFAT and
+  NTFS fuzz harnesses build.
+- Block-stress gate (normal build): 31/31. Kernel phase: 4 workers, ~90–130
+  jobs in ~4.3 s, ≥10 rounds per digest; 55/55 keys over USB HID.
+- The same gate on a `-DSECOS_LOCKDEP` build: 31/31 and silent, both alone
+  and merged with `feat/pagecache-fill` (B2).
+- Lockdep with a FAT32 disk on AHCI, `cat /mnt/*` from bash: on B3 alone it
+  panics with `klock taken while holding a spinlock: sda vs pagecache`, as
+  expected before B2. With B2 merged it is silent.
+- Gates (a selftest subset: M10×{fat32,ext2,ext4}, M21, M22 nvme+usb, M50
+  B3, M41 persistent root, M41 exFAT incl. corrupt suite, MNT, the read-only
+  mount gate, M42 NTFS): **240 passed, 0 failed**.
+- `make lockdep-check`: 15/15 (ssd4, ssd8, nsd4, off4). A first run gave
+  13/15 (ssd8 step + marker). It ran while other QEMU runs and builds loaded
+  the host, its logs were lost in a private /tmp, and a clean rerun passed.

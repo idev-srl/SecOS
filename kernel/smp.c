@@ -100,6 +100,9 @@ void ap_entry(void) {
 #ifdef SECOS_PAGECACHE_TEST
         { extern void pagecache_selftest_ap(cpu_t*); pagecache_selftest_ap(c); }   // [M50 B2]
 #endif
+#ifdef SECOS_B3_BLKSTRESS
+        { extern void blkstress_ap(cpu_t*); blkstress_ap(c); }                    // [M50 B3]
+#endif
         sched_reap_zombies();
         cpu_wait_irq();
     }

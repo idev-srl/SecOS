@@ -1931,7 +1931,7 @@ static void kernel_main_phase2(void) {
             block_dev_t* vda = block_find("vda");
             if (vda) {
                 static uint8_t s0[512];
-                int r = vda->read(vda, 0, s0, 1);
+                int r = block_read(vda, 0, s0, 1);
                 debugcon_writestring("[M10] virtio-blk read sector0 r=");
                 debugcon_print_hex((uint64_t)r);
                 debugcon_writestring(" bytes[0..3]=");
@@ -1943,8 +1943,8 @@ static void kernel_main_phase2(void) {
                     static uint8_t wb[512], rb[512];
                     for (int i = 0; i < 512; i++) wb[i] = (uint8_t)(i ^ 0xA5);
                     uint64_t scratch = (vda->sector_count > 1) ? (vda->sector_count - 1) : 0;
-                    int wr = vda->write(vda, scratch, wb, 1);
-                    int rr = vda->read(vda, scratch, rb, 1);
+                    int wr = block_write(vda, scratch, wb, 1);
+                    int rr = block_read(vda, scratch, rb, 1);
                     int ok = (wr == 1 && rr == 1);
                     for (int i = 0; ok && i < 512; i++) if (rb[i] != wb[i]) ok = 0;
                     debugcon_writestring(ok ? "[M10] virtio-blk write+readback: OK\n"
@@ -2239,6 +2239,10 @@ static void kernel_main_phase2(void) {
     // [M50 B2] Page-cache fill races, forced through a test hook (on this CPU
     // and against an AP), once the root FS is up.
     { extern void pagecache_selftest(void); pagecache_selftest(); }
+#endif
+#ifdef SECOS_B3_BLKSTRESS
+    // [M50 B3] Block/USB lock stress on every CPU at once (fs/blkstress.c).
+    { extern void blkstress_run(void); blkstress_run(); }
 #endif
 #if M41_EXFAT_DEMO
     // [M41] exFAT self-test, once /mnt and /proc are mounted: the good image on

@@ -33,11 +33,18 @@
 #define LK_K11_SYSROOT     11   /* sysroot_lock, pkg_lock (C6)                  */
 #define LK_K20_VFS_NS      20   /* vfs_ns_lock: mount/umount/remount (C1)       */
 #define LK_K30_FS          30   /* one per FS driver instance (C2-C4)           */
-#define LK_K40_BLKDEV      40   /* blkdev->lock on the base disk (B3)           */
+#define LK_K35_USB_ENUM    35   /* xhci_enum_lock: USB enumeration incl. hubs;
+                                   registers usbN disks and reads them (B3)     */
+#define LK_K40_BLKDEV      40   /* blkdev->lock on the base disk; a partition
+                                   uses its parent's (fs/block.h, B3)           */
 #define LK_KLOCK_MAX       99   /* every klock level is <= this                 */
 
 /* ---- S/N: CPU-owned spinlocks (arch/x86/spinlock.h) ----------------------- */
 #define LK_S10_TTY         110  /* tty_con_lock (C5), g_pty_lock                */
+#define LK_S12_HID         112  /* hid_lock (drivers/usb_hid.c): HID slots; the
+                                   poll only trylocks it and delivers reports
+                                   under it (input S15, proc S30, kbd S50,
+                                   xhci S45 nest inside) (B3)                   */
 #define LK_S15_SUBSYS      115  /* procfs g_proc_lock, g_sysfs_lock,
                                    g_input_lock, g_pipe_lock, g_ipc_lock,
                                    driver_if_lock (B1)                          */
@@ -51,16 +58,11 @@
 #define LK_S40_PAGECACHE   140  /* pc_lock: page-cache index only. Since B2 no
                                    FS or block call runs under it (misses are
                                    filled unlocked), so it nests INSIDE the FS
-                                   (K30) and block (K40) locks, never above
-                                   them; only the PMM (S75) is taken inside.   */
-#define LK_S42_BLOCK_IO    142  /* block_io_lock (fs/block.c), deleted by B3.
-                                   Not in the plan table. Until B2 the page
-                                   cache called ops->read under pc_lock, so
-                                   block I/O nested inside S40; that nesting is
-                                   gone, the level is kept only so the lock
-                                   stays classified until B3 replaces it with
-                                   the per-disk K40 blkdev->lock.               */
-#define LK_S45_XHCI        145  /* xhci_lock (B3)                               */
+                                   (K30) and block (K40/S45) locks, never above
+                                   them; only the PMM (S75) is taken inside.
+                                   (B3 deleted block_io_lock, the old S42.)    */
+#define LK_S45_XHCI        145  /* xhci_lock: one xHCI transfer/command (B3);
+                                   HID only trylocks it                         */
 #define LK_S50_KBD         150  /* kbd_lock. con_lock (drivers/vt.c) and the
                                    klog/debugcon line locks (kernel/klog.c) are
                                    S50 too but are raw, bounded, recursive
