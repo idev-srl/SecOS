@@ -737,16 +737,48 @@ static void statfs_to_vfs(const struct statfs* s, struct statvfs* v){
 }
 int statvfs(const char* path, struct statvfs* v){ struct statfs s; if(statfs(path, &s) != 0) return -1; statfs_to_vfs(&s, v); return 0; }
 int fstatvfs(int fd, struct statvfs* v){ struct statfs s; if(fstatfs(fd, &s) != 0) return -1; statfs_to_vfs(&s, v); return 0; }
-int get_nprocs(void){
+/* Count the CPUs in a Linux cpulist file ("0-3", "0,2-5\n"), as glibc does
+ * for /sys/devices/system/cpu/{online,possible}. 0 if unreadable/malformed. */
+static int cpulist_count(const char* path){
+    int fd = open(path, O_RDONLY);
+    if(fd < 0) return 0;
+    char b[1024]; long r = read(fd, b, sizeof(b) - 1); close(fd);
+    if(r <= 0) return 0;
+    b[r] = 0;
+    int n = 0; const char* p = b;
+    while(*p >= '0' && *p <= '9'){
+        long lo = 0, hi;
+        while(*p >= '0' && *p <= '9') lo = lo * 10 + (*p++ - '0');
+        hi = lo;
+        if(*p == '-'){
+            p++; hi = 0;
+            if(*p < '0' || *p > '9') return 0;
+            while(*p >= '0' && *p <= '9') hi = hi * 10 + (*p++ - '0');
+        }
+        if(hi < lo) return 0;
+        n += (int)(hi - lo + 1);
+        if(*p == ',') p++;
+    }
+    return n;
+}
+/* Fallback without /sys: the "cpuN" lines of /proc/stat. */
+static int procstat_cpus(void){
     int fd = open("/proc/stat", O_RDONLY), n = 0;
     if(fd < 0) return 1;
-    char b[1024]; long r = read(fd, b, sizeof(b) - 1); close(fd);
+    static char b[16384]; long r = read(fd, b, sizeof(b) - 1); close(fd);
     if(r <= 0) return 1;
     b[r] = 0;
     for(char* p = b; (p = strstr(p, "\ncpu")) != 0; p++) n++;
     return n ? n : 1;
 }
-int get_nprocs_conf(void){ return get_nprocs(); }
+int get_nprocs(void){
+    int n = cpulist_count("/sys/devices/system/cpu/online");
+    return n > 0 ? n : procstat_cpus();
+}
+int get_nprocs_conf(void){
+    int n = cpulist_count("/sys/devices/system/cpu/possible");
+    return n > 0 ? n : get_nprocs();
+}
 int getloadavg(double* la, int n){
     struct sysinfo si;
     if(n < 0 || sysinfo(&si) != 0) return -1;
@@ -755,8 +787,8 @@ int getloadavg(double* la, int n){
 }
 
 #include <unistd.h>
-/* sysconf / pathconf. CPUs and memory come from the kernel (/proc/stat,
- * SYS_SYSINFO); the rest are SecOS's fixed limits. */
+/* sysconf / pathconf. CPUs and memory come from the kernel
+ * (/sys/devices/system/cpu, SYS_SYSINFO); the rest are SecOS's fixed limits. */
 long sysconf(int name){
     struct sysinfo si;
     switch(name){
@@ -771,7 +803,8 @@ long sysconf(int name){
     case _SC_TTY_NAME_MAX:    return 32;
     case _SC_SYMLOOP_MAX:     return 40;                  /* kernel path walk */
     case _SC_HOST_NAME_MAX:   return 64;
-    case _SC_NPROCESSORS_CONF: case _SC_NPROCESSORS_ONLN: return get_nprocs();
+    case _SC_NPROCESSORS_CONF: return get_nprocs_conf();
+    case _SC_NPROCESSORS_ONLN: return get_nprocs();
     case _SC_PHYS_PAGES:      return sysinfo(&si) == 0 ? (long)(si.totalram * si.mem_unit / 4096) : -1;
     case _SC_AVPHYS_PAGES:    return sysinfo(&si) == 0 ? (long)(si.freeram * si.mem_unit / 4096) : -1;
     default: errno = EINVAL; return -1;

@@ -126,6 +126,7 @@ int     getpgrp(void);
 int     killpg(int pgrp, int sig);                       /* == kill(-pgrp, sig) */
 int     setsid(void);                                    /* new session, no controlling tty */
 int     getsid(int pid);
+long    secos_sched_getaffinity(int pid, unsigned long len, void* mask); /* raw syscall: bytes filled */
 int     sigsuspend(const unsigned long* mask);           /* always -1/EINTR */
 #define SECOS_REBOOT_POWEROFF 1                          /* secos_reboot() commands */
 #define SECOS_REBOOT_RESTART  2

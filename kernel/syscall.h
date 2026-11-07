@@ -74,11 +74,18 @@
 // Sessions + pseudo-terminals (numbers 85-89 are reserved for the pty work).
 #define SYS_SETSID      85 // setsid() -> new session id / -EPERM (already a group leader)
 #define SYS_GETSID      86 // getsid(pid) -> session id (pid 0 = caller) / -ESRCH
-// 90-94 were reserved for the GUI work (unused); 95-99 for init / system services.
+// 90-94 were reserved for the GUI work (90 = prctl, 91 = sched_getaffinity, 92-94
+// free); 95-99 for init / system services.
 // [M46] prctl(option, arg): PR_SET_NO_NEW_PRIVS (38, arg 1) / PR_GET_NO_NEW_PRIVS
 // (39) as on Linux, plus PR_SECOS_GET_CAPS (0x53430001): effective caps
 // (MANIFEST_FLAG_CAP_* bits) | bit 30 if confined | bit 29 if no_new_privs.
 #define SYS_PRCTL       90
+// sched_getaffinity(pid, len, mask) as on Linux: pid 0 = caller; fills
+// ceil(cpus / 64) * 8 bytes (cpus = present CPUs, the kernel's nr_cpu_ids) of a
+// CPU-index bit mask and returns that byte count; -EINVAL when `len` is smaller
+// or not a multiple of 8, -ESRCH for an unknown pid. The mask is the task's
+// pinned CPU, else every online CPU. Libc zeroes the rest of the caller's set.
+#define SYS_SCHED_GETAFFINITY 91
 #define PR_SET_NO_NEW_PRIVS 38
 #define PR_GET_NO_NEW_PRIVS 39
 #define PR_SECOS_GET_CAPS   0x53430001

@@ -16,9 +16,19 @@
  *     Fork/exit bursts: each round forks `width` children that exit with a
  *     distinct status, and reaps them with waitpid; checks every status.
  *     Prints "[smptest] burst PASS".
+ *
+ *   smptest cpus
+ *     Every userland view of the CPU count must agree: sysconf
+ *     (_SC_NPROCESSORS_ONLN/_CONF), get_nprocs{,_conf} and the bits set by the
+ *     sched_getaffinity syscall. Prints "[smptest] cpus=<n> onln=.. conf=..
+ *     nprocs=.. conf_nprocs=.. affinity=.." and "[smptest] cpus PASS" / "FAIL".
  */
 #include "libsecos.h"
 #include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/sysinfo.h>
 
 #define P(s) write(1, s, strlen(s))
 
@@ -152,11 +162,33 @@ static unsigned long arg_num(const char* s, unsigned long dflt) {
     return any ? v : dflt;
 }
 
+static int cmd_cpus(void) {
+    long onln = sysconf(_SC_NPROCESSORS_ONLN), conf = sysconf(_SC_NPROCESSORS_CONF);
+    long np = get_nprocs(), npc = get_nprocs_conf();
+    unsigned long mask[16];                       /* 1024 CPUs, like glibc's cpu_set_t */
+    for (int i = 0; i < 16; i++) mask[i] = 0;
+    long r = secos_sched_getaffinity(0, sizeof(mask), mask);
+    long aff = 0;
+    for (long w = 0; r > 0 && w < r / 8; w++)
+        for (unsigned long m = mask[w]; m; m &= m - 1) aff++;
+    long small = secos_sched_getaffinity(0, 4, mask);   /* too small: must be EINVAL */
+    P("[smptest] cpus="); put_dec((unsigned long)np);
+    P(" onln="); put_dec((unsigned long)onln); P(" conf="); put_dec((unsigned long)conf);
+    P(" nprocs="); put_dec((unsigned long)np); P(" conf_nprocs="); put_dec((unsigned long)npc);
+    P(" affinity="); put_dec((unsigned long)aff); P(" bytes="); put_dec((unsigned long)(r < 0 ? 0 : r));
+    P("\n");
+    int ok = np >= 1 && onln == np && conf == npc && npc >= np && aff == np && r >= 8 && small < 0;
+    P(ok ? "[smptest] cpus PASS\n" : "[smptest] cpus FAIL\n");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (argc >= 2 && strcmp(argv[1], "fpu") == 0)
         return cmd_fpu((int)arg_num(argc > 2 ? argv[2] : 0, 8), arg_num(argc > 3 ? argv[3] : 0, 3000000));
     if (argc >= 2 && strcmp(argv[1], "burst") == 0)
         return cmd_burst((int)arg_num(argc > 2 ? argv[2] : 0, 20), (int)arg_num(argc > 3 ? argv[3] : 0, 12));
-    P("usage: smptest fpu [children] [iters] | burst [rounds] [width]\n");
+    if (argc >= 2 && strcmp(argv[1], "cpus") == 0)
+        return cmd_cpus();
+    P("usage: smptest fpu [children] [iters] | burst [rounds] [width] | cpus\n");
     return 2;
 }

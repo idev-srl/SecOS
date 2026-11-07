@@ -806,7 +806,14 @@ clock_t times(struct tms* t) {
     return now;
 }
 int prctl(int op, ...) { (void)op; return 0; }
-int sched_getaffinity(pid_t p, size_t sz, cpu_set_t* s) { (void)p; (void)sz; CPU_ZERO(s); CPU_SET(0, s); return 0; }
+/* glibc semantics over the Linux syscall: the kernel fills its mask (online
+ * CPUs, or the pinned one), the rest of the caller's buffer is zeroed. */
+int sched_getaffinity(pid_t p, size_t sz, cpu_set_t* s) {
+    long r = secos_sched_getaffinity(p, sz, s);
+    if (r < 0) return -1;
+    if ((size_t)r < sz) memset((char*)s + r, 0, sz - (size_t)r);
+    return 0;
+}
 int sched_setaffinity(pid_t p, size_t sz, const cpu_set_t* s) { (void)p; (void)sz; (void)s; return 0; }
 int sched_getscheduler(pid_t p) { (void)p; return SCHED_OTHER; }
 int sched_setscheduler(pid_t p, int pol, const struct sched_param* sp) { (void)p; (void)pol; (void)sp; errno = EPERM; return -1; }
