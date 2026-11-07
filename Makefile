@@ -121,6 +121,7 @@ SRC_C   = \
 	$(FS_DIR)/exfat.c \
 	$(FS_DIR)/exfat_test.c \
 	$(FS_DIR)/blkstress.c \
+	$(FS_DIR)/c4_fsstress.c \
 	$(FS_DIR)/ntfs.c \
 	$(FS_DIR)/ntfs_test.c \
 	$(FS_DIR)/ext2.c \
