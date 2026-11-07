@@ -530,7 +530,13 @@ static uint32_t bmap_alloc(uint8_t* inode, uint32_t fb){
         if(!ind){ ind=alloc_block(); if(!ind) return 0; wr32(inode+40+12*4, ind); }
         if(blk_read(ind, g_xb)!=0) return 0;
         uint32_t b = rd32(g_xb+fb*4);
-        if(!b){ b=alloc_block(); if(!b) return 0; wr32(g_xb+fb*4, b); if(blk_write(ind,g_xb)!=0) return 0; }
+        if(!b){
+            /* alloc_block() reads the block bitmap into g_xb: read the indirect
+             * block again before patching it, or the bitmap is written over it */
+            b=alloc_block(); if(!b) return 0;
+            if(blk_read(ind, g_xb)!=0) return 0;
+            wr32(g_xb+fb*4, b); if(blk_write(ind,g_xb)!=0) return 0;
+        }
         return b;
     }
     return 0; /* beyond single indirect not supported for writes */
