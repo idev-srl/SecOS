@@ -23,8 +23,43 @@
 #include "heap.h"
 #include "pagecache.h"
 #include "mntopts.h"
+#include "klock.h"
 #include <stdint.h>
 #include <stddef.h>
+
+/* ── [M51 C3] Driver lock ────────────────────────────────────────────────────
+ * Every piece of driver state below is global (one ext volume at a time):
+ * the geometry, the scratch block buffers (g_b, g_mb, g_xb, g_eb, g_tb, g_csb,
+ * g_jdesc, g_jdata), the JBD2 transaction (g_jt[]), the journal geometry, the
+ * VFS inode pool (g_vchunk/g_vused) and the mount options. One task-owned
+ * klock, g_e2_lock (LK_K30_FS), protects all of it:
+ *   - every exported entry point (each vfs_fs_ops member, ext2_mount,
+ *     ext2_mount_root, ext2_set_mount_options, ext2_journal_state, ...) is
+ *     `lock; r = x_locked(...); unlock;` — except ->mntinfo, which procfs
+ *     calls under its spinlock and which therefore reads mount-time words
+ *     without the lock (e2op_mntinfo);
+ *   - every x_locked function and internal helper runs with the lock held and
+ *     calls only other _locked/internal functions (KLOCK_ASSERT_HELD in the
+ *     hot helpers; lockdep panics on recursion);
+ *   - a JBD2 transaction is begun, filled and committed (or aborted) inside
+ *     ONE hold of the lock: jt_begin..jt_finish never straddle an unlock;
+ *   - the lock is held across block I/O (K30 -> blkdev K40, xHCI S45), page-
+ *     cache invalidation (S40) and kmalloc (S70), all of them later levels;
+ *   - it is never held across a VFS mount-table call (vfs_mount*,
+ *     vfs_mount_point_of: vfs_mount calls back into ->mntinfo) nor across a
+ *     readdir callback (entries are collected under the lock, delivered after
+ *     it is dropped: the callbacks page output, re-enter the VFS, ...).
+ * Mounting claims the driver first (g_e2_claimed, under the lock) so two
+ * concurrent mounts cannot both retarget the globals while the VFS calls run
+ * unlocked. ext2_fs_lock() exposes the lock for the VFS (unmount draining:
+ * lock + unlock, never an ext2 op while holding it — the lock is not
+ * recursive). An atomic O_APPEND is ext2_append() (C1's ->append): the end of
+ * file is read and written under one hold. */
+static klock_t g_e2_lock = KLOCK_INIT(LK_K30_FS, "ext2");
+#define E2_LOCK()   klock_lock(&g_e2_lock)
+#define E2_UNLOCK() klock_unlock(&g_e2_lock)
+#define E2_HELD()   KLOCK_ASSERT_HELD(&g_e2_lock)
+klock_t* ext2_fs_lock(void){ return &g_e2_lock; }
 
 #define SECSZ            512
 #define EXT2_MAGIC       0xEF53
@@ -72,6 +107,7 @@ static void wr32(uint8_t* p, uint32_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8);
 static int g_jt_active;                                  /* [M27b] a metadata txn is open */
 static int jt_read_cached(uint32_t b, uint8_t* buf);     /* fwd: 1 if served from txn buffer */
 static int blk_read(uint32_t b, uint8_t* buf){
+    E2_HELD();
     /* [M27b] Read-your-writes: inside a transaction, a block modified earlier in
      * the same txn lives only in the buffer (not yet on disk). Serve it from there
      * so read-modify-write of shared metadata (group desc, superblock, bitmaps)
@@ -98,9 +134,10 @@ static int  jt_finish(int r, int ok);                    /* fwd */
  * the journal commit ordering makes every operation atomic across a power loss. */
 static int g_blk_dead;
 static int g_crash_mode;             /* 0=none, 1=before commit block, 2=after publish */
-void ext2_test_set_crash(int mode){ g_crash_mode=mode; g_blk_dead=0; }
+void ext2_test_set_crash(int mode){ E2_LOCK(); g_crash_mode=mode; g_blk_dead=0; E2_UNLOCK(); }
 static int g_ro;                     /* [M46] mounted read-only: nothing is written */
 static int blk_write_direct(uint32_t b, const uint8_t* buf){
+    E2_HELD();
     if(g_blk_dead) return 0;         /* write lost to the (simulated) crash */
     if(g_ro) return -1;              /* never touch a read-only volume */
     return block_write(g_dev, (uint64_t)b*g_sec_per_blk, buf, g_sec_per_blk)==(int)g_sec_per_blk ? 0 : -1;
@@ -326,6 +363,7 @@ static void e2_init_block_bitmap(uint32_t g, uint8_t* bmp){
 }
 
 static uint32_t alloc_block(void){
+    E2_HELD();
     for(uint32_t g=0; g<g_num_groups; g++){
         uint8_t gd[64]; if(gd_read(g,gd)!=0) continue;
         if(rd16(gd+12)==0 && (g_desc_size<64 || rd16(gd+0x2C)==0)) continue;   /* group full */
@@ -375,6 +413,7 @@ static void free_block(uint32_t bno){
     }
 }
 static uint32_t alloc_inode(int is_dir){
+    E2_HELD();
     for(uint32_t g=0; g<g_num_groups; g++){
         uint8_t gd[64]; if(gd_read(g,gd)!=0) continue;
         if(rd16(gd+14)==0 && (g_desc_size<64 || rd16(gd+0x2E)==0)) continue;   /* no free inode */
@@ -530,7 +569,13 @@ static uint32_t bmap_alloc(uint8_t* inode, uint32_t fb){
         if(!ind){ ind=alloc_block(); if(!ind) return 0; wr32(inode+40+12*4, ind); }
         if(blk_read(ind, g_xb)!=0) return 0;
         uint32_t b = rd32(g_xb+fb*4);
-        if(!b){ b=alloc_block(); if(!b) return 0; wr32(g_xb+fb*4, b); if(blk_write(ind,g_xb)!=0) return 0; }
+        if(!b){
+            /* alloc_block() reads the block bitmap into g_xb: read the indirect
+             * block again before patching it, or the bitmap is written over it */
+            b=alloc_block(); if(!b) return 0;
+            if(blk_read(ind, g_xb)!=0) return 0;
+            wr32(g_xb+fb*4, b); if(blk_write(ind,g_xb)!=0) return 0;
+        }
         return b;
     }
     return 0; /* beyond single indirect not supported for writes */
@@ -793,6 +838,7 @@ static int dir_remove_entry(uint32_t dir_ino, const char* name, size_t nlen){
 
 /* ── Path resolution ─────────────────────────────────────────────────────── */
 static uint32_t path_to_ino(const char* path, int* is_dir, uint32_t* size_out){
+    E2_HELD();
     if(!path) return 0;
     if(path[0]=='/') path++;
     uint32_t cur = EXT2_ROOT_INO;
@@ -862,6 +908,7 @@ static void vslot_drop_cache(uint32_t ino){
 }
 
 static vfs_inode_t* vino_alloc(const char* path){
+    E2_HELD();
     int idx=g_vused;
     if(idx/E2_VCHUNK >= E2_VCHUNKS_MAX){ debugcon_writestring("[EXT2] VFS inode pool full\n"); return NULL; }
     if(!g_vchunk[idx/E2_VCHUNK]){
@@ -879,7 +926,7 @@ static vfs_inode_t* vino_alloc(const char* path){
 
 /* [M26] Read a symlink target. Fast symlinks (target <= 60 bytes) store the
  * target inline in the i_block area (offset 40); larger ones use data block 0. */
-static int e2_readlink(const char* path, char* buf, size_t len){
+static int e2_readlink_locked(const char* path, char* buf, size_t len){
     if(!g_mounted||!path||!buf||len==0) return -1;
     int isd; uint32_t ino=path_to_ino(path,&isd,NULL);
     if(!ino) return -1;
@@ -898,7 +945,7 @@ static int e2_readlink(const char* path, char* buf, size_t len){
 
 /* [M26] Create a fast symlink (target inline in i_block; supports up to 60-byte
  * targets, which covers virtually all real symlinks). */
-static int e2_symlink(const char* target, const char* linkpath){
+static int e2_symlink_locked(const char* target, const char* linkpath){
     if(!g_mounted||!target||!linkpath) return -1;
     if(path_to_ino(linkpath,NULL,NULL)) return -1;       /* exists */
     size_t tlen=0; while(target[tlen]) tlen++;
@@ -918,7 +965,7 @@ static int e2_symlink(const char* target, const char* linkpath){
 }
 
 /* ── VFS ops ─────────────────────────────────────────────────────────────── */
-static vfs_inode_t* e2_lookup(const char* path){
+static vfs_inode_t* e2_lookup_locked(const char* path){
     if(!g_mounted) return NULL;
     int isd; uint32_t sz;
     uint32_t ino=path_to_ino(path,&isd,&sz);
@@ -928,7 +975,15 @@ static vfs_inode_t* e2_lookup(const char* path){
     // a write through one name must be seen by a read through another.
     e2_vslot_t* slot=vslot_find(ino);
     vfs_inode_t* v=slot?&slot->v:NULL;
-    if(v){ const char* np=path&&path[0]?path:"/"; size_t k=0; for(; np[k] && k<sizeof(v->path)-1; k++) v->path[k]=np[k]; v->path[k]=0; }
+    if(v){
+        /* [M51 C3] Rewrite the cached path only when it really changes (a hard
+         * link looked up by its other name): procfs and the syscalls read
+         * ino->path without this lock, so an identical rewrite must not tear it. */
+        const char* np=path&&path[0]?path:"/";
+        size_t k=0; while(np[k] && k<sizeof(v->path)-1 && v->path[k]==np[k]) k++;
+        int same = (v->path[k]==0 && (np[k]==0 || k==sizeof(v->path)-1));
+        if(!same){ for(k=0; np[k] && k<sizeof(v->path)-1; k++) v->path[k]=np[k]; v->path[k]=0; }
+    }
     else v=vino_alloc(path&&path[0]?path:"/");
     if(!v) return NULL;
     v->type=isd?VFS_NODE_DIR:VFS_NODE_FILE; v->size=sz; v->ino=ino;
@@ -949,15 +1004,33 @@ static vfs_inode_t* e2_lookup(const char* path){
     return v;
 }
 
-static int e2_readdir(const char* dir_path, vfs_iter_cb cb, void* user){
-    if(!g_mounted || !cb) return -1;
+/* [M51 C3] readdir collects the entries under the lock and the exported
+ * wrapper delivers them after dropping it: a callback may page console output
+ * (cpu_wait_irq), stat the child through the VFS (re-entering this driver) or
+ * take any lock, none of which may happen under g_e2_lock. Entries are packed
+ * as {type, name length, name bytes} in a growing kmalloc buffer. */
+typedef struct { uint8_t* p; uint32_t n, cap; } e2_dlist_t;
+static int e2_dlist_add(e2_dlist_t* l, uint8_t type, const uint8_t* name, uint8_t nl){
+    if(l->n + 2u + nl > l->cap){
+        uint32_t nc = l->cap ? l->cap*2 : 4096;
+        while(nc < l->n + 2u + nl) nc *= 2;
+        uint8_t* np = (uint8_t*)kmalloc(nc);
+        if(!np) return -1;
+        if(l->p){ mem_copy(np, l->p, l->n); kfree(l->p); }
+        l->p = np; l->cap = nc;
+    }
+    l->p[l->n++] = type; l->p[l->n++] = nl;
+    mem_copy(l->p + l->n, name, nl); l->n += nl;
+    return 0;
+}
+static int e2_readdir_locked(const char* dir_path, e2_dlist_t* out){
+    E2_HELD();
+    if(!g_mounted) return -1;
     int isd; uint32_t dino=path_to_ino(dir_path,&isd,NULL);
     if(!dino || !isd) return -1;
     uint8_t inode[256]; if(inode_read(dino, inode)!=0) return -1;
     uint32_t dsize=inode_size_lo(inode);
     uint32_t nblocks=(dsize+g_blk_size-1)/g_blk_size;
-    char base[256]; size_t bl=0; if(dir_path){ for(; dir_path[bl]&&bl<sizeof(base)-1; bl++) base[bl]=dir_path[bl]; } base[bl]=0;
-    if(bl==1&&base[0]=='/'){ bl=0; base[0]=0; }
     for(uint32_t fb=0; fb<nblocks; fb++){
         uint32_t pb=bmap_read(inode,fb); if(!pb) continue;
         if(blk_read(pb, g_b)!=0) return -1;
@@ -965,18 +1038,12 @@ static int e2_readdir(const char* dir_path, vfs_iter_cb cb, void* user){
         while(off+8<=g_blk_size){
             uint32_t e_ino=rd32(g_b+off); uint16_t rec=rd16(g_b+off+4); uint8_t nl=g_b[off+6]; uint8_t ft=g_b[off+7];
             if(rec<8) break;
-            if(e_ino!=0 && nl>0){
+            if(e_ino!=0 && nl>0 && off+8u+nl<=g_blk_size){
                 /* skip "." and ".." */
                 int dot = (nl==1 && g_b[off+8]=='.') || (nl==2 && g_b[off+8]=='.' && g_b[off+9]=='.');
                 if(!dot){
-                    vfs_inode_t child; size_t k=0;
-                    for(size_t i=0;i<bl && k<sizeof(child.path)-1;i++) child.path[k++]=base[i];
-                    if(k<sizeof(child.path)-1) child.path[k++]='/';
-                    for(uint8_t i=0;i<nl && k<sizeof(child.path)-1;i++) child.path[k++]=(char)g_b[off+8+i];
-                    child.path[k]=0;
-                    child.type=(ft==DT_DIR)?VFS_NODE_DIR:(ft==DT_LNK)?VFS_NODE_SYMLINK:VFS_NODE_FILE;
-                    child.size=0; child.fs_data=NULL; child.ops=NULL;
-                    cb(&child, user);
+                    uint8_t t=(ft==DT_DIR)?VFS_NODE_DIR:(ft==DT_LNK)?VFS_NODE_SYMLINK:VFS_NODE_FILE;
+                    if(e2_dlist_add(out, t, g_b+off+8, nl)!=0) return -1;
                 }
             }
             off+=rec;
@@ -984,8 +1051,33 @@ static int e2_readdir(const char* dir_path, vfs_iter_cb cb, void* user){
     }
     return 0;
 }
+static int e2op_readdir(const char* dir_path, vfs_iter_cb cb, void* user){
+    if(!cb) return -1;
+    e2_dlist_t l = { NULL, 0, 0 };
+    E2_LOCK();
+    int r = e2_readdir_locked(dir_path, &l);
+    E2_UNLOCK();
+    if(r==0){
+        char base[256]; size_t bl=0; if(dir_path){ for(; dir_path[bl]&&bl<sizeof(base)-1; bl++) base[bl]=dir_path[bl]; } base[bl]=0;
+        if(bl==1&&base[0]=='/'){ bl=0; base[0]=0; }
+        vfs_inode_t child; mem_zero((uint8_t*)&child, sizeof(child));
+        for(uint32_t i=0; i<l.n; ){
+            uint8_t t=l.p[i], nl=l.p[i+1]; const uint8_t* nm=l.p+i+2; i+=2u+nl;
+            size_t k=0;
+            for(size_t j=0;j<bl && k<sizeof(child.path)-1;j++) child.path[k++]=base[j];
+            if(k<sizeof(child.path)-1) child.path[k++]='/';
+            for(uint8_t j=0;j<nl && k<sizeof(child.path)-1;j++) child.path[k++]=(char)nm[j];
+            child.path[k]=0;
+            child.type=(vfs_node_type_t)t;
+            child.size=0; child.fs_data=NULL; child.ops=NULL;
+            cb(&child, user);
+        }
+    }
+    if(l.p) kfree(l.p);
+    return r;
+}
 
-static int e2_read(vfs_inode_t* v, size_t off, void* buf, size_t len){
+static int e2_read_locked(vfs_inode_t* v, size_t off, void* buf, size_t len){
     if(!g_mounted||!v||v->type!=VFS_NODE_FILE) return -1;
     return file_read(((e2_node_t*)v->fs_data)->ino, off, buf, len);
 }
@@ -993,7 +1085,7 @@ static int e2_read(vfs_inode_t* v, size_t off, void* buf, size_t len){
 /* [M26] chmod/chown/utimes: patch the on-disk inode metadata in place. The mode
  * change preserves the S_IFMT type bits (chmod sets only the low 12 perm bits).
  * e2fsck-clean: we only touch fields, never the block map. */
-static int e2_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
+static int e2_setattr_locked(const char* path, const vfs_attr_t* a, unsigned valid){
     if(!g_mounted || !path || !a) return -1;
     int isd; uint32_t ino=path_to_ino(path,&isd,NULL);
     if(!ino) return -1;
@@ -1006,7 +1098,7 @@ static int e2_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
     e2_stamp(in,0,1,0);                                   /* ctime: attributes changed */
     return inode_write(ino,in);
 }
-static int e2_write(vfs_inode_t* v, size_t off, const void* data, size_t len){
+static int e2_write_locked(vfs_inode_t* v, size_t off, const void* data, size_t len){
     if(!g_mounted||!v||v->type!=VFS_NODE_FILE) return -1;
     e2_node_t* nd=(e2_node_t*)v->fs_data;
     int r=file_write(nd->ino, off, data, len);
@@ -1015,7 +1107,7 @@ static int e2_write(vfs_inode_t* v, size_t off, const void* data, size_t len){
 }
 
 /* Create a regular file (optionally with initial data). */
-static int e2_create(const char* path, const void* initial, size_t size){
+static int e2_create_locked(const char* path, const void* initial, size_t size){
     if(!g_mounted||!path) return -1;
     if(path_to_ino(path,NULL,NULL)) return -1; /* exists */
     uint32_t parent; char comp[128];
@@ -1041,7 +1133,7 @@ static int e2_create(const char* path, const void* initial, size_t size){
     return 0;
 }
 
-static int e2_mkdir(const char* path){
+static int e2_mkdir_locked(const char* path){
     if(!g_mounted||!path) return -1;
     if(path_to_ino(path,NULL,NULL)) return -1;
     uint32_t parent; char comp[128];
@@ -1168,7 +1260,7 @@ static int e2_adjust_links(uint32_t ino, int delta){
     return inode_write(ino,in);
 }
 
-static int e2_remove(const char* path){
+static int e2_remove_locked(const char* path){
     if(!g_mounted||!path) return -1;
     int isd; uint32_t sz; uint32_t ino=path_to_ino(path,&isd,&sz);
     if(!ino || ino==EXT2_ROOT_INO) return -1;
@@ -1183,7 +1275,7 @@ static int e2_remove(const char* path){
 /* Shrink or grow (sparse) a regular file. Freed blocks are unmapped from the
  * depth-0 extent tree or the direct/single-indirect map; the tail of the last
  * kept block is zeroed so a later grow reads zeros (POSIX). */
-static int e2_truncate(const char* path, size_t new_size){
+static int e2_truncate_locked(const char* path, size_t new_size){
     if(!g_mounted||!path) return -1;
     int isd; uint32_t sz; uint32_t ino=path_to_ino(path,&isd,&sz);
     if(!ino||isd) return -1;
@@ -1260,12 +1352,12 @@ static int dir_set_entry(uint32_t dir_ino, const char* name, size_t nlen, uint32
     return -1;
 }
 
-/* rename(2) inside one volume, as a single metadata transaction (e2j_rename):
+/* rename(2) inside one volume, as a single metadata transaction (e2j_rename_locked):
  * an existing target entry is re-pointed in place (never a moment with neither
  * name), the old entry removed, a moved directory's ".." re-parented, link
  * counts fixed, and the replaced inode loses its link. The VFS has already
  * checked the POSIX type rules (dir over non-dir, non-empty target, ...). */
-static int e2_rename(const char* oldp, const char* newp){
+static int e2_rename_locked(const char* oldp, const char* newp){
     if(!g_mounted||!oldp||!newp) return -1;
     int isd; uint32_t ino=path_to_ino(oldp,&isd,NULL);
     if(!ino || ino==EXT2_ROOT_INO) return -1;
@@ -1295,7 +1387,7 @@ static int e2_rename(const char* oldp, const char* newp){
 }
 
 /* link(2): one more name for an existing non-directory inode. */
-static int e2_link(const char* oldp, const char* newp){
+static int e2_link_locked(const char* oldp, const char* newp){
     if(!g_mounted||!oldp||!newp) return -1;
     int isd; uint32_t ino=path_to_ino(oldp,&isd,NULL);
     if(!ino || isd) return -1;
@@ -1314,7 +1406,7 @@ static int e2_link(const char* oldp, const char* newp){
 /* statfs(2): block/inode totals from the superblock, free counts summed over
  * the group descriptors (the per-group counts are what allocation keeps exact;
  * the superblock totals can lag, as on Linux). */
-static int e2_statfs(vfs_statfs_t* st){
+static int e2_statfs_locked(vfs_statfs_t* st){
     if(!g_mounted || !st) return -1;
     if(blk_read(g_first_data_block, g_mb)!=0) return -1;
     const uint8_t* sb = (g_blk_size==1024) ? g_mb : g_mb+1024;
@@ -1344,22 +1436,34 @@ static int e2_statfs(vfs_statfs_t* st){
  * Read-only ops (lookup/readdir/read/readlink) are not wrapped. */
 /* [M46] On a read-only mount every change is refused up front with -EROFS. */
 #define E2_RO_CHECK() do { if(g_ro) return -30; } while(0)
-static int e2j_create(const char* p, const void* d, size_t s){ E2_RO_CHECK(); jt_begin(); int r=e2_create(p,d,s); return jt_finish(r, r==0); }
-static int e2j_mkdir(const char* p){ E2_RO_CHECK(); jt_begin(); int r=e2_mkdir(p); return jt_finish(r, r==0); }
-static int e2j_remove(const char* p){ E2_RO_CHECK(); jt_begin(); int r=e2_remove(p); return jt_finish(r, r==0); }
-static int e2j_rename(const char* o,const char* n){ E2_RO_CHECK(); jt_begin(); int r=e2_rename(o,n); return jt_finish(r, r==0); }
-static int e2j_truncate(const char* p, size_t s){ E2_RO_CHECK(); jt_begin(); int r=e2_truncate(p,s); return jt_finish(r, r==0); }
-static int e2j_setattr(const char* p, const vfs_attr_t* a, unsigned v){ E2_RO_CHECK(); jt_begin(); int r=e2_setattr(p,a,v); return jt_finish(r, r==0); }
-static int e2j_symlink(const char* t, const char* l){ E2_RO_CHECK(); jt_begin(); int r=e2_symlink(t,l); return jt_finish(r, r==0); }
-static int e2j_link(const char* o, const char* n){ E2_RO_CHECK(); jt_begin(); int r=e2_link(o,n); return jt_finish(r, r==0); }
-static int e2j_write(vfs_inode_t* v, size_t off, const void* d, size_t l){ E2_RO_CHECK(); jt_begin(); int r=e2_write(v,off,d,l); return jt_finish(r, r>=0); }
+static int e2j_create_locked(const char* p, const void* d, size_t s){ E2_RO_CHECK(); jt_begin(); int r=e2_create_locked(p,d,s); return jt_finish(r, r==0); }
+static int e2j_mkdir_locked(const char* p){ E2_RO_CHECK(); jt_begin(); int r=e2_mkdir_locked(p); return jt_finish(r, r==0); }
+static int e2j_remove_locked(const char* p){ E2_RO_CHECK(); jt_begin(); int r=e2_remove_locked(p); return jt_finish(r, r==0); }
+static int e2j_rename_locked(const char* o,const char* n){ E2_RO_CHECK(); jt_begin(); int r=e2_rename_locked(o,n); return jt_finish(r, r==0); }
+static int e2j_truncate_locked(const char* p, size_t s){ E2_RO_CHECK(); jt_begin(); int r=e2_truncate_locked(p,s); return jt_finish(r, r==0); }
+static int e2j_setattr_locked(const char* p, const vfs_attr_t* a, unsigned v){ E2_RO_CHECK(); jt_begin(); int r=e2_setattr_locked(p,a,v); return jt_finish(r, r==0); }
+static int e2j_symlink_locked(const char* t, const char* l){ E2_RO_CHECK(); jt_begin(); int r=e2_symlink_locked(t,l); return jt_finish(r, r==0); }
+static int e2j_link_locked(const char* o, const char* n){ E2_RO_CHECK(); jt_begin(); int r=e2_link_locked(o,n); return jt_finish(r, r==0); }
+/* [M51 C3] append != 0: write at the current end of file, read from the
+ * on-disk inode in the same lock hold as the write (atomic O_APPEND: two
+ * appenders never pick the same offset). *at (optional) gets the offset used. */
+static int e2j_write_at_locked(vfs_inode_t* v, size_t off, int append, const void* d, size_t l, size_t* at){
+    E2_RO_CHECK();
+    if(append){
+        if(!g_mounted||!v||v->type!=VFS_NODE_FILE) return -1;
+        uint8_t in[256]; if(inode_read(((e2_node_t*)v->fs_data)->ino, in)!=0) return -1;
+        off=inode_size_lo(in);
+    }
+    if(at) *at=off;
+    jt_begin(); int r=e2_write_locked(v,off,d,l); return jt_finish(r, r>=0);
+}
 
 /* Orderly shutdown / sync. Every mutating op already runs as one committed and
  * checkpointed transaction (or writes directly on a journal-less volume), so
  * only a transaction left open by an interrupted op needs committing here. */
 static int g_jdirty;                 /* (defined with the journal code) */
 static void e2_sb_set_recover(int on);
-static int e2_sync(void){
+static int e2_sync_locked(void){
     if(g_ro) return 0;                   /* [M46] nothing was changed */
     if(g_jt_active) jt_commit();
     /* Every transaction is checkpointed and retired: the journal is empty, so
@@ -1369,26 +1473,70 @@ static int e2_sync(void){
 }
 
 static int g_jhas;                   /* (tentative; defined with the journal code) */
-static int e2_mntinfo(const char** src, const char** type){
+static int e2_mntinfo_nolock(const char** src, const char** type){   /* lock-free: see e2op_mntinfo */
     if(!g_mounted) return -1;
     if(src) *src = (g_dev && g_dev->name) ? g_dev->name : "ext2";
     if(type) *type = g_use_extents ? "ext4" : (g_jhas ? "ext3" : "ext2");
     return 0;
 }
 
-static int e2_remount(int ro);
+static int e2_remount_locked(int ro);
+
+/* [M51 C3] The exported entry points: one lock hold per VFS operation (the
+ * transactional ones begin and commit their JBD2 transaction inside it). */
+#define E2_WRAP(expr) do { E2_LOCK(); r = (expr); E2_UNLOCK(); } while(0)
+static vfs_inode_t* e2op_lookup(const char* p){ vfs_inode_t* r; E2_WRAP(e2_lookup_locked(p)); return r; }
+static int e2op_read(vfs_inode_t* v, size_t off, void* b, size_t l){ int r; E2_WRAP(e2_read_locked(v,off,b,l)); return r; }
+static int e2op_write(vfs_inode_t* v, size_t off, const void* d, size_t l){ int r; E2_WRAP(e2j_write_at_locked(v,off,0,d,l,NULL)); return r; }
+static int e2op_create(const char* p, const void* d, size_t sz){ int r; E2_WRAP(e2j_create_locked(p,d,sz)); return r; }
+static int e2op_mkdir(const char* p){ int r; E2_WRAP(e2j_mkdir_locked(p)); return r; }
+static int e2op_remove(const char* p){ int r; E2_WRAP(e2j_remove_locked(p)); return r; }
+static int e2op_rename(const char* o, const char* n){ int r; E2_WRAP(e2j_rename_locked(o,n)); return r; }
+static int e2op_truncate(const char* p, size_t sz){ int r; E2_WRAP(e2j_truncate_locked(p,sz)); return r; }
+static int e2op_setattr(const char* p, const vfs_attr_t* a, unsigned v){ int r; E2_WRAP(e2j_setattr_locked(p,a,v)); return r; }
+static int e2op_readlink(const char* p, char* b, size_t l){ int r; E2_WRAP(e2_readlink_locked(p,b,l)); return r; }
+static int e2op_symlink(const char* t, const char* l){ int r; E2_WRAP(e2j_symlink_locked(t,l)); return r; }
+static int e2op_sync(void){ int r; E2_WRAP(e2_sync_locked()); return r; }
+static int e2op_link(const char* o, const char* n){ int r; E2_WRAP(e2j_link_locked(o,n)); return r; }
+static int e2op_statfs(vfs_statfs_t* st){ int r; E2_WRAP(e2_statfs_locked(st)); return r; }
+/* ->mntinfo is the one lock-free entry point: the /proc/mounts generator calls
+ * it under procfs's spinlock (S15), where a klock must not be taken. It only
+ * reads words that change at mount time (g_mounted, g_dev, g_use_extents,
+ * g_jhas) and returns static strings, so a racing mount shows at worst the
+ * previous volume's name. */
+static int e2op_mntinfo(const char** src, const char** type){ return e2_mntinfo_nolock(src,type); }
+static int e2op_remount(int ro){ int r; E2_WRAP(e2_remount_locked(ro)); return r; }
+
+/* Atomic append for the VFS (O_APPEND), the C1 `vfs_fs_ops.append` contract:
+ *     int (*append)(vfs_inode_t* inode, const void* buf, size_t len, uint64_t* at);
+ * the data lands at the end of file as it is under the lock; *at (optional)
+ * gets the offset it was written at, so the caller can set the fd offset to
+ * *at + return value. Returns bytes written or a negative value. */
+int ext2_append(vfs_inode_t* v, const void* d, size_t l, uint64_t* at){
+    int r; size_t off=0;
+    E2_WRAP(e2j_write_at_locked(v, 0, 1, d, l, &off));
+    if(at) *at=(uint64_t)off;
+    return r;
+}
+
 static vfs_fs_ops_t ext2_ops = {
-    .lookup=e2_lookup, .readdir=e2_readdir, .read=e2_read, .write=e2j_write,
-    .create=e2j_create, .mkdir=e2j_mkdir, .remove=e2j_remove, .rename=e2j_rename,
-    .truncate=e2j_truncate, .setattr=e2j_setattr,
-    .readlink=e2_readlink, .symlink=e2j_symlink, .sync=e2_sync,
-    .link=e2j_link, .statfs=e2_statfs, .mntinfo=e2_mntinfo, .remount=e2_remount
+    .lookup=e2op_lookup, .readdir=e2op_readdir, .read=e2op_read, .write=e2op_write,
+    .create=e2op_create, .mkdir=e2op_mkdir, .remove=e2op_remove, .rename=e2op_rename,
+    .truncate=e2op_truncate, .setattr=e2op_setattr,
+    .readlink=e2op_readlink, .symlink=e2op_symlink, .sync=e2op_sync,
+    .link=e2op_link, .statfs=e2op_statfs, .mntinfo=e2op_mntinfo, .remount=e2op_remount,
+    .lock = &g_e2_lock, .append = ext2_append,      /* [M51 C1] contract */
 };
+/* For in-kernel tests that drive the driver directly (mount-relative paths). */
+const vfs_fs_ops_t* ext2_vfs_ops(void){ return &ext2_ops; }
 
 /* ── Mount ───────────────────────────────────────────────────────────────── */
 /* Why the last ext2_read_super() refused a volume (NULL = accepted or not ext). */
 static const char* g_reject;
-const char* ext2_last_error(void){ return g_reject ? g_reject : "unknown error"; }
+const char* ext2_last_error(void){
+    E2_LOCK(); const char* r = g_reject ? g_reject : "unknown error"; E2_UNLOCK();
+    return r;                        /* a static string: valid after the unlock */
+}
 
 /* Feature bits this driver reads AND writes correctly. Anything else in
  * INCOMPAT or RO_COMPAT makes the volume unusable here: we refuse it instead of
@@ -1437,6 +1585,7 @@ static const char* e2_check_super(const uint8_t* sb){
  * it is an ext volume this driver must not touch (g_reject says why). Sets
  * g_mounted=1 on success. Nothing is written. */
 static int ext2_read_super(block_dev_t* dev){
+    E2_HELD();
     g_reject=NULL;
     if(!dev) return -1;
     /* Superblock is at byte offset 1024. Read enough to cover it. */
@@ -1592,6 +1741,7 @@ static uint32_t jbd2_pass(int phase, uint32_t first, uint32_t maxlen,
 /* Recover the journal of the currently-mounted volume (globals from read_super).
  * Returns 1 if a replay happened, 0 if nothing to do, -1 on error. */
 static int jbd2_recover(void){
+    E2_HELD();
     uint8_t sbsec[1024];
     if(block_read(g_dev, 2, sbsec, 2)!=2) return -1;
     uint8_t* sb=sbsec;
@@ -1707,12 +1857,13 @@ static void jt_init(void){
 
 /* Journal state for the boot report: 0 none, 1 journalled, -1 present but in a
  * format this driver does not write (direct writes, no crash safety). */
-int ext2_journal_state(void){
+static int e2_journal_state_locked(void){
     if(g_jhas) return 1;
     uint8_t sbsec[1024];
     if(!g_mounted || block_read(g_dev,2,sbsec,2)!=2) return 0;
     return (rd32(sbsec+92)&0x4) ? -1 : 0;
 }
+int ext2_journal_state(void){ int r; E2_WRAP(e2_journal_state_locked()); return r; }
 
 static int jt_read_cached(uint32_t b, uint8_t* buf){
     for(int i=0;i<g_jt_n;i++) if(g_jt[i].blk==b){ mem_copy(buf,g_jt[i].data,g_blk_size); return 1; }
@@ -1730,6 +1881,7 @@ static int jt_buffer(uint32_t b, const uint8_t* buf){
 }
 
 static void jt_begin(void){
+    E2_HELD();
     if(!g_jhas) return;
     if(!g_jdirty){ e2_sb_set_recover(1); g_jdirty=1; }   /* the journal may now hold data */
     g_jt_n=0; g_jt_active=1;
@@ -1752,6 +1904,7 @@ static int jt_finish(int r, int ok){ if(ok) jt_commit(); else jt_abort(); return
  * commit-block and journal-superblock checksums JBD2 defines; a block whose
  * first word is the JBD2 magic is stored escaped (first word zeroed). */
 static void jt_commit(void){
+    E2_HELD();
     if(!g_jt_active) return;
     g_jt_active=0;
     int n=g_jt_n; if(n<=0) return;
@@ -1837,7 +1990,7 @@ static int e2_opt_tok(const char** pp, const char* k){
     if(*p && *p != ',') return 0;
     *pp = p; return 1;
 }
-int ext2_set_mount_options(const char* opts){
+static int e2_set_mount_options_locked(const char* opts){
     char rest[128]; size_t n = 0;
     int ro = 0, noload = 0;
     const char* p = opts ? opts : "";
@@ -1857,10 +2010,15 @@ int ext2_set_mount_options(const char* opts){
     g_e2opt_ro = ro; g_e2opt_noload = noload;
     return 0;
 }
+/* The options are consumed by the next ext2_mount; mount(2) runs the pair
+ * under the VFS namespace lock (C1), which keeps another mount from taking
+ * them in between. */
+int ext2_set_mount_options(const char* opts){ int r; E2_WRAP(e2_set_mount_options_locked(opts)); return r; }
 
 /* Validate, replay the journal, re-validate and capture the journal geometry.
  * Returns 0, -1 (no ext superblock) or -3 (refused; g_reject says why). */
 static int e2_open_volume(const char* dev_name){
+    E2_HELD();
     block_dev_t* dev=block_find(dev_name);
     g_ro = 0;                            /* reads/replay below must not be refused */
     int r=ext2_read_super(dev);
@@ -1881,19 +2039,41 @@ static int e2_open_volume(const char* dev_name){
     return 0;
 }
 
+/* [M51 C3] Mount claim. The VFS mount-table calls (vfs_mount*, which call
+ * back into ->mntinfo, and vfs_mount_point_of) run without g_e2_lock, so a
+ * mount first claims the driver under the lock: a second mount (or mount_root)
+ * attempted meanwhile sees the claim and fails as "already mounted" instead of
+ * retargeting the globals underneath the first. */
+static int g_e2_claimed;
+static int e2_claim(void){
+    E2_LOCK(); int busy=g_e2_claimed; if(!busy) g_e2_claimed=1; E2_UNLOCK();
+    if(busy) return -1;
+    if(e2_busy()){ E2_LOCK(); g_e2_claimed=0; E2_UNLOCK(); return -1; }
+    return 0;
+}
+static void e2_unclaim(void){ E2_LOCK(); g_e2_claimed=0; E2_UNLOCK(); }
+
 int ext2_mount(const char* dev_name, const char* mount_point){
-    if(e2_busy()){ debugcon_writestring("[EXT2] an ext2/ext4 volume is already mounted\n"); return -1; }
+    if(e2_claim()!=0){
+        E2_LOCK(); g_e2opt_ro = 0; g_e2opt_noload = 0; E2_UNLOCK();
+        debugcon_writestring("[EXT2] an ext2/ext4 volume is already mounted\n"); return -1;
+    }
+    E2_LOCK();
     int r=e2_open_volume(dev_name);
     if(r==-3){ debugcon_writestring("[EXT2] refusing "); debugcon_writestring(dev_name);
                debugcon_writestring(": "); debugcon_writestring(g_reject); debugcon_writestring("\n"); }
     int want_ro = g_e2opt_ro;
     g_e2opt_ro = 0; g_e2opt_noload = 0;  /* options are for this mount only */
-    if(r!=0) return -1;
-    /* [M46] -o ro, or a device without a write path: read-only from here on. */
-    g_ro = (want_ro || !g_dev || !g_dev->write) ? 1 : 0;
-    ext2_ops.flags = g_ro ? VFS_FS_RDONLY : 0;
-    if(g_ro) debugcon_writestring("[EXT2] mounted read-only\n");
-    return vfs_mount(mount_point, &ext2_ops, "ext2");
+    if(r==0){
+        /* [M46] -o ro, or a device without a write path: read-only from here on. */
+        g_ro = (want_ro || !g_dev || !g_dev->write) ? 1 : 0;
+        ext2_ops.flags = g_ro ? VFS_FS_RDONLY : 0;
+        if(g_ro) debugcon_writestring("[EXT2] mounted read-only\n");
+    }
+    E2_UNLOCK();
+    if(r==0) r=vfs_mount(mount_point, &ext2_ops, "ext2");
+    e2_unclaim();
+    return r==0 ? 0 : -1;
 }
 
 /* [M23] Mount an ext2/ext4 volume as the persistent VFS root, but only if it is
@@ -1909,30 +2089,35 @@ int ext2_mount(const char* dev_name, const char* mount_point){
  * that actually uses it, e.g. a later `mount -o ro,noload`). The marker is
  * made with the disk and never rewritten, so the unreplayed tree has it. */
 int ext2_mount_root(const char* dev_name){
-    if(e2_busy()) return -1;
+    if(e2_claim()!=0) return -1;
+    E2_LOCK();
     g_ro=0; g_e2opt_noload=0;
     int r=ext2_read_super(block_find(dev_name));
-    if(r!=0) return r;
-    g_vused=0;
-    if(!e2_lookup("/.secosroot")) return -2;     /* ext2 but not a SecOS root */
-    g_vused=0;
-    r=e2_open_volume(dev_name);                  /* now replay + re-validate */
-    if(r!=0) return r;
-    g_vused=0;
-    return vfs_mount_root(&ext2_ops, "ext2")==0 ? 0 : -3;
+    if(r==0){
+        g_vused=0;
+        if(!e2_lookup_locked("/.secosroot")) r=-2;   /* ext2 but not a SecOS root */
+        g_vused=0;
+    }
+    if(r==0) r=e2_open_volume(dev_name);           /* now replay + re-validate */
+    if(r==0) g_vused=0;
+    E2_UNLOCK();
+    if(r==0 && vfs_mount_root(&ext2_ops, "ext2")!=0) r=-3;
+    e2_unclaim();
+    return r;
 }
 
 /* Boot report: does the mounted volume carry metadata checksums? */
-int ext2_has_csum(void){ return g_mounted && g_csum; }
+int ext2_has_csum(void){ int r; E2_WRAP(g_mounted && g_csum); return r; }
 
 /* [M46] mount -o remount,ro|rw. Every metadata transaction is committed and
  * checkpointed when its operation returns, so going read-only only has to
- * retire the journal (e2_sync). Going read-write needs a writable device and a
+ * retire the journal (e2_sync_locked). Going read-write needs a writable device and a
  * replayed journal (a noload mount must be unmounted and mounted again). */
-static int e2_remount(int ro){
+static int e2_remount_locked(int ro){
+    E2_HELD();
     if(!g_mounted) return -22;
     if(ro){
-        if(!g_ro) e2_sync();
+        if(!g_ro) e2_sync_locked();
         g_ro = 1;
     } else {
         if(!g_dev || !g_dev->write || g_noload_dirty) return -30;
