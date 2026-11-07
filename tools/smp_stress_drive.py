@@ -6,7 +6,8 @@
 # console bash prompt and runs a fixed list of multicore workloads: CPU-bound
 # background jobs, pipelines, fork/exec bursts, nested command substitution,
 # the FPU-across-migration/signal check (/bin/smptest fpu), fork bursts with
-# status checks (/bin/smptest burst) and several syscall fuzzers in parallel
+# status checks (/bin/smptest burst), pty pairs and checked pipelines
+# (/bin/smptest pty|pipe, M51) and several syscall fuzzers in parallel
 # on all CPUs. Each step must print its expected text before a timeout, and
 # the debugcon log must stay free of kernel fault markers. Finally /proc/smp
 # must show the work actually spread (migrations, reschedule IPIs) and no
@@ -42,10 +43,12 @@ STEPS = [
     ("dd-pipe",    "echo DD-$(dd if=/dev/zero bs=4096 count=2000 2>/dev/null | wc -c)", "DD-8192000", 400),
     ("smp-fpu",    "/bin/smptest fpu 12 2000000", "[smptest] fpu PASS", 600),
     ("smp-burst",  "/bin/smptest burst 25 12", "[smptest] burst PASS", 600),
+    ("smp-pty",    "/bin/smptest pty 16 32", "[smptest] pty PASS", 600),    # [M51] 16 pty pairs
+    ("smp-pipe",   "/bin/smptest pipe 3 3 256", "[smptest] pipe PASS", 600), # [M51] checked pipelines
     ("fuzz-par",   "( /bin/sysfuzz -s 11 -b 4 -c 100 & /bin/sysfuzz -s 13 -b 4 -c 100 & /bin/sysfuzz -s 17 -b 4 -c 100 & /bin/sysfuzz -s 19 -b 4 -c 100 & wait ); echo FUZZ-$((6*7))",
                    "FUZZ-42", 600),
 ]
-QUICK = {"cpu-count", "spin-jobs", "pipelines", "smp-fpu", "smp-burst", "fuzz-par"}
+QUICK = {"cpu-count", "spin-jobs", "pipelines", "smp-fpu", "smp-burst", "smp-pty", "fuzz-par"}
 FAIL_MARKERS = ["[EXC] int=", "[PANIC]", "nested fault", "stack smashing", "CORRUPT",
                 "[TLB] BUG", "shootdown timeout", "LOCKDEP"]
 
