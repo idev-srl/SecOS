@@ -96,6 +96,7 @@ really works"):
 | M47 | Network stack locking (tick gate / per-NIC RX+TX / stack lock hierarchy, lockdep-lite) | ✅ done (Phase 4) |
 | M48 | SMP on by default: TLB shootdown (IPI 0xF0), reschedule IPI (0xF1), migration, x2APIC, 256 CPUs, `/proc/smp`, `nosmp`; kernel lock (`kernel/bkl.c`) as stop-gap | ✅ done (Phase 4) |
 | M49 | Big memory: physmap to 64 TiB (1 GiB pages, RAM only), sectioned PMM, `vmm_map_mmio`, DMA32 zone | ✅ done (Phase 4) |
+| M50 | Lock core (BKL removal phase A): `klock`, lock levels, lockdep (`-DSECOS_LOCKDEP`, `/proc/lockstat`), BKL on klock, `bkl=on\|off` + `syscall_bkl_mask` | ✅ done |
 
 **Phases done:** A–E (M0–M13), F (M15–M17), G (M18–M20), H (M26–M27, + M33),
 I (M28–M29, SMP opt-in), J/networking (M24), K (M31–M32, M34, bash in M39),
@@ -273,6 +274,14 @@ robustness and the paused real-hardware bring-up — see below.
 - [x] SMP: TLB shootdown, IPI reschedule, migration, on by default (M48, `docs/devlog/M48-smp.md`).
 - [x] Big memory: 64 TiB physmap, sectioned PMM, explicit MMIO mappings (M49, `docs/devlog/M49-bigmem.md`).
 - [ ] **Remove the kernel lock** (`kernel/bkl.c`): per-filesystem / VFS / TTY / cred locking.
+      Plan: `docs/BKL_REMOVAL_PLAN.md`.
+  - [x] Phase A (M50, `docs/devlog/M50-lock-core.md`): klock, `lock_order.h`, lockdep,
+        BKL on klock, `cpu_wait_irq`, `bkl=on|off` + `syscall_bkl_mask`, `make lockdep-check`.
+  - [ ] Phase B: B1 process refcounts + `mm_lock`, B2 page-cache fill outside `pc_lock`,
+        B3 per-disk block locks + `xhci_lock` (B4/B5 fold into C5/C6).
+  - [ ] Phase C: VFS ns lock + atomic O_APPEND, per-FS klocks (ramfs/devfs, ext4, fat/exfat/ntfs),
+        TTY locks, exec/sysroot/pkg locks.
+  - [ ] Phase D: clear `syscall_bkl_mask` subsystem by subsystem, then default `bkl=off`.
 - [ ] NUMA awareness; buddy allocator for contiguous runs (M49 PMM search is linear and
       cannot cross a 1 GiB section); physmap + kernel-heap randomization.
 - [ ] Real-HW re-validation of SMP / x2APIC / shootdown (paused, see below).
