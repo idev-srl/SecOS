@@ -565,17 +565,37 @@ static void proc_image_free(proc_image_t* im) {
 // holds elf_buf and becomes the pinned image (freed on failure); otherwise the
 // image is copied. 'extra_stack' bytes are added to the stack VMA (for exec's
 // argv/envp). On failure everything is freed and -errno returned.
+//
+// [M51-C6] Reentrant: no static state, so loads on different CPUs run in
+// parallel (the Ed25519 verify is most of an exec's 16-34 ms). The signature is
+// checked on the PINNED copy, never on the caller's buffer: a copy made after
+// the check could differ from what was verified if the source changed in
+// between (a shared staging buffer refilled by another CPU, a file page), and
+// the pinned copy is what the FILE VMAs fault in from.
 static int proc_image_build(const void* elf_buf, size_t size, uint8_t* owned,
                             uint64_t extra_stack, vma_set_t* vmas, proc_image_t* im) {
     im->space = NULL; im->image = owned; im->image_size = size; im->mf = NULL;
     im->entry = 0; im->footprint = 0; im->stack_top = 0; im->stack_lo = 0;
     vmas->count = 0;
 
+    // [M14] Pin a private copy of the ELF image for the process lifetime:
+    // FILE-backed VMAs fill pages from it on demand.
+    if (!im->image) {
+        im->image = (uint8_t*)kmalloc(size ? size : 1);
+        if (!im->image) {
+            terminal_writestring("[PROC] image pin alloc failed\n");
+            proc_image_free(im);
+            return -ENOMEM;
+        }
+        const uint8_t* src = (const uint8_t*)elf_buf;
+        for (size_t i = 0; i < size; i++) im->image[i] = src[i];
+    }
+
     // [M9] Code-signing gate (root of trust). Every ELF must carry a valid
     // Ed25519 signature (docs/SIGNING.md) to run. -DDEV_ALLOW_UNSIGNED downgrades
     // refusal to a warning for bootstrap (e.g. the M7/M8 synthetic demos).
     {
-        int sv = elf_signature_verify(elf_buf, size);
+        int sv = elf_signature_verify(im->image, size);
 #ifdef DEV_ALLOW_UNSIGNED
         if (sv != ELF_SIG_OK)
             debugcon_writestring("[SEC] WARN: unsigned/invalid ELF allowed (DEV_ALLOW_UNSIGNED)\n");
@@ -595,18 +615,6 @@ static int proc_image_build(const void* elf_buf, size_t size, uint8_t* owned,
         terminal_writestring("[PROC] space alloc failed\n");
         proc_image_free(im);
         return -ENOMEM;
-    }
-    // [M14] Pin a private copy of the (already signature-verified) ELF image for
-    // the process lifetime: FILE-backed VMAs fill pages from it on demand.
-    if (!im->image) {
-        im->image = (uint8_t*)kmalloc(size);
-        if (!im->image) {
-            terminal_writestring("[PROC] image pin alloc failed\n");
-            proc_image_free(im);
-            return -ENOMEM;
-        }
-        const uint8_t* src = (const uint8_t*)elf_buf;
-        for (size_t i = 0; i < size; i++) im->image[i] = src[i];
     }
 
     int r = elf_load_image_lazy(im->image, size, im->space, &im->entry, vmas, &im->footprint);
@@ -695,12 +703,34 @@ process_t* process_create_from_elf(const void* elf_buf, size_t size) {
     return process_create_from_elf_args(elf_buf, size, 0, NULL);
 }
 
+static process_t* process_create_common(const void* elf_buf, size_t size, uint8_t* owned,
+                                        int argc, const char* const argv[]);
+
 process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
+                                        int argc, const char* const argv[]) {
+    return process_create_common(elf_buf, size, NULL, argc, argv);
+}
+
+// [M51-C6] Like process_create_from_elf_args, but 'image' is a kmalloc'd buffer
+// the process takes over as its pinned image (no second copy); it is freed on
+// failure. SYS_SPAWN reads the file straight into it, so concurrent spawns
+// share no staging buffer.
+process_t* process_create_from_elf_owned(uint8_t* image, size_t size,
+                                         int argc, const char* const argv[]) {
+    if (!image) return NULL;
+    return process_create_common(image, size, image, argc, argv);
+}
+
+static process_t* process_create_common(const void* elf_buf, size_t size, uint8_t* owned,
                                         int argc, const char* const argv[]) {
     if (!proc_inited) process_init_system();
 
     process_t* p = (process_t*)kmalloc(sizeof(process_t));
-    if (!p) { terminal_writestring("[PROC] pcb alloc failed\n"); return NULL; }
+    if (!p) {
+        terminal_writestring("[PROC] pcb alloc failed\n");
+        if (owned) kfree(owned);
+        return NULL;
+    }
     klock_task_reset(&p->klk);               // [M50] holds no klock
     p->refs = 0;                             // [M50-B1] lifetime + address-space lock
     spin_init_class_dynamic(&p->mm_lock, LK_S35_MM, "mm");
@@ -708,7 +738,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
     p->mapped_page_count = 0;
 
     proc_image_t im;
-    if (proc_image_build(elf_buf, size, NULL, 0, &p->vmas, &im) != 0) {
+    if (proc_image_build(elf_buf, size, owned, 0, &p->vmas, &im) != 0) {
         kfree(p);
         return NULL;
     }

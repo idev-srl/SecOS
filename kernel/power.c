@@ -65,7 +65,18 @@ static const char* cmd_name(int cmd) {
     }
 }
 
+/* [M51-C6] Only one caller runs the final phase. Two processes asking for a
+ * reboot at once (each walks its own phases in its PCB) would otherwise sync
+ * and unmount every filesystem twice at the same time on two CPUs. The loser
+ * parks its CPU with interrupts on (it keeps answering TLB shootdowns the
+ * winner's unmounts may send); the winner powers the machine off. */
+static volatile int g_power_final_owner;
+
 static void power_final(int cmd) {
+    if (__atomic_exchange_n(&g_power_final_owner, 1, __ATOMIC_ACQ_REL)) {
+        debugcon_writestring("[POWER] final phase already running on another CPU\n");
+        for (;;) __asm__ volatile("sti; hlt");
+    }
     debugcon_writestring("[POWER] syncing filesystems\n");
     int n = vfs_sync_all();
     debugcon_writestring("[POWER] synced "); debugcon_print_hex((uint64_t)n);

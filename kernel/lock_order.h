@@ -29,8 +29,9 @@
 
 /* ---- K: task-owned klocks (kernel/klock.h) -------------------------------- */
 #define LK_K0_BKL          0    /* the BKL (recursive): fallback only           */
-#define LK_K10_EXEC        10   /* exec_lock: g_spawn_buf / exec staging (B5)   */
-#define LK_K11_SYSROOT     11   /* sysroot_lock, pkg_lock (C6)                  */
+#define LK_K10_EXEC        10   /* reserved, unused: C6 made exec staging per
+                                   call (no g_spawn_buf), so no exec_lock      */
+#define LK_K11_SYSROOT     11   /* sysroot_lock, pkg_lock (C6; never nested)    */
 #define LK_K20_VFS_NS      20   /* vfs_ns_lock: mount/umount/remount (C1)       */
 #define LK_K25_VFS_APPEND  25   /* vfs_append_lock: O_APPEND/truncate fallback
                                    for an FS without ->append; the FS (K30)
@@ -83,11 +84,14 @@
                                    klog/debugcon line locks (kernel/klog.c) are
                                    S50 too but are raw, bounded, recursive
                                    output locks: lockdep reports THROUGH them,
-                                   so they are deliberately not tracked.        */
+                                   so they are deliberately not tracked.
+                                   con_lock also guards the KD text/graphics
+                                   mode (drivers/fbdev.c, C6).                  */
 #define LK_S60_KSTACK      160  /* kstack_lock, g_pm_lock, kvmm_lock (future)   */
 #define LK_S62_TLB         162  /* tlb_lock: shootdowns are issued from inside
                                    kstack_lock / g_pm_lock sections (plan: S60) */
-#define LK_S64_LEAF        164  /* kclock, csprng: leaf locks (plan: S60)       */
+#define LK_S64_LEAF        164  /* kclock, csprng, elf-revoke (C6, writers
+                                   only): leaf locks (plan: S60)                */
 #define LK_S70_HEAP        170  /* heap_lock (expand_heap calls the PMM)        */
 #define LK_S75_PMM         175  /* pmm_lock: innermost                          */
 

@@ -264,8 +264,8 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
     process_t* c = sched_get_current();
     switch (cmd) {
     case KDGETMODE: {
-        int m = g_kd_mode;
-        return copy_to_user((void*)arg, &m, sizeof(m)) ? E_FAULT : 0;
+        int m = __atomic_load_n(&g_kd_mode, __ATOMIC_RELAXED);
+        return copy_to_user((void*)arg, &m, sizeof(m)) ? E_FAULT : 0;   /* no lock held */
     }
     case KDSETMODE:
         if (arg == KD_GRAPHICS) {
@@ -314,7 +314,8 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
 
 void vtcon_proc_exit(struct process* pp) {
     process_t* p = (process_t*)pp;
-    if (!p || g_kd_mode != KD_GRAPHICS || p->pid != g_kd_owner) return;   /* fast path */
+    if (!p || __atomic_load_n(&g_kd_mode, __ATOMIC_RELAXED) != KD_GRAPHICS ||
+        p->pid != __atomic_load_n(&g_kd_owner, __ATOMIC_RELAXED)) return;   /* fast path */
     uint64_t lf = con_lock();
     int restored = 0;
     if (g_kd_mode == KD_GRAPHICS && p->pid == g_kd_owner) restored = set_text_locked();

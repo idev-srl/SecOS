@@ -32,5 +32,6 @@ int elf_signature_verify(const void* elf_buf, size_t size);
  * cryptographically valid (retire a compromised signer without re-keying). */
 void elf_sign_revoke_key(uint32_t key_id);
 int  elf_sign_key_revoked(uint32_t key_id);
+int  elf_sign_revoked_count(void);   /* [M51-C6] entries in the revocation list */
 
 #endif /* SECOS_ELF_SIGN_H */

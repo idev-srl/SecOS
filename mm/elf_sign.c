@@ -8,6 +8,7 @@
 #include "sha256.h"
 #include "ed25519.h"
 #include "secos_pubkey.h"
+#include "spinlock.h"
 
 /* Locate the QSIG note's sig[64] field; returns its file offset, or 0 if none. */
 static size_t find_qsig_sig_offset(const uint8_t* base, size_t size) {
@@ -49,15 +50,34 @@ static size_t find_qsig_sig_offset(const uint8_t* base, size_t size) {
  * project dev key, id 0, is trusted); revoke at boot/policy time. */
 #define SECOS_MAX_REVOKED 16
 static uint32_t g_revoked_keys[SECOS_MAX_REVOKED];
-static int      g_revoked_n;
+static uint32_t g_revoked_n;
+/* [M51-C6] The list is append-only. Writers (rare: boot/policy time) are
+ * serialized by g_revoke_lock and publish an entry by storing it before the
+ * release-store of the count; readers (every exec, any CPU) take no lock: an
+ * acquire-load of the count makes every published entry visible. A revocation
+ * racing with an exec that already passed the check does not stop that exec,
+ * like any revocation that lands a moment later. */
+static spinlock_t g_revoke_lock = SPINLOCK_INIT_CLASS(LK_S64_LEAF, "elf-revoke");
 
+static int revoked_in(uint32_t n, uint32_t key_id) {
+    for (uint32_t i = 0; i < n; i++)
+        if (__atomic_load_n(&g_revoked_keys[i], __ATOMIC_RELAXED) == key_id) return 1;
+    return 0;
+}
 void elf_sign_revoke_key(uint32_t key_id) {
-    for (int i = 0; i < g_revoked_n; i++) if (g_revoked_keys[i] == key_id) return;
-    if (g_revoked_n < SECOS_MAX_REVOKED) g_revoked_keys[g_revoked_n++] = key_id;
+    uint64_t fl = spin_lock_irqsave(&g_revoke_lock);
+    uint32_t n = g_revoked_n;
+    if (!revoked_in(n, key_id) && n < SECOS_MAX_REVOKED) {
+        __atomic_store_n(&g_revoked_keys[n], key_id, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_revoked_n, n + 1, __ATOMIC_RELEASE);
+    }
+    spin_unlock_irqrestore(&g_revoke_lock, fl);
 }
 int elf_sign_key_revoked(uint32_t key_id) {
-    for (int i = 0; i < g_revoked_n; i++) if (g_revoked_keys[i] == key_id) return 1;
-    return 0;
+    return revoked_in(__atomic_load_n(&g_revoked_n, __ATOMIC_ACQUIRE), key_id);
+}
+int elf_sign_revoked_count(void) {
+    return (int)__atomic_load_n(&g_revoked_n, __ATOMIC_ACQUIRE);
 }
 
 int elf_signature_verify(const void* elf_buf, size_t size) {

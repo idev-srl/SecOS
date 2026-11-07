@@ -48,6 +48,7 @@
 #include "../crypto/sha256.h"
 #include "../drivers/keyboard.h"
 #include "sysroot.h"
+#include "klock.h"
 
 extern uint64_t timer_get_ticks(void);
 extern int vfs_read_all(const char*, void*, size_t);
@@ -126,6 +127,18 @@ static void con_dec(uint64_t v){
     do { b[--i]=(char)('0'+v%10); v/=10; } while(v && i>0);
     terminal_writestring(&b[i]);
 }
+
+/* ---- locking [M51-C6] ---------------------------------------------------------
+ * Everything below (the table g_sf, the blob-hash cache, the manifest buffers
+ * g_mf_* / g_mr, g_cmpbuf, g_akbuf, the stats g_st and the function-local
+ * static buffers) is scratch state of one provisioning run. sysroot_lock
+ * (K11) makes each exported entry one critical section: provision,
+ * apply_settings and install_exec never interleave. Inside it only VFS (K20/
+ * K30 and below), the keyboard lock (S50) and the heap are taken; no user
+ * memory, no block, no spawn. The entries do not call one another.
+ * g_persistent / g_rootdev are written once by sysroot_set_root at boot,
+ * before the first user process exists, and only read afterwards (procfs). */
+static klock_t sysroot_lock = KLOCK_INIT(LK_K11_SYSROOT, "sysroot");
 
 /* ---- root state ------------------------------------------------------------ */
 static int  g_persistent;
@@ -851,7 +864,14 @@ static void report_components(void){
                          : "[NET] FAIL: could not install netcfg\n");
 }
 
+static void sysroot_provision_locked(void);
 void sysroot_provision(void){
+    klock_lock(&sysroot_lock);
+    sysroot_provision_locked();
+    klock_unlock(&sysroot_lock);
+}
+static void sysroot_provision_locked(void){
+    KLOCK_ASSERT_HELD(&sysroot_lock);
     uint64_t t0=timer_get_ticks();
     g_st.written=g_st.kept=g_st.linked=g_st.removed=g_st.created=g_st.failed=g_st.fixed=0;
     for(unsigned i=0;i<sizeof(g_dirs)/sizeof(g_dirs[0]);i++){
@@ -897,7 +917,14 @@ void sysroot_provision(void){
 }
 
 /* /etc/vconsole.conf: KEYMAP=<layout> (written by /bin/loadkeys). */
+static void sysroot_apply_settings_locked(void);
 void sysroot_apply_settings(void){
+    klock_lock(&sysroot_lock);
+    sysroot_apply_settings_locked();
+    klock_unlock(&sysroot_lock);
+}
+static void sysroot_apply_settings_locked(void){
+    KLOCK_ASSERT_HELD(&sysroot_lock);
     static char buf[1024];
     int n=vfs_read_all("/etc/vconsole.conf", buf, sizeof(buf)-1);
     if(n<0){
@@ -923,7 +950,9 @@ void sysroot_apply_settings(void){
 }
 
 int sysroot_install_exec(const char* path, const void* data, size_t len){
+    klock_lock(&sysroot_lock);
     int r=vfs_create(path, data, len);
     if(r==0) fix_attr(path, 0755, 0, 0);   /* best effort: a FAT32 mount has fixed modes */
+    klock_unlock(&sysroot_lock);
     return r;
 }

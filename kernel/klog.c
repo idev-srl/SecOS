@@ -236,8 +236,17 @@ void klog_clear(void) {
     kunlock(fl);
 }
 
-uint64_t klog_read_pos(void) { return g_rd; }
-void klog_set_read_pos(uint64_t pos) { g_rd = pos; }
+/* [M51-C6] The destructive-read cursor only moves forward: two concurrent
+ * SYSLOG_ACTION_READ callers (each copies to user space outside the log lock)
+ * may both return the same bytes, but neither can move the cursor back over
+ * what the other consumed. */
+uint64_t klog_read_pos(void) { return __atomic_load_n(&g_rd, __ATOMIC_ACQUIRE); }
+void klog_set_read_pos(uint64_t pos) {
+    uint64_t cur = __atomic_load_n(&g_rd, __ATOMIC_RELAXED);
+    while (pos > cur &&
+           !__atomic_compare_exchange_n(&g_rd, &cur, pos, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+        ;
+}
 
 /* /dev/kmsg: one Linux kmsg record "L,seq,usec,-;text\n" per read(). File
  * offset `off` is the byte position in the stream of converted records, counted

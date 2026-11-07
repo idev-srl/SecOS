@@ -118,6 +118,9 @@ void ap_entry(void) {
 #ifdef SECOS_TTY_TEST
         { extern void tty_test_ap(cpu_t*); tty_test_ap(c); }                      // [M51 C5]
 #endif
+#ifdef SECOS_EXEC_TEST
+        { extern void exectest_ap(cpu_t*); exectest_ap(c); }                      // [M51 C6]
+#endif
         sched_reap_zombies();
         cpu_wait_irq();
     }

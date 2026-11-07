@@ -241,6 +241,9 @@ int process_init_system(void); // initialize process table
 process_t* process_create_from_elf(const void* elf_buf, size_t size);
 process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
                                         int argc, const char* const argv[]); // [M16]
+/* [M51-C6] Takes ownership of the kmalloc'd 'image' (pinned, or freed on failure). */
+process_t* process_create_from_elf_owned(uint8_t* image, size_t size,
+                                         int argc, const char* const argv[]);
 process_t* process_fork(process_t* parent, trapframe_t* tf); // [M19] COW fork
 // In-place execve: replace p's user image with the signed ELF 'image' (kmalloc'd,
 // ownership transferred; freed on failure). 'blob' holds argc argv strings then

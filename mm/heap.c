@@ -803,6 +803,18 @@ static void hst(const char* name, int ok) {
     if (ok) hst_pass++; else hst_fail++;
 }
 
+/* [M51-C6] Bytes in use and the heap's whole footprint (every block with its
+ * header: the frames the heap took from the PMM, which it never gives back).
+ * A leak check compares PMM free + footprint (frames not leaked) and used. */
+void heap_usage(uint64_t* used, uint64_t* footprint) {
+    heap_walk_stats_t s = {0};
+    uint64_t fl = spin_lock_irqsave(&heap_lock);
+    heap_check_locked(0, &s);
+    spin_unlock_irqrestore(&heap_lock, fl);
+    if (used) *used = s.used_bytes;
+    if (footprint) *footprint = s.used_bytes + s.free_bytes + s.blocks * HDR;
+}
+
 static uint64_t heap_used_bytes(void) {
     heap_walk_stats_t s = {0};
     uint64_t fl = spin_lock_irqsave(&heap_lock);

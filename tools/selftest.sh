@@ -3176,6 +3176,42 @@ else
     check "M51 TTY gate build" 1
 fi
 
+# ---- M51 EXEC GATE [C6]: concurrent signed-image loads + userland exec stress ----
+# One -DSECOS_EXEC_TEST -DSECOS_LOCKDEP image at -smp 4. At boot,
+# kernel/exec_test.c loads signed images (hello, coreutils, bash) and tampered
+# copies on every CPU at once, outside the BKL, through both loader entry
+# points (copy, and the SYS_SPAWN owned-buffer path): every signed image must
+# load with a byte-exact pinned copy, every tampered one be refused, the
+# revocation list take concurrent writers, and no frame or kmalloc leak. Then
+# tools/exec_stress_drive.py runs `bash -c true` x500 in 4 parallel loops plus
+# a loop of a tampered program (refused every time), MemFree steady.
+echo "[selftest] M51 exec gate: concurrent loads (boot self-test) + bash -c true x500, -smp 4..."
+make clean >/dev/null 2>&1 || true
+if make iso CONSOLE=root CFLAGS_EXTRA="-DSECOS_EXEC_TEST -DSECOS_LOCKDEP" >/tmp/secos_selftest_build.log 2>&1; then
+    EXDIR=$(mktemp -d /tmp/secos_selftest_exec.XXXXXX)
+    cp myos.iso "$EXDIR/ex.iso"
+    timeout 1800 python3 tools/exec_stress_drive.py --iso "$EXDIR/ex.iso" --smp 4 --count 500 \
+        --log "$EXDIR/ex.log" >"$EXDIR/ex.out" 2>&1
+    while IFS= read -r l; do
+        case "$l" in
+            "[ESD] RESULT "*|"[ESD] memfree "*) ;;
+            "[ESD] "*" OK"*)   x=${l#\[ESD\] }; check "M51 exec ${x%% OK*}" 0 ;;
+            "[ESD] "*" FAIL"*) x=${l#\[ESD\] }; check "M51 exec ${x%% FAIL*}" 1; echo "    $l" | cut -c1-240 ;;
+        esac
+    done <"$EXDIR/ex.out"
+    grep -q "^\[ESD\] RESULT " "$EXDIR/ex.out"; check "M51 exec stress driver ran to completion" $?
+    grep -aq "\[EXECTEST\] DONE ok=[0-9]* fail=0" "$EXDIR/ex.log"; check "M51 exec boot self-test: every check passed" $?
+    ! grep -aq "\[EXECTEST\] .*: FAIL" "$EXDIR/ex.log"; check "M51 exec boot self-test: no failing check" $?
+    grep -aq "\[EXECTEST\] at least two CPUs loaded images at once: OK" "$EXDIR/ex.log"
+    check "M51 exec boot self-test ran on several CPUs at once" $?
+    grep -a "\[EXECTEST\] serial \|\[EXECTEST\] pmm " "$EXDIR/ex.log" | sed 's/^/    /'
+    cp "$EXDIR/ex.out" /tmp/secos_selftest_exec.out; cp "$EXDIR/ex.log" /tmp/secos_selftest_exec.log
+    rm -rf "$EXDIR"
+else
+    echo "[selftest] M51 exec BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "M51 exec gate build" 1
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
