@@ -6,6 +6,7 @@
 #include "bkl.h"
 #include "klock.h"
 #include "debugcon.h"
+#include "syscall.h"
 
 klock_t g_bkl = KLOCK_INIT_RECURSIVE(LK_K0_BKL, "bkl");
 
@@ -41,11 +42,42 @@ int      bkl_held_by(struct process* p)  { return klock_owned_by(&g_bkl, p); }
 /* ---- [M50] mode + per-syscall mask ---- */
 int g_bkl_mode = 1;
 
-/* Every syscall still needs the BKL: phase D of the BKL removal clears bits
- * here one subsystem at a time, once that subsystem has its own locks. */
+/* Every syscall starts under the BKL; phase D of the BKL removal (M52,
+ * docs/devlog/M52-bkl-removal.md) lists below, step by step, the ones whose
+ * subsystems have their own locks. bkl_init_mode clears their bits (they
+ * only matter with bkl=off). A syscall not listed keeps the BKL, as does any
+ * number past SYSCALL_BKL_NR. */
 #define ALL64 0xFFFFFFFFFFFFFFFFULL
 uint64_t syscall_bkl_mask[SYSCALL_BKL_WORDS] = { ALL64, ALL64, ALL64, ALL64 };
 typedef char syscall_bkl_mask_init_covers_all[(SYSCALL_BKL_WORDS == 4) ? 1 : -1];
+
+/* D1: process-local state, signals, sockets, pipes/IPC, scheduling, memory
+ * (VMAs + page tables under mm_lock), credentials (published under
+ * proc_lock), fd-table ops that call no filesystem (close/dup/dup2/fcntl:
+ * stores under mm_lock, object refs under each object's lock). */
+static const uint16_t g_bkl_free_d1[] = {
+    SYS_YIELD, SYS_CLOSE, SYS_GETPID, SYS_DRIVER, SYS_WAIT, SYS_GETTICKS,
+    SYS_MSG_SEND, SYS_MSG_RECV, SYS_SLEEP, SYS_MMAP, SYS_MUNMAP, SYS_BRK,
+    SYS_MPROTECT,
+    SYS_SOCKET, SYS_CONNECT, SYS_BIND, SYS_LISTEN, SYS_ACCEPT, SYS_SEND,
+    SYS_RECV, SYS_SENDTO, SYS_RECVFROM, SYS_SOCKCLOSE, SYS_SOCKNAME, SYS_NETCTL,
+    SYS_PIPE,
+    SYS_SIGACTION, SYS_SIGRETURN, SYS_KILL, SYS_SIGPROCMASK, SYS_SETPGID,
+    SYS_GETPGID, SYS_SIGSUSPEND, SYS_SETSID, SYS_GETSID,
+    SYS_DUP2, SYS_DUP, SYS_FCNTL, SYS_GETPPID, SYS_WAITANY, SYS_REBOOT,
+    SYS_PRCTL, SYS_SCHED_GETAFFINITY,
+    SYS_CLOCK_GETTIME, SYS_CLOCK_SETTIME, SYS_NANOSLEEP, SYS_SYSLOG,
+    SYS_UMASK, SYS_UNAME, SYS_SYSINFO,
+    SYS_GETUID, SYS_GETEUID, SYS_GETGID, SYS_GETEGID, SYS_SETUID, SYS_SETGID,
+    SYS_SETRESUID, SYS_SETRESGID, SYS_GETGROUPS, SYS_SETGROUPS,
+};
+
+static void bkl_mask_clear(const uint16_t* nums, unsigned n) {
+    for (unsigned i = 0; i < n; i++)
+        if (nums[i] < SYSCALL_BKL_NR)
+            syscall_bkl_mask[nums[i] >> 6] &= ~(1ULL << (nums[i] & 63));
+}
+#define BKL_MASK_CLEAR(a) bkl_mask_clear((a), sizeof(a) / sizeof((a)[0]))
 
 /* [M52] The mode when the command line names none (Makefile BKL_DEFAULT). */
 #ifdef SECOS_BKL_DEFAULT_OFF
@@ -56,6 +88,7 @@ typedef char syscall_bkl_mask_init_covers_all[(SYSCALL_BKL_WORDS == 4) ? 1 : -1]
 
 void bkl_init_mode(void) {
     extern int kernel_cmdline_has(const char* word);
+    BKL_MASK_CLEAR(g_bkl_free_d1);
     if (kernel_cmdline_has("bkl=off")) g_bkl_mode = 0;
     else if (kernel_cmdline_has("bkl=on")) g_bkl_mode = 1;
     else g_bkl_mode = BKL_MODE_DEFAULT;
