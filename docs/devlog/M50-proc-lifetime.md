@@ -74,7 +74,7 @@ helpers, 3 `process_get_last`, 1 collect-then-post callback):
 pointer. That is safe because they run under `proc_lock`. They must not
 keep the pointer after they return.
 
-## `mm_lock` (`LK_S35_MM`, per process, irqsave)
+## `mm_lock` (`LK_S35_MM`, per process, keeps the caller's IF)
 
 `process_t.mm_lock` protects the VMA set, the user page tables of `space`,
 and the `space`/`image`/`manifest` pointers. Initialize it with the new
@@ -115,6 +115,8 @@ Rules for the next phases:
 - Never hold `mm_lock` across a page-cache or filesystem call, a user copy,
   or anything that takes `proc_lock` or a lower level (S15 driver_if, S10
   tty, any klock).
+- It keeps the caller's interrupt flag (not irqsave: no IRQ handler takes
+  it); a holder may be interrupted, never preempted (ring 0).
 - Inside it is fine: PMM/heap allocation, `vmm_map/unmap/protect_in_space`
   and TLB shootdowns (waiters spin in `cpu_relax_poll` → `tlb_poll`).
 - `vmm_unmap_in_space()` and `vmm_protect_in_space()` take a space, not a
@@ -230,6 +232,56 @@ it becomes the actual race test.
   - the new PROCRACE gate (18).
 
   The full suite was not run; that is left to the integrator.
+
+## Follow-up: lost USB keystrokes under load (`fix/b1-hid-latency`)
+
+After the merge into `integ/bkl`, the M50 B3 gate (`tools/blk_stress_drive.py`,
+lockdep build, -smp 4) lost USB HID keys typed during the userland dd storm.
+
+**How keys get lost.** QEMU's `usb-kbd` reports the current key state each
+time the guest fetches a report. The test holds every key for 30 ms. A key
+pressed and released between two fetches never appears in any report. So
+the guest must poll at least every ~30 ms.
+
+**Who polls.** The only regular poller is the console reader
+(`keyboard_has_char` / `keyboard_getc_raw` in the TTY read). It is woken every
+8 ticks and must win the BKL before it can poll.
+
+**Measurements** (temporary TSC instrumentation, `/proc/lockstat` dump, no
+debugcon writes in hot paths):
+- During the dd storm the BKL is held back to back: exec takes 16–34 ms (the
+  signature check), fork 8–12 ms, plus the disk syscalls.
+- The HID poll gap over the userland phase reached 32–200 ms. There were 2–6
+  gaps of 64 ms or more per run, before and after B1.
+- B1's irqsave `mm_lock` also kept interrupts off for up to 7 ms during fork's
+  COW-share walk. On the BSP, which runs the only timer tick, that showed up as
+  tick gaps.
+- The test sits on this edge in both versions. On this host:
+  - `d67a836` (before B1) passed 2/2 uninstrumented and failed 2/2 with the
+    instrumentation;
+  - B1 failed 3/3 uninstrumented and passed 6/6 instrumented.
+
+  The gap is the cause. B1 only shifted the timing.
+
+**Fixes:**
+1. `mm_lock` is no longer irqsave. No interrupt handler takes it, so it keeps
+   the caller's interrupt flag. The exec swap disables interrupts explicitly
+   around the CR3 switch. Every PTE install is still made under `mm_lock`.
+2. A task spinning for the BKL with interrupts on calls `usb_hid_poll()`, at
+   most once a millisecond system-wide (`bkl_wait_poll`, `kernel/bkl.c`,
+   called from the klock spin loop for the BKL only). The poll only trylocks
+   the HID and xHCI locks, and nothing is held while it runs.
+
+   Measured: over the userland phase there is no poll gap of 32 ms or more.
+   This holds even on the `d67a836` + instrumentation build that failed
+   before; that build passes 3/3 with this fix.
+
+**Separate, pre-existing:** about one B3 run in five on this host trips the
+lockdep watchdog. It reports `[LOCKDEP] stuck on klock bkl ... pid 0 no
+klock`: an idle-context BKL waiter (the zombie reaper) spinning for more than
+2 s behind back-to-back BKL holders, because the spinning test-and-set BKL is
+unfair. It also happens on `d67a836` without B1 (run q2). It is not addressed
+here.
 
 ## Plan notes (vs `docs/BKL_REMOVAL_PLAN.md`)
 
