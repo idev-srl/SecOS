@@ -52,6 +52,14 @@ extern void process_foreach(void (*cb)(process_t*, void*), void* user);
 #define NEG(e)   ((uint64_t)(int64_t)-(e))
 
 /* ---------------------------------------------------------------- accounting */
+/* [M51-C6] Concurrency: g_cpu_* are per-CPU, each written only by its own CPU's
+ * tick; g_load only by CPU 0's tick; readers take aligned 64-bit loads (never
+ * torn on x86-64, a stat may be one tick old). g_ctxt / g_forks are bumped by
+ * every CPU (switches, process creation): atomic adds, or concurrent updates
+ * are lost. A process's ki.cmdline/comm are written by its own exec (or before
+ * it is published) while /proc readers copy them unlocked: a reader can see a
+ * mix of the old and new name, never past the array (cmdline_len is bounded by
+ * sizeof(cmdline)) -- acceptable for /proc, like Linux's racy comm reads. */
 static uint64_t g_cpu_user[SMP_MAX_CPUS], g_cpu_sys[SMP_MAX_CPUS], g_cpu_idle[SMP_MAX_CPUS];
 static volatile uint64_t g_ctxt, g_forks;
 static volatile uint32_t g_last_pid;
@@ -92,7 +100,7 @@ void kiface_proc_init(process_t* p, int argc, const char* const* argv) {
     p->ki.start_ns = kclock_mono_ns();
     ki_copy_name(p->ki.comm, "init", sizeof(p->ki.comm));
     kiface_proc_set_cmdline(p, argc, argv, 0);
-    g_forks++;
+    __atomic_add_fetch(&g_forks, 1, __ATOMIC_RELAXED);
     g_last_pid = p->pid;
 }
 
@@ -102,7 +110,7 @@ void kiface_proc_fork(process_t* c) {
     c->ki.utime_ticks = c->ki.stime_ticks = c->ki.nvcsw = 0;
     c->ki.nsleep_deadline = 0; c->ki.poll_deadline = 0;
     c->ki.poll_active = 0; c->ki.poll_wait = 0;
-    g_forks++;
+    __atomic_add_fetch(&g_forks, 1, __ATOMIC_RELAXED);
     g_last_pid = c->pid;
 }
 
@@ -128,7 +136,7 @@ void kiface_account_tick(process_t* cur, int from_user, int is_idle) {
             g_load[i] = (g_load[i] * exp[i] + active * (FIXED_1 - exp[i])) >> FSHIFT;
     }
 }
-void kiface_count_switch(void) { g_ctxt++; }
+void kiface_count_switch(void) { __atomic_add_fetch(&g_ctxt, 1, __ATOMIC_RELAXED); }
 
 uint32_t kiface_cpu_count(void) { uint32_t n = smp_cpu_count(); return n ? (n > SMP_MAX_CPUS ? SMP_MAX_CPUS : n) : 1; }
 void kiface_cpu_stat(uint32_t cpu, kiface_cpu_stat_t* o) {
