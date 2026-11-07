@@ -17,8 +17,33 @@
 #include "heap.h"
 #include "pagecache.h"
 #include "mntopts.h"
+#include "fs_dirbuf.h"
+#include "klock.h"
 #include <stdint.h>
 #include <stddef.h>
+
+/* ── Locking (M51 C4) ─────────────────────────────────────────────────────────
+ * One K30 klock for the whole driver: there is one FAT32 instance, and all of
+ * its state (geometry, g_sec, the FSInfo flag, the inode pool, the mount
+ * options) is global. Every vfs_fs_ops entry and every exported function is
+ * `lock(); r = x_locked(); unlock();`; internal code only calls _locked
+ * functions and helpers (KLOCK_ASSERT_HELD in the central ones). Under the
+ * lock: block I/O (K40), kmalloc (S70), pagecache_invalidate (S40),
+ * vfs_mount_point_of (S20) — all later in the order. Never under it:
+ * vfs_mount() (C1's vfs_ns_lock, K20, comes first), a readdir callback
+ * (collected with fs_dirbuf.h and replayed unlocked), user copies (the VFS
+ * passes kernel bounce buffers). -DSECOS_C4_NOLOCK compiles the lock out: the
+ * negative control of the C4 stress test (fs/c4_fsstress.c), never a product. */
+static klock_t g_fat_lock = KLOCK_INIT(LK_K30_FS, "fat32");
+#ifdef SECOS_C4_NOLOCK
+#define FAT_LOCK()   ((void)0)
+#define FAT_UNLOCK() ((void)0)
+#define FAT_HELD()   ((void)0)
+#else
+#define FAT_LOCK()   klock_lock(&g_fat_lock)
+#define FAT_UNLOCK() klock_unlock(&g_fat_lock)
+#define FAT_HELD()   KLOCK_ASSERT_HELD(&g_fat_lock)
+#endif
 
 #define SECSZ           512
 #define FAT_EOC         0x0FFFFFF8u
@@ -52,9 +77,10 @@ static uint32_t rd32(const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1]<
 static void wr16(uint8_t* p, uint16_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }
 static void wr32(uint8_t* p, uint32_t v){ p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); }
 
-static int sec_read(uint64_t lba, uint8_t* buf){ return block_read(g_dev, lba, buf, 1)==1 ? 0 : -1; }
+static int sec_read(uint64_t lba, uint8_t* buf){ FAT_HELD(); return block_read(g_dev, lba, buf, 1)==1 ? 0 : -1; }
 static int      g_ro;          /* [M46] mounted read-only (-o ro, or a read-only device) */
 static int sec_write(uint64_t lba, const uint8_t* buf){
+    FAT_HELD();
     if(g_ro) return -1;                                   /* never touch a read-only volume */
     return block_write(g_dev, lba, buf, 1)==1 ? 0 : -1;
 }
@@ -354,6 +380,7 @@ static fat_vslot_t* fvslot_find(uint32_t ec, uint32_t eo){
     return NULL;
 }
 static vfs_inode_t* inode_get(const char* path, uint32_t ec, uint32_t eo){
+    FAT_HELD();
     fat_vslot_t* s = fvslot_find(ec, eo);
     if(!s){
         int idx = g_inode_used;
@@ -370,7 +397,7 @@ static vfs_inode_t* inode_get(const char* path, uint32_t ec, uint32_t eo){
         s->v.fs_data=&s->n;
     }
     vfs_inode_t* ino = &s->v;
-    size_t k=0; for(; path[k] && k<sizeof(ino->path)-1; k++) ino->path[k]=path[k]; ino->path[k]=0;
+    fs_set_path(ino->path, sizeof(ino->path), path);
     return ino;
 }
 /* st_ino: the entry location (unique on the volume, stable across remounts
@@ -378,6 +405,7 @@ static vfs_inode_t* inode_get(const char* path, uint32_t ec, uint32_t eo){
 static uint64_t fat_ino_of(uint32_t ec, uint32_t eo){ return ec ? (((uint64_t)ec << 16) | (eo >> 5)) : 1; }
 /* The entry at (ec,eo) is gone (unlink, or the target of a rename). */
 static void inode_kill(uint32_t ec, uint32_t eo){
+    FAT_HELD();
     fat_vslot_t* s = fvslot_find(ec, eo);
     if(!s) return;
     s->n.dead=1; s->n.first_cluster=0; s->n.size=0; s->v.size=0;
@@ -386,10 +414,11 @@ static void inode_kill(uint32_t ec, uint32_t eo){
 /* The entry moved from (oc,oo) to (nc,no), now named `newp` (rename): an fd
  * open on it keeps following the file. */
 static void inode_move(uint32_t oc, uint32_t oo, uint32_t nc, uint32_t no, const char* newp){
+    FAT_HELD();
     fat_vslot_t* s = fvslot_find(oc, oo);
     if(!s) return;
     s->n.ent_clus=nc; s->n.ent_off=no; s->v.ino=fat_ino_of(nc, no);
-    size_t k=0; for(; newp[k] && k<sizeof(s->v.path)-1; k++) s->v.path[k]=newp[k]; s->v.path[k]=0;
+    fs_set_path(s->v.path, sizeof(s->v.path), newp);
 }
 
 /* ── File read ───────────────────────────────────────────────────────────── */
@@ -487,20 +516,24 @@ static int fat_write_file(fat_node_t* nd, size_t offset, const void* buf, size_t
  * (nothing to store), after the usual owner/root check. */
 static mntopts_t g_fopt     = { 0, 0, 022, 0133, 0, 0 };   /* the mounted volume */
 static mntopts_t g_fopt_new = { 0, 0, 022, 0133, 0, 0 };   /* for the next mount */
+/* The (set options, mount) pair is one request: the caller serializes it
+ * (the BKL today, vfs_ns_lock after C1); the lock only keeps the copy whole. */
 int fat32_set_mount_options(const char* opts){
     mntopts_t o;
     if(mntopts_parse(opts, &o) != 0) return -1;
+    FAT_LOCK();
     g_fopt_new = o;
+    FAT_UNLOCK();
     return 0;
 }
-static int fat32_setattr(const char* path, const vfs_attr_t* a, unsigned valid){
+static int fat32_setattr_locked(const char* path, const vfs_attr_t* a, unsigned valid){
     (void)path; (void)a; (void)valid;
     if(g_ro) return -30;                                  /* -EROFS */
     return 0;                                             /* nothing to store (vfat "quiet") */
 }
 
 /* ── VFS operations ──────────────────────────────────────────────────────── */
-static vfs_inode_t* fat32_lookup(const char* path){
+static vfs_inode_t* fat32_lookup_locked(const char* path){
     if(!g_mounted) return NULL;
     uint32_t fc, sz; int isd; dent_loc_t loc; loc.clus=0; loc.off=0;
     if(path_resolve(path, &fc, &sz, &isd, &loc)!=0) return NULL;
@@ -525,7 +558,7 @@ static vfs_inode_t* fat32_lookup(const char* path){
     return ino;
 }
 
-static int fat32_readdir(const char* dir_path, vfs_iter_cb cb, void* user){
+static int fat32_readdir_locked(const char* dir_path, vfs_iter_cb cb, void* user){
     if(!g_mounted || !cb) return -1;
     uint32_t fc; int isd;
     if(path_resolve(dir_path, &fc, NULL, &isd, NULL)!=0) return -1;
@@ -562,22 +595,28 @@ static int fat32_readdir(const char* dir_path, vfs_iter_cb cb, void* user){
     return 0;
 }
 
-static int fat32_read(vfs_inode_t* ino, size_t off, void* buf, size_t len){
+static int fat32_read_locked(vfs_inode_t* ino, size_t off, void* buf, size_t len){
     if(!g_mounted || !ino || ino->type!=VFS_NODE_FILE) return -1;
     return fat_read_file((fat_node_t*)ino->fs_data, off, buf, len);
 }
 
-static int fat32_write(vfs_inode_t* ino, size_t off, const void* data, size_t len){
+/* off == VFS_OFF_APPEND: write at the file's current size, resolved here under
+ * the lock (atomic O_APPEND); *at (if given) receives the offset used. The
+ * slot's size is authoritative: one slot per directory entry, and every path
+ * that changes the entry (write, truncate, rename, unlink) updates it. */
+static int fat32_write_at_locked(vfs_inode_t* ino, size_t off, const void* data, size_t len, size_t* at){
     if(!g_mounted || !ino || ino->type!=VFS_NODE_FILE) return -1;
     if(g_ro) return -30;                                  /* -EROFS */
     fat_node_t* nd = (fat_node_t*)ino->fs_data;
     if(nd->dead) return -1;                 /* unlinked: its entry slot may be reused */
+    if(off==VFS_OFF_APPEND) off = nd->size;
+    if(at) *at = off;
     int r = fat_write_file(nd, off, data, len);
     if(r>=0) ino->size = nd->size;
     return r;
 }
 
-static int fat32_create(const char* path, const void* initial, size_t size){
+static int fat32_create_locked(const char* path, const void* initial, size_t size){
     if(!g_mounted || !path) return -1;
     if(g_ro) return -30;                                  /* -EROFS */
     /* fail if exists */
@@ -600,7 +639,7 @@ static int fat32_create(const char* path, const void* initial, size_t size){
     return 0;
 }
 
-static int fat32_mkdir(const char* path){
+static int fat32_mkdir_locked(const char* path){
     if(g_ro) return -30;                                  /* -EROFS */
     if(!g_mounted || !path) return -1;
     if(path_resolve(path, NULL, NULL, NULL, NULL)==0) return -1;
@@ -628,7 +667,7 @@ static int fat32_mkdir(const char* path){
     return dent_write_back(&loc);
 }
 
-static int fat32_remove(const char* path){
+static int fat32_remove_locked(const char* path){
     if(g_ro) return -30;                                  /* -EROFS */
     if(!g_mounted || !path) return -1;
     uint32_t fc; uint32_t sz; int isd; dent_loc_t loc; loc.clus=0;
@@ -640,7 +679,7 @@ static int fat32_remove(const char* path){
     return dent_write_back(&loc);
 }
 
-static int fat32_truncate(const char* path, size_t new_size){
+static int fat32_truncate_locked(const char* path, size_t new_size){
     if(g_ro) return -30;                                  /* -EROFS */
     if(!g_mounted || !path) return -1;
     uint32_t fc; uint32_t sz; int isd; dent_loc_t loc; loc.clus=0;
@@ -683,7 +722,7 @@ static int fat32_truncate(const char* path, size_t new_size){
  * first, then the entry is copied to the new name and the old one freed; a
  * directory moved to another parent gets its ".." re-pointed. Not crash-atomic
  * (FAT has no journal), but never leaves both names pointing at one chain. */
-static int fat32_rename(const char* oldp, const char* newp){
+static int fat32_rename_locked(const char* oldp, const char* newp){
     if(g_ro) return -30;                                  /* -EROFS */
     if(!g_mounted || !oldp || !newp) return -1;
     uint32_t fc, sz; int isd; dent_loc_t loc; loc.clus=0;
@@ -723,7 +762,7 @@ static int fat32_rename(const char* oldp, const char* newp){
 }
 
 /* statfs: clusters as blocks; free ones counted from the first FAT. */
-static int fat32_statfs(vfs_statfs_t* st){
+static int fat32_statfs_locked(vfs_statfs_t* st){
     if(!g_mounted || !st) return -1;
     uint64_t freec=0;
     uint32_t per = g_bytes_per_sec/4;
@@ -748,12 +787,12 @@ done:
 
 /* FAT and directory updates are written through to the device as they happen
  * (no cached FAT sectors), so there is nothing left to flush at shutdown. */
-static int fat32_sync(void){ return 0; }
+static int fat32_sync_locked(void){ return 0; }
 
 /* [M46] mount -o remount,ro|rw. Writes go straight to the device, so going
  * read-only has nothing to flush; going read-write needs a writable device. */
 static vfs_fs_ops_t fat32_ops;
-static int fat32_remount(int ro){
+static int fat32_remount_locked(int ro){
     if(!g_mounted) return -22;
     if(!ro && (!g_dev || !g_dev->write)) return -30;
     g_ro = ro ? 1 : 0;
@@ -761,12 +800,38 @@ static int fat32_remount(int ro){
     return 0;
 }
 
-static int fat32_mntinfo(const char** src, const char** type){
+static int fat32_mntinfo_locked(const char** src, const char** type){
     if(!g_mounted) return -1;
     if(src) *src = (g_dev && g_dev->name) ? g_dev->name : "fat32";
     if(type) *type = "vfat";
     return 0;
 }
+
+/* ── Locked entry points (M51 C4) ────────────────────────────────────────── */
+static vfs_inode_t* fat32_lookup(const char* p){ FAT_LOCK(); vfs_inode_t* r = fat32_lookup_locked(p); FAT_UNLOCK(); return r; }
+static int fat32_readdir(const char* p, vfs_iter_cb cb, void* u){
+    if(!cb) return -1;
+    fs_dirbuf_t db; fs_dirbuf_init(&db);
+    FAT_LOCK(); int r = fat32_readdir_locked(p, fs_dirbuf_cb, &db); FAT_UNLOCK();
+    if(r==0) r = fs_dirbuf_replay(&db, cb, u);           /* callbacks run unlocked */
+    fs_dirbuf_free(&db);
+    return r;
+}
+static int fat32_read(vfs_inode_t* i, size_t o, void* b, size_t l){ FAT_LOCK(); int r = fat32_read_locked(i, o, b, l); FAT_UNLOCK(); return r; }
+static int fat32_write(vfs_inode_t* i, size_t o, const void* d, size_t l){ FAT_LOCK(); int r = fat32_write_at_locked(i, o, d, l, NULL); FAT_UNLOCK(); return r; }
+static int fat32_create(const char* p, const void* d, size_t n){ FAT_LOCK(); int r = fat32_create_locked(p, d, n); FAT_UNLOCK(); return r; }
+static int fat32_mkdir(const char* p){ FAT_LOCK(); int r = fat32_mkdir_locked(p); FAT_UNLOCK(); return r; }
+static int fat32_remove(const char* p){ FAT_LOCK(); int r = fat32_remove_locked(p); FAT_UNLOCK(); return r; }
+static int fat32_rename(const char* a, const char* b){ FAT_LOCK(); int r = fat32_rename_locked(a, b); FAT_UNLOCK(); return r; }
+static int fat32_truncate(const char* p, size_t n){ FAT_LOCK(); int r = fat32_truncate_locked(p, n); FAT_UNLOCK(); return r; }
+static int fat32_sync(void){ FAT_LOCK(); int r = fat32_sync_locked(); FAT_UNLOCK(); return r; }
+static int fat32_statfs(vfs_statfs_t* st){ FAT_LOCK(); int r = fat32_statfs_locked(st); FAT_UNLOCK(); return r; }
+/* mntinfo takes no lock: procfs calls it under g_proc_lock (a spinlock, no
+ * klock may be taken inside). It reads the device name pointer and the
+ * mounted flag only, both stable while the mount is in the table. */
+static int fat32_mntinfo(const char** s, const char** t){ return fat32_mntinfo_locked(s, t); }
+static int fat32_setattr(const char* p, const vfs_attr_t* a, unsigned v){ FAT_LOCK(); int r = fat32_setattr_locked(p, a, v); FAT_UNLOCK(); return r; }
+static int fat32_remount(int ro){ FAT_LOCK(); int r = fat32_remount_locked(ro); FAT_UNLOCK(); return r; }
 
 static vfs_fs_ops_t fat32_ops = {
     .lookup=fat32_lookup, .readdir=fat32_readdir, .read=fat32_read, .write=fat32_write,
@@ -775,13 +840,25 @@ static vfs_fs_ops_t fat32_ops = {
     .setattr=fat32_setattr, .remount=fat32_remount
 };
 
+/* For the VFS (C1): the driver lock, e.g. to drain an unmount
+ * (klock_lock(fat32_fs_lock()); klock_unlock(...) once the mount left the
+ * table: every op that entered before has finished). Never call an op of this
+ * driver while holding it. */
+klock_t* fat32_fs_lock(void){ return &g_fat_lock; }
+/* Atomic append: write at the current end of file under the lock; *at gets
+ * the offset the data landed at (for the caller's fd offset and page-cache
+ * invalidation). Same as ops->write(ino, VFS_OFF_APPEND, ...) plus *at. */
+int fat32_write_append(vfs_inode_t* ino, const void* data, size_t len, size_t* at){
+    FAT_LOCK(); int r = fat32_write_at_locked(ino, VFS_OFF_APPEND, data, len, at); FAT_UNLOCK(); return r;
+}
+
 /* ── Mount ───────────────────────────────────────────────────────────────── */
-int fat32_mount(const char* dev_name, const char* mount_point){
-    block_dev_t* dev = block_find(dev_name);
-    if(!dev) return -1;
+static int g_mounting;          /* geometry committed, vfs_mount still pending */
+static int fat32_mount_locked(block_dev_t* dev){
+    FAT_HELD();
     // One FAT32 volume at a time (the driver state is global): a second mount
     // would re-point the attached volume's g_dev, geometry and inode pool.
-    if(vfs_mount_point_of(&fat32_ops)) return -1;
+    if(g_mounting || vfs_mount_point_of(&fat32_ops)) return -1;
     // Probe into locals: a rejected device must not clobber the geometry (or
     // g_dev) of a volume that is already mounted.
     static uint8_t bs[SECSZ];
@@ -825,5 +902,21 @@ int fat32_mount(const char* dev_name, const char* mount_point){
     mntopts_default(&g_fopt_new);
     g_ro = (g_fopt.ro || !dev->write) ? 1 : 0;            /* [M46] -o ro / read-only device */
     fat32_ops.flags = g_ro ? VFS_FS_RDONLY : 0;
-    return vfs_mount(mount_point, &fat32_ops, "fat32");
+    g_mounting = 1;
+    return 0;
+}
+int fat32_mount(const char* dev_name, const char* mount_point){
+    block_dev_t* dev = block_find(dev_name);
+    if(!dev) return -1;
+    FAT_LOCK();
+    int r = fat32_mount_locked(dev);
+    FAT_UNLOCK();
+    if(r!=0) return r;
+    /* vfs_mount runs unlocked: the namespace lock (K20, C1) comes before ours.
+     * g_mounting keeps a concurrent mount out until the table has us. */
+    r = vfs_mount(mount_point, &fat32_ops, "fat32");
+    FAT_LOCK();
+    g_mounting = 0;
+    FAT_UNLOCK();
+    return r;
 }

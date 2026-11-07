@@ -24,3 +24,9 @@ typedef struct fat32_bpb {
 
 // Mount FAT32 read-only from block device name -> returns 0 success
 int fat32_mount(const char* dev_name, const char* mount_point);
+
+// [M51 C4] Locking hooks for the VFS (see fs/fat32.c "Locking"): the driver's
+// K30 klock (to drain an unmount), and an atomic O_APPEND write that resolves
+// the offset (returned in *at) to the current end of file under that lock.
+struct klock* fat32_fs_lock(void);
+int fat32_write_append(vfs_inode_t* ino, const void* data, size_t len, size_t* at);
