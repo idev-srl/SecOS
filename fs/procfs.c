@@ -108,6 +108,7 @@ static int seq(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i
 struct psnap {
     int      found;
     uint32_t pid, ppid, pgid, cpu;
+    int32_t  pin;            /* hard affinity (cpu_pin), -1 = any online CPU */
     int      state;
     char     comm[16];
     char     cmdline[256]; int cmdlen;
@@ -133,7 +134,7 @@ static void snap_cb(process_t* p, void* u){
     if(p->pid != g_ps_want || g_ps.found) return;
     struct psnap* s = &g_ps;
     s->found = 1;
-    s->pid = p->pid; s->ppid = p->ppid; s->pgid = p->pgid; s->cpu = p->cpu_affinity;
+    s->pid = p->pid; s->ppid = p->ppid; s->pgid = p->pgid; s->cpu = p->cpu_affinity; s->pin = p->cpu_pin;
     s->cred = p->cred;
     s->inspect_ok = cred_may_inspect(sched_get_current(), p);
     s->state = p->state;
@@ -405,7 +406,21 @@ static void gen_pid_status(struct sb* s){
     sb_str(s,"\nShdPnd:\t0000000000000000\nSigBlk:\t"); sb_hex(s,g_ps.sig_blocked,16);
     sb_str(s,"\nSigIgn:\t"); sb_hex(s,g_ps.sig_ign,16);
     sb_str(s,"\nSigCgt:\t"); sb_hex(s,g_ps.sig_catch,16);
-    sb_str(s,"\nCpus_allowed_list:\t"); sb_u64(s,g_ps.cpu);
+    sb_str(s,"\nCpus_allowed_list:\t");      /* same set as sched_getaffinity */
+    if(g_ps.pin >= 0) sb_u64(s,(uint64_t)g_ps.pin);
+    else {
+        extern uint32_t smp_cpu_count(void); extern int smp_cpu_online(uint32_t);
+        uint32_t n = smp_cpu_count(); if(n == 0) n = 1;
+        int first = 1;
+        for(uint32_t i = 0; i < n; ){
+            if(!smp_cpu_online(i)){ i++; continue; }
+            uint32_t j = i; while(j + 1 < n && smp_cpu_online(j + 1)) j++;
+            if(!first) sb_putc(s, ',');
+            first = 0; sb_u64(s, i);
+            if(j > i){ sb_putc(s, '-'); sb_u64(s, j); }
+            i = j + 1;
+        }
+    }
     sb_str(s,"\nvoluntary_ctxt_switches:\t"); sb_u64(s,g_ps.nvcsw);
     sb_str(s,"\nnonvoluntary_ctxt_switches:\t0\n");
 }
