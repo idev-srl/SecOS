@@ -53,8 +53,8 @@
  * concurrent mounts cannot both retarget the globals while the VFS calls run
  * unlocked. ext2_fs_lock() exposes the lock for the VFS (unmount draining:
  * lock + unlock, never an ext2 op while holding it — the lock is not
- * recursive). An atomic O_APPEND is ->write(v, VFS_OFF_APPEND, ...) or
- * ext2_write_append(): the end of file is read and written under one hold. */
+ * recursive). An atomic O_APPEND is ext2_append() (C1's ->append): the end of
+ * file is read and written under one hold. */
 static klock_t g_e2_lock = KLOCK_INIT(LK_K30_FS, "ext2");
 #define E2_LOCK()   klock_lock(&g_e2_lock)
 #define E2_UNLOCK() klock_unlock(&g_e2_lock)
@@ -1444,15 +1444,12 @@ static int e2j_truncate_locked(const char* p, size_t s){ E2_RO_CHECK(); jt_begin
 static int e2j_setattr_locked(const char* p, const vfs_attr_t* a, unsigned v){ E2_RO_CHECK(); jt_begin(); int r=e2_setattr_locked(p,a,v); return jt_finish(r, r==0); }
 static int e2j_symlink_locked(const char* t, const char* l){ E2_RO_CHECK(); jt_begin(); int r=e2_symlink_locked(t,l); return jt_finish(r, r==0); }
 static int e2j_link_locked(const char* o, const char* n){ E2_RO_CHECK(); jt_begin(); int r=e2_link_locked(o,n); return jt_finish(r, r==0); }
-/* [M51 C3] off == VFS_OFF_APPEND: write at the current end of file, read from
- * the on-disk inode in the same lock hold as the write (atomic O_APPEND: two
+/* [M51 C3] append != 0: write at the current end of file, read from the
+ * on-disk inode in the same lock hold as the write (atomic O_APPEND: two
  * appenders never pick the same offset). *at (optional) gets the offset used. */
-#ifndef VFS_OFF_APPEND
-#define VFS_OFF_APPEND ((size_t)-1)
-#endif
-static int e2j_write_at_locked(vfs_inode_t* v, size_t off, const void* d, size_t l, size_t* at){
+static int e2j_write_at_locked(vfs_inode_t* v, size_t off, int append, const void* d, size_t l, size_t* at){
     E2_RO_CHECK();
-    if(off==VFS_OFF_APPEND){
+    if(append){
         if(!g_mounted||!v||v->type!=VFS_NODE_FILE) return -1;
         uint8_t in[256]; if(inode_read(((e2_node_t*)v->fs_data)->ino, in)!=0) return -1;
         off=inode_size_lo(in);
@@ -1490,7 +1487,7 @@ static int e2_remount_locked(int ro);
 #define E2_WRAP(expr) do { E2_LOCK(); r = (expr); E2_UNLOCK(); } while(0)
 static vfs_inode_t* e2op_lookup(const char* p){ vfs_inode_t* r; E2_WRAP(e2_lookup_locked(p)); return r; }
 static int e2op_read(vfs_inode_t* v, size_t off, void* b, size_t l){ int r; E2_WRAP(e2_read_locked(v,off,b,l)); return r; }
-static int e2op_write(vfs_inode_t* v, size_t off, const void* d, size_t l){ int r; E2_WRAP(e2j_write_at_locked(v,off,d,l,NULL)); return r; }
+static int e2op_write(vfs_inode_t* v, size_t off, const void* d, size_t l){ int r; E2_WRAP(e2j_write_at_locked(v,off,0,d,l,NULL)); return r; }
 static int e2op_create(const char* p, const void* d, size_t sz){ int r; E2_WRAP(e2j_create_locked(p,d,sz)); return r; }
 static int e2op_mkdir(const char* p){ int r; E2_WRAP(e2j_mkdir_locked(p)); return r; }
 static int e2op_remove(const char* p){ int r; E2_WRAP(e2j_remove_locked(p)); return r; }
@@ -1510,14 +1507,15 @@ static int e2op_statfs(vfs_statfs_t* st){ int r; E2_WRAP(e2_statfs_locked(st)); 
 static int e2op_mntinfo(const char** src, const char** type){ return e2_mntinfo_nolock(src,type); }
 static int e2op_remount(int ro){ int r; E2_WRAP(e2_remount_locked(ro)); return r; }
 
-/* Atomic append for the VFS (O_APPEND): the data lands at the end of file as
- * it is under the lock; *off (optional) gets the offset it was written at, so
- * the caller can set the fd offset to *off + return value. Same as
- * ->write(v, VFS_OFF_APPEND, d, l). Returns bytes written or a negative value. */
-int ext2_write_append(vfs_inode_t* v, const void* d, size_t l, uint64_t* off){
-    int r; size_t at=0;
-    E2_WRAP(e2j_write_at_locked(v, VFS_OFF_APPEND, d, l, &at));
-    if(off) *off=(uint64_t)at;
+/* Atomic append for the VFS (O_APPEND), the C1 `vfs_fs_ops.append` contract:
+ *     int (*append)(vfs_inode_t* inode, const void* buf, size_t len, uint64_t* at);
+ * the data lands at the end of file as it is under the lock; *at (optional)
+ * gets the offset it was written at, so the caller can set the fd offset to
+ * *at + return value. Returns bytes written or a negative value. */
+int ext2_append(vfs_inode_t* v, const void* d, size_t l, uint64_t* at){
+    int r; size_t off=0;
+    E2_WRAP(e2j_write_at_locked(v, 0, 1, d, l, &off));
+    if(at) *at=(uint64_t)off;
     return r;
 }
 

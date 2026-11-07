@@ -15,9 +15,8 @@
  *   mkdir + nested file + rmdir, symlink + readlink, link + remove, setattr,
  *   readdir of its own dir (must equal the model) and of the shared dir,
  *   statfs, lookup + read (must equal the model),
- * and appends one record to the shared /e4lt/log, alternately through
- * ->write(VFS_OFF_APPEND) and ext2_write_append() (the atomic O_APPEND
- * paths). At the end the BSP checks every worker's model and the log (each
+ * and appends one record to the shared /e4lt/log through ext2_append()
+ * (the atomic O_APPEND path, C1's ->append). At the end the BSP checks every worker's model and the log (each
  * record whole, per-worker sequence numbers gap-free and in order, total
  * length = sum of the records), syncs, and the host runs `e2fsck -fn` on the
  * image. The run must show real contention on the driver lock (some
@@ -42,9 +41,6 @@
 extern uint64_t ktime_ms(void);
 extern uint32_t smp_online_count(void);
 
-#ifndef VFS_OFF_APPEND
-#define VFS_OFF_APPEND ((size_t)-1)
-#endif
 
 #define NSLOT      4
 #define MAXF       (20u * 1024u)
@@ -314,10 +310,10 @@ static void op_log(lt_worker_t* t, uint32_t i) {
     make_rec(rec, (uint32_t)t->w, i, n);
     vfs_inode_t* v = g_ops->lookup(lp);
     if (!v) { lt_fail(t, "lookup log", 0, i, 0); return; }
-    int r;
-    if (i & 1) r = g_ops->write(v, VFS_OFF_APPEND, rec, n);
-    else { uint64_t at = 0; r = ext2_write_append(v, rec, n, &at); }
+    uint64_t at = ~0ull;
+    int r = ext2_append(v, rec, n, &at);
     if (r != (int)n) { lt_fail(t, "log append", 0, (uint64_t)(int64_t)r, n); return; }
+    if (at == ~0ull || at + n > (uint64_t)1 << 30) { lt_fail(t, "append offset", 0, at, n); return; }
     __atomic_add_fetch(&g_records, 1, __ATOMIC_SEQ_CST);
     t->ops++;
 }

@@ -41,9 +41,9 @@ int ext2_set_mount_options(const char* opts);
 // ext2 op takes it itself; the VFS may take it only to drain the driver (lock
 // + unlock, e.g. on unmount) and must never call an ext2 op while holding it.
 klock_t* ext2_fs_lock(void);
-// [M51 C3] Atomic O_APPEND: write at the end of file as it is under the lock
-// (same as ops->write(v, VFS_OFF_APPEND, ...)). *off (optional) gets the
-// offset the data landed at. Returns bytes written or a negative value.
-int ext2_write_append(vfs_inode_t* v, const void* data, size_t len, uint64_t* off);
+// [M51 C3] Atomic O_APPEND, signature of C1's vfs_fs_ops.append: write at
+// the end of file as it is under the lock; *at (optional) gets the offset the
+// data landed at. Returns bytes written or a negative value.
+int ext2_append(vfs_inode_t* v, const void* data, size_t len, uint64_t* at);
 // The ops table, for in-kernel tests that drive the driver directly.
 const vfs_fs_ops_t* ext2_vfs_ops(void);
