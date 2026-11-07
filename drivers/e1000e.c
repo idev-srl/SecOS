@@ -24,7 +24,7 @@
 #include "pci.h"
 #include "io.h"
 #include "debugcon.h"
-#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_extend_physmap
+#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_map_mmio
 #include <stddef.h>
 
 /* ---- Device register offsets (BAR0 MMIO) ---- */
@@ -286,8 +286,8 @@ int e1000e_init(void) {
 
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[E1000E] BAR0 not memory\n"); return -1; }
-    vmm_extend_physmap(bar + 0x20000);   // register window is up to ~0x14000
-    g_mmio = (volatile uint8_t*)phys_to_virt(bar);
+    g_mmio = (volatile uint8_t*)pci_bar_map(&dev, 0, 0x20000);   // [M49] uncached, regs up to ~0x14000
+    if (!g_mmio) { debugcon_writestring("[E1000E] BAR0 map failed\n"); return -1; }
 
     debugcon_writestring("[E1000E] dev=0x"); debugcon_print_hex(dev.device_id);
     debugcon_writestring(" BAR0=0x"); debugcon_print_hex(bar); debugcon_writestring("\n");

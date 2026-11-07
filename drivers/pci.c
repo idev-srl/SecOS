@@ -6,7 +6,7 @@
  */
 #include "pci.h"
 #include "io.h"
-#include "vmm.h"        /* phys_to_virt / vmm_extend_physmap (MSI-X table map) */
+#include "vmm.h"        /* vmm_map_mmio (BAR + MSI-X table maps) */
 #include "debugcon.h"   /* [MSIX] markers */
 
 #define PCI_CONFIG_ADDRESS  0xCF8
@@ -138,6 +138,46 @@ uint64_t pci_bar_mem64(const pci_device_t* d, int idx) {
     return base;
 }
 
+/* [M49] Size memory BAR[idx] (standard all-ones probe, memory decode off while
+ * probing so the device never sees the transient address). Returns the size in
+ * bytes, 0 for an I/O or unimplemented BAR. */
+uint64_t pci_bar_size(const pci_device_t* d, int idx) {
+    if (idx < 0 || idx > 5) return 0;
+    uint8_t off = (uint8_t)(PCI_CFG_BAR0 + idx * 4);
+    uint32_t lo = pci_config_read32(d->bus, d->slot, d->func, off);
+    if (lo & 0x1) return 0;
+    int is64 = (((lo >> 1) & 0x3) == 0x2) && idx < 5;
+    uint32_t hi = is64 ? pci_config_read32(d->bus, d->slot, d->func, (uint8_t)(off + 4)) : 0;
+    uint16_t cmd = pci_config_read16(d->bus, d->slot, d->func, PCI_CFG_COMMAND);
+    pci_config_write16(d->bus, d->slot, d->func, PCI_CFG_COMMAND, (uint16_t)(cmd & ~0x2u));
+    pci_config_write32(d->bus, d->slot, d->func, off, 0xFFFFFFFFu);
+    uint32_t mlo = pci_config_read32(d->bus, d->slot, d->func, off);
+    uint32_t mhi = 0xFFFFFFFFu;
+    if (is64) {
+        pci_config_write32(d->bus, d->slot, d->func, (uint8_t)(off + 4), 0xFFFFFFFFu);
+        mhi = pci_config_read32(d->bus, d->slot, d->func, (uint8_t)(off + 4));
+        pci_config_write32(d->bus, d->slot, d->func, (uint8_t)(off + 4), hi);
+    }
+    pci_config_write32(d->bus, d->slot, d->func, off, lo);
+    pci_config_write16(d->bus, d->slot, d->func, PCI_CFG_COMMAND, cmd);
+    uint64_t mask = ((uint64_t)mhi << 32) | (mlo & 0xFFFFFFF0u);
+    if ((mlo & 0xFFFFFFF0u) == 0) return 0;
+    return ~mask + 1;
+}
+
+/* [M49] Map memory BAR[idx] uncached into the physmap (the physmap maps RAM
+ * only). At least `min_size` bytes are mapped (a register window the driver
+ * knows it needs even if sizing reads back odd), at most 256 MiB. Returns the
+ * virtual address of the BAR, 0 on failure. */
+uint64_t pci_bar_map(const pci_device_t* d, int idx, uint64_t min_size) {
+    uint64_t base = pci_bar_mem64(d, idx);
+    if (!base) return 0;
+    uint64_t sz = pci_bar_size(d, idx);
+    if (sz < min_size) sz = min_size;
+    if (sz > (256ULL << 20)) sz = 256ULL << 20;
+    return vmm_map_mmio(base, sz, VMM_CACHE_UC);
+}
+
 /* ============================================================================
  * MSI / MSI-X interrupt support.
  *
@@ -190,8 +230,8 @@ int pci_enable_msix(const pci_device_t* d, uint8_t vector) {
     uint64_t tbl_phys = bar + off;
     /* Map the table window through the physmap (one entry = 16 bytes; map a page
      * to be safe — the table can hold many entries). */
-    vmm_extend_physmap(tbl_phys + 0x1000);
-    volatile uint32_t* entry0 = (volatile uint32_t*)phys_to_virt(tbl_phys);
+    volatile uint32_t* entry0 = (volatile uint32_t*)vmm_map_mmio(tbl_phys, 0x1000, VMM_CACHE_UC);
+    if (!entry0) return -1;
 
     /* MSI-X table entry layout (16 bytes): msg addr lo, msg addr hi, msg data,
      * vector control (bit0 = mask). Program entry 0. */

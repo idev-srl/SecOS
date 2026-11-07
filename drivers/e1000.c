@@ -149,8 +149,8 @@ int e1000_init(void) {
     pci_enable_mem_and_busmaster(&pci);
     uint64_t bar = pci_bar_mem64(&pci, 0);
     if (bar == 0) { debugcon_writestring("[E1000] BAR0 not memory\n"); return -1; }
-    vmm_extend_physmap(bar + 0x20000);
-    g_mmio = (volatile uint8_t*)phys_to_virt(bar);
+    g_mmio = (volatile uint8_t*)pci_bar_map(&pci, 0, 0x20000);   // [M49] uncached
+    if (!g_mmio) { debugcon_writestring("[E1000] BAR0 map failed\n"); return -1; }
 
     // Disable interrupts, reset, disable again.
     wr(REG_IMC, 0xFFFFFFFFu); (void)rd(REG_ICR);

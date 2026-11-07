@@ -2680,6 +2680,87 @@ else
 fi
 
 # ============================================================================
+# BIGMEM GATE [M49]: large RAM. QEMU backs guest RAM lazily, so a 1 TiB guest
+# costs the host only what the kernel touches (PMM metadata ~33 MiB/TiB, page
+# tables, the pages the self-test writes). Four boots run in parallel:
+#   8g     mb2, -m 8G, -cpu max (1 GiB physmap pages); a root bash over serial
+#          runs lua allocating a 512 MiB string (user anon memory far above
+#          4 GiB) and /proc/meminfo before/after (MemFree comes back);
+#   8g2m   mb2, -m 8G, qemu64 CPU (no pdpe1gb: 2 MiB physmap pages);
+#   1t     mb2, -m 1T, phys-bits=46: RAM above 512 GiB (the old physmap limit)
+#          is allocated, written and read back through the physmap;
+#   uefi   OVMF q35, -m 8G.
+# Each boot's kernel self-test ([BIGMEM]) touches one frame in up to 64 RAM
+# sections spread over the map plus the highest free frame, checks the zones
+# (ordinary frames >= 4 GiB, DMA32 allocations < 4 GiB), COW refcounts, the free
+# count and meminfo; the physmap audit proves every leaf supervisor + NX. A run
+# whose QEMU cannot start with that much RAM (host limits) is SKIPPED.
+# ============================================================================
+echo "[selftest] BIGMEM gate: 8G/8G-2M/1T mb2 + 8G UEFI, in parallel (~100s)..."
+make clean >/dev/null 2>&1 || true
+if make iso >/tmp/secos_selftest_build.log 2>&1 && make uefi >>/tmp/secos_selftest_build.log 2>&1; then
+    BMDIR=$(mktemp -d /tmp/secos_selftest_bigmem.XXXXXX)
+    cp myos.iso "$BMDIR/bm.iso"; cp -r dist "$BMDIR/esp"
+    bm_boot() { # bm_boot <name> <timeout> <qemu args...>   (stdin -> serial)
+        local n="$1" t="$2"; shift 2
+        : > "$BMDIR/$n.log"
+        timeout "$t" qemu-system-x86_64 "$@" -debugcon file:"$BMDIR/$n.log" \
+            -global isa-debugcon.iobase=0xe9 -no-reboot -display none -serial stdio \
+            >/dev/null 2>"$BMDIR/$n.err"
+        echo $? >"$BMDIR/$n.rc"
+    }
+    ( sleep 30; printf '  head -2 /proc/meminfo\r'; sleep 4
+      printf "  lua -e 's=string.rep(\"x\",1<<29) print(\"LUA-BIG\", #s)'\r"; sleep 25
+      printf '  head -2 /proc/meminfo\r'; sleep 4; printf '  echo BIGMEM-$((6*7))-DONE\r'; sleep 30 ) | \
+        bm_boot 8g 100 -cdrom "$BMDIR/bm.iso" -boot d -m 8G -cpu max &
+    bm_boot 8g2m 45 -cdrom "$BMDIR/bm.iso" -boot d -m 8G </dev/null &
+    bm_boot 1t 90 -cdrom "$BMDIR/bm.iso" -boot d -m 1T -cpu max,phys-bits=46 </dev/null &
+    if [[ -n "$OVMF" ]]; then
+        bm_boot uefi 90 -machine q35 -m 8G -cpu max -bios "$OVMF" \
+            -drive format=raw,file=fat:rw:"$BMDIR/esp"/ -net none </dev/null &
+    fi
+    wait
+    bm_ok() { grep -aq "$2" "$BMDIR/$1.log"; }
+    for n in 8g 8g2m 1t uefi; do
+        [[ $n == uefi && -z "$OVMF" ]] && { echo "  [SKIP] BIGMEM uefi (no OVMF)"; continue; }
+        if ! grep -aq "SECoS build" "$BMDIR/$n.log" && [[ "$(cat "$BMDIR/$n.rc")" != 124 ]]; then
+            echo "  [SKIP] BIGMEM $n: QEMU could not start the guest (host limit): $(head -c 200 "$BMDIR/$n.err")"
+            continue
+        fi
+        bm_ok $n "^\[BIGMEM\] selftest PASS"; check "BIGMEM $n: PMM self-test (sections, zones, refcounts, meminfo)" $?
+        bm_ok $n "^\[BIGMEM\] touched=[0-9]* .* pattern OK"; check "BIGMEM $n: frames across the map written + read back via the physmap" $?
+        bm_ok $n "^\[PHYSMAP\] audit leaves=[0-9]* all supervisor+NX"; check "BIGMEM $n: every physmap leaf supervisor + NX" $?
+        bm_ok $n "^\[HEAP\] kmalloc(4M) phys=0x0000000[1-9A-F]" ; check "BIGMEM $n: 4 MiB kmalloc served from RAM above 4 GiB" $?
+        bm_ok $n "started console (/bin/bash)"; check "BIGMEM $n: boot reaches init and the console bash" $?
+        ! bm_ok $n "\[EXC\]\|PANIC"; check "BIGMEM $n: no CPU exception or panic" $?
+    done
+    if grep -aq "SECoS build" "$BMDIR/8g.log"; then
+        bm_ok 8g "^\[PHYSMAP\] .* gbpages=1"; check "BIGMEM 8g: physmap uses 1 GiB pages (pdpe1gb)" $?
+        bm_ok 8g "^LUA-BIG	536870912"; check "BIGMEM 8g: a ring-3 process allocates and fills 512 MiB" $?
+        bm_ok 8g "BIGMEM-42-DONE"; check "BIGMEM 8g: shell alive after the big allocation" $?
+        mf=( $(grep -ao "^MemFree: *[0-9]*" "$BMDIR/8g.log" | awk '{print $2}') )
+        [[ ${#mf[@]} -ge 2 && $(( ${mf[0]} - ${mf[1]} )) -lt 4096 && $(( ${mf[1]} - ${mf[0]} )) -lt 4096 ]]
+        check "BIGMEM 8g: MemFree restored after the 512 MiB process exits (${mf[0]:-?} -> ${mf[1]:-?} kB)" $?
+        mt=$(grep -ao "^MemTotal: *[0-9]*" "$BMDIR/8g.log" | head -1 | awk '{print $2}')
+        [[ -n "$mt" && $mt -gt 8000000 && $mt -le 8388608 ]]; check "BIGMEM 8g: MemTotal reports the 8 GiB (${mt:-?} kB)" $?
+    fi
+    if grep -aq "SECoS build" "$BMDIR/8g2m.log"; then
+        bm_ok 8g2m "^\[PHYSMAP\] .* pages1g=0 .* gbpages=0"; check "BIGMEM 8g2m: no pdpe1gb -> 2 MiB physmap pages" $?
+    fi
+    if grep -aq "SECoS build" "$BMDIR/1t.log"; then
+        hf=$(grep -ao "^\[BIGMEM\] touched=[0-9]* sections=[0-9]* highest_frame_MiB=[0-9]*" "$BMDIR/1t.log" | sed 's/.*=//')
+        [[ -n "$hf" && $hf -gt 524288 ]]; check "BIGMEM 1t: a frame above 512 GiB allocated + verified (highest ${hf:-?} MiB)" $?
+        bm_ok 1t "^\[PMM\] sections=1024/"; check "BIGMEM 1t: 1024 RAM sections managed" $?
+        bm_ok 1t "^\[PHYSMAP\] .* slots=[1-9][0-9]* "; check "BIGMEM 1t: physmap spans several PML4 slots" $?
+    fi
+    for n in 8g 8g2m 1t uefi; do cp "$BMDIR/$n.log" "/tmp/secos_selftest_bigmem_$n.log" 2>/dev/null; done
+    rm -rf "$BMDIR"
+else
+    echo "[selftest] BIGMEM BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "BIGMEM gate build" 1
+fi
+
+# ============================================================================
 # NETSMP GATE [M47]: network stack locking under SMP. An image built with
 # -DSECOS_SMP_AT_BOOT -DSECOS_LOCKDEP_LITE (lock-order checker on) and a baked
 # throwaway SSH key is driven by tools/net_stress_drive.py three times in

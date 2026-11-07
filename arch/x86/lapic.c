@@ -16,7 +16,7 @@
  */
 #include "lapic.h"
 #include "acpi.h"       /* acpi_get / acpi_irq_to_gsi — discovered topology */
-#include "vmm.h"        /* phys_to_virt / vmm_extend_physmap */
+#include "vmm.h"        /* phys_to_virt / vmm_map_mmio */
 #include "debugcon.h"
 #include <stddef.h>
 
@@ -139,10 +139,10 @@ int lapic_enable(void) {
     if (g_x2apic) wrmsr(IA32_APIC_BASE_MSR, base | IA32_APIC_BASE_EXTD); /* ... then x2APIC */
 
     uint64_t phys = base & 0xFFFFF000ull;
-    // TODO(M48/bigmem integration): map the LAPIC with vmm_map_mmio() (uncached
-    // MMIO mapping from feat/bigmem) instead of the deprecated physmap shim.
-    vmm_extend_physmap(phys + 0x1000);
-    g_lapic = (volatile uint32_t*)phys_to_virt(phys);   /* unused in x2APIC mode */
+    /* [M49] Explicit uncached MMIO mapping in the physmap (idempotent: an AP
+     * re-running this finds the page already UC and changes nothing). */
+    uint64_t lv = vmm_map_mmio(phys, 0x1000, VMM_CACHE_UC);
+    g_lapic = (volatile uint32_t*)(lv ? lv : phys_to_virt(phys)); /* unused in x2APIC mode */
 
     /* Software-enable the LAPIC via the Spurious Interrupt Vector Register. */
     lapic_wr(LAPIC_REG_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VECTOR);
@@ -188,9 +188,9 @@ static void ioapic_route_irq(uint8_t irq, uint8_t vector, uint8_t dest_apic_id) 
         if (gsi >= t->ioapics[i].gsi_base) { base = t->ioapics[i].base; gsi_base = t->ioapics[i].gsi_base; }
     uint32_t idx = gsi - gsi_base;
 
-    // TODO(M48/bigmem integration): vmm_map_mmio() for the IOAPIC too.
-    vmm_extend_physmap(base + 0x1000);
-    g_ioapic = (volatile uint32_t*)phys_to_virt(base);
+    uint64_t iv = vmm_map_mmio(base, 0x1000, VMM_CACHE_UC);   /* [M49] uncached MMIO */
+    if (!iv) return;
+    g_ioapic = (volatile uint32_t*)iv;
 
     /* MADT flags: bits[1:0] polarity (11=active-low), bits[3:2] trigger (11=level).
      * 0/conforms => ISA default: active-high, edge. */

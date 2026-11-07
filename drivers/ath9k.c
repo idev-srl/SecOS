@@ -85,7 +85,8 @@ int ath9k_init(void) {
     uint64_t bar = pci_bar_mem(&pd, 0);
     if (!bar) { debugcon_writestring("[ath9k] BAR0 unmapped\n"); g_ath9k.present = 0; return 0; }
     g_ath9k.mmio_phys = bar;
-    g_ath9k.mmio = (volatile uint8_t*)phys_to_virt(bar);
+    g_ath9k.mmio = (volatile uint8_t*)pci_bar_map(&pd, 0, 0x10000);   /* [M49] uncached */
+    if (!g_ath9k.mmio) { debugcon_writestring("[ath9k] BAR0 map failed\n"); g_ath9k.present = 0; return 0; }
 
     debugcon_writestring("[ath9k] found "); debugcon_writestring(name);
     debugcon_writestring(" (168c:"); debugcon_print_hex(pd.device_id);

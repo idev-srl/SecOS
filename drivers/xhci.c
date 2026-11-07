@@ -101,6 +101,15 @@ static uint8_t    d_output[MAX_DEV][4096] __attribute__((aligned(64)));
 static xhci_trb_t d_ep0[MAX_DEV][XHCI_RING_SIZE] __attribute__((aligned(1024)));
 static xhci_trb_t d_epr[MAX_DEV][XHCI_EPR_PER_DEV][XHCI_RING_SIZE] __attribute__((aligned(1024)));
 
+// [M49] DMA reach. HCCPARAMS1.AC64 = 0 means the controller only generates
+// 32-bit addresses. Its rings and contexts are static (kernel image, low RAM),
+// but a caller's data buffer can be a heap or kernel-stack frame anywhere in RAM
+// (the PMM prefers frames above 4 GiB), so synchronous transfers to such a
+// buffer bounce through g_bounce32; an async submit of one is refused.
+#define XHCI_BOUNCE_BYTES (64 * 1024)
+static int     g_ac64 = 1;
+static uint8_t g_bounce32[XHCI_BOUNCE_BYTES] __attribute__((aligned(4096)));
+
 static usb_device_t g_dev[MAX_DEV];
 static int g_ndev;
 static int g_last_cc;       // completion code of the most recent transfer
@@ -245,7 +254,29 @@ static int cmd_run(uint32_t p0, uint32_t p1, uint32_t st, uint32_t ctrl, int* sl
     return (int)((ev.d[2] >> 24) & 0xFF);   // completion code
 }
 
+// [M49] 1 if [p, p+len) is not reachable by a 32-bit-only controller.
+static int needs_bounce(const void* p, int len) {
+    if (g_ac64 || len <= 0) return 0;
+    return phys_of(p) + (uint64_t)len > 0x100000000ULL;
+}
+static void xcopy(void* dst, const void* src, int n) {
+    uint8_t* d = (uint8_t*)dst; const uint8_t* s = (const uint8_t*)src;
+    for (int i = 0; i < n; i++) d[i] = s[i];
+}
+
+static int xhci_control_raw(usb_device_t* d, const void* setup, void* data, int len);
+
 int xhci_control(usb_device_t* d, const void* setup, void* data, int len) {
+    if (!needs_bounce(data, len)) return xhci_control_raw(d, setup, data, len);
+    if (len > XHCI_BOUNCE_BYTES) return -1;
+    int in = (((const uint8_t*)setup)[0] & 0x80) != 0;
+    if (!in) xcopy(g_bounce32, data, len);
+    int r = xhci_control_raw(d, setup, g_bounce32, len);
+    if (in && r > 0) xcopy(data, g_bounce32, r);
+    return r;
+}
+
+static int xhci_control_raw(usb_device_t* d, const void* setup, void* data, int len) {
     const uint8_t* s = (const uint8_t*)setup;
     int in = (s[0] & 0x80) != 0;
     // Setup stage (immediate data: the 8 setup bytes live in the TRB).
@@ -345,6 +376,7 @@ static int submit_raw(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
 }
 
 int xhci_submit(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
+    if (needs_bounce(data, len)) return -1;   // [M49] async: no bounce possible
     int r = submit_raw(d, ep_addr, data, len);
     if (r == 0) g_async[d->slot_id & 0xFF] |= (1u << ep_dci(ep_addr));
     return r;
@@ -370,13 +402,22 @@ int xhci_poll_transfer(usb_device_t* d, uint8_t ep_addr, int len, int* bytes) {
 }
 
 int xhci_transfer(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
-    if (submit_raw(d, ep_addr, data, len) < 0) return -1;
+    void* buf = data;
+    int in = (ep_addr & 0x80) != 0;
+    if (needs_bounce(data, len)) {                // [M49] 32-bit-only controller
+        if (len > XHCI_BOUNCE_BYTES) return -1;
+        buf = g_bounce32;
+        if (!in) xcopy(buf, data, len);
+    }
+    if (submit_raw(d, ep_addr, buf, len) < 0) return -1;
     xhci_trb_t ev;
     if (!evt_wait(TRB_XFER_EVENT, d->slot_id, ep_dci(ep_addr), &ev)) { g_last_cc = -1; return -1; }
     int cc = (ev.d[2] >> 24) & 0xFF;
     g_last_cc = cc;
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) return -1;
-    return len - (int)(ev.d[2] & 0xFFFFFF);
+    int got = len - (int)(ev.d[2] & 0xFFFFFF);
+    if (buf != data && in && got > 0) xcopy(data, buf, got);
+    return got;
 }
 
 // Find the transfer ring serving a given DCI (1 = EP0).
@@ -556,8 +597,8 @@ int xhci_init(void) {
     pci_enable_mem_and_busmaster(&dev);
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[XHCI] BAR0 not memory\n"); return -1; }
-    vmm_extend_physmap(bar + 0x10000);
-    g_cap = (volatile uint8_t*)phys_to_virt(bar);
+    g_cap = (volatile uint8_t*)pci_bar_map(&dev, 0, 0x10000);   // [M49] uncached
+    if (!g_cap) { debugcon_writestring("[XHCI] BAR0 map failed\n"); return -1; }
 
     uint8_t caplen = (uint8_t)(cap_rd(CAP_CAPLENGTH) & 0xFF);
     g_op = g_cap + caplen;
@@ -568,6 +609,14 @@ int xhci_init(void) {
     g_max_ports = (hcs1 >> 24) & 0xFF;
     uint32_t hcc1 = cap_rd(CAP_HCCPARAMS1);
     g_ctx_stride = (hcc1 & (1u << 2)) ? 64 : 32;
+    g_ac64 = (hcc1 & 1u) != 0;                   // [M49] AC64: 64-bit DMA addresses
+    if (!g_ac64 && (phys_of(d_epr) + sizeof(d_epr) > 0x100000000ULL ||
+                    phys_of(g_scratch_buf) + sizeof(g_scratch_buf) > 0x100000000ULL ||
+                    phys_of(g_bounce32) + sizeof(g_bounce32) > 0x100000000ULL)) {
+        debugcon_writestring("[XHCI] 32-bit DMA controller but the kernel image is above 4 GiB\n");
+        return -1;
+    }
+    if (!g_ac64) debugcon_writestring("[XHCI] AC64=0: 32-bit DMA, high buffers bounce\n");
     debugcon_writestring("[XHCI] BAR=0x"); debugcon_print_hex(bar);
     debugcon_writestring(" slots="); debugcon_print_hex(max_slots);
     debugcon_writestring(" ports="); debugcon_print_hex(g_max_ports);

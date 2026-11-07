@@ -66,6 +66,12 @@ uint32_t pci_bar_mem(const pci_device_t* d, int idx);
  * masked. Returns 0 if BAR[idx] is an I/O BAR. NVMe/XHCI use 64-bit MMIO BARs. */
 uint64_t pci_bar_mem64(const pci_device_t* d, int idx);
 
+/* [M49] Size of memory BAR[idx] in bytes (0 = I/O / unimplemented). */
+uint64_t pci_bar_size(const pci_device_t* d, int idx);
+/* [M49] Map memory BAR[idx] uncached into the physmap (>= min_size bytes).
+ * Returns the BAR's virtual address (phys_to_virt of its base) or 0. */
+uint64_t pci_bar_map(const pci_device_t* d, int idx, uint64_t min_size);
+
 /* ----------------------------------------------------------------------------
  * MSI / MSI-X interrupt support — IMPLEMENTED BUT NOT YET TESTED.
  *

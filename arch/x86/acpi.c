@@ -20,14 +20,21 @@ static acpi_topology_t g_topo;
  *
  * [UEFI-FIX] On large-RAM UEFI machines (e.g. 2 GB+, including the ASUS test
  * laptop) the firmware places the ACPI tables in RESERVED memory ABOVE the usable
- * RAM top. vmm_init_physmap() sizes the physmap to *usable* RAM only, so that
- * reserved region is unmapped. So every table is mapped explicitly: the physmap
- * is extended to cover the address (plus a 1 MiB margin for the table body)
- * before a physmap pointer is returned. vmm_extend_physmap is idempotent and
- * 2MB-granular, and a no-op for addresses already covered. */
+ * RAM top, which the physmap does not cover. [M49] So every table is mapped
+ * explicitly, write-back and only where it is not mapped yet (vmm_map_phys):
+ * pv() maps the first bytes (an RSDP or a table header), pvt() maps a whole SDT
+ * once its header gives the length. No speculative margin: the physmap never
+ * covers MMIO with a WB mapping. */
 static const uint8_t* pv(uint64_t phys){
-    vmm_extend_physmap(phys + 0x100000ULL);
+    vmm_map_phys(phys, 64);
     return (const uint8_t*)phys_to_virt(phys);
+}
+static uint32_t rd32(const uint8_t* p);
+static const uint8_t* pvt(uint64_t phys){
+    const uint8_t* h = pv(phys);
+    uint32_t len = rd32(h + 4);
+    if(len > 36 && len <= (16u << 20)) vmm_map_phys(phys, len);
+    return h;
 }
 static uint16_t rd16(const uint8_t* p){ return (uint16_t)(p[0] | (p[1]<<8)); }
 static uint32_t rd32(const uint8_t* p){ return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); }
@@ -51,7 +58,7 @@ static uint64_t find_rsdp(void){
 
 /* Parse the MADT (APIC) at physical 'madt' into the topology. */
 static void parse_madt(uint64_t madt){
-    const uint8_t* t = pv(madt);
+    const uint8_t* t = pvt(madt);
     uint32_t len = rd32(t+4);
     g_topo.lapic_base = rd32(t+36);                        /* 32-bit LAPIC addr   */
     uint32_t off = 44;                                     /* entries start at 44 */
@@ -103,7 +110,7 @@ static void parse_madt(uint64_t madt){
 
 /* Walk the RSDT/XSDT pointer array and find a table by 4-char signature. */
 static uint64_t find_table(uint64_t sdt, int is_xsdt, const char* sig){
-    const uint8_t* h = pv(sdt);
+    const uint8_t* h = pvt(sdt);
     uint32_t len = rd32(h+4);
     uint32_t entsz = is_xsdt ? 8 : 4;
     uint32_t n = (len > 36) ? (len - 36) / entsz : 0;
@@ -119,7 +126,7 @@ static uint64_t find_madt(uint64_t sdt, int is_xsdt){ return find_table(sdt, is_
  * the DSDT's AML for the \_S5 package to get the soft-off SLP_TYP values — the
  * standard portable ACPI shutdown recipe (works on QEMU, VMware, real HW). */
 static void parse_fadt(uint64_t fadt){
-    const uint8_t* f = pv(fadt);
+    const uint8_t* f = pvt(fadt);
     uint32_t flen = rd32(f + 4);
     g_topo.pm1a_cnt = rd32(f + 64);     /* PM1a_CNT_BLK */
     g_topo.pm1b_cnt = rd32(f + 68);     /* PM1b_CNT_BLK */
@@ -149,7 +156,7 @@ static void parse_fadt(uint64_t fadt){
         if(xdsdt) dsdt = xdsdt;
     }
     if(!dsdt) return;
-    const uint8_t* d = pv(dsdt);
+    const uint8_t* d = pvt(dsdt);
     uint32_t dlen = rd32(d + 4);
     /* Find the object "Name (_S5, Package () {SLP_TYPa, SLP_TYPb, ...})":
      * NameOp (0x08), optionally a root prefix '\\', the NameSeg "_S5_", then
@@ -287,8 +294,8 @@ void acpi_reboot(void){
         if(g_topo.reset_space == 1){                 /* SystemIO */
             outb_((uint16_t)g_topo.reset_addr, g_topo.reset_value);
         } else if(g_topo.reset_space == 0){          /* SystemMemory */
-            vmm_extend_physmap(g_topo.reset_addr + 0x1000);
-            *(volatile uint8_t*)phys_to_virt(g_topo.reset_addr) = g_topo.reset_value;
+            volatile uint8_t* r = (volatile uint8_t*)vmm_map_mmio(g_topo.reset_addr, 1, VMM_CACHE_UC);
+            if(r) *r = g_topo.reset_value;
         }
         reboot_delay();
     }

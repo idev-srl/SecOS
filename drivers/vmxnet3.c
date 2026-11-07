@@ -29,7 +29,7 @@
 #include "io.h"
 #include "net.h"
 #include "debugcon.h"
-#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_extend_physmap
+#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_map_mmio
 #include <stddef.h>
 
 /* ---- PCI identity (VMware vmxnet3) ---- */
@@ -465,11 +465,10 @@ int vmxnet3_init(void) {
         debugcon_writestring("[VMXNET3] BAR not memory\n");
         return -1;
     }
-    /* Each register window is small (<4 KB); extend the physmap past both. */
-    vmm_extend_physmap(pt_bar + 0x1000);
-    vmm_extend_physmap(vd_bar + 0x1000);
-    g_st.pt = (volatile uint8_t*)phys_to_virt(pt_bar);
-    g_st.vd = (volatile uint8_t*)phys_to_virt(vd_bar);
+    /* [M49] Map both register windows uncached (each is small, < 4 KB). */
+    g_st.pt = (volatile uint8_t*)pci_bar_map(&dev, VMXNET3_PT_BAR, 0x1000);
+    g_st.vd = (volatile uint8_t*)pci_bar_map(&dev, VMXNET3_VD_BAR, 0x1000);
+    if (!g_st.pt || !g_st.vd) { debugcon_writestring("[VMXNET3] BAR map failed\n"); return -1; }
 
     debugcon_writestring("[VMXNET3] PT=0x"); debugcon_print_hex(pt_bar);
     debugcon_writestring(" VD=0x"); debugcon_print_hex(vd_bar); debugcon_writestring("\n");
