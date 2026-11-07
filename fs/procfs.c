@@ -76,7 +76,7 @@ static void sb_kv_kb(struct sb* s, const char* k, uint64_t kb){
 enum pk {
     PK_ROOT=1, PK_SELF,
     PK_MEMINFO, PK_UPTIME, PK_LOADAVG, PK_STAT, PK_VERSION, PK_CPUINFO,
-    PK_MOUNTS, PK_FILESYSTEMS, PK_KMSG, PK_CMDLINE_K, PK_SMP,
+    PK_MOUNTS, PK_FILESYSTEMS, PK_KMSG, PK_CMDLINE_K, PK_SMP, PK_LOCKSTAT,
     PK_PID_DIR, PK_PID_STAT, PK_PID_STATUS, PK_PID_STATM, PK_PID_CMDLINE,
     PK_PID_COMM, PK_PID_ENVIRON, PK_PID_MAPS, PK_PID_CWD, PK_PID_EXE,
     PK_PID_ROOT, PK_PID_FDDIR, PK_PID_FD,
@@ -90,7 +90,7 @@ static const struct { const char* name; int kind; } g_top[] = {
     {"meminfo",PK_MEMINFO}, {"uptime",PK_UPTIME}, {"loadavg",PK_LOADAVG},
     {"stat",PK_STAT}, {"version",PK_VERSION}, {"cpuinfo",PK_CPUINFO},
     {"mounts",PK_MOUNTS}, {"filesystems",PK_FILESYSTEMS}, {"kmsg",PK_KMSG},
-    {"cmdline",PK_CMDLINE_K}, {"smp",PK_SMP},
+    {"cmdline",PK_CMDLINE_K}, {"smp",PK_SMP}, {"lockstat",PK_LOCKSTAT},
 };
 #define NTOP (int)(sizeof(g_top)/sizeof(g_top[0]))
 static const struct { const char* name; int kind; } g_pidf[] = {
@@ -490,7 +490,19 @@ static void gen_smp(struct sb* s){
         sb_str(s," ipi_resched "); sb_u64(s,ir);
         sb_putc(s,'\n');
     }
+    /* [M50] kernel lock mode + how many syscalls still take the BKL */
+    extern int g_bkl_mode; extern uint32_t syscall_bkl_mask_count(void);
+    sb_str(s,"bkl "); sb_str(s, g_bkl_mode ? "on" : "off");
+    sb_str(s," mask "); sb_u64(s, syscall_bkl_mask_count()); sb_str(s,"/256");
+#ifdef SECOS_LOCKDEP
+    sb_str(s," lockdep on");
+#endif
+    sb_putc(s,'\n');
 }
+
+/* [M50] /proc/lockstat: per-lock acquire / contended / max-wait counts. */
+static void lockstat_emit(void* ctx, const char* line){ sb_str((struct sb*)ctx, line); }
+static void gen_lockstat(struct sb* s){ lockstat_generate(lockstat_emit, s); }
 
 /* [M43] What Linux guards with a ptrace-style check: only root or a reader
  * whose effective ids equal all of the target's ids (cred_may_inspect). */
@@ -540,6 +552,7 @@ static int gen_key(uint64_t key){
 #endif
         sb_putc(&s,'\n'); break; }
     case PK_SMP: gen_smp(&s); break;
+    case PK_LOCKSTAT: gen_lockstat(&s); break;
     case PK_SELF: { process_t* c=sched_get_current(); if(!c||!c->pid) return -1; sb_u64(&s,c->pid); break; }
     case PK_PID_STAT: gen_pid_stat(&s); break;
     case PK_PID_STATUS: gen_pid_status(&s); break;
