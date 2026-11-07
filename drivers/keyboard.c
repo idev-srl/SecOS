@@ -122,12 +122,14 @@ static int ring_space_nolock(void) {
     return BUFFER_SIZE - 1 - used;
 }
 // Push a whole sequence or nothing (a half-queued ESC [ A would be misparsed).
-static void buffer_put_seq_nolock(const char* s, int n) {
-    if (n <= 0 || ring_space_nolock() < n) return;
+// Returns 1 when queued.
+static int buffer_put_seq_nolock(const char* s, int n) {
+    if (n <= 0 || ring_space_nolock() < n) return 0;
     for (int i = 0; i < n; i++) {
         input_buffer[buffer_end] = (uint8_t)s[i];
         buffer_end = (buffer_end + 1) % BUFFER_SIZE;
     }
+    return 1;
 }
 // Pop one byte (-1 if empty). Caller holds kbd_lock.
 static int buffer_get_nolock(void) {
@@ -181,6 +183,12 @@ bool keyboard_input_pending_noirq(void) {
 // exactly as received (CR stays CR, DEL stays DEL; termios maps them).
 int keyboard_getc_raw(void) {
     usb_hid_poll();
+    return keyboard_getc_raw_nopoll();
+}
+// [M51] The same without the USB HID poll: the console line discipline polls
+// the HID with its lock dropped, then drains the ring with this under the lock
+// (an xHCI transfer must not run with the console locked and interrupts off).
+int keyboard_getc_raw_nopoll(void) {
     int c = buffer_get();
     if (c >= 0) return c;
     return serial_poll_raw();
@@ -193,9 +201,14 @@ void keyboard_inject_char(char c) {
     spin_unlock_irqrestore(&kbd_lock, fl);
 }
 void keyboard_inject_seq(const char* s, int n) {
+    (void)keyboard_inject_seq_try(s, n);
+}
+// The whole sequence, or nothing when the ring is full: 1 = queued.
+int keyboard_inject_seq_try(const char* s, int n) {
     uint64_t fl = spin_lock_irqsave(&kbd_lock);
-    buffer_put_seq_nolock(s, n);
+    int r = buffer_put_seq_nolock(s, n);
     spin_unlock_irqrestore(&kbd_lock, fl);
+    return r;
 }
 
 /* ---- [M40] key codes, keymaps, evdev ---------------------------------------

@@ -2261,6 +2261,11 @@ static void kernel_main_phase2(void) {
     // [M51 C4] FAT32/exFAT/NTFS driver locks under concurrency (fs/c4_fsstress.c).
     { extern void c4_fsstress_run(void); c4_fsstress_run(); }
 #endif
+#ifdef SECOS_TTY_TEST
+    // [M51 C5] Console line discipline + pty locks driven from every CPU at
+    // once (kernel/tty_test.c).
+    { extern void tty_selftest(void); tty_selftest(); }
+#endif
 #if M41_EXFAT_DEMO
     // [M41] exFAT self-test, once /mnt and /proc are mounted: the good image on
     // vda, or the corrupt-image suite when AHCI disks are attached.

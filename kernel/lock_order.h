@@ -45,7 +45,13 @@
 #define LK_KLOCK_MAX       99   /* every klock level is <= this                 */
 
 /* ---- S/N: CPU-owned spinlocks (arch/x86/spinlock.h) ----------------------- */
-#define LK_S10_TTY         110  /* tty_con_lock (C5), g_pty_lock                */
+#define LK_S10_TTY         110  /* tty_con_lock (console ldisc, M51 C5) and
+                                   g_pty_lock (every pty): never nested. Inside:
+                                   kbd S50, con_lock (echo), proc S30 (console
+                                   ISIG posts). Never across cpu_wait_irq, a
+                                   user copy or the USB HID poll; IRQ/HID
+                                   context never takes it (lock-free ISIG
+                                   snapshot + reply ring, kernel/tty.c)        */
 #define LK_S12_HID         112  /* hid_lock (drivers/usb_hid.c): HID slots; the
                                    poll only trylocks it and delivers reports
                                    under it (input S15, proc S30, kbd S50,

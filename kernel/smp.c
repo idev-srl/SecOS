@@ -115,6 +115,9 @@ void ap_entry(void) {
 #ifdef SECOS_C4_FSSTRESS
         { extern void c4_fsstress_ap(cpu_t*); c4_fsstress_ap(c); }                // [M51 C4]
 #endif
+#ifdef SECOS_TTY_TEST
+        { extern void tty_test_ap(cpu_t*); tty_test_ap(c); }                      // [M51 C5]
+#endif
         sched_reap_zombies();
         cpu_wait_irq();
     }

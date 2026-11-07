@@ -24,9 +24,21 @@ extern void sched_kill_current(int sig) __attribute__((noreturn));
 extern void sched_stop_current(trapframe_t* tf) __attribute__((noreturn));
 
 // ---- foreground process group (console job control) ----
-static uint32_t g_foreground_pgid = 0;
-void     signal_set_foreground_pgid(uint32_t pgid) { g_foreground_pgid = pgid; }
-uint32_t signal_get_foreground_pgid(void) { return g_foreground_pgid; }
+// [M51] Written under the console line-discipline lock (kernel/tty.c,
+// tty_con_lock S10), so it never changes in the middle of a console ldisc
+// operation; never set it from under that lock or from IRQ context. Read
+// lock-free: the keyboard IRQ and the USB HID poll (which hold kbd_lock S50 /
+// hid_lock S12, inside the console lock's level) and procfs (S15) only need a
+// consistent 32-bit value, and the console ldisc reads it under its lock.
+extern uint64_t tty_con_lock_irqsave(void);
+extern void     tty_con_unlock_irqrestore(uint64_t fl);
+static volatile uint32_t g_foreground_pgid = 0;
+void signal_set_foreground_pgid(uint32_t pgid) {
+    uint64_t fl = tty_con_lock_irqsave();
+    __atomic_store_n(&g_foreground_pgid, pgid, __ATOMIC_RELEASE);
+    tty_con_unlock_irqrestore(fl);
+}
+uint32_t signal_get_foreground_pgid(void) { return __atomic_load_n(&g_foreground_pgid, __ATOMIC_ACQUIRE); }
 
 // ---- disposition helpers ----
 static int sig_default_ignore(int s) { return s == SIGCHLD || s == SIGCONT || s == SIGURG || s == SIGWINCH; }

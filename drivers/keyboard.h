@@ -30,9 +30,11 @@ char keyboard_getchar(void);           // Blocking read char (kernel shell: '\n'
 bool keyboard_has_char(void);          // Non-blocking availability check
 bool keyboard_input_pending_noirq(void); // PS/2 buffer or serial RX waiting (no USB poll; ISR-safe)
 int  keyboard_getc_raw(void);          // [TTY] Non-blocking raw byte (PS/2/USB ring, then serial), -1 if none
+int  keyboard_getc_raw_nopoll(void);   // [M51] the same without polling the USB HID first
 void keyboard_readline(char* buffer, int max_len); // Read line until Enter
 void keyboard_inject_char(char c);     // [M22] Inject a char (e.g. from a USB HID keyboard)
 void keyboard_inject_seq(const char* s, int n); // inject a whole key sequence atomically
+int  keyboard_inject_seq_try(const char* s, int n); // [M51] the same, 1 = queued, 0 = ring full
 /* Bytes for a key press: `key` is an ASCII code (Enter = '\r', Backspace =
  * 0x7f) or a KEY_* code; `mods` are KMOD_* bits. Ctrl turns letters and
  * @[\]^_ into C0 controls, Alt prefixes ESC (meta). Returns the byte count. */

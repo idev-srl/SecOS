@@ -33,6 +33,7 @@
 #include "vmm.h"
 #include "vma.h"
 #include "../mm/user_copy.h"
+#include "vt.h"        /* [M51] con_lock around the KD mode */
 
 #define E_PERM   (-1)
 #define E_NOMEM  (-12)
@@ -231,18 +232,28 @@ int64_t fbdev_mmap(struct process* cp, uint64_t len, int prot, int flags, uint64
     return (int64_t)base;
 }
 
-/* ---- console mode (KDSETMODE) ------------------------------------------------------ */
+/* ---- console mode (KDSETMODE) ------------------------------------------------------
+ * [M51] The mode and its owner change under con_lock (drivers/vt.c), the lock
+ * that already serializes every console output: a switch is atomic against
+ * another CPU's switch (two compositors, an owner exiting while another
+ * program asks for text) and against output being drawn, and the repaint on
+ * the way back to text no longer races a CPU that is printing. The capability
+ * checks (which audit) and the debugcon messages run outside it. */
 static int g_kd_mode = KD_TEXT;
 static uint32_t g_kd_owner;          /* pid that switched to KD_GRAPHICS */
 
 int vtcon_mode(void) { return g_kd_mode; }
 
-static void set_text(const char* why, uint32_t pid) {
-    if (g_kd_mode == KD_TEXT) return;
+/* con_lock held. Returns 1 when the console was switched back to text. */
+static int set_text_locked(void) {
+    if (g_kd_mode == KD_TEXT) return 0;
     g_kd_mode = KD_TEXT; g_kd_owner = 0;
 #if ENABLE_FB
     fb_console_set_graphics(0);
 #endif
+    return 1;
+}
+static void log_text(const char* why, uint32_t pid) {
     debugcon_writestring("[VT] text console restored (");
     debugcon_writestring(why);
     debugcon_writestring(" pid="); debugcon_print_hex(pid);
@@ -261,11 +272,13 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
             /* Blanking the console is a display privilege. */
             if (!cap_check_explicit(c, CAP_DISPLAY, 53 /*SYS_IOCTL*/, "KD_GRAPHICS")) return E_PERM;
             uint32_t pid = c ? c->pid : 0;
-            if (g_kd_mode == KD_GRAPHICS && g_kd_owner == pid) return 0;
+            uint64_t lf = con_lock();
+            if (g_kd_mode == KD_GRAPHICS && g_kd_owner == pid) { con_unlock(lf); return 0; }
             g_kd_mode = KD_GRAPHICS; g_kd_owner = pid;
 #if ENABLE_FB
             fb_console_set_graphics(1);
 #endif
+            con_unlock(lf);
             debugcon_writestring("[VT] graphics mode (owner pid="); debugcon_print_hex(pid);
             debugcon_writestring(")\n");
             return 0;
@@ -273,12 +286,25 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
         if (arg == KD_TEXT) {
             /* Only the graphics owner (or another display-privileged program)
              * may take the screen back: any console user forcing text mode
-             * would scribble the console over a compositor. */
+             * would scribble the console over a compositor. The capability is
+             * checked (and audited) only when the state needs it, with the
+             * lock dropped; then the state is looked at again. */
             uint32_t pid = c ? c->pid : 0;
-            if (g_kd_mode == KD_GRAPHICS && pid != g_kd_owner &&
-                !cap_check_explicit(c, CAP_DISPLAY, 53 /*SYS_IOCTL*/, "KD_TEXT")) return E_PERM;
-            set_text("KD_TEXT", pid);
-            return 0;
+            int allowed = -1;                        /* -1: not checked yet */
+            for (;;) {
+                uint64_t lf = con_lock();
+                int need = g_kd_mode == KD_GRAPHICS && pid != g_kd_owner;
+                if (need && allowed < 0) {
+                    con_unlock(lf);
+                    allowed = cap_check_explicit(c, CAP_DISPLAY, 53 /*SYS_IOCTL*/, "KD_TEXT") ? 1 : 0;
+                    continue;
+                }
+                if (need && !allowed) { con_unlock(lf); return E_PERM; }
+                int restored = set_text_locked();
+                con_unlock(lf);
+                if (restored) log_text("KD_TEXT", pid);
+                return 0;
+            }
         }
         return E_INVAL;
     default:
@@ -288,6 +314,10 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
 
 void vtcon_proc_exit(struct process* pp) {
     process_t* p = (process_t*)pp;
-    if (!p || g_kd_mode != KD_GRAPHICS || p->pid != g_kd_owner) return;
-    set_text("graphics owner exited", p->pid);
+    if (!p || g_kd_mode != KD_GRAPHICS || p->pid != g_kd_owner) return;   /* fast path */
+    uint64_t lf = con_lock();
+    int restored = 0;
+    if (g_kd_mode == KD_GRAPHICS && p->pid == g_kd_owner) restored = set_text_locked();
+    con_unlock(lf);
+    if (restored) log_text("graphics owner exited", p->pid);
 }

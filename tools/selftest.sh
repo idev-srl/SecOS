@@ -3144,6 +3144,38 @@ else
     check "M51 FSVIRT gate build" 1
 fi
 
+# ---- M51 TTY GATE [C5]: console line discipline + pty locks ----
+# One image with -DSECOS_TTY_TEST (boot self-test, kernel/tty_test.c: every
+# CPU drives the console ldisc and pty pairs at once outside the BKL — typed
+# lines exactly once / in order per typist, raw byte streams complete and in
+# order, echo under the lock, the ESC wait dropping the lock, the emulator
+# reply ring, pty open/close churn, and a negative control without the
+# console lock that must show damage) and -DSECOS_LOCKDEP, on -smp 4.
+# tools/tty_stress_drive.py then runs /bin/smptest pty (16 pairs) and pipe,
+# types on the PS/2 keyboard (QMP) and the serial line while a background job
+# writes to the console, and sends Ctrl-C / Ctrl-Z from the keyboard IRQ.
+echo "[selftest] M51 TTY gate: ldisc/pty forced concurrency + pty/pipe stress -smp 4..."
+make clean >/dev/null 2>&1 || true
+if make iso CONSOLE=root CFLAGS_EXTRA="-DSECOS_TTY_TEST -DSECOS_LOCKDEP" >/tmp/secos_selftest_build.log 2>&1; then
+    TSDDIR=$(mktemp -d /tmp/secos_selftest_tsd.XXXXXX)
+    cp myos.iso "$TSDDIR/tsd.iso"
+    timeout 2400 python3 tools/tty_stress_drive.py --iso "$TSDDIR/tsd.iso" --smp 4 --tttest \
+        --log "$TSDDIR/tsd.log" >"$TSDDIR/tsd.out" 2>&1
+    while IFS= read -r l; do
+        case "$l" in
+            "[TSD] RESULT "*) ;;
+            "[TSD] "*" OK"*)   x=${l#\[TSD\] }; check "M51 TTY ${x%% OK*}" 0 ;;
+            "[TSD] "*" FAIL"*) x=${l#\[TSD\] }; check "M51 TTY ${x%% FAIL*}" 1; echo "    $l" | cut -c1-240 ;;
+        esac
+    done < "$TSDDIR/tsd.out"
+    grep -q "^\[TSD\] RESULT " "$TSDDIR/tsd.out"; check "M51 TTY driver ran to completion" $?
+    cp "$TSDDIR/tsd.out" /tmp/secos_selftest_tsd.out; cp "$TSDDIR/tsd.log" /tmp/secos_selftest_tsd.log
+    rm -rf "$TSDDIR"
+else
+    echo "[selftest] M51 TTY BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "M51 TTY gate build" 1
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi

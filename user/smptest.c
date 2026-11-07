@@ -34,6 +34,21 @@
  *     mm_lock this is a use-after-free of the process_t / its page tables
  *     (heap poisoning turns that into a fault). Prints "[smptest] procrace
  *     PASS ..." / "FAIL ...".
+ *
+ *   smptest pty [pairs] [kbytes]
+ *     TTY stress (M51 C5). `pairs` children (max 16) each open a pty pair
+ *     and push `kbytes` KiB through it in both directions in raw mode
+ *     (master -> slave, then the same bytes slave -> master, chunks of
+ *     1..509 bytes, every byte checked), then 200 canonical lines with echo
+ *     (the slave must read each line, the master its echo with CR LF).
+ *     Prints "[smptest] pty PASS ..." / "FAIL ...".
+ *
+ *   smptest pipe [pipelines] [stages] [kbytes]
+ *     Pipe stress (M51 C5). `pipelines` (max 4) chains of producer | stage x
+ *     `stages` (max 4) | consumer, each its own process: the producer writes
+ *     a pattern of `kbytes` KiB in writes of 1..4093 bytes, each stage copies
+ *     with its own buffer size, the consumer checks every byte and the count.
+ *     Prints "[smptest] pipe PASS ..." / "FAIL ...".
  */
 #include "libsecos.h"
 #include <signal.h>
@@ -43,6 +58,7 @@
 #include <sys/sysinfo.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <termios.h>
 
 #define P(s) write(1, s, strlen(s))
 
@@ -320,6 +336,176 @@ static int cmd_procrace(int secs, int nread, int nchurn) {
     return bad || spawn_fail ? 1 : 0;
 }
 
+/* ---- [M51] pty / pipe stress ---------------------------------------------------- */
+static unsigned char pat(unsigned id, unsigned long i) {
+    unsigned long z = (i + 1) * 2654435761ul ^ ((unsigned long)id << 24);
+    return (unsigned char)(z ^ (z >> 13) ^ (z >> 7));
+}
+static int read_full(int fd, unsigned char* b, int n) {
+    int got = 0;
+    while (got < n) {
+        int r = (int)read(fd, b + got, (unsigned long)(n - got));
+        if (r <= 0) return got;
+        got += r;
+    }
+    return got;
+}
+static int write_full(int fd, const unsigned char* b, int n) {
+    int put = 0;
+    while (put < n) {
+        int r = (int)write(fd, b + put, (unsigned long)(n - put));
+        if (r <= 0) return put;
+        put += r;
+    }
+    return put;
+}
+
+/* One pty pair, both directions, from one process: raw rounds (master ->
+ * slave, then the same bytes slave -> master, chunks of 1..509 bytes), then
+ * canonical lines with ECHO (the slave reads each line, the master reads its
+ * echo). Exit status 0 when every byte came back in order. */
+static int pty_worker(int id, unsigned long bytes) {
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (m < 0 || unlockpt(m) != 0) { P("[smptest] pty: openpt failed\n"); return 3; }
+    char name[32];
+    if (ptsname_r(m, name, sizeof(name)) != 0) return 3;
+    int s = open(name, O_RDWR | O_NOCTTY);
+    if (s < 0) { P("[smptest] pty: slave open failed\n"); return 3; }
+    struct termios raw, cooked;
+    tcgetattr(s, &cooked);
+    raw = cooked;
+    cfmakeraw(&raw);
+    tcsetattr(s, TCSANOW, &raw);
+    static unsigned char out[512], in[512];
+    unsigned long done = 0;
+    int bad = 0;
+    while (done < bytes && !bad) {
+        int n = (int)(1 + (done * 7 + (unsigned long)id * 13) % 509);
+        if ((unsigned long)n > bytes - done) n = (int)(bytes - done);
+        for (int i = 0; i < n; i++) out[i] = pat((unsigned)id, done + (unsigned long)i);
+        if (write_full(m, out, n) != n) { bad = 1; break; }
+        if (read_full(s, in, n) != n || memcmp(in, out, (unsigned long)n) != 0) { bad = 2; break; }
+        if (write_full(s, in, n) != n) { bad = 3; break; }
+        if (read_full(m, in, n) != n || memcmp(in, out, (unsigned long)n) != 0) { bad = 4; break; }
+        done += (unsigned long)n;
+    }
+    /* Canonical with echo: "p<id>-<k>\n" -> the slave reads the line, the
+     * master reads the echo "p<id>-<k>\r\n" (OPOST|ONLCR). */
+    tcsetattr(s, TCSAFLUSH, &cooked);
+    for (int k = 0; k < 200 && !bad; k++) {
+        char line[32]; int n = 0;
+        line[n++] = 'p';
+        { char d[12]; int q = 0; unsigned v = (unsigned)id; do { d[q++] = (char)('0' + v % 10); v /= 10; } while (v); while (q) line[n++] = d[--q]; }
+        line[n++] = '-';
+        { char d[12]; int q = 0; unsigned v = (unsigned)k; do { d[q++] = (char)('0' + v % 10); v /= 10; } while (v); while (q) line[n++] = d[--q]; }
+        line[n++] = '\n';
+        if (write_full(m, (unsigned char*)line, n) != n) { bad = 5; break; }
+        char got[64];
+        int r = (int)read(s, got, sizeof(got));
+        if (r != n || memcmp(got, line, (unsigned long)n) != 0) { bad = 6; break; }
+        if (read_full(m, (unsigned char*)got, n + 1) != n + 1 || memcmp(got, line, (unsigned long)(n - 1)) != 0 ||
+            got[n - 1] != '\r' || got[n] != '\n') { bad = 7; break; }
+    }
+    close(s); close(m);
+    if (bad) { P("[smptest] pty worker "); put_dec((unsigned long)id); P(" FAIL step="); put_dec((unsigned long)bad);
+               P(" at="); put_dec(done); P("\n"); }
+    return bad ? 1 : 0;
+}
+
+static int cmd_pty(int pairs, unsigned long kbytes) {
+    if (pairs > 16) pairs = 16;
+    int pids[16], n = 0, bad = 0, spawn_fail = 0;
+    for (int i = 0; i < pairs; i++) {
+        int pid = fork();
+        if (pid == 0) _exit(pty_worker(i, kbytes * 1024ul));
+        if (pid < 0) { spawn_fail++; continue; }
+        pids[n++] = pid;
+    }
+    for (int i = 0; i < n; i++) if (waitpid(pids[i]) != 0) bad++;
+    P(bad || spawn_fail ? "[smptest] pty FAIL" : "[smptest] pty PASS");
+    P(" pairs="); put_dec((unsigned long)n); P(" kbytes="); put_dec(kbytes);
+    P(" bad="); put_dec((unsigned long)bad); P(" spawn_fail="); put_dec((unsigned long)spawn_fail); P("\n");
+    return bad || spawn_fail ? 1 : 0;
+}
+
+/* Pipelines: producer | stage x S | consumer, every process its own fork. The
+ * producer writes a pattern in writes of 1..4093 bytes, each stage copies with
+ * its own buffer size, the consumer checks every byte and the count. */
+static int pipe_producer(int id, unsigned long bytes) {
+    static unsigned char b[4096];
+    unsigned long done = 0;
+    while (done < bytes) {
+        int n = (int)(1 + (done * 31 + (unsigned long)id) % 4093);
+        if ((unsigned long)n > bytes - done) n = (int)(bytes - done);
+        for (int i = 0; i < n; i++) b[i] = pat((unsigned)id, done + (unsigned long)i);
+        if (write_full(1, b, n) != n) return 1;
+        done += (unsigned long)n;
+    }
+    return 0;
+}
+static int pipe_stage(int k) {
+    static unsigned char b[8192];
+    int sz = 1 + (k * 1531) % 8191;
+    for (;;) {
+        int r = (int)read(0, b, (unsigned long)sz);
+        if (r == 0) return 0;
+        if (r < 0) return 1;
+        if (write_full(1, b, r) != r) return 1;
+    }
+}
+static int pipe_consumer(int id, unsigned long bytes) {
+    static unsigned char b[4096];
+    unsigned long got = 0;
+    for (;;) {
+        int r = (int)read(0, b, sizeof(b));
+        if (r == 0) break;
+        if (r < 0) return 1;
+        for (int i = 0; i < r; i++)
+            if (b[i] != pat((unsigned)id, got + (unsigned long)i)) {
+                P("[smptest] pipe "); put_dec((unsigned long)id); P(" byte mismatch at "); put_dec(got + (unsigned long)i); P("\n");
+                return 1;
+            }
+        got += (unsigned long)r;
+    }
+    if (got != bytes) {
+        P("[smptest] pipe "); put_dec((unsigned long)id); P(" count "); put_dec(got); P(" != "); put_dec(bytes); P("\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int cmd_pipe(int lines, int stages, unsigned long kbytes) {
+    if (lines > 4) lines = 4;
+    if (stages > 4) stages = 4;
+    unsigned long bytes = kbytes * 1024ul;
+    int pids[32], n = 0, bad = 0, spawn_fail = 0;
+    for (int l = 0; l < lines; l++) {
+        int in = -1;                                  /* read end feeding the next process */
+        for (int k = 0; k <= stages + 1; k++) {
+            int fds[2] = { -1, -1 };
+            int last = (k == stages + 1);
+            if (!last && pipe(fds) != 0) { spawn_fail++; break; }
+            int pid = fork();
+            if (pid == 0) {
+                if (in >= 0) { dup2(in, 0); close(in); }
+                if (!last) { dup2(fds[1], 1); close(fds[1]); close(fds[0]); }
+                int r = k == 0 ? pipe_producer(l, bytes) : last ? pipe_consumer(l, bytes) : pipe_stage(k + l * 5);
+                _exit(r);
+            }
+            if (pid < 0) spawn_fail++; else pids[n++] = pid;
+            if (in >= 0) close(in);
+            if (!last) { close(fds[1]); in = fds[0]; }
+        }
+        if (in >= 0) close(in);
+    }
+    for (int i = 0; i < n; i++) if (waitpid(pids[i]) != 0) bad++;
+    P(bad || spawn_fail ? "[smptest] pipe FAIL" : "[smptest] pipe PASS");
+    P(" pipelines="); put_dec((unsigned long)lines); P(" stages="); put_dec((unsigned long)stages);
+    P(" kbytes="); put_dec(kbytes); P(" procs="); put_dec((unsigned long)n);
+    P(" bad="); put_dec((unsigned long)bad); P(" spawn_fail="); put_dec((unsigned long)spawn_fail); P("\n");
+    return bad || spawn_fail ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     if (argc >= 2 && strcmp(argv[1], "fpu") == 0)
         return cmd_fpu((int)arg_num(argc > 2 ? argv[2] : 0, 8), arg_num(argc > 3 ? argv[3] : 0, 3000000));
@@ -330,7 +516,13 @@ int main(int argc, char** argv) {
     if (argc >= 2 && strcmp(argv[1], "procrace") == 0)
         return cmd_procrace((int)arg_num(argc > 2 ? argv[2] : 0, 20), (int)arg_num(argc > 3 ? argv[3] : 0, 8),
                             (int)arg_num(argc > 4 ? argv[4] : 0, 4));
+    if (argc >= 2 && strcmp(argv[1], "pty") == 0)
+        return cmd_pty((int)arg_num(argc > 2 ? argv[2] : 0, 16), arg_num(argc > 3 ? argv[3] : 0, 64));
+    if (argc >= 2 && strcmp(argv[1], "pipe") == 0)
+        return cmd_pipe((int)arg_num(argc > 2 ? argv[2] : 0, 3), (int)arg_num(argc > 3 ? argv[3] : 0, 3),
+                        arg_num(argc > 4 ? argv[4] : 0, 512));
     P("usage: smptest fpu [children] [iters] | burst [rounds] [width] | cpus"
-      " | procrace [secs] [readers] [churners]\n");
+      " | procrace [secs] [readers] [churners] | pty [pairs] [kbytes]"
+      " | pipe [pipelines] [stages] [kbytes]\n");
     return 2;
 }

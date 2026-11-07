@@ -100,6 +100,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/ipc.c \
 	$(KERNEL_DIR)/pipe.c \
 	$(KERNEL_DIR)/tty.c \
+	$(KERNEL_DIR)/tty_test.c \
 	$(KERNEL_DIR)/pty.c \
 	$(KERNEL_DIR)/power.c \
 	$(KERNEL_DIR)/sysroot.c \

@@ -39,10 +39,31 @@
  * is the reader's controlling terminal, writes with TOSTOP and termios/pgrp
  * changes from the background raise SIGTTOU.
  *
- * Locking: the console is not locked (as before). A pty's struct tty is only
- * touched under its pty lock (kernel/pty.c); signals raised meanwhile are
- * queued (tty_emit_sig) and posted by tty_post_sigs() after the lock is
- * dropped, because signal posting takes the process-table lock.
+ * Locking ([M51] C5, docs/devlog/M51-tty.md):
+ *   - The console's struct tty (g_con) is only touched under tty_con_lock
+ *     (S10, irqsave). Every console entry point takes it; the shared ldisc
+ *     code below gets a tlk_t that says whether (and with which flags) it
+ *     holds it, so it can drop it around a wait. It is never held across
+ *     cpu_wait_irq(): the 10 ms ESC wait in pull_input() and the TTY_RD_SPIN
+ *     wait drop it (and the BKL, which nothing in this file needs) and
+ *     re-check the state afterwards; nor across a user copy (console ioctl
+ *     payloads are bounced like pty.c's); nor across the USB HID poll
+ *     (pull_input polls with the lock dropped, then drains the ring).
+ *   - Inside it: kbd_lock (S50, the input ring), con_lock (vt output, echo),
+ *     proc_lock (S30, ISIG / SIGTTIN / SIGWINCH posting: the console posts at
+ *     once, a reader spinning in place must see its own SIGINT).
+ *   - Interrupt and HID context never take it (the keyboard IRQ holds
+ *     kbd_lock S50, the HID poll hid_lock S12, and the vt holds con_lock when
+ *     it types a DSR/DA reply): they read a lock-free snapshot of the ISIG
+ *     characters (g_con_isig, published under the lock whenever the console
+ *     termios changes), set flush_req, and queue emulator replies in a
+ *     lock-free ring drained by the next pull_input().
+ *   - The console's foreground group (signal.c's g_foreground_pgid) is
+ *     written under tty_con_lock and read lock-free (IRQ, procfs).
+ *   - A pty's struct tty is only touched under the pty lock (kernel/pty.c,
+ *     also S10, never nested with tty_con_lock); signals raised meanwhile are
+ *     queued (tty_emit_sig) and posted by tty_post_sigs() after the lock is
+ *     dropped. The pty path never reaches a wait in this file.
  */
 #include <stdint.h>
 #include <stdbool.h>
@@ -57,8 +78,11 @@
 #include "cred.h"
 #include "../fs/vfs.h"
 #include "klock.h"   /* [M50] cpu_wait_irq */
+#include "bkl.h"     /* [M51] waits drop the BKL */
+#include "spinlock.h"
 
-extern int  keyboard_getc_raw(void);
+extern int  keyboard_getc_raw_nopoll(void);
+extern void usb_hid_poll(void);
 extern bool keyboard_input_pending_noirq(void);
 extern process_t* sched_get_current(void);
 extern uint64_t timer_get_ticks(void);
@@ -83,6 +107,67 @@ static void console_out(struct tty* t, const char* s, int n, int onlcr) {
 }
 static struct tty g_con;
 static int g_con_init;
+
+/* ---- [M51] console locking ------------------------------------------------------ */
+static spinlock_t tty_con_lock = SPINLOCK_INIT_CLASS(LK_S10_TTY, "tty_con");
+
+/* Lock context of one ldisc operation: the console's saved flags, or nothing
+ * for a pty (its caller holds the pty lock for the whole operation). */
+typedef struct { uint64_t fl; int held; } tlk_t;
+static void tlk_lock(struct tty* t, tlk_t* k) {
+    k->held = 0;
+    if (!t->is_console) return;
+    k->fl = spin_lock_irqsave(&tty_con_lock);
+    k->held = 1;
+}
+static void tlk_unlock(tlk_t* k) {
+    if (!k->held) return;
+    k->held = 0;
+    spin_unlock_irqrestore(&tty_con_lock, k->fl);
+}
+
+#ifdef SECOS_TTY_TEST
+/* Negative control of the M51 forced-concurrency test: run the console ldisc
+ * without its lock (kernel/tty_test.c expects to see the damage). */
+volatile int g_tty_test_nolock;
+volatile uint32_t g_tty_test_esc_waits;            /* ESC waits taken (lock dropped) */
+#define TLK_LOCK(t, k)  do { if (g_tty_test_nolock) (k)->held = 0; else tlk_lock((t), (k)); } while (0)
+#else
+#define TLK_LOCK(t, k)  tlk_lock((t), (k))
+#endif
+
+/* Wait for an interrupt with nothing held: the console lock is dropped by the
+ * caller; the BKL (taken by the syscall around this read) is suspended so the
+ * other CPUs' syscalls go on during the wait. */
+static void tty_wait_irq(void) {
+    uint32_t bd = bkl_suspend();
+    cpu_wait_irq();
+    bkl_resume(bd);
+}
+
+/* ISIG snapshot for interrupt / HID context (tty_isig_for, tty_note_isig):
+ * bit 0 ISIG, bit 1 NOFLSH, bytes 1..3 VINTR, VQUIT, VSUSP. Published under
+ * tty_con_lock after every change of the console termios. */
+#define ISNAP_ISIG   1u
+#define ISNAP_NOFLSH 2u
+static volatile uint32_t g_con_isig;
+static void con_publish(struct tty* t) {
+    uint32_t w = 0;
+    if (t->tio.c_lflag & T_ISIG)   w |= ISNAP_ISIG;
+    if (t->tio.c_lflag & T_NOFLSH) w |= ISNAP_NOFLSH;
+    w |= (uint32_t)t->tio.c_cc[T_VINTR] << 8;
+    w |= (uint32_t)t->tio.c_cc[T_VQUIT] << 16;
+    w |= (uint32_t)t->tio.c_cc[T_VSUSP] << 24;
+    __atomic_store_n(&g_con_isig, w, __ATOMIC_RELEASE);
+}
+
+/* Emulator replies (DSR/DA) arrive from the vt with con_lock held, possibly
+ * while this CPU echoes under tty_con_lock: they go into a lock-free ring
+ * (producers are serialized by con_lock) that pull_input() drains into the
+ * read queue. */
+#define REPLY_RING 256
+static uint8_t g_reply_buf[REPLY_RING];
+static volatile uint32_t g_reply_head, g_reply_tail;   /* head: producer, tail: consumer */
 
 static void tio_defaults(struct tty_termios* tio) {
     for (unsigned i = 0; i < sizeof(*tio); i++) ((uint8_t*)tio)[i] = 0;
@@ -113,6 +198,7 @@ struct tty* tty_console(void) {
         tty_instance_init(&g_con, console_out, 0);
         g_con.is_console = 1;
         g_con.ws.ws_row = 0; g_con.ws.ws_col = 0;   /* 0 = the real console size */
+        con_publish(&g_con);
         g_con_init = 1;
     }
     return &g_con;
@@ -137,6 +223,7 @@ static void q_clear(struct tty* t) { t->qh = t->qt = 0; }
 uint32_t tty_fg(struct tty* t) {
     return t->is_console ? signal_get_foreground_pgid() : t->fg_pgrp;
 }
+/* Console: takes the console lock (signal.c), so never call it under it. */
 void tty_set_fg(struct tty* t, uint32_t pgrp) {
     if (t->is_console) signal_set_foreground_pgid(pgrp);
     else t->fg_pgrp = pgrp;
@@ -217,15 +304,36 @@ static int echo_width(struct tty* t, uint8_t c) {
 int tty_write(const void* buf, int len) {
     if (len <= 0) return 0;
     struct tty* t = tty_console();
-    terminal_write_tty((const char*)buf, (size_t)len, tty_onlcr(t));
+    tlk_t k;
+    TLK_LOCK(t, &k);
+    int onlcr = tty_onlcr(t);
+    tlk_unlock(&k);
+    /* The write itself runs unlocked: it may be long, and the vt serializes
+     * output with con_lock. */
+    terminal_write_tty((const char*)buf, (size_t)len, onlcr);
     return len;
 }
 
 /* DSR/DA replies from the emulator are typed into the console input queue
- * (left unterminated in canonical mode: a reply is not a line). */
+ * (left unterminated in canonical mode: a reply is not a line). Called with
+ * con_lock held, so it only queues (see g_reply_buf); a full ring drops the
+ * rest of the reply. */
 static void tty_reply(const char* s, int n) {
-    struct tty* t = tty_console();
-    for (int i = 0; i < n; i++) q_push(t, (uint8_t)s[i]);
+    uint32_t h = g_reply_head;
+    for (int i = 0; i < n; i++) {
+        uint32_t tl = __atomic_load_n(&g_reply_tail, __ATOMIC_ACQUIRE);
+        if (h - tl >= REPLY_RING) break;
+        g_reply_buf[h % REPLY_RING] = (uint8_t)s[i];
+        h++;
+    }
+    __atomic_store_n(&g_reply_head, h, __ATOMIC_RELEASE);
+}
+/* Under tty_con_lock: move the queued replies into the read queue. */
+static void drain_replies(struct tty* t) {
+    uint32_t tl = g_reply_tail;
+    uint32_t h = __atomic_load_n(&g_reply_head, __ATOMIC_ACQUIRE);
+    while (tl != h) { q_push(t, g_reply_buf[tl % REPLY_RING]); tl++; }
+    __atomic_store_n(&g_reply_tail, tl, __ATOMIC_RELEASE);
 }
 
 /* ---- input processing -------------------------------------------------------- */
@@ -260,16 +368,28 @@ static int isig_sig(struct tty* t, uint8_t c) {
     return 0;
 }
 
-/* Called from the PS/2 IRQ: is this byte a signal character right now? */
+/* Called from the PS/2 IRQ and the USB HID poll (kbd_lock held): is this byte
+ * a signal character right now? Lock-free: reads the published snapshot. */
+static int isnap_is(uint32_t w, int shift, uint8_t c) {
+    uint8_t v = (uint8_t)(w >> shift);
+    return v != 0 && v == c;
+}
 int tty_isig_for(char c) {
-    return isig_sig(tty_console(), (uint8_t)c);
+    uint32_t w = __atomic_load_n(&g_con_isig, __ATOMIC_ACQUIRE);
+    uint8_t b = (uint8_t)c;
+    if (!(w & ISNAP_ISIG)) return 0;
+    if (isnap_is(w, 8, b))  return SIGINT;
+    if (isnap_is(w, 16, b)) return SIGQUIT;
+    if (isnap_is(w, 24, b)) return SIGTSTP;
+    return 0;
 }
 /* The IRQ posted `sig` for a signal character: flush pending input (unless
- * NOFLSH) at the next console operation. */
+ * NOFLSH) at the next console operation (flush_req is consumed under the
+ * console lock). */
 void tty_note_isig(int sig) {
     (void)sig;
-    struct tty* t = tty_console();
-    if (!(t->tio.c_lflag & T_NOFLSH)) t->flush_req = 1;
+    uint32_t w = __atomic_load_n(&g_con_isig, __ATOMIC_ACQUIRE);
+    if (!(w & ISNAP_NOFLSH)) tty_console()->flush_req = 1;
 }
 
 static void process_byte(struct tty* t, uint8_t c) {
@@ -360,8 +480,11 @@ static void process_byte(struct tty* t, uint8_t c) {
 }
 
 void tty_input_byte(struct tty* t, uint8_t c) {
+    tlk_t k;
+    TLK_LOCK(t, &k);                                   /* a pty: no-op, pty lock held */
     if (t->flush_req) { t->flush_req = 0; flush_input(t); }
     process_byte(t, c);
+    tlk_unlock(&k);
 }
 
 /* How many more input bytes this terminal can take without dropping any: the
@@ -369,9 +492,12 @@ void tty_input_byte(struct tty* t, uint8_t c) {
  * committed. In canonical mode a full line keeps accepting (the bytes are
  * discarded, as n_tty does) so a writer never deadlocks on a line nobody ends. */
 int tty_input_room(struct tty* t) {
+    tlk_t k;
+    TLK_LOCK(t, &k);
     int room = q_space(t) - t->n - 1;
-    if (LF(t, T_ICANON) && t->n >= TTY_LINE - 1 && room > 0) return room;
-    return room > 0 ? room : 0;
+    int r = room > 0 ? room : 0;
+    tlk_unlock(&k);
+    return r;
 }
 
 /* Drain the raw console input sources into the discipline. In non-canonical
@@ -379,19 +505,50 @@ int tty_input_room(struct tty* t) {
  * delivers bytes one at a time, and a reader that sees ESC alone (readline,
  * through FIONREAD) would take it as a bare Escape key instead of the start of
  * ESC [ A. PS/2 and USB queue whole sequences atomically. */
-static void pull_input(struct tty* t) {
+/*
+ * [M51] Console: called with tty_con_lock held (k->held), returns with it
+ * held, but drops it twice: for the USB HID poll (xHCI transfers do not run
+ * with the console locked and interrupts off; the poll delivers into the
+ * keyboard ring, which is drained below) and for the ESC wait. The caller
+ * looks at the ldisc state only after pull_input() returns.
+ */
+static void pull_input(struct tty* t, tlk_t* k) {
+    if (!t->is_console) {                              /* a pty is pushed by its master */
+        if (t->flush_req) { t->flush_req = 0; flush_input(t); }
+        return;
+    }
+    if (k->held) {
+        tlk_unlock(k);
+        usb_hid_poll();
+        TLK_LOCK(t, k);
+    } else {
+        usb_hid_poll();                                /* negative-control test only */
+    }
     if (t->flush_req) { t->flush_req = 0; flush_input(t); }
-    if (!t->is_console) return;                        /* a pty is pushed by its master */
-    for (;;) {
-        int c = keyboard_getc_raw();
+    drain_replies(t);
+    for (int nb = 0;; nb++) {
+        if (nb == 32 && k->held) {                     /* a paste: let interrupts in */
+            nb = 0;
+            tlk_unlock(k);
+            TLK_LOCK(t, k);
+        }
+        int c = keyboard_getc_raw_nopoll();
         if (c < 0) break;
         process_byte(t, (uint8_t)c);
         if (c == 0x1B && !LF(t, T_ICANON) && !keyboard_input_pending_noirq()) {
             uint64_t t0 = timer_get_ticks();
             uint32_t hz = timer_get_frequency(); if (!hz) hz = 1000;
             uint64_t wait = hz / 100 + 1;              /* ~10 ms */
+            int relock = k->held;
+#ifdef SECOS_TTY_TEST
+            __atomic_add_fetch(&g_tty_test_esc_waits, 1, __ATOMIC_RELAXED);
+#endif
+            tlk_unlock(k);                             /* never hlt with the lock */
             while (!keyboard_input_pending_noirq() && timer_get_ticks() - t0 < wait)
-                cpu_wait_irq();
+                tty_wait_irq();
+            if (relock) TLK_LOCK(t, k);
+            /* Re-check: the ISIG flush may have been requested meanwhile. */
+            if (t->flush_req) { t->flush_req = 0; flush_input(t); }
         }
     }
 }
@@ -410,10 +567,13 @@ static int readable_count(struct tty* t) {
 }
 /* poll(POLLIN): data, or a pending EOF marker, would satisfy a read now. */
 int tty_ldisc_readable(struct tty* t) {
-    pull_input(t);
+    tlk_t k;
+    TLK_LOCK(t, &k);
+    pull_input(t, &k);
     int n = readable_count(t);
-    if (n == 0 && LF(t, T_ICANON) && q_count(t) > 0 && (t->q[t->qh] & TQ_EOF)) return 1;
-    if (n == 0 && !LF(t, T_ICANON) && t->tio.c_cc[T_VMIN] == 0) return 1;  /* never waits */
+    if (n == 0 && LF(t, T_ICANON) && q_count(t) > 0 && (t->q[t->qh] & TQ_EOF)) n = 1;
+    else if (n == 0 && !LF(t, T_ICANON) && t->tio.c_cc[T_VMIN] == 0) n = 1;  /* never waits */
+    tlk_unlock(&k);
     return n;
 }
 
@@ -448,7 +608,7 @@ static int take(struct tty* t, uint8_t* out, int len) {
  * error/WOULDBLOCK to hand back. When interruption is due (signal pending, the
  * line cancelled) the partially typed line stays, so the re-issued read()
  * continues it (bash treats a non-EINTR read error on stdin as EOF). */
-static int wait_input(struct tty* t, process_t* cur, int mode) {
+static int wait_input(struct tty* t, process_t* cur, int mode, tlk_t* k) {
     if (cur && signal_pending(cur)) return TTY_EINTR;   /* [M30] EINTR */
     if (mode == TTY_RD_NONBLOCK) return TTY_EAGAIN;
     if (!t->is_console) {
@@ -460,7 +620,12 @@ static int wait_input(struct tty* t, process_t* cur, int mode) {
         cur->wait_tty = 1;                              /* armed; tty_wake_readers() */
         return TTY_WOULDBLOCK;
     }
-    cpu_wait_irq();
+    /* Kernel caller spinning in place: wait with nothing held, then the
+     * caller's loop looks at the queue again. */
+    int relock = k->held;
+    tlk_unlock(k);
+    tty_wait_irq();
+    if (relock) TLK_LOCK(t, k);
     return 0;
 }
 
@@ -468,9 +633,18 @@ static int wait_input(struct tty* t, process_t* cur, int mode) {
  * timeout), -EINTR when a signal is pending or the line was cancelled, -EIO
  * for a background reader that cannot be stopped or a hung-up pty, -EAGAIN
  * (nonblocking), -2 when the caller should block (TTY_RD_BLOCK). */
+static int ldisc_read_locked(struct tty* t, uint8_t* out, int len, int mode, tlk_t* k);
+/* `buf` is a kernel buffer (the syscall layer copies it out afterwards). */
 int tty_ldisc_read(struct tty* t, void* buf, int len, int mode) {
     if (len <= 0) return -1;
-    uint8_t* out = (uint8_t*)buf;
+    tlk_t k;
+    TLK_LOCK(t, &k);
+    int r = ldisc_read_locked(t, (uint8_t*)buf, len, mode, &k);
+    tlk_unlock(&k);
+    return r;
+}
+
+static int ldisc_read_locked(struct tty* t, uint8_t* out, int len, int mode, tlk_t* k) {
     process_t* cur = sched_get_current();
 
     /* Job control: only the foreground process group may read. A background
@@ -492,7 +666,7 @@ int tty_ldisc_read(struct tty* t, void* buf, int len, int mode) {
     }
 
     for (;;) {
-        pull_input(t);
+        pull_input(t, k);
         if (t->intr_noproc) { t->intr_noproc = 0; return TTY_EINTR; }   /* Ctrl-C, no fg group */
         if (t->hungup) {                                /* pty master gone: drain, then EIO */
             int any = LF(t, T_ICANON) ? (readable_count(t) > 0 || (q_count(t) > 0 && (t->q[t->qh] & TQ_EOF)))
@@ -522,7 +696,7 @@ int tty_ldisc_read(struct tty* t, void* buf, int len, int mode) {
                 if (now - t->vtime_start >= tlen) { t->vtime_pid = 0; return 0; }   /* timeout */
             }
         }
-        int w = wait_input(t, cur, mode);
+        int w = wait_input(t, cur, mode, k);
         if (w != 0) {
             if (w != TTY_WOULDBLOCK) t->vtime_pid = 0;
             return w;
@@ -603,7 +777,7 @@ unsigned tty_ldisc_ioctl_payload(uint64_t cmd, int* in) {
     }
 }
 
-static int ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg, int kb) {
+static int ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg, int kb, tlk_t* lk) {
     switch (cmd) {
     case TTY_TCGETS:
         return x_copy_to(kb, (void*)arg, &t->tio, sizeof(t->tio));
@@ -631,6 +805,7 @@ static int ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg, int kb) {
             t->q[k] |= TQ_EOL;
         }
         t->vtime_pid = 0;
+        if (t->is_console) con_publish(t);           /* ISIG snapshot for the IRQ */
         return 0;
     }
     case TTY_TIOCGWINSZ: {
@@ -658,7 +833,7 @@ static int ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg, int kb) {
         return 0;
     }
     case TTY_FIONREAD: {
-        pull_input(t);
+        pull_input(t, lk);
         int n = readable_count(t);
         return x_copy_to(kb, (void*)arg, &n, sizeof(n));
     }
@@ -667,7 +842,7 @@ static int ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg, int kb) {
         return x_copy_to(kb, (void*)arg, &n, sizeof(n));
     }
     case TTY_TCFLSH:
-        if (arg == 0 || arg == 2) { pull_input(t); flush_input(t); }   /* TCIFLUSH / TCIOFLUSH */
+        if (arg == 0 || arg == 2) { pull_input(t, lk); flush_input(t); }   /* TCIFLUSH / TCIOFLUSH */
         return 0;
     case TTY_TCSBRK: case TTY_TCXONC:
         return 0;
@@ -676,9 +851,38 @@ static int ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg, int kb) {
     }
 }
 
-int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) { return ldisc_ioctl(t, cmd, arg, 0); }
+/* The console ldisc ioctls: the payload is bounced through a kernel buffer
+ * (copied in before tty_con_lock, out after it), as pty_ioctl does. */
+static int con_ldisc_ioctl(uint64_t cmd, uint64_t arg) {
+    union { struct tty_termios tio; struct tty_winsize ws; int i; } kb;
+    int in = 0;
+    unsigned plen = tty_ldisc_ioctl_payload(cmd, &in);
+    if (plen > sizeof(kb)) return -22;                 /* cannot happen */
+    if (plen && in && copy_from_user(&kb, (void*)arg, plen)) return -14;
+    struct tty* t = tty_console();
+    tlk_t k;
+    TLK_LOCK(t, &k);
+    int r = plen ? ldisc_ioctl(t, cmd, (uint64_t)&kb, 1, &k)
+                 : ldisc_ioctl(t, cmd, arg, 1, &k);    /* no payload: no copy either way */
+    tlk_unlock(&k);
+    if (r == 0 && plen && !in && copy_to_user((void*)arg, &kb, plen)) return -14;
+    return r;
+}
+
+/* pty.c, with the pty lock held: `arg` must not be a user pointer for a
+ * request with a payload (use the _kbuf form; pty.c only calls this one for
+ * requests without one). */
+int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) {
+    if (t->is_console) return con_ldisc_ioctl(cmd, arg);
+    tlk_t k = { 0, 0 };
+    return ldisc_ioctl(t, cmd, arg, 0, &k);
+}
 int tty_ldisc_ioctl_kbuf(struct tty* t, uint64_t cmd, void* kbuf) {
-    return ldisc_ioctl(t, cmd, (uint64_t)kbuf, 1);
+    tlk_t k;
+    TLK_LOCK(t, &k);
+    int r = ldisc_ioctl(t, cmd, (uint64_t)kbuf, 1, &k);
+    tlk_unlock(&k);
+    return r;
 }
 
 /* [M40] Console-only requests: graphics handoff (KDSETMODE/KDGETMODE, see
@@ -722,17 +926,34 @@ static int console_kd_ioctl(uint64_t cmd, uint64_t arg) {
 int tty_ioctl(uint64_t cmd, uint64_t arg) {
     int r = console_kd_ioctl(cmd, arg);
     if (r != -515) return r;
-    return tty_ldisc_ioctl(tty_console(), cmd, arg);
+    return con_ldisc_ioctl(cmd, arg);
 }
 
 /* Back to the boot defaults (cooked, echo, ISIG) with empty queues: the
  * kernel shell calls it when a foreground program it ran has finished. */
 void tty_reset(void) {
     struct tty* t = tty_console();
+    tlk_t k;
+    TLK_LOCK(t, &k);
     tio_defaults(&t->tio);
     flush_input(t);
     t->flush_req = 0; t->intr_noproc = 0; t->vtime_pid = 0;
+    con_publish(t);
+    tlk_unlock(&k);
 }
 
 /* Current console termios (for the self-test / debugging). */
-void tty_get_termios(struct tty_termios* out) { *out = tty_console()->tio; }
+void tty_get_termios(struct tty_termios* out) {
+    struct tty* t = tty_console();
+    tlk_t k;
+    TLK_LOCK(t, &k);
+    *out = t->tio;
+    tlk_unlock(&k);
+}
+
+/* [M51] The console's foreground process group is written under the console
+ * lock (signal.c), so it changes between two ldisc operations, never in the
+ * middle of one: once tcsetpgrp() returns, no ISIG / SIGTTIN decision of an
+ * operation that started before it can still target the old group. */
+uint64_t tty_con_lock_irqsave(void) { return spin_lock_irqsave(&tty_con_lock); }
+void tty_con_unlock_irqrestore(uint64_t fl) { spin_unlock_irqrestore(&tty_con_lock, fl); }

@@ -605,3 +605,24 @@ int pty_devfs_readdir(vfs_iter_cb cb, void* user) {
     for (int i = 0; i < n; i++) cb(list[i], user);
     return 0;
 }
+
+#ifdef SECOS_TTY_TEST
+/* [M51] kernel/tty_test.c: a pty pair opened from kernel context (no fds): the
+ * master as /dev/ptmx would give it, the slave unlocked and referenced once,
+ * with the given termios. pty_test_close drops both references. */
+int pty_test_open(void** m, void** s, const struct tty_termios* tio) {
+    extern vfs_inode_t* vfs_lookup(const char*);
+    vfs_inode_t* ptmx = vfs_lookup("/dev/ptmx");
+    vfs_inode_t* mi = NULL;
+    if (!ptmx || !devfs_is_ptmx(ptmx) || pty_alloc(ptmx, &mi) != 0) return -1;
+    uint64_t fl = spin_lock_irqsave(&g_pty_lock);
+    pty_t* p = pty_of(mi, NULL);
+    if (!p) { spin_unlock_irqrestore(&g_pty_lock, fl); return -1; }
+    p->locked = 0; p->srefs++; p->slave_opened = 1;
+    if (tio) p->t.tio = *tio;
+    spin_unlock_irqrestore(&g_pty_lock, fl);
+    *m = mi; *s = &p->sino;
+    return 0;
+}
+void pty_test_close(void* m, void* s) { pty_unref(s); pty_unref(m); }
+#endif
