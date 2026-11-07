@@ -111,13 +111,29 @@ static int clus_zero(uint32_t c){
     return 0;
 }
 
-/* Allocate one free cluster, mark it EOC, zero it. Returns 0 if none free. */
+/* Allocate one free cluster, mark it EOC, zero it. Returns 0 if none free.
+ * [M51 C4] Next-fit from g_alloc_hint (no free cluster below it is skipped
+ * for long: a free lowers the hint), one FAT sector read per 128 entries.
+ * The old first-fit read one FAT sector per cluster from cluster 2 every
+ * time: on a 512-byte-cluster volume a 64 KiB write held the driver lock for
+ * seconds (the lockdep stuck-lock watchdog fired in the C4 stress test). */
+static uint32_t g_alloc_hint = 2;
 static uint32_t fat_alloc(void){
-    for(uint32_t c=2; c<g_total_clusters+2; c++){
-        if(fat_get(c)==0){
-            if(fat_set(c, FAT_EOC)!=0) return 0;
-            if(clus_zero(c)!=0) return 0;
-            return c;
+    uint32_t end = g_total_clusters + 2, per = g_bytes_per_sec / 4;
+    if(g_alloc_hint < 2 || g_alloc_hint >= end) g_alloc_hint = 2;
+    for(int pass = 0; pass < 2; pass++){
+        uint32_t c = pass ? 2 : g_alloc_hint, stop = pass ? g_alloc_hint : end;
+        while(c < stop){
+            if(sec_read(g_fat_start + (uint64_t)c / per, g_sec)!=0) return 0;
+            uint32_t last = (c / per + 1) * per;
+            if(last > stop) last = stop;
+            for(; c < last; c++){
+                if((rd32(g_sec + (c % per) * 4) & 0x0FFFFFFFu) != 0) continue;
+                if(fat_set(c, FAT_EOC)!=0) return 0;
+                if(clus_zero(c)!=0) return 0;
+                g_alloc_hint = c + 1;
+                return c;
+            }
         }
     }
     return 0;
@@ -128,6 +144,7 @@ static void fat_free_chain(uint32_t c){
     while(clus_valid(c)){
         uint32_t next = fat_get(c);
         fat_set(c, 0);
+        if(c < g_alloc_hint) g_alloc_hint = c;
         if(next < 0x0FFFFFF8u && next>=2) c = next; else break;
     }
 }
@@ -796,6 +813,7 @@ int fat32_mount(const char* dev_name, const char* mount_point){
     g_inode_used = 0;
     g_fsinfo_sec = rd16(bs+48);
     g_fsinfo_done = 0;
+    g_alloc_hint = 2;
     g_mounted = 1;
     g_fopt = g_fopt_new;                                  /* [M43] this mount's owner/masks */
     mntopts_default(&g_fopt_new);
