@@ -50,10 +50,21 @@ typedef struct vmm_space {
 #define VMM_PHYSMAP_BASE 0xFFFF888000000000ULL
 #define VMM_PHYSMAP_SIZE (64ULL << 40)
 
-// [M12] Higher-half kernel base: the kernel image is linked at this VMA and the
-// low identity (0-512MB) maps to it via PML4[511]. A kernel-image symbol's
-// physical address is its VMA minus this base.
+// [M12] Higher-half kernel LINK base: the kernel image is linked at this VMA.
+// [M45] KASLR: it RUNS at kernel_vma_base() = KERNEL_VMA_BASE + g_kaslr_slide
+// (a random 2 MiB multiple, boot/kaslr.h), where the low 0-512MB is mapped via
+// PML4[511]. A kernel-image symbol's physical address is its runtime VMA minus
+// kernel_vma_base().
 #define KERNEL_VMA_BASE 0xFFFFFFFF80000000ULL
+extern uint64_t g_kaslr_slide;   // kernel/kaslr.c
+static inline uint64_t kernel_vma_base(void) { return KERNEL_VMA_BASE + g_kaslr_slide; }
+// [M45] A kernel-image address as it is in kernel.bin (runtime VA minus the
+// slide), for logs: it resolves with nm/addr2line and does not reveal the slide.
+// Addresses outside the high-half window are returned unchanged.
+static inline uint64_t kaddr_link(uint64_t a) {
+    uint64_t base = kernel_vma_base();
+    return (a >= base && a - base < (512ULL << 20)) ? a - g_kaslr_slide : a;
+}
 
 // Build the physmap from the PMM's RAM ranges (WB, 1G/2M/4K pages, NX).
 void vmm_init_physmap(void);
@@ -86,7 +97,7 @@ static inline uint64_t phys_to_virt(uint64_t phys) { return VMM_PHYSMAP_BASE + p
 static inline uint64_t virt_to_phys(uint64_t virt) { return (virt >= VMM_PHYSMAP_BASE) ? (virt - VMM_PHYSMAP_BASE) : 0; }
 
 // [M12] Translate any kernel-reachable virtual address to physical:
-//   - kernel image (>= KERNEL_VMA_BASE)  -> v - KERNEL_VMA_BASE
+//   - kernel image (>= KERNEL_VMA_BASE)  -> v - kernel_vma_base()
 //   - physmap      (>= VMM_PHYSMAP_BASE) -> v - VMM_PHYSMAP_BASE
 //   - otherwise                          -> page-table walk ([M44])
 // Used where a static/kernel pointer must be handed to hardware as a physical
@@ -96,7 +107,7 @@ static inline uint64_t virt_to_phys(uint64_t virt) { return (virt >= VMM_PHYSMAP
 // is retired after early boot), so a low pointer yields 0, never "itself".
 uint64_t vmm_kvirt_to_phys_slow(uint64_t v);
 static inline uint64_t kvirt_to_phys(uint64_t v) {
-    if (v >= KERNEL_VMA_BASE)  return v - KERNEL_VMA_BASE;
+    if (v >= KERNEL_VMA_BASE)  return v - kernel_vma_base();
     if (v >= VMM_PHYSMAP_BASE && v < VMM_PHYSMAP_BASE + VMM_PHYSMAP_SIZE) return v - VMM_PHYSMAP_BASE;
     return vmm_kvirt_to_phys_slow(v);
 }

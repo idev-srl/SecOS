@@ -2516,14 +2516,21 @@ void cpu_enable_mitigations(void) {
 // logged so a build can be attested against its expected hash. The signed user
 // programs (M9) are separately verified at load, so the whole trust chain — boot
 // loader (future) -> kernel measurement -> signed userland — is covered.
+//
+// [M45] KASLR: the relocator patched every absolute high-half reference by the
+// slide, so the live bytes differ per boot. The measurement reverts each
+// relocated field to its link-time value while hashing (kaslr.c), i.e. it hashes
+// the image exactly as it is in the signed, reproducible kernel.bin: the value
+// is slide-independent and still matches a host-side sha256 of the file.
 #include "../crypto/sha256.h"
+#include "../boot/kaslr.h"
 extern char _text_start[], _rodata_end[];
 void boot_measure(void) {
     const uint8_t* start = (const uint8_t*)_text_start;
     const uint8_t* end   = (const uint8_t*)_rodata_end;
     if (end <= start) { debugcon_writestring("[M37] measurement: bad bounds\n"); return; }
     uint8_t digest[32];
-    sha256(start, (size_t)(end - start), digest);
+    kaslr_sha256_unrelocated(start, end, digest);
     debugcon_writestring("[M37] kernel code measurement (sha256 .text+.rodata): ");
     static const char hx[] = "0123456789abcdef";
     for (int i = 0; i < 32; i++) {
@@ -2535,6 +2542,7 @@ void boot_measure(void) {
 
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // --- Phase 1 begins (old .bss stack) ---
+    kaslr_init();       // [M45] read back + self-check the KASLR slide (first!)
     terminal_initialize();
     cpu_enable_sse();   // [M34] FPU/SSE for ring-3 (lua & other FP userland)
     cpu_enable_mitigations(); // [M36] SMEP/SMAP/canary
@@ -2546,6 +2554,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // readable.  BUILD_TS and GIT_HASH are injected by the Makefile as -D macros.
     debugcon_writestring("SECoS build " BUILD_TS " git:" GIT_HASH "\n");
     print_banner();
+    kaslr_report();     // [M45] "KASLR on/off" (never the slide)
 
     // Save for phase2 (framebuffer)
     g_multiboot_magic = multiboot_magic;

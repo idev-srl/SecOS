@@ -89,6 +89,7 @@ static void memset8(uint8_t* dst, uint8_t v, uint64_t n) { while(n--) *dst++ = v
 secos_loaded_segment_t g_loaded_segments[SECOS_MAX_SEGMENTS];
 uint16_t g_loaded_segment_count = 0;
 void* g_kernel_entry = NULL;
+uint64_t g_kaslr_table_phys = 0;   // [M45] physical load address of the .kaslr table
 
 // Reads entire file into a newly allocated pool buffer.
 static EFI_STATUS read_file_into_buffer(EFI_SYSTEM_TABLE* st, const CHAR16* name, uint8_t** out_buf, uint64_t* out_size) {
@@ -225,6 +226,28 @@ EFI_STATUS elf_load_kernel(EFI_SYSTEM_TABLE* SystemTable, void** entry_out) {
                 if (strneq(strtab + syms[si].st_name, "_uefi_start"))
                     uefi_entry = syms[si].st_value;
             }
+        }
+    }
+    /* [M45] Locate the KASLR relocation table (section .kaslr) and translate
+     * its link VA to the physical address it is loaded at (via the PT_LOAD
+     * that holds it). It is applied after the segments are placed (boot.c).
+     * The file was already signature-verified, so the table is trusted. */
+    if (eh->e_shoff && eh->e_shnum && eh->e_shentsize == sizeof(elf64_shdr_t) &&
+        eh->e_shstrndx < eh->e_shnum &&
+        eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(elf64_shdr_t) <= file_len) {
+        elf64_shdr_t* sh = (elf64_shdr_t*)(file_buf + eh->e_shoff);
+        elf64_shdr_t* ss = &sh[eh->e_shstrndx];
+        for (uint16_t s = 0; s < eh->e_shnum && ss->sh_offset < file_len; s++) {
+            if (sh[s].sh_name + 7 > ss->sh_size) continue;
+            if (!strneq((const char*)(file_buf + ss->sh_offset + sh[s].sh_name), ".kaslr")) continue;
+            if (sh[s].sh_size < 48) break;
+            for (uint16_t i = 0; i < eh->e_phnum; i++) {
+                if (ph[i].p_type != PT_LOAD) continue;
+                if (sh[s].sh_addr >= ph[i].p_vaddr &&
+                    sh[s].sh_addr + sh[s].sh_size <= ph[i].p_vaddr + ph[i].p_filesz)
+                    g_kaslr_table_phys = ph[i].p_paddr + (sh[s].sh_addr - ph[i].p_vaddr);
+            }
+            break;
         }
     }
     *entry_out = (void*)(uefi_entry ? uefi_entry : eh->e_entry);

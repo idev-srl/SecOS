@@ -1,6 +1,8 @@
 /*
  * SecOS Kernel - Linker Script (higher-half)
- * The kernel runs at the canonical high-half base KERNEL_VMA = 0xFFFFFFFF80000000.
+ * The kernel is LINKED at the canonical high-half base KERNEL_VMA =
+ * 0xFFFFFFFF80000000; at boot it is slid by a random 2 MiB multiple (KASLR, M45,
+ * boot/kaslr.h) and runs at KERNEL_VMA + slide.
  * A small .boot section stays at its low physical load address (identity) so the
  * 32-bit Multiboot2 entry can run before paging maps the high half. All other
  * sections are linked HIGH (VMA) but LOADED low (LMA = VMA - KERNEL_VMA), so the
@@ -24,6 +26,7 @@ SECTIONS
         mb2_header_start = .;
         KEEP(*(.multiboot))
         *(.boot.text*)
+        *(.boot.rodata*)
         *(.boot.data*)
         . = ALIGN(4K);
         *(.boot.bss*)
@@ -70,6 +73,20 @@ SECTIONS
         *(.data*)
         _data_end = .;
     }
+
+    /* [M45] KASLR relocation table (boot/kaslr.h, tools/kaslr-relocs.py). It
+     * is produced from a first link and linked back in here, AFTER every
+     * section that carries relocations and BEFORE .bss, so adding it moves
+     * nothing the table describes (the Makefile re-extracts and compares).
+     * Loaded with the image and covered by the kernel signature. The early
+     * relocators find it by its physical load address _kaslr_phys. */
+    .kaslr ALIGN(4K) : AT(ADDR(.kaslr) - KERNEL_VMA) {
+        _kaslr_start = .;
+        KEEP(*(.kaslr))
+        . = ALIGN(8);
+        _kaslr_end = .;
+    }
+    _kaslr_phys = LOADADDR(.kaslr);
 
     .bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_VMA) {
         _bss_start = .;

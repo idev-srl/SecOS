@@ -242,6 +242,28 @@ static const EFI_GUID EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID = {0x9042a9de,0x23dc,0x4
 // NOTE: GUIDs below should be verified against the UEFI specification; provided values are placeholders that may need adjustment.
 static const EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID = {0x964e5b22,0x6459,0x11d2,{0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b}};
 
+// [M45] KASLR: the loader reads its own load options (for `nokaslr`) and asks
+// the firmware RNG for entropy when it has one.
+static const EFI_GUID EFI_LOADED_IMAGE_PROTOCOL_GUID = {0x5b1b31a1,0x9562,0x11d2,{0x8e,0x3f,0x00,0xa0,0xc9,0x69,0x72,0x3b}};
+static const EFI_GUID EFI_RNG_PROTOCOL_GUID = {0x3152bca5,0xeade,0x433d,{0x86,0x2e,0xc0,0x1c,0xdc,0x29,0x1f,0x44}};
+typedef EFI_STATUS (EFIAPI *EFI_HANDLE_PROTOCOL)(EFI_HANDLE Handle, const EFI_GUID* Protocol, void** Interface);
+typedef struct {
+    uint32_t   Revision;
+    EFI_HANDLE ParentHandle;
+    void*      SystemTable;
+    EFI_HANDLE DeviceHandle;
+    void*      FilePath;
+    void*      Reserved;
+    uint32_t   LoadOptionsSize;        /* bytes */
+    void*      LoadOptions;            /* CHAR16 command line */
+    void*      ImageBase;
+    uint64_t   ImageSize;
+} EFI_LOADED_IMAGE_PROTOCOL;
+typedef struct EFI_RNG_PROTOCOL {
+    void* GetInfo;
+    EFI_STATUS (EFIAPI *GetRNG)(struct EFI_RNG_PROTOCOL* This, const EFI_GUID* Algorithm,
+                                uint64_t ValueLength, uint8_t* Value);
+} EFI_RNG_PROTOCOL;
 
 // Helper to make a CHAR16 literal (wide) from ASCII (simple macro for short strings)
 #define WIDE(str) ((const CHAR16*)L"" str)
@@ -265,6 +287,7 @@ typedef struct {
 extern secos_loaded_segment_t g_loaded_segments[];       // Array segmenti caricati
 extern uint16_t               g_loaded_segment_count;    // Numero segmenti
 extern void*                  g_kernel_entry;            // Entry point ELF
+extern uint64_t               g_kaslr_table_phys;        // [M45] .kaslr load address (0 = none)
 
 // --- W^X Remap Planning (design-only for now) ---
 // We will later rebuild page tables with 4KB granularity assigning permissions:

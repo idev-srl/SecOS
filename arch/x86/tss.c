@@ -126,7 +126,7 @@ void tss_init(uint64_t kernel_rsp0) {
     tss.iomap_base = sizeof(tss_t);
 
     // --- Build + load the BSP GDT and TSS ---
-    terminal_writestring("[M2] TSS addr: "); print_hex((uint64_t)&tss);
+    terminal_writestring("[M2] TSS addr: "); print_hex(kaddr_link((uint64_t)&tss)); // [M45] link VA
     terminal_writestring(" rsp0: "); print_hex(tss.rsp0); terminal_writestring("\n");
     build_and_load_gdt(gdt_entries, &gdt_tss, gdt_raw, &gdt_ptr, &tss);
 

@@ -9,6 +9,7 @@
  */
 #include "efi.h"
 #include "bootinfo.h"
+#include "kaslr.h"      // [M45] boot/kaslr.h: relocation table + shared core
 // Nota: page table setup minimale (solo identità + segmenti kernel) prima di ExitBootServices.
 
 // [UEFI-FIX] Install the kernel's high-half mapping WITHOUT discarding the
@@ -42,6 +43,33 @@ static void install_kernel_mapping(uint8_t* pml4_copy, uint8_t* pdpt_hi) {
     __asm__ __volatile__("mov $0xC0000080, %%ecx; wrmsr" :: "a"(eax), "d"(edx): "ecx");
 
     __asm__ __volatile__("mov %0, %%cr3" :: "r"((uint64_t)pml4_copy) : "memory");
+}
+
+// [M45] `nokaslr` in the loader's own load options (e.g. started from the UEFI
+// shell as `BOOTX64.EFI nokaslr`, or a boot entry with optional data).
+static int uefi_nokaslr(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
+    EFI_LOADED_IMAGE_PROTOCOL* li = NULL;
+    EFI_HANDLE_PROTOCOL hp = (EFI_HANDLE_PROTOCOL)st->BootServices->HandleProtocol;
+    if (!hp || hp(image, &EFI_LOADED_IMAGE_PROTOCOL_GUID, (void**)&li) != EFI_SUCCESS || !li) return 0;
+    if (!li->LoadOptions || li->LoadOptionsSize < 2) return 0;
+    char buf[256];
+    uint64_t n = li->LoadOptionsSize / 2;
+    if (n > sizeof(buf)) n = sizeof(buf);
+    const CHAR16* w = (const CHAR16*)li->LoadOptions;
+    for (uint64_t i = 0; i < n; i++) buf[i] = (w[i] < 0x80) ? (char)w[i] : '?';
+    return kaslr_cmdline_nokaslr(buf, n);
+}
+
+// [M45] 64 bits from EFI_RNG_PROTOCOL (default algorithm), 0 if unavailable.
+static uint64_t uefi_rng64(EFI_SYSTEM_TABLE* st, int* ok) {
+    EFI_RNG_PROTOCOL* rng = NULL;
+    uint64_t v = 0;
+    *ok = 0;
+    if (st->BootServices->LocateProtocol(&EFI_RNG_PROTOCOL_GUID, NULL, (void**)&rng) != EFI_SUCCESS || !rng)
+        return 0;
+    if (rng->GetRNG(rng, NULL, sizeof(v), (uint8_t*)&v) != EFI_SUCCESS) return 0;
+    *ok = 1;
+    return v;
 }
 
 // Forward: ELF kernel loader (implemented in elf_load.c)
@@ -153,20 +181,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
     // reachable until it installs its own page tables. We allocate one page for a
     // COPY of the firmware PML4 (filled in install_kernel_mapping), the high PDPT
     // and the PDT.
-    uint64_t pml4_phys = 0, pdt_phys = 0, pdpt_hi_phys = 0;
-    uint8_t* pml4_copy = NULL; uint8_t* pdt = NULL; uint8_t* pdpt_hi = NULL;
+    // [M45] KASLR: the window is mapped at KERNEL_VMA + slide once the slide is
+    // known (after the segments are placed and relocated, below); a slid window
+    // can straddle PDPT[510]/[511], hence two PDTs.
+    uint64_t pml4_phys = 0, pdt_phys = 0, pdt2_phys = 0, pdpt_hi_phys = 0;
+    uint8_t* pml4_copy = NULL; uint8_t* pdt = NULL; uint8_t* pdt2 = NULL; uint8_t* pdpt_hi = NULL;
     CHECK_OK("AllocPages PML4",   SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pml4_phys));
     CHECK_OK("AllocPages PDT",    SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdt_phys));
+    CHECK_OK("AllocPages PDT2",   SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdt2_phys));
     CHECK_OK("AllocPages PDPThi", SystemTable->BootServices->AllocatePages(AllocateAnyPages, EFI_LOADER_DATA, 1, &pdpt_hi_phys));
-    pml4_copy = (uint8_t*)pml4_phys; pdt = (uint8_t*)pdt_phys; pdpt_hi = (uint8_t*)pdpt_hi_phys;
-    for(int i=0;i<4096;i++){ pdt[i]=0; pdpt_hi[i]=0; } // pml4_copy is filled from the live PML4 at activate time
-    // High-half backing: identity phys 0-512MB with 2MB pages, exposed at KERNEL_VMA.
-    for(int e=0;e<256;e++) {
-        uint64_t phys = (uint64_t)e << 21; // e*2MB
-        ((uint64_t*)pdt)[e] = phys | 0x83; // Present|Write|PS
-    }
-    // PML4[511] -> PDPThi[510] -> PDT (high half KERNEL_VMA -> phys 0)
-    ((uint64_t*)pdpt_hi)[510] = (uint64_t)pdt | 0x3;
+    pml4_copy = (uint8_t*)pml4_phys; pdt = (uint8_t*)pdt_phys; pdt2 = (uint8_t*)pdt2_phys; pdpt_hi = (uint8_t*)pdpt_hi_phys;
+    for(int i=0;i<4096;i++){ pdpt_hi[i]=0; } // pml4_copy is filled from the live PML4 at activate time
 
     // Fase 3: Rimappare segmenti ELF (placeholder: già copiati in pool; mapping reale post-ExitBootServices non ancora implementato).
     // Per implementazione completa servirebbe allocare memoria fisica alle vaddr e copiare i dati fuori da pool temporaneo.
@@ -199,6 +224,48 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable
         puts16(SystemTable, WIDE("[INFO] Copia segmenti completata (W^X da applicare con pagine 4KB)\r\n"));
         // TODO: Convertire flags ELF in permessi pagine (rimappando con 4KB granularità): RW per data, RX per codice.
     }
+
+    // [M45] KASLR: pick the slide, apply the (signature-verified) relocation
+    // table to the placed image, and map the high-half window at the slid base.
+    // The slide value itself is never printed.
+    uint64_t kaslr_slide = 0;
+    {
+        struct kaslr_hdr* kh = (struct kaslr_hdr*)g_kaslr_table_phys;
+        if (kh && kaslr_hdr_valid(kh) && !(kh->state & KASLR_ST_APPLIED)) {
+            uint32_t state = KASLR_ST_UEFI, source = KASLR_SRC_NONE;
+            if (kh->flags & KASLR_F_DISABLED) {
+                state |= KASLR_ST_OFF_BUILD;
+                puts16(SystemTable, WIDE("[KASLR] off (built with SECOS_NO_KASLR)\r\n"));
+            } else if (uefi_nokaslr(ImageHandle, SystemTable)) {
+                state |= KASLR_ST_OFF_CMD;
+                puts16(SystemTable, WIDE("[KASLR] off (nokaslr)\r\n"));
+            } else {
+                int rng_ok = 0;
+                uint64_t extra = uefi_rng64(SystemTable, &rng_ok);
+                uint64_t rnd = kaslr_entropy(extra, 1, &source);
+                if (rng_ok && source == KASLR_SRC_TSC) source = KASLR_SRC_EFI_RNG;
+                kaslr_slide = kaslr_pick_slide(rnd, kh->slots);
+                state |= KASLR_ST_RANDOM;
+                puts16(SystemTable, WIDE("[KASLR] on, kernel base randomized (768 slots x 2 MiB)\r\n"));
+            }
+            if (kaslr_apply(kh, kaslr_slide, source, state) != 0) kaslr_slide = 0;
+            // Independent draw for the stack-protector guard (also when the
+            // slide is disabled).
+            {
+                int ok2 = 0;
+                uint64_t e2 = uefi_rng64(SystemTable, &ok2);
+                uint32_t src2;
+                kaslr_set_guard(kh, kaslr_entropy(e2 ^ kaslr_slide, 1, &src2));
+            }
+        } else if (kh && kaslr_hdr_valid(kh)) {
+            kaslr_slide = kh->slide;   // already applied (never happens on a fresh load)
+        } else {
+            puts16(SystemTable, WIDE("[KASLR] no relocation table: kernel at its link base\r\n"));
+        }
+    }
+    kaslr_map_window((uint64_t*)pdpt_hi, (uint64_t*)pdt, (uint64_t*)pdt2, kaslr_slide);
+    if ((uint64_t)kernel_entry >= KASLR_LINK_BASE)        // the high-half _uefi_start
+        kernel_entry = (void*)((uint64_t)kernel_entry + kaslr_slide);
 
     // Salva valori GOP prima di ExitBootServices (gop->Mode è boot-services memory, freed dopo EBS).
     uint64_t saved_fb_addr = 0, saved_fb_w = 0, saved_fb_h = 0, saved_fb_pitch = 0;
