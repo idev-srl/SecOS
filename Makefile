@@ -970,6 +970,14 @@ run-gui: iso $(ROOT_DEP)
 run-vnc: iso $(ROOT_DEP)
 	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -display vnc=:0 -debugcon stdio -global isa-debugcon.iobase=0xe9
 
+# [M50] Lock validator run: a -DSECOS_LOCKDEP image through the SMP stress
+# (-smp 4/8), the network stress and a bkl=off boot; must stay free of
+# [LOCKDEP] reports (tools/lockdep_check.sh, ~25 min). Leaves a lockdep build
+# in the tree: `make clean` afterwards.
+.PHONY: lockdep-check
+lockdep-check:
+	tools/lockdep_check.sh
+
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
