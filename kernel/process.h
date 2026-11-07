@@ -63,8 +63,15 @@ typedef struct process {
     uint64_t stack_top;
     uint64_t kstack_top; // kernel stack top (for future trap/switch)
     uint8_t  kstack_slot; // bounded slot index for kernel stack region
+    // [M52] PROC_EMBRYO: in the table but still being built (no kstack / tf
+    // yet) or held by its creator while it is wired up. Nothing ever moves it
+    // out of that state but its creator: no wake-up (signal_post, waits)
+    // touches it -- they only know BLOCKED/STOPPED -- and no CPU picks it.
+    // It used to be BLOCKED, and a signal posted to its group (Ctrl-C, or
+    // kill() from another CPU) could make a half-built process READY.
     enum { PROC_NEW, PROC_READY, PROC_RUNNING, PROC_BLOCKED, PROC_ZOMBIE,
-           PROC_STOPPED /* [M30] job-control stop (SIGSTOP/SIGTSTP) */ } state;
+           PROC_STOPPED /* [M30] job-control stop (SIGSTOP/SIGTSTP) */,
+           PROC_EMBRYO } state;
     trapframe_t* tf;      // [M6] saved trapframe for context switch
     struct regs_snapshot {
         uint64_t rip, rsp, rflags;
@@ -270,6 +277,7 @@ int        process_pid_state(uint32_t pid);    // state of pid, -1 when gone (no
 // from the table and return it for process_destroy(); NULL otherwise.
 process_t* process_detach_unstarted(uint32_t pid);
 void process_foreach(void (*cb)(process_t*, void*), void* user);
+void process_foreach_locked(void (*cb)(process_t*, void*), void* user);   // proc_lock held
 process_t* process_reap_one(void); // [M48] detach+return one reapable, off-CPU, unreferenced ZOMBIE
 // [M39/M50-B1] wait-any: collect an uncollected zombie child of ppid (marks it
 // collected under proc_lock); 1 + *pid/*code when one was found, else 0.

@@ -212,7 +212,8 @@ static char state_char(int st){
 }
 static const char* state_name(int st){
     switch(st){ case PROC_BLOCKED: return "S (sleeping)"; case PROC_STOPPED: return "T (stopped)";
-                case PROC_ZOMBIE: return "Z (zombie)"; default: return "R (running)"; }
+                case PROC_ZOMBIE: return "Z (zombie)"; case PROC_EMBRYO: return "D (disk sleep)";
+                default: return "R (running)"; }
 }
 
 /* Absolute path of an fd's file: mount point + mount-relative inode path. */

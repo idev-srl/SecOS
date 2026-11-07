@@ -241,6 +241,15 @@ static void proc_remove(process_t* p) {
     spin_unlock_irqrestore(&proc_lock, fl);
 }
 
+// [M52] A process that failed construction after proc_add: take it out of the
+// table, then wait for the references taken meanwhile (a signal being posted
+// to its group, a /proc reader) before the caller frees it. It is EMBRYO, so
+// nobody can be running it; the holders keep it for a few microseconds.
+static void proc_remove_unbuilt(process_t* p) {
+    proc_remove(p);
+    while (__atomic_load_n(&p->refs, __ATOMIC_ACQUIRE) != 0) cpu_relax_poll();
+}
+
 // [M50-B1] References. Taken under proc_lock, so a lookup can never race the
 // reaper's detach (process_reap_one checks refs under the same lock); dropped
 // with a plain atomic decrement: the reaper reads 0 only after the last user
@@ -322,6 +331,16 @@ void process_set_cred(process_t* p, const struct proc_cred* cr) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     p->cred = *cr;
     spin_unlock_irqrestore(&proc_lock, fl);
+}
+
+// [M52] The same walk for a caller that already holds proc_lock (a check and
+// the store it guards in one critical section).
+void process_foreach_locked(void (*cb)(process_t*, void*), void* user) {
+    SPIN_ASSERT_HELD(&proc_lock);
+    if (!cb) return;
+    for (int i=0;i<MAX_PROCESSES;i++) {
+        if (proc_table[i]) cb(proc_table[i], user);
+    }
 }
 
 void process_foreach(void (*cb)(process_t*, void*), void* user) {
@@ -759,8 +778,9 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     p->tf = NULL;
     // [M8] Non-runnable while under construction: with preemptive scheduling
     // active, the scheduler must not pick this process (tf still NULL) until it
-    // is fully built. Promoted to PROC_NEW at the end.
-    p->state = PROC_BLOCKED;
+    // is fully built. Promoted to PROC_NEW at the end. [M52] EMBRYO, not
+    // BLOCKED: a signal posted to it meanwhile must not make it runnable.
+    p->state = PROC_EMBRYO;
     p->manifest = NULL;
     // [M11] Default privilege: USER, no device binding. Upgraded below only if
     // the (already signature-verified) manifest declares PROC_TYPE_DRIVER.
@@ -849,7 +869,7 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     p->kstack_top = vmm_alloc_kernel_stack_for_slot(p->kstack_slot);
     if (!p->kstack_top) {
         terminal_writestring("[PROC] kstack alloc failed\n");
-        proc_remove(p);
+        proc_remove_unbuilt(p);
         goto fail_unbound;
     }
     // [M6] Allocate and initialize trapframe for initial iretq entry
@@ -857,7 +877,7 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     if (!p->tf) {
         terminal_writestring("[PROC] trapframe alloc failed\n");
         vmm_free_kernel_stack_for_slot(p->kstack_slot); p->kstack_top = 0;
-        proc_remove(p);
+        proc_remove_unbuilt(p);
         goto fail_unbound;
     }
     {
@@ -1145,7 +1165,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->wait_tty = 0; c->power_phase = 0; c->power_deadline = 0;
     c->wait_pty = NULL;                        // sid/ctty/ctty_detached inherited (copied)
     c->sigsusp_active = 0; c->sigsusp_saved = 0;
-    c->state = PROC_BLOCKED;                   // not runnable until fully built
+    c->state = PROC_EMBRYO;                    // not runnable until fully built (M52)
     { extern void kiface_proc_fork(process_t*); kiface_proc_fork(c); }
 
     // [M25] The child inherits the parent's open pipe ends (fds were shallow
@@ -1168,7 +1188,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     }
     c->kstack_top = vmm_alloc_kernel_stack_for_slot(c->kstack_slot);
     if (!c->kstack_top) {
-        proc_remove(c); process_release_pipes(c); kfree(c->tf); if (c->manifest) kfree(c->manifest);
+        proc_remove_unbuilt(c); process_release_pipes(c); kfree(c->tf); if (c->manifest) kfree(c->manifest);
         if (c->image) kfree(c->image); vmm_space_destroy(c->space); kfree(c); return NULL;
     }
     debugcon_writestring("[FORK] parent="); debugcon_print_hex(parent->pid);

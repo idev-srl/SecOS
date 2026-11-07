@@ -1707,11 +1707,15 @@ static void sh_wait_tick(void){
     bkl_resume(d);
 }
 
+// [M52] The hold is EMBRYO (was BLOCKED): no signal can make a stage runnable
+// before its fds are wired. A stage killed on the failure path gets the
+// SIGKILL pending and is released like the others: it dies at its first
+// kernel exit.
 static int sh_hold_new(process_t* p){
-    return __sync_bool_compare_and_swap(&p->state, PROC_NEW, PROC_BLOCKED);
+    return __sync_bool_compare_and_swap(&p->state, PROC_NEW, PROC_EMBRYO);
 }
 static void sh_release(process_t* p, int held){
-    if(held) sched_wake_task(p, PROC_BLOCKED);
+    if(held && __sync_bool_compare_and_swap(&p->state, PROC_EMBRYO, PROC_NEW)) sched_make_ready(p);
 }
 
 static void run_job(char* line, int background){
@@ -1770,11 +1774,13 @@ static void run_job(char* line, int background){
                 terminal_writestring(" (missing or unsigned)\n"); goto fail; }
         held[created]=sh_hold_new(p);
         // Wire stdin from the previous stage's pipe, stdout to a fresh pipe.
-        if(prev_read){ p->fds[0].used=1; p->fds[0].is_pipe=1; p->fds[0].pipe_w=0; p->fds[0].inode=prev_read; prev_read=NULL; }
+        // [M52] fd stores under the child's mm_lock (the fd-table contract of
+        // M51 C2): procfs and the umount busy check can already see it.
+        if(prev_read){ uint64_t fl=mm_lock(p); p->fds[0].used=1; p->fds[0].is_pipe=1; p->fds[0].pipe_w=0; p->fds[0].inode=prev_read; mm_unlock(p, fl); prev_read=NULL; }
         if(i < ns-1){
             void* pp=pipe_alloc();
             if(!pp){ terminal_writestring("pipe: out of pipes\n"); procs[created]=p; pids[created]=p->pid; created++; goto fail; }
-            p->fds[1].used=1; p->fds[1].is_pipe=1; p->fds[1].pipe_w=1; p->fds[1].inode=pp;
+            { uint64_t fl=mm_lock(p); p->fds[1].used=1; p->fds[1].is_pipe=1; p->fds[1].pipe_w=1; p->fds[1].inode=pp; mm_unlock(p, fl); }
             prev_read=pp;
         } else if(redir){
             // [M38] last stage: redirect stdout to the file (create / truncate / append).
@@ -1784,7 +1790,8 @@ static void run_job(char* line, int background){
             vfs_inode_t* fino=vfs_lookup(redir);
             if(!fino){ vfs_create(redir,"",0); fino=vfs_lookup(redir); }
             else if(!redir_append){ vfs_truncate(redir,0); fino=vfs_lookup(redir); }
-            if(fino){ p->fds[1].used=1; p->fds[1].is_pipe=0; p->fds[1].pipe_w=0; p->fds[1].inode=fino; p->fds[1].flags=1 /*O_WRONLY*/; p->fds[1].offset = redir_append ? fino->size : 0; }
+            if(fino){ uint64_t fl=mm_lock(p); p->fds[1].used=1; p->fds[1].is_pipe=0; p->fds[1].pipe_w=0; p->fds[1].inode=fino; mm_unlock(p, fl);
+                      p->fds[1].flags=1 /*O_WRONLY*/; p->fds[1].offset = redir_append ? fino->size : 0; }
             else { terminal_writestring("redirect: cannot open "); terminal_writestring(redir); terminal_writestring("\n"); procs[created]=p; pids[created]=p->pid; created++; goto fail; }
         }
         if(i==0) pgid=p->pid;
@@ -2116,7 +2123,7 @@ static void sh_pinfo(const char* a){
     if(!p){ terminal_writestring("[PINFO] PID not found\n"); return; }
     char hx[]="0123456789ABCDEF"; char buf[64];
     terminal_writestring("[PINFO] PID="); for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->pid>>i)&0xF]);
-    terminal_writestring(" state="); const char* st="UNKNOWN"; switch(p->state){case PROC_NEW:st="NEW";break;case PROC_READY:st="READY";break;case PROC_RUNNING:st="RUN";break;case PROC_BLOCKED:st="BLK";break;case PROC_ZOMBIE:st="ZOMB";break;} terminal_writestring(st);
+    terminal_writestring(" state="); const char* st="UNKNOWN"; switch(p->state){case PROC_NEW:st="NEW";break;case PROC_READY:st="READY";break;case PROC_RUNNING:st="RUN";break;case PROC_BLOCKED:st="BLK";break;case PROC_ZOMBIE:st="ZOMB";break;case PROC_EMBRYO:st="EMB";break;} terminal_writestring(st);
     terminal_writestring("\n  entry="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->entry>>i)&0xF]);
     terminal_writestring(" stack_top="); for(int i=60;i>=0;i-=4) terminal_putchar(hx[(p->stack_top>>i)&0xF]);
     terminal_writestring(" pages="); itoa(p->mapped_page_count, buf, 10); terminal_writestring(buf);
@@ -2219,9 +2226,9 @@ static void ps_cb_impl(process_t* p, void* user) {
     terminal_writestring(" pages="); for(int i=28;i>=0;i-=4) terminal_putchar(hx[(p->mapped_page_count>>i)&0xF]);
     terminal_writestring(" memKB="); char buf[32]; itoa(memkb,buf,10); terminal_writestring(buf);
     terminal_writestring(" cpuTicks="); itoa(p->cpu_ticks, buf, 10); terminal_writestring(buf);
-    const char* st="UNKNOWN"; switch(p->state){case PROC_NEW:st="NEW";break;case PROC_READY:st="READY";break;case PROC_RUNNING:st="RUN";break;case PROC_BLOCKED:st="BLK";break;case PROC_ZOMBIE:st="ZOMB";break;} terminal_writestring(" state="); terminal_writestring(st); terminal_writestring("\n");
+    const char* st="UNKNOWN"; switch(p->state){case PROC_NEW:st="NEW";break;case PROC_READY:st="READY";break;case PROC_RUNNING:st="RUN";break;case PROC_BLOCKED:st="BLK";break;case PROC_ZOMBIE:st="ZOMB";break;case PROC_EMBRYO:st="EMB";break;} terminal_writestring(" state="); terminal_writestring(st); terminal_writestring("\n");
     ctx->count++; ctx->total_pages += p->mapped_page_count; ctx->total_cpu += p->cpu_ticks;
-    switch(p->state){case PROC_NEW:ctx->st_new++;break;case PROC_READY:ctx->st_ready++;break;case PROC_RUNNING:ctx->st_run++;break;case PROC_BLOCKED:ctx->st_blk++;break;case PROC_ZOMBIE:ctx->st_zomb++;break;}
+    switch(p->state){case PROC_NEW:ctx->st_new++;break;case PROC_READY:ctx->st_ready++;break;case PROC_RUNNING:ctx->st_run++;break;case PROC_BLOCKED:ctx->st_blk++;break;case PROC_ZOMBIE:ctx->st_zomb++;break;case PROC_EMBRYO:ctx->st_new++;break;}
 }
 
 static void shell_ps_list(void) {
