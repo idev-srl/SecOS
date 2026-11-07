@@ -588,11 +588,14 @@ void fb_console_redraw(void){
     { int x, y; if(vt_get_cursor(&x, &y)) fbvt_cursor(x, y, 1); }
     if(dbuf_enabled && dbuf){ dirty_all(); fb_console_flush(); }
 }
+// [M51] Under con_lock (recursive per CPU, the caller in fbdev.c holds it
+// already): the repaint reads the vt grid and writes the shadow buffer and its
+// dirty rectangle, which another CPU's output also does.
 void fb_console_set_graphics(int on){
-    if(on){ fb_gfx = 1; return; }
-    if(!fb_gfx) return;
-    fb_gfx = 0;
-    fb_console_redraw();
+    uint64_t lf = con_lock();
+    if(on){ fb_gfx = 1; con_unlock(lf); return; }
+    if(fb_gfx){ fb_gfx = 0; fb_console_redraw(); }
+    con_unlock(lf);
 }
 int fb_console_in_graphics(void){ return fb_gfx; }
 void fb_console_set_dbuf_auto(int on){ dbuf_auto_flush = on?1:0; if(dbuf_auto_flush) fb_console_flush(); }
