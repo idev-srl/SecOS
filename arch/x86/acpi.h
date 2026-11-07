@@ -25,6 +25,7 @@ typedef struct {
     uint32_t cpu_count;                   /* enabled processors (LAPICs)        */
     uint32_t lapic_ids[ACPI_MAX_CPUS];    /* per-CPU Local APIC IDs (x2APIC: 32-bit) */
     uint32_t bsp_lapic_id;                /* this (boot) CPU's LAPIC ID         */
+    uint32_t cpus_dropped;                /* enabled CPUs beyond ACPI_MAX_CPUS  */
     uint32_t ioapic_count;
     struct { uint8_t id; uint64_t base; uint32_t gsi_base; } ioapics[ACPI_MAX_IOAPICS];
     uint32_t override_count;

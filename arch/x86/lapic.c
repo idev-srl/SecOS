@@ -139,6 +139,8 @@ int lapic_enable(void) {
     if (g_x2apic) wrmsr(IA32_APIC_BASE_MSR, base | IA32_APIC_BASE_EXTD); /* ... then x2APIC */
 
     uint64_t phys = base & 0xFFFFF000ull;
+    // TODO(M48/bigmem integration): map the LAPIC with vmm_map_mmio() (uncached
+    // MMIO mapping from feat/bigmem) instead of the deprecated physmap shim.
     vmm_extend_physmap(phys + 0x1000);
     g_lapic = (volatile uint32_t*)phys_to_virt(phys);   /* unused in x2APIC mode */
 
@@ -186,6 +188,7 @@ static void ioapic_route_irq(uint8_t irq, uint8_t vector, uint8_t dest_apic_id) 
         if (gsi >= t->ioapics[i].gsi_base) { base = t->ioapics[i].base; gsi_base = t->ioapics[i].gsi_base; }
     uint32_t idx = gsi - gsi_base;
 
+    // TODO(M48/bigmem integration): vmm_map_mmio() for the IOAPIC too.
     vmm_extend_physmap(base + 0x1000);
     g_ioapic = (volatile uint32_t*)phys_to_virt(base);
 
