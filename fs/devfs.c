@@ -223,6 +223,8 @@ static int devfs_readdir(const char* dir, vfs_iter_cb cb, void* user) {
 // kernel/pty.c and drivers/input.c, whose own locks rank below this one.
 static int devfs_setattr(const char* rel, const vfs_attr_t* a, unsigned valid) {
     if (!a) return -1;
+    int pr = pty_devfs_setattr(rel, a, valid);                    /* [M52] /pts/N: pty lock */
+    if (pr <= 0) return pr;
     vfs_inode_t* ino = devfs_lookup(rel);
     if (!ino) return -2;                                           // -ENOENT
     uint64_t fl = spin_lock_irqsave(&g_devfs_lock);

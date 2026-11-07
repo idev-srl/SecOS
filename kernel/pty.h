@@ -84,6 +84,7 @@ long ksys_getsid(int pid);                 /* SYS_GETSID (86) */
 
 /* devfs glue: "/pts" and "/pts/N" lookups and the /pts listing. */
 vfs_inode_t* pty_devfs_lookup(const char* rel);
+int  pty_devfs_setattr(const char* rel, const vfs_attr_t* a, unsigned valid);   /* 1: not /pts/N */
 int  pty_devfs_readdir(vfs_iter_cb cb, void* user);
 extern vfs_inode_t g_pty_dir_inode;        /* /dev/pts */
 

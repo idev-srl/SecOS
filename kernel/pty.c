@@ -61,6 +61,14 @@ typedef struct pty {
 } pty_t;
 
 static pty_t* g_pty[PTY_MAX];
+/* [M52] Pseudo-terminals live in a static pool and are never freed, only
+ * detached (g_pty[idx] = NULL) and reused. A /dev/pts/N lookup hands out
+ * &p->sino after dropping g_pty_lock, and the VFS writes ino->ops into it
+ * and the open path reads its mode/uid; with kmalloc'd ptys a concurrent
+ * hangup could free it in between (a write into freed heap). A slot reused
+ * by another pty in that window is caught by re-checking under the lock
+ * (pty_open_hook, pty_devfs_setattr). */
+static pty_t g_pty_mem[PTY_MAX];
 static spinlock_t g_pty_lock = SPINLOCK_INIT_CLASS(LK_S10_TTY, "pty");
 vfs_inode_t g_pty_dir_inode;
 
@@ -131,9 +139,9 @@ static void hangup_session(struct tty* t) {
 
 /* Common tail: post queued signals, wake waiters, free if released. */
 static void finish(pty_t* p, struct tty_sig* sigs, int nsig, int wake, pty_t* to_free) {
+    (void)to_free;                  /* [M52] detached under the lock; pool slots are not freed */
     tty_post_sigs(sigs, nsig);
     if (wake) sched_wake_pty(p);
-    if (to_free) kfree(to_free);
 }
 
 /* ---- references -------------------------------------------------------------- */
@@ -225,13 +233,12 @@ static void acquire_ctty(process_t* c, pty_t* p) {
 
 /* ---- open ---------------------------------------------------------------------- */
 static int pty_alloc(vfs_inode_t* ptmx, vfs_inode_t** out) {
-    pty_t* np = (pty_t*)kmalloc(sizeof(pty_t));
-    if (!np) return E_NOSPC;
-    for (size_t i = 0; i < sizeof(*np); i++) ((uint8_t*)np)[i] = 0;
     uint64_t fl = spin_lock_irqsave(&g_pty_lock);
     int idx = -1;
     for (int i = 0; i < PTY_MAX; i++) if (!g_pty[i]) { idx = i; break; }
-    if (idx < 0) { spin_unlock_irqrestore(&g_pty_lock, fl); kfree(np); return E_NOSPC; }
+    if (idx < 0) { spin_unlock_irqrestore(&g_pty_lock, fl); return E_NOSPC; }
+    pty_t* np = &g_pty_mem[idx];                    /* [M52] static pool slot */
+    for (size_t i = 0; i < sizeof(*np); i++) ((uint8_t*)np)[i] = 0;
     np->idx = idx;
     tty_instance_init(&np->t, pty_echo_out, np);
     np->mrefs = 1;
@@ -279,6 +286,14 @@ int pty_open_hook(process_t* c, vfs_inode_t** ino, int flags) {
     if (!p) { spin_unlock_irqrestore(&g_pty_lock, fl); return 0; }   /* not a pty node */
     if (k != PTY_KIND_SLAVE) { spin_unlock_irqrestore(&g_pty_lock, fl); return E_IO; }
     if (p->locked || p->mrefs == 0) { spin_unlock_irqrestore(&g_pty_lock, fl); return E_IO; }
+    /* [M52] The open path checked the permission on a lookup made without
+     * this lock; the slot may since have been reused by another user's pty.
+     * Check again against what is there now (cred_inode_perm takes no lock). */
+    {   int acc = flags & 3, mask = 0;
+        if (acc != 1) mask |= MAY_READ;
+        if (acc != 0) mask |= MAY_WRITE;
+        int pe = cred_inode_perm(c, &p->sino, mask);
+        if (pe) { spin_unlock_irqrestore(&g_pty_lock, fl); return pe; } }
     p->srefs++; p->slave_opened = 1;
     /* A session leader without a controlling terminal acquires a free one. */
     int stale = 0;
@@ -598,6 +613,35 @@ vfs_inode_t* pty_devfs_lookup(const char* rel) {
     uint64_t fl = spin_lock_irqsave(&g_pty_lock);
     pty_t* p = g_pty[idx];
     vfs_inode_t* r = (p && p->mrefs > 0) ? &p->sino : NULL;
+    spin_unlock_irqrestore(&g_pty_lock, fl);
+    return r;
+}
+
+/* [M52] chmod/chown/utimes of /dev/pts/N (devfs routes them here): applied to
+ * the live slave under g_pty_lock. The caller's permission was checked on an
+ * earlier lookup; unless it is root it must still own the slave now (the
+ * slot may have been reused by another user's pty meanwhile). 1 = not a
+ * /pts/N path, else 0 / -errno. */
+int pty_devfs_setattr(const char* rel, const vfs_attr_t* a, unsigned valid) {
+    if (!(rel[0] == '/' && rel[1] == 'p' && rel[2] == 't' && rel[3] == 's' && rel[4] == '/')) return 1;
+    int idx;
+    if (atoi_dec(rel + 5, &idx) != 0 || idx < 0 || idx >= PTY_MAX) return -2;
+    extern process_t* sched_get_current(void);
+    process_t* c = sched_get_current();
+    uint64_t fl = spin_lock_irqsave(&g_pty_lock);
+    pty_t* p = g_pty[idx];
+    int r = 0;
+    if (!p || p->mrefs <= 0) r = -2;                               /* -ENOENT */
+    else if (!cred_is_root(c) && c->cred.euid != p->sino.uid &&
+             (valid & (VFS_ATTR_MODE | VFS_ATTR_UID | VFS_ATTR_GID))) r = -1;   /* -EPERM */
+    else {
+        vfs_inode_t* ino = &p->sino;
+        if (valid & VFS_ATTR_MODE)  ino->mode = (ino->mode & 0170000u) | (a->mode & 07777u);
+        if (valid & VFS_ATTR_UID)   ino->uid = a->uid;
+        if (valid & VFS_ATTR_GID)   ino->gid = a->gid;
+        if (valid & VFS_ATTR_ATIME) ino->atime = a->atime;
+        if (valid & VFS_ATTR_MTIME) ino->mtime = a->mtime;
+    }
     spin_unlock_irqrestore(&g_pty_lock, fl);
     return r;
 }
