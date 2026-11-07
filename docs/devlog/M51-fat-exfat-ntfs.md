@@ -195,8 +195,12 @@ lock, an unlock of a free lock or a helper reached without the lock aborts).
 `ntfs_fuzz` `list` (compared with ntfs-3g: 3537 objects OK) + 2000 mutated
 images (3946 mounts): no crash, hang, UB or lock-discipline abort.
 
-**Gates** (extracted from `tools/selftest.sh`, run in a private `/tmp`): see
-the results section below.
+**Gates** (the sections extracted from `tools/selftest.sh`, run in a private
+`/tmp`, on the final driver code): M10/fat32, M41 exFAT (good image, corrupt
+suite, host fuzz, userland), MNT (mount hardening, heap-debug), RO (read-only
+mounts), M42 NTFS (good image vs ntfs-3g, corrupt suite, host fuzz, userland):
+**146 passed, 0 failed**. `make lockdep-check`: **pass=18 fail=0**.
+The C4 stress test was re-run after the final API change: 12/12 OK.
 
 ## For phase D
 
