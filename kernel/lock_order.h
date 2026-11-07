@@ -32,7 +32,9 @@
 #define LK_K10_EXEC        10   /* exec_lock: g_spawn_buf / exec staging (B5)   */
 #define LK_K11_SYSROOT     11   /* sysroot_lock, pkg_lock (C6)                  */
 #define LK_K20_VFS_NS      20   /* vfs_ns_lock: mount/umount/remount (C1)       */
-#define LK_K30_FS          30   /* one per FS driver instance (C2-C4)           */
+#define LK_K30_FS          30   /* one per FS driver instance (C2-C4). ramfs:
+                                   ramfs_fs_lock() (C2); inside it only the
+                                   page-cache index (S40) and the heap         */
 #define LK_K35_USB_ENUM    35   /* xhci_enum_lock: USB enumeration incl. hubs;
                                    registers usbN disks and reads them (B3)     */
 #define LK_K40_BLKDEV      40   /* blkdev->lock on the base disk; a partition
@@ -47,14 +49,19 @@
                                    xhci S45 nest inside) (B3)                   */
 #define LK_S15_SUBSYS      115  /* procfs g_proc_lock, g_sysfs_lock,
                                    g_input_lock, g_pipe_lock, g_ipc_lock,
-                                   driver_if_lock (B1)                          */
+                                   driver_if_lock (B1), g_devfs_lock (C2: only
+                                   the block-node append and node chmod/chown;
+                                   the block registry S64 nests inside)        */
 #define LK_N0_NET_TICK     116  /* M47 net locks, net/net_lock.h                */
 #define LK_N1_NET_RX       117
 #define LK_N2_NET_STACK    118
 #define LK_N3_NET_TX       119
 #define LK_S20_MOUNT       120  /* g_mount_lock: mount table only               */
 #define LK_S30_PROC        130  /* proc_lock: process table, refcounts, creds   */
-#define LK_S35_MM          135  /* p->mm_lock (B1, per process)                 */
+#define LK_S35_MM          135  /* p->mm_lock (B1, per process). Since C2 it
+                                   also publishes p->cwd and what each p->fds[]
+                                   entry is: the owner stores under it, procfs
+                                   and sysfs read under proc_lock -> mm_lock   */
 #define LK_S40_PAGECACHE   140  /* pc_lock: page-cache index only. Since B2 no
                                    FS or block call runs under it (misses are
                                    filled unlocked), so it nests INSIDE the FS
