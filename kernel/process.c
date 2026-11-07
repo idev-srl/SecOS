@@ -992,20 +992,25 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     if (old_space) vmm_space_destroy(old_space);
 
     // Close-on-exec descriptors.
+    // [M51 C2] Each entry is unhooked under mm_lock (procfs reads the fd
+    // table of other processes under it), then its object is dropped.
     for (int i = 0; i < 32; i++) {
         if (!p->fds[i].used || !p->fds[i].cloexec) continue;
-        if (p->fds[i].is_pipe) {
-            extern void pipe_unref(void*, int);
-            pipe_unref(p->fds[i].inode, p->fds[i].pipe_w);
-        } else if (p->fds[i].is_sock) {
-            extern void socket_unref(int);
-            socket_unref(p->fds[i].is_sock - 1);
-        } else {
-            pty_unref(p->fds[i].inode);            // a pty end: drop this holder
-            input_obj_unref(p->fds[i].inode);      // [M40] an evdev client
-        }
+        uint64_t ffl = mm_lock(p);
+        struct proc_fd_entry e = p->fds[i];
         p->fds[i].used = 0; p->fds[i].inode = NULL; p->fds[i].is_pipe = 0;
         p->fds[i].pipe_w = 0; p->fds[i].cloexec = 0; p->fds[i].is_sock = 0; p->fds[i].offset = 0; p->fds[i].flags = 0;
+        mm_unlock(p, ffl);
+        if (e.is_pipe) {
+            extern void pipe_unref(void*, int);
+            pipe_unref(e.inode, e.pipe_w);
+        } else if (e.is_sock) {
+            extern void socket_unref(int);
+            socket_unref(e.is_sock - 1);
+        } else {
+            pty_unref(e.inode);                    // a pty end: drop this holder
+            input_obj_unref(e.inode);              // [M40] an evdev client
+        }
     }
     // Signals (POSIX): caught signals revert to SIG_DFL (their handlers lived in
     // the old image); ignored stay ignored; mask and pending set are preserved.
@@ -1163,27 +1168,21 @@ void process_print(const process_t* p) {
 void process_release_pipes(process_t* p) {
     extern void pipe_unref(void*, int); extern void socket_unref(int);
     if (!p) return;
+    // [M51 C2] Entries are unhooked under mm_lock (procfs reads a zombie's
+    // fd table under it) and their objects dropped after it.
     for (int i = 0; i < 32; i++) {
-        if (p->fds[i].used && p->fds[i].is_sock) {   // last ref closes the connection (FIN)
-            int sx = p->fds[i].is_sock - 1;
-            p->fds[i].is_sock = 0; p->fds[i].used = 0; p->fds[i].inode = NULL;
-            socket_unref(sx);
-            continue;
-        }
-        if (p->fds[i].used && p->fds[i].is_pipe) {
-            void* pp = p->fds[i].inode;
-            int   w  = p->fds[i].pipe_w;
-            p->fds[i].is_pipe = 0; p->fds[i].used = 0; p->fds[i].inode = NULL;
-            pipe_unref(pp, w);
-        } else if (p->fds[i].used && pty_is_inode(p->fds[i].inode)) {
-            void* ino = p->fds[i].inode;
-            p->fds[i].used = 0; p->fds[i].inode = NULL;
-            pty_unref(ino);
-        } else if (p->fds[i].used && input_is_client(p->fds[i].inode)) {
-            void* ino = p->fds[i].inode;           // [M40] evdev client (drops a grab)
-            p->fds[i].used = 0; p->fds[i].inode = NULL;
-            input_obj_unref(ino);
-        }
+        if (!p->fds[i].used) continue;
+        int kind = p->fds[i].is_sock ? 1 : p->fds[i].is_pipe ? 2 :
+                   pty_is_inode(p->fds[i].inode) ? 3 : input_is_client(p->fds[i].inode) ? 4 : 0;
+        if (!kind) continue;                         // plain files stay until reap
+        uint64_t ffl = mm_lock(p);
+        struct proc_fd_entry e = p->fds[i];
+        p->fds[i].is_sock = 0; p->fds[i].is_pipe = 0; p->fds[i].used = 0; p->fds[i].inode = NULL;
+        mm_unlock(p, ffl);
+        if (kind == 1) socket_unref(e.is_sock - 1);  // last ref closes the connection (FIN)
+        else if (kind == 2) pipe_unref(e.inode, e.pipe_w);
+        else if (kind == 3) pty_unref(e.inode);
+        else input_obj_unref(e.inode);               // [M40] evdev client (drops a grab)
     }
     pty_proc_exit(p);
     vtcon_proc_exit(p);                            // [M40] graphics owner gone: text console back

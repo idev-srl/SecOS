@@ -40,7 +40,23 @@ void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
 #define SPAWN_MAX_ARGS 8
 #define SPAWN_ARG_LEN  128
 
-static int fd_alloc(process_t* p){ for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; p->fds[i].is_sock=0; return i; } } return -1; }
+// [M51 C2] The owner is the only writer of its fd table and cwd, but procfs
+// (another process's /proc/<pid>/fd, cwd) and the procfs/sysfs inode-pool
+// busy checks read them from other CPUs. Every store that changes what an fd
+// is (used/inode/is_pipe/pipe_w/is_sock) or the cwd is made under the owner's
+// mm_lock, which those readers take; the object references (pipe/socket/pty/
+// evdev) are taken and dropped outside it (their locks rank below S35).
+// offset/flags/cloexec are read by nobody else and stay unlocked.
+static inline uint64_t fdt_lock(process_t* p){ return mm_lock(p); }
+static inline void fdt_unlock(process_t* p, uint64_t fl){ mm_unlock(p, fl); }
+static int fd_alloc(process_t* p){
+    uint64_t fl = fdt_lock(p);
+    for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; p->fds[i].is_sock=0; fdt_unlock(p, fl); return i; } }
+    fdt_unlock(p, fl);
+    return -1;
+}
+// Release an fd slot fd_alloc reserved (error paths).
+static void fd_release(process_t* p, int fd){ uint64_t fl = fdt_lock(p); p->fds[fd].used=0; p->fds[fd].inode=NULL; fdt_unlock(p, fl); }
 
 // Take / drop the extra reference a duplicated fd entry holds on its object
 // (pipe end, socket, pty end or evdev client; pty_ref/pty_unref and
@@ -63,9 +79,11 @@ int ksys_pipe(int kfds[2]){
     extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1;
     pipe_t* p = pipe_alloc(); if(!p) return -1;
     int rfd=fd_alloc(c); if(rfd<0){ pipe_unref(p,0); pipe_unref(p,1); return -1; }
-    int wfd=fd_alloc(c); if(wfd<0){ c->fds[rfd].used=0; pipe_unref(p,0); pipe_unref(p,1); return -1; }
+    int wfd=fd_alloc(c); if(wfd<0){ fd_release(c, rfd); pipe_unref(p,0); pipe_unref(p,1); return -1; }
+    uint64_t fl = fdt_lock(c);
     c->fds[rfd].inode=p; c->fds[rfd].is_pipe=1; c->fds[rfd].pipe_w=0;  // read end
     c->fds[wfd].inode=p; c->fds[wfd].is_pipe=1; c->fds[wfd].pipe_w=1;  // write end
+    fdt_unlock(c, fl);
     kfds[0]=rfd; kfds[1]=wfd;
     return 0;
 }
@@ -97,8 +115,10 @@ static void spawn_inherit_stdio(process_t* parent, process_t* child){
     if(!parent || !child) return;
     for(int i=0;i<3;i++){
         if(!parent->fds[i].used) continue;
+        uint64_t fl = fdt_lock(child);     // the child is already in the process table
         child->fds[i]=parent->fds[i];
         child->fds[i].cloexec=0;
+        fdt_unlock(child, fl);
         fd_entry_ref(&child->fds[i]);
     }
 }
@@ -595,7 +615,8 @@ int ksys_open_mode(const char* path, int flags, uint32_t mode){
     { extern int devfs_open_hook(void*, vfs_inode_t**, int);
       int gr = devfs_open_hook(c, &ino, flags); if(gr<0) return gr; }
     int fd=fd_alloc(c); if(fd<0){ pty_unref(ino); input_obj_unref(ino); return -1; }
-    c->fds[fd].inode=ino; c->fds[fd].flags=flags;
+    { uint64_t fl = fdt_lock(c); c->fds[fd].inode=ino; fdt_unlock(c, fl); }
+    c->fds[fd].flags=flags;
     c->fds[fd].offset = (flags & 0x400) ? ino->size : 0;    // O_APPEND -> seek to end
     c->fds[fd].cloexec = (flags & K_O_CLOEXEC) ? 1 : 0;     // O_CLOEXEC
     c->fds[fd].flags = flags & ~K_O_CLOEXEC;                // F_GETFL: status flags only
@@ -603,8 +624,14 @@ int ksys_open_mode(const char* path, int flags, uint32_t mode){
 }
 int ksys_open(const char* path, int flags){ return ksys_open_mode(path, flags, 0); }
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
-    fd_entry_unref(&c->fds[fd]);   // drop pipe end (EOF/EPIPE) / socket ref (FIN on the last) / pty end (hangup)
-    c->fds[fd].used=0; c->fds[fd].inode=NULL; return 0; }
+    // Unhook the entry first (under the fd-table lock), then drop its object:
+    // pipe end (EOF/EPIPE) / socket ref (FIN on the last) / pty end (hangup).
+    uint64_t fl = fdt_lock(c);
+    struct proc_fd_entry e = c->fds[fd];
+    c->fds[fd].used=0; c->fds[fd].inode=NULL; c->fds[fd].is_pipe=0; c->fds[fd].is_sock=0;
+    fdt_unlock(c, fl);
+    fd_entry_unref(&e);
+    return 0; }
 // [uaccess] read()/write() never touch the user buffer directly: data moves
 // through a kernel bounce buffer and copy_to/from_user, so an unmapped or
 // read-only user page yields -EFAULT (or a short count) instead of a ring-0
@@ -1168,8 +1195,10 @@ int ksys_dup2(int oldfd, int newfd){
     // Take the new reference before dropping the old target, so dup2 of a pty
     // or socket fd over another fd of the same object never hits zero.
     fd_entry_ref(&c->fds[oldfd]);
+    uint64_t fl = fdt_lock(c);
     struct proc_fd_entry old = c->fds[newfd];
     c->fds[newfd]=c->fds[oldfd]; c->fds[newfd].used=1; c->fds[newfd].cloexec=0; // POSIX: dup clears FD_CLOEXEC
+    fdt_unlock(c, fl);
     if(old.used) fd_entry_unref(&old);                         // close the old newfd target
     return newfd;
 }
@@ -1177,7 +1206,9 @@ int ksys_dup(int oldfd){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(oldfd<0||oldfd>=32||!c->fds[oldfd].used) return -1;
     int n=fd_alloc(c); if(n<0) return -1;
+    uint64_t fl = fdt_lock(c);
     c->fds[n]=c->fds[oldfd]; c->fds[n].used=1; c->fds[n].cloexec=0;
+    fdt_unlock(c, fl);
     fd_entry_ref(&c->fds[n]);
     return n;
 }
@@ -1198,8 +1229,10 @@ int ksys_fcntl(int fd, int cmd, long arg){
         if(arg<0||arg>=32) return -22;                       // -EINVAL
         int n=-1; for(int i=(int)arg;i<32;i++) if(!c->fds[i].used){ n=i; break; }
         if(n<0) return -24;                                  // -EMFILE
+        uint64_t fl = fdt_lock(c);
         c->fds[n]=c->fds[fd]; c->fds[n].used=1;
         c->fds[n].cloexec = (cmd==K_F_DUPFD_CLOEXEC) ? 1 : 0;
+        fdt_unlock(c, fl);
         fd_entry_ref(&c->fds[n]);
         return n;
     }
@@ -1226,7 +1259,9 @@ int ksys_chdir(const char* upath){
     if((e = cred_inode_perm(c, ino, MAY_EXEC))) return e;       // -EACCES
     // Keep the path the caller used (symlinks in it intact), as before.
     { int i=0; for(; ab0[i] && i<255; i++) abs[i]=ab0[i]; abs[i]=0; }
+    uint64_t fl = fdt_lock(c);                                  // [M51 C2] procfs reads it
     int i=0; for(; abs[i] && i<255; i++) c->cwd[i]=abs[i]; c->cwd[i]=0;
+    fdt_unlock(c, fl);
     return 0;
 }
 int ksys_getcwd(char* ubuf, int len){
@@ -1593,7 +1628,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
             if (sx < 0) return (uint64_t)(int64_t)sx;
             int fd = fd_alloc(c);
             if (fd < 0) { socket_unref(sx); return (uint64_t)(int64_t)-24; }   /* -EMFILE */
-            c->fds[fd].is_sock = sx + 1;
+            { uint64_t fl = fdt_lock(c); c->fds[fd].is_sock = sx + 1; fdt_unlock(c, fl); }
             c->fds[fd].flags = (uint32_t)(a0 & 0x800);                         /* SOCK_NONBLOCK */
             return (uint64_t)(int64_t)fd;
         }
@@ -1616,8 +1651,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
             int nfd = fd_alloc(c);
             if (nfd < 0) return (uint64_t)(int64_t)-24;                                  /* -EMFILE */
             int nsx = socket_accept(sx);
-            if (nsx < 0) { c->fds[nfd].used = 0; return (uint64_t)(int64_t)nsx; }      /* -EAGAIN: re-run */
-            c->fds[nfd].is_sock = nsx + 1;
+            if (nsx < 0) { fd_release(c, nfd); return (uint64_t)(int64_t)nsx; }        /* -EAGAIN: re-run */
+            { uint64_t fl = fdt_lock(c); c->fds[nfd].is_sock = nsx + 1; fdt_unlock(c, fl); }
             return (uint64_t)(int64_t)nfd;
         }
         case SYS_SEND:

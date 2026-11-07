@@ -106,6 +106,9 @@ void ap_entry(void) {
 #ifdef SECOS_VFS_TEST
         { extern void vfstest_ap(cpu_t*); vfstest_ap(c); }                        // [M51 C1]
 #endif
+#ifdef SECOS_FSVIRT_TEST
+        { extern void fsvirt_selftest_ap(cpu_t*); fsvirt_selftest_ap(c); }        // [M51 C2]
+#endif
         sched_reap_zombies();
         cpu_wait_irq();
     }

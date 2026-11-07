@@ -3109,6 +3109,41 @@ else
     check "PROCRACE gate build" 1
 fi
 
+# ---- M51 FSVIRT GATE [M51 C2]: ramfs / procfs locks under real concurrency ----
+# fs/fsvirt_test.c (-DSECOS_FSVIRT_TEST, lockdep, -smp 4): every CPU runs the
+# ramfs ops at once outside the BKL (create/grow/read/truncate/rename/chmod/
+# readdir/mkdir/unlink + atomic appends to one log, two passes, heap_check
+# and MemFree compared), then procfs readers against a writer rewriting held
+# processes' cwd and fd 5 under mm_lock, a negative control (unlocked writer
+# must be seen torn), and readers while those processes are destroyed.
+echo "[selftest] M51 FSVIRT gate: ramfs/procfs locks, -smp 4, lockdep (mb2, ~60s)..."
+make clean >/dev/null 2>&1 || true
+if make iso CONSOLE=root CFLAGS_EXTRA="-DSECOS_FSVIRT_TEST -DSECOS_LOCKDEP" >/tmp/secos_selftest_build.log 2>&1; then
+    FVDIR=$(mktemp -d /tmp/secos_selftest_fsvt.XXXXXX)
+    cp myos.iso "$FVDIR/fsvt.iso"
+    timeout 150 qemu-system-x86_64 -cdrom "$FVDIR/fsvt.iso" -boot d -smp 4 -m 1G \
+        -debugcon file:"$FVDIR/fsvt.log" -global isa-debugcon.iobase=0xe9 \
+        -no-reboot -no-shutdown -display none -serial null >/dev/null 2>&1 &
+    FVPID=$!
+    for _ in $(seq 1 140); do grep -aq "^\[FSVT\] RESULT " "$FVDIR/fsvt.log" 2>/dev/null && break; sleep 1; done
+    kill "$FVPID" 2>/dev/null; wait "$FVPID" 2>/dev/null
+    while IFS= read -r l; do
+        case "$l" in
+            "[FSVT] FAIL "*)   check "M51 FSVIRT ${l#\[FSVT\] }" 1 ;;
+            "[FSVT] "*": OK")  x=${l#\[FSVT\] }; check "M51 FSVIRT ${x%: OK}" 0 ;;
+            "[FSVT] "*": FAIL") x=${l#\[FSVT\] }; check "M51 FSVIRT ${x%: FAIL}" 1 ;;
+        esac
+    done < <(grep -a "^\[FSVT\] " "$FVDIR/fsvt.log")
+    grep -aq "^\[FSVT\] RESULT PASS" "$FVDIR/fsvt.log"; check "M51 FSVIRT self-test ran to completion and passed" $?
+    ! grep -aq "\[LOCKDEP\]\|PANIC\|\[EXC\]" "$FVDIR/fsvt.log"
+    check "M51 FSVIRT no lockdep violation, panic or CPU exception" $?
+    cp "$FVDIR/fsvt.log" /tmp/secos_selftest_fsvt.log
+    rm -rf "$FVDIR"
+else
+    echo "[selftest] M51 FSVIRT BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "M51 FSVIRT gate build" 1
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
