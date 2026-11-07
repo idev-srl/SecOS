@@ -670,7 +670,13 @@ static int fat32_truncate(const char* path, size_t new_size){
     }
     wr16(loc.raw+20,(uint16_t)(fc>>16)); wr16(loc.raw+26,(uint16_t)(fc&0xFFFF)); wr32(loc.raw+28,(uint32_t)new_size);
     fat_stamp(loc.raw, 0);
-    return dent_write_back(&loc);
+    int r = dent_write_back(&loc);
+    /* An fd open on the file keeps writing through its slot: give it the new
+     * chain head and size (a shrink to 0 freed the old chain; the slot used
+     * to keep pointing at it until the next lookup). */
+    fat_vslot_t* sl = fvslot_find(loc.clus, loc.off);
+    if(sl){ sl->n.first_cluster = fc; sl->n.size = (uint32_t)new_size; sl->v.size = new_size; }
+    return r;
 }
 
 /* rename: an existing target (the VFS checked the type rules) is deleted
