@@ -950,6 +950,8 @@ run-ssh: iso $(ROOT_DEP)
 #   make run-gui KEYMAP=it SSH_AUTHORIZED_KEYS=~/.ssh/id_ed25519.pub GUI_AUTOSTART=1
 # GUI_SMP / GUI_MEM size the guest (SMP is on by default since M48):
 #   make run-gui GUI_SMP=4 GUI_MEM=2G
+# From a Windows ssh client (QEMU in WSL2) use `ssh -4` or 127.0.0.1: hostfwd is
+# IPv4-only and `localhost` -> ::1 costs a ~21 s connect timeout (docs/SSH.md).
 GUI_SSH_PORT ?= 2222
 GUI_SMP ?= 2
 GUI_MEM ?= 512M
