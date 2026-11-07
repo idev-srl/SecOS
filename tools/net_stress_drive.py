@@ -74,17 +74,22 @@ def free_port():
 counters = {"echo": 0, "fire": 0, "udp": 0, "dns": 0}
 
 
-def serve_tcp(port, handler):
+# The host peers bind port 0 and report the kernel-assigned port: probing a
+# "free" port first and binding it later raced other drivers running in
+# parallel (a UDP port that was free for TCP, or taken in between).
+def serve_tcp(handler):
     ls = socket.socket()
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    ls.bind(("127.0.0.1", port))
+    ls.bind(("127.0.0.1", 0))
     ls.listen(64)
+    port = ls.getsockname()[1]
 
     def loop():
         while True:
             c, _ = ls.accept()
             threading.Thread(target=handler, args=(c,), daemon=True).start()
     threading.Thread(target=loop, daemon=True).start()
+    return port
 
 
 def h_echo(c):
@@ -115,9 +120,10 @@ def h_fire(c):
     c.close()
 
 
-def serve_udp_sink(port):
+def serve_udp_sink():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", port))
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
 
     def loop():
         while True:
@@ -125,11 +131,13 @@ def serve_udp_sink(port):
             with lock:
                 counters["udp"] += 1
     threading.Thread(target=loop, daemon=True).start()
+    return port
 
 
-def serve_dns(port):
+def serve_dns():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", port))
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
 
     def loop():
         while True:
@@ -156,14 +164,14 @@ def serve_dns(port):
             with lock:
                 counters["dns"] += 1
     threading.Thread(target=loop, daemon=True).start()
+    return port
 
 
-P_ECHO, P_FIRE, P_UDP, P_DNS = free_port(), free_port(), free_port(), free_port()
-P_SSH, P_LISTEN = free_port(), free_port()
-serve_tcp(P_ECHO, h_echo)
-serve_tcp(P_FIRE, h_fire)
-serve_udp_sink(P_UDP)
-serve_dns(P_DNS)
+P_ECHO = serve_tcp(h_echo)
+P_FIRE = serve_tcp(h_fire)
+P_UDP = serve_udp_sink()
+P_DNS = serve_dns()
+P_SSH, P_LISTEN = free_port(), free_port()   # QEMU hostfwd: bound by QEMU itself
 GUEST_LISTEN = 7777
 
 # ---------------------------------------------------------------- guest
