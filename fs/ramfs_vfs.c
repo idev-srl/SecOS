@@ -102,7 +102,11 @@ static void ramfs_vfs_iter_children(const char* dir_path, vfs_iter_cb cb, void* 
 static int ramfs_vfs_readdir(const char* dir_path, vfs_iter_cb cb, void* user){ if(!cb) return -1; ramfs_vfs_iter_children(dir_path, cb, user); return 0; }
 
 static int ramfs_vfs_read(vfs_inode_t* inode, size_t offset, void* buf, size_t len){ if(!inode || inode->type!=VFS_NODE_FILE) return -1; const ramfs_entry_t* e=(const ramfs_entry_t*)inode->fs_data; if(!e) return -1; if(offset>e->size) return -1; size_t avail = e->size - offset; if(len>avail) len=avail; const uint8_t* src = e->data + offset; for(size_t i=0;i<len;i++) ((uint8_t*)buf)[i]=src[i]; return (int)len; }
-static int ramfs_vfs_write(vfs_inode_t* inode, size_t offset, const void* data, size_t len){ if(!inode || inode->type!=VFS_NODE_FILE) return -1; const ramfs_entry_t* e=(const ramfs_entry_t*)inode->fs_data; if(!e) return -1; return ramfs_write(((const ramfs_entry_t*)e)->name, offset, data, len); }
+// [M50 B2] Keep the inode's size in step with the entry: the page cache fills
+// (and zero-pads) by inode->size, so a file-mmap fault between a growing write
+// and the next lookup cached a page cut at the old size, which no later
+// invalidation removed (read() clamps to the same stale size and hid it).
+static int ramfs_vfs_write(vfs_inode_t* inode, size_t offset, const void* data, size_t len){ if(!inode || inode->type!=VFS_NODE_FILE) return -1; const ramfs_entry_t* e=(const ramfs_entry_t*)inode->fs_data; if(!e) return -1; int r = ramfs_write(((const ramfs_entry_t*)e)->name, offset, data, len); if(r > 0) inode->size = e->size; return r; }
 static int ramfs_vfs_create(const char* path, const void* initial, size_t size){ if(!path) return -1; const char* p=path; if(p[0]=='/') p++; if(ramfs_find(p)) return -1; return ramfs_add(p, initial, size); }
 static int ramfs_vfs_mkdir(const char* path){ if(!path) return -1; const char* p=path; if(p[0]=='/') p++; return ramfs_mkdir(p); }
 static int ramfs_remove_fixed(const char* p, int dir){

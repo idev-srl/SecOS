@@ -2235,6 +2235,11 @@ static void kernel_main_phase2(void) {
             debugcon_writestring(vfs_lookup(bn)?"[M23] /dev block node present\n":"[M23] /dev block node MISSING\n");
         }
     }
+#ifdef SECOS_PAGECACHE_TEST
+    // [M50 B2] Page-cache fill races, forced through a test hook (on this CPU
+    // and against an AP), once the root FS is up.
+    { extern void pagecache_selftest(void); pagecache_selftest(); }
+#endif
 #if M41_EXFAT_DEMO
     // [M41] exFAT self-test, once /mnt and /proc are mounted: the good image on
     // vda, or the corrupt-image suite when AHCI disks are attached.

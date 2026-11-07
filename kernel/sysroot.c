@@ -58,6 +58,7 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_svc_elf.h"
 #include "../crypto/user_sysfuzz_elf.h"
 #include "../crypto/user_smptest_elf.h"   // [M48] SMP regression checks
+#include "../crypto/user_pcstress_elf.h"  // [M50] page-cache coherence stress
 #include "../crypto/user_uaccess_elf.h"
 #include "../crypto/user_abi_test_elf.h"
 #include "../crypto/user_ttytest_elf.h"
@@ -342,6 +343,7 @@ static void build_table(void){
     sf_bin("svc", user_svc_elf, user_svc_elf_len);
     sf_bin("sysfuzz", user_sysfuzz_elf, user_sysfuzz_elf_len);
     sf_bin("smptest", user_smptest_elf, user_smptest_elf_len);
+    sf_bin("pcstress", user_pcstress_elf, user_pcstress_elf_len);
     sf_bin("uaccess_test", user_uaccess_elf, user_uaccess_elf_len);
     sf_bin("abi_test", user_abi_test_elf, user_abi_test_elf_len);
     sf_bin("ttytest", user_ttytest_elf, user_ttytest_elf_len);

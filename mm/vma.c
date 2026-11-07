@@ -173,14 +173,11 @@ int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr) {
         // [M20] Page-cache-backed mmap (MAP_PRIVATE): copy the file's cached page
         // into this private frame. The cache provides shared, coherent bytes; the
         // process gets its own writable copy.
+        // [M50 B2] Copied out by the cache itself (under its lock): a cache
+        // frame may be evicted by another CPU as soon as the lock drops.
         uint64_t foff = v->file_voff + (pg - v->start);
-        uint64_t cphys = pagecache_get_phys(v->file_inode, foff & ~0xFFFULL);
-        if (cphys) {
-            const uint8_t* src = (const uint8_t*)phys_to_virt(cphys);
-            for (int b = 0; b < 0x1000; b++) dst[b] = src[b];
-        } else {
+        if (pagecache_copy_page(v->file_inode, foff, dst) != 0)
             vma_memset(dst, 0, 0x1000);
-        }
     } else if (v->type == VMA_TYPE_FILE && v->file_base) {
         // File content occupies region offsets [file_pad, file_pad+file_len).
         // Intersect it with this page [poff, poff+0x1000) and copy the overlap;

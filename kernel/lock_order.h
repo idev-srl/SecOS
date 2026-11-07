@@ -48,11 +48,18 @@
 #define LK_S20_MOUNT       120  /* g_mount_lock: mount table only               */
 #define LK_S30_PROC        130  /* proc_lock: process table, refcounts, creds   */
 #define LK_S35_MM          135  /* p->mm_lock (B1, per process)                 */
-#define LK_S40_PAGECACHE   140  /* pc_lock: page-cache index                    */
+#define LK_S40_PAGECACHE   140  /* pc_lock: page-cache index only. Since B2 no
+                                   FS or block call runs under it (misses are
+                                   filled unlocked), so it nests INSIDE the FS
+                                   (K30) and block (K40) locks, never above
+                                   them; only the PMM (S75) is taken inside.   */
 #define LK_S42_BLOCK_IO    142  /* block_io_lock (fs/block.c), deleted by B3.
-                                   Not in the plan table: today the page cache
-                                   still calls ops->read under pc_lock (B2), so
-                                   block I/O nests inside S40.                  */
+                                   Not in the plan table. Until B2 the page
+                                   cache called ops->read under pc_lock, so
+                                   block I/O nested inside S40; that nesting is
+                                   gone, the level is kept only so the lock
+                                   stays classified until B3 replaces it with
+                                   the per-disk K40 blkdev->lock.               */
 #define LK_S45_XHCI        145  /* xhci_lock (B3)                               */
 #define LK_S50_KBD         150  /* kbd_lock. con_lock (drivers/vt.c) and the
                                    klog/debugcon line locks (kernel/klog.c) are

@@ -83,6 +83,7 @@ SRC_C   = \
 	$(MM_DIR)/pmm.c $(MM_DIR)/heap.c $(MM_DIR)/vmm.c \
 	$(MM_DIR)/vma.c \
 	$(MM_DIR)/pagecache.c \
+	$(MM_DIR)/pagecache_test.c \
 	$(MM_DIR)/elf.c \
 	$(MM_DIR)/elf_unload.c \
 	$(MM_DIR)/elf_manifest.c \
@@ -528,6 +529,11 @@ user-progs: libcrypt
 	$(LD) --gc-sections -T user/user.ld -o user/smptest.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/smptest.o
 	python3 tools/secos-sign user/smptest.elf --dev
 	python3 tools/elf2h.py user/smptest.elf user_smptest_elf crypto/user_smptest_elf.h
+	# [M50 B2] page-cache coherence stress (read/mmap vs write/truncate/append)
+	$(CC) $(USER_CFLAGS) -c user/pcstress.c    -o user/pcstress.o
+	$(LD) --gc-sections -T user/user.ld -o user/pcstress.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/pcstress.o
+	python3 tools/secos-sign user/pcstress.elf --dev
+	python3 tools/elf2h.py user/pcstress.elf user_pcstress_elf crypto/user_pcstress_elf.h
 	# [uaccess] bad-user-pointer -EFAULT regression test (selftest uaccess gate)
 	$(CC) $(USER_CFLAGS) -c user/uaccess_test.c -o user/uaccess_test.o
 	$(LD) --gc-sections -T user/user.ld -o user/uaccess_test.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/uaccess_test.o
@@ -603,7 +609,7 @@ user-progs: libcrypt
 	$(MAKE) --no-print-directory gui-progs
 	$(MAKE) --no-print-directory acct-progs
 	$(MAKE) --no-print-directory m46-progs
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + smptest + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + smptest + pcstress + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
 
 # [M46] Exec confinement selftest (docs/devlog/M46-exec-confinement.md): one
 # source, three signed manifests -- m46conf (confined driver), m46probe (ambient
