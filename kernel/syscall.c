@@ -1161,12 +1161,15 @@ struct umount_busy { const vfs_fs_ops_t* ops; int busy; };
 static void umount_busy_cb(process_t* p, void* u){
     struct umount_busy* b = (struct umount_busy*)u;
     if(b->busy || p->state == PROC_ZOMBIE) return;
+    // [M50-B1] S30 (process_foreach) -> S35. [M52] The fd table too: its
+    // owner rewrites entries under mm_lock (dup2/close/pipe on another CPU),
+    // and an entry seen mid-change could be a pipe read as a vfs_inode_t.
+    uint64_t fl = mm_lock(p);
     for(int i=0;i<32;i++){
         struct proc_fd_entry* e = &p->fds[i];
         if(!e->used || e->is_pipe || e->is_sock || !e->inode) continue;
-        if(((const vfs_inode_t*)e->inode)->ops == b->ops){ b->busy = 1; return; }
+        if(((const vfs_inode_t*)e->inode)->ops == b->ops){ b->busy = 1; mm_unlock(p, fl); return; }
     }
-    uint64_t fl = mm_lock(p);            // [M50-B1] S30 (process_foreach) -> S35
     for(uint32_t i=0;i<p->vmas.count;i++){
         const vma_t* v = &p->vmas.v[i];
         if(v->type != VMA_TYPE_NONE && v->file_inode && v->file_inode->ops == b->ops){ b->busy = 1; break; }
