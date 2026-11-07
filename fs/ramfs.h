@@ -56,6 +56,7 @@ int ramfs_add_locked(const char* name, const void* data, size_t size);
 int ramfs_write_locked(const char* name, size_t offset, const void* src, size_t len);
 int ramfs_write_entry_locked(ramfs_entry_t* e, size_t offset, const void* src, size_t len);
 int ramfs_truncate_locked(const char* name, size_t new_size);
+int ramfs_truncate_entry_locked(ramfs_entry_t* e, size_t new_size);
 int ramfs_remove_locked(const char* name);
 int ramfs_mkdir_locked(const char* path);
 int ramfs_rmdir_locked(const char* path);

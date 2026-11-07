@@ -94,7 +94,13 @@ int ramfs_write_locked(const char* name, size_t offset, const void* src, size_t 
 }
 
 int ramfs_truncate_locked(const char* name, size_t new_size){
-    ramfs_entry_t* e = (ramfs_entry_t*)ramfs_find_locked(name); if(!e) return -1;
+    return ramfs_truncate_entry_locked((ramfs_entry_t*)ramfs_find_locked(name), new_size);
+}
+// [M52 D3] Truncate the entry itself (an open file's inode points at it,
+// whatever its name now). -1 for NULL, immutable or a directory.
+int ramfs_truncate_entry_locked(ramfs_entry_t* e, size_t new_size){
+    RAMFS_LOCKED();
+    if(!e) return -1;
     if(e->flags & 3) return -1;                   // immutable file / directory
     if(new_size == e->size) return 0;
     if(new_size == 0){ // kmalloc(0) returns NULL: O_TRUNC used to fail and keep the old bytes
