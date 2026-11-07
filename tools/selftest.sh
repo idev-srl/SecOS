@@ -2945,8 +2945,10 @@ fi
 # stress session tools/smp_stress_drive.py on -smp 4 and -smp 8 (CPU-bound
 # jobs, pipelines, fork/exec bursts, FPU across migration + signal handlers,
 # parallel syscall fuzzers; /proc/smp must show migrations and reschedule
-# IPIs, no shootdown timeouts). The same image booted through the GRUB
-# "nosmp" entry keeps a single CPU. x2APIC mode is exercised only when
+# IPIs, no shootdown timeouts); its first step checks that nproc, sysfs,
+# sysconf and sched_getaffinity report every online CPU. The same image
+# booted through the GRUB "nosmp" entry keeps a single CPU (and userland
+# counts 1). x2APIC mode is exercised only when
 # SECOS_QEMU_X2APIC names a QEMU whose TCG supports it (QEMU >= 9).
 echo "[selftest] M48 gate: SMP (shootdown selftest, stress -smp 4/8, nosmp)..."
 M48LOG=/tmp/secos_selftest_m48.log
@@ -2987,6 +2989,10 @@ if make iso >/tmp/secos_selftest_build.log 2>&1; then
         grep -q "\[SMP\] nosmp on the command line" "$M48LOG.nosmp"; check "M48 nosmp boot word keeps the APs parked" $?
         ! grep -q "\[SMP\] online cpus=" "$M48LOG.nosmp"; check "M48 nosmp: no AP brought up" $?
         grep -q "\[INIT\] /bin/init started" "$M48LOG.nosmp"; check "M48 nosmp: system boots to init on one CPU" $?
+        # Userland agrees: nproc, sysfs, Cpus_allowed_list and sysconf all say 1.
+        timeout 400 python3 tools/smp_stress_drive.py --iso "$M48DIR/nosmp.iso" --smp 4 --expect-cpus 1 \
+            --cpus-only --log "$M48DIR/ssd_nosmp.log" > "$M48DIR/ssd_nosmp.out" 2>&1
+        grep -q "^\[SSD\] cpu-count OK" "$M48DIR/ssd_nosmp.out"; check "M48 nosmp: userland CPU count is 1 (nproc, sysfs, sysconf, affinity)" $?
     else
         check "M48 nosmp ISO build" 1
     fi

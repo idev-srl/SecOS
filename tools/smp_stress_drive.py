@@ -12,11 +12,18 @@
 # must show the work actually spread (migrations, reschedule IPIs) and no
 # TLB-shootdown timeouts.
 #
+# The first step checks that userland sees the CPU count the kernel brought
+# online: nproc, nproc --all, /sys/devices/system/cpu/online, the
+# Cpus_allowed_list of /proc/<pid>/status and /bin/smptest cpus (sysconf,
+# get_nprocs, sched_getaffinity). --cpus-only runs just that step, against
+# --expect-cpus (default --smp; 1 for an image booted with nosmp).
+#
 # Output: one "[SSD] <step> OK|FAIL ..." line per step and "[SSD] RESULT ok=N
 # fail=M". Exit 0 when every step passed.
 #
 # Usage: smp_stress_drive.py --iso ISO --smp N [--mem 1G] [--log LOG]
 #                            [--qemu BIN] [--cpu MODEL] [--boot SECS] [--quick]
+#                            [--cpus-only] [--expect-cpus N]
 import sys, time, subprocess, threading, re, argparse
 
 STEPS = [
@@ -38,7 +45,7 @@ STEPS = [
     ("fuzz-par",   "( /bin/sysfuzz -s 11 -b 4 -c 100 & /bin/sysfuzz -s 13 -b 4 -c 100 & /bin/sysfuzz -s 17 -b 4 -c 100 & /bin/sysfuzz -s 19 -b 4 -c 100 & wait ); echo FUZZ-$((6*7))",
                    "FUZZ-42", 600),
 ]
-QUICK = {"spin-jobs", "pipelines", "smp-fpu", "smp-burst", "fuzz-par"}
+QUICK = {"cpu-count", "spin-jobs", "pipelines", "smp-fpu", "smp-burst", "fuzz-par"}
 FAIL_MARKERS = ["[EXC] int=", "[PANIC]", "nested fault", "stack smashing", "CORRUPT",
                 "[TLB] BUG", "shootdown timeout", "LOCKDEP"]
 
@@ -52,7 +59,16 @@ def main():
     ap.add_argument("--cpu", default=None)
     ap.add_argument("--boot", type=float, default=240)
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--cpus-only", action="store_true")
+    ap.add_argument("--expect-cpus", type=int, default=None)
     o = ap.parse_args()
+    ncpu = o.expect_cpus if o.expect_cpus is not None else o.smp
+    cpulist = "0" if ncpu == 1 else f"0-{ncpu - 1}"
+    steps = [("cpu-count",
+              "echo NP-$(nproc)-$(nproc --all)-$(cat /sys/devices/system/cpu/online)"
+              "-$(grep Cpus_allowed_list /proc/self/status | cut -f2); /bin/smptest cpus",
+              f"NP-{ncpu}-{ncpu}-{cpulist}-{cpulist}", 120)]
+    if not o.cpus_only: steps += STEPS
 
     qemu = [o.qemu, "-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp),
             "-debugcon", "file:" + o.log, "-global", "isa-debugcon.iobase=0xe9",
@@ -99,7 +115,7 @@ def main():
     time.sleep(1.0)
 
     idx = 0
-    for name, cmd, expect, tmo in STEPS:
+    for name, cmd, expect, tmo in steps:
         if o.quick and name not in QUICK: continue
         sentinel = f"SSD-END-{idx}"
         line = f"{cmd}; echo SSD-END-$(({idx}+0))\r"
@@ -111,9 +127,17 @@ def main():
         if not done: report(name, False, f"timeout {tmo}s")
         elif m: report(name, False, f"kernel marker {m!r}")
         elif expect not in out: report(name, False, f"expected {expect!r} missing")
+        elif name == "cpu-count" and "[smptest] cpus PASS" not in out:
+            report(name, False, "smptest cpus FAIL: " + (re.findall(r"\[smptest\] cpus=[^\r\n]*", out) or ["?"])[0])
         else: report(name, True)
         idx += 1
         if not alive[0]: break
+
+    if o.cpus_only:
+        report("no-kernel-fault", fault() is None, str(fault() or ""))
+        p.kill()
+        print(f"[SSD] RESULT ok={ok} fail={fail}", flush=True)
+        sys.exit(0 if fail == 0 else 1)
 
     # /proc/smp: work spread across CPUs, no shootdown timeouts
     with lock: since = len(buf)
