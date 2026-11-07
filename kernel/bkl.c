@@ -144,12 +144,13 @@ void bkl_init_mode(void) {
     for (unsigned i = 0; i < sizeof(g_bkl_keep) / sizeof(g_bkl_keep[0]); i++)
         if (g_bkl_keep[i] < SYSCALL_BKL_NR)
             syscall_bkl_mask[g_bkl_keep[i] >> 6] |= 1ULL << (g_bkl_keep[i] & 63);
+    int word = 1;
     if (kernel_cmdline_has("bkl=off")) g_bkl_mode = 0;
     else if (kernel_cmdline_has("bkl=on")) g_bkl_mode = 1;
-    else g_bkl_mode = BKL_MODE_DEFAULT;
+    else { g_bkl_mode = BKL_MODE_DEFAULT; word = 0; }
     debugcon_writestring(g_bkl_mode ? "[BKL] kernel lock mode: bkl=on"
                                     : "[BKL] kernel lock mode: bkl=off");
-    debugcon_writestring(BKL_MODE_DEFAULT == g_bkl_mode ? " (default)" : " (boot word)");
+    debugcon_writestring(word ? " (boot word)" : " (default)");
     debugcon_writestring(", syscall numbers under the BKL (unused ones included): ");
     debugcon_print_hex(syscall_bkl_mask_count());
     debugcon_writestring("/0x100\n");

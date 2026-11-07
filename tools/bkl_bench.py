@@ -107,8 +107,8 @@ def main():
         if seen: p.stdin.write(b"\r"); p.stdin.flush(); time.sleep(4.5)   # fresh prompt
         time.sleep(0.5)
     time.sleep(2)
-    done, out = run("grep -q ' / ext4 ' /proc/mounts && echo ROOT-$((6*7)); grep -o 'bkl=o[nf]*' /proc/smp", 60)
-    report("boot", done and "ROOT-42" in out and f"bkl={o.mode}" in out.split("\n", 1)[-1])
+    done, out = run("grep -q ' / ext4 ' /proc/mounts && echo ROOT-$((6*7)); grep -o 'bkl o[nf]*' /proc/smp", 60)
+    report("boot", done and "ROOT-42" in out and f"bkl {o.mode}" in out.split("\n", 1)[-1])
 
     def timed(name, body, n, unit):
         cmd = f"t0=$(cut -d' ' -f1 /proc/uptime); {body}; t1=$(cut -d' ' -f1 /proc/uptime); echo BT-$t0-$t1"
