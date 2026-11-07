@@ -17,6 +17,7 @@
 #ifndef PERCPU_H
 #define PERCPU_H
 #include <stdint.h>
+#include "klock.h"
 
 struct process;
 struct vmm_space;
@@ -50,6 +51,9 @@ typedef struct cpu {
     uint32_t dbg_n;
     uint64_t dbg_since;         /* timer tick of the line's first byte     */
     char     dbg_line[200];
+    /* [M50] Lock state (kernel/klock.c, kernel/lockdep.c). */
+    uint32_t irq_depth;         /* hardware-interrupt nesting (irq_enter/exit) */
+    klock_task_t klk;           /* klocks held before the scheduler runs here  */
 } cpu_t;
 
 extern cpu_t* g_cpu_ptr[SMP_MAX_CPUS];

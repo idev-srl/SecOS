@@ -13,6 +13,7 @@
 #include "../mm/elf.h" // for ELF_OK
 #include "../mm/vma.h" // [M14] per-process VMAs for demand paging
 #include "cred.h"      // [M43] uid/gid credentials
+#include "klock.h"     // [M50] klock_task_t
 
 // [M11] Process privilege type. A "driver" is a Ring-3 process granted
 // capability-mediated hardware access (SYS_DRIVER). The claim is rooted in the
@@ -199,6 +200,9 @@ typedef struct process {
         char     comm[16];           // executable name (basename of argv[0])
         char     cmdline[256];       // argv, NUL-separated (/proc/<pid>/cmdline)
     } ki;
+    // [M50] Klocks this task holds (kernel/klock.h). Never inherited: fork and
+    // every creation path reset it (klock_task_reset).
+    klock_task_t klk;
 } process_t;
 
 int process_init_system(void); // initialize process table

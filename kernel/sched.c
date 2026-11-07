@@ -24,6 +24,7 @@
 #include "percpu.h"
 #include "lapic.h"
 #include "bkl.h"
+#include "klock.h"
 
 extern uint64_t timer_get_ticks(void);
 
@@ -173,6 +174,7 @@ static void switch_to(process_t* next) {
     // gives up the kernel lock; it re-runs its syscall from the start. (An
     // idle task holding it is never switched away: see the tick.)
     if (prev && prev != me->idle_task) bkl_drop_for(prev);
+    klock_on_switch(prev, me->idle_task);   // [M50] nothing else held; IRQ nesting reset
     { extern void kiface_count_switch(void); kiface_count_switch(); }   // /proc/stat ctxt
     fpu_switch(prev, next, me->idle_task);
     me->current = next;

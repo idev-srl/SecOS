@@ -5,6 +5,7 @@
 #include "user_copy.h"
 #include <stdint.h>
 #include <stddef.h>
+#include "lockdep.h"   /* [M50] no spinlock / non-BKL klock across a user copy */
 
 /* [M36] SMAP: when enabled, the kernel may not touch user pages unless RFLAGS.AC
  * is set. These primitives are the sanctioned bridge, so they raise AC (stac)
@@ -38,6 +39,7 @@ extern long     __uaccess_strncpy(char* dst, const char* usrc, uint64_t max);
 
 int copy_from_user(void* dst, const void* user_src, size_t len) {
     if (!user_range_valid(user_src, len)) return -EFAULT;
+    lockdep_check_copy_user(__builtin_return_address(0));
     ua_begin();
     uint64_t left = __uaccess_copy(dst, user_src, len);
     ua_end();
@@ -46,6 +48,7 @@ int copy_from_user(void* dst, const void* user_src, size_t len) {
 
 int copy_to_user(void* user_dst, const void* src, size_t len) {
     if (!user_range_valid(user_dst, len)) return -EFAULT;
+    lockdep_check_copy_user(__builtin_return_address(0));
     ua_begin();
     uint64_t left = __uaccess_copy(user_dst, src, len);
     ua_end();
@@ -59,6 +62,7 @@ long strncpy_from_user(char* dst, const char* user_src, size_t max) {
     /* Never read past the top of the user range. */
     uint64_t lim = max;
     if (lim > USER_ADDR_MAX - s) lim = USER_ADDR_MAX - s;
+    lockdep_check_copy_user(__builtin_return_address(0));
     ua_begin();
     long n = __uaccess_strncpy(dst, user_src, lim);
     ua_end();

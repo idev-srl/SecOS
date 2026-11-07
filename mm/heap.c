@@ -57,7 +57,8 @@
  * allocation). Every hit → kernel_panic with block, expected, found, caller and
  * owner. heap_check() validates the whole list (also from the shell `heapcheck`).
  *
- * Debug (-DSECOS_HEAP_DEBUG, or -DSECOS_HEAP_POISON for poisoning alone):
+ * Debug (-DSECOS_HEAP_DEBUG, or -DSECOS_HEAP_POISON for poisoning alone; a
+ * -DSECOS_LOCKDEP build poisons too, with 0x6B):
  * freed payloads are filled with 0xDE and the poison is verified when the
  * memory is handed out again (use-after-free writes), kfree confirms list
  * membership, and heap_check() runs every HEAP_PERIODIC_OPS operations.
@@ -70,7 +71,7 @@
 #else
 #define HEAP_PERIODIC    0
 #define HEAP_MEMBERSHIP  0
-#if defined(SECOS_HEAP_POISON)
+#if defined(SECOS_HEAP_POISON) || defined(SECOS_LOCKDEP) || defined(SECOS_LOCKDEP_LITE)
 #define HEAP_POISON      1
 #else
 #define HEAP_POISON      0
@@ -83,8 +84,15 @@
 #define HEAP_MAGIC_FREE   0xF7EEB10Cu
 #define HEAP_MAGIC_ALIGN  0xA1167ED0u
 #define HEAP_MAGIC_MERGED 0x3E46EDDDu
+#if defined(SECOS_LOCKDEP) || defined(SECOS_LOCKDEP_LITE)
+/* [M50] Lockdep builds poison freed memory with 0x6B (Linux POISON_FREE), so a
+ * use-after-free of an object freed under a racing lock reads 0x6B6B... */
+#define HEAP_POISON_BYTE  0x6B
+#define HEAP_POISON_U32   0x6B6B6B6Bu
+#else
 #define HEAP_POISON_BYTE  0xDE
 #define HEAP_POISON_U32   0xDEDEDEDEu
+#endif
 
 #define HB_F_ALIGNED      0x1u   // owner of a kmalloc_aligned allocation
 

@@ -27,6 +27,9 @@
 #include "config.h"
 #include "terminal.h"
 #include "multiboot.h"
+#include "klock.h"   /* [M50] cpu_wait_irq */
+#include "bkl.h"     /* [M50] bkl=on|off */
+#include "lockdep.h" /* [M50] lockdep_selftest */
 #include "multiboot2.h"
 #include "pmm.h"
 #include "sysroot.h"
@@ -1600,6 +1603,9 @@ static void kernel_main_phase2(void) {
     // would have been a triple fault (same risk exists for vmm_init() in M1).
     // A minimal no-STI fallback IDT could be added in M3 for safer debugging.
     idt_init();
+#ifdef SECOS_LOCKDEP
+    lockdep_selftest();   // [M50] the validator's negative controls (IDT up, one CPU)
+#endif
 
     // [M39] Full high-half kernel W^X: text RX, rodata/note R/NX, data/bss/stack
     // RW/NX, and NX on the duplicate phys-window alias. Until now this was deferred

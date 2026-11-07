@@ -15,6 +15,7 @@
 #include "debugcon.h"
 #include "../mm/user_copy.h"
 #include "cred.h"
+#include "klock.h"
 #define INT32_MIN_ (-2147483647 - 1)
 
 extern process_t* sched_get_current(void);
@@ -196,6 +197,9 @@ static int signal_post_checked(process_t* sender, uint32_t pgid, int all, int si
 void signal_dispatch(trapframe_t* tf) {
     if (!tf) return;
     if ((tf->cs & 3) != 3) return;              // only deliver returning to ring-3
+#ifdef SECOS_LOCKDEP
+    klock_check_user_return("iret to ring 3");  // [M50] nothing held going back to user
+#endif
     process_t* cur = sched_get_current();
     if (!cur) return;
 

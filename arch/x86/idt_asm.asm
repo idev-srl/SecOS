@@ -169,6 +169,8 @@ isr_stub:
 ; Handler per il timer (IRQ0 = interrupt 0x20)
 global isr_timer
 extern timer_handler
+extern irq_enter        ; [M50] kernel/klock.c
+extern irq_exit
 extern irq_eoi          ; M28-2: mode-aware EOI (LAPIC vs 8259)
 
 isr_timer:
@@ -196,12 +198,14 @@ isr_timer:
     ; rdi = &trapframe (points at r15).  On a preemptive switch the C handler
     ; sends EOI itself and does NOT return (it iretq's into the next task);
     ; otherwise it returns here and we EOI + iretq into the same task.
+    call irq_enter      ; [M50] hardware-interrupt nesting (klock/lockdep)
     mov rdi, rsp
     call timer_handler
 
     ; Send EOI to whichever controller owns the line (LAPIC in APIC mode, else
     ; the 8259). Caller-saved clobbers are fine — all GPRs are restored below.
     call irq_eoi
+    call irq_exit       ; (a preemptive switch never returns here: switch_to resets it)
 
     ; [M30] On a non-preemptive timer return to ring-3, deliver any pending signal
     ; (this is the path that delivers an async Ctrl-C/SIGINT to a compute-bound
@@ -252,10 +256,12 @@ isr_keyboard:
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     
     ; Chiama il gestore C
+    call irq_enter
     call keyboard_handler
 
     ; EOI to the active controller (LAPIC in APIC mode, else the 8259 master).
     call irq_eoi
+    call irq_exit
 
     pop r15
     pop r14
@@ -298,8 +304,10 @@ isr_mouse:
     push r15
     SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code
+    call irq_enter
     call ps2mouse_handler
     call irq_eoi_aux    ; LAPIC EOI, or slave + master 8259
+    call irq_exit
     pop r15
     pop r14
     pop r13
@@ -344,7 +352,9 @@ isr_xhci:
     push r15
     SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
+    call irq_enter
     call xhci_irq_handler        ; drains/acks; LAPIC EOI done in C
+    call irq_exit
     pop r15
     pop r14
     pop r13
@@ -382,7 +392,9 @@ isr_nvme:
     push r15
     SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
+    call irq_enter
     call nvme_irq_handler        ; drains/acks; LAPIC EOI done in C
+    call irq_exit
     pop r15
     pop r14
     pop r13
@@ -423,7 +435,9 @@ isr_net:
     push r15
     SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
+    call irq_enter
     call net_irq_handler         ; acks NIC, drains ring; LAPIC EOI done in C
+    call irq_exit
     pop r15
     pop r14
     pop r13
@@ -468,7 +482,9 @@ isr_ipi_tlb:
     push r15
     SMAP_CLAC
     cld
+    call irq_enter
     call tlb_ipi_handler         ; services the request + LAPIC EOI
+    call irq_exit
     pop r15
     pop r14
     pop r13
@@ -508,8 +524,10 @@ isr_ipi_resched:
     push r15
     SMAP_CLAC
     cld
+    call irq_enter
     mov rdi, rsp
     call sched_on_resched_ipi    ; EOIs first; may switch away (no return)
+    call irq_exit
     mov rdi, rsp
     call signal_dispatch         ; returning to ring-3: deliver pending signals
     pop r15

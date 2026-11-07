@@ -102,6 +102,7 @@ static void panic_enter(const char* what) {
         for (;;) __asm__ volatile("cli; hlt");
     }
     g_in_kernel_panic = 1;
+    { extern void klock_dump_held(void); klock_dump_held(); }  // [M50] locks this CPU/task held
     { extern void smp_stop_others(void); smp_stop_others(); }   // [M48] freeze the other CPUs
     vmm_switch_space(vmm_get_kernel_space());
 #if ENABLE_FB

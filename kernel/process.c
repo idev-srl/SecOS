@@ -630,6 +630,7 @@ process_t* process_create_from_elf_args(const void* elf_buf, size_t size,
 
     process_t* p = (process_t*)kmalloc(sizeof(process_t));
     if (!p) { terminal_writestring("[PROC] pcb alloc failed\n"); return NULL; }
+    klock_task_reset(&p->klk);               // [M50] holds no klock
     p->mapped_pages = NULL;
     p->mapped_page_count = 0;
 
@@ -964,6 +965,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     process_t* c = (process_t*)kmalloc(sizeof(process_t));
     if (!c) return NULL;
     *c = *parent;                              // shallow-copy all fields (incl. VMAs, fds)
+    klock_task_reset(&c->klk);                 // [M50] the parent's klocks (the BKL) are not the child's
     c->pid = alloc_pid();
     c->cpu_affinity = process_pick_home();     // [M48] push the child to the least-loaded CPU
     c->on_cpu = 0; c->wake_snap = 0; c->ready_tick = 0; c->smp_logged = 0;   // cpu_pin is inherited
