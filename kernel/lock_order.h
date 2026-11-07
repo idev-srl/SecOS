@@ -36,9 +36,13 @@
 #define LK_K25_VFS_APPEND  25   /* vfs_append_lock: O_APPEND/truncate fallback
                                    for an FS without ->append; the FS (K30)
                                    is called inside it (C1)                     */
-#define LK_K30_FS          30   /* one per FS driver instance (C2-C4). ramfs:
-                                   ramfs_fs_lock() (C2); inside it only the
-                                   page-cache index (S40) and the heap         */
+#define LK_K30_FS          30   /* one per FS driver instance, set as
+                                   vfs_fs_ops.lock: ramfs_fs_lock() (C2; only
+                                   S40 + heap inside), g_e2_lock (C3),
+                                   g_fat_lock, g_ex_lock, g_vol_lock[i] per
+                                   NTFS volume (C4); block K40 nests inside.
+                                   Never two at once; never held across a
+                                   readdir callback or ->mntinfo (C1)          */
 #define LK_K35_USB_ENUM    35   /* xhci_enum_lock: USB enumeration incl. hubs;
                                    registers usbN disks and reads them (B3)     */
 #define LK_K40_BLKDEV      40   /* blkdev->lock on the base disk; a partition
@@ -86,7 +90,7 @@
                                    output locks: lockdep reports THROUGH them,
                                    so they are deliberately not tracked.
                                    con_lock also guards the KD text/graphics
-                                   mode (drivers/fbdev.c, C6).                  */
+                                   mode (drivers/fbdev.c, C5/C6).               */
 #define LK_S60_KSTACK      160  /* kstack_lock, g_pm_lock, kvmm_lock (future)   */
 #define LK_S62_TLB         162  /* tlb_lock: shootdowns are issued from inside
                                    kstack_lock / g_pm_lock sections (plan: S60) */
