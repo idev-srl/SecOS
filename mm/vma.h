@@ -38,7 +38,7 @@ typedef struct vma {
     uint64_t file_len;     // content length in bytes (= p_filesz)
     // [M20] Alternative FILE backing: a VFS inode served through the page cache
     // (file-backed mmap, MAP_PRIVATE). When file_inode != NULL the fault sources
-    // bytes from pagecache_get_phys(file_inode, file_voff + (pg - start)).
+    // bytes from pagecache_copy_page(file_inode, file_voff + (pg - start)).
     struct vfs_inode* file_inode;
     uint64_t file_voff;    // file offset corresponding to 'start'
     // [M40] VMA_TYPE_PHYS: physical address mapped at 'start'. The frames are
