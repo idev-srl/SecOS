@@ -254,12 +254,30 @@ void exception_handler(struct registers* regs) {
         //    [M48] A user-address fault walks the task's VMAs and may read a
         //    file (file-backed mmap): under the kernel lock (recursive when the
         //    fault comes from a syscall's user access).
+        //    [M52 D2] Only with bkl=on. Without it the fault needs no lock of
+        //    its own: the VMA lookup and the PTE install run under the
+        //    owner's mm_lock, the frame fill goes through the page cache and
+        //    the FS locks (vma_fault_in_live, M50 B1/B2), COW under mm_lock.
+        //    Interrupts come back on for the fill when the faulting context
+        //    had them (ring 3 always; a syscall's user copy too), so a fault
+        //    that waits for an FS lock or a disk keeps taking timer ticks
+        //    and TLB shootdowns like a syscall does. The fault is not an
+        //    IRQ, ring 0 is not preemptible, and #PF has no IST stack, so a
+        //    nested fault or interrupt is fine.
         {
             int handled;
-            if (cr2 < USER_ADDR_MAX) {
+            if (cr2 < USER_ADDR_MAX && g_bkl_mode) {
                 if ((regs->cs & 3) == 3) bkl_lock_enable_irq(); else bkl_lock();
                 handled = (vmm_try_handle_page_fault(cr2, err_code) == 0);
                 bkl_unlock();
+            } else if (cr2 < USER_ADDR_MAX) {
+                int irq_on = (regs->rflags & (1ULL << 9)) != 0;
+                if (irq_on) __asm__ volatile ("sti" ::: "memory");
+                handled = (vmm_try_handle_page_fault(cr2, err_code) == 0);
+                if (irq_on) __asm__ volatile ("cli" ::: "memory");
+                // A nested fault during the fill rewrote CR2: put ours back
+                // for the report and kill/panic path below.
+                if (!handled) __asm__ volatile ("mov %0, %%cr2" :: "r"(cr2) : "memory");
             } else {
                 handled = (vmm_try_handle_page_fault(cr2, err_code) == 0);
             }
