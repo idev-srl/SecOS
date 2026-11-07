@@ -262,6 +262,14 @@ def main():
     else:
         report("userland-md5-line", False)
     report("userland-no-fault", fault() is None, str(fault() or ""))
+    # Informational: the kernel lock's contention (acquired, contended, max
+    # wait in us) after the storm, from /proc/lockstat.
+    with lock: since = len(buf)
+    p.stdin.write(b"\x15grep -E '^klock' /proc/lockstat; echo LS-$((6*7))\r"); p.stdin.flush()
+    if wait_serial("LS-42", 30, since):
+        with lock: so = bytes(buf[since:]).decode("latin1")
+        for ln in re.findall(r"^klock +\S+ +\d+ +\d+ +\d+ +\d+", so, re.M):
+            print("[BSD] lockstat " + " ".join(ln.split()), flush=True)
     qmp("quit")
     try: p.wait(timeout=20)
     except subprocess.TimeoutExpired: p.kill()
