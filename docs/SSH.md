@@ -172,6 +172,20 @@ Step by step:
    disk) it changes every boot: add `-o StrictHostKeyChecking=no
    -o UserKnownHostsFile=/dev/null` for such throwaway VMs.
 
+   **Windows client, QEMU in WSL2: connect over IPv4.** `ssh -p 2222
+   user@localhost` from Windows waits about 21 s before anything happens:
+   Windows resolves `localhost` to `::1` first, QEMU's user-mode `hostfwd`
+   listens on IPv4 only, and WSL2 (mirrored networking) does not forward
+   `::1` to WSL at all, so that connect attempt runs into the Windows SYN
+   timeout (3 + 6 + 12 s) before the client falls back to `127.0.0.1`. The
+   guest is not involved: the same login over `127.0.0.1` takes about 0.2 s.
+   Use `ssh -4 -p 2222 user@localhost` or `ssh -p 2222 user@127.0.0.1`, or
+   put this in `%USERPROFILE%\.ssh\config`:
+   ```
+   Host localhost 127.0.0.1
+       AddressFamily inet
+   ```
+
 The same `kernel.bin` carries the keys on the UEFI path (`make uefi
 SSH_AUTHORIZED_KEYS=...`). Without `SSH_AUTHORIZED_KEYS` there is no
 `authorized_keys` file and every login is refused until you install a key by
