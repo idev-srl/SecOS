@@ -15,6 +15,7 @@
 #include "vfs.h"
 #include "ramfs.h"
 #include "pagecache.h"
+#include "process.h"   // [M52 D3] fd tables / file mappings: busy dead inodes
 #include <stddef.h>
 
 #define RLOCK()   klock_lock(ramfs_fs_lock())
@@ -50,6 +51,46 @@ static void cache_fix_after_remove(const ramfs_entry_t* gone){
     }
 }
 
+// [M52 D3] Dead inodes still held by an open fd or a file mapping: recycling
+// one would re-point that fd at the next file. The fd tables and VMA sets are
+// read under each owner's mm_lock (K30 ramfs -> S30 proc_lock -> S35 mm_lock,
+// the order procfs/sysfs use for their pools). Only runs once the cache is
+// full and a new entry needs a slot.
+#define RAMFS_BUSY_WORDS ((INODE_CACHE_N + 63) / 64)
+struct ramfs_busy { uint64_t m[RAMFS_BUSY_WORDS]; };
+static void ramfs_busy_mark(struct ramfs_busy* b, const void* p){
+    const vfs_inode_t* ino = (const vfs_inode_t*)p;
+    if(ino < &inode_cache[0] || ino >= &inode_cache[INODE_CACHE_N]) return;
+    size_t i = (size_t)(ino - &inode_cache[0]);
+    b->m[i / 64] |= 1ull << (i % 64);
+}
+static void ramfs_busy_cb(process_t* p, void* u){
+    struct ramfs_busy* b = (struct ramfs_busy*)u;
+    uint64_t fl = mm_lock(p);
+    for(int i=0;i<32;i++){
+        const struct proc_fd_entry* f = &p->fds[i];
+        if(!f->used || f->is_pipe || f->is_sock || !f->inode) continue;
+        ramfs_busy_mark(b, f->inode);
+    }
+    for(uint32_t i=0;i<p->vmas.count;i++){
+        const vma_t* v = &p->vmas.v[i];
+        if(v->type != VMA_TYPE_NONE && v->file_inode) ramfs_busy_mark(b, v->file_inode);
+    }
+    mm_unlock(p, fl);
+}
+static vfs_inode_t* recycle_dead_locked(void){
+    RAMFS_LOCKED();
+    int any = 0;
+    for(size_t i=0;i<inode_cache_used && !any;i++) if(inode_is_dead(&inode_cache[i])) any = 1;
+    if(!any) return NULL;
+    struct ramfs_busy b;
+    for(size_t w=0; w<RAMFS_BUSY_WORDS; w++) b.m[w] = 0;
+    process_foreach(ramfs_busy_cb, &b);
+    for(size_t i=0;i<inode_cache_used;i++)
+        if(inode_is_dead(&inode_cache[i]) && !((b.m[i / 64] >> (i % 64)) & 1)) return &inode_cache[i];
+    return NULL;   // every dead inode is still open: no slot (the lookup fails)
+}
+
 static vfs_inode_t* inode_from_entry_locked(const ramfs_entry_t* e){
     RAMFS_LOCKED();
     if(!e) return NULL;
@@ -62,9 +103,9 @@ static vfs_inode_t* inode_from_entry_locked(const ramfs_entry_t* e){
     if(!ino && inode_cache_used < INODE_CACHE_N){
         ino = &inode_cache[inode_cache_used++]; fresh = 1;
     }
-    // Cache full: recycle a dead inode. Fresh slots go first so a dead inode an
-    // fd may still hold is recycled as late as possible.
-    if(!ino) for(size_t i=0;i<inode_cache_used;i++) if(inode_is_dead(&inode_cache[i])){ ino=&inode_cache[i]; fresh=1; break; }
+    // Cache full: recycle a dead inode that no fd or mapping holds ([M52 D3];
+    // fresh slots go first). None free: no inode, the lookup fails.
+    if(!ino){ ino = recycle_dead_locked(); if(ino) fresh = 1; }
     if(!ino) return NULL;
     // [M43] The cached inode is the ramfs's only copy of mode/uid/gid (chmod and
     // chown land here through ramfs_vfs_setattr). A slot bound to a new entry
