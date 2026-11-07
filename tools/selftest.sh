@@ -3013,6 +3013,39 @@ else
     check "M48 gate build" 1
 fi
 
+# ---- M50 PAGECACHE GATE: page-cache fill without pc_lock (BKL removal B2) ----
+# One image with -DSECOS_PAGECACHE_TEST (boot self-test that forces the fill
+# races through a hook between the FS read and publication: a write, an
+# invalidate_fs, a recursive miss and a cache flood on the BSP; a remote
+# write, a waiter, a timed-out waiter and a remote invalidate_fs on an AP; a
+# negative control that ignores the stale bit) and -DSECOS_LOCKDEP, on -smp 4
+# with a default mkfs.ext4 disk at /mnt. tools/pc_stress_drive.py then runs
+# /bin/pcstress on the ramfs /tmp and the ext4 /mnt at once (writers
+# overwrite / O_TRUNC / O_APPEND / ftruncate while hammers read() and mmap
+# the same files; lock-step checkers verify every completed write through
+# read() and a fresh mmap), unmounts and runs host e2fsck -fn.
+echo "[selftest] M50 pagecache gate: fill races (boot self-test) + pcstress -smp 4..."
+make clean >/dev/null 2>&1 || true
+if make iso CONSOLE=root CFLAGS_EXTRA="-DSECOS_PAGECACHE_TEST -DSECOS_LOCKDEP" >/tmp/secos_selftest_build.log 2>&1; then
+    PCDDIR=$(mktemp -d /tmp/secos_selftest_pcd.XXXXXX)
+    cp myos.iso "$PCDDIR/pcd.iso"
+    timeout 2400 python3 tools/pc_stress_drive.py --iso "$PCDDIR/pcd.iso" --smp 4 --pctest \
+        --rounds 200 --log "$PCDDIR/pcd.log" >"$PCDDIR/pcd.out" 2>&1
+    while IFS= read -r l; do
+        case "$l" in
+            "[PCD] "*" OK"*)   x=${l#\[PCD\] }; check "M50 pagecache ${x%% OK*}" 0 ;;
+            "[PCD] "*" FAIL"*) x=${l#\[PCD\] }; check "M50 pagecache ${x%% FAIL*}" 1; echo "    $l" | cut -c1-240 ;;
+        esac
+    done < "$PCDDIR/pcd.out"
+    grep -q "^\[PCD\] RESULT " "$PCDDIR/pcd.out"; check "M50 pagecache stress driver ran to completion" $?
+    grep -q "\[PCTEST\] negative control: ignoring the stale bit serves a stale page: OK" "$PCDDIR/pcd.log"
+    check "M50 pagecache negative control sees the stale page without the stale bit" $?
+    rm -rf "$PCDDIR"
+else
+    echo "[selftest] M50 pagecache BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "M50 pagecache gate build" 1
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
