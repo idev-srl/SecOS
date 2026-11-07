@@ -149,6 +149,11 @@ int  tty_input_room(struct tty* t);                  /* bytes input can still ac
 int  tty_ldisc_read(struct tty* t, void* buf, int len, int mode);
 int  tty_ldisc_readable(struct tty* t);              /* bytes a read() could take now */
 int  tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg); /* -515: not a ldisc ioctl */
+/* [M50] The same on a kernel buffer of tty_ldisc_ioctl_payload() bytes, for a
+ * caller that holds a spinlock (pty.c): it copies the payload in before and out
+ * after the lock. */
+int  tty_ldisc_ioctl_kbuf(struct tty* t, uint64_t cmd, void* kbuf);
+unsigned tty_ldisc_ioctl_payload(uint64_t cmd, int* in);
 int  tty_onlcr(struct tty* t);                       /* OPOST && ONLCR */
 uint32_t tty_fg(struct tty* t);                      /* foreground process group */
 void tty_set_fg(struct tty* t, uint32_t pgrp);

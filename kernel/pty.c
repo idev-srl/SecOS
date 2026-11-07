@@ -414,12 +414,25 @@ static void pg_find_cb(process_t* p, void* u) {
 }
 
 /* Termios, window size, queue, job-control and session requests on a pty fd.
- * Integer arguments are copied in before taking the pty lock and results
- * copied out after it (the termios/winsize requests copy under it through the
- * fault-safe uaccess helpers, like the console). */
+ * Every user payload is copied in before taking the pty lock and copied out
+ * after it: [M50] no user copy runs under a spinlock (a fault there would page
+ * in, maybe from disk, with interrupts off), so the line-discipline requests
+ * work on a kernel buffer (tty_ldisc_ioctl_kbuf). */
+static int ldisc_locked(struct tty* t, uint64_t cmd, uint64_t arg, unsigned plen,
+                        int kb_err, void* kb) {
+    if (!plen) return tty_ldisc_ioctl(t, cmd, arg);     /* no payload: no copy */
+    if (kb_err) return -14;                              /* where the copy-in would fail */
+    return tty_ldisc_ioctl_kbuf(t, cmd, kb);
+}
+
 int pty_ioctl(process_t* c, void* inode, uint64_t cmd, uint64_t arg) {
     int inv = 0;
     int pg_ok = 0;
+    union { struct tty_termios tio; struct tty_winsize ws; int i; } kb;
+    int p_in = 0, kb_err = 0;
+    unsigned plen = tty_ldisc_ioctl_payload(cmd, &p_in);
+    if (plen > sizeof(kb)) plen = 0;                     /* cannot happen; stay safe */
+    if (plen && p_in && copy_from_user(&kb, (void*)arg, plen)) kb_err = 1;
     if (cmd == TTY_TIOCSPTLCK || cmd == TTY_TIOCSPGRP) {
         if (copy_from_user(&inv, (void*)arg, sizeof(inv))) return -EFAULT;
         if (cmd == TTY_TIOCSPGRP && c && inv > 0) {   /* the group must be in our session */
@@ -479,17 +492,17 @@ int pty_ioctl(process_t* c, void* inode, uint64_t cmd, uint64_t arg) {
     case TTY_TCSETS: case TTY_TCSETSW: case TTY_TCSETSF:
     case TTY_TCFLSH: case TTY_TCXONC:
         if (!master && is_ctty) { r = tty_bg_check(t, c, SIGTTOU); if (r) break; }
-        r = tty_ldisc_ioctl(t, cmd, arg);
+        r = ldisc_locked(t, cmd, arg, plen, kb_err, &kb);
         break;
     case TTY_FIONREAD:                               /* master: output waiting to be read */
-        if (master) { outv = (int)p->olen; have_out = 1; }
-        else r = tty_ldisc_ioctl(t, cmd, arg);
+        if (master) { outv = (int)p->olen; have_out = 1; plen = 0; }
+        else r = ldisc_locked(t, cmd, arg, plen, kb_err, &kb);
         break;
     case TTY_TIOCOUTQ:                               /* slave: output not yet read */
         outv = master ? 0 : (int)p->olen; have_out = 1;
         break;
     default:                                         /* termios get, winsize, flush... */
-        r = tty_ldisc_ioctl(t, cmd, arg);
+        r = ldisc_locked(t, cmd, arg, plen, kb_err, &kb);
         break;
     }
     ns = tty_take_sigs(t, sigs);
@@ -508,6 +521,7 @@ int pty_ioctl(process_t* c, void* inode, uint64_t cmd, uint64_t arg) {
         c->ctty_detached = 1;
     }
     if (have_out && r == 0 && copy_to_user((void*)arg, &outv, sizeof(outv))) return -EFAULT;
+    if (!have_out && r == 0 && plen && !p_in && copy_to_user((void*)arg, &kb, plen)) return -14;
     return r;
 }
 

@@ -563,6 +563,18 @@ void tty_wake_readers(uint64_t now) {
  * checks. Returns 0 / a negative errno; ENOIOCTLCMD (-515) if not here. */
 static int k_copy_to(void* u, const void* k, unsigned n) { return copy_to_user(u, k, n) ? -14 : 0; }
 static int k_copy_from(void* k, const void* u, unsigned n) { return copy_from_user(k, u, n) ? -14 : 0; }
+/* [M50] `arg` is a user pointer, or (kb) a kernel buffer the caller copies
+ * in before / out after its spinlock: no user copy may run under one. */
+static int x_copy_to(int kb, void* u, const void* k, unsigned n) {
+    if (!kb) return k_copy_to(u, k, n);
+    for (unsigned i = 0; i < n; i++) ((uint8_t*)u)[i] = ((const uint8_t*)k)[i];
+    return 0;
+}
+static int x_copy_from(int kb, void* k, const void* u, unsigned n) {
+    if (!kb) return k_copy_from(k, u, n);
+    for (unsigned i = 0; i < n; i++) ((uint8_t*)k)[i] = ((const uint8_t*)u)[i];
+    return 0;
+}
 
 void tty_init(void) {
     tty_console();
@@ -577,13 +589,27 @@ static void winsize_get(struct tty* t, struct tty_winsize* w) {
     w->ws_xpixel = (uint16_t)(cols * 8); w->ws_ypixel = (uint16_t)(rows * 16);
 }
 
-int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) {
+/* Bytes of the user payload of ldisc request `cmd` (0 = none); *in = 1 when
+ * the kernel reads it (set requests), 0 when it writes it (get requests). */
+unsigned tty_ldisc_ioctl_payload(uint64_t cmd, int* in) {
+    switch (cmd) {
+    case TTY_TCGETS:   *in = 0; return sizeof(struct tty_termios);
+    case TTY_TCSETS: case TTY_TCSETSW: case TTY_TCSETSF:
+                       *in = 1; return sizeof(struct tty_termios);
+    case TTY_TIOCGWINSZ: *in = 0; return sizeof(struct tty_winsize);
+    case TTY_TIOCSWINSZ: *in = 1; return sizeof(struct tty_winsize);
+    case TTY_FIONREAD: case TTY_TIOCOUTQ: *in = 0; return sizeof(int);
+    default:           *in = 0; return 0;
+    }
+}
+
+static int ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg, int kb) {
     switch (cmd) {
     case TTY_TCGETS:
-        return k_copy_to((void*)arg, &t->tio, sizeof(t->tio));
+        return x_copy_to(kb, (void*)arg, &t->tio, sizeof(t->tio));
     case TTY_TCSETS: case TTY_TCSETSW: case TTY_TCSETSF: {
         struct tty_termios nt;
-        int r = k_copy_from(&nt, (void*)arg, sizeof(nt));
+        int r = x_copy_from(kb, &nt, (void*)arg, sizeof(nt));
         if (r) return r;
         int was_canon = (t->tio.c_lflag & T_ICANON) != 0;
         int now_canon = (nt.c_lflag & T_ICANON) != 0;
@@ -610,11 +636,11 @@ int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) {
     case TTY_TIOCGWINSZ: {
         struct tty_winsize w;
         winsize_get(t, &w);
-        return k_copy_to((void*)arg, &w, sizeof(w));
+        return x_copy_to(kb, (void*)arg, &w, sizeof(w));
     }
     case TTY_TIOCSWINSZ: {
         struct tty_winsize w, old;
-        int r = k_copy_from(&w, (void*)arg, sizeof(w));
+        int r = x_copy_from(kb, &w, (void*)arg, sizeof(w));
         if (r) return r;
         winsize_get(t, &old);
         if (t->is_console) {
@@ -634,11 +660,11 @@ int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) {
     case TTY_FIONREAD: {
         pull_input(t);
         int n = readable_count(t);
-        return k_copy_to((void*)arg, &n, sizeof(n));
+        return x_copy_to(kb, (void*)arg, &n, sizeof(n));
     }
     case TTY_TIOCOUTQ: {
         int n = 0;
-        return k_copy_to((void*)arg, &n, sizeof(n));
+        return x_copy_to(kb, (void*)arg, &n, sizeof(n));
     }
     case TTY_TCFLSH:
         if (arg == 0 || arg == 2) { pull_input(t); flush_input(t); }   /* TCIFLUSH / TCIOFLUSH */
@@ -648,6 +674,11 @@ int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) {
     default:
         return -515;
     }
+}
+
+int tty_ldisc_ioctl(struct tty* t, uint64_t cmd, uint64_t arg) { return ldisc_ioctl(t, cmd, arg, 0); }
+int tty_ldisc_ioctl_kbuf(struct tty* t, uint64_t cmd, void* kbuf) {
+    return ldisc_ioctl(t, cmd, (uint64_t)kbuf, 1);
 }
 
 /* [M40] Console-only requests: graphics handoff (KDSETMODE/KDGETMODE, see
