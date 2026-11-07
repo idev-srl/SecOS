@@ -156,7 +156,7 @@ robustness and the paused real-hardware bring-up — see below.
       to the default `/etc/inittab` (never respawned; leaving the GUI returns to the console bash).
 - [ ] GUI: clipboard (compositor-mediated, explicit user action only), terminal text selection.
 - [ ] GUI: shared-memory buffers for clients (memfd-style object passed at spawn, syscalls
-      90-94) if a client needs more than pipe bandwidth.
+      92-94; 90 = `SYS_PRCTL`, 91 = `SYS_SCHED_GETAFFINITY`) if a client needs more than pipe bandwidth.
 - [ ] GUI: mouse reporting in the terminal (`?1000/?1006`) for `vi`/`less` mouse support;
       wide (CJK) characters; blinking cursor.
 - [ ] GUI: software key autorepeat for USB keyboards (no host-side repeat yet).
@@ -289,6 +289,8 @@ robustness and the paused real-hardware bring-up — see below.
 ### SMP prep (QEMU `-smp 4`) — done in M48
 - [x] TLB shootdown, IPI reschedule, logical per-CPU run queues + migration, line-atomic
       debugcon (M48).
+- [x] Userland CPU count: `sched_getaffinity` (syscall 91), `/sys/devices/system/cpu`,
+      `Cpus_allowed_list`, libc `get_nprocs`/`sysconf`, BusyBox `nproc` (`fix/nproc`).
 
 ### Test coverage
 - [ ] **Selftest coverage for M34–M39** (lua, caps, mitigations, measured boot, WPA2 KATs,

@@ -285,6 +285,25 @@ framebuffer console).
 - The kernel lock serializes syscalls: check that a GUI session (secwm +
   terminals) and SSH stay responsive on the 4/8-thread laptop.
 
+## Follow-up: userland CPU count (`fix/nproc`)
+
+`nproc`, `get_nprocs` and `sysconf(_SC_NPROCESSORS_ONLN)` used to count the
+`cpuN` lines of `/proc/stat`. Now, as on Linux:
+
+- **`SYS_SCHED_GETAFFINITY` (91)**: pid 0 = caller; fills `ceil(cpus/64)*8`
+  bytes of a CPU mask (the task's pinned CPU, else every online CPU) and
+  returns the byte count; `-EINVAL` for a short or unaligned buffer, `-ESRCH`
+  for an unknown pid.
+- **`/sys/devices/system/cpu/`**: `online`, `possible`, `present`, `offline`
+  (cpulist format), `kernel_max`, `cpuN/online`. sysfs lookups now take
+  per-path slots from an inode pool under a lock, instead of one shared
+  scratch inode an open fd could see change under it.
+- procfs `/proc/<pid>/status` reports the real `Cpus_allowed_list`.
+- libc `get_nprocs`/`get_nprocs_conf` read the sysfs cpulists (`/proc/stat`
+  fallback); BusyBox uses the real `sched_getaffinity`.
+- `smptest cpus` cross-checks syscall, sysfs, procfs and libc; the M48
+  selftest gate runs it on the `-smp` guest and on an extra `nosmp` boot.
+
 ## Integration notes
 
 - Resolved on `integ/phase4` (merge of feat/bigmem): the LAPIC and IOAPIC are
