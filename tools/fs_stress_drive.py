@@ -85,10 +85,17 @@ class VM:
         return False
 
     def wait_prompt(self, timeout):
-        t0 = time.time()
+        # [M52] init's console messages ("[init] gui ... exited") can land
+        # right after bash's first prompt (they run in parallel now), and
+        # then the tail never ends with '#': once bash has printed a prompt,
+        # ask for a fresh one every few seconds.
+        t0 = time.time(); poke = 0.0
         while time.time() - t0 < timeout and self.alive:
-            with self.lock: tail = bytes(self.buf[-64:])
+            with self.lock: tail = bytes(self.buf[-64:]); seen = b"bash-" in self.buf
             if tail.rstrip().endswith(b"#"): return True
+            if seen and time.time() - poke > 5.0:
+                poke = time.time()
+                self.p.stdin.write(b"\r"); self.p.stdin.flush()
             time.sleep(0.2)
         return False
 

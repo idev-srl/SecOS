@@ -223,8 +223,12 @@ def main():
     # ---- phase 2: userland dd in parallel + usb-kbd typing ----
     t0 = time.time(); prompt = False
     while time.time() - t0 < o.boot and alive[0]:
-        with lock: tail = bytes(buf[-64:])
+        # [M52] init messages can land after bash's first prompt (they run in
+        # parallel): once bash printed one, ask for a fresh prompt now and then.
+        with lock: tail = bytes(buf[-64:]); seen = b"bash-" in buf
         if tail.rstrip().endswith(b"#"): prompt = True; break
+        if seen and time.time() - globals().get("_m52_poke", 0.0) > 5.0:
+            globals()["_m52_poke"] = time.time(); p.stdin.write(b"\r"); p.stdin.flush()
         time.sleep(0.2)
     report("boot-prompt", prompt)
     if not prompt: finish()

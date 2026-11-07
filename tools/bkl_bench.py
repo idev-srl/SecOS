@@ -102,8 +102,9 @@ def main():
         return sentinel in out, out
     t0 = time.time()
     while time.time() - t0 < 300:
-        with lk: tail = bytes(buf[-64:])
+        with lk: tail = bytes(buf[-64:]); seen = b"bash-" in buf
         if tail.rstrip().endswith(b"#"): break
+        if seen: p.stdin.write(b"\r"); p.stdin.flush(); time.sleep(4.5)   # fresh prompt
         time.sleep(0.5)
     time.sleep(2)
     done, out = run("grep -q ' / ext4 ' /proc/mounts && echo ROOT-$((6*7)); grep -o 'bkl=o[nf]*' /proc/smp", 60)
