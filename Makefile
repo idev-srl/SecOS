@@ -962,18 +962,46 @@ sysdisk-ext4-csum: sysroot-stage
 # MB2/ISO path (i440fx, -boot d so SeaBIOS boots the CD) and the UEFI/q35 path.
 ROOT      ?= disk
 ROOT_IMG  ?= secos-root.img
-ROOT_SIZE ?= 1G
+ROOT_SIZE ?= 8G
 ROOT_DRIVE := $(if $(filter ram,$(ROOT)),,-drive file=$(ROOT_IMG),if=virtio,format=raw)
 ROOT_DEP   := $(if $(filter ram,$(ROOT)),,root-img)
-.PHONY: root-img reset-root
+.PHONY: root-img reset-root grow-root
 root-img:
 	@bash tools/mkroot.sh $(ROOT_IMG) $(ROOT_SIZE)
 reset-root:
 	@bash tools/mkroot.sh --reset $(ROOT_IMG) $(ROOT_SIZE)
+# [U6] Grow an existing system disk in place, offline (SecOS shut down):
+#   make grow-root                         secos-root.img -> 8 GiB
+#   make grow-root SIZE=16G ROOT_IMG=...   another size / image
+# e2fsck before and after, resize2fs in between, a sparse backup copy first
+# (BACKUP=0 skips it). Nothing on the disk changes but its size.
+SIZE ?= 8G
+grow-root:
+	@bash tools/growroot.sh $(ROOT_IMG) $(SIZE)
+
+# [U6] Transfer disk for packages: an exFAT image holding the given .spkg
+# files (each verified on the host first), for `spkg install` in SecOS:
+#   make pkgdisk PKGS="a.spkg b.spkg"           -> pkgdisk.img
+#   make run-serial PKGDISK=pkgdisk.img          attached as USB storage (usb0)
+#   (SecOS) mount -t exfat /dev/usb0 /media; spkg install /media/a.spkg
+# For VMware: `make pkgdisk-vmdk` converts it (attach as a second SATA disk).
+PKGS ?=
+PKGDISK_IMG ?= pkgdisk.img
+.PHONY: pkgdisk pkgdisk-vmdk
+pkgdisk:
+	@bash tools/mkpkgdisk.sh $(PKGDISK_IMG) $(PKGS)
+pkgdisk-vmdk: pkgdisk
+	qemu-img convert -f raw -O vmdk $(PKGDISK_IMG) $(PKGDISK_IMG:.img=.vmdk)
+	@echo "pkgdisk-vmdk: $(PKGDISK_IMG:.img=.vmdk)"
+# Any run target: PKGDISK=<image> attaches it as a USB stick (always probed,
+# also next to the virtio root disk).
+PKGDISK ?=
+PKGDISK_DEV := $(if $(PKGDISK),-drive if=none$(comma)id=pkgdisk$(comma)file=$(PKGDISK)$(comma)format=raw -device usb-storage$(comma)drive=pkgdisk,)
+PKGDISK_HCI := $(if $(PKGDISK),-device qemu-xhci,)
 
 # Run with QEMU (graphical window — needs a working display backend)
 run: iso $(ROOT_DEP)
-	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -debugcon stdio -global isa-debugcon.iobase=0xe9
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -debugcon stdio -global isa-debugcon.iobase=0xe9 $(PKGDISK_HCI) $(PKGDISK_DEV)
 
 # Run headless with a virtio-blk disk attached (debugcon to stdio).
 .PHONY: run-disk
@@ -985,7 +1013,7 @@ run-disk: iso
 # No GUI/VNC needed (works where WSLg/GTK does not). Ctrl-A X to quit QEMU.
 .PHONY: run-serial
 run-serial: iso $(ROOT_DEP)
-	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -serial stdio -display none -no-reboot
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -serial stdio -display none -no-reboot $(PKGDISK_HCI) $(PKGDISK_DEV)
 
 # Serial console + an e1000 NIC with host port SSH_PORT (default 2222) forwarded
 # to guest :22, for the Dropbear SSH server (docs/SSH.md). -cpu max gives the
@@ -994,7 +1022,7 @@ SSH_PORT ?= 2222
 .PHONY: run-ssh
 run-ssh: iso $(ROOT_DEP)
 	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -m 512M -cpu max -serial stdio -display none -no-reboot \
-		-netdev user,id=n0,hostfwd=tcp::$(SSH_PORT)-:22 -device e1000,netdev=n0
+		-netdev user,id=n0,hostfwd=tcp::$(SSH_PORT)-:22 -device e1000,netdev=n0 $(PKGDISK_HCI) $(PKGDISK_DEV)
 
 # Graphical UI in a GTK window (docs/GUI.md): PS/2 keyboard + a USB tablet, so
 # the guest pointer follows the host cursor without a mouse grab. Type
@@ -1016,12 +1044,12 @@ run-gui: iso $(ROOT_DEP)
 	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -m $(GUI_MEM) -smp $(GUI_SMP) -cpu max -display gtk \
 		-device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 \
 		-netdev user,id=n0,hostfwd=tcp::$(GUI_SSH_PORT)-:22 -device e1000,netdev=n0 \
-		-debugcon file:secos-gui.log -global isa-debugcon.iobase=0xe9
+		-debugcon file:secos-gui.log -global isa-debugcon.iobase=0xe9 $(PKGDISK_DEV)
 
 # Run with a VNC server on :0 (connect a VNC viewer to localhost:5900)
 .PHONY: run-vnc
 run-vnc: iso $(ROOT_DEP)
-	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -display vnc=:0 -debugcon stdio -global isa-debugcon.iobase=0xe9
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -display vnc=:0 -debugcon stdio -global isa-debugcon.iobase=0xe9 $(PKGDISK_HCI) $(PKGDISK_DEV)
 
 # [M50] Lock validator run: a -DSECOS_LOCKDEP image through the SMP stress
 # (-smp 4/8), the network stress and a bkl=off boot; must stay free of
