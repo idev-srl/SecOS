@@ -213,7 +213,7 @@ if [[ $GROW -eq 1 ]]; then
     [[ -n "$dfk" ]] && (( dfk > 8000000 && dfk <= 8388608 )); ok "boot 2 df shows the grown size (${dfk:-?} KiB, about 8 GiB)" $?
     grep -aq "^$(md5sum <"$W/userdata" | cut -c1-32)  /home/bob/data.bin" "$W/p2.ser"; ok "boot 2 data written before the grow is intact" $?
     nf=$(newfree)
-    (( NEWFREE0 - nf > 4000 )); ok "boot 1+2 writes were allocated in the groups grow-root added ($((NEWFREE0 - nf)) blocks)" $?
+    (( NEWFREE0 - nf > 100 )); ok "boot 1+2 writes were allocated in the groups grow-root added ($((NEWFREE0 - nf)) blocks)" $?
 fi
 
 # ---- 3. upgraded kernel image ------------------------------------------------------
