@@ -16,6 +16,10 @@ waits for the prompt and checks:
                      hid               keys typed into the usb-kbd through QMP
                                        sendkey run a command in bash;
                      proc              /proc/iommu lists the unit and devices;
+                     ps2               (M56) /bin/guitest input sees PS/2 mouse
+                                       motion + a button and a PS/2 key sent
+                                       through QMP (no usb-kbd/tablet in the
+                                       guest: QMP input then goes to PS/2);
   --disk dev[:NODE]=IMG   dev = sata (/dev/sda), nvme (/dev/nvme0n1), usb
                    (/dev/usb0), NODE overrides the device node:
                    the host writes 1 MiB of random data at offset 0 of IMG,
@@ -23,6 +27,11 @@ waits for the prompt and checks:
                    offset 1 MiB that the host checks after QEMU exits;
   --faults N       /proc/iommu must show exactly N faults (default: 0, or the
                    edu test count with --edu; -1 = don't check).
+  --ir             (M56) the in-kernel interrupt-remapping tests ran:
+                   "[IR-TEST] RESULT pass=N fail=0", and /proc/iommu says
+                   "ir on"; --ir-off: /proc/iommu says "ir off".
+  --irq NAME       (M56) after the I/O, /proc/interrupts shows the vector
+                   named NAME with a non-zero count (repeatable).
 
 Always: no CPU exception, panic, lockdep report or nested fault in the log.
 Prints "[iommu] <name>: <check> ok|FAIL ..." lines and "[iommu] <name>: PASS"
@@ -49,6 +58,9 @@ ap.add_argument('--disk', action='append', default=[],
 ap.add_argument('--proc-off', action='store_true', help='/proc/iommu must say remapping is off')
 ap.add_argument('--cmdfile', default=None, help='one --cmd per line')
 ap.add_argument('--no-prompt', action='store_true', help='do not wait for bash (log checks only)')
+ap.add_argument('--ir', action='store_true', help='M56: interrupt-remapping tests ran and passed')
+ap.add_argument('--ir-off', action='store_true', help='M56: /proc/iommu must say ir off')
+ap.add_argument('--irq', action='append', default=[], help='M56: this vector name must have counted interrupts')
 ap.add_argument('qemu_args', nargs=argparse.REMAINDER)
 a = ap.parse_args()
 if a.cmdfile: a.cmd += [l.rstrip('\n') for l in open(a.cmdfile) if l.strip()]
@@ -244,7 +256,52 @@ if ok_prompt and not a.no_prompt:
             check('hid-keyboard', o is not None and 'HID-OK' in o)
         except Exception as e:
             check('hid-keyboard', False, 'QMP: %s' % e)
-    o = run('cat /proc/iommu', 30) if ('proc' in io or a.edu or a.faults is not None) else None
+    if 'ps2' in io:
+        # PS/2 keyboard (IRQ1) + mouse (IRQ12) through the IOAPIC: guitest
+        # (CAP_INPUT) prints every evdev event; QMP input goes to PS/2.
+        run('rm -f /tmp/gi; (/bin/guitest input > /tmp/gi 2>&1 &)', 20)
+        ready = False
+        for _ in range(30):
+            o = run('grep -c GI-READY /tmp/gi', 10)
+            if o and re.search(r'(?m)^1\s*$', o.replace('\r', '')): ready = True; break
+            time.sleep(0.5)
+        try:
+            for _ in range(5):
+                qmp('input-send-event', {'events': [{'type': 'rel', 'data': {'axis': 'x', 'value': 12}},
+                                                     {'type': 'rel', 'data': {'axis': 'y', 'value': 7}}]})
+                time.sleep(0.2)
+            qmp('input-send-event', {'events': [{'type': 'btn', 'data': {'down': True, 'button': 'left'}}]})
+            time.sleep(0.3)
+            qmp('input-send-event', {'events': [{'type': 'btn', 'data': {'down': False, 'button': 'left'}}]})
+            time.sleep(0.3)
+            qmp('send-key', {'keys': [{'type': 'qcode', 'data': 'a'}]}); time.sleep(0.5)
+            qmp('send-key', {'keys': [{'type': 'qcode', 'data': 'q'}]}); time.sleep(1.5)
+        except Exception as e:
+            check('ps2-qmp', False, str(e))
+        # Keys that reached bash (a grab that failed) would prefix the next
+        # command: discard the line first (readline ^U).
+        p.stdin.write(b'\x15'); p.stdin.flush(); time.sleep(0.3)
+        o = run('cat /tmp/gi; killall guitest 2>/dev/null; true', 30) or ''
+        rel = re.search(r'GI-EV "[^"]*Mouse[^"]*" type=2 ', o) is not None
+        btn = re.search(r'GI-EV "[^"]*Mouse[^"]*" type=1 code=272 value=1', o) is not None
+        key = re.search(r'GI-EV "AT Translated[^"]*" type=1 code=30 value=1', o) is not None
+        check('ps2-ready', ready)
+        check('ps2-mouse-motion', rel)
+        check('ps2-mouse-button', btn)
+        check('ps2-keyboard', key)
+    if a.irq:
+        o = run('cat /proc/interrupts', 30) or ''
+        open(os.path.join(W, a.name + '.irqs'), 'w').write(o)
+        for name in a.irq:
+            m = re.search(r'(?m)^\s*[0-9a-f]{2}:\s*\d+\s+(\d+)\s+(\d+)\s+' + re.escape(name) + r'\s*$',
+                          o.replace('\r', ''))
+            check('irq-%s-counted' % name, m is not None and int(m.group(1)) > 0 and int(m.group(2)) == 0,
+                  ('count %s off_cpu %s' % (m.group(1), m.group(2))) if m else 'no vector named ' + name)
+    o = run('cat /proc/iommu', 30) if ('proc' in io or a.edu or a.ir or a.ir_off or a.faults is not None) else None
+    if o is not None and a.ir:
+        check('proc-ir-on', re.search(r'(?m)^ir on entries 256', o) is not None)
+    if o is not None and a.ir_off:
+        check('proc-ir-off', re.search(r'(?m)^ir off', o) is not None)
     if o is not None:
         open(os.path.join(W, a.name + '.proc'), 'w').write(o)
     if 'proc' in io and a.proc_off:
@@ -269,6 +326,11 @@ if a.edu:
           m.group(0) if m else 'no RESULT line')
     for l in re.findall(r'\[IOMMU-TEST\] FAIL [^\n]*', d): print('    ' + l)
     if want is None and m: want = int(m.group(3))
+if a.ir:
+    m = re.search(r'\[IR-TEST\] RESULT pass=(\d+) fail=(\d+) limit=(\d+) ir-faults=(\d+)', d)
+    check('ir-tests', m is not None and m.group(2) == '0' and int(m.group(1)) > 0,
+          m.group(0) if m else 'no RESULT line')
+    for l in re.findall(r'\[IR-TEST\] (?:FAIL|LIMIT) [^\n]*', d): print('    ' + l)
 if want is None: want = 0
 if want >= 0 and not a.no_prompt and ok_prompt:
     o = run('cat /proc/iommu', 30)

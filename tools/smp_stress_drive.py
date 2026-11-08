@@ -24,7 +24,7 @@
 #
 # Usage: smp_stress_drive.py --iso ISO --smp N [--mem 1G] [--log LOG]
 #                            [--qemu BIN] [--cpu MODEL] [--boot SECS] [--quick]
-#                            [--cpus-only] [--expect-cpus N]
+#                            [--cpus-only] [--expect-cpus N] [--qemu-pre ARGS]
 import sys, time, subprocess, threading, re, argparse
 
 STEPS = [
@@ -79,6 +79,7 @@ def main():
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--cpus-only", action="store_true")
     ap.add_argument("--expect-cpus", type=int, default=None)
+    ap.add_argument("--qemu-pre", default="", help="extra QEMU arguments placed first (machine, IOMMU)")
     o = ap.parse_args()
     ncpu = o.expect_cpus if o.expect_cpus is not None else o.smp
     cpulist = "0" if ncpu == 1 else f"0-{ncpu - 1}"
@@ -88,7 +89,7 @@ def main():
               f"NP-{ncpu}-{ncpu}-{cpulist}-{cpulist}", 120)]
     if not o.cpus_only: steps += STEPS
 
-    qemu = [o.qemu, "-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp),
+    qemu = [o.qemu] + o.qemu_pre.split() + ["-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp),
             "-debugcon", "file:" + o.log, "-global", "isa-debugcon.iobase=0xe9",
             "-no-reboot", "-display", "none", "-serial", "stdio"]
     if o.cpu: qemu += ["-cpu", o.cpu]
