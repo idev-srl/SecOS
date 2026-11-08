@@ -40,7 +40,6 @@ void lockstat_line(void (*emit)(void*, const char*), void* ctx, const char* kind
 
 #define LD_STACK   16
 #define LD_FRAMES  8
-#define LD_STUCK_S 2           /* watchdog: a wait longer than this        */
 
 struct ld_ent {
     spinlock_t* l;
@@ -62,9 +61,43 @@ static inline uint64_t ld_rflags(void) {
     __asm__ volatile ("pushfq; pop %0" : "=r"(f));
     return f;
 }
+/* This CPU's index without touching the LAPIC. this_cpu() reads the LAPIC ID
+ * register, and every lock operation needs the index: under QEMU TCG each of
+ * those reads is an MMIO exit that takes QEMU's global lock, which the vCPUs
+ * spinning on a lock keep taking too (every `pause` returns to QEMU's CPU
+ * loop), so a holder could stall right after winning the lock and before
+ * recording itself as the owner ("owner=cpu 0xFFFF"). The index is cached per
+ * CPU in IA32_KERNEL_GS_BASE, which nothing else uses (the kernel never
+ * executes swapgs) and ring 3 cannot touch; the tag keeps a value left by
+ * firmware from being taken for an index. A CPU caches its index only once
+ * this_cpu() demonstrably resolved it (the cpu_t's APIC ID is this CPU's):
+ * until an AP is registered, this_cpu() answers "the BSP" on it. */
+#define LD_MSR_KGSBASE 0xC0000102u
+#define LD_IDX_TAG     0xFFFFEC1D00000000ULL   /* canonical: the MSR requires it */
+static inline uint64_t ld_rdmsr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void ld_wrmsr(uint32_t msr, uint64_t v) {
+    __asm__ volatile ("wrmsr" :: "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+extern uint32_t lapic_get_id(void);
+static uint32_t ld_idx_slow(void) {
+    uint64_t f;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    cpu_t* c = this_cpu();
+    uint32_t i = c->index < SMP_MAX_CPUS ? c->index : 0;
+    if (g_cpu_count > 1 && c->lapic_id == lapic_get_id())
+        ld_wrmsr(LD_MSR_KGSBASE, LD_IDX_TAG | i);
+    __asm__ volatile ("push %0; popfq" :: "r"(f) : "memory", "cc");
+    return i;
+}
 static inline uint32_t ld_idx(void) {
-    uint32_t i = this_cpu()->index;
-    return i < SMP_MAX_CPUS ? i : 0;
+    uint64_t v = ld_rdmsr(LD_MSR_KGSBASE);
+    if ((v & 0xFFFFFFFF00000000ULL) == LD_IDX_TAG && (uint32_t)v < SMP_MAX_CPUS)
+        return (uint32_t)v;
+    return ld_idx_slow();
 }
 static inline struct ld_cpu* ld_me(void) { return &g_ld[ld_idx()]; }
 
@@ -117,6 +150,10 @@ static void ld_report2(const char* what, const char* a, const char* b, void* cal
             if (g_seen[i][0] == what && g_seen[i][1] == (const void*)a) return;
         if (n < LD_SEEN_MAX) { g_seen[n][0] = what; g_seen[n][1] = a; g_nseen = n + 1; }
     }
+    /* Interrupts off while in_report is set: an IRQ handler on this CPU
+     * would otherwise take its locks untracked (no owner, no checks). */
+    uint64_t rf;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(rf) :: "memory");
     d->in_report = 1;
     __atomic_add_fetch(&g_nreports, 1, __ATOMIC_RELAXED);
     debugcon_writestring("[LOCKDEP] ");
@@ -131,6 +168,7 @@ static void ld_report2(const char* what, const char* a, const char* b, void* cal
     debugcon_kflush();
     if (!g_warn_mode) kernel_panic("lockdep violation", __FILE__, __LINE__);
     d->in_report = 0;
+    __asm__ volatile ("push %0; popfq" :: "r"(rf) : "memory", "cc");
 }
 
 void lockdep_report(const char* what, const char* name) {
@@ -199,20 +237,46 @@ static void ld_push(struct ld_cpu* d, spinlock_t* l, uint64_t rf) {
     e->frame = (uint8_t)d->nframe;
 }
 
+/* Right after the lock word was won: the owner is recorded first, with no
+ * LAPIC (or other MMIO) access in between. */
 static void ld_acquired(struct ld_cpu* d, spinlock_t* l, uint64_t rf) {
-    l->owner_cpu = ld_idx() + 1;
+    l->owner_cpu = (uint32_t)(d - g_ld) + 1;
     l->t_acq = tsc_read();
-    l->n_acq++;
+    __atomic_store_n(&l->n_acq, l->n_acq + 1, __ATOMIC_RELAXED);
     if (!l->reg) ld_register(l);
     ld_push(d, l, rf);
 }
+
+/* [ldwatch] -DSECOS_LDWATCH_TEST counts watchdog reports instead of printing
+ * them as [LOCKDEP] lines (kernel/ldwatch_test.c). */
+static volatile int g_ld_stuck_expect;
+static volatile uint32_t g_ld_stuck_caught;
+void lockdep_stuck_expect(int on) { g_ld_stuck_expect = on; }
+uint32_t lockdep_stuck_caught(void) { return __atomic_load_n(&g_ld_stuck_caught, __ATOMIC_RELAXED); }
 
 static void ld_stuck(const char* kind, const char* name, const char* okind, uint64_t oid,
                      uint64_t held_cyc) {
     struct ld_cpu* d = ld_me();
     if (d->in_report) return;
+    uint64_t rf;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(rf) :: "memory");
     d->in_report = 1;
     uint64_t hz = tsc_hz();
+    if (g_ld_stuck_expect) {           /* forced test: counted, not a report */
+        __atomic_add_fetch(&g_ld_stuck_caught, 1, __ATOMIC_RELAXED);
+        debugcon_writestring("[LDTEST]   caught: stuck on ");
+        debugcon_writestring(kind);
+        debugcon_writestring(" ");
+        ld_name(name);
+        debugcon_writestring(" owner=");
+        debugcon_writestring(okind);
+        debugcon_writestring(" ");
+        debugcon_print_hex(oid);
+        debugcon_writestring("\n");
+        d->in_report = 0;
+        __asm__ volatile ("push %0; popfq" :: "r"(rf) : "memory", "cc");
+        return;
+    }
     debugcon_writestring("[LOCKDEP] stuck on ");
     debugcon_writestring(kind);
     debugcon_writestring(" ");
@@ -228,32 +292,46 @@ static void ld_stuck(const char* kind, const char* name, const char* okind, uint
     debugcon_kflush();
     __atomic_add_fetch(&g_nreports, 1, __ATOMIC_RELAXED);
     d->in_report = 0;
+    __asm__ volatile ("push %0; popfq" :: "r"(rf) : "memory", "cc");
+}
+
+/* ---- the stuck-lock watchdog (decision in lockdep_wait.h) ----------------- */
+void lockdep_wait_init(ld_wait_t* w, uint64_t progress) {
+    ld_wait_start(w, progress, tsc_read());
+}
+
+/* Sample every 1024 spins: LD_WAIT_STUCK / LD_WAIT_STARVED = report now. */
+static int ld_wait_poll(ld_wait_t* w, uint64_t progress) {
+    if ((++w->spins & 0x3FF) != 0) return LD_WAIT_OK;
+    return ld_wait_sample(w, progress, tsc_read(), tsc_hz());
 }
 
 void lockdep_spin_lock(spinlock_t* l) {
     uint64_t rf = ld_rflags();
     struct ld_cpu* d = ld_me();
-    if (d->in_report) { spin_lock_raw(l); return; }
+    if (d->in_report) {             /* untracked, but the owner is known */
+        spin_lock_raw(l);
+        l->owner_cpu = (uint32_t)(d - g_ld) + 1;
+        return;
+    }
     void* caller = __builtin_return_address(0);
     ld_check_acquire(d, l, rf, caller);
     if (!spin_trylock_raw(l)) {
-        uint64_t t0 = tsc_read(), hz = tsc_hz();
-        uint32_t spins = 0;
-        int reported = 0;
+        ld_wait_t wt;
+        lockdep_wait_init(&wt, __atomic_load_n(&l->n_acq, __ATOMIC_RELAXED));
         for (;;) {
             while (l->locked) {
                 cpu_relax_poll();
-                if (!reported && hz && (++spins & 0x3FF) == 0 &&
-                    tsc_read() - t0 > hz * LD_STUCK_S) {
-                    reported = 1;
+                int r = ld_wait_poll(&wt, __atomic_load_n(&l->n_acq, __ATOMIC_RELAXED));
+                if (r) {
                     uint32_t oc = l->owner_cpu;
-                    ld_stuck("spinlock", l->name, "cpu", oc ? oc - 1 : 0xFFFF,
-                             tsc_read() - l->t_acq);
+                    ld_stuck(r == LD_WAIT_STUCK ? "spinlock" : "spinlock (starved)", l->name, "cpu",
+                             oc ? oc - 1 : 0xFFFF, tsc_read() - l->t_acq);
                 }
             }
             if (spin_trylock_raw(l)) break;
         }
-        uint64_t w = tsc_read() - t0;
+        uint64_t w = tsc_read() - wt.t0;
         l->n_contended++;
         if (w > l->max_wait_cyc) l->max_wait_cyc = w;
     }
@@ -263,7 +341,11 @@ void lockdep_spin_lock(spinlock_t* l) {
 int lockdep_spin_trylock(spinlock_t* l) {
     uint64_t rf = ld_rflags();
     struct ld_cpu* d = ld_me();
-    if (d->in_report) return spin_trylock_raw(l);
+    if (d->in_report) {
+        if (!spin_trylock_raw(l)) return 0;
+        l->owner_cpu = (uint32_t)(d - g_ld) + 1;
+        return 1;
+    }
     /* A trylock cannot deadlock: no order check, but recursion is a bug. */
     uint32_t n = d->depth < LD_STACK ? d->depth : LD_STACK;
     for (uint32_t i = 0; i < n; i++)
@@ -353,16 +435,13 @@ void lockdep_klock_before(klock_t* l, klock_task_t* t) {
     }
 }
 
-void lockdep_klock_wait(klock_t* l, uint64_t t0, int* reported) {
-    static const uint32_t mask = 0x3FF;
-    static uint32_t spins;          /* sampling only: races are harmless */
-    if (*reported || ((++spins) & mask)) return;
-    uint64_t hz = tsc_hz();
-    if (!hz || tsc_read() - t0 <= hz * LD_STUCK_S) return;
-    *reported = 1;
+void lockdep_klock_wait(klock_t* l, ld_wait_t* w) {
+    /* `serving` advances on every hand-over of the ticket lock. */
+    int r = ld_wait_poll(w, __atomic_load_n(&l->serving, __ATOMIC_ACQUIRE));
+    if (!r) return;
     uint64_t id;
     const char* k = klock_owner_desc(l, &id);
-    ld_stuck("klock", l->name, k, id, tsc_read() - l->t_acq);
+    ld_stuck(r == LD_WAIT_STUCK ? "klock" : "klock (starved)", l->name, k, id, tsc_read() - l->t_acq);
     debugcon_writestring("[LOCKDEP]   klock queue: waiters=");
     debugcon_print_hex((uint32_t)(l->next - l->serving));
     debugcon_writestring("\n");

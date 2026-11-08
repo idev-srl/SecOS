@@ -39,15 +39,22 @@ struct klock;
 struct klock_task;
 
 #ifdef SECOS_LOCKDEP
+#include "lockdep_wait.h"
+
 /* spinlock.h hooks (the whole acquisition / release, with checks + stats). */
 void lockdep_spin_lock(struct spinlock* l);
 int  lockdep_spin_trylock(struct spinlock* l);
 void lockdep_spin_unlock(struct spinlock* l);
 int  lockdep_spin_held(const struct spinlock* l);       /* by this CPU */
 
+/* The stuck-lock watchdog state of one wait (ld_wait_t, lockdep_wait.h). */
+void lockdep_wait_init(ld_wait_t* w, uint64_t progress);
+void lockdep_stuck_expect(int on);       /* forced test: count reports, print [LDTEST] */
+uint32_t lockdep_stuck_caught(void);
+
 /* klock.c hooks. */
 void lockdep_klock_before(struct klock* l, struct klock_task* t);
-void lockdep_klock_wait(struct klock* l, uint64_t t0, int* reported);
+void lockdep_klock_wait(struct klock* l, ld_wait_t* w);
 
 /* Called by lockdep's checkers, panic and the IRQ stubs. */
 uint32_t lockdep_cpu_spin_depth(void);   /* spinlocks held by this CPU */
