@@ -3,11 +3,11 @@
 #
 #   tools/mkpkgdisk.sh <image> <pkg.spkg>...
 #
-# An exFAT volume (label SPKG) holding the packages at its root, made with the
+# An exFAT volume holding the packages at its root, made with the
 # real host tools (tools/exfat-host.sh: exfatprogs + exfat-fuse, no sudo).
 # Every package is verified on the host first (tools/secos-pkg verify): a
 # disk is never built with a package SecOS would refuse. The image is sized
-# to the packages (+ 25 % + 32 MiB), sparse. Attach it with
+# to the packages (+ 25 % + 32 MiB, + PKGDISK_FREE_MB), sparse. Attach it with
 # `make run-serial PKGDISK=<image>` (USB storage, usb0), then in SecOS:
 #   mkdir -p /media && mount -t exfat /dev/usb0 /media
 #   spkg install /media/<pkg>.spkg
@@ -23,7 +23,7 @@ for p in "$@"; do
         || { echo "pkgdisk: $p: signature/structure check FAILED, not adding it" >&2; exit 1; }
     total=$(( total + $(stat -c %s "$p") ))
 done
-mb=$(( total * 5 / 4 / 1048576 + 32 ))
+mb=$(( total * 5 / 4 / 1048576 + 32 + ${PKGDISK_FREE_MB:-0} ))
 rm -f -- "$img"
 bash "$REPO/tools/exfat-host.sh" mkfs "$img" "$mb" >/dev/null
 abs=()

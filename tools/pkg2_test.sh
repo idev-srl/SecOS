@@ -102,7 +102,8 @@ done
 ! $PKG verify "$W/bad-data.spkg" >/dev/null 2>&1 && ! $PKG verify "$W/bad-table.spkg" >/dev/null 2>&1 \
   && $PKG verify "$W/bigtest.spkg" >/dev/null && $PKG verify "$W/dotdot.spkg" >/dev/null
 ok "host: packages built, secos-pkg verify accepts the good ones and refuses the tampered ones" $?
-make --no-print-directory pkgdisk PKGDISK_IMG="$W/pkg.img" \
+# Room for the two tampered copies, added by hand below.
+PKGDISK_FREE_MB=$(( 2 * BIGMB + 64 )) make --no-print-directory pkgdisk PKGDISK_IMG="$W/pkg.img" \
     PKGS="$W/bigtest.spkg $W/ktest1.spkg $W/ktest2.spkg $W/outside.spkg $W/dotdot.spkg" >"$W/pkgdisk.log" 2>&1
 rc=$?
 # The tampered ones go in by hand (make pkgdisk refuses them, by design).
@@ -301,7 +302,8 @@ start_vm b5
 waitfor "$PROMPT" 240
 run P1 600 "$KCHK"
 kstate_ok; ok "after the reboot one whole ktest version is installed ($LASTK)" $?
-grep -aq "finishing an interrupted package operation" "$W/b5.ser" && echo "    (init finished a committed upgrade at boot)"
+grep -aq "finishing an interrupted package operation" "$W/b5.ser" && echo "    (init ran spkg recover at boot)"
+grep -aq "spkg: interrupted operation completed" "$W/b5.ser" && echo "    (the cut upgrade had committed: init completed it)"
 run P2 300 "spkg remove ktest; [ ! -e /opt/ktest ] && [ ! -e /usr/share/ktest ] && [ ! -e /etc/ktest.conf ] && [ -z \"\$(ls /var/lib/spkg/db)\" ]"
 [[ "$(rcof P2)" == 0 ]]; ok "ktest removed, no leftovers" $?
 send 'poweroff'; stop_vm 90; rc=$?
