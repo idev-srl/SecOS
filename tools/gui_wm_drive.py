@@ -11,6 +11,8 @@
 #   - the guest's debugcon log (--log) carries the in-guest markers;
 #   - this driver appends "[WM-DRV] <check> OK|FAIL ..." lines to --out;
 #   - --shots DIR keeps the screendumps (PPM, plus PNG when Pillow exists).
+# --taskmgr runs the TASKMGR gate instead (U5, /bin/taskmgr in an unprivileged
+# user's desktop; --smp N sets the guest CPUs, default 2).
 # Never binds host TCP ports (QMP is a private unix socket); only kills the
 # QEMU it started.
 import argparse, json, os, re, socket, subprocess, sys, tempfile, time
@@ -22,7 +24,10 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--shots", default="")
 ap.add_argument("--timeout", type=float, default=420)
 ap.add_argument("--demo", action="store_true", help="visual tour (screenshots only, no checks)")
+ap.add_argument("--taskmgr", action="store_true", help="TASKMGR gate: /bin/taskmgr in a user session")
+ap.add_argument("--smp", type=int, default=0, help="guest CPUs (-smp); --taskmgr defaults to 2")
 args = ap.parse_args()
+if args.taskmgr and not args.smp: args.smp = 2
 
 tmpd = tempfile.mkdtemp(prefix="secos_wm_")
 qmp_path = os.path.join(tmpd, "qmp.sock")
@@ -31,6 +36,7 @@ cmd = ["qemu-system-x86_64", "-cdrom", args.iso, "-boot", "d", "-m", "512M",
        "-no-reboot", "-display", "none", "-serial", "stdio",
        "-qmp", "unix:%s,server=on,wait=off" % qmp_path,
        "-device", "qemu-xhci,id=xhci", "-device", "usb-tablet,bus=xhci.0"]
+if args.smp: cmd += ["-smp", str(args.smp)]
 open(args.log, "w").close()
 out = open(args.out, "a")
 def note(s):
@@ -202,6 +208,208 @@ if args.demo:
     sendkey("ctrl-alt-backspace")
     wait_for(r"SW-EXIT", 15, pos)
     q.kill()
+    sys.exit(0)
+
+if args.taskmgr:
+    # [U5] TASKMGR gate. The desktop runs as an unprivileged user (tmu, in the
+    # video/input groups; secwm --auto switches to it); root keeps a
+    # `sleep 2000` on the console. /bin/taskmgr --trace (secwm passes it on)
+    # prints TASKMGR-* markers: the row geometry, the dialogs' buttons and every
+    # signal it sends. The clicks below use them, like a user would the screen.
+    def last_block(after):
+        t = logtext()[after:]
+        i = t.rfind("TASKMGR-LIST-END")
+        if i < 0: return []
+        j = t.rfind("TASKMGR-LIST n=", 0, i)
+        if j < 0: return []
+        return re.findall(r"TASKMGR-P (\d+) (\S+) (\S+) (\S)", t[j:i])
+    def rows(after):
+        ms = list(re.finditer(r"TASKMGR-ROWS y0=(-?\d+) rh=(\d+) pids=([\d,]*)", logtext()[after:]))
+        if not ms: return None
+        m = ms[-1]
+        return int(m.group(1)), int(m.group(2)), [int(x) for x in m.group(3).split(",") if x]
+    def obj(name, after):
+        ms = list(re.finditer(r"TASKMGR-OBJ %s (-?\d+),(-?\d+),(\d+),(\d+)" % re.escape(name), logtext()[after:]))
+        return tuple(int(v) for v in ms[-1].groups()) if ms else None
+    def wclick(o, cx, cy):
+        x, y, w, h = o
+        click(cx + x + w // 2, cy + y + h // 2)
+    def select_row(pid, cx, cy, after, list_obj):
+        r = rows(after)
+        if not r or pid not in r[2]: return False
+        y0, rh, pids = r
+        y = y0 + pids.index(pid) * rh + rh // 2
+        if list_obj and (y < list_obj[1] + 40 or y > list_obj[1] + list_obj[3] - 4): return False
+        p0 = len(logtext())
+        click(cx + 60, cy + y)
+        return wait_for(r"TASKMGR-SELECT pid=%d " % pid, 8, p0) is not None
+
+    # /proc/net/dev in the Linux layout (the e1000 of the default QEMU NIC).
+    pos = len(logtext())
+    type_serial("  cat /proc/net/dev; echo NETDEV-END")
+    wait_for(r"NETDEV-END", 20, pos)
+    t = logtext()[pos:]
+    check("procnetdev-format", "Inter-|   Receive" in t and
+          " face |bytes    packets errs drop fifo frame compressed multicast|bytes" in t and
+          re.search(r"\n\s*eth0:\s*[1-9]\d*\s+[1-9]\d*\s+\d+\s+\d+\s+0\s+0\s+0\s+0\s+[1-9]\d*\s+[1-9]\d*\s+\d+\s+\d+\s+0\s+0\s+0\s+0", t) is not None)
+    pos = len(logtext())
+    type_serial("  useradd tmu && usermod -aG video,input tmu && printf '1\\nuser=tmu\\n' > /etc/gui-autostart; echo TMSETUP-$?")
+    check("tm-setup", wait_for(r"TMSETUP-0", 30, pos) is not None)
+    pos = len(logtext())
+    type_serial("  sleep 2000 & echo ROOTSLEEP=$!")
+    m = wait_for(r"ROOTSLEEP=(\d+)", 15, pos)
+    rootpid = int(m.group(1)) if m else -1
+    pos = len(logtext())
+    type_serial("  /bin/startgui --trace --auto")
+    m = wait_for(r"SW-READY (\d+)x(\d+)", 40, pos)
+    if not check("tm-wm-ready", m is not None):
+        q.kill(); sys.exit(1)
+    W, H = int(m.group(1)), int(m.group(2))
+    mt = wait_for(r"SW-TERM-OPEN 1 pid=\d+ pts/\d+ at (-?\d+),(-?\d+)", 30, pos)
+    tx, ty = (int(mt.group(1)), int(mt.group(2))) if mt else (40, 48)
+    time.sleep(2)
+    # A sleep owned by the user, started from the GUI terminal.
+    p0 = len(logtext())
+    click(tx + 60, ty + 200)
+    time.sleep(1)
+    type_keys("sleep 1000 & echo SLEEP=$! UID=$(id -u)")
+    m = wait_for(r"SW-TTY 1: SLEEP=(\d+) UID=(\d+)", 20, p0)
+    sleeppid = int(m.group(1)) if m else -1
+    check("tm-user-session", m is not None and m.group(2) != "0",
+          "sleep=%d uid=%s" % (sleeppid, m.group(2) if m else "?"))
+    # The panel entry opens it; Ctrl+Shift+Esc then raises the same instance.
+    mb = re.search(r"SW-PANEL TaskManager (\d+),(\d+),(\d+),(\d+)", logtext()[pos:])
+    check("tm-panel-button", mb is not None)
+    p0 = len(logtext())
+    if mb: click(int(mb.group(1)) + int(mb.group(3)) // 2, int(mb.group(2)) + int(mb.group(4)) // 2)
+    mw = wait_for(r"SW-CLIENT-WINDOW (\d+) (\d+)x(\d+) at (-?\d+),(-?\d+)", 30, p0)
+    mr = wait_for(r"TASKMGR-READY (\d+)x(\d+) cpus=(\d+) user=(\S+) uid=(\d+)", 30, p0)
+    check("tm-window-opens", mw is not None and mr is not None)
+    if not (mw and mr):
+        q.kill(); sys.exit(1)
+    wid = mw.group(1)
+    cx, cy = int(mw.group(4)) + 1, int(mw.group(5)) + 26
+    cw, ch = int(mw.group(2)), int(mw.group(3))
+    check("tm-runs-as-user", mr.group(4) == "tmu", "user=%s" % mr.group(4))
+    mg = wait_for(r"TASKMGR-CPUGRAPHS (\d+)", 10, p0)
+    check("tm-cpus", int(mr.group(3)) == args.smp, "cpus=%s smp=%d" % (mr.group(3), args.smp))
+    check("tm-cpu-graphs", mg is not None and int(mg.group(1)) == args.smp,
+          "graphs=%s smp=%d" % (mg.group(1) if mg else "?", args.smp))
+    time.sleep(3)
+    procs = last_block(p0)
+    names = set(x[1] for x in procs)
+    check("tm-list-init-bash", "init" in names and "bash" in names, "names=%s" % sorted(names))
+    check("tm-list-users", any(x[0] == "1" and x[2] == "root" for x in procs) and
+          any(int(x[0]) == sleeppid and x[2] == "tmu" for x in procs))
+    click(tx + 20, ty + 200)                   # focus the terminal (left of the task manager)
+    time.sleep(1)
+    p1 = len(logtext())
+    sendkey("ctrl-shift-esc")
+    check("tm-shortcut-single-instance", wait_for(r"SW-FOCUS %s\b" % wid, 10, p1) is not None and
+          re.search(r"SW-CLIENT \d+ pid=\d+ /bin/taskmgr", logtext()[p1:]) is None)
+    time.sleep(2)
+    img = screendump("taskmgr_processes")
+    cols = set(pixel(img, x, y) for y in range(cy, cy + ch, 3) for x in range(cx, cx + cw, 3))
+    check("tm-pixels", len(cols) > 40, "colours=%d" % len(cols))
+    lst = obj("proc-list", p0)
+    # Sort by PID with a click on the header.
+    if lst:
+        p1 = len(logtext())
+        click(cx + 168 + 32, cy + lst[1] + 20)
+        check("tm-sort-click", wait_for(r"TASKMGR-SORT processes col=PID desc=0", 8, p1) is not None)
+        time.sleep(1.5)
+    # End task on the user's sleep: select its row, End task, confirm.
+    check("tm-select-row", select_row(sleeppid, cx, cy, p0, lst), "pid=%d" % sleeppid)
+    eb = obj("end-task", p0)
+    p1 = len(logtext())
+    if eb: wclick(eb, cx, cy)
+    check("tm-confirm-dialog", wait_for(r"TASKMGR-CONFIRM pid=%d " % sleeppid, 10, p1) is not None)
+    time.sleep(1.5)
+    screendump("taskmgr_confirm")
+    okb = obj("dlg-ok", p1)
+    p2 = len(logtext())
+    if okb: wclick(okb, cx, cy)
+    check("tm-sigterm", wait_for(r"TASKMGR-TERM pid=%d rc=0 " % sleeppid, 10, p2) is not None)
+    check("tm-gone", wait_for(r"TASKMGR-GONE pid=%d" % sleeppid, 15, p2) is not None)
+    time.sleep(2.5)
+    procs = last_block(p2)
+    check("tm-gone-from-list", bool(procs) and all(int(x[0]) != sleeppid for x in procs))
+    # Ending root's process from this user session is refused; nothing is sent.
+    time.sleep(1)
+    check("tm-select-root-row", select_row(rootpid, cx, cy, p0, lst), "pid=%d" % rootpid)
+    p2 = len(logtext())
+    if eb: wclick(eb, cx, cy)
+    check("tm-refused", wait_for(r"TASKMGR-REFUSED pid=%d name=sleep owner=root errno=1" % rootpid, 10, p2) is not None)
+    time.sleep(1.5)
+    screendump("taskmgr_refused")
+    check("tm-refused-no-signal", re.search(r"TASKMGR-(CONFIRM|TERM) pid=%d\b" % rootpid, logtext()[p2:]) is None)
+    okb = obj("dlg-ok", p2)
+    if okb: wclick(okb, cx, cy)
+    time.sleep(1)
+    # init too, with the keyboard: Home = first row (PID order), Delete = End task.
+    p2 = len(logtext())
+    sendkey("home"); time.sleep(0.5)
+    sendkey("delete")
+    check("tm-refused-init-keyboard", wait_for(r"TASKMGR-REFUSED pid=1 name=init owner=root", 10, p2) is not None)
+    time.sleep(0.5)
+    sendkey("ret")
+    time.sleep(1)
+    # Performance tab (one graph per CPU), then Users.
+    tp = obj("tab-performance", p0)
+    p2 = len(logtext())
+    if tp: wclick(tp, cx, cy)
+    check("tm-tab-performance", wait_for(r"TASKMGR-TAB 1 Performance", 10, p2) is not None)
+    time.sleep(3)
+    img = screendump("taskmgr_performance")
+    pcols = set(pixel(img, x, y) for y in range(cy, cy + ch, 3) for x in range(cx, cx + cw, 3))
+    blue = sum(1 for y in range(cy, cy + ch, 2) for x in range(cx + 230, cx + cw, 2)
+               if near(pixel(img, x, y), hexrgb(0x3FA4F0), 40))
+    check("tm-perf-pixels", len(pcols) > 40 and blue > 20, "colours=%d blue=%d" % (len(pcols), blue))
+    check("tm-nic-listed", re.search(r"TASKMGR-NIC eth0", logtext()[p0:]) is not None)
+    tu = obj("tab-users", p0)
+    p2 = len(logtext())
+    if tu: wclick(tu, cx, cy)
+    check("tm-tab-users", wait_for(r"TASKMGR-TAB 2 Users", 10, p2) is not None)
+    time.sleep(2)
+    screendump("taskmgr_users")
+    if tp:
+        wclick(tp, cx, cy); time.sleep(1)
+        # Memory and the NIC in the sidebar (screenshots only).
+        click(cx + 110, cy + 40 + 8 + 66 + 30); time.sleep(2.5); screendump("taskmgr_memory")
+        click(cx + 110, cy + 40 + 8 + 132 + 30); time.sleep(2.5); screendump("taskmgr_network")
+        click(cx + 110, cy + 40 + 8 + 30); time.sleep(1)
+    tpr = obj("tab-processes", p0)
+    if tpr: wclick(tpr, cx, cy)
+    time.sleep(2)
+    screendump("taskmgr_final")
+    # Ctrl+Alt+W closes it; Ctrl+Shift+Esc opens a new one.
+    p2 = len(logtext())
+    sendkey("ctrl-alt-w")
+    check("tm-close", wait_for(r"SW-CLOSE %s\b" % wid, 10, p2) is not None and
+          wait_for(r"SW-CLIENT-EXIT %s " % wid, 10, p2) is not None)
+    p2 = len(logtext())
+    sendkey("ctrl-shift-esc")
+    check("tm-shortcut-open", wait_for(r"TASKMGR-READY ", 30, p2) is not None)
+    time.sleep(2)
+    p2 = len(logtext())
+    sendkey("ctrl-alt-backspace")
+    check("tm-exit-gui", wait_for(r"SW-EXIT", 15, p2) is not None)
+    time.sleep(2)
+    p2 = len(logtext())
+    type_serial("  kill -0 %d 2>/dev/null; echo USERSLEEP-$?; kill -0 %d && echo ROOTSLEEP-ALIVE; kill %d"
+                % (sleeppid, rootpid, rootpid))
+    check("tm-user-sleep-ended", wait_for(r"USERSLEEP-1", 15, p2) is not None)
+    check("tm-root-sleep-survived", wait_for(r"ROOTSLEEP-ALIVE", 15, p2) is not None)
+    # No capability denial: kill() is CAP_SIGNAL, granted; the refusal is the
+    # kernel's credential rule (EPERM), not an [AUDIT] DENY.
+    tpids = [int(x) for x in re.findall(r"SW-CLIENT \d+ pid=(\d+) /bin/taskmgr", logtext())]
+    denies = re.findall(r"\[AUDIT\] pid=(0x[0-9A-Fa-f]+|\d+) DENY\s+(\S+) \(([^)]*)\)", logtext())
+    bad = [d for d in denies if int(d[0], 0) in tpids]
+    check("tm-no-audit-deny", bool(tpids) and not bad, "taskmgr pids=%s denies=%s" % (tpids, bad))
+    check("tm-no-panic", re.search(r"\[PANIC\]|\[EXC\].*ring0", logtext()) is None)
+    q.kill()
+    try: q.wait(5)
+    except Exception: pass
     sys.exit(0)
 
 # ==== session 1: compositor, terminals, input isolation, job control, layout ====
