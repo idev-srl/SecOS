@@ -364,8 +364,39 @@ Every run below used a private `/tmp` (`unshare -rm`), random host ports.
 | `make lockdep-check` (default off, alt on) | lockdep | **18/18** |
 | `make locktests` (9 forced-concurrency tests incl. the new `fsops`) | lockdep, bkl=off | **18/18** |
 | full `tools/selftest.sh`, pre-D7 default (bkl=on), at `07ceb87` | normal | 1267 passed, 1 failed: the new exec `heap-in-use-steady` check saw +1.7 MB (an unreaped bash zombie's image); the driver now takes the best of three samples (`536e024`) |
-| full `tools/selftest.sh`, D7 default (bkl=off) | normal | see below |
+| full `tools/selftest.sh`, D7 default (bkl=off), at `20ce2c3` | normal | 1267 passed, 1 failed: the same kind of transient in the proc-race heap check (SUnreclaim 14902 → 16175 → 15030 kB, i.e. back down); the check now looks for growth, not spread (`4aac959`) |
 | soak: `tools/soak.sh` + syscall fuzzer, -smp 8, 5 seeds × 2500 commands, 32 min | normal, bkl=off | **5/5 PASS**, no kernel fault |
-| bklstress subset on the final tip (fsd4 esd8 fsc4 fsr4 prd8 fsx4) | lockdep, bkl=off | see below |
+| bklstress subset at `536e024` (fsd4 esd8 fsc4 fsr4 prd8 fsx4) | lockdep, bkl=off | **13/13**, 0 lockdep reports |
+| full `tools/selftest.sh`, default bkl=off, at `536e024` (+ `4aac959` driver) | normal | 1267 passed, 1 failed: proc-race heap check, SUnreclaim 16304 / 15165 / 16304 kB (±1.1 MB = one pinned bash image of a process being torn down). The heap checks now allow 2048 kB (`10e60a9`); PROCRACE and the exec gate re-run on the tip, see below |
 
 `-Wall -Wextra`: 35 warnings at every commit, as at the base.
+
+On the final tip (`10e60a9`), normal build, bkl=off: PROCRACE at -smp 4
+and 8 and the M51 exec gate, twice each: **6/6 runs pass** (9/9, 9/9,
+10/10 checks each).
+
+## Open risks
+
+- **Name-based check-then-act left**: unlink, rmdir, rename and link check
+  permission on one lookup and act by name. Exploiting it needs write
+  access to the directory; in a sticky directory only one's own entries
+  can be swapped. Fix: driver-level "remove this inode" ops like the
+  inode-keyed truncate/setattr.
+- **Slot reuse vs an open in flight**: an `open()` that looked an inode up
+  but has not installed its fd yet is not counted by the ramfs/ext2 dead
+  slot recyclers; if the file is unlinked and 64 new slots are allocated
+  in that window, the fd lands on the reused slot. Needs real inode
+  references (an `irefs` count taken by the pinned lookup).
+- **ext2 unlink-while-open** returns EIO (no orphan list), as noted by the
+  inode-ops work: correct (no wrong data), not POSIX.
+- **`mm_lock` is irqsave**: a long fork walk delays the tick on its CPU.
+- **Lockdep cannot see cross-frame IRQ cycles** (the `mm_lock` deadlock was
+  found by the stuck watchdog, not by an order report): a lock held with
+  IF on, nested under a lock that an IRQ takes. Worth a Linux-style
+  IRQ-safe/unsafe class check.
+- **Bottlenecks**: the per-volume ext4 lock held across synchronous JBD2
+  commits; `heap_lock`. With `bkl=off` these, not the BKL, bound file I/O
+  and exec on many CPUs.
+- **Not re-validated on real hardware** (paused): plan §6 deletes the BKL
+  only after the ASUS laptop passes GUI, SSH and `stress 32` with
+  `bkl=off`. Until then the GRUB fallback entry stays.
