@@ -188,6 +188,31 @@ static void parse_fadt(uint64_t fadt){
     }
 }
 
+/* [M53a] MCFG: the PCIe ECAM windows. Firmware input: the length and the entry
+ * count are bounded, the checksum must hold; the windows themselves are
+ * validated by the PCI registry before use (drivers/pci_registry.c). */
+static acpi_mcfg_entry_t g_mcfg[ACPI_MAX_MCFG];
+static int g_mcfg_n;
+static void parse_mcfg(uint64_t mcfg){
+    g_mcfg_n = 0;
+    if(!mcfg) return;
+    const uint8_t* t = pvt(mcfg);
+    uint32_t len = rd32(t+4);
+    if(len < 44 || len > 4096){ debugcon_writestring("[ACPI] MCFG: bad length, ignored\n"); return; }
+    if(!checksum_ok(t, len)){ debugcon_writestring("[ACPI] MCFG: bad checksum, ignored\n"); return; }
+    uint32_t n = (len - 44) / 16;
+    for(uint32_t i=0; i<n && g_mcfg_n < ACPI_MAX_MCFG; i++){
+        const uint8_t* e = t + 44 + i*16;
+        g_mcfg[g_mcfg_n].base = rd64(e);
+        g_mcfg[g_mcfg_n].segment = rd16(e+8);
+        g_mcfg[g_mcfg_n].start_bus = e[10];
+        g_mcfg[g_mcfg_n].end_bus = e[11];
+        g_mcfg_n++;
+    }
+}
+int acpi_mcfg_count(void){ return g_mcfg_n; }
+const acpi_mcfg_entry_t* acpi_mcfg_get(int i){ return (i >= 0 && i < g_mcfg_n) ? &g_mcfg[i] : 0; }
+
 int acpi_init(uint64_t rsdp_hint){
     for(unsigned i=0;i<sizeof(g_topo);i++) ((uint8_t*)&g_topo)[i]=0;
     /* Prefer the RSDP handed over by the UEFI loader (the only reliable source on
@@ -209,6 +234,7 @@ int acpi_init(uint64_t rsdp_hint){
     }
     /* FADT for ACPI poweroff (independent of the MADT). */
     if(sdt){ uint64_t fadt = find_table(sdt, is_xsdt, "FACP"); if(fadt) parse_fadt(fadt); }
+    if(sdt) parse_mcfg(find_table(sdt, is_xsdt, "MCFG"));       /* [M53a] ECAM */
     if(!madt){ debugcon_writestring("[ACPI] MADT not found\n"); return -1; }
     g_topo.lapic_base = 0xFEE00000;                        /* sane default before parse */
     parse_madt(madt);

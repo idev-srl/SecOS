@@ -69,4 +69,11 @@ void acpi_poweroff(void);
  * return. */
 void acpi_reboot(void);
 
+/* [M53a] MCFG (PCIe ECAM) entries, as found (validated by the PCI registry).
+ * The ECAM address of bus b is base + (b << 20). */
+#define ACPI_MAX_MCFG 8
+typedef struct { uint64_t base; uint16_t segment; uint8_t start_bus, end_bus; } acpi_mcfg_entry_t;
+int acpi_mcfg_count(void);
+const acpi_mcfg_entry_t* acpi_mcfg_get(int i);
+
 #endif /* ACPI_H */
