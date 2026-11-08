@@ -1662,6 +1662,7 @@ static void kernel_main_phase2(void) {
       }
       acpi_init(rsdp_hint);
     }
+    { extern void pci_init(void); pci_init(); }   // [M53a] PCI registry (+ ECAM from MCFG)
     timer_init(1000);
     keyboard_init();
     { extern void tty_init(void); tty_init(); }   // console termios defaults + vt reply hook

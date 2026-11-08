@@ -30,6 +30,7 @@
 #include "klog.h"
 #include "kclock.h"
 #include "../kernel/signal.h"
+#include "pci.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -78,6 +79,7 @@ enum pk {
     PK_ROOT=1, PK_SELF,
     PK_MEMINFO, PK_UPTIME, PK_LOADAVG, PK_STAT, PK_VERSION, PK_CPUINFO,
     PK_MOUNTS, PK_FILESYSTEMS, PK_KMSG, PK_CMDLINE_K, PK_SMP, PK_LOCKSTAT,
+    PK_BUS, PK_BUS_PCI, PK_PCI_DEVICES, PK_PCI_TOPOLOGY,   /* [M53a] /proc/bus/pci */
     PK_PID_DIR, PK_PID_STAT, PK_PID_STATUS, PK_PID_STATM, PK_PID_CMDLINE,
     PK_PID_COMM, PK_PID_ENVIRON, PK_PID_MAPS, PK_PID_CWD, PK_PID_EXE,
     PK_PID_ROOT, PK_PID_FDDIR, PK_PID_FD,
@@ -528,11 +530,71 @@ static void gen_smp(struct sb* s){
 static void lockstat_emit(void* ctx, const char* line){ sb_str((struct sb*)ctx, line); }
 static void gen_lockstat(struct sb* s){ lockstat_generate(lockstat_emit, s); }
 
+/* [M53a] /proc/bus/pci/devices in the Linux format (BDF, vendor+device, IRQ,
+ * 7 base addresses with the BAR flag bits, 7 sizes; no driver column), from
+ * the boot registry (read-only after boot: no config access here). */
+static void sb_hex16sp(struct sb* s, uint64_t v){           /* "%16llx" */
+    int d=1; for(uint64_t t=v>>4; t; t>>=4) d++;
+    for(int i=d;i<16;i++) sb_putc(s,' ');
+    sb_hex(s, v, 1);
+}
+static void gen_pci_devices(struct sb* s){
+    int n = pci_dev_count();
+    for(int i=0;i<n;i++){
+        const pci_dev_t* d = pci_dev_at(i);
+        if(!d) break;
+        sb_hex(s, d->bus, 2); sb_hex(s, (uint64_t)((d->slot << 3) | d->func), 2); sb_putc(s,'\t');
+        sb_hex(s, d->vendor_id, 4); sb_hex(s, d->device_id, 4); sb_putc(s,'\t');
+        sb_hex(s, d->irq_line, 1);
+        for(int b=0;b<7;b++){
+            uint64_t v = 0;
+            if(b < d->nbars && (d->bar_flags[b] & PCI_BAR_PRESENT)){
+                uint8_t f = d->bar_flags[b];
+                v = d->bar_base[b] | ((f & PCI_BAR_IO) ? 1 : ((f & PCI_BAR_MEM64) ? 4 : 0) | ((f & PCI_BAR_PREFETCH) ? 8 : 0));
+            }
+            sb_putc(s,'\t'); sb_hex16sp(s, v);
+        }
+        for(int b=0;b<7;b++){
+            uint64_t v = (b < d->nbars && (d->bar_flags[b] & PCI_BAR_PRESENT)) ? d->bar_size[b] : 0;
+            sb_putc(s,'\t'); sb_hex16sp(s, v);
+        }
+        sb_putc(s,'\n');
+    }
+}
+
+/* [M53a] /proc/bus/pci/topology (SecOS): one line per function with its PCIe
+ * type, upstream bridge, isolation group and whether it may be assigned to a
+ * ring-3 driver alone (M57), plus the capabilities Phase 5 uses. */
+static void gen_pci_topology(struct sb* s){
+    sb_str(s, pci_ecam_active() ? "config ecam\n" : "config cf8\n");
+    int n = pci_dev_count();
+    for(int i=0;i<n;i++){
+        const pci_dev_t* d = pci_dev_at(i);
+        if(!d) break;
+        sb_hex(s, d->seg, 4); sb_putc(s,':'); sb_hex(s, d->bus, 2); sb_putc(s,':');
+        sb_hex(s, d->slot, 2); sb_putc(s,'.'); sb_u64(s, d->func);
+        sb_putc(s,' '); sb_hex(s, d->vendor_id, 4); sb_putc(s,':'); sb_hex(s, d->device_id, 4);
+        sb_str(s," class "); sb_hex(s, d->class_code, 2); sb_hex(s, d->subclass, 2); sb_hex(s, d->prog_if, 2);
+        sb_str(s," pcie "); if(d->pcie_type == PCI_EXP_NONE) sb_str(s,"-"); else sb_u64(s, d->pcie_type);
+        sb_str(s," up ");
+        const pci_dev_t* p = d->parent >= 0 ? pci_dev_at(d->parent) : 0;
+        if(p){ sb_hex(s, p->bus, 2); sb_putc(s,':'); sb_hex(s, p->slot, 2); sb_putc(s,'.'); sb_u64(s, p->func); }
+        else sb_str(s,"-");
+        sb_str(s," group "); sb_u64(s, (uint64_t)d->group);
+        sb_str(s," assignable "); sb_str(s, pci_assign_reason(d->why));
+        sb_str(s," acs "); sb_hex(s, d->acs_cap, 4);
+        sb_str(s, d->flr ? " flr" : " -");
+        sb_str(s, d->ecap_ats ? " ats" : " -");
+        sb_str(s, d->cap_msix ? " msix" : d->cap_msi ? " msi" : " -");
+        sb_putc(s,'\n');
+    }
+}
+
 /* [M43] What Linux guards with a ptrace-style check: only root or a reader
  * whose effective ids equal all of the target's ids (cred_may_inspect). */
 static int is_private(int k){ return k==PK_PID_ENVIRON||k==PK_PID_MAPS||k==PK_PID_CWD||k==PK_PID_EXE||
                                      k==PK_PID_ROOT||k==PK_PID_FDDIR||k==PK_PID_FD; }
-static int is_dir(int k){ return k==PK_ROOT||k==PK_PID_DIR||k==PK_PID_FDDIR; }
+static int is_dir(int k){ return k==PK_ROOT||k==PK_PID_DIR||k==PK_PID_FDDIR||k==PK_BUS||k==PK_BUS_PCI; }
 
 /* Generate node `key` into g_genbuf; returns its length (-1 = gone). Caller
  * holds g_proc_lock. kmsg is served straight from the log ring instead. */
@@ -577,6 +639,8 @@ static int gen_key(uint64_t key){
         sb_putc(&s,'\n'); break; }
     case PK_SMP: gen_smp(&s); break;
     case PK_LOCKSTAT: gen_lockstat(&s); break;
+    case PK_PCI_DEVICES: gen_pci_devices(&s); break;
+    case PK_PCI_TOPOLOGY: gen_pci_topology(&s); break;
     case PK_SELF: { process_t* c=sched_get_current(); if(!c||!c->pid) return -1; sb_u64(&s,c->pid); break; }
     case PK_PID_STAT: gen_pid_stat(&s); break;
     case PK_PID_STATUS: gen_pid_status(&s); break;
@@ -599,6 +663,11 @@ static void name_of(uint64_t key, char* out){
     out[0]=0;
     for(int i=0;i<NTOP;i++) if(g_top[i].kind==k){ const char* n=g_top[i].name; while(*n) out[o++]=*n++; out[o]=0; return; }
     if(k==PK_SELF){ out[0]='s'; out[1]='e'; out[2]='l'; out[3]='f'; out[4]=0; return; }
+    {   /* [M53a] */
+        const char* nm = k==PK_BUS ? "bus" : k==PK_BUS_PCI ? "pci" : k==PK_PCI_DEVICES ? "devices" :
+                         k==PK_PCI_TOPOLOGY ? "topology" : 0;
+        if(nm){ while(*nm) out[o++]=*nm++; out[o]=0; return; }
+    }
     if(k==PK_PID_DIR || k==PK_PID_FD){
         uint64_t v = (k==PK_PID_DIR) ? K_PID(key) : (uint64_t)K_FD(key);
         char d[24]; int n=0; do{ d[n++]=(char)('0'+v%10); v/=10; }while(v);
@@ -681,6 +750,17 @@ static uint64_t path_key(const char* rel){
         process_t* c=sched_get_current(); if(!c||!c->pid) return 0;
         if(!*rest) return KEY(PK_SELF,0,0);
         pid=c->pid;
+    } else if(seq(c1,"bus")){                       /* [M53a] /proc/bus/pci/... */
+        if(!*rest) return KEY(PK_BUS,0,0);
+        if(rest[0]=='p' && rest[1]=='c' && rest[2]=='i'){
+            const char* r = rest+3;
+            if(*r && *r!='/') return 0;
+            while(*r=='/') r++;
+            if(!*r) return KEY(PK_BUS_PCI,0,0);
+            if(seq(r,"devices")) return KEY(PK_PCI_DEVICES,0,0);
+            if(seq(r,"topology")) return KEY(PK_PCI_TOPOLOGY,0,0);
+        }
+        return 0;
     } else if(parse_u32(c1,n1,&pid)!=0){
         if(*rest) return 0;
         for(int i=0;i<NTOP;i++) if(seq(g_top[i].name,c1)) return KEY(g_top[i].kind,0,0);
@@ -728,9 +808,14 @@ static int procfs_readdir(const char* dir, vfs_iter_cb cb, void* user){
     uint64_t* keys = L->keys; int nk=0;
     if(k==PK_ROOT){
         for(int i=0;i<NTOP;i++) keys[nk++]=KEY(g_top[i].kind,0,0);
+        keys[nk++]=KEY(PK_BUS,0,0);                                  /* [M53a] */
         process_t* c=sched_get_current(); if(c && c->pid) keys[nk++]=KEY(PK_SELF,0,0);
         struct pidlist l; list_pids(&l);
         for(int i=0;i<l.n && nk<128;i++) keys[nk++]=KEY(PK_PID_DIR,l.pid[i],0);
+    } else if(k==PK_BUS){                                            /* [M53a] */
+        keys[nk++]=KEY(PK_BUS_PCI,0,0);
+    } else if(k==PK_BUS_PCI){
+        keys[nk++]=KEY(PK_PCI_DEVICES,0,0); keys[nk++]=KEY(PK_PCI_TOPOLOGY,0,0);
     } else if(k==PK_PID_DIR){
         for(int i=0;i<NPIDF;i++) keys[nk++]=KEY(g_pidf[i].kind,K_PID(key),0);
     } else {
