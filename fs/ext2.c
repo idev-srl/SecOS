@@ -142,6 +142,14 @@ static int blk_write_direct(uint32_t b, const uint8_t* buf){
     if(g_ro) return -1;              /* never touch a read-only volume */
     return block_write(g_dev, (uint64_t)b*g_sec_per_blk, buf, g_sec_per_blk)==(int)g_sec_per_blk ? 0 : -1;
 }
+/* [U6] n consecutive blocks in one device request (file data runs). */
+static int blk_write_direct_n(uint32_t b, const uint8_t* buf, uint32_t n){
+    E2_HELD();
+    if(g_blk_dead) return 0;
+    if(g_ro) return -1;
+    uint32_t ns = n*g_sec_per_blk;
+    return block_write(g_dev, (uint64_t)b*g_sec_per_blk, buf, ns)==(int)ns ? 0 : -1;
+}
 static int blk_write(uint32_t b, const uint8_t* buf){
     if(g_jt_active) return jt_buffer(b, buf);            /* metadata -> transaction */
     return blk_write_direct(b, buf);
@@ -172,8 +180,24 @@ static int      g_csum;          /* 1 if the volume has metadata_csum */
 static uint32_t g_csum_seed;     /* s_checksum_seed or crc32c(~0, uuid) */
 static uint8_t  g_csb[MAX_BLK];  /* scratch for bitmap reads inside gd_write */
 
+/* [U6] Table-driven (one table, byte at a time): 8x fewer steps than the bit
+ * loop it replaces, which dominated every block allocation on a csum volume
+ * (bitmap + group descriptor + superblock + journal tag checksums). The table
+ * is built on first use; two CPUs building it at once write the same values,
+ * and a reader that sees the flag (acquire) sees the whole table. */
+static uint32_t g_crc32c_tab[256];
+static int      g_crc32c_ready;
+static void e2_crc32c_init(void){
+    for(uint32_t i=0;i<256;i++){
+        uint32_t c=i;
+        for(int k=0;k<8;k++) c = (c>>1) ^ (0x82F63B78u & (uint32_t)(-(int32_t)(c&1)));
+        g_crc32c_tab[i]=c;
+    }
+    __atomic_store_n(&g_crc32c_ready, 1, __ATOMIC_RELEASE);
+}
 static uint32_t e2_crc32c(uint32_t crc, const uint8_t* p, uint32_t n){
-    while(n--){ crc ^= *p++; for(int k=0;k<8;k++) crc = (crc>>1) ^ (0x82F63B78u & (uint32_t)(-(int32_t)(crc&1))); }
+    if(!__atomic_load_n(&g_crc32c_ready, __ATOMIC_ACQUIRE)) e2_crc32c_init();
+    while(n--) crc = (crc>>8) ^ g_crc32c_tab[(crc ^ *p++) & 0xFF];
     return crc;
 }
 /* per-inode seed = crc32c(crc32c(s_csum_seed, le32(ino)), le32(gen)) */
@@ -362,7 +386,9 @@ static void e2_init_block_bitmap(uint32_t g, uint8_t* bmp){
     for(uint32_t i=in_group; i<g_blk_size*8; i++) bmp[i>>3] |= (uint8_t)(1u<<(i&7));
 }
 
-static uint32_t alloc_block(void){
+/* zero=0: the caller overwrites the whole block before the transaction commits
+ * (a full-block file write), so the zero-fill write is skipped. */
+static uint32_t alloc_block_z(int zero){
     E2_HELD();
     for(uint32_t g=0; g<g_num_groups; g++){
         uint8_t gd[64]; if(gd_read(g,gd)!=0) continue;
@@ -389,13 +415,14 @@ static uint32_t alloc_block(void){
                 /* zero the new block (direct: a freshly-allocated block's prior
                  * content is irrelevant, and journalling a data block's zero would
                  * clobber the direct data write on checkpoint) */
-                mem_zero(g_b, g_blk_size); blk_write_direct(bno, g_b);
+                if(zero){ mem_zero(g_b, g_blk_size); blk_write_direct(bno, g_b); }
                 return bno;
             }
         }
     }
     return 0;
 }
+static uint32_t alloc_block(void){ return alloc_block_z(1); }
 static void free_block(uint32_t bno){
     if(bno<g_first_data_block) return;
     uint32_t rel = bno - g_first_data_block;
@@ -685,33 +712,59 @@ static int extent_append(uint32_t ino, uint8_t* inode, uint32_t fb, uint32_t pb)
 
 /* Map file block fb to a physical block for WRITE, allocating as needed.
  * Handles both extent (ext4) and indirect (ext2) inodes. Returns 0 on fail. */
-static uint32_t block_for_write(uint32_t ino, uint8_t* inode, uint32_t fb){
+static uint32_t block_for_write(uint32_t ino, uint8_t* inode, uint32_t fb, int full){
     if(rd32(inode+32) & EXT4_EXTENTS_FL){
         uint32_t pb = extent_bmap(inode+40, fb, 1);
         if(pb) return pb;
-        pb = alloc_block(); if(!pb) return 0;
+        pb = alloc_block_z(!full); if(!pb) return 0;
         if(extent_append(ino, inode, fb, pb)!=0){ free_block(pb); return 0; }
         return pb;
     }
     return bmap_alloc(inode, fb);
 }
 /* ── File write (grow); supports ext2 indirect and ext4 inline extents ───── */
+/* [U6] Whole data blocks that land on consecutive physical blocks are
+ * gathered here and written with one device request (a 64 KiB write() used to
+ * cost 16 requests). Flushed before the write returns, so the data is still on
+ * disk before the transaction commits (ordered mode). */
+#define E2_RUN_BYTES 65536
+static uint8_t  g_run[E2_RUN_BYTES];
+static uint32_t g_run_pb, g_run_n;
+static int run_flush(void){
+    if(!g_run_n) return 0;
+    int r = blk_write_direct_n(g_run_pb, g_run, g_run_n);
+    g_run_n = 0;
+    return r;
+}
 static int file_write(uint32_t ino, size_t offset, const void* buf, size_t len){
     uint8_t inode[256];
     if(inode_read(ino, inode)!=0) return -1;
     uint32_t fsize = inode_size_lo(inode);
     const uint8_t* in=(const uint8_t*)buf; size_t done=0;
+    g_run_n = 0;
     while(done<len){
         uint32_t fb=(uint32_t)((offset+done)/g_blk_size);
         uint32_t bo=(uint32_t)((offset+done)%g_blk_size);
-        uint32_t pb=block_for_write(ino, inode, fb);
-        if(!pb) return -1;
         uint32_t chunk=g_blk_size-bo; if(chunk>len-done) chunk=(uint32_t)(len-done);
-        if(bo!=0 || chunk!=g_blk_size){ if(blk_read(pb,g_b)!=0) return -1; }
+        int full = (bo==0 && chunk==g_blk_size);
+        uint32_t pb=block_for_write(ino, inode, fb, full);
+        if(!pb){ run_flush(); return -1; }
+        if(full){                                      /* [M27b] data: ordered (direct, pre-commit) */
+            if(g_run_n && (pb!=g_run_pb+g_run_n || (g_run_n+1)*g_blk_size>E2_RUN_BYTES))
+                if(run_flush()!=0) return -1;
+            if(!g_run_n) g_run_pb = pb;
+            mem_copy(g_run + (size_t)g_run_n*g_blk_size, in+done, g_blk_size);
+            g_run_n++;
+            done+=chunk;
+            continue;
+        }
+        if(run_flush()!=0) return -1;
+        if(blk_read(pb,g_b)!=0) return -1;
         for(uint32_t i=0;i<chunk;i++) g_b[bo+i]=in[done+i];
-        if(blk_write_direct(pb,g_b)!=0) return -1;   /* [M27b] data: ordered (direct, pre-commit) */
+        if(blk_write_direct(pb,g_b)!=0) return -1;
         done+=chunk;
     }
+    if(run_flush()!=0) return -1;
     uint32_t newsize = (uint32_t)(offset+len); if(newsize<fsize) newsize=fsize;
     wr32(inode+4, newsize);
     /* i_blocks in 512-byte units: the blocks really mapped (holes excluded) */
@@ -792,7 +845,7 @@ static int dir_add(uint32_t dir_ino, const char* name, size_t nlen, uint32_t chi
     }
     /* Append a fresh directory block. */
     uint32_t fb = nblocks;
-    uint32_t pb = block_for_write(dir_ino, inode, fb); if(!pb) return -1;  /* extent or indirect dir */
+    uint32_t pb = block_for_write(dir_ino, inode, fb, 0); if(!pb) return -1;  /* extent or indirect dir */
     mem_zero(g_b, g_blk_size);
     wr32(g_b+0, child);
     wr16(g_b+4, (uint16_t)lim);                      /* [M33] leave room for the tail */
