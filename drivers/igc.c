@@ -13,7 +13,7 @@
  * map BAR0 (64-bit MMIO) through the physmap, reset the MAC (CTRL.RST), set the
  * link up (CTRL.SLU), read the station MAC from RAL0/RAH0, and program one RX
  * and one TX queue (queue 0) with static page-aligned DMA rings + 2 KB per-desc
- * buffers. All hardware-visible physical addresses come from kvirt_to_phys
+ * buffers. All hardware-visible addresses come from the DMA API ([M55], __dma)
  * (the kernel is higher-half; rings live in the kernel image / physmap).
  *
  * transmit() copies the frame into the next TX buffer, fills an advanced TX
@@ -27,7 +27,8 @@
 #include "pci.h"
 #include "io.h"
 #include "debugcon.h"
-#include "vmm.h"        /* phys_to_virt / kvirt_to_phys / vmm_map_mmio */
+#include "vmm.h"        /* vmm_map_mmio */
+#include "dma.h"        /* [M55] bus addresses */
 #include <stddef.h>
 
 /* ---- Supported PCI device IDs (vendor 0x8086) ---- */
@@ -138,19 +139,17 @@ struct igc_tx_desc {
 } __attribute__((packed));
 
 /* Static, page-aligned DMA: rings + per-descriptor packet buffers. */
-static struct igc_rx_desc g_rx_ring[RX_RING] __attribute__((aligned(4096)));
-static struct igc_tx_desc g_tx_ring[TX_RING] __attribute__((aligned(4096)));
-static uint8_t g_rx_buf[RX_RING][RX_BUF_SIZE] __attribute__((aligned(4096)));
-static uint8_t g_tx_buf[TX_RING][TX_BUF_SIZE] __attribute__((aligned(4096)));
+static struct igc_rx_desc g_rx_ring[RX_RING] __dma __attribute__((aligned(4096)));
+static struct igc_tx_desc g_tx_ring[TX_RING] __dma __attribute__((aligned(4096)));
+static uint8_t g_rx_buf[RX_RING][RX_BUF_SIZE] __dma __attribute__((aligned(4096)));
+static uint8_t g_tx_buf[TX_RING][TX_BUF_SIZE] __dma __attribute__((aligned(4096)));
 
 static volatile uint8_t* g_bar;     /* BAR0 mapped through the physmap */
 static uint32_t g_rx_tail;          /* next RDT value (last refilled + 1) */
 static uint32_t g_tx_tail;          /* next free TX slot */
 static net_dev_t g_dev;
 
-static inline uint64_t phys_of(const void* p) {
-    return kvirt_to_phys((uint64_t)(uintptr_t)p);
-}
+static dma_dev_t* g_dd;     /* [M55] the device's DMA handle */
 static inline uint32_t rd32(uint32_t off) {
     return *(volatile uint32_t*)(g_bar + off);
 }
@@ -165,10 +164,10 @@ static void igc_delay(uint32_t loops) {
 /* Reset the RX ring to read format and reset head/tail bookkeeping. */
 static void igc_setup_rx(void) {
     for (uint32_t i = 0; i < RX_RING; i++) {
-        g_rx_ring[i].addr   = phys_of(g_rx_buf[i]);
+        g_rx_ring[i].addr   = dma_static(g_dd, g_rx_buf[i], sizeof(g_rx_buf[i]));
         g_rx_ring[i].status = 0;
     }
-    uint64_t ring = phys_of(g_rx_ring);
+    uint64_t ring = dma_static(g_dd, g_rx_ring, sizeof(g_rx_ring));
     wr32(IGC_RDBAL0, (uint32_t)ring);
     wr32(IGC_RDBAH0, (uint32_t)(ring >> 32));
     wr32(IGC_RDLEN0, (uint32_t)(RX_RING * sizeof(struct igc_rx_desc)));
@@ -199,7 +198,7 @@ static void igc_setup_tx(void) {
         g_tx_ring[i].cmd_type_len = 0;
         g_tx_ring[i].olinfo_status = IGC_ADVTXD_STAT_DD; /* mark free initially */
     }
-    uint64_t ring = phys_of(g_tx_ring);
+    uint64_t ring = dma_static(g_dd, g_tx_ring, sizeof(g_tx_ring));
     wr32(IGC_TDBAL0, (uint32_t)ring);
     wr32(IGC_TDBAH0, (uint32_t)(ring >> 32));
     wr32(IGC_TDLEN0, (uint32_t)(TX_RING * sizeof(struct igc_tx_desc)));
@@ -232,7 +231,7 @@ static int igc_transmit(net_dev_t* dev, const void* frame, uint32_t len) {
     const uint8_t* src = (const uint8_t*)frame;
     for (uint32_t i = 0; i < len; i++) g_tx_buf[idx][i] = src[i];
 
-    d->addr = phys_of(g_tx_buf[idx]);
+    d->addr = dma_static(g_dd, g_tx_buf[idx], sizeof(g_tx_buf[idx]));
     /* DTALEN (bytes in this buffer) in low 16 bits, advanced data type, and
      * the command bits: EOP + IFCS + RS + DEXT. */
     d->cmd_type_len = (len & 0xFFFF) | IGC_ADVTXD_DTYP_DATA |
@@ -265,7 +264,7 @@ static void igc_poll(net_dev_t* dev) {
         }
 
         /* Refill: restore the descriptor to read format and give it back. */
-        d->addr   = phys_of(g_rx_buf[idx]);
+        d->addr   = dma_static(g_dd, g_rx_buf[idx], sizeof(g_rx_buf[idx]));
         d->status = 0;
         io_mfence();
 
@@ -296,6 +295,7 @@ int igc_init(void) {
         return -1;
     }
 
+    g_dd = dma_dev_legacy(&dev);    /* [M55] joins the kernel DMA domain first */
     pci_enable_mem_and_busmaster(&dev);
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[IGC] BAR0 not memory\n"); return -1; }

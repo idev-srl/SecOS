@@ -12,7 +12,7 @@
  * physmap, resets the MAC, brings the link up, reads the station MAC from
  * RAL0/RAH0, and sets up one advanced-descriptor RX ring and one advanced TX
  * ring with static page-aligned DMA buffers (physical addresses via
- * kvirt_to_phys). Registers a net_dev_t with transmit + poll (NAPI-style RX
+ * the DMA API, [M55]). Registers a net_dev_t with transmit + poll (NAPI-style RX
  * drain). The igc register model is an evolution of e1000e (advanced
  * descriptors). The core (net_request_irq) picks MSI-X / INTx / poll; this
  * driver only provides dev->poll.
