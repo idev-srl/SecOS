@@ -3231,6 +3231,36 @@ while IFS= read -r l; do
 done </tmp/secos_selftest_m53b.out
 grep -q "^\[m53b\] [0-9]* passed" /tmp/secos_selftest_m53b.out; check "M53b gate ran to completion" $?
 
+# ---- M53a: PCI registry + ECAM (tools/pci_gate.sh) ----
+# i440fx, q35, q35 + intel-iommu, q35 + amd-iommu and q35 UEFI/OVMF: the boot
+# PCI listing must equal QMP query-pci, q35 must switch to ECAM after the
+# self-check, the drivers must still probe. Again on QEMU 9.2 when present.
+echo "[selftest] Running the M53a PCI registry gate (~1-2 min)..."
+if make iso >/tmp/secos_selftest_build.log 2>&1 && make uefi >>/tmp/secos_selftest_build.log 2>&1; then
+    pci_gate_run() { # pci_gate_run <tag> <out> [gate args]
+        local tag="$1" out="$2"; shift 2
+        tools/pci_gate.sh --uefi "$@" >"$out" 2>&1
+        while IFS= read -r l; do
+            case "$l" in
+                "[pci] "*": PASS") n="${l#\[pci\] }"; check "M53a PCI gate$tag ${n%: PASS}: boot listing = query-pci, ECAM state" 0 ;;
+                "[pci] "*": FAIL"*) echo "    $l"
+                    [[ "$l" == *": FAIL" ]] && { n="${l#\[pci\] }"; check "M53a PCI gate$tag ${n%: FAIL}" 1; } ;;
+            esac
+        done <"$out"
+        grep -q "^\[pci-gate\] [0-9]* passed, 0 failed" "$out"; check "M53a PCI gate$tag ran to completion, no failure (incl. driver probes)" $?
+    }
+    pci_gate_run "" /tmp/secos_selftest_pci.out
+    if [[ -x "${SECOS_QEMU_X2APIC:-$HOME/qemu-local/bin/qemu-system-x86_64}" ]]; then
+        pci_gate_run " (QEMU 9.2)" /tmp/secos_selftest_pci9.out \
+            --qemu "${SECOS_QEMU_X2APIC:-$HOME/qemu-local/bin/qemu-system-x86_64}" --workdir build/pci-gate9
+    else
+        echo "  [SKIP] M53a PCI gate on QEMU 9.2 (not installed)"
+    fi
+else
+    echo "[selftest] M53a PCI gate BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
+    check "M53a PCI gate build" 1
+fi
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
