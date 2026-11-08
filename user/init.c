@@ -381,6 +381,15 @@ int main(int argc, char** argv) {
     say("SecOS init (pid %d): %d entr%s from %s\n", getpid(), g_n, g_n == 1 ? "y" : "ies", tab);
     if (getpid() != 1) say("warning: not running as PID 1\n");
 
+    /* [U6] A package operation was cut by a crash after its commit point:
+     * finish it before anything else runs, so no service sees a half-old,
+     * half-new package (/bin/spkg, docs/devlog/U6-pkg2.md). */
+    if (access("/var/lib/spkg/txn", F_OK) == 0 && access("/bin/spkg", X_OK) == 0) {
+        static struct entry rec;
+        char line[] = "pkg:sysinit:/bin/spkg recover";
+        say("finishing an interrupted package operation\n");
+        if (parse_line(line, &rec) == 0) run_wait(&rec, SYSINIT_TIMEOUT * 5);
+    }
     for (int i = 0; i < g_n && !g_shutdown; i++)
         if (g_tab[i].action == A_SYSINIT) run_wait(&g_tab[i], SYSINIT_TIMEOUT);
     for (int i = 0; i < g_n; i++)
