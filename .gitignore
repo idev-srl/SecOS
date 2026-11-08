@@ -46,6 +46,7 @@ exfat_corrupt/
 tools/exfat_fuzz/exfat_fuzz
 ntfs_corrupt/
 tools/ntfs_fuzz/ntfs_fuzz
+tools/acpi_fuzz/acpi_fuzz
 *.img.list
 .console.stamp
 .bkl-default.stamp
