@@ -172,31 +172,23 @@ run_m10_fs fat32
 run_m10_fs ext2
 run_m10_fs ext4
 
-# ---- M11: Driver Space (signed manifest -> proc_type -> capability boundary) ----
-M11LOG=/tmp/secos_selftest_m11.log
-echo "[selftest] Building M11 image (M11_DRIVER_DEMO=1, signing enforced)..."
-make clean >/dev/null 2>&1 || true
-if ! make CFLAGS_EXTRA=-DM11_DRIVER_DEMO=1 >/tmp/secos_selftest_build.log 2>&1; then
-    echo "[selftest] M11 BUILD ERROR — see /tmp/secos_selftest_build.log" >&2
-    tail -20 /tmp/secos_selftest_build.log >&2; exit 2
-fi
-echo "[selftest] Running M11 (mb2, ${TIMEOUT}s)..."
-tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$M11LOG" >/dev/null 2>&1 || true
-
-# Driver: the signed manifest marks it PROC_TYPE_DRIVER and grants dev0 caps 0x13.
-grep -q "\[M11\] driver bound dev=0x0000000000000000 caps=0x0000000000000013" "$M11LOG"; check "M11 driver bound from signed manifest (dev0 caps=0x13)" $?
-grep -q "\[M11\] spawned driver proc_type=0x0000000000000001" "$M11LOG"; check "M11 driver runs as PROC_TYPE_DRIVER" $?
-# Granted mediated HW access works: written register value round-trips on read.
-grep -q "\[driver\] READ_REG ret=0 val=0xcafef00dd15ea5ed" "$M11LOG"; check "M11 driver mediated reg read/write round-trips (granted)" $?
-# Un-granted capability (MAP_MEM) is refused even though the device supports it.
-grep -q "\[driver\] MAP_MEM ret=-1" "$M11LOG"; check "M11 un-granted capability (MAP_MEM) refused (DRV_ERR_PERM)" $?
-# A plain user process has no driver rights: every SYS_DRIVER call -> DRV_ERR_NOTDRV.
-grep -q "\[M11\] spawned userprobe proc_type=0x0000000000000000" "$M11LOG"; check "M11 user probe runs as PROC_TYPE_USER" $?
-grep -q "\[user\] GET_INFO ret=-7" "$M11LOG"; check "M11 user process denied SYS_DRIVER (DRV_ERR_NOTDRV)" $?
-n_audit=$(grep -c "\[DRV-AUDIT\]" "$M11LOG" || true)
-[[ "$n_audit" -ge 8 ]]; check "M11 driver calls audited (audit=$n_audit)" $?
-grep -q "\[M11\] DONE" "$M11LOG"; check "M11 demo completed ([M11] DONE)" $?
-! grep -q "\[EXC\]" "$M11LOG"; check "no CPU exception ([EXC]) during M11 run" $?
+# ---- M57: Driver Space v2 (tools/udrv_gate.sh; replaces the M11 SYS_DRIVER demo) ----
+# A signed ring-3 driver (/bin/udrv_edu) claims QEMU's edu device on q35 +
+# intel-iommu: BAR, 10000 MSI round trips through the claim fd, edu DMA
+# through its own IOMMU domain; run again from /etc/inittab as a respawn
+# service killed with kill -9; MMIO-only without an IOMMU; untouched without
+# udrv=; counters (vectors, IOMMU tables, DMA/BAR pages) back to baseline;
+# lockdep -smp 4 and bkl=on.
+echo "[selftest] Running the M57 Driver Space v2 gate (~15-25 min)..."
+tools/udrv_gate.sh >/tmp/secos_selftest_m57.out 2>&1
+while IFS= read -r l; do
+    case "$l" in
+        "[udrv] "*": PASS") n="${l#\[udrv\] }"; check "M57 UDRV ${n%: PASS}" 0 ;;
+        "[udrv] "*": FAIL"*) n="${l#\[udrv\] }"; check "M57 UDRV ${n%%: FAIL*}" 1 ;;
+        "[udrv] "*" FAIL"*) echo "    $l" ;;
+    esac
+done </tmp/secos_selftest_m57.out
+grep -q "^\[udrv-gate\] [0-9]* passed, 0 failed" /tmp/secos_selftest_m57.out; check "M57 UDRV gate ran to completion, no failure" $?
 
 # ---- M12: memory scalability + W^X hard gate ----
 M12LOG=/tmp/secos_selftest_m12.log
