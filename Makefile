@@ -88,7 +88,7 @@ SRC_C   = \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c $(DRIVERS_DIR)/vt.c \
 	$(DRIVERS_DIR)/input.c $(DRIVERS_DIR)/keymap.c $(DRIVERS_DIR)/ps2mouse.c \
 	$(DRIVERS_DIR)/fbdev.c \
-	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/virtio_blk.c \
+	$(DRIVERS_DIR)/pci.c $(DRIVERS_DIR)/pci_msi.c $(DRIVERS_DIR)/virtio_blk.c \
 	$(DRIVERS_DIR)/ahci.c $(DRIVERS_DIR)/nvme.c \
 	$(DRIVERS_DIR)/xhci.c $(DRIVERS_DIR)/usb.c \
 	$(DRIVERS_DIR)/usb_hid.c $(DRIVERS_DIR)/usb_msc.c \

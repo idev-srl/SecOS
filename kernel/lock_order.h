@@ -91,6 +91,11 @@
                                    so they are deliberately not tracked.
                                    con_lock also guards the KD text/graphics
                                    mode (drivers/fbdev.c, C5/C6).               */
+#define LK_S58_MSI         158  /* g_msi_lock (drivers/pci_msi.c, M53c): MSI /
+                                   MSI-X per-device records and the config
+                                   read-modify-writes of their control words;
+                                   only PCI config access (S64) inside. Never
+                                   held across vmm_map_mmio (S60)              */
 #define LK_S60_KSTACK      160  /* kstack_lock, g_pm_lock, kvmm_lock (future)   */
 #define LK_S62_TLB         162  /* tlb_lock: shootdowns are issued from inside
                                    kstack_lock / g_pm_lock sections (plan: S60) */
