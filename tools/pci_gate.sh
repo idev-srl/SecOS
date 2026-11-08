@@ -11,7 +11,7 @@
 #   - the drivers still probe (AHCI, NVMe, xHCI, MSC, e1000/e1000e, virtio);
 #   - no [EXC], panic or lockdep report.
 #
-# usage: tools/pci_gate.sh [--uefi] [--qemu BIN] [--workdir DIR]
+# usage: tools/pci_gate.sh [--uefi] [--qemu BIN] [--workdir DIR]   (UEFI_ONLY=1: only the UEFI guest)
 # Build first: make iso [CONSOLE=root]; make uefi (for --uefi).
 # Runs in a private /tmp (unshare -rm); QEMU is stopped via QMP or its pid file.
 # SPDX-License-Identifier: MIT
@@ -64,16 +64,19 @@ run() {   # name expect-ecam probe-regex... -- qemu args
 }
 
 Q35PROBES=('\[AHCI\] ready' '\[NVME\] ready' '\[XHCI\] running' '\[MSC\] usb0 ready' '\[HID\] boot keyboard ready' '\[E1000E\] ready' '\[NET\] up')
-run i440fx off '\[VIRTIO-BLK\] ready' '\[XHCI\] running' '\[MSC\] usb0 ready' '\[E1000\] ready' -- \
+[ "${UEFI_ONLY:-0}" = 1 ] || run i440fx off '\[VIRTIO-BLK\] ready' '\[XHCI\] running' '\[MSC\] usb0 ready' '\[E1000\] ready' -- \
     -machine pc $CD -drive file="$WD/d1.img",format=raw,if=virtio -device e1000 $USB
-run q35 on "${Q35PROBES[@]}" -- -machine q35 $CD $Q35
-run q35-intel-iommu on "${Q35PROBES[@]}" -- -machine q35 -device intel-iommu $CD $Q35
-run q35-amd-iommu on "${Q35PROBES[@]}" -- -machine q35 -device amd-iommu $CD $Q35
+[ "${UEFI_ONLY:-0}" = 1 ] || run q35 on "${Q35PROBES[@]}" -- -machine q35 $CD $Q35
+[ "${UEFI_ONLY:-0}" = 1 ] || run q35-intel-iommu on "${Q35PROBES[@]}" -- -machine q35 -device intel-iommu $CD $Q35
+[ "${UEFI_ONLY:-0}" = 1 ] || run q35-amd-iommu on "${Q35PROBES[@]}" -- -machine q35 -device amd-iommu $CD $Q35
 if [ $UEFI = 1 ]; then
     OVMF=/usr/share/ovmf/OVMF.fd
     [ -f "$OVMF" ] || OVMF=/usr/share/OVMF/OVMF.fd
+    # vvfat writes back into its directory (NvVars, and it has been seen to
+    # damage kernel.elf), so boot a fresh copy of dist/.
+    rm -rf "$WD/esp"; cp -r "$REPO/dist" "$WD/esp"; rm -f "$WD/esp/NvVars"
     run q35-uefi on "${Q35PROBES[@]}" -- -machine q35 -bios "$OVMF" \
-        -drive format=raw,file=fat:rw:"$REPO/dist/" $Q35
+        -drive format=raw,file=fat:rw:"$WD/esp/" $Q35
 fi
 echo "[pci-gate] $PASS passed, $FAILN failed"
 [ $FAILN = 0 ]
