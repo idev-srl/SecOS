@@ -54,6 +54,11 @@ int acpi_init(uint64_t rsdp_hint);
 /* The discovered topology (valid after acpi_init() returns 0). */
 const acpi_topology_t* acpi_get(void);
 
+/* [M53b] Find a table by its 4-char signature in the RSDT/XSDT and map all of
+ * it. Returns its virtual address and sets *len (header length field, 36 <
+ * len <= 16 MiB), or NULL if absent / before acpi_init(). Contents untrusted. */
+const uint8_t* acpi_table_find(const char* sig, uint32_t* len);
+
 /* Map a legacy ISA IRQ to its Global System Interrupt, applying MADT interrupt
  * source overrides (identity by default). Used to program the IOAPIC. */
 uint32_t acpi_irq_to_gsi(uint8_t irq, uint16_t* flags_out);

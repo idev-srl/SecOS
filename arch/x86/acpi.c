@@ -12,6 +12,8 @@
 #include "debugcon.h"
 
 static acpi_topology_t g_topo;
+static uint64_t g_sdt;          /* [M53b] RSDT/XSDT found by acpi_init()     */
+static int      g_sdt_is_xsdt;
 
 /* Read ACPI tables through the physmap only. [M44] The low identity map
  * (0-512 MiB) used to serve tables below 512 MiB; it is retired after early
@@ -232,6 +234,7 @@ int acpi_init(uint64_t rsdp_hint){
         uint64_t rsdt = rd32(r+16);
         if(rsdt && sig_eq(pv(rsdt),"RSDT",4)){ sdt = rsdt; is_xsdt = 0; madt = find_madt(rsdt, 0); }
     }
+    g_sdt = sdt; g_sdt_is_xsdt = is_xsdt;
     /* FADT for ACPI poweroff (independent of the MADT). */
     if(sdt){ uint64_t fadt = find_table(sdt, is_xsdt, "FACP"); if(fadt) parse_fadt(fadt); }
     if(sdt) parse_mcfg(find_table(sdt, is_xsdt, "MCFG"));       /* [M53a] ECAM */
@@ -257,6 +260,19 @@ int acpi_init(uint64_t rsdp_hint){
 }
 
 const acpi_topology_t* acpi_get(void){ return &g_topo; }
+
+/* [M53b] Map a whole table by signature (DMAR, IVRS, ...). */
+const uint8_t* acpi_table_find(const char* sig, uint32_t* len){
+    if(len) *len = 0;
+    if(!g_sdt) return 0;
+    uint64_t tp = find_table(g_sdt, g_sdt_is_xsdt, sig);
+    if(!tp) return 0;
+    const uint8_t* t = pvt(tp);
+    uint32_t l = rd32(t + 4);
+    if(l <= 36 || l > (16u << 20)) return 0;     /* pvt() mapped only the header */
+    if(len) *len = l;
+    return t;
+}
 
 static inline void outw(uint16_t port, uint16_t v){ __asm__ volatile("outw %0,%1"::"a"(v),"Nd"(port)); }
 static inline uint16_t inw(uint16_t port){ uint16_t v; __asm__ volatile("inw %1,%0":"=a"(v):"Nd"(port)); return v; }

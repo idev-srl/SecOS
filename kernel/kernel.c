@@ -1661,6 +1661,8 @@ static void kernel_main_phase2(void) {
           rsdp_hint = bi->acpi_rsdp;
       }
       acpi_init(rsdp_hint);
+      // [M53b] DMAR (VT-d) / IVRS (AMD-Vi): read-only parse + log for M54/M64.
+      { extern void acpi_dmar_init(void); acpi_dmar_init(); }
     }
     { extern void pci_init(void); pci_init(); }   // [M53a] PCI registry (+ ECAM from MCFG)
     timer_init(1000);
