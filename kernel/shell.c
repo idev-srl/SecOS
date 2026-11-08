@@ -145,7 +145,7 @@ static void sh_vls(const char* a); static void sh_vcat(const char* a); static vo
 static void sh_vcreate(const char* a); static void sh_vwrite(const char* a); static void sh_vtruncate2(const char* a);
 static void sh_ext2mount(const char* a);
 static void sh_blk(const char* a); static void sh_mountdev(const char* a);
-static void sh_lspci(const char* a); static void sh_usbinfo(const char* a); static void sh_usbrescan(const char* a);
+static void sh_lspci(const char* a); static void sh_pci(const char* a); static void sh_usbinfo(const char* a); static void sh_usbrescan(const char* a);
 static void sh_audit(const char* a);   // [M35] capability audit log
 static void sh_wifi(const char* a);     // [M38] ath9k WiFi status
 // [M23] POSIX-style commands over the VFS (with a real working directory).
@@ -272,6 +272,7 @@ static const struct shell_cmd shell_cmds[] = {
     {"blk",       sh_blk,       "list block devices"},
     {"mountdev",  sh_mountdev,  "mount a block device"},
     {"lspci",     sh_lspci,     "list PCI devices (controllers)"},
+    {"pci",       sh_pci,       "PCI registry: topology + isolation [M53a]"},
     {"usbinfo",   sh_usbinfo,   "xHCI controller + port status"},
     {"usbrescan", sh_usbrescan, "re-enumerate USB + rescan partitions"},
     {"netinfo",   sh_netinfo,   "network status"},
@@ -1115,6 +1116,29 @@ static void sh_lspci(const char* a){ (void)a;
     }
     if(!found) terminal_writestring("[lspci] NO PCI devices found — legacy CF8/CFC config access may be unavailable on this firmware\n");
     else { terminal_writestring("[lspci] "); print_dec((uint64_t)found); terminal_writestring(" functions\n"); }
+}
+
+// [M53a] pci: the boot PCI registry, one lspci-like line per function plus its
+// PCIe type, upstream bridge, isolation group and assignability (M57).
+#include "../drivers/pci.h"
+static void sh_pci(const char* a){ (void)a;
+    int n = pci_dev_count();
+    for(int i=0;i<n;i++){
+        const pci_dev_t* d = pci_dev_at(i);
+        if(!d) break;
+        prhex(d->bus,2); terminal_writestring(":"); prhex(d->slot,2); terminal_writestring("."); print_dec(d->func);
+        terminal_writestring(" "); prhex(d->vendor_id,4); terminal_writestring(":"); prhex(d->device_id,4);
+        terminal_writestring(" "); prhex(d->class_code,2); prhex(d->subclass,2); prhex(d->prog_if,2);
+        terminal_writestring(" "); terminal_writestring(pci_class_name(d->class_code,d->subclass,d->prog_if));
+        terminal_writestring(d->pcie_type == PCI_EXP_NONE ? " pci" : " pcie");
+        if(d->parent >= 0){ const pci_dev_t* p = pci_dev_at(d->parent);
+            if(p){ terminal_writestring(" up "); prhex(p->bus,2); terminal_writestring(":"); prhex(p->slot,2); terminal_writestring("."); print_dec(p->func); } }
+        terminal_writestring(" grp "); print_dec((uint64_t)d->group);
+        terminal_writestring(" "); terminal_writestring(pci_assign_reason(d->why));
+        terminal_writestring("\n");
+    }
+    terminal_writestring("[pci] "); print_dec((uint64_t)n);
+    terminal_writestring(pci_ecam_active() ? " functions, config ecam\n" : " functions, config cf8\n");
 }
 
 // [M35] audit: dump the capability audit log (granted/denied capability checks
