@@ -128,7 +128,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/selftest.c \
 	$(KERNEL_DIR)/exec_test.c \
 	$(KERNEL_DIR)/iommu.c $(KERNEL_DIR)/iommu_test.c \
-	user/testdriver.c \
+	$(KERNEL_DIR)/udrv.c \
 	$(LIB_DIR)/terminal.c \
 	$(FS_DIR)/ramfs.c \
 	$(FS_DIR)/vfs.c \
@@ -413,15 +413,11 @@ crypt-test-link:
 user-progs: libcrypt
 	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
 	$(CC) $(USER_CFLAGS) -c user/note.S       -o user/note.o
-	$(CC) $(USER_CFLAGS) -c user/note_driver.S -o user/note_driver.o
 	$(CC) $(USER_CFLAGS) -c user/libsecos.c   -o user/libsecos.o
 	$(CC) $(USER_CFLAGS) -c user/libc.c       -o user/libc.o
 	$(CC) $(USER_CFLAGS) -c user/setjmp.S     -o user/setjmp.o
 	$(CC) $(USER_CFLAGS) -c user/libm.c        -o user/libm.o
 	$(CC) $(USER_CFLAGS) -c user/hello.c      -o user/hello.o
-	$(CC) $(USER_CFLAGS) -c user/drvprobe.c   -o user/drvprobe.o
-	$(CC) $(USER_CFLAGS) -c user/driver_demo.c -o user/driver_demo.o
-	$(CC) $(USER_CFLAGS) -c user/userprobe.c  -o user/userprobe.o
 	$(CC) $(USER_CFLAGS) -c user/note_maxmem.S -o user/note_maxmem.o
 	$(CC) $(USER_CFLAGS) -c user/ipc_send.c   -o user/ipc_send.o
 	$(CC) $(USER_CFLAGS) -c user/ipc_recv.c   -o user/ipc_recv.o
@@ -430,14 +426,6 @@ user-progs: libcrypt
 	$(LD) --gc-sections -T user/user.ld -o user/hello.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/hello.o
 	python3 tools/secos-sign user/hello.elf --dev
 	python3 tools/elf2h.py user/hello.elf user_hello_elf crypto/user_hello_elf.h
-	# [M11] Signed user-space driver (PROC_TYPE_DRIVER manifest)
-	$(LD) --gc-sections -T user/user.ld -o user/driver_demo.elf user/crt0.o user/note_driver.o user/libsecos.o user/libc.o user/drvprobe.o user/driver_demo.o
-	python3 tools/secos-sign user/driver_demo.elf --dev
-	python3 tools/elf2h.py user/driver_demo.elf user_driver_elf crypto/user_driver_elf.h
-	# [M11] Signed plain-user probe (PROC_TYPE_USER manifest) — driver calls denied
-	$(LD) --gc-sections -T user/user.ld -o user/userprobe.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/drvprobe.o user/userprobe.o
-	python3 tools/secos-sign user/userprobe.elf --dev
-	python3 tools/elf2h.py user/userprobe.elf user_userprobe_elf crypto/user_userprobe_elf.h
 	# [M13] IPC producer/consumer (signed, normal manifest)
 	$(LD) --gc-sections -T user/user.ld -o user/ipc_send.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/ipc_send.o
 	python3 tools/secos-sign user/ipc_send.elf --dev
@@ -642,7 +630,29 @@ user-progs: libcrypt
 	$(MAKE) --no-print-directory gui-progs
 	$(MAKE) --no-print-directory acct-progs
 	$(MAKE) --no-print-directory m46-progs
-	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + smptest + pcstress + fsstress + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+	$(MAKE) --no-print-directory udrv-progs
+	@echo "user-progs: built+signed hello + udrv_edu + udrv_negtest + udrv_user + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + smptest + pcstress + fsstress + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+
+# [M57] Ring-3 driver test programs (docs/devlog/M57-udrv-core.md): udrv_edu
+# (positive: edu BAR, IRQ fd, DMA) and udrv_negtest (inputs the kernel must
+# refuse) carry the v3 DRIVER manifest note_udrv; udrv_user is the same
+# negative-test binary with a plain manifest (every claim must be refused).
+.PHONY: udrv-progs
+udrv-progs:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S          -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note.S          -o user/note.o
+	$(CC) $(USER_CFLAGS) -c user/note_udrv.S     -o user/note_udrv.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c      -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c          -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/udrv_edu.c      -o user/udrv_edu.o
+	$(CC) $(USER_CFLAGS) -c user/udrv_negtest.c  -o user/udrv_negtest.o
+	$(LD) --gc-sections -T user/user.ld -o user/udrv_edu.elf user/crt0.o user/note_udrv.o user/libsecos.o user/libc.o user/udrv_edu.o
+	$(LD) --gc-sections -T user/user.ld -o user/udrv_negtest.elf user/crt0.o user/note_udrv.o user/libsecos.o user/libc.o user/udrv_negtest.o
+	$(LD) --gc-sections -T user/user.ld -o user/udrv_user.elf user/crt0.o user/note.o user/libsecos.o user/libc.o user/udrv_negtest.o
+	for n in udrv_edu udrv_negtest udrv_user; do \
+	    python3 tools/secos-sign user/$$n.elf --dev || exit 1; \
+	    python3 tools/elf2h.py user/$$n.elf user_$${n}_elf crypto/user_$${n}_elf.h || exit 1; \
+	done
 
 # [M46] Exec confinement selftest (docs/devlog/M46-exec-confinement.md): one
 # source, three signed manifests -- m46conf (confined driver), m46probe (ambient
