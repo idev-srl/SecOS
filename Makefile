@@ -458,7 +458,7 @@ user-progs: libcrypt
 	python3 tools/secos-sign user/coreutils.elf --dev
 	python3 tools/elf2h.py user/coreutils.elf user_coreutils_elf crypto/user_coreutils_elf.h
 	# [M32] signed package (.spkg): a dir + a text file, sealed with the dev key
-	python3 tools/secos-pkg create user/testpkg.spkg user/pkg_motd.txt:/etc/pkg-motd.txt --mkdir /opt/pkgdir user/pkg_motd.txt:/opt/pkgdir/info.txt
+	python3 tools/secos-pkg create user/testpkg.spkg --v1 user/pkg_motd.txt:/etc/pkg-motd.txt --mkdir /opt/pkgdir user/pkg_motd.txt:/opt/pkgdir/info.txt
 	python3 tools/elf2h.py user/testpkg.spkg user_testpkg_spkg crypto/user_testpkg_spkg.h
 	# [M32] init/service-manager + a demo service (signed)
 	$(CC) $(USER_CFLAGS) -c user/svc_demo.c    -o user/svc_demo.o
@@ -638,7 +638,25 @@ user-progs: libcrypt
 	$(MAKE) --no-print-directory gui-progs
 	$(MAKE) --no-print-directory acct-progs
 	$(MAKE) --no-print-directory m46-progs
+	$(MAKE) --no-print-directory pkg-progs
 	@echo "user-progs: built+signed hello + driver_demo + userprobe + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + smptest + pcstress + fsstress + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+
+# [U6] /bin/spkg, the package installer v2 (docs/devlog/U6-pkg2.md): confined
+# manifest (CAP_ENFORCE|FS_READ|FS_WRITE|SIGNAL|TIME), SHA-256 from crypto/,
+# the signature itself is checked by the kernel (SYS_SIGVERIFY).
+.PHONY: pkg-progs
+pkg-progs:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note_spkg.S  -o user/note_spkg.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c   -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c       -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/spkg.c       -o user/spkg.o
+	$(CC) $(USER_CFLAGS) -c crypto/sha256.c   -o user/sha256_u.o
+	$(LD) --gc-sections -T user/user.ld -o user/spkg.elf user/crt0.o user/note_spkg.o user/libsecos.o user/libc.o \
+	    user/spkg.o user/sha256_u.o
+	python3 tools/secos-sign user/spkg.elf --dev
+	python3 tools/elf2h.py user/spkg.elf user_spkg_elf crypto/user_spkg_elf.h
+	@echo "pkg-progs: built+signed spkg -> crypto/user_spkg_elf.h"
 
 # [M46] Exec confinement selftest (docs/devlog/M46-exec-confinement.md): one
 # source, three signed manifests -- m46conf (confined driver), m46probe (ambient

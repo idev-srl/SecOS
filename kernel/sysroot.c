@@ -72,6 +72,7 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_guitest_elf.h"
 #include "../crypto/user_guitest_nocap_elf.h"
 #include "../crypto/user_loadkeys_elf.h"
+#include "../crypto/user_spkg_elf.h"     // [U6] package installer v2
 #include "../crypto/user_secwm_elf.h"
 #include "../crypto/user_sysinfo_elf.h"
 #include "../crypto/user_swptest_elf.h"
@@ -372,6 +373,7 @@ static void build_table(void){
     sf_bin("guitest", user_guitest_elf, user_guitest_elf_len);
     sf_bin("guitest_nocap", user_guitest_nocap_elf, user_guitest_nocap_elf_len);
     sf_bin("loadkeys", user_loadkeys_elf, user_loadkeys_elf_len);
+    sf_bin("spkg", user_spkg_elf, user_spkg_elf_len);                 // [U6]
     sf_bin("secwm", user_secwm_elf, user_secwm_elf_len);
     sf_alias("startgui", "secwm", user_secwm_elf, user_secwm_elf_len, 0);
     sf_bin("sysinfo", user_sysinfo_elf, user_sysinfo_elf_len);
