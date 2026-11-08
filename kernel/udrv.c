@@ -145,6 +145,9 @@ static int        g_ndev;
 static udrv_fdo_t g_fdo[UDRV_MAX_FD];
 static int        g_unsafe, g_noir, g_tainted;
 static uint64_t   g_refused_dma, g_refused_claim;
+/* Pages currently given to ring-3 drivers (g_udrv_lock): DMA frames and BAR
+ * mappings. Both return to 0 when no claim is held (leak checks). */
+static uint64_t   g_live_dma_pages, g_live_map_pages;
 
 /* ---------------------------------------------------------------- helpers */
 static uint64_t now_ms(void) { return ktime_ns() / 1000000ull; }
@@ -526,7 +529,10 @@ static void release_locked(udrv_dev_t* d, const char* why) {
     /* 4. Blocked domain: returns after the invalidation completed. */
     if (d->dom) iommu_detach(d->pd);
     /* 6. The driver's mappings. */
-    for (uint32_t i = 0; i < d->nmap; i++) unmap_region(owner, d->map[i].uva, d->map[i].len);
+    for (uint32_t i = 0; i < d->nmap; i++) {
+        unmap_region(owner, d->map[i].uva, d->map[i].len);
+        g_live_map_pages -= d->map[i].len / 4096;
+    }
     for (int i = 0; i < UDRV_MAX_DMA; i++) if (d->dma[i].used) unmap_region(owner, d->dma[i].uva, d->dma[i].len);
     /* 7. Only now: IOMMU tables, then the frames. */
     if (d->dom) { iommu_domain_free(d->dom); d->dom = NULL; }
@@ -535,6 +541,7 @@ static void release_locked(udrv_dev_t* d, const char* why) {
         if (!d->dma[i].used) continue;
         pmm_free_contiguous((void*)d->dma[i].phys, (size_t)(d->dma[i].len / 4096));
         freed += d->dma[i].len;
+        g_live_dma_pages -= d->dma[i].len / 4096;
         d->dma[i].used = 0;
     }
     d->nmap = 0; d->dma_used = 0;
@@ -738,11 +745,15 @@ static long op_map_bar(process_t* c, udrv_dev_t* d, struct udrv_map_bar* a) {
         uint64_t run = off;
         while (run < len && !msix_hole(d, b, run)) run += 0x1000;
         if (!map_region(c, va + off, base + off, run - off, VMA_VF_UC)) {
-            for (uint32_t i = first; i < d->nmap; i++) unmap_region(c, d->map[i].uva, d->map[i].len);
+            for (uint32_t i = first; i < d->nmap; i++) {
+                unmap_region(c, d->map[i].uva, d->map[i].len);
+                g_live_map_pages -= d->map[i].len / 4096;
+            }
             d->nmap = first;
             return -U_ENOMEM;
         }
         d->map[d->nmap].uva = va + off; d->map[d->nmap].len = run - off; d->nmap++;
+        g_live_map_pages += (run - off) / 4096;
         off = run;
     }
     d->bar_uva[b] = va;
@@ -866,6 +877,7 @@ static long op_dma_alloc(process_t* c, udrv_dev_t* d, struct udrv_dma* a) {
     d->dma[slot].uva = va; d->dma[slot].iova = iova; d->dma[slot].phys = phys;
     d->dma[slot].len = len; d->dma[slot].used = 1;
     d->dma_used += len;
+    g_live_dma_pages += len / 4096;
     a->uva = va; a->iova = iova;
     return 0;
 }
@@ -885,6 +897,7 @@ static long op_dma_free(process_t* c, udrv_dev_t* d, const struct udrv_dma* a) {
     unmap_region(c, b->uva, b->len);
     pmm_free_contiguous((void*)b->phys, (size_t)(b->len / 4096));
     d->dma_used -= b->len;
+    g_live_dma_pages -= b->len / 4096;
     b->used = 0;
     return 0;
 }
@@ -1231,6 +1244,8 @@ void udrv_generate(void (*emit)(void* ctx, const char* line), void* ctx) {
     iommu_ln_s(&l, " unsafe="); iommu_ln_dec(&l, (uint64_t)g_unsafe);
     iommu_ln_s(&l, " refused_claims="); iommu_ln_dec(&l, g_refused_claim);
     iommu_ln_s(&l, " refused_dma="); iommu_ln_dec(&l, g_refused_dma);
+    iommu_ln_s(&l, " live_dma_pages="); iommu_ln_dec(&l, g_live_dma_pages);
+    iommu_ln_s(&l, " live_bar_pages="); iommu_ln_dec(&l, g_live_map_pages);
     emit(ctx, iommu_ln_end(&l));
     if (g_unsafe || g_tainted) {
         l.n = 0;
