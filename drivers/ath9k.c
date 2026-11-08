@@ -6,6 +6,7 @@
 #include "pci.h"
 #include "debugcon.h"
 #include "../mm/vmm.h"
+#include "dma.h"        /* [M55] bus addresses of the RX pool */
 
 /* --- AR9300 register offsets (subset; from the open ath9k driver) --- */
 #define AR_SREV            0x4020   /* silicon revision */
@@ -39,6 +40,7 @@
 #define AR_PHY_BASE            0xa000   /* baseband/PHY register block base */
 
 ath9k_dev_t g_ath9k;
+static dma_dev_t* g_ath_dd;   /* [M55] the AR9xxx DMA handle (32-bit DMA) */
 
 static inline uint32_t rd(uint32_t off) { return *(volatile uint32_t*)(g_ath9k.mmio + off); }
 static inline void     wr(uint32_t off, uint32_t v) { *(volatile uint32_t*)(g_ath9k.mmio + off) = v; }
@@ -81,6 +83,8 @@ int ath9k_init(void) {
 
     /* Map BAR0 (the register space) through the physmap and enable MMIO + bus
      * master. AR9300 BAR0 is a 32-bit memory BAR. */
+    g_ath_dd = dma_dev_legacy(&pd);   /* [M55] joins the kernel DMA domain first */
+    dma_set_mask(g_ath_dd, DMA_MASK_32);   /* EDMA RX buffer pointers are 32-bit */
     pci_enable_mem_and_busmaster(&pd);
     uint64_t bar = pci_bar_mem(&pd, 0);
     if (!bar) { debugcon_writestring("[ath9k] BAR0 unmapped\n"); g_ath9k.present = 0; return 0; }
@@ -144,10 +148,28 @@ int ath9k_tune_channel(int chan) {
     return ath9k_secos_tune(chan);
 }
 
-/* [M39] Translate a kernel VA (RX DMA buffer in the ported driver) to a physical
- * address for the AR9565 DMA engine. The buffers live in the ath9k_port .bss
- * (higher-half); kvirt_to_phys resolves them. */
-unsigned long ath9k_host_v2p(void* v) { return kvirt_to_phys((uint64_t)v); }
+/* [M39] Bus address of an RX DMA buffer of the ported driver (one 2048-byte
+ * slot of g_rxpool in drivers/ath9k_port/ath9k_secos.c) for the AR9565 DMA
+ * engine. [M55] Through the DMA API: the source tags g_rxpool __dma, so once
+ * the prebuilt drivers/ath9k_port/ath9k_hw.o is regenerated (tools/
+ * port-ath9k.sh, needs the network) the pool is in .dmabss. The committed
+ * object predates that and keeps the pool in its own .bss: the first call
+ * (rx_bring_up queues slot 0 first, i.e. the pool start) then maps the whole
+ * pool (ATH9K_POOL_BYTES) with dma_map_single so the strict kernel DMA domain
+ * covers it, and every later slot is inside that mapping. */
+#define ATH9K_RXBUF_BYTES 2048
+#define ATH9K_POOL_BYTES  (24 * ATH9K_RXBUF_BYTES)
+unsigned long ath9k_host_v2p(void* v) {
+    static int legacy_mapped;
+    if (!dma_reachable(g_ath_dd, v, ATH9K_RXBUF_BYTES) && !legacy_mapped) {
+        legacy_mapped = 1;
+        if (dma_map_single(g_ath_dd, v, ATH9K_POOL_BYTES, DMA_FROM_DEVICE) == DMA_ADDR_ERROR)
+            debugcon_writestring("[ath9k] RX pool outside .dmabss and not mappable\n");
+        else
+            debugcon_writestring("[ath9k] RX pool outside .dmabss (prebuilt object): mapped for DMA\n");
+    }
+    return (unsigned long)dma_static(g_ath_dd, v, ATH9K_RXBUF_BYTES);
+}
 
 /* [M39] Scan: receive beacons on the current channel via the EDMA RX path. */
 int ath9k_scan(void) {

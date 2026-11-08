@@ -158,9 +158,14 @@ int ath9k_secos_tune(int chan_num){
  * ------------------------------------------------------------------------- */
 #define ATH_NRXBUF   24
 #define ATH_RXBUF_SZ 2048
-static u8  g_rxpool[ATH_NRXBUF][ATH_RXBUF_SZ] __attribute__((aligned(256)));
+/* [M55] In the kernel DMA region (.dmabss, input section .bss.dma; the
+ * attribute is spelled out because kernel/dma.h clashes with the compat
+ * headers): the only memory the device may reach under the strict kernel DMA
+ * domain. The committed ath9k_hw.o predates this (ath9k_host_v2p handles
+ * both). */
+static u8  g_rxpool[ATH_NRXBUF][ATH_RXBUF_SZ] __attribute__((section(".bss.dma"), aligned(256)));
 static int g_rx_idx;
-extern unsigned long ath9k_host_v2p(void* v);   /* SecOS kvirt_to_phys */
+extern unsigned long ath9k_host_v2p(void* v);   /* SecOS DMA API (drivers/ath9k.c) */
 
 static void rx_addbuf(int i){
     /* Clear the status region so AR_RxDone is 0 until the hw fills it again
