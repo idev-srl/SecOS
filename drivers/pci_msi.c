@@ -117,8 +117,19 @@ static int msix_geometry(const pci_device_t* d, uint8_t cap, uint16_t* size, uin
     if (bir > 5) return -1;
     uint64_t bar = pci_bar_mem64(d, (int)bir);
     if (bar == 0) return -1;
-    /* TODO(M53a): take the size from the PCI registry instead of re-sizing. */
-    uint64_t barsz = pci_bar_size(d, (int)bir);
+    /* [M53a] The BAR size comes from the boot registry (sized once, before any
+     * driver ran): never re-probe a live BAR whose MSI-X table may be in use.
+     * A BAR the registry does not know at this base is refused; only when the
+     * registry overflowed (function not recorded) is the BAR sized here. */
+    uint64_t barsz = 0;
+    const pci_dev_t* r = pci_dev_of(d);
+    if (r) {
+        if (bir < r->nbars && (r->bar_flags[bir] & PCI_BAR_PRESENT) &&
+            !(r->bar_flags[bir] & (PCI_BAR_IO | PCI_BAR_UPPER)) && r->bar_base[bir] == bar)
+            barsz = r->bar_size[bir];
+    } else if (!pci_registry_complete()) {
+        barsz = pci_bar_size(d, (int)bir);
+    }
     uint64_t bytes = (uint64_t)MSIX_MC_SIZE(mc) * MSIX_ENTRY_SIZE;
     if (barsz == 0 || off >= barsz || bytes > barsz - off) {
         debugcon_writestring("[MSIX] table outside its BAR, refused\n");
