@@ -63,8 +63,16 @@ grep -q "^\[NSD\] RESULT " "$OUT/nsd4.out"; chk "nsd4 driver ran to completion" 
 ! grep -q "^\[NSD\] .* FAIL" "$OUT/nsd4.out"; chk "nsd4 every step passed" $?
 grep -q "^\[PRD\] RESULT " "$OUT/prd8.out"; chk "prd8 driver ran to completion" $?
 ! grep -q "^\[PRD\] .* FAIL" "$OUT/prd8.out"; chk "prd8 every step passed" $?
+# [M53] The smp_stress_drive.py runs include sysfuzz, whose batch children may
+# die of their own bad pointers: "[EXC] int=... ring3" + "[EXC] ring3 fault ->
+# kill pid=" + "[KILL]". The driver allows that only in its fuzz-par step; in
+# their logs every OTHER [EXC] line is a kernel exception.
+kernel_exc() { grep -a "\[EXC\]" "$1" | grep -av " ring3\$\|\[EXC\] ring3 fault -> kill pid="; }
 for r in ssd4 ssd8 nsd4 alt4 prd8; do
-    ! grep -aq "\[LOCKDEP\]\|\[LOCK\] BUG\|PANIC\|\[EXC\]" "$OUT/$r.log"
+    case $r in
+        ssd*|alt4) ! grep -aq "\[LOCKDEP\]\|\[LOCK\] BUG\|PANIC" "$OUT/$r.log" && [ -z "$(kernel_exc "$OUT/$r.log")" ] ;;
+        *)         ! grep -aq "\[LOCKDEP\]\|\[LOCK\] BUG\|PANIC\|\[EXC\]" "$OUT/$r.log" ;;
+    esac
     chk "$r no lockdep report, panic or CPU exception" $?
 done
 grep -aq "\[LDTEST\] all 0x000000000000000A/0x000000000000000A" "$OUT/ssd4.log"

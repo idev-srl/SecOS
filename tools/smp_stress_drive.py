@@ -51,6 +51,21 @@ STEPS = [
 QUICK = {"cpu-count", "spin-jobs", "pipelines", "smp-fpu", "smp-burst", "smp-pty", "fuzz-par"}
 FAIL_MARKERS = ["[EXC] int=", "[PANIC]", "nested fault", "stack smashing", "CORRUPT",
                 "[TLB] BUG", "shootdown timeout", "LOCKDEP"]
+# A CPU exception taken in ring 3 is logged "[EXC] int=... ring3", followed by
+# "[EXC] ring3 fault -> kill pid=..." and "[KILL]": the process died of its own
+# fault and the kernel carried on (M15). Only "ring0" (or a line without the
+# ring word) is a kernel fault. Ring-3 kills are allowed only in the steps that
+# provoke them: sysfuzz hands its own memory (g_buf, whose end borders the
+# fuzzer's globals such as its RNG state) to mprotect, mmap(MAP_FIXED), read
+# and friends, so a batch child may die of it; sysfuzz itself reports that as
+# fine ("child KILLED ... repro").
+USER_KILL_OK = {"fuzz-par"}
+
+def exc_lines(d):
+    return [l for l in d.splitlines() if "[EXC] int=" in l]
+
+def is_user_exc(line):
+    return line.rstrip().endswith(" ring3")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -95,12 +110,18 @@ def main():
             if not alive[0]: return False
             time.sleep(0.05)
         return False
+    def logtext():
+        try: return open(o.log, "rb").read().decode("latin1")
+        except OSError: return ""
     def fault():
-        try: d = open(o.log, "rb").read().decode("latin1")
-        except OSError: d = ""
+        d = logtext()
         for m in FAIL_MARKERS:
-            if m in d: return m
+            if m == "[EXC] int=":
+                if any(not is_user_exc(l) for l in exc_lines(d)): return m
+            elif m in d: return m
         return None
+    def user_kills(since=0):
+        return sum(1 for l in exc_lines(logtext()[since:]) if is_user_exc(l))
     ok = fail = 0
     def report(name, good, why=""):
         nonlocal ok, fail
@@ -127,16 +148,19 @@ def main():
         sentinel = f"SSD-END-{idx}"
         line = f"{cmd}; echo SSD-END-$(({idx}+0))\r"
         with lock: since = len(buf)
+        logsince = len(logtext())
         p.stdin.write(line.encode()); p.stdin.flush()
         done = wait_for(sentinel, tmo, since)
         with lock: out = bytes(buf[since:]).decode("latin1")
         m = fault()
+        nk = user_kills(logsince)
         if not done: report(name, False, f"timeout {tmo}s")
         elif m: report(name, False, f"kernel marker {m!r}")
+        elif nk and name not in USER_KILL_OK: report(name, False, f"unexpected ring-3 kill(s): {nk}")
         elif expect not in out: report(name, False, f"expected {expect!r} missing")
         elif name == "cpu-count" and "[smptest] cpus PASS" not in out:
             report(name, False, "smptest cpus FAIL: " + (re.findall(r"\[smptest\] cpus=[^\r\n]*", out) or ["?"])[0])
-        else: report(name, True)
+        else: report(name, True, f"({nk} ring-3 kill(s) of fuzz children, allowed)" if nk else "")
         idx += 1
         if not alive[0]: break
 

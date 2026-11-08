@@ -83,12 +83,22 @@ for r in $RUNS; do
 done
 wait
 
+# [M53] The smp_stress_drive.py runs include sysfuzz, whose batch children may
+# die of their own bad pointers: "[EXC] int=... ring3" + "[EXC] ring3 fault ->
+# kill pid=" + "[KILL]". The driver allows that only in its fuzz-par step; in
+# their logs every OTHER [EXC] line is a kernel exception.
+kernel_exc() { grep -a "\[EXC\]" "$1" | grep -av " ring3\$\|\[EXC\] ring3 fault -> kill pid="; }
 pass=0; fail=0
 chk() { if [ "$2" -eq 0 ]; then pass=$((pass+1)); echo "  [PASS] $1"; else fail=$((fail+1)); echo "  [FAIL] $1"; fi; }
 for r in $RUNS; do
     [ "$(cat "$OUT/$r.rc" 2>/dev/null)" = 0 ]; rc=$?    # before the $(...) below resets $?
     chk "$r passed ($(grep -a 'RESULT' "$OUT/$r.out" 2>/dev/null | tail -n 1 | cut -c1-90))" $rc
-    [ -s "$OUT/$r.log" ] && ! grep -aq "\[LOCKDEP\]\|\[LOCK\] BUG\|PANIC\|\[EXC\]" "$OUT/$r.log"
+    if [ "$r" = ssd8 ]; then
+        [ -s "$OUT/$r.log" ] && ! grep -aq "\[LOCKDEP\]\|\[LOCK\] BUG\|PANIC" "$OUT/$r.log" &&
+            [ -z "$(kernel_exc "$OUT/$r.log")" ]
+    else
+        [ -s "$OUT/$r.log" ] && ! grep -aq "\[LOCKDEP\]\|\[LOCK\] BUG\|PANIC\|\[EXC\]" "$OUT/$r.log"
+    fi
     chk "$r no lockdep report, panic or CPU exception" $?
 done
 grep -aq "\[BKL\] kernel lock mode: bkl=$MODE (default)" "$OUT/ssd8.log" 2>/dev/null || [[ " $RUNS " != *" ssd8 "* ]]
