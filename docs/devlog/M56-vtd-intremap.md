@@ -226,7 +226,8 @@ section "M56" runs the gate.
 wrong handle → `ps2-mouse-motion`, `ps2-mouse-button`, `ps2-keyboard` FAIL. So
 the PS/2 checks really depend on the remapped IOAPIC path.
 
-The final full runs on the finished tree are in "Final runs" below.
+(smp-ipi-q6 and smp-ipi-q9 are one row: 13 guests in all.) The final runs on
+the finished tree are in "Final runs" below.
 
 ### Warnings
 `-Wall -Wextra`: 35 normal / 35 `-DSECOS_LOCKDEP` (base `cba08ac`: 35/35);
@@ -234,7 +235,23 @@ also 35 with `-DSECOS_IOMMU_TEST` and with `-DSECOS_IOMMU_TEST -DSECOS_LOCKDEP`;
 none in the new files.
 
 ## Final runs
-(filled in below)
+On the final tree (`ada6bf7` code), after a host reboot, starting from
+`make clean`, in this worktree only:
+- `tools/iommu_gate.sh` (M54): **15 passed, 0 failed** (default, main,
+  noflush, aw48-cm, cm-qemu-ptoff, kernel-ptoff, qioff-cm, block-ahci,
+  no-iommu, amd-iommu, lockdep-smp4, q9-x2apic, q9-aw39, uefi,
+  fsstress-ahci-root). Because of finding 4, every `iommu=on` guest of that
+  gate now runs **with IR on** (`IR: on: … xapic` / `x2apic eim`, the UEFI
+  path included). Its edu has the default 28-bit mask, so the IR test logs
+  `edu dma_mask < 32 bits: DMA-injection checks skipped` and runs the
+  remaining 11 checks (`pass=11 fail=0`). The M54 fault counts are unchanged:
+  IR faults are a separate class.
+- `tools/ir_gate.sh` (M56): **13 passed, 0 failed** (the table above).
+- Default image (`make iso`, no `iommu=`): `tools/smoke.sh --mb2` PASS,
+  `--uefi` PASS. Both log `[IOMMU] none` (i440fx / plain q35) and no IR or
+  vt-d line.
+The same results were obtained once before the reboot (the M56 gate 13/13,
+the M54 gate 14/14 before fsstress was cut off).
 
 ## Shared files touched (small, additive)
 - `kernel/lock_order.h`: S61, S63.
