@@ -273,8 +273,8 @@ for k in $(seq 1 "$KILLS"); do
     run KR$k 600 "spkg recover; $KCHK"
     if kstate_ok; then
         v=${LASTK#KSTATE v=}; v=${v%% *}; cur=$v
-        [[ $v == 1 ]] && seen1=$((seen1+1)); [[ $v == 2 ]] && seen2=$((seen2+1))
-        echo "    kill run $k ($how): version $v whole"
+        if [[ $v == "$want" ]]; then seen2=$((seen2+1)); else seen1=$((seen1+1)); fi   # new / old
+        echo "    kill run $k ($how): version $v whole ($([[ $v == "$want" ]] && echo new || echo old))"
     else
         kfail=1; echo "    kill run $k ($how): INCONSISTENT: $LASTK"
     fi
