@@ -1004,7 +1004,12 @@ long udrv_syscall(uint64_t op, uint64_t handle, uint64_t arg, uint64_t size) {
     }
     if (size != want) return -U_EINVAL;
     if (want && op != UDRV_OP_INFO && copy_from_user(&k, (const void*)arg, want) != 0) return -U_EFAULT;
-    if (want && op == UDRV_OP_INFO && !user_range_valid((const void*)arg, want)) return -U_EFAULT;
+    if (op == UDRV_OP_INFO) bzero8(&k, sizeof(k.in));
+    /* An op with a result must be able to write it back: probe that now by
+     * writing the same bytes (a process has one thread, nothing changes them
+     * meanwhile), so a read-only or unmapped struct fails with EFAULT before
+     * the op acts, never after it mapped a BAR or allocated DMA. */
+    if (want && out && copy_to_user((void*)arg, &k, want) != 0) return -U_EFAULT;
     if (g_ndev == 0 && op == UDRV_OP_CLAIM) {
         refuse_log(c, NULL, "not-assigned");
         return -U_ENODEV;
