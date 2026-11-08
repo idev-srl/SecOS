@@ -154,6 +154,13 @@ run_uefi() {
     echo "[smoke] Launching QEMU (UEFI / q35 / OVMF)..."
     # Clear previous log
     : > "$LOG"
+    # QEMU's vvfat (fat:rw:) writes guest changes (OVMF NvVars, ...) back into
+    # the directory and has corrupted dist/kernel.elf before (M53a): boot a
+    # throw-away copy of dist/ instead.
+    local esp
+    esp="$(mktemp -d "${TMPDIR:-/tmp}/secos_smoke_esp.XXXXXX")"
+    cp -r dist/. "$esp"/
+    rm -f "$esp/NvVars"
     # 'timeout' returns 124 when it kills the child (= PASS for us).
     # Disable set -e here so the non-zero exit propagates to QEMU_EXIT below.
     set +e
@@ -161,13 +168,14 @@ run_uefi() {
         -machine q35,accel=tcg \
         -m 256M \
         -bios "$ovmf" \
-        -drive format=raw,file=fat:rw:dist/ \
+        -drive format=raw,file=fat:rw:"$esp"/ \
         -debugcon file:"$LOG" \
         -global isa-debugcon.iobase=0xe9 \
         -no-reboot -no-shutdown \
         -display none \
         -net none
     QEMU_EXIT=$?
+    rm -rf "$esp"
     set -e
 }
 

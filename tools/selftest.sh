@@ -1543,12 +1543,15 @@ if [[ -n "$OVMF_PW" ]] && make uefi >/tmp/secos_selftest_build.log 2>&1; then
     UPLOG=/tmp/secos_selftest_power_uefi.log
     echo "[selftest] Running poweroff under UEFI/OVMF (q35, serial, 75s)..."
     : > "$UPLOG"
+    # vvfat (fat:rw:) writes back into its directory: boot a copy of dist/.
+    UPESP=$(mktemp -d /tmp/secos_power_esp.XXXXXX); cp -r dist/. "$UPESP"/; rm -f "$UPESP/NvVars"
     ( sleep 45; printf '  poweroff\r'; sleep 1 ) | \
         timeout 75 qemu-system-x86_64 -machine q35,accel=tcg -m 256M -bios "$OVMF_PW" \
-            -drive format=raw,file=fat:rw:dist/ \
+            -drive format=raw,file=fat:rw:"$UPESP"/ \
             -debugcon file:"$UPLOG" -global isa-debugcon.iobase=0xe9 \
             -no-reboot -display none -net none -serial stdio >/dev/null 2>&1
     up_rc=$?
+    rm -rf "$UPESP"
     grep -q "\[POWER\] powering off" "$UPLOG"; check "UEFI: poweroff from bash reaches ACPI power-off" $?
     [[ $up_rc -eq 0 ]]; check "UEFI: QEMU exits by itself after poweroff (rc=$up_rc)" $?
     ! grep -q "ACPI poweroff unavailable" "$UPLOG"; check "UEFI: S5 powered off before the kernel gave up (no \"unavailable\" message)" $?
