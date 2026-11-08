@@ -26,6 +26,9 @@ FAIL_MARKERS = ["[EXC] int=", "[PANIC]", "PANIC", "nested fault", "stack smashin
                 "[HEAP] CORRUPTION", "CORRUPTION FOUND", "[TLB] BUG", "shootdown timeout",
                 "[LOCKDEP]", "[LOCK] BUG", "[PROC] BUG"]
 MEMFREE_SLACK_KB = 1024   # allowed drift between measured runs
+# Heap in use: a process still being torn down holds its pinned image (bash:
+# ~1.1 MB), so samples swing by that much with nothing leaked ([M52]).
+HEAP_SLACK_KB = 2048
 
 def main():
     ap = argparse.ArgumentParser()
@@ -154,8 +157,8 @@ def main():
     # A leak only grows: compare the last measured run with the first (a
     # transient in the middle, a zombie not reaped yet, is no leak).
     hv = [v[1] for v in mf] if None not in mf else None
-    good = hv is not None and len(hv) >= 2 and hv[-1] - (hv[1] if len(hv) > 2 else hv[0]) <= MEMFREE_SLACK_KB
-    report("heap-in-use-steady", bool(good), f"SUnreclaim_kB={[v and v[1] for v in mf]} slack={MEMFREE_SLACK_KB}")
+    good = hv is not None and len(hv) >= 2 and hv[-1] - (hv[1] if len(hv) > 2 else hv[0]) <= HEAP_SLACK_KB
+    report("heap-in-use-steady", bool(good), f"SUnreclaim_kB={[v and v[1] for v in mf]} slack={HEAP_SLACK_KB}")
     finish()
 
 if __name__ == "__main__":

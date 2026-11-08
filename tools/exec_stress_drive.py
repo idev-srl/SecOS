@@ -32,6 +32,9 @@ FAIL_MARKERS = ["[EXC] int=", "[PANIC]", "PANIC", "nested fault", "stack smashin
                 "[HEAP] CORRUPTION", "CORRUPTION FOUND", "[TLB] BUG", "shootdown timeout",
                 "[LOCKDEP]", "[LOCK] BUG", "[PROC] BUG"]
 MEMFREE_SLACK_KB = 1024   # allowed drift between measured runs
+# Heap in use: a process still being torn down holds its pinned image (bash:
+# ~1.1 MB), so samples swing by that much with nothing leaked ([M52]).
+HEAP_SLACK_KB = 2048
 
 def main():
     ap = argparse.ArgumentParser()
@@ -162,8 +165,8 @@ def main():
     good = len(mf) == 2 and None not in mf and abs(mf[1][0] - mf[0][0]) <= MEMFREE_SLACK_KB
     report("memfree-steady", good, f"MemFree+Slab_kB={[v and v[0] for v in mf]} "
            f"MemFree_kB={[v and v[2] for v in mf]} slack={MEMFREE_SLACK_KB}")
-    good = len(mf) == 2 and None not in mf and mf[1][1] - mf[0][1] <= MEMFREE_SLACK_KB
-    report("heap-in-use-steady", good, f"SUnreclaim_kB={[v and v[1] for v in mf]} slack={MEMFREE_SLACK_KB}")
+    good = len(mf) == 2 and None not in mf and mf[1][1] - mf[0][1] <= HEAP_SLACK_KB
+    report("heap-in-use-steady", good, f"SUnreclaim_kB={[v and v[1] for v in mf]} slack={HEAP_SLACK_KB}")
     cpus = set(re.findall(r"\[SMP\] cpu=0x([0-9A-Fa-f]+) run pid", dlog()))
     report("ran-on-several-cpus", len(cpus) >= 2 or o.smp < 2, f"cpus={sorted(cpus)}")
     finish()
