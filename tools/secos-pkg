@@ -1,98 +1,328 @@
 #!/usr/bin/env python3
 # secos-pkg — build + sign a SecOS package (.spkg). SPDX-License-Identifier: MIT
 #
-# A .spkg bundles files (and directories) to install into the SecOS VFS, sealed
-# with the same Ed25519 signing root as executables: install = verify + unpack.
-# Only a package signed by the trusted key is installed (the M9 trust root,
-# extended to distribution).
+# A .spkg bundles files, directories and symlinks to install into the SecOS
+# VFS, sealed with the same Ed25519 signing root as executables: install =
+# verify + unpack. Only a package signed by the trusted key is installed (the
+# M9 trust root, extended to distribution). See docs/SIGNING.md and
+# docs/devlog/U6-pkg2.md.
 #
-# Layout (all little-endian):
+# Signature (both versions): digest = SHA-256 over the whole file with the 64
+# signature bytes zeroed (the ELF QSIG rule), Ed25519-signed; the signature is
+# the last 64 bytes of the file.
+#
+# Version 1 (M32, installed by the kernel shell `pkg install`), little-endian:
 #   header (64B):  magic "SECOSPKG"; u32 version=1; u32 file_count;
 #                  u64 sig_offset; u8 reserved[40]
 #   entries:       file_count x { char path[128]; u32 mode; u32 type(0=file,1=dir);
 #                                 u64 data_offset; u64 data_size }
-#   data blobs:    file contents at their data_offset
-#   signature:     64-byte Ed25519 sig at sig_offset (file end)
-# Digest = SHA-256 over the whole file with the 64 sig bytes zeroed (same rule as
-# the ELF QSIG digest), Ed25519-signed.
+#   data blobs, then the signature.
+#
+# Version 2 (U6, installed by /bin/spkg), little-endian:
+#   header (256B): 0 magic "SECOSPKG"; 8 u32 version=2; 12 u32 entry_count;
+#                  16 u64 sig_offset (= file size - 64); 24 u64 table_offset (=256);
+#                  32 u64 data_offset (= table_offset + entry_count*320);
+#                  40 u32 key_id (0 = project key); 44 u32 flags (0);
+#                  48 char name[64]; 112 char version[32]; 144 u64 data_size
+#                  (sum of the blobs); 152 u8 reserved[104] (zero)
+#   entries (320B): 0 char path[256]; 256 u32 mode (07777); 260 u32 type
+#                  (0=file, 1=dir, 2=symlink); 264 u64 data_offset; 272 u64
+#                  data_size (symlink: target length); 280 u8 sha256[32] of the
+#                  blob; 312 u32 flags (bit 0 = configuration file); 316 u32 0
+#   blobs: one per file/symlink entry, in entry order, back to back from
+#          data_offset (no gaps: the installer reads the package as one stream).
+#   signature: 64 bytes at sig_offset.
+# Files are streamed: nothing is held in memory but a 1 MiB buffer, so packages
+# of many GiB work.
 #
 # Usage:
-#   tools/secos-pkg create OUT.spkg  SRC:/dest/path [SRC:/dest/path ...] [--mkdir /d ...]
-#   tools/secos-pkg verify IN.spkg
-import sys, os, struct, hashlib
+#   tools/secos-pkg create OUT.spkg [--v1] [--name N] [--version V]
+#                   [SRC:/dest ...] [--mkdir /d ...] [--tree DIR:/prefix ...]
+#                   [--symlink TARGET:/link ...] [--conf /etc/path ...]
+#                   [--mode MODE:/dest ...]
+#   tools/secos-pkg verify IN.spkg     (signature + structure)
+#   tools/secos-pkg list IN.spkg       (v2: header + entries)
+# Files under /etc are configuration files by default (never overwritten on
+# the device); --conf marks others. Default modes: dirs 0755, files 0644, or
+# 0755 when the source file is executable on the host.
+import sys, os, struct, hashlib, stat
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from secos_signlib import DEV_SEED
 
 MAGIC = b"SECOSPKG"
-HDR = struct.Struct("<8sIIQ40s")        # 64 bytes
-ENT = struct.Struct("<128sIIQQ")        # 152 bytes
+HDR1 = struct.Struct("<8sIIQ40s")                 # 64 bytes
+ENT1 = struct.Struct("<128sIIQQ")                 # 152 bytes
+HDR2 = struct.Struct("<8sIIQQQII64s32sQ104s")     # 256 bytes
+ENT2 = struct.Struct("<256sIIQQ32sII")            # 320 bytes
+assert HDR2.size == 256 and ENT2.size == 320
+T_FILE, T_DIR, T_LINK = 0, 1, 2
+F_CONF = 1
+CHUNK = 1 << 20
 
-def build(out, specs, dirs):
-    entries = []   # (path, mode, type, data)
-    for d in dirs:
-        entries.append((d, 0o755, 1, b""))
-    for s in specs:
-        if ":" not in s:
-            sys.stderr.write("bad spec (need SRC:/dest): %s\n" % s); sys.exit(2)
-        src, dest = s.split(":", 1)
-        data = open(src, "rb").read()
-        entries.append((dest, 0o644, 0, data))
 
-    n = len(entries)
-    data_start = HDR.size + n * ENT.size
-    # lay out blobs
-    blobs = bytearray(); offs = []
-    for (_p, _m, _t, d) in entries:
-        offs.append(data_start + len(blobs)); blobs += d
-    sig_off = data_start + len(blobs)
+def die(msg):
+    sys.stderr.write("secos-pkg: %s\n" % msg)
+    sys.exit(2)
 
-    hdr = HDR.pack(MAGIC, 1, n, sig_off, b"\x00" * 40)
-    tbl = b""
-    for (p, m, t, d), o in zip(entries, offs):
-        pb = p.encode()[:127]
-        tbl += ENT.pack(pb + b"\x00" * (128 - len(pb)), m, t, o, len(d))
-    blob = bytearray(hdr + tbl + bytes(blobs) + b"\x00" * 64)   # 64 zero sig
 
-    digest = hashlib.sha256(blob).digest()
+def signer():
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     except ImportError:
-        sys.stderr.write("[pkg] need python3 'cryptography'\n"); sys.exit(1)
-    sig = Ed25519PrivateKey.from_private_bytes(DEV_SEED).sign(digest)
-    blob[sig_off:sig_off + 64] = sig
+        die("need python3 'cryptography' (export PYENV_VERSION=3.11.8?)")
+    return Ed25519PrivateKey.from_private_bytes(DEV_SEED)
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(CHUNK)
+            if not b:
+                break
+            h.update(b)
+    return h.digest()
+
+
+# ---- v1 (unchanged layout; kept for the kernel's M32 test package) -----------
+def build_v1(out, entries):
+    rows = []
+    # M32 order: every --mkdir first, then the files (byte-identical output).
+    entries = [e for e in entries if e["type"] == T_DIR] + [e for e in entries if e["type"] != T_DIR]
+    for e in entries:
+        if e["type"] == T_LINK:
+            die("v1 packages have no symlinks")
+        data = open(e["src"], "rb").read() if e["type"] == T_FILE else b""
+        rows.append((e["path"], 0o644 if e["type"] == T_FILE else 0o755, e["type"], data))
+    n = len(rows)
+    data_start = HDR1.size + n * ENT1.size
+    blobs = bytearray(); offs = []
+    for (_p, _m, _t, d) in rows:
+        offs.append(data_start + len(blobs)); blobs += d
+    sig_off = data_start + len(blobs)
+    hdr = HDR1.pack(MAGIC, 1, n, sig_off, b"\x00" * 40)
+    tbl = b""
+    for (p, m, t, d), o in zip(rows, offs):
+        pb = p.encode()[:127]
+        tbl += ENT1.pack(pb + b"\x00" * (128 - len(pb)), m, t, o, len(d))
+    blob = bytearray(hdr + tbl + bytes(blobs) + b"\x00" * 64)
+    digest = hashlib.sha256(blob).digest()
+    blob[sig_off:sig_off + 64] = signer().sign(digest)
     open(out, "wb").write(blob)
-    sys.stderr.write("[pkg] %s: %d entr%s, %d bytes, digest %s\n"
+    sys.stderr.write("[pkg] %s: v1, %d entr%s, %d bytes, digest %s\n"
                      % (out, n, "y" if n == 1 else "ies", len(blob), digest.hex()[:16]))
 
-def verify(path):
-    data = bytearray(open(path, "rb").read())
-    magic, ver, n, sig_off, _ = HDR.unpack_from(data, 0)
-    if magic != MAGIC: sys.stderr.write("not a .spkg\n"); sys.exit(1)
-    sig = bytes(data[sig_off:sig_off + 64])
-    for k in range(64): data[sig_off + k] = 0
-    digest = hashlib.sha256(data).digest()
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    pub = Ed25519PrivateKey.from_private_bytes(DEV_SEED).public_key()
+
+# ---- v2 -------------------------------------------------------------------------
+def check_dest(p):
+    if not p.startswith("/") or p.endswith("/") or "//" in p:
+        die("bad destination path %r (absolute, no trailing or double slash)" % p)
+    if any(c in ("", ".", "..") for c in p.split("/")[1:]):
+        die("bad destination path %r ('.' / '..' components)" % p)
+    if len(p.encode()) > 255:
+        die("destination path too long (max 255 bytes): %r" % p)
+    for ch in p:
+        if ord(ch) <= 0x20 or ord(ch) == 0x7F:
+            die("destination path %r has a space or control character" % p)
+
+
+def build_v2(out, entries, name, version):
+    if not name or len(name.encode()) > 63:
+        die("v2 needs --name (1..63 bytes)")
+    if any(not (c.isalnum() or c in "._+-") for c in name):
+        die("package name: letters, digits and . _ + - only")
+    if not version or len(version.encode()) > 31 or any(ord(c) <= 0x20 for c in version):
+        die("v2 needs --version (1..31 bytes, no spaces)")
+    seen = set()
+    for e in entries:
+        check_dest(e["path"])
+        if e["path"] in seen:
+            die("duplicate destination %s" % e["path"])
+        seen.add(e["path"])
+    # Parents before children; the installer also creates missing parents.
+    entries.sort(key=lambda e: (e["path"].count("/"), e["path"]) if e["type"] == T_DIR else (1 << 30, 0))
+    n = len(entries)
+    table_off = HDR2.size
+    data_off = table_off + n * ENT2.size
+    rows = []
+    pos = data_off
+    total = 0
+    for e in entries:
+        if e["type"] == T_FILE:
+            size = os.path.getsize(e["src"])
+            digest = file_sha256(e["src"])
+        elif e["type"] == T_LINK:
+            tb = e["target"].encode()
+            size, digest = len(tb), hashlib.sha256(tb).digest()
+        else:
+            size, digest = 0, b"\x00" * 32
+        rows.append((e, pos if size else 0, size, digest))
+        pos += size; total += size
+    sig_off = pos
+    nb = name.encode(); vb = version.encode()
+    hdr = HDR2.pack(MAGIC, 2, n, sig_off, table_off, data_off, 0, 0,
+                    nb + b"\x00" * (64 - len(nb)), vb + b"\x00" * (32 - len(vb)), total, b"\x00" * 104)
+    h = hashlib.sha256()
+    tmp = out + ".tmp"
+    with open(tmp, "wb") as f:
+        def put(b):
+            h.update(b); f.write(b)
+        put(hdr)
+        for (e, off, size, digest) in rows:
+            pb = e["path"].encode()
+            put(ENT2.pack(pb + b"\x00" * (256 - len(pb)), e["mode"] & 0o7777, e["type"], off, size,
+                          digest, e.get("flags", 0), 0))
+        for (e, off, size, digest) in rows:
+            if e["type"] == T_LINK:
+                put(e["target"].encode())
+            elif e["type"] == T_FILE:
+                left = size
+                with open(e["src"], "rb") as s:
+                    while left:
+                        b = s.read(min(CHUNK, left))
+                        if not b:
+                            die("%s shrank while packing" % e["src"])
+                        put(b); left -= len(b)
+        assert f.tell() == sig_off
+        h.update(b"\x00" * 64)
+        digest = h.digest()
+        f.write(signer().sign(digest))
+    os.replace(tmp, out)
+    sys.stderr.write("[pkg] %s: v2 %s %s, %d entr%s, %d data bytes, %d bytes, digest %s\n"
+                     % (out, name, version, n, "y" if n == 1 else "ies", total, sig_off + 64,
+                        digest.hex()[:16]))
+
+
+# ---- reading --------------------------------------------------------------------
+def stream_digest(path, sig_off):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        left = sig_off
+        while left:
+            b = f.read(min(CHUNK, left))
+            if not b:
+                break
+            h.update(b); left -= len(b)
+        h.update(b"\x00" * 64)
+        f.seek(sig_off)
+        sig = f.read(64)
+    return h.digest(), sig
+
+
+def verify(path, quiet=False):
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        head = f.read(256)
+    if len(head) < 64 or head[:8] != MAGIC:
+        print("[pkg] %s: not a .spkg" % path); return 1
+    ver = struct.unpack_from("<I", head, 8)[0]
+    if ver == 1:
+        _m, _v, n, sig_off, _r = HDR1.unpack_from(head, 0)
+    elif ver == 2 and len(head) == 256:
+        _m, _v, n, sig_off = HDR2.unpack_from(head, 0)[:4]
+        if sig_off + 64 != size:
+            print("[pkg] %s: signature not at the end of the file" % path); return 1
+    else:
+        print("[pkg] %s: unknown version %d" % (path, ver)); return 1
+    if sig_off + 64 > size:
+        print("[pkg] %s: truncated" % path); return 1
+    digest, sig = stream_digest(path, sig_off)
     from cryptography.exceptions import InvalidSignature
     try:
-        pub.verify(sig, digest)
-        print("[pkg] %s OK (%d entries)" % (path, n))
+        signer().public_key().verify(sig, digest)
     except InvalidSignature:
-        print("[pkg] %s SIGNATURE INVALID" % path); sys.exit(1)
+        print("[pkg] %s SIGNATURE INVALID" % path); return 1
+    if not quiet:
+        print("[pkg] %s OK (v%d, %d entries, digest %s)" % (path, ver, n, digest.hex()))
+    return 0
+
+
+def list_pkg(path):
+    if verify(path, quiet=True):
+        return 1
+    with open(path, "rb") as f:
+        hdr = HDR2.unpack(f.read(256))
+        if hdr[1] != 2:
+            die("list: v2 packages only")
+        n = hdr[2]
+        print("name %s version %s entries %d data %d" % (hdr[8].rstrip(b"\0").decode(),
+                                                         hdr[9].rstrip(b"\0").decode(), n, hdr[10]))
+        for _ in range(n):
+            p, mode, typ, off, size, dg, fl, _r = ENT2.unpack(f.read(320))
+            print("%s %04o %10d %s%s" % ("fdl"[typ] if typ < 3 else "?", mode, size,
+                                         p.rstrip(b"\0").decode(), " (conf)" if fl & F_CONF else ""))
+    return 0
+
 
 def main():
     a = sys.argv[1:]
     if len(a) >= 2 and a[0] == "create":
-        out = a[1]; specs = []; dirs = []; i = 2
-        while i < len(a):
-            if a[i] == "--mkdir": i += 1; dirs.append(a[i])
-            else: specs.append(a[i])
+        out = a[1]; entries = []; i = 2; v1 = False; name = version = None
+        modes = {}; confs = set()
+        def nxt():
+            nonlocal i
             i += 1
-        build(out, specs, dirs)
+            if i >= len(a):
+                die("%s needs an argument" % a[i - 1])
+            return a[i]
+        while i < len(a):
+            x = a[i]
+            if x == "--v1": v1 = True
+            elif x == "--name": name = nxt()
+            elif x == "--version": version = nxt()
+            elif x == "--mkdir": entries.append({"path": nxt(), "type": T_DIR, "mode": 0o755})
+            elif x == "--conf": confs.add(nxt())
+            elif x == "--mode":
+                m, d = nxt().split(":", 1); modes[d] = int(m, 8)
+            elif x == "--symlink":
+                t, d = nxt().split(":", 1)
+                entries.append({"path": d, "type": T_LINK, "target": t, "mode": 0o777})
+            elif x == "--tree":
+                src, pre = nxt().split(":", 1)
+                pre = pre.rstrip("/")
+                for root, dirs, files in os.walk(src):
+                    dirs.sort()
+                    rel = os.path.relpath(root, src)
+                    dst = pre if rel == "." else pre + "/" + rel
+                    entries.append({"path": dst, "type": T_DIR, "mode": 0o755})
+                    for fn in sorted(files):
+                        sp = os.path.join(root, fn)
+                        if os.path.islink(sp):
+                            entries.append({"path": dst + "/" + fn, "type": T_LINK,
+                                            "target": os.readlink(sp), "mode": 0o777})
+                        else:
+                            ex = os.stat(sp).st_mode & stat.S_IXUSR
+                            entries.append({"path": dst + "/" + fn, "type": T_FILE, "src": sp,
+                                            "mode": 0o755 if ex else 0o644})
+            elif x.startswith("--"):
+                die("unknown option %s" % x)
+            else:
+                if ":" not in x:
+                    die("bad spec (need SRC:/dest): %s" % x)
+                src, dest = x.split(":", 1)
+                if not os.path.isfile(src):
+                    die("%s: not a file" % src)
+                ex = os.stat(src).st_mode & stat.S_IXUSR
+                entries.append({"path": dest, "type": T_FILE, "src": src, "mode": 0o755 if ex else 0o644})
+            i += 1
+        if v1:
+            build_v1(out, entries)
+            return
+        for e in entries:
+            if e["path"] in modes:
+                e["mode"] = modes[e["path"]]
+            if e["type"] == T_FILE and (e["path"].startswith("/etc/") or e["path"] in confs):
+                e["flags"] = F_CONF
+        build_v2(out, entries, name, version)
     elif len(a) == 2 and a[0] == "verify":
-        verify(a[1])
+        sys.exit(verify(a[1]))
+    elif len(a) == 2 and a[0] == "list":
+        sys.exit(list_pkg(a[1]))
     else:
-        sys.stderr.write(__doc__ or "usage: secos-pkg create OUT SRC:/dest ...\n"); sys.exit(2)
+        sys.stderr.write(__doc__ or "usage: secos-pkg create OUT SRC:/dest ...\n")
+        sys.exit(2)
+
 
 if __name__ == "__main__":
     main()
