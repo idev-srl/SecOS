@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "idt.h"
+#include "irq.h"
 
 #define IDT_ENTRIES 256
 
@@ -145,6 +146,11 @@ void idt_init(void) {
     idt_set_gate(0x21, (uint64_t)isr_keyboard, 0x08, 0x8E);
     // [M40] PS/2 mouse (IRQ12 -> 0x2C); stays masked until ps2mouse_init + irq_enable_aux
     idt_set_gate(0x2C, (uint64_t)isr_mouse, 0x08, 0x8E);
+
+    // [M53c] Dynamic device vectors 0x50..0xDF: generic stubs -> irq_dispatch
+    // (arch/x86/irq.c). Unbound ones count as spurious and are EOIed.
+    for (int v = IRQ_VEC_FIRST; v <= IRQ_VEC_LAST; v++)
+        idt_set_gate((uint8_t)v, (uint64_t)irq_stub_table[v - IRQ_VEC_FIRST], 0x08, 0x8E);
 
     // [M48] SMP IPIs: TLB shootdown + reschedule (arch/x86/tlb.c, kernel/sched.c)
     { extern void isr_ipi_tlb(void); extern void isr_ipi_resched(void);

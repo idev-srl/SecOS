@@ -96,6 +96,9 @@
                                    kstack_lock / g_pm_lock sections (plan: S60) */
 #define LK_S64_LEAF        164  /* kclock, csprng, elf-revoke (C6, writers
                                    only): leaf locks (plan: S60)                */
+#define LK_S66_IRQVEC      166  /* g_irqvec_lock (arch/x86/irq.c, M53c): the
+                                   dynamic vector allocator; leaf, IRQ-safe.
+                                   irq_dispatch never takes it               */
 #define LK_S70_HEAP        170  /* heap_lock (expand_heap calls the PMM)        */
 #define LK_S75_PMM         175  /* pmm_lock: innermost                          */
 

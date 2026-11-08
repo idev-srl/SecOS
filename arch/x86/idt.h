@@ -87,6 +87,10 @@ extern void isr_net(void);     // vector 0x42 (NIC MSI-X, [M24] NAPI RX)
 // NOT YET TESTED — only the gated interrupt paths call this.
 void idt_install_msi_vector(uint8_t vector, void (*handler)(void));
 
+// [M53c] Dynamic device vectors 0x50..0xDF (arch/x86/irq.h): idt_init
+// installs one generic stub per vector from this table.
+extern void (* const irq_stub_table[])(void);
+
 // Syscall entry (INT 0x80)
 extern void syscall_entry(void);
 

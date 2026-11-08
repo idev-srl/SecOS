@@ -455,6 +455,78 @@ isr_net:
     pop rax
     iretq
 
+; ============================================================================
+; [M53c] Dynamic device vectors 0x50..0xDF (arch/x86/irq.c). One tiny stub per
+; vector pushes a dummy error code and the vector number (so the frame has the
+; trapframe layout and RSP stays 16-byte aligned for the C call), then joins
+; irq_common, which calls irq_dispatch(vec) between irq_enter/irq_exit.
+; irq_dispatch runs the bound handler and sends the LAPIC EOI. These handlers
+; never switch tasks, so no signal delivery is needed on the way out (the next
+; timer tick / syscall return delivers, as for the keyboard and mouse).
+; irq_stub_table (.rodata) lists the stubs for idt_init.
+; ============================================================================
+extern irq_dispatch
+
+%assign irqv 0x50
+%rep 0x90
+irq_stub_%[irqv]:
+    push 0
+    push irqv
+    jmp irq_common
+%assign irqv irqv+1
+%endrep
+
+irq_common:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    SMAP_CLAC
+    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
+    call irq_enter
+    mov rdi, [rsp + 15*8]        ; the vector pushed by the stub
+    call irq_dispatch            ; handler + LAPIC EOI
+    call irq_exit
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16                  ; drop vector + dummy error code
+    iretq
+
+section .rodata
+align 8
+global irq_stub_table
+irq_stub_table:
+%assign irqv 0x50
+%rep 0x90
+    dq irq_stub_%[irqv]
+%assign irqv irqv+1
+%endrep
+section .text
+
 ;
 ; [M48] SMP inter-processor interrupts.
 ;  0xF0 TLB shootdown: flush what the request names, ack, EOI (tlb.c). Never
