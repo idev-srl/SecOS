@@ -3,14 +3,37 @@
  * Copyright (c) 2025 iDev srl
  * Author: Luigi De Astis <l.deastis@idev-srl.com>
  * SPDX-License-Identifier: MIT
+ *
+ * [M53a] Config space goes through one of two mechanisms:
+ *  - CF8/CFC (legacy port pair). The address write and the data access are two
+ *    port operations, so every pair runs under pci_cfg_lock (it used to have no
+ *    lock: two CPUs could interleave and read another function's register).
+ *  - ECAM (memory-mapped, from the ACPI MCFG table, segment 0 only). One MMIO
+ *    access per operation, so no lock is needed. The registry
+ *    (drivers/pci_registry.c) switches it on only after a boot self-check
+ *    compared it with CF8/CFC for every function; it also reaches extended
+ *    config space (0x100-0xFFF).
+ * The device table and pci_find* live in drivers/pci_registry.c.
  */
 #include "pci.h"
+#include "pci_internal.h"
 #include "io.h"
 #include "vmm.h"        /* vmm_map_mmio (BAR + MSI-X table maps) */
 #include "debugcon.h"   /* [MSIX] markers */
+#include "spinlock.h"
 
 #define PCI_CONFIG_ADDRESS  0xCF8
 #define PCI_CONFIG_DATA     0xCFC
+
+/* [M53a] Leaf lock: nothing is taken inside it; IRQ-safe. */
+static spinlock_t pci_cfg_lock = SPINLOCK_INIT_CLASS(LK_S64_LEAF, "pci_cfg");
+
+/* ECAM window for segment 0 (set by pci_ecam_enable after the self-check).
+ * g_ecam_virt is the virtual address bus 0 would have; only buses in
+ * [g_ecam_start, g_ecam_end] are mapped and used. */
+static uint64_t g_ecam_virt;
+static uint8_t  g_ecam_start, g_ecam_end;
+static volatile int g_ecam_on;
 
 /* Build the CONFIG_ADDRESS dword: enable bit + bus/slot/func + aligned offset. */
 static inline uint32_t cfg_addr(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
@@ -21,9 +44,55 @@ static inline uint32_t cfg_addr(uint8_t bus, uint8_t slot, uint8_t func, uint8_t
                       ((uint32_t)off & 0xFC));
 }
 
-uint32_t pci_config_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+static inline volatile uint32_t* ecam_at(uint64_t virt_bus0, uint8_t bus, uint8_t slot,
+                                         uint8_t func, uint16_t off) {
+    return (volatile uint32_t*)(uintptr_t)(virt_bus0 + ((uint64_t)bus << 20) +
+                                           ((uint64_t)(slot & 0x1F) << 15) +
+                                           ((uint64_t)(func & 0x07) << 12) +
+                                           (uint64_t)(off & 0xFFC));
+}
+
+/* ECAM dword of (bus, slot, func, off), or NULL when ECAM does not cover it. */
+static inline volatile uint32_t* ecam_ptr(uint8_t bus, uint8_t slot, uint8_t func, uint16_t off) {
+    if (!g_ecam_on || bus < g_ecam_start || bus > g_ecam_end || off > 0xFFF) return 0;
+    return ecam_at(g_ecam_virt, bus, slot, func, off);
+}
+
+uint32_t pci_cf8_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+    uint64_t fl = spin_lock_irqsave(&pci_cfg_lock);
     io_outl(PCI_CONFIG_ADDRESS, cfg_addr(bus, slot, func, off));
-    return io_inl(PCI_CONFIG_DATA);
+    uint32_t v = io_inl(PCI_CONFIG_DATA);
+    spin_unlock_irqrestore(&pci_cfg_lock, fl);
+    return v;
+}
+
+uint32_t pci_ecam_probe_read32(uint64_t virt_bus0, uint8_t bus, uint8_t slot,
+                               uint8_t func, uint16_t off) {
+    return *ecam_at(virt_bus0, bus, slot, func, off);
+}
+
+void pci_ecam_enable(uint64_t virt_bus0, uint8_t start_bus, uint8_t end_bus) {
+    g_ecam_virt = virt_bus0;
+    g_ecam_start = start_bus;
+    g_ecam_end = end_bus;
+    __asm__ volatile("" ::: "memory");
+    g_ecam_on = 1;
+}
+
+int pci_ecam_active(void) { return g_ecam_on; }
+
+uint32_t pci_config_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+    volatile uint32_t* p = ecam_ptr(bus, slot, func, off);
+    if (p) return *p;
+    return pci_cf8_read32(bus, slot, func, off);
+}
+
+uint32_t pci_config_read32_ext(uint8_t bus, uint8_t slot, uint8_t func, uint16_t off) {
+    if (off > 0xFFF) return 0xFFFFFFFFu;
+    volatile uint32_t* p = ecam_ptr(bus, slot, func, off);
+    if (p) return *p;
+    if (off < 0x100) return pci_cf8_read32(bus, slot, func, (uint8_t)off);
+    return 0xFFFFFFFFu;
 }
 
 uint16_t pci_config_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
@@ -37,68 +106,35 @@ uint8_t pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
 }
 
 void pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint32_t val) {
+    volatile uint32_t* p = ecam_ptr(bus, slot, func, off);
+    if (p) { *p = val; return; }
+    uint64_t fl = spin_lock_irqsave(&pci_cfg_lock);
     io_outl(PCI_CONFIG_ADDRESS, cfg_addr(bus, slot, func, off));
     io_outl(PCI_CONFIG_DATA, val);
+    spin_unlock_irqrestore(&pci_cfg_lock, fl);
 }
 
 void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint16_t val) {
-    /* Read-modify-write the containing dword to preserve the other half. */
-    uint32_t cur = pci_config_read32(bus, slot, func, off);
-    uint32_t shift = (off & 2) * 8;
+    /* Read-modify-write the containing dword to preserve the other half (the
+     * semantics both paths always had). On CF8 the whole RMW is one lock hold,
+     * so no other config access slips in between. */
+    uint32_t shift = (uint32_t)(off & 2) * 8;
+    volatile uint32_t* p = ecam_ptr(bus, slot, func, off);
+    if (p) {
+        uint32_t cur = *p;
+        cur &= ~(0xFFFFu << shift);
+        cur |= ((uint32_t)val << shift);
+        *p = cur;
+        return;
+    }
+    uint64_t fl = spin_lock_irqsave(&pci_cfg_lock);
+    io_outl(PCI_CONFIG_ADDRESS, cfg_addr(bus, slot, func, off));
+    uint32_t cur = io_inl(PCI_CONFIG_DATA);
     cur &= ~(0xFFFFu << shift);
     cur |= ((uint32_t)val << shift);
-    pci_config_write32(bus, slot, func, off, cur);
-}
-
-int pci_find(uint16_t want_vendor, uint16_t want_device, pci_device_t* out) {
-    for (uint32_t bus = 0; bus < 256; bus++) {
-        for (uint8_t slot = 0; slot < 32; slot++) {
-            uint16_t vendor = pci_config_read16((uint8_t)bus, slot, 0, PCI_CFG_VENDOR_ID);
-            if (vendor == 0xFFFF) continue; /* no device in this slot */
-            uint8_t header = pci_config_read8((uint8_t)bus, slot, 0, 0x0E);
-            uint8_t nfunc  = (header & 0x80) ? 8 : 1; /* multi-function? */
-            for (uint8_t func = 0; func < nfunc; func++) {
-                uint16_t v = pci_config_read16((uint8_t)bus, slot, func, PCI_CFG_VENDOR_ID);
-                if (v == 0xFFFF) continue;
-                uint16_t d = pci_config_read16((uint8_t)bus, slot, func, PCI_CFG_DEVICE_ID);
-                if (v == want_vendor && (want_device == 0 || d == want_device)) {
-                    if (out) {
-                        out->bus = (uint8_t)bus; out->slot = slot; out->func = func;
-                        out->vendor_id = v; out->device_id = d;
-                    }
-                    return 0;
-                }
-            }
-        }
-    }
-    return -1;
-}
-
-int pci_find_class(uint8_t cls, uint8_t subcls, uint8_t progif, pci_device_t* out) {
-    for (uint32_t bus = 0; bus < 256; bus++) {
-        for (uint8_t slot = 0; slot < 32; slot++) {
-            uint16_t vendor = pci_config_read16((uint8_t)bus, slot, 0, PCI_CFG_VENDOR_ID);
-            if (vendor == 0xFFFF) continue;
-            uint8_t header = pci_config_read8((uint8_t)bus, slot, 0, 0x0E);
-            uint8_t nfunc  = (header & 0x80) ? 8 : 1;
-            for (uint8_t func = 0; func < nfunc; func++) {
-                uint16_t v = pci_config_read16((uint8_t)bus, slot, func, PCI_CFG_VENDOR_ID);
-                if (v == 0xFFFF) continue;
-                uint8_t pif = pci_config_read8((uint8_t)bus, slot, func, 0x09);
-                uint8_t sub = pci_config_read8((uint8_t)bus, slot, func, 0x0A);
-                uint8_t bc  = pci_config_read8((uint8_t)bus, slot, func, 0x0B);
-                if (bc == cls && sub == subcls && (progif == 0xFF || pif == progif)) {
-                    if (out) {
-                        out->bus = (uint8_t)bus; out->slot = slot; out->func = func;
-                        out->vendor_id = v;
-                        out->device_id = pci_config_read16((uint8_t)bus, slot, func, PCI_CFG_DEVICE_ID);
-                    }
-                    return 0;
-                }
-            }
-        }
-    }
-    return -1;
+    io_outl(PCI_CONFIG_ADDRESS, cfg_addr(bus, slot, func, off));
+    io_outl(PCI_CONFIG_DATA, cur);
+    spin_unlock_irqrestore(&pci_cfg_lock, fl);
 }
 
 void pci_enable_io_and_busmaster(const pci_device_t* d) {
@@ -143,6 +179,13 @@ uint64_t pci_bar_mem64(const pci_device_t* d, int idx) {
  * bytes, 0 for an I/O or unimplemented BAR. */
 uint64_t pci_bar_size(const pci_device_t* d, int idx) {
     if (idx < 0 || idx > 5) return 0;
+    /* [M53a] The registry sized every BAR once at boot (same probe, interrupts
+     * off, before the APs ran): serve that unless the BAR moved since. */
+    const pci_dev_t* r = pci_dev_of(d);
+    if (r && idx < r->nbars && (r->bar_flags[idx] & PCI_BAR_PRESENT) &&
+        !(r->bar_flags[idx] & (PCI_BAR_IO | PCI_BAR_UPPER)) &&
+        r->bar_base[idx] == pci_bar_mem64(d, idx))
+        return r->bar_size[idx];
     uint8_t off = (uint8_t)(PCI_CFG_BAR0 + idx * 4);
     uint32_t lo = pci_config_read32(d->bus, d->slot, d->func, off);
     if (lo & 0x1) return 0;
