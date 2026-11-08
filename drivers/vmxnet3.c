@@ -12,7 +12,7 @@
  * = VD (virtual device) registers — command/status doorbell. Both are MMIO,
  * mapped through the physmap. A single shared "DriverShared" DMA structure
  * (physically contiguous, static, page-aligned) holds the magic, the misc/
- * interrupt/RX/TX queue config, and physical pointers (via kvirt_to_phys) to one
+ * interrupt/RX/TX queue config, and bus addresses (DMA API, [M55]) of one
  * TX queue (TxDesc ring + TxComp ring) and one RX queue (two RxDesc rings + one
  * RxComp ring). Setup writes DSAL/DSAH with the DriverShared physical address and
  * issues ACTIVATE_DEV; the permanent MAC is read with the GET_PERM_MAC commands.
@@ -21,7 +21,7 @@
  * TxDesc and rings the TXPROD doorbell; poll() walks the RX completion ring by
  * generation bit, delivers each frame to net_rx(), refills the RxDesc and rings
  * the RXPROD doorbell. Every DMA structure is a static, page-aligned kernel
- * buffer; physical addresses come from kvirt_to_phys (the kernel is identity /
+ * __dma buffer; bus addresses come from the DMA API (the kernel is identity /
  * physmap mapped so the device sees the right physical frames).
  */
 #include "vmxnet3.h"
@@ -29,7 +29,8 @@
 #include "io.h"
 #include "net.h"
 #include "debugcon.h"
-#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_map_mmio
+#include "vmm.h"        // vmm_map_mmio
+#include "dma.h"        // [M55] bus addresses
 #include <stddef.h>
 
 /* ---- PCI identity (VMware vmxnet3) ---- */
@@ -226,17 +227,17 @@ struct vmxnet3_queue_descs {
 /* ============================================================================
  * Static, page-aligned DMA buffers (single TX + single RX queue).
  * ========================================================================== */
-static struct vmxnet3_driver_shared g_shared   __attribute__((aligned(4096)));
-static struct vmxnet3_queue_descs   g_qdescs    __attribute__((aligned(512)));
+static struct vmxnet3_driver_shared g_shared __dma __attribute__((aligned(4096)));
+static struct vmxnet3_queue_descs   g_qdescs __dma __attribute__((aligned(512)));
 
-static struct vmxnet3_tx_desc      g_tx_ring[VMXNET3_TX_RING_SIZE]      __attribute__((aligned(512)));
-static struct vmxnet3_tx_comp_desc g_tx_comp[VMXNET3_TX_RING_SIZE]      __attribute__((aligned(512)));
-static struct vmxnet3_rx_desc      g_rx_ring[VMXNET3_RX_RING_SIZE]      __attribute__((aligned(512)));
-static struct vmxnet3_rx_comp_desc g_rx_comp[VMXNET3_RX_RING_SIZE]      __attribute__((aligned(512)));
+static struct vmxnet3_tx_desc      g_tx_ring[VMXNET3_TX_RING_SIZE] __dma __attribute__((aligned(512)));
+static struct vmxnet3_tx_comp_desc g_tx_comp[VMXNET3_TX_RING_SIZE] __dma __attribute__((aligned(512)));
+static struct vmxnet3_rx_desc      g_rx_ring[VMXNET3_RX_RING_SIZE] __dma __attribute__((aligned(512)));
+static struct vmxnet3_rx_comp_desc g_rx_comp[VMXNET3_RX_RING_SIZE] __dma __attribute__((aligned(512)));
 
 /* Per-slot buffers (one frame each). Static so they have stable phys addrs. */
-static uint8_t g_tx_buf[VMXNET3_TX_RING_SIZE][VMXNET3_TX_BUF_SIZE] __attribute__((aligned(64)));
-static uint8_t g_rx_buf[VMXNET3_RX_RING_SIZE][VMXNET3_RX_BUF_SIZE] __attribute__((aligned(64)));
+static uint8_t g_tx_buf[VMXNET3_TX_RING_SIZE][VMXNET3_TX_BUF_SIZE] __dma __attribute__((aligned(64)));
+static uint8_t g_rx_buf[VMXNET3_RX_RING_SIZE][VMXNET3_RX_BUF_SIZE] __dma __attribute__((aligned(64)));
 
 /* ============================================================================
  * Driver state.
@@ -256,7 +257,7 @@ struct vmxnet3_state {
 static struct vmxnet3_state g_st;
 static net_dev_t g_net;
 
-static inline uint64_t phys_of(const void* p) { return kvirt_to_phys((uint64_t)(uintptr_t)p); }
+static dma_dev_t* g_dd;     /* [M55] the device's DMA handle */
 
 static inline uint32_t vd_rd(uint32_t off) { return *(volatile uint32_t*)(g_st.vd + off); }
 static inline void     vd_wr(uint32_t off, uint32_t v) { *(volatile uint32_t*)(g_st.vd + off) = v; }
@@ -293,7 +294,7 @@ static void vmxnet3_init_rings(void) {
     /* Pre-post every RX descriptor pointing at its static buffer. The gen bit on
      * each RxDesc tells the device the slot is owned by it. */
     for (uint32_t i = 0; i < VMXNET3_RX_RING_SIZE; i++) {
-        g_rx_ring[i].addr = phys_of(g_rx_buf[i]);
+        g_rx_ring[i].addr = dma_static(g_dd, g_rx_buf[i], sizeof(g_rx_buf[i]));
         /* dword2: len[13:0] | btype[14] | gen[31] */
         g_rx_ring[i].dword2 = (VMXNET3_RX_BUF_SIZE & 0x3FFF)
                             | (VMXNET3_RXD_BTYPE_HEAD << 14)
@@ -324,7 +325,7 @@ static void vmxnet3_build_shared(void) {
     m->uptFeatures = 0;                                      /* no LRO/csum offload */
     m->ddPA = 0;
     m->ddLen = 0;
-    m->queueDescPA = phys_of(&g_qdescs);
+    m->queueDescPA = dma_static(g_dd, &g_qdescs, sizeof(g_qdescs));
     m->queueDescLen = (uint32_t)sizeof(g_qdescs);
     m->mtu = NET_MTU;
     m->maxNumRxSG = 1;
@@ -348,9 +349,9 @@ static void vmxnet3_build_shared(void) {
 
     /* --- TX queue desc --- */
     struct vmxnet3_tx_queue_desc* txq = &g_qdescs.tx;
-    txq->confTxRingBasePA   = phys_of(g_tx_ring);
+    txq->confTxRingBasePA   = dma_static(g_dd, g_tx_ring, sizeof(g_tx_ring));
     txq->confDataRingBasePA = 0;                 /* no inline data ring */
-    txq->confCompRingBasePA = phys_of(g_tx_comp);
+    txq->confCompRingBasePA = dma_static(g_dd, g_tx_comp, sizeof(g_tx_comp));
     txq->confDdPA = 0;
     txq->confTxRingSize   = VMXNET3_TX_RING_SIZE;
     txq->confDataRingSize = 0;
@@ -360,9 +361,9 @@ static void vmxnet3_build_shared(void) {
 
     /* --- RX queue desc (two rings; we only post ring 0) --- */
     struct vmxnet3_rx_queue_desc* rxq = &g_qdescs.rx;
-    rxq->confRxRingBasePA[0] = phys_of(g_rx_ring);
-    rxq->confRxRingBasePA[1] = phys_of(g_rx_ring);   /* ring1 unused; alias ring0 */
-    rxq->confCompRingBasePA  = phys_of(g_rx_comp);
+    rxq->confRxRingBasePA[0] = dma_static(g_dd, g_rx_ring, sizeof(g_rx_ring));
+    rxq->confRxRingBasePA[1] = dma_static(g_dd, g_rx_ring, sizeof(g_rx_ring));   /* ring1 unused; alias ring0 */
+    rxq->confCompRingBasePA  = dma_static(g_dd, g_rx_comp, sizeof(g_rx_comp));
     rxq->confDdPA = 0;
     rxq->confRxRingSize[0] = VMXNET3_RX_RING_SIZE;
     rxq->confRxRingSize[1] = VMXNET3_RX_RING_SIZE;
@@ -385,7 +386,7 @@ static int vmxnet3_transmit(net_dev_t* dev, const void* frame, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) g_tx_buf[idx][i] = src[i];
 
     struct vmxnet3_tx_desc* d = &g_tx_ring[idx];
-    d->addr = phys_of(g_tx_buf[idx]);
+    d->addr = dma_static(g_dd, g_tx_buf[idx], sizeof(g_tx_buf[idx]));
     /* dword3 first (no offload), then dword2 with the gen bit last so the device
      * never sees a half-written descriptor with the new gen. */
     d->dword3 = 0;
@@ -429,7 +430,7 @@ static void vmxnet3_poll(net_dev_t* dev) {
 
         /* Refill that RxDesc and hand it back to the device with the current gen. */
         if (rxd_idx < VMXNET3_RX_RING_SIZE) {
-            g_rx_ring[rxd_idx].addr = phys_of(g_rx_buf[rxd_idx]);
+            g_rx_ring[rxd_idx].addr = dma_static(g_dd, g_rx_buf[rxd_idx], sizeof(g_rx_buf[rxd_idx]));
             g_rx_ring[rxd_idx].dword3 = 0;
             io_mfence();
             g_rx_ring[rxd_idx].dword2 = (VMXNET3_RX_BUF_SIZE & 0x3FFF)
@@ -457,6 +458,7 @@ int vmxnet3_init(void) {
         debugcon_writestring("[VMXNET3] no device on PCI\n");
         return -1;
     }
+    g_dd = dma_dev_legacy(&dev);    /* [M55] joins the kernel DMA domain first */
     pci_enable_mem_and_busmaster(&dev);
 
     uint64_t pt_bar = pci_bar_mem64(&dev, VMXNET3_PT_BAR);
@@ -480,7 +482,7 @@ int vmxnet3_init(void) {
     vmxnet3_build_shared();
 
     /* Hand the DriverShared physical address to the device, then activate. */
-    uint64_t ds = phys_of(&g_shared);
+    uint64_t ds = dma_static(g_dd, &g_shared, sizeof(g_shared));
     vd_wr(VMXNET3_REG_DSAL, (uint32_t)ds);
     vd_wr(VMXNET3_REG_DSAH, (uint32_t)(ds >> 32));
     io_mfence();
