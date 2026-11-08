@@ -207,10 +207,14 @@ static uint64_t ahci_identify(struct ahci_disk* d) {
 #include "iommu.h"
 // [M55] Negative test (-DSECOS_DMA_TEST, strict kernel DMA domain only): point
 // one PRD at memory outside .dmabss/coherent and check that the IOMMU blocks
-// it, the command fails, the port recovers and .text is unchanged.
+// the transfer and the kernel survives:
 //   1. READ DMA into a .text page  -> device write fault, .text hash unchanged;
-//   2. WRITE DMA from a heap page  -> device read fault (nothing reaches disk);
-//   3. a normal read afterwards     -> works (the port recovered).
+//   2. WRITE DMA from a heap page  -> device read fault, the page's bytes do
+//      not reach the disk (the sector keeps the marker written before);
+//   3. a normal read afterwards     -> works.
+// The command status is logged but not required: QEMU's ich9-ahci completes a
+// command whose DMA the IOMMU refused with success (no HBFS/TFES; it drops the
+// data), real HBAs report a host bus error (handled by port_recover()).
 static int dmat_fault_seen(uint64_t before, uint64_t iova, int is_write) {
     for (int i = 0; i < 200; i++) {
         iommu_fault_poll();
@@ -228,6 +232,7 @@ static void ahci_dma_negative_test(struct ahci_disk* d) {
         return;
     }
     uint64_t far_lba = d->dev.sector_count > 64 ? d->dev.sector_count - 16 : 0;
+    uint8_t* dma = g_dma[d->idx];
     // 1. Device writes into .text.
     uint8_t h0[32], h1[32];
     dma_test_text_hash(h0);
@@ -238,29 +243,39 @@ static void ahci_dma_negative_test(struct ahci_disk* d) {
     int seen = dmat_fault_seen(st.total, bad, 1);
     dma_test_text_hash(h1);
     int same = 1; for (int i = 0; i < 32; i++) if (h0[i] != h1[i]) same = 0;
-    debugcon_writestring("[DMA-TEST] ahci read into .text phys=0x"); debugcon_print_hex(bad);
-    debugcon_writestring(rc ? " command failed" : " command SUCCEEDED");
+    debugcon_writestring("[DMA-TEST] ahci read into .text phys="); debugcon_print_hex(bad);
+    debugcon_writestring(rc ? " (command failed)" : " (command completed)");
     debugcon_writestring(seen ? ", IOMMU write fault seen" : ", NO matching IOMMU fault");
     debugcon_writestring(same ? ", .text hash unchanged\n" : ", .text hash CHANGED\n");
-    if (rc && seen && same) pass++; else fail++;
+    if (seen && same) pass++; else fail++;
     // 2. Device reads a heap page (would leak kernel memory to the disk).
+    for (int i = 0; i < 4096; i++) dma[i] = 0xC3;              // marker sector
+    int mk = ahci_cmd(d, ATA_WRITE_DMA_EX, far_lba, 8, 4096, 1);
     bad = dma_test_bad_addr(1, &kva);
-    if (bad != DMA_ADDR_ERROR) {
+    if (bad != DMA_ADDR_ERROR && mk == 0) {
+        for (int i = 0; i < 3 * 4096; i++) ((uint8_t*)kva)[i] = 0x5A;   // "secret"
         iommu_fault_stats(&st);
         rc = ahci_cmd_at(d, ATA_WRITE_DMA_EX, far_lba, 8, 4096, 1, bad);
         seen = dmat_fault_seen(st.total, bad, 0);
-        debugcon_writestring("[DMA-TEST] ahci write from a heap page phys=0x"); debugcon_print_hex(bad);
-        debugcon_writestring(rc ? " command failed" : " command SUCCEEDED");
-        debugcon_writestring(seen ? ", IOMMU read fault seen\n" : ", NO matching IOMMU fault\n");
-        if (rc && seen) pass++; else fail++;
+        int leaked = 0;
+        for (int i = 0; i < 4096; i++) dma[i] = 0;
+        if (ahci_cmd(d, ATA_READ_DMA_EX, far_lba, 8, 4096, 0) != 0) leaked = -1;
+        else for (int i = 0; i < 4096; i++) if (dma[i] == 0x5A) { leaked = 1; break; }
+        debugcon_writestring("[DMA-TEST] ahci write from a heap page phys="); debugcon_print_hex(bad);
+        debugcon_writestring(rc ? " (command failed)" : " (command completed)");
+        debugcon_writestring(seen ? ", IOMMU read fault seen" : ", NO matching IOMMU fault");
+        debugcon_writestring(leaked == 0 ? ", heap bytes not on disk\n"
+                             : leaked > 0 ? ", heap bytes LEAKED to disk\n" : ", read-back FAILED\n");
+        if (seen && leaked == 0) pass++; else fail++;
         dma_test_free(kva);
     } else {
-        debugcon_writestring("[DMA-TEST] heap page allocation failed\n"); fail++;
+        debugcon_writestring("[DMA-TEST] heap page / marker write failed\n"); fail++;
+        if (kva) dma_test_free(kva);
     }
     // 3. The port still works.
     rc = ahci_cmd(d, ATA_READ_DMA_EX, 0, 8, 4096, 0);
     debugcon_writestring(rc ? "[DMA-TEST] ahci read after the faults FAILED\n"
-                            : "[DMA-TEST] ahci read after the faults ok (port recovered)\n");
+                            : "[DMA-TEST] ahci read after the faults ok\n");
     if (rc == 0) pass++; else fail++;
     debugcon_writestring("[DMA-TEST] RESULT pass="); debugcon_print_hex((uint64_t)pass);
     debugcon_writestring(" fail="); debugcon_print_hex((uint64_t)fail); debugcon_writestring("\n");
