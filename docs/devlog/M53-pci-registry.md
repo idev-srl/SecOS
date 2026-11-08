@@ -91,7 +91,7 @@ q35 UEFI/OVMF.
 | Run | Result |
 |---|---|
 | gate, QEMU 6.2, incl. `--uefi` | 5/5 PASS (listing = query-pci: 9/13/13/14/13 functions) |
-| gate, QEMU 9.2, incl. `--uefi` | PASS (q35 guests -smp 4 in a manual run too) |
+| gate, QEMU 9.2, incl. `--uefi` | 5/5 PASS (q35 guests at -smp 4 in a manual run too) |
 | driver probe lines vs the base kernel (96bb08b), i440fx + q35 | identical |
 | q35 + intel-iommu, `-m 8G` | identical driver lines, ECAM OK |
 | negative: `-DSECOS_PCI_ECAM_TEST=1` (ECAM window off by one bus) | `self-check FAIL at 00:00.0 id ecam=10d38086 cf8=29c08086`, CF8 used, drivers identical |
@@ -115,6 +115,13 @@ q35 UEFI/OVMF.
   QEMU 6.2 advertises no FLR on e1000e or NVMe, QEMU 9.2's NVMe has FLR (still
   none on e1000e: M57/M58 reset needs the PM-reset fallback); `-cdrom` on q35
   takes `ide.2`.
+- **vvfat write-back damaged `dist/kernel.elf`**: QEMU's `fat:rw:dist/` (used by
+  `tools/smoke.sh --uefi` and the UEFI run targets) writes back into the
+  directory. After a few runs `dist/kernel.elf` differed from `kernel.bin` and
+  the UEFI guest showed nothing at all on debugcon (first seen as a QEMU 9.2
+  failure; the base kernel had the same problem with a fresh `dist/`, it is not
+  a kernel bug). `make uefi` restores it. `tools/pci_gate.sh` boots a fresh
+  copy of `dist/`; smoke.sh still uses the directory itself (not changed here).
 - `/proc/bus/pci/devices` is generated into procfs' 16 KiB buffer: about 60
   functions fit; beyond that the file is truncated (no overflow).
 
