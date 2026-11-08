@@ -23,6 +23,7 @@
 #include "tty.h"
 #include "input.h"            // [M40] /dev/input/eventN clients
 #include "fbdev.h"            // [M40] /dev/fb0
+#include "udrv.h"             // [M57] ring-3 driver claims (SYS_UDRV, claim fds)
 #include "percpu.h"           // SMP_MAX_CPUS, smp_cpu_count (sched_getaffinity)
 
 extern uint64_t timer_get_ticks(void);
@@ -55,6 +56,16 @@ static int fd_alloc(process_t* p){
     fdt_unlock(p, fl);
     return -1;
 }
+// [M57] Install a kernel object (an inode-tagged fd kind: a udrv claim fd) as
+// a new fd of c. Returns the fd or -1 (table full).
+int ksys_fd_install(process_t* c, void* ino, uint32_t flags, int cloexec){
+    int fd = fd_alloc(c);
+    if (fd < 0) return -1;
+    uint64_t fl = fdt_lock(c);
+    c->fds[fd].inode = ino; c->fds[fd].flags = flags; c->fds[fd].cloexec = cloexec ? 1 : 0;
+    fdt_unlock(c, fl);
+    return fd;
+}
 // Release an fd slot fd_alloc reserved (error paths).
 static void fd_release(process_t* p, int fd){ uint64_t fl = fdt_lock(p); p->fds[fd].used=0; p->fds[fd].inode=NULL; fdt_unlock(p, fl); }
 
@@ -65,12 +76,12 @@ static void fd_release(process_t* p, int fd){ uint64_t fl = fdt_lock(p); p->fds[
 static void fd_entry_ref(struct proc_fd_entry* e){
     if(e->is_pipe) pipe_ref((pipe_t*)e->inode, e->pipe_w);
     else if(e->is_sock) socket_ref(e->is_sock - 1);
-    else { pty_ref(e->inode); input_obj_ref(e->inode); }
+    else { pty_ref(e->inode); input_obj_ref(e->inode); udrv_fd_ref(e->inode); }
 }
 static void fd_entry_unref(struct proc_fd_entry* e){
     if(e->is_pipe){ pipe_unref((pipe_t*)e->inode, e->pipe_w); e->is_pipe=0; }
     else if(e->is_sock){ int sx=e->is_sock-1; e->is_sock=0; socket_unref(sx); }
-    else { void* ino=e->inode; e->inode=NULL; pty_unref(ino); input_obj_unref(ino); }   // a pty end may hang up
+    else { void* ino=e->inode; e->inode=NULL; pty_unref(ino); input_obj_unref(ino); udrv_fd_unref(ino); }   // a pty end may hang up
 }
 
 // [M25] pipe(): allocate a pipe object and two fds (read end + write end).
@@ -440,6 +451,7 @@ uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
         if (devfs_is_fb(c->fds[fd].inode))
             return (uint64_t)fbdev_mmap(c, len, prot, flags, off);
         if (input_is_client(c->fds[fd].inode)) return (uint64_t)(int64_t)-19;   // -ENODEV
+        if (udrv_is_fd(c->fds[fd].inode)) return (uint64_t)(int64_t)-19;        // [M57] MAP_BAR instead
     }
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return (uint64_t)-1; // W^X
     vfs_inode_t* ino = 0;
@@ -482,6 +494,7 @@ int ksys_munmap(uint64_t addr, uint64_t len){
     if (!len) return -1;                                     // EINVAL
     uint64_t end = addr + len;
     uint64_t fl = mm_lock(c);
+    if (vma_pinned_overlap(&c->vmas, addr, end)) { mm_unlock(c, fl); return -22; }  // [M57] -EINVAL
     // Every user page is VMA-backed (M14), so only VMA intersections can hold
     // present PTEs: unmap those instead of walking the whole (maybe huge) range.
     for (uint32_t i = 0; i < c->vmas.count; i++) {
@@ -522,6 +535,7 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
     uint64_t fl = mm_lock(c);
     int ret = -1;
     if (!vma_overlaps(&c->vmas, addr, end)) goto out;           // must be backed
+    if (vma_pinned_overlap(&c->vmas, addr, end)) { ret = -22; goto out; }  // [M57] driver map: -EINVAL
     // [M40] Device memory (the framebuffer) is never executable.
     if (prot & PROT_EXEC) {
         for (uint32_t i = 0; i < c->vmas.count; i++) {
@@ -746,6 +760,8 @@ int ksys_read(int fd, void* ubuf, int len){ extern process_t* sched_get_current(
     if(fd<0||fd>=32) return -1;
     if(len<=0) return -1;
     if(c->fds[fd].used && c->fds[fd].is_sock) return ksys_sock_read(c, fd, ubuf, len);
+    if(c->fds[fd].used && c->fds[fd].inode && udrv_is_fd(c->fds[fd].inode))   // [M57] claim fd: events
+        return udrv_fd_read(c, c->fds[fd].inode, ubuf, len, (c->fds[fd].flags & 0x800) != 0);   // -2: blocks
     int is_pipe = c->fds[fd].used && c->fds[fd].is_pipe;
     int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
     if(!is_pipe && !is_file && fd!=0) return -1;
@@ -808,6 +824,8 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
     if(fd<0||fd>=32) return -1;
     if(len<=0) return -1;
     if(c->fds[fd].used && c->fds[fd].is_sock) return ksys_sock_write(c, fd, ubuf, len);
+    if(c->fds[fd].used && c->fds[fd].inode && udrv_is_fd(c->fds[fd].inode))   // [M57] claim fd: ack + unmask
+        return udrv_fd_write(c, c->fds[fd].inode, ubuf, len);
     int is_pipe = c->fds[fd].used && c->fds[fd].is_pipe;
     int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
     if(!is_pipe && !is_file && fd!=1 && fd!=2) return -1;
@@ -1766,28 +1784,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         return (uint64_t)(int64_t)-1;
     }
 
-    case SYS_DRIVER: {
-        /*
-         * [M3] SYS_DRIVER hardening:
-         *  1. copy_from_user: copy driver_call_t from user to kernel buffer.
-         *  2. Execute with kernel-owned copy (no user pointer in driver_if).
-         *  3. copy_to_user: write value field back for READ_REG / GET_INFO.
-         */
-        driver_call_t kdc;
-        if (copy_from_user(&kdc, (const void*)a0, sizeof(kdc)) != 0) {
-            terminal_writestring("[SYSCALL][M3] SYS_DRIVER: invalid user struct pointer\n");
-            return (uint64_t)(int64_t)-EFAULT;
-        }
-        int r = driver_syscall(&kdc);
-        /* Write value field back for read-type opcodes. */
-        if (r == DRV_OK &&
-            (kdc.opcode == DRIVER_OP_READ_REG || kdc.opcode == DRIVER_OP_GET_INFO)) {
-            /* Pointer was already validated by copy_from_user above. */
-            copy_to_user((void*)((uint64_t)a0 + __builtin_offsetof(driver_call_t, value)),
-                         &kdc.value, sizeof(kdc.value));
-        }
-        return (uint64_t)(int64_t)r;
-    }
+    case SYS_DRIVER:
+        /* [M57] The M11 Driver Space mock (synthetic devices, shadow registers)
+         * is retired: SYS_UDRV (92) drives real PCI functions from ring 3. */
+        return (uint64_t)(int64_t)-38;    /* -ENOSYS */
+
+    case SYS_UDRV:
+        return (uint64_t)(int64_t)udrv_syscall(a0, a1, a2, a3);
 
     /* [M30] Signals + job control. SYS_SIGRETURN is handled in syscall_trap.c
      * (it needs the live trapframe); the rest are plain dispatches. */

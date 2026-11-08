@@ -32,6 +32,10 @@
 // frame alone: unmap/destroy just drop the PTE, fork copies it verbatim (the
 // mapping stays shared), mprotect keeps the bit and never adds COW.
 #define VMM_FLAG_DEVICE    (1ULL<<11)
+// [M57] Software bit (CPU-ignored, outside ADDRESS_MASK): a ring-3 driver's
+// device mapping (BAR, DMA buffer). vmm_fork_space leaves it out of the child;
+// always set together with VMM_FLAG_DEVICE.
+#define VMM_FLAG_DONTFORK  (1ULL<<52)
 #define VMM_FLAG_NOEXEC    (1ULL<<63) // NX bit (requires EFER.NXE enabled)
 
 // Address space structure.

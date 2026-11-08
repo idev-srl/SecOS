@@ -10,7 +10,7 @@
 #define SYS_OPEN    4
 #define SYS_CLOSE   5
 #define SYS_GETPID  6
-#define SYS_DRIVER  7  // driver space mediated hardware access
+#define SYS_DRIVER  7  // retired M11 Driver Space mock: -ENOSYS since M57 (see SYS_UDRV)
 #define SYS_SPAWN   8  // load+verify a signed ELF from a VFS path, return pid
 #define SYS_WAIT    9  // wait for a child pid to become ZOMBIE, return status
 #define SYS_GETTICKS 10 // [M13] uptime in timer ticks
@@ -74,8 +74,8 @@
 // Sessions + pseudo-terminals (numbers 85-89 are reserved for the pty work).
 #define SYS_SETSID      85 // setsid() -> new session id / -EPERM (already a group leader)
 #define SYS_GETSID      86 // getsid(pid) -> session id (pid 0 = caller) / -ESRCH
-// 90-94 were reserved for the GUI work (90 = prctl, 91 = sched_getaffinity, 92-94
-// free); 95-99 for init / system services.
+// 90-94 were reserved for the GUI work (90 = prctl, 91 = sched_getaffinity,
+// 92 = udrv (M57), 93-94 free); 95-99 for init / system services.
 // [M46] prctl(option, arg): PR_SET_NO_NEW_PRIVS (38, arg 1) / PR_GET_NO_NEW_PRIVS
 // (39) as on Linux, plus PR_SECOS_GET_CAPS (0x53430001): effective caps
 // (MANIFEST_FLAG_CAP_* bits) | bit 30 if confined | bit 29 if no_new_privs.
@@ -86,6 +86,10 @@
 // or not a multiple of 8, -ESRCH for an unknown pid. The mask is the task's
 // pinned CPU, else every online CPU. Libc zeroes the rest of the caller's set.
 #define SYS_SCHED_GETAFFINITY 91
+// [M57] Driver Space v2: udrv(op, handle, arg, size) — ring-3 PCI drivers.
+// ABI in user/include/secos/udrv.h (claim, BAR map, mediated config, DMA
+// buffers in the device's own IOMMU domain, IRQ fd). SYS_DRIVER (7) -> -ENOSYS.
+#define SYS_UDRV        92
 #define PR_SET_NO_NEW_PRIVS 38
 #define PR_GET_NO_NEW_PRIVS 39
 #define PR_SECOS_GET_CAPS   0x53430001
@@ -223,6 +227,3 @@ int  ksys_symlink(const char* target, const char* linkpath);
 int  ksys_mount(const char* dev, const char* target, const char* fstype);
 int  ksys_umount(const char* target);
 
-// Driver interface forward declaration (struct defined in driver_if.h)
-struct driver_call;
-int driver_syscall(struct driver_call* req);

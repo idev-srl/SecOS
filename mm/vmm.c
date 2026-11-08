@@ -1062,6 +1062,7 @@ vmm_space_t* vmm_fork_space(vmm_space_t* parent) {
                     if (!vmm_pte_has_frame(pte)) continue;
                     uint64_t va = ((uint64_t)pi << 30) | ((uint64_t)di << 21) | ((uint64_t)ti << 12);
                     uint64_t phys  = pte & ADDRESS_MASK;
+                    if (pte & VMM_FLAG_DONTFORK) continue;  // [M57] ring-3 driver mapping: not inherited
                     if (pte & VMM_FLAG_DEVICE) {
                         // [M40] Device memory (framebuffer): the mapping is shared
                         // by nature. Copy the PTE as-is: no refcount, no COW.

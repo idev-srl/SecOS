@@ -69,6 +69,8 @@
 // Manifest versions
 #define MANIFEST_VERSION_BASE    1u   // version/flags/max_mem/entry_hint (24-byte desc)
 #define MANIFEST_VERSION_DRIVER  2u   // adds proc_type/dev_id/dev_caps (40-byte desc)
+#define MANIFEST_VERSION_UDRV    3u   // [M57] adds the ring-3 PCI driver fields (96-byte desc)
+#define MANIFEST_UDRV_MATCH_MAX  4u
 
 // [M11] Process type carried by the (signed) manifest. The signature is the
 // trust root for this claim: a binary can only run as a driver if the signed
@@ -94,7 +96,25 @@ typedef struct elf_manifest_raw {
     uint32_t dev_id;      // device che il driver può legare (significativo se DRIVER)
     uint32_t dev_caps;    // capability concesse (DEV_CAP_* mask) — sottoinsieme del device
     uint32_t reserved;    // padding/futuro (0)
+    // --- v3 (MANIFEST_VERSION_UDRV, [M57] Driver Space v2): descsz >= 96 ---
+    // Which PCI functions the driver may claim and what it may do with them.
+    // Covered by the signature like every other field. Absent -> zero (no
+    // match: a v2 DRIVER can claim nothing).
+    uint32_t udrv_flags;  // reserved for the kernel proxies (M58: DRV_NET ...)
+    uint16_t bar_mask;    // memory BARs it may map (bit n = BAR n)
+    uint8_t  irq_max;     // MSI/MSI-X vectors it may set up (<= 32)
+    uint8_t  nmatch;      // valid entries in match[] (<= 4)
+    uint64_t dma_max;     // DMA bytes it may hold (0 = no DMA)
+    uint32_t cfg_write_mask; // UDRV_CFGW_* (user/include/secos/udrv.h)
+    uint32_t reserved2;
+    struct {
+        uint16_t vendor, device;   // 0xFFFF = any
+        uint8_t  class_code, subclass; // 0xFF = any
+        uint16_t reserved;
+    } match[MANIFEST_UDRV_MATCH_MAX];
 } elf_manifest_raw_t;
+#define MANIFEST_RAW_V2_SIZE 40u
+typedef char elf_manifest_raw_v3_is_96_bytes[(sizeof(elf_manifest_raw_t) == 96) ? 1 : -1];
 
 // Struttura interna usata dal kernel (espande se servono campi derivati)
 typedef struct elf_manifest {
@@ -105,6 +125,17 @@ typedef struct elf_manifest {
     uint32_t proc_type;   // [M11] derivato dal manifest (default USER se v1)
     uint32_t dev_id;      // [M11] device richiesto (valido se DRIVER)
     uint32_t dev_caps;    // [M11] capability richieste (DEV_CAP_* mask)
+    // [M57] v3 ring-3 PCI driver fields (zero unless version >= 3, DRIVER).
+    uint32_t udrv_flags;
+    uint16_t bar_mask;
+    uint8_t  irq_max;
+    uint8_t  nmatch;
+    uint64_t dma_max;
+    uint32_t cfg_write_mask;
+    struct {
+        uint16_t vendor, device;
+        uint8_t  class_code, subclass;
+    } match[MANIFEST_UDRV_MATCH_MAX];
 } elf_manifest_t;
 
 int elf_manifest_parse(const void* elf_buf, size_t size, elf_manifest_t* out);

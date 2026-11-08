@@ -22,6 +22,7 @@
 #include "pty.h"        // pty fd / controlling-terminal references
 #include "input.h"      // [M40] evdev client references
 #include "fbdev.h"      // [M40] graphics-owner exit -> text console
+#include "udrv.h"       // [M57] ring-3 driver claims and their fds
 
 #define MAX_PROCESSES 32
 static process_t* volatile proc_table[MAX_PROCESSES];
@@ -822,7 +823,7 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     p->pgid = p->pid; p->ppid = 0; p->spawner_pid = 0;
     p->stop_report = 0; p->cont_report = 0; p->stop_sig = 0;
     p->wait_tty = 0; p->power_phase = 0; p->power_deadline = 0;
-    p->wait_pty = NULL; p->sid = p->pid; p->ctty = NULL; p->ctty_detached = 0;  // own session, console
+    p->wait_pty = NULL; p->wait_udrv = NULL; p->sid = p->pid; p->ctty = NULL; p->ctty_detached = 0;  // own session, console
     p->sigsusp_active = 0; p->sigsusp_saved = 0; p->sig_eintr_rip = 0; p->sig_rerun_eintr = 0; p->fpu_valid = 0;
     p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
     cred_init_root(&p->cred);         // [M43] kernel-made: root (SYS_SPAWN copies the spawner's)
@@ -842,33 +843,11 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     // re-applies the rule with the spawner's bound (ksys_spawn_argv).
     p->no_new_privs = 0;
     cap_exec_transition(p, cap_exec_bound(NULL), "load");
-    // [M11] Driver Space: the signed manifest is the trust root for the
-    // driver claim. If it declares PROC_TYPE_DRIVER, validate the device
-    // and grant only capabilities the device actually supports (subset),
-    // then bind the process. A bogus claim degrades to USER (the process
-    // still runs, but SYS_DRIVER will refuse it).
-    if (mf && mf->proc_type == MANIFEST_PROC_TYPE_DRIVER) {
-        const device_desc_t* dev = driver_get_device((int)mf->dev_id);
-        if (!dev) {
-            debugcon_writestring("[M11] driver claim refused: unknown device\n");
-        } else {
-            uint32_t granted = mf->dev_caps & dev->caps_mask;
-            if (granted != mf->dev_caps)
-                debugcon_writestring("[M11] WARN: requested caps reduced to device-supported subset\n");
-            if (driver_register_binding_caps(p, (int)mf->dev_id, granted) == DRV_OK) {
-                p->proc_type = PROC_TYPE_DRIVER;
-                p->drv_dev_id = (int)mf->dev_id;
-                p->drv_caps = granted;
-                debugcon_writestring("[M11] driver bound dev=");
-                debugcon_print_hex((uint64_t)mf->dev_id);
-                debugcon_writestring(" caps=");
-                debugcon_print_hex((uint64_t)granted);
-                debugcon_writestring("\n");
-            } else {
-                debugcon_writestring("[M11] driver bind failed (no slot)\n");
-            }
-        }
-    }
+    // [M57] Driver Space v2: the signed manifest is the trust root for the
+    // driver type. A DRIVER process may then try SYS_UDRV claims, which also
+    // need euid 0, a udrv= boot assignment and a manifest match (kernel/udrv.c).
+    // (The M11 synthetic device bindings are retired.)
+    if (mf && mf->proc_type == MANIFEST_PROC_TYPE_DRIVER) p->proc_type = PROC_TYPE_DRIVER;
     p->regs.rip = entry;
     p->regs.rsp = st_top;
     p->regs.rflags = 0x202; // IF enabled by default
@@ -1002,13 +981,19 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     proc_image_t im;
     int r = proc_image_build(image, size, image, argbytes, nv, &im);
     if (r != 0) { kfree(nv); return r; }
-    // Driver Space privilege is granted only when a process is created from a
-    // signed driver manifest (spawn / kernel), never through exec: neither a
-    // plain user process nor a driver can acquire a device binding by exec'ing.
+    // [M57] A signed v3 driver manifest makes the new image a DRIVER (init
+    // starts ring-3 drivers with fork + execve). Under no_new_privs (set
+    // before this exec) it runs as a plain USER instead, like a spawn (M46).
+    // Older driver manifests (the retired M11 mock) are still refused.
+    int exec_driver = 0;
     if (im.mf && im.mf->proc_type == MANIFEST_PROC_TYPE_DRIVER) {
-        debugcon_writestring("[EXEC] REFUSED: driver manifest (exec never grants driver privilege)\n");
-        proc_image_free(&im); kfree(nv);
-        return -EACCES;
+        if (im.mf->version < MANIFEST_VERSION_UDRV) {
+            debugcon_writestring("[EXEC] REFUSED: pre-v3 driver manifest\n");
+            proc_image_free(&im); kfree(nv);
+            return -EACCES;
+        }
+        if (p->no_new_privs) cap_audit(p->pid, CAP_AUDIT_DRIVER, 60 /*SYS_EXECVE*/, "execve-nnp", 0);
+        else exec_driver = 1;
     }
     uint64_t rsp = 0, argvp = 0, envp = 0;
     if (setup_user_args(im.space, nv, im.stack_top, im.stack_lo, blob, blen,
@@ -1034,8 +1019,9 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     vmm_space_t* old_space = p->space;
     uint8_t*     old_image = p->image;
     void*        old_mf    = p->manifest;
-    // The driver type of the old image goes with it.
-    p->proc_type = PROC_TYPE_USER; p->drv_dev_id = -1; p->drv_caps = 0;
+    // The driver type of the old image goes with it ([M57] its claims were
+    // released above); the new one is a driver only per exec_driver.
+    p->proc_type = exec_driver ? PROC_TYPE_DRIVER : PROC_TYPE_USER; p->drv_dev_id = -1; p->drv_caps = 0;
     // Load the new CR3 before the old tables are freed. p is pinned to this CPU
     // (cpu_affinity), so no other core has the old space loaded or cached; the
     // CR3 write flushes this core's non-global (user) TLB entries.
@@ -1083,6 +1069,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
         } else {
             pty_unref(e.inode);                    // a pty end: drop this holder
             input_obj_unref(e.inode);              // [M40] an evdev client
+            udrv_fd_unref(e.inode);                // [M57] a claim fd
         }
     }
     // Signals (POSIX): caught signals revert to SIG_DFL (their handlers lived in
@@ -1148,6 +1135,11 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
         // the parent's mm_lock (vmm_fork_space rewrites the parent's PTEs).
         uint64_t mfl = mm_lock(parent);
         c->vmas = parent->vmas;
+        // [M57] A ring-3 driver's device mappings are not inherited: the child
+        // gets a hole there (its PTEs are skipped by vmm_fork_space too).
+        for (uint32_t i = 0; i < c->vmas.count; i++)
+            if (c->vmas.v[i].type != VMA_TYPE_NONE && (c->vmas.v[i].vflags & VMA_VF_DONTFORK))
+                vma_remove(&c->vmas, &c->vmas.v[i]);
         c->space = vmm_fork_space(parent->space);
         mm_unlock(parent, mfl);
     }
@@ -1187,6 +1179,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->stop_report = 0; c->cont_report = 0; c->stop_sig = 0;
     c->wait_tty = 0; c->power_phase = 0; c->power_deadline = 0;
     c->wait_pty = NULL;                        // sid/ctty/ctty_detached inherited (copied)
+    c->wait_udrv = NULL;                       // [M57] the child owns no claim
     c->sigsusp_active = 0; c->sigsusp_saved = 0;
     c->state = PROC_EMBRYO;                    // not runnable until fully built (M52)
     { extern void kiface_proc_fork(process_t*); kiface_proc_fork(c); }
@@ -1200,7 +1193,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
           if (!c->fds[i].used) continue;
           if (c->fds[i].is_pipe) pipe_ref(c->fds[i].inode, c->fds[i].pipe_w);
           else if (c->fds[i].is_sock) socket_ref(c->fds[i].is_sock - 1);
-          else { pty_ref(c->fds[i].inode); input_obj_ref(c->fds[i].inode); }
+          else { pty_ref(c->fds[i].inode); input_obj_ref(c->fds[i].inode); udrv_fd_ref(c->fds[i].inode); }
       }
       pty_ctty_ref(c->ctty); }
 
@@ -1241,12 +1234,16 @@ void process_print(const process_t* p) {
 void process_release_pipes(process_t* p) {
     extern void pipe_unref(void*, int); extern void socket_unref(int);
     if (!p) return;
+    // [M57] Ring-3 driver claims end at exit, not at reap: the device is
+    // quiesced and free again before init restarts the driver.
+    udrv_release_all(p);
     // [M51 C2] Entries are unhooked under mm_lock (procfs reads a zombie's
     // fd table under it) and their objects dropped after it.
     for (int i = 0; i < 32; i++) {
         if (!p->fds[i].used) continue;
         int kind = p->fds[i].is_sock ? 1 : p->fds[i].is_pipe ? 2 :
-                   pty_is_inode(p->fds[i].inode) ? 3 : input_is_client(p->fds[i].inode) ? 4 : 0;
+                   pty_is_inode(p->fds[i].inode) ? 3 : input_is_client(p->fds[i].inode) ? 4 :
+                   udrv_is_fd(p->fds[i].inode) ? 5 : 0;
         if (!kind) continue;                         // plain files stay until reap
         uint64_t ffl = mm_lock(p);
         struct proc_fd_entry e = p->fds[i];
@@ -1255,7 +1252,8 @@ void process_release_pipes(process_t* p) {
         if (kind == 1) socket_unref(e.is_sock - 1);  // last ref closes the connection (FIN)
         else if (kind == 2) pipe_unref(e.inode, e.pipe_w);
         else if (kind == 3) pty_unref(e.inode);
-        else input_obj_unref(e.inode);               // [M40] evdev client (drops a grab)
+        else if (kind == 4) input_obj_unref(e.inode); // [M40] evdev client (drops a grab)
+        else udrv_fd_unref(e.inode);                 // [M57] claim fd
     }
     pty_proc_exit(p);
     vtcon_proc_exit(p);                            // [M40] graphics owner gone: text console back

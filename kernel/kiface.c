@@ -16,6 +16,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
+#include "udrv.h"          /* [M57] claim fds in poll() */
 #include "kiface.h"
 #include "cred.h"
 #include "process.h"
@@ -459,6 +460,8 @@ static int ki_fd_revents(process_t* c, int fd, int events, int* watch) {
     struct proc_fd_entry* e = &c->fds[fd];
     if (e->used && e->is_sock) return socket_poll(c->pid, e->is_sock - 1);
     if (e->used && e->is_pipe) return pipe_poll((pipe_t*)e->inode, e->pipe_w);
+    if (e->used && e->inode && udrv_is_fd(e->inode))          /* [M57] claim fd: its IRQ wakes the poller */
+        return udrv_fd_poll(e->inode);
     if (e->used && e->inode && input_is_client(e->inode)) {   /* [M40] evdev */
         *watch |= PW_INPUT;
         return input_poll(e->inode);

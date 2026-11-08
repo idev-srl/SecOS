@@ -182,6 +182,14 @@ int      pci_ecam_active(void);
 /* Extended config read (off 0..0xFFF, dword aligned). 0xFFFFFFFF without ECAM. */
 uint32_t pci_config_read32_ext(uint8_t bus, uint8_t slot, uint8_t func, uint16_t off);
 
+/* [M57] Extended config write (off 0..0xFFF, dword aligned). Dropped without
+ * ECAM for off >= 0x100. */
+void     pci_config_write32_ext(uint8_t bus, uint8_t slot, uint8_t func, uint16_t off, uint32_t val);
+/* [M57] Hide a function from pci_find / pci_find_class (a ring-3 driver's,
+ * boot word udrv=). Call before the in-kernel probes. */
+void     pci_registry_reserve(const pci_dev_t* d);
+int      pci_dev_reserved(const pci_dev_t* d);
+
 /* Short reason name for pci_dev_t.why. */
 const char* pci_assign_reason(uint8_t why);
 

@@ -114,6 +114,13 @@ void pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, ui
     spin_unlock_irqrestore(&pci_cfg_lock, fl);
 }
 
+void pci_config_write32_ext(uint8_t bus, uint8_t slot, uint8_t func, uint16_t off, uint32_t val) {
+    if (off > 0xFFF) return;
+    if (off < 0x100) { pci_config_write32(bus, slot, func, (uint8_t)off, val); return; }
+    volatile uint32_t* p = ecam_ptr(bus, slot, func, off);
+    if (p) *p = val;
+}
+
 void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint16_t val) {
     /* Read-modify-write the containing dword to preserve the other half (the
      * semantics both paths always had). On CF8 the whole RMW is one lock hold,
