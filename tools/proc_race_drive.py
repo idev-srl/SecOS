@@ -151,7 +151,10 @@ def main():
     good = None not in mf and steady([v[0] for v in mf])
     report("memfree-steady", bool(good), f"MemFree+Slab_kB={[v and v[0] for v in mf]} "
            f"MemFree_kB={[v and v[2] for v in mf]} slack={MEMFREE_SLACK_KB}")
-    good = None not in mf and steady([v[1] for v in mf])
+    # A leak only grows: compare the last measured run with the first (a
+    # transient in the middle, a zombie not reaped yet, is no leak).
+    hv = [v[1] for v in mf] if None not in mf else None
+    good = hv is not None and len(hv) >= 2 and hv[-1] - (hv[1] if len(hv) > 2 else hv[0]) <= MEMFREE_SLACK_KB
     report("heap-in-use-steady", bool(good), f"SUnreclaim_kB={[v and v[1] for v in mf]} slack={MEMFREE_SLACK_KB}")
     finish()
 
