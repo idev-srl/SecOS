@@ -35,8 +35,8 @@
 # Usage: fs_stress_drive.py --iso ISO [--smp 4] [--mem 1G] [--work DIR]
 #                           [--target /root] [--workers 6] [--iters 150]
 #                           [--rounds 2] [--crash K] [--seed S]
-#                           [--qemu BIN] [--boot SECS]
-import sys, os, time, subprocess, threading, re, argparse, random, shutil
+#                           [--qemu BIN] [--qemu-pre ARGS] [--boot SECS]
+import sys, os, time, subprocess, threading, re, argparse, random, shutil, shlex
 
 FAIL_MARKERS = ["[EXC] int=", "[PANIC]", "nested fault", "stack smashing", "CORRUPT",
                 "[TLB] BUG", "shootdown timeout", "LOCKDEP]", "[LOCK] BUG"]
@@ -54,7 +54,7 @@ class VM:
                      "-drive", f"file={data},if=ide,index=1,format=raw"]
         else:
             disks = [] if o.ramroot else ["-drive", f"file={disk},if=virtio,format=raw"]
-        cmd = [o.qemu, "-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp)] + disks + [
+        cmd = [o.qemu] + shlex.split(o.qemu_pre) + ["-cdrom", o.iso, "-boot", "d", "-m", o.mem, "-smp", str(o.smp)] + disks + [
                "-nic", "none",
                "-debugcon", "file:" + log, "-global", "isa-debugcon.iobase=0xe9",
                "-no-reboot", "-display", "none", "-serial", "stdio"]
@@ -148,6 +148,9 @@ def main():
     ap.add_argument("--crash", type=int, default=0)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--qemu", default="qemu-system-x86_64")
+    # [M54] Extra QEMU arguments placed first (e.g. "-device intel-iommu",
+    # which must come before any PCI device).
+    ap.add_argument("--qemu-pre", default="")
     ap.add_argument("--boot", type=float, default=300)
     ap.add_argument("--data", choices=["vfat", "exfat"], default=None)
     ap.add_argument("--mount-race", type=int, default=0)
