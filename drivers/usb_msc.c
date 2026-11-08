@@ -24,6 +24,7 @@
 #include "usb.h"
 #include "block.h"
 #include "debugcon.h"
+#include "dma.h"      // [M55] __dma: device-reachable static buffers
 #include <stddef.h>
 
 #define CBW_SIG 0x43425355u   // 'USBC'
@@ -47,9 +48,9 @@ static int g_nmsc = 0;
 
 // Per-device transfer buffers (indexed like g_msc). The data buffer is aligned
 // to its size so a single TRB never crosses a 64 KiB boundary.
-static uint8_t g_cbw_all[MAX_MSC][64] __attribute__((aligned(64)));
-static uint8_t g_csw_all[MAX_MSC][64] __attribute__((aligned(64)));
-static uint8_t g_data_all[MAX_MSC][32 * 1024] __attribute__((aligned(32 * 1024)));
+static uint8_t g_cbw_all[MAX_MSC][64] __dma __attribute__((aligned(64)));
+static uint8_t g_csw_all[MAX_MSC][64] __dma __attribute__((aligned(64)));
+static uint8_t g_data_all[MAX_MSC][32 * 1024] __dma __attribute__((aligned(32 * 1024)));
 #define DATA_BYTES sizeof(g_data_all[0])
 #define M_IDX(m)  ((int)((m) - g_msc))
 #define M_CBW(m)  (g_cbw_all[M_IDX(m)])

@@ -12,11 +12,12 @@
  */
 #include "usb.h"
 #include "debugcon.h"
+#include "dma.h"      // [M55] __dma: device-reachable static buffers
 #include <stddef.h>
 
 // Shared control-transfer buffer (one operation at a time, like the rest of the
-// polled stack). Static => physically addressable via kvirt_to_phys.
-static uint8_t g_ctlbuf[512] __attribute__((aligned(64)));
+// polled stack). Static __dma => reachable by the controller ([M55] DMA API).
+static uint8_t g_ctlbuf[512] __dma __attribute__((aligned(64)));
 
 void usb_setup(uint8_t* o, uint8_t t, uint8_t r, uint16_t v, uint16_t i, uint16_t l) {
     o[0] = t; o[1] = r;

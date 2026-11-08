@@ -24,6 +24,7 @@
  */
 #include "usb.h"
 #include "debugcon.h"
+#include "dma.h"      // [M55] __dma: device-reachable static buffers
 #include <stddef.h>
 
 // Hub descriptor type (class-specific).
@@ -65,8 +66,8 @@
 
 // Dedicated buffers so child enumeration (which reuses the USB core's shared
 // control buffer) does not clobber the hub's own descriptor / port-status reads.
-static uint8_t g_hubdesc[16] __attribute__((aligned(64)));
-static uint8_t g_status[4]    __attribute__((aligned(64)));
+static uint8_t g_hubdesc[16] __dma __attribute__((aligned(64)));
+static uint8_t g_status[4] __dma __attribute__((aligned(64)));
 
 static void hub_delay(uint64_t n) {
     for (volatile uint64_t i = 0; i < n; i++) { }
