@@ -2101,6 +2101,34 @@ else
 fi
 
 # ============================================================================
+# [U6] PKG2 GATE: package installer v2 + a grown root. tools/pkg2_test.sh: a
+# 1 GiB root with data grown to 8 GiB (make grow-root), a ~200 MB package from
+# an exFAT transfer disk (make pkgdisk) installed / checked / removed with no
+# leftovers, tampered and out-of-tree packages refused, kill -9 and a power
+# cut during upgrades leave one whole version. Then the M41 persist test on a
+# grown disk (tools/persist_test.sh --grow). PKG2_BIG_MB / PKG2_KILLS resize it.
+# ============================================================================
+if command -v mkfs.ext4 >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1 && command -v debugfs >/dev/null 2>&1; then
+    for g in "tools/pkg2_test.sh --big-mb ${PKG2_BIG_MB:-200} --kills ${PKG2_KILLS:-6}" \
+             "tools/persist_test.sh --grow --crash-runs ${PERSIST_CRASH_RUNS:-2}"; do
+        echo "[selftest] PKG2 gate: $g ..."
+        PKG2_OUT=$(mktemp /tmp/secos_selftest_pkg2.XXXXXX)
+        $g >"$PKG2_OUT" 2>&1
+        while IFS= read -r l; do
+            case "$l" in
+                "  [PASS] "*) check "${l#  \[PASS\] }" 0 ;;
+                "  [FAIL] "*) check "${l#  \[FAIL\] }" 1 ;;
+                "    "*) echo "$l" ;;
+            esac
+        done <"$PKG2_OUT"
+        grep -q "RESULT:" "$PKG2_OUT" || { check "PKG2 gate ran to completion ($g)" 1; tail -20 "$PKG2_OUT"; }
+        rm -f "$PKG2_OUT"
+    done
+else
+    echo "  [SKIP] PKG2 gate (needs mkfs.ext4, resize2fs, debugfs)"
+fi
+
+# ============================================================================
 # INIT GATE: /bin/init as PID 1 — a ready system with no manual steps.
 # (a) An image built with SSH_AUTHORIZED_KEYS=<throwaway key generated here>
 #     boots with a user-net NIC: init must be PID 1, ifup must take a DHCP
