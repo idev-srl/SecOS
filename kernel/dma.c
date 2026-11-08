@@ -180,6 +180,7 @@ void dma_init(void) {
     if (pt) {
         g_mode = "pt";
         debugcon_writestring("[DMA] kernel DMA domain: passthrough (iommu.kernel=pt)\n");
+        iommu_set_state("on (kernel drivers: passthrough, iommu.kernel=pt)");
         return;
     }
     iommu_domain_t* d = iommu_domain_new(IDOM_TRANSLATED);
@@ -195,6 +196,7 @@ void dma_init(void) {
     }
     g_strict = d;
     g_mode = "strict";
+    iommu_set_state("on (kernel drivers: strict DMA domain)");
     if (strict_selftest()) {
         debugcon_writestring("[DMA] strict domain self-test FAIL\n");
     } else {

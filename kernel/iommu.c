@@ -98,6 +98,7 @@ int iommu_cmdline_value(const char* key, char* out, int cap) {
 /* ------------------------------------------------------------ domains */
 void iommu_register_ops(const iommu_ops_t* ops) { g_ops = ops; }
 int  iommu_present(void) { return g_on; }
+void iommu_set_state(const char* st) { if (g_on && st) g_state = st; }   /* [M55] */
 iommu_domain_t* iommu_kernel_domain(void) { return g_kdom; }
 int  iommu_domain_kind(const iommu_domain_t* d) { return d ? d->kind : -1; }
 
