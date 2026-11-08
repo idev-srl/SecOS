@@ -79,6 +79,7 @@ SRC_C   = \
 	$(ARCH_DIR)/idt.c $(ARCH_DIR)/tss.c $(ARCH_DIR)/context_switch.c \
 	$(ARCH_DIR)/lapic.c \
 	$(ARCH_DIR)/acpi.c \
+	$(ARCH_DIR)/acpi_dmar.c $(ARCH_DIR)/acpi_dmar_pci.c \
 	$(ARCH_DIR)/tsc.c \
 	$(ARCH_DIR)/percpu.c \
 	$(ARCH_DIR)/tlb.c \
