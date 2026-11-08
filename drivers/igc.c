@@ -262,6 +262,8 @@ static void igc_poll(net_dev_t* dev) {
         uint32_t len = (uint32_t)((wb >> 32) & 0xFFFF);
         if (len > 0 && len <= RX_BUF_SIZE && (status & IGC_ADVRXD_STAT_EOP)) {
             net_rx(dev, g_rx_buf[idx], len);
+        } else {
+            net_dev_rx_error(dev);                  /* [U5] bad length or not EOP */
         }
 
         /* Refill: restore the descriptor to read format and give it back. */

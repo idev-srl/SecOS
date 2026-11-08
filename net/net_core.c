@@ -42,7 +42,10 @@ net_dev_t* net_get_dev(int i) { return (i>=0 && i<g_ndev) ? g_devs[i] : NULL; }
 net_dev_t* net_primary(void) { return g_ndev ? g_devs[0] : NULL; }
 
 void net_rx(net_dev_t* dev, const void* frame, uint32_t len) {
-    if (!dev || !frame || len < 14 || len > NET_FRAME_MAX) return;
+    if (!dev) return;
+    if (!frame || len < 14 || len > NET_FRAME_MAX) { dev->stats.rx_dropped++; return; }
+    dev->stats.rx_packets++;                       /* [U5] rx_lock held (poll) */
+    dev->stats.rx_bytes += len;
     uint64_t fl = net_lock();
     g_rx_frames++;
     eth_input(dev, (const uint8_t*)frame, len);
@@ -77,6 +80,8 @@ int net_dev_xmit(net_dev_t* dev, const void* frame, uint32_t len) {
     if (!dev || !dev->transmit) return -1;
     uint64_t fl = netlk_acquire(&dev->tx_lock);
     int r = dev->transmit(dev, frame, len);
+    if (r < 0) dev->stats.tx_errors++;             /* [U5] under tx_lock */
+    else { dev->stats.tx_packets++; dev->stats.tx_bytes += len; }
     netlk_release(&dev->tx_lock, fl);
     if (r < 0) g_tx_errors++; else g_tx_frames++;
     return r;

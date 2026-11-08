@@ -110,6 +110,7 @@ static void e1000_poll(net_dev_t* dev) {
     while (g_rx[g_rx_cur].status & DESC_DD) {
         volatile struct rx_desc* d = &g_rx[g_rx_cur];
         if (d->status & RX_STAT_EOP) net_rx(dev, (const void*)g_rxbuf[g_rx_cur], d->len);
+        else net_dev_rx_error(dev);            // [U5] spans buffers: not deliverable
         d->status = 0;
         wr(REG_RDT, g_rx_cur);                 // hand the descriptor back to HW
         g_rx_cur = (g_rx_cur + 1) % RX_DESC;
