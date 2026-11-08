@@ -259,7 +259,7 @@ static void e1000e_poll(net_dev_t* dev) {
 static void e1000e_irq_enable(net_dev_t* dev) {
     (void)dev;
     // 82574L MSI-X: route the RxQ0 cause (and "Other") to MSI-X table entry 0 —
-    // the only entry pci_enable_msix() programmed (it carries IDT vector 0x42).
+    // the only entry net_request_irq() programs (its allocated vector, M53c).
     // IVAR (0xE4): low nibble = RxQ0 (entry|VALID=bit3); bit31 = Other valid.
     // EIAC (0xDC): auto-clear the MSI-X causes so they don't stay asserted.
     reg_wr(0x000E4 /*IVAR*/, 0x00000008u | (1u << 31));
@@ -269,11 +269,14 @@ static void e1000e_irq_enable(net_dev_t* dev) {
 }
 static void e1000e_irq_ack(net_dev_t* dev) {
     (void)dev;
-    // 82574 MSI-X cause is in EICR (0x1580), separate from the legacy ICR. Clear
-    // both so the next RX re-asserts a fresh edge-triggered MSI-X message; without
-    // this only the first interrupt ever fires.
-    reg_wr(0x01580 /*EICR*/, 0xFFFFFFFFu);
-    (void)reg_rd(E1000_ICR);
+    // [M53c] In MSI-X mode a read of ICR does NOT clear it (read-to-clear
+    // applies only without MSI-X or with CTRL_EXT.IAME; QEMU models this), and
+    // the 82574 has no EICR (0x1580 is an 82576 register). A cause left set
+    // in ICR keeps the device from sending the next message, so before this
+    // fix only the first MSI-X interrupt ever fired and RX ran on the timer
+    // poll backstop. Clear the causes write-1-to-clear, before the drain:
+    // a frame that lands after this raises a fresh message.
+    reg_wr(E1000_ICR, 0xFFFFFFFFu);
 }
 
 int e1000e_init(void) {
