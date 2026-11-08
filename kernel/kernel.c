@@ -1761,6 +1761,10 @@ static void kernel_main_phase2(void) {
     // unchanged. Needs the PCI registry, the DMAR and a free vector (fault
     // event); before any driver enables bus mastering. No-op by default.
     { extern void iommu_init(void); iommu_init(); }
+    // [M55] Kernel DMA API: with iommu=on (and no iommu.kernel=pt) the
+    // drivers' functions join a strict domain that maps only .dmabss and
+    // dma_alloc_coherent frames. Before any driver probes.
+    { extern void dma_init(void); dma_init(); }
 
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();

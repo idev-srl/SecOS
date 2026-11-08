@@ -314,6 +314,7 @@ void iommu_generate(void (*emit)(void* ctx, const char* line), void* ctx) {
         iommu_ln_s(&l, " devices "); iommu_ln_dec(&l, g_kdom->ndev);
     }
     emit(ctx, iommu_ln_end(&l));
+    { extern void dma_generate(void (*)(void*, const char*), void*); dma_generate(emit, ctx); }   /* [M55] */
     int n = pci_dev_count();
     for (int i = 0; i < n && i < PCI_MAX_DEVS; i++) {
         const pci_dev_t* d = pci_dev_at(i);
