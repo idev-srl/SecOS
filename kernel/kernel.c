@@ -1755,6 +1755,10 @@ static void kernel_main_phase2(void) {
     // [M53c] Dynamic device vectors: self-IPIs (BSP and an AP), freed-vector
     // negative, block alignment, exhaustion. Before any driver allocates one.
     { extern void irq_vec_selftest(void); irq_vec_selftest(); }
+#if defined(SECOS_LDWATCH_TEST) && defined(SECOS_LOCKDEP)
+    // Forced test of the lockdep stuck-lock watchdog (kernel/ldwatch_test.c).
+    { extern void ldwatch_test_run(void); ldwatch_test_run(); }
+#endif
 
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();
