@@ -86,10 +86,12 @@ int net_dev_xmit(net_dev_t* dev, const void* frame, uint32_t len) {
 // others fall back to timer-tick polling. NULL when no NIC uses MSI-X.
 static net_dev_t* g_irq_dev;
 
-#include "idt.h"
+#include "irq.h"
 #include "lapic.h"
-#include "pci.h"
+#include "pci_msi.h"
 #include "klock.h"   /* [M50] cpu_wait_irq */
+
+static void net_irq_handler(uint8_t vec, void* ctx);
 
 net_irq_mode_t net_request_irq(net_dev_t* dev) {
     if (!dev || !dev->poll) { if (dev) dev->irq_mode = NET_IRQ_NONE; return NET_IRQ_NONE; }
@@ -98,11 +100,12 @@ net_irq_mode_t net_request_irq(net_dev_t* dev) {
     // latency. Only the first NIC is wired. If MSI-X/MSI or the LAPIC are
     // unavailable (e.g. QEMU's legacy e1000), fall through to timer-tick polling.
     // Build with -DNET_NO_MSIX to force pure polling.
+    // [M53c] The vector comes from the dynamic allocator (targeted at the BSP,
+    // as before) and the message is programmed on MSI-X entry 0 / MSI message 0.
     if (!g_irq_dev && lapic_enable() == 0) {
-        idt_install_msi_vector(IDT_VECTOR_NET, isr_net);
-        extern void isr_net(void);
-        if (pci_enable_msix(&dev->pci, IDT_VECTOR_NET) == 0 ||
-            pci_enable_msi(&dev->pci, IDT_VECTOR_NET) == 0) {
+        int vec = irq_vec_alloc(IRQ_CPU_ANY, net_irq_handler, dev, "net");
+        int how = vec < 0 ? -1 : pci_irq_setup_single(&dev->pci, (uint8_t)vec, (uint32_t)irq_vec_cpu(vec));
+        if (how > 0) {
             g_irq_dev = dev;
             if (dev->irq_enable) dev->irq_enable(dev);   // NIC unmasks its RX cause
             dev->irq_mode = NET_IRQ_MSIX;
@@ -111,9 +114,12 @@ net_irq_mode_t net_request_irq(net_dev_t* dev) {
             // NIC's interrupt re-arm semantics drop an edge — a watchdog poll is
             // standard practice in production NIC drivers. Belt and suspenders.
             if (g_npoll < NET_MAX_DEV) g_poll[g_npoll++] = dev;
-            debugcon_writestring("[NET] MSI-X NAPI armed vector=0x42 (+poll backstop)\n");
+            debugcon_writestring(how == 1 ? "[NET] MSI-X NAPI armed vector=0x" : "[NET] MSI NAPI armed vector=0x");
+            debugcon_print_hex((uint64_t)vec);
+            debugcon_writestring(" (+poll backstop)\n");
             return NET_IRQ_MSIX;                         // timers still run via net_tick
         }
+        if (vec >= 0) irq_vec_free(vec);
         debugcon_writestring("[NET] no MSI-X/MSI; staying polled\n");
     }
 #endif
@@ -127,21 +133,20 @@ net_irq_mode_t net_request_irq(net_dev_t* dev) {
     return NET_IRQ_NONE;
 }
 
-// [M24] C half of isr_net (vector 0x42). NAPI: ack the NIC, drain the RX ring via
-// dev->poll, EOI the LAPIC. Protocol timers (ARP/TCP) stay on the timer tick via
-// net_tick(), so they don't run per-packet here. Fires when a NIC uses MSI-X.
+// [M24] NIC interrupt handler (an allocated vector, [M53c]). NAPI: ack the NIC,
+// drain the RX ring via dev->poll; irq_dispatch EOIs the LAPIC. Protocol timers
+// (ARP/TCP) stay on the timer tick via net_tick(), so they don't run per-packet.
 volatile uint32_t g_net_irq_count;
-void net_irq_handler(void) {
+static void net_irq_handler(uint8_t vec, void* ctx) {
+    (void)vec;
     g_net_irq_count++;
-    net_dev_t* d = g_irq_dev;
+    net_dev_t* d = (net_dev_t*)ctx;
     if (d) {
         // Ack unconditionally (a cause left set may stop the NIC from raising
         // the next MSI), then drain — or hand the drain to the CPU already in it.
         if (d->irq_ack) d->irq_ack(d);
         net_dev_poll(d);
     }
-    extern void lapic_eoi(void);
-    lapic_eoi();
 }
 
 extern void tcp_tick(void) __attribute__((weak));

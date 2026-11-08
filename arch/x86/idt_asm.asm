@@ -326,15 +326,27 @@ isr_mouse:
     iretq
 
 ; ============================================================================
-; MSI/MSI-X interrupt stubs — IMPLEMENTED BUT NOT YET TESTED / not enabled by
-; default (the kernel is polled). These vectors (0x40 xHCI, 0x41 NVMe) are only
-; wired into the IDT when the gated *_USE_IRQ driver paths register them; the
-; default build never installs them and never fires them. They acknowledge via
-; the LAPIC (lapic_eoi inside the C handler), NOT the legacy PIC.
+; [M53c] Dynamic device vectors 0x50..0xDF (arch/x86/irq.c). One tiny stub per
+; vector pushes a dummy error code and the vector number (so the frame has the
+; trapframe layout and RSP stays 16-byte aligned for the C call), then joins
+; irq_common, which calls irq_dispatch(vec) between irq_enter/irq_exit.
+; irq_dispatch runs the bound handler and sends the LAPIC EOI. These handlers
+; never switch tasks, so no signal delivery is needed on the way out (the next
+; timer tick / syscall return delivers, as for the keyboard and mouse).
+; irq_stub_table (.rodata) lists the stubs for idt_init.
 ; ============================================================================
-global isr_xhci
-extern xhci_irq_handler
-isr_xhci:
+extern irq_dispatch
+
+%assign irqv 0x50
+%rep 0x90
+irq_stub_%[irqv]:
+    push 0
+    push irqv
+    jmp irq_common
+%assign irqv irqv+1
+%endrep
+
+irq_common:
     push rax
     push rbx
     push rcx
@@ -353,7 +365,8 @@ isr_xhci:
     SMAP_CLAC
     cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
     call irq_enter
-    call xhci_irq_handler        ; drains/acks; LAPIC EOI done in C
+    mov rdi, [rsp + 15*8]        ; the vector pushed by the stub
+    call irq_dispatch            ; handler + LAPIC EOI
     call irq_exit
     pop r15
     pop r14
@@ -370,90 +383,19 @@ isr_xhci:
     pop rcx
     pop rbx
     pop rax
+    add rsp, 16                  ; drop vector + dummy error code
     iretq
 
-global isr_nvme
-extern nvme_irq_handler
-isr_nvme:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    SMAP_CLAC
-    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
-    call irq_enter
-    call nvme_irq_handler        ; drains/acks; LAPIC EOI done in C
-    call irq_exit
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    iretq
-
-; [M24] NIC MSI-X (vector 0x42). NAPI-style: the C handler acks the NIC, drains
-; the RX ring via dev->poll, runs protocol timers, and EOIs the LAPIC. Only wired
-; when net_request_irq() picks MSI-X (gated by NET_USE_MSIX); polled by default.
-global isr_net
-extern net_irq_handler
-isr_net:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push rbp
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    SMAP_CLAC
-    cld                 ; SysV ABI: DF=0 in C code; ring 3 may enter with DF=1
-    call irq_enter
-    call net_irq_handler         ; acks NIC, drains ring; LAPIC EOI done in C
-    call irq_exit
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    iretq
+section .rodata
+align 8
+global irq_stub_table
+irq_stub_table:
+%assign irqv 0x50
+%rep 0x90
+    dq irq_stub_%[irqv]
+%assign irqv irqv+1
+%endrep
+section .text
 
 ;
 ; [M48] SMP inter-processor interrupts.

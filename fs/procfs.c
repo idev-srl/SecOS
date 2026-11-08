@@ -80,6 +80,7 @@ enum pk {
     PK_MEMINFO, PK_UPTIME, PK_LOADAVG, PK_STAT, PK_VERSION, PK_CPUINFO,
     PK_MOUNTS, PK_FILESYSTEMS, PK_KMSG, PK_CMDLINE_K, PK_SMP, PK_LOCKSTAT,
     PK_BUS, PK_BUS_PCI, PK_PCI_DEVICES, PK_PCI_TOPOLOGY,   /* [M53a] /proc/bus/pci */
+    PK_INTERRUPTS,
     PK_PID_DIR, PK_PID_STAT, PK_PID_STATUS, PK_PID_STATM, PK_PID_CMDLINE,
     PK_PID_COMM, PK_PID_ENVIRON, PK_PID_MAPS, PK_PID_CWD, PK_PID_EXE,
     PK_PID_ROOT, PK_PID_FDDIR, PK_PID_FD,
@@ -94,6 +95,7 @@ static const struct { const char* name; int kind; } g_top[] = {
     {"stat",PK_STAT}, {"version",PK_VERSION}, {"cpuinfo",PK_CPUINFO},
     {"mounts",PK_MOUNTS}, {"filesystems",PK_FILESYSTEMS}, {"kmsg",PK_KMSG},
     {"cmdline",PK_CMDLINE_K}, {"smp",PK_SMP}, {"lockstat",PK_LOCKSTAT},
+    {"interrupts",PK_INTERRUPTS},
 };
 #define NTOP (int)(sizeof(g_top)/sizeof(g_top[0]))
 static const struct { const char* name; int kind; } g_pidf[] = {
@@ -590,6 +592,10 @@ static void gen_pci_topology(struct sb* s){
     }
 }
 
+/* [M53c] /proc/interrupts: the dynamic device vectors (arch/x86/irq.c). */
+extern void irq_vec_generate(void (*emit)(void* ctx, const char* line), void* ctx);
+static void gen_interrupts(struct sb* s){ irq_vec_generate(lockstat_emit, s); }
+
 /* [M43] What Linux guards with a ptrace-style check: only root or a reader
  * whose effective ids equal all of the target's ids (cred_may_inspect). */
 static int is_private(int k){ return k==PK_PID_ENVIRON||k==PK_PID_MAPS||k==PK_PID_CWD||k==PK_PID_EXE||
@@ -641,6 +647,7 @@ static int gen_key(uint64_t key){
     case PK_LOCKSTAT: gen_lockstat(&s); break;
     case PK_PCI_DEVICES: gen_pci_devices(&s); break;
     case PK_PCI_TOPOLOGY: gen_pci_topology(&s); break;
+    case PK_INTERRUPTS: gen_interrupts(&s); break;
     case PK_SELF: { process_t* c=sched_get_current(); if(!c||!c->pid) return -1; sb_u64(&s,c->pid); break; }
     case PK_PID_STAT: gen_pid_stat(&s); break;
     case PK_PID_STATUS: gen_pid_status(&s); break;

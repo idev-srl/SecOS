@@ -1751,6 +1751,10 @@ static void kernel_main_phase2(void) {
     debugcon_writestring("[SMP] built with SECOS_NO_SMP: single CPU\n");
 #endif
 
+    // [M53c] Dynamic device vectors: self-IPIs (BSP and an AP), freed-vector
+    // negative, block alignment, exhaustion. Before any driver allocates one.
+    { extern void irq_vec_selftest(void); irq_vec_selftest(); }
+
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();
 #endif

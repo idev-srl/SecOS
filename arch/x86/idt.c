@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "idt.h"
+#include "irq.h"
 
 #define IDT_ENTRIES 256
 
@@ -42,14 +43,6 @@ void idt_set_gate(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flag
 void idt_set_gate_ist(uint8_t num, uint64_t handler, uint16_t selector, uint8_t flags, uint8_t ist) {
     idt_set_gate(num, handler, selector, flags);
     idt[num].ist = ist;  // Apply IST selector
-}
-
-// Install an interrupt gate for a runtime MSI/MSI-X vector. NOT YET TESTED:
-// only invoked from the gated *_USE_IRQ driver paths; the default polled build
-// never calls this. Kernel code selector 0x08, present 64-bit interrupt gate
-// (0x8E), DPL=0 (the device, not user code, raises it).
-void idt_install_msi_vector(uint8_t vector, void (*handler)(void)) {
-    idt_set_gate(vector, (uint64_t)handler, 0x08, 0x8E);
 }
 
 // Remap the PIC (Programmable Interrupt Controller) to avoid conflicts with CPU exceptions
@@ -145,6 +138,11 @@ void idt_init(void) {
     idt_set_gate(0x21, (uint64_t)isr_keyboard, 0x08, 0x8E);
     // [M40] PS/2 mouse (IRQ12 -> 0x2C); stays masked until ps2mouse_init + irq_enable_aux
     idt_set_gate(0x2C, (uint64_t)isr_mouse, 0x08, 0x8E);
+
+    // [M53c] Dynamic device vectors 0x50..0xDF: generic stubs -> irq_dispatch
+    // (arch/x86/irq.c). Unbound ones count as spurious and are EOIed.
+    for (int v = IRQ_VEC_FIRST; v <= IRQ_VEC_LAST; v++)
+        idt_set_gate((uint8_t)v, (uint64_t)irq_stub_table[v - IRQ_VEC_FIRST], 0x08, 0x8E);
 
     // [M48] SMP IPIs: TLB shootdown + reschedule (arch/x86/tlb.c, kernel/sched.c)
     { extern void isr_ipi_tlb(void); extern void isr_ipi_resched(void);

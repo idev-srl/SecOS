@@ -36,7 +36,8 @@
 #include "io.h"
 #include "debugcon.h"
 #include "vmm.h"
-#include "idt.h"
+#include "irq.h"      /* [M53c] dynamic vectors */
+#include "pci_msi.h"
 #include "lapic.h"
 #include "tsc.h"      // ktime_ms — real-time delays for port reset (real-HW timing)
 #include "spinlock.h"
@@ -62,6 +63,7 @@
 
 #define USBCMD_RS    (1u << 0)
 #define USBCMD_HCRST (1u << 1)
+#define USBCMD_INTE  (1u << 2)   /* [M53c] interrupter enable (XHCI_USE_IRQ) */
 #define USBSTS_HCH   (1u << 0)
 #define USBSTS_CNR   (1u << 11)
 
@@ -156,7 +158,6 @@ int xhci_dev_last_cc(const usb_device_t* d) { return d ? d->last_cc : g_last_cc;
 
 // MSI-X plumbing (defined at end of file; NOT enabled by default).
 int  xhci_enable_irq(void);
-void xhci_irq_handler(void);
 
 static pci_device_t g_pci;          // located xHCI PCI function (for MSI-X)
 static volatile uint8_t* g_cap;     // capability base
@@ -785,69 +786,74 @@ int xhci_init(void) {
     g_ndev = 0;
 
 #ifdef XHCI_USE_IRQ
-    // MSI-X interrupt mode — IMPLEMENTED BUT NOT YET TESTED. OFF by default; the
-    // completion path above (evt_poll / evt_wait) remains the working default.
-    // When this gate is built, we additionally arm MSI-X so the handler can
-    // drain the event ring; the two coexist on a single CPU because the handler
-    // only advances ERDP, which the poller tolerates.
+    // [M53c] Interrupt mode, OFF by default: the handler drains the event
+    // ring (parking transfer events for their pollers) when no polled
+    // transfer owns it; the polled paths above stay the ones that complete.
     xhci_enable_irq();
 #endif
     return 0;
 }
 
 /* ============================================================================
- * MSI-X interrupt support — IMPLEMENTED BUT NOT YET TESTED / not enabled by
- * default (the kernel is polled). Needs the LAPIC + hardware validation. The
- * polled completion path (evt_poll/evt_wait) stays the working default; this
- * handler only drains the event ring and acknowledges, so an unexpected
- * interrupt can never corrupt an in-flight polled transfer.
+ * MSI-X / MSI interrupt support (-DXHCI_USE_IRQ only; the default build is
+ * polled). M53c: dynamic vector, generic dispatch. The polled completion path
+ * (evt_poll/evt_wait) stays the one that serves transfers; the handler only
+ * acknowledges and drains the event ring while nobody owns it.
  * ========================================================================== */
 
-// Volatile flag a future interrupt-driven waiter could spin on instead of the
-// event ring. Set by the ISR; unused by the default polled path.
+// Interrupts taken (xhci_irq_count, /proc/interrupts).
 static volatile uint32_t g_xhci_irq_count;
 
-// C half of isr_xhci (vector 0x40). Acknowledge the interrupter, advance the
-// event ring dequeue (so the controller stops asserting), and EOI the LAPIC.
-void xhci_irq_handler(void) {
+// [M53c] Interrupt handler on an allocated vector (irq_dispatch EOIs the
+// LAPIC). Acknowledge the interrupter, then drain the event ring so the
+// controller stops asserting. Drained transfer events are parked for their
+// pollers (evt_park), exactly as a polled waiter does: an armed HID
+// endpoint's completion must not be lost. Runs only when no polled transfer
+// owns the event ring ([M50 B3]: never spin in an IRQ); otherwise the owner
+// drains it.
+static int g_xhci_vec = -1;
+static void xhci_irq_handler(uint8_t vec, void* ctx) {
+    (void)vec; (void)ctx;
     if (g_rt) {
         // RW1C the interrupter's IP bit and re-arm IE.
         uint32_t iman = rt_rd(IR0_IMAN);
         rt_wr(IR0_IMAN, iman | IMAN_IP | IMAN_IE);
-        // Drain any pending events to clear EHB and advance ERDP — only when no
-        // polled transfer owns the event ring ([M50 B3]: never spin in an IRQ).
         uint64_t fl;
         if (xhci_trylock_irqsave(&fl)) {
             xhci_trb_t ev;
-            while (evt_poll(&ev)) { /* consumed; ERDP advanced inside evt_poll */ }
+            while (evt_poll(&ev)) evt_park(&ev);   /* ERDP advanced inside evt_poll */
             xhci_unlock_irqrestore(fl);
         }
     }
     g_xhci_irq_count++;
-    lapic_eoi();
 }
 
-// Bring up MSI-X delivery for the xHCI event interrupter. NOT YET TESTED.
-// Returns 0 on success, -1 if MSI-X/LAPIC could not be programmed. Safe to
-// leave unused: the default build never calls it.
+// Bring up MSI-X (or MSI) delivery for the xHCI event interrupter.
+// Returns 0 on success, -1 if MSI-X/MSI/LAPIC could not be programmed.
+// Only the -DXHCI_USE_IRQ build calls it.
 int xhci_enable_irq(void) {
     if (lapic_enable() != 0) {
         debugcon_writestring("[MSIX] xhci: LAPIC unavailable, staying polled\n");
         return -1;
     }
-    idt_install_msi_vector(IDT_VECTOR_XHCI, isr_xhci);
-    if (pci_enable_msix(&g_pci, IDT_VECTOR_XHCI) != 0) {
-        // Fall back to plain MSI if the controller exposes only that.
-        if (pci_enable_msi(&g_pci, IDT_VECTOR_XHCI) != 0) {
-            debugcon_writestring("[MSIX] xhci: no MSI-X/MSI capability\n");
-            return -1;
-        }
+    int vec = irq_vec_alloc(IRQ_CPU_ANY, xhci_irq_handler, NULL, "xhci");
+    if (vec < 0) { debugcon_writestring("[MSIX] xhci: no free vector\n"); return -1; }
+    if (pci_irq_setup_single(&g_pci, (uint8_t)vec, (uint32_t)irq_vec_cpu(vec)) < 0) {
+        irq_vec_free(vec);
+        debugcon_writestring("[MSIX] xhci: no MSI-X/MSI capability\n");
+        return -1;
     }
-    // Make sure interrupter 0 has IE set; IP is RW1C so writing it clears it.
+    g_xhci_vec = vec;
+    // Interrupter 0: IE on (IP is RW1C so writing it clears it), then the
+    // controller-wide interrupt enable, without which nothing is ever sent.
     if (g_rt) rt_wr(IR0_IMAN, rt_rd(IR0_IMAN) | IMAN_IE | IMAN_IP);
-    debugcon_writestring("[MSIX] xhci vector=0x40 armed (NOT TESTED)\n");
+    op_wr(OP_USBCMD, op_rd(OP_USBCMD) | USBCMD_INTE);
+    debugcon_writestring("[MSIX] xhci armed vector=0x"); debugcon_print_hex((uint64_t)vec);
+    debugcon_writestring("\n");
     return 0;
 }
+
+uint32_t xhci_irq_count(void) { return g_xhci_irq_count; }
 
 /* ---- Diagnostics (read-only; for the `usbinfo` shell command) -------------
  * On real hardware with no serial, these let the framebuffer console report what
