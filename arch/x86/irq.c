@@ -11,6 +11,7 @@
 #include "tsc.h"
 #include "klock.h"
 #include "debugcon.h"
+#include "iommu.h"
 #include <stddef.h>
 
 typedef struct irq_desc {
@@ -88,6 +89,10 @@ void irq_vec_free(int vec) {
     if (was) __atomic_store_n(&d->handler, NULL, __ATOMIC_SEQ_CST);
     spin_unlock_irqrestore(&g_irqvec_lock, fl);
     if (!was) return;
+    /* [M56] With interrupt remapping, clear the vector's remapping entry
+     * (and wait for the entry-cache invalidation): a late message from the
+     * old source now faults instead of reaching a later owner. */
+    iommu_ir_vec_free(vec);
     /* Dekker pair with irq_dispatch: it increments `active` (seq_cst) before
      * loading the handler; we cleared the handler (seq_cst) before reading
      * `active`. So once active reads 0, no CPU can still use handler/ctx. The
@@ -120,6 +125,9 @@ int irq_vec_set_cpu(int vec, uint32_t cpu) {
     int r = d->allocated ? 0 : -1;
     if (!r) d->cpu = (uint32_t)c;
     spin_unlock_irqrestore(&g_irqvec_lock, fl);
+    /* [M56] A remapped source follows its vector: the remapping entry's
+     * destination is rewritten (no-op without interrupt remapping). */
+    if (!r) iommu_ir_vec_set_cpu(vec, (uint32_t)c);
     return r;
 }
 

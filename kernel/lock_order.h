@@ -97,8 +97,15 @@
                                    only PCI config access (S64) inside. Never
                                    held across vmm_map_mmio (S60)              */
 #define LK_S60_KSTACK      160  /* kstack_lock, g_pm_lock, kvmm_lock (future)   */
+#define LK_S61_IOAPIC      161  /* g_ioapic_lock (arch/x86/lapic.c, M56): routed
+                                   IOAPIC lines + IOREGSEL/IOWIN pairs; leaf
+                                   (the IR callback runs outside it)         */
 #define LK_S62_TLB         162  /* tlb_lock: shootdowns are issued from inside
                                    kstack_lock / g_pm_lock sections (plan: S60) */
+#define LK_S63_IOMMU_IR    163  /* g_ir_lock (arch/x86/vtd_ir.c, M56): the
+                                   interrupt-remapping table and its entry-
+                                   cache invalidations (unit S68 inside).
+                                   Never held by irq_dispatch               */
 #define LK_S64_LEAF        164  /* kclock, csprng, elf-revoke (C6, writers
                                    only), pci_cfg_lock (M53a: one CF8/CFC
                                    pair or RMW): leaf locks (plan: S60)        */

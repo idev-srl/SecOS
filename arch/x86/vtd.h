@@ -6,7 +6,8 @@
  *
  * Legacy (non-scalable) mode only: root table -> context tables -> second-
  * level page tables (3 levels for a 39-bit AGAW, 4 for 48-bit). No ATS, no
- * interrupt remapping (M56), no first-level / nested translation.
+ * first-level / nested translation. Interrupt remapping (M56) lives in
+ * arch/x86/vtd_ir.c on top of the unit accessors at the end of this file.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -34,6 +35,7 @@
 #define VTD_REG_IQT       0x088
 #define VTD_REG_IQA       0x090
 #define VTD_REG_ICS       0x09C
+#define VTD_REG_IRTA      0x0B8     /* M56: interrupt-remapping table address */
 
 /* CAP */
 #define VTD_CAP_ND(c)       ((uint32_t)((c) & 7))
@@ -67,11 +69,15 @@
 #define VTD_GCMD_WBF        (1u << 27)
 #define VTD_GCMD_QIE        (1u << 26)
 #define VTD_GCMD_IRE        (1u << 25)
+#define VTD_GCMD_SIRTP      (1u << 24)   /* M56: latch IRTA                  */
+#define VTD_GCMD_CFI        (1u << 23)   /* M56: compatibility format allowed */
 #define VTD_GSTS_TES        (1u << 31)
 #define VTD_GSTS_RTPS       (1u << 30)
 #define VTD_GSTS_WBFS       (1u << 27)
 #define VTD_GSTS_QIES       (1u << 26)
 #define VTD_GSTS_IRES       (1u << 25)
+#define VTD_GSTS_IRTPS      (1u << 24)
+#define VTD_GSTS_CFIS       (1u << 23)
 /* GSTS bits that are persistent commands (kept when writing GCMD). */
 #define VTD_GSTS_PERSIST    0x96FFFFFFu
 
@@ -105,6 +111,8 @@
 #define VTD_QI_CC           0x1     /* context-cache invalidate  */
 #define VTD_QI_IOTLB        0x2
 #define VTD_QI_WAIT         0x5
+#define VTD_QI_IEC          0x4     /* M56: interrupt-entry-cache invalidate */
+#define VTD_QI_IEC_INDEX    (1ull << 4)   /* index-selective (else global)   */
 #define VTD_QI_GRAN_GLOBAL  (1ull << 4)
 #define VTD_QI_GRAN_DOMAIN  (2ull << 4)
 #define VTD_QI_GRAN_DEVPAGE (3ull << 4)   /* CC: device; IOTLB: page */
@@ -163,5 +171,44 @@ uint64_t vtd_pt_translate(vtd_dom_t* h, uint64_t iova, int* prot);
 void     vtd_pt_free(vtd_dom_t* h);
 
 void vtd_probe(void);   /* kernel/iommu.c calls this from iommu_init */
+
+/* ------------------------- unit access for arch/x86/vtd_ir.c (M56) */
+/* Interrupt-remapping fault reasons (0x20..0x27). */
+#define VTD_FR_IR_FIRST     0x20
+#define VTD_FR_IR_LAST      0x2F
+
+int      vtd_unit_count(void);                 /* slots, used or not        */
+int      vtd_unit_used(int i);                 /* probed, kept, translating */
+uint64_t vtd_unit_ecap(int i);
+int      vtd_unit_has_qi(int i);               /* queued invalidation in use */
+uint32_t vtd_unit_index(int i);                /* DRHD index (logs)          */
+uint32_t vtd_unit_gsts(int i);
+/* Under the unit lock: write IRTA, latch it (SIRTP), global IEC + wait. */
+int      vtd_unit_set_irta(int i, uint64_t irta);
+/* Under the unit lock: set/clear a persistent GCMD bit, wait for GSTS. */
+int      vtd_unit_gcmd(int i, uint32_t bit, int on);
+/* Under the unit lock: queue one IEC descriptor (global when count == 0,
+ * else index-selective for [index, index+count), count a power of two
+ * aligned to it) and wait for it. */
+int      vtd_unit_iec(int i, uint32_t index, uint32_t count);
+/* The unit (slot index) that remaps this function, or -1. */
+int      vtd_unit_for_dev(const pci_dev_t* dev);
+/* The unit whose DMAR scope names the IOAPIC / HPET source id, or -1. */
+int      vtd_unit_for_sid(uint16_t seg, uint16_t sid);
+/* The requester id a function's messages carry: *svt = 1 (exact SID) or
+ * 2 (bus range: *sid = start bus << 8 | end bus, for a PCIe-to-PCI bridge
+ * alias). */
+void     vtd_dev_requester(const pci_dev_t* dev, uint16_t* sid, uint8_t* svt);
+
+/* arch/x86/vtd_ir.c (M56). */
+int      vtd_ir_init(void);                    /* after vtd_enable           */
+int      vtd_ir_compose(const pci_dev_t* dev, int vec, uint32_t cpu,
+                        uint64_t* addr, uint32_t* data);
+int      vtd_ir_enabled(void);
+int      vtd_ir_covers(const pci_dev_t* dev);
+void     vtd_ir_free(int vec);
+int      vtd_ir_set_cpu(int vec, uint32_t cpu);
+void     vtd_ir_generate(void (*emit)(void* ctx, const char* line), void* ctx);
+const char* vtd_ir_fault_reason(uint8_t r);
 
 #endif /* VTD_H */

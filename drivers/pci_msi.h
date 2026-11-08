@@ -3,8 +3,8 @@
  *
  * The vector comes from the dynamic allocator (arch/x86/irq.h) and the target
  * is a CPU index; msi_compose() turns (vector, CPU) into the message
- * address/data pair. It is the one place that knows the message format, so
- * M56 (interrupt remapping) replaces only it with the remappable format.
+ * address/data pair. It is the one place that knows the message format: since
+ * M56 it returns the remappable format when interrupt remapping is on.
  *
  * MSI-X: pci_msix_enable() maps the table (bounds-checked against the BAR),
  * masks every entry and turns MSI-X on. pci_msix_set() programs one entry
@@ -35,11 +35,21 @@
 #define MSI_ADDR_BASE       0xFEE00000u
 
 /* Compose the message for `vec` delivered to CPU index `cpu` (IRQ_CPU_ANY =
- * the allocator's choice). Without interrupt remapping the destination field
- * is 8 bits, so a CPU whose APIC ID is above 254 cannot be targeted: -1.
- * `d` identifies the requester (unused until M56). */
+ * the allocator's choice). [M56] With interrupt remapping on (kernel/iommu.h)
+ * this programs the remapping entry for `vec` (owner = `d`'s requester id)
+ * and returns a remappable message (handle = vec, SHV=1, data 0); otherwise,
+ * or for a device no remapping unit covers, the compatibility format, whose
+ * destination field is 8 bits, so a CPU whose APIC ID is above 254 cannot be
+ * targeted: -1. Never call it with g_msi_lock held (it may wait for an
+ * interrupt-entry-cache invalidation). */
 int msi_compose(const pci_device_t* d, uint8_t vec, uint32_t cpu,
                 uint64_t* addr, uint32_t* data);
+/* The compatibility format only (the IOMMU layer and its fault MSI). */
+int msi_compose_compat(const pci_device_t* d, uint8_t vec, uint32_t cpu,
+                       uint64_t* addr, uint32_t* data);
+/* [M56] Number of functions with MSI or MSI-X on (the interrupt-remapping
+ * switchover refuses to start while a compatibility-format source is live). */
+int pci_msi_any_enabled(void);
 
 /* ---- MSI-X ---- */
 int pci_msix_table_size(const pci_device_t* d);      /* entries, or -1 */

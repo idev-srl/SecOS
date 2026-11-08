@@ -79,4 +79,17 @@ void irq_eoi(void);
 void irq_enable_aux(void);
 void irq_eoi_aux(void);
 
+/* [M56] Interrupt remapping of the IOAPIC lines. `fn` programs the IOMMU's
+ * remapping entry for (IOAPIC `ioapic_id`, `vector`, destination APIC ID,
+ * trigger) and returns its handle; it is called with no IOAPIC lock held.
+ * ioapic_remap_switch() masks every routed line, gets each line's handle,
+ * calls `enable(ctx)` (turns remapping on), then rewrites every line in
+ * remappable format and unmasks it; lines routed later use `fn` too. If a
+ * handle cannot be had or `enable` fails, the lines go back to their
+ * compatibility entries and it returns -1. */
+typedef int (*ioapic_remap_fn)(uint8_t ioapic_id, uint8_t vector, uint32_t dest_apic_id,
+                               int level, uint16_t* handle);
+int ioapic_remap_switch(ioapic_remap_fn fn, int (*enable)(void* ctx), void* ctx);
+int ioapic_line_count(void);
+
 #endif /* LAPIC_H */

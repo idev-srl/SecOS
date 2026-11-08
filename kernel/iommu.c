@@ -18,6 +18,7 @@ extern int  kernel_cmdline_has(const char* word);
 extern char g_kcmdline[256];
 #ifdef SECOS_IOMMU_TEST
 extern void iommu_test_run(void);
+extern void iommu_ir_test_run(void);
 #endif
 
 static const iommu_ops_t* g_ops;
@@ -36,11 +37,22 @@ static uint8_t            g_devatt[PCI_MAX_DEVS];   /* context programmed */
 static volatile uint64_t  g_f_total, g_f_irqs, g_f_polled, g_f_logged, g_f_supp, g_f_ovf;
 static iommu_fault_t      g_f_last;
 static iommu_fault_hook_t volatile g_f_hook;
-static volatile uint64_t  g_rl_window;      /* tick the current window began  */
-static volatile uint32_t  g_rl_count;       /* lines printed in the window    */
-static volatile uint64_t  g_rl_pending;     /* suppressed, not yet reported   */
+/* Log rate limit, one per fault class (DMA, and M56 interrupt remapping). */
+typedef struct {
+    volatile uint64_t window;               /* tick the current window began  */
+    volatile uint32_t count;                /* lines printed in the window    */
+    volatile uint64_t pending;              /* suppressed, not yet reported   */
+    volatile uint64_t* supp;                /* total-suppressed counter       */
+} iommu_rl_t;
+static iommu_rl_t         g_rl_dma = { 0, 0, 0, &g_f_supp };
 #define IOMMU_RL_WINDOW_MS  1000
 #define IOMMU_RL_BURST      5
+
+/* M56: interrupt-remapping faults (counted apart from DMA faults). */
+static volatile uint64_t  g_irf_total, g_irf_logged, g_irf_supp;
+static volatile uint16_t  g_irf_bdf, g_irf_index;
+static volatile uint8_t   g_irf_reason;
+static iommu_rl_t         g_rl_ir = { 0, 0, 0, &g_irf_supp };
 
 /* ------------------------------------------------------------ lines */
 void iommu_ln_s(iommu_line_t* l, const char* s) {
@@ -238,7 +250,32 @@ iommu_domain_t* iommu_dev_domain(const pci_dev_t* dev) {
 int iommu_irq_compose(const pci_dev_t* dev, int vec, uint32_t cpu, uint64_t* addr, uint32_t* data) {
     if (g_ops && g_on && g_ops->irq_compose) return g_ops->irq_compose(dev, vec, cpu, addr, data);
     pci_device_t pd = { dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id };
-    return msi_compose(&pd, (uint8_t)vec, cpu, addr, data);
+    return msi_compose_compat(&pd, (uint8_t)vec, cpu, addr, data);
+}
+
+/* ------------------------------------------- interrupt remapping (M56) */
+static volatile int g_ir_on;          /* published by iommu_init after ir_init */
+
+int iommu_ir_enabled(void) { return __atomic_load_n(&g_ir_on, __ATOMIC_ACQUIRE); }
+
+int iommu_ir_covers(const pci_dev_t* dev) {
+    return dev && iommu_ir_enabled() && g_ops->ir_covers && g_ops->ir_covers(dev);
+}
+
+void iommu_ir_vec_free(int vec) {
+    if (iommu_ir_enabled() && g_ops->ir_free) g_ops->ir_free(vec);
+}
+
+void iommu_ir_vec_set_cpu(int vec, uint32_t cpu) {
+    if (iommu_ir_enabled() && g_ops->ir_set_cpu) g_ops->ir_set_cpu(vec, cpu);
+}
+
+int iommu_ir_msi_compose(const pci_device_t* d, uint8_t vec, uint32_t cpu,
+                         uint64_t* addr, uint32_t* data) {
+    if (!iommu_ir_enabled()) return 1;
+    const pci_dev_t* dev = pci_dev_of(d);
+    if (!dev || !g_ops->ir_covers || !g_ops->ir_covers(dev)) return 1;
+    return g_ops->irq_compose(dev, vec, cpu, addr, data) == 0 ? 0 : -1;
 }
 
 /* ------------------------------------------------------------ faults */
@@ -250,27 +287,59 @@ void iommu_note_overflow(void) {
 
 /* Rate limit: at most IOMMU_RL_BURST lines per second; the number dropped
  * is reported with the first line of the next window. */
-static int rl_allow(uint64_t* dropped) {
+static int rl_allow(iommu_rl_t* rl, uint64_t* dropped) {
     uint64_t now = timer_get_ticks();
-    uint64_t w = __atomic_load_n(&g_rl_window, __ATOMIC_RELAXED);
+    uint64_t w = __atomic_load_n(&rl->window, __ATOMIC_RELAXED);
     *dropped = 0;
     if (now - w >= IOMMU_RL_WINDOW_MS &&
-        __atomic_compare_exchange_n(&g_rl_window, &w, now, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-        __atomic_store_n(&g_rl_count, 0, __ATOMIC_RELEASE);
-        *dropped = __atomic_exchange_n(&g_rl_pending, 0, __ATOMIC_ACQ_REL);
+        __atomic_compare_exchange_n(&rl->window, &w, now, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&rl->count, 0, __ATOMIC_RELEASE);
+        *dropped = __atomic_exchange_n(&rl->pending, 0, __ATOMIC_ACQ_REL);
     }
-    if (__atomic_add_fetch(&g_rl_count, 1, __ATOMIC_ACQ_REL) <= IOMMU_RL_BURST) return 1;
-    __atomic_add_fetch(&g_rl_pending, 1, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&g_f_supp, 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&rl->count, 1, __ATOMIC_ACQ_REL) <= IOMMU_RL_BURST) return 1;
+    __atomic_add_fetch(&rl->pending, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(rl->supp, 1, __ATOMIC_RELAXED);
     return 0;
 }
 
+/* M56: an interrupt-remapping fault (a blocked interrupt request). */
+static void report_ir_fault(const iommu_fault_t* f) {
+    __atomic_add_fetch(&g_irf_total, 1, __ATOMIC_RELAXED);
+    g_irf_bdf = f->bdf; g_irf_index = f->ir_index; g_irf_reason = f->reason;
+    uint64_t dropped = 0;
+    if (rl_allow(&g_rl_ir, &dropped)) {
+        iommu_line_t l; l.n = 0;
+        if (dropped) {
+            iommu_ln_s(&l, "[IOMMU] "); iommu_ln_dec(&l, dropped);
+            iommu_ln_s(&l, " IR fault message(s) suppressed (rate limit)");
+            debugcon_writestring(iommu_ln_end(&l));
+        }
+        iommu_ln_s(&l, "[IOMMU] IR fault bdf=");
+        if (f->seg) { iommu_ln_hexw(&l, f->seg, 4); iommu_ln_s(&l, ":"); }
+        iommu_ln_bdf(&l, f->bdf);
+        iommu_ln_s(&l, " index="); iommu_ln_hex(&l, f->ir_index);
+        iommu_ln_s(&l, " reason="); iommu_ln_hex(&l, f->reason);
+        iommu_ln_s(&l, " ("); iommu_ln_s(&l, g_ops ? g_ops->fault_reason(f->reason) : "?");
+        iommu_ln_s(&l, ") interrupt blocked");
+        debugcon_writestring(iommu_ln_end(&l));
+        __atomic_add_fetch(&g_irf_logged, 1, __ATOMIC_RELAXED);
+    }
+    iommu_fault_hook_t h = g_f_hook;
+    if (h) h(f);
+}
+
+void iommu_ir_fault_stats(iommu_ir_fault_stats_t* o) {
+    o->total = g_irf_total; o->logged = g_irf_logged; o->suppressed = g_irf_supp;
+    o->last_bdf = g_irf_bdf; o->last_index = g_irf_index; o->last_reason = g_irf_reason;
+}
+
 void iommu_report_fault(const iommu_fault_t* f, int from_irq) {
+    if (f->is_ir) { report_ir_fault(f); return; }
     __atomic_add_fetch(&g_f_total, 1, __ATOMIC_RELAXED);
     if (!from_irq) __atomic_add_fetch(&g_f_polled, 1, __ATOMIC_RELAXED);
     g_f_last = *f;
     uint64_t dropped = 0;
-    if (rl_allow(&dropped)) {
+    if (rl_allow(&g_rl_dma, &dropped)) {
         iommu_line_t l; l.n = 0;
         if (dropped) {
             iommu_ln_s(&l, "[IOMMU] "); iommu_ln_dec(&l, dropped);
@@ -307,6 +376,16 @@ void iommu_generate(void (*emit)(void* ctx, const char* line), void* ctx) {
     emit(ctx, iommu_ln_end(&l));
     if (!g_ops) return;
     if (g_ops->generate) g_ops->generate(emit, ctx);
+    if (g_ops->ir_generate) g_ops->ir_generate(emit, ctx);
+    iommu_ln_s(&l, "ir faults "); iommu_ln_dec(&l, g_irf_total);
+    iommu_ln_s(&l, " logged "); iommu_ln_dec(&l, g_irf_logged);
+    iommu_ln_s(&l, " suppressed "); iommu_ln_dec(&l, g_irf_supp);
+    if (g_irf_total) {
+        iommu_ln_s(&l, " last bdf "); iommu_ln_bdf(&l, g_irf_bdf);
+        iommu_ln_s(&l, " index "); iommu_ln_hex(&l, g_irf_index);
+        iommu_ln_s(&l, " reason "); iommu_ln_hex(&l, g_irf_reason);
+    }
+    emit(ctx, iommu_ln_end(&l));
     iommu_ln_s(&l, "domains "); iommu_ln_dec(&l, g_ndomains);
     if (g_kdom) {
         iommu_ln_s(&l, " kernel ");
@@ -419,7 +498,11 @@ void iommu_init(void) {
     iommu_ln_dec(&l, (uint64_t)skip); iommu_ln_s(&l, " not translated, ");
     iommu_ln_dec(&l, (uint64_t)fail); iommu_ln_s(&l, " failed");
     debugcon_writestring(iommu_ln_end(&l));
+    /* M56: interrupt remapping (its own switchover; logs [IOMMU] IR ...). */
+    if (g_ops->ir_init && g_ops->ir_init() == 0)
+        __atomic_store_n(&g_ir_on, 1, __ATOMIC_RELEASE);
 #ifdef SECOS_IOMMU_TEST
     iommu_test_run();
+    iommu_ir_test_run();
 #endif
 }

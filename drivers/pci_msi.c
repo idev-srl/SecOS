@@ -10,6 +10,7 @@
  */
 #include "pci_msi.h"
 #include "irq.h"
+#include "iommu.h"
 #include "percpu.h"
 #include "spinlock.h"
 #include "io.h"
@@ -91,9 +92,9 @@ static msi_rec_t* rec_get_locked(const pci_device_t* d) {
 }
 
 /* ======================================================================== */
-int msi_compose(const pci_device_t* d, uint8_t vec, uint32_t cpu,
-                uint64_t* addr, uint32_t* data) {
-    (void)d;   /* M56: the requester ID selects the IRTE */
+int msi_compose_compat(const pci_device_t* d, uint8_t vec, uint32_t cpu,
+                       uint64_t* addr, uint32_t* data) {
+    (void)d;
     if (vec < 0x20 || vec == 0xFF) return -1;
     int c = irq_pick_cpu(cpu);
     if (c < 0) return -1;
@@ -105,6 +106,26 @@ int msi_compose(const pci_device_t* d, uint8_t vec, uint32_t cpu,
     *addr = (uint64_t)MSI_ADDR_BASE | ((uint64_t)cp->lapic_id << 12);
     *data = (uint32_t)vec;          /* fixed delivery, edge trigger */
     return 0;
+}
+
+/* [M56] With interrupt remapping on, the message is in remappable format:
+ * the IOMMU programs the interrupt-remapping entry for `vec` (owner = the
+ * device's requester id, destination = `cpu`) and returns its handle. A
+ * device no remapping unit covers keeps the compatibility format. */
+int msi_compose(const pci_device_t* d, uint8_t vec, uint32_t cpu,
+                uint64_t* addr, uint32_t* data) {
+    int rc = iommu_ir_msi_compose(d, vec, cpu, addr, data);
+    if (rc <= 0) return rc;
+    return msi_compose_compat(d, vec, cpu, addr, data);
+}
+
+int pci_msi_any_enabled(void) {
+    int n = 0;
+    for (int i = 0; i < MSI_MAX_DEV; i++) {
+        msi_rec_t* r = &g_msi[i];
+        if (__atomic_load_n(&r->used, __ATOMIC_ACQUIRE) && (r->msix_on || r->msi_on)) n++;
+    }
+    return n;
 }
 
 /* ======================================================================== MSI-X */
@@ -274,6 +295,14 @@ int pci_msi_enable(const pci_device_t* d, int nvec, uint8_t vec, uint32_t cpu) {
     if (vec & (uint32_t)(nvec - 1)) return -1;       /* block must be aligned */
     uint64_t addr; uint32_t data;
     if (msi_compose(d, vec, cpu, &addr, &data) != 0) return -1;
+    /* [M56] Multi-message: the device ORs the message number into the low
+     * data bits, which a remappable message (SHV=1, subhandle 0) turns into
+     * entry handle + i. Program entries vec+1 .. vec+nvec-1 too (with IR
+     * off this only re-checks the target). */
+    for (int i = 1; i < nvec; i++) {
+        uint64_t a2; uint32_t d2;
+        if (msi_compose(d, (uint8_t)(vec + i), cpu, &a2, &d2) != 0) return -1;
+    }
     uint32_t mme = 0;
     while ((1 << mme) < nvec) mme++;
 
