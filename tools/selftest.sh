@@ -3212,6 +3212,22 @@ else
     check "M51 exec gate build" 1
 fi
 
+# ---- M53b: ACPI DMAR / IVRS parsing (tools/acpi_dmar_gate.sh) ----
+# Read-only: host known answers + 50k-table fuzz, then q35 + intel-iommu /
+# amd-iommu, plain q35, i440fx and UEFI guests must log the expected
+# [IOMMU] lines and boot normally.
+echo "[selftest] Running the M53b DMAR/IVRS gate (~2 min)..."
+make clean >/dev/null 2>&1 || true
+tools/acpi_dmar_gate.sh >/tmp/secos_selftest_m53b.out 2>&1
+while IFS= read -r l; do
+    case "$l" in
+        "  [PASS] "*) check "${l#  \[PASS\] }" 0 ;;
+        "  [FAIL] "*) check "${l#  \[FAIL\] }" 1 ;;
+        "  [SKIP] "*) echo "$l" ;;
+    esac
+done </tmp/secos_selftest_m53b.out
+grep -q "^\[m53b\] [0-9]* passed" /tmp/secos_selftest_m53b.out; check "M53b gate ran to completion" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
