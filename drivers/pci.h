@@ -168,6 +168,8 @@ typedef struct pci_dev {
 void pci_init(void);
 
 int              pci_dev_count(void);
+/* 1 if every function found at boot is in the table (no PCI_MAX_DEVS overflow). */
+int              pci_registry_complete(void);
 const pci_dev_t* pci_dev_at(int idx);
 const pci_dev_t* pci_dev_lookup(uint16_t seg, uint8_t bus, uint8_t slot, uint8_t func);
 const pci_dev_t* pci_dev_of(const pci_device_t* d);

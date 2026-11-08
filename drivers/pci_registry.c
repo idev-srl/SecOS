@@ -530,6 +530,7 @@ const pci_dev_t* pci_dev_at(int idx) {
     pci_init();
     return (idx >= 0 && idx < g_ndev) ? &g_devs[idx] : 0;
 }
+int pci_registry_complete(void) { pci_init(); return g_overflow == 0; }
 int pci_dev_index(const pci_dev_t* d) {
     if (d < &g_devs[0] || d >= &g_devs[g_ndev]) return -1;
     return (int)(d - &g_devs[0]);
