@@ -76,6 +76,10 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_sysinfo_elf.h"
 #include "../crypto/user_swptest_elf.h"
 #include "../crypto/user_sysmon_elf.h"   // LVGL 9.2 system monitor (make port-lvgl)
+// [M57] Driver Space v2 test drivers (edu device): positive + negative tests.
+#include "../crypto/user_udrv_edu_elf.h"
+#include "../crypto/user_udrv_negtest_elf.h"
+#include "../crypto/user_udrv_user_elf.h"
 #ifndef SECOS_NO_BUSYBOX
 #include "../crypto/user_busybox_elf.h"
 #include "../crypto/user_bbstub_elf.h"
@@ -377,6 +381,10 @@ static void build_table(void){
     sf_bin("sysinfo", user_sysinfo_elf, user_sysinfo_elf_len);
     sf_bin("swptest", user_swptest_elf, user_swptest_elf_len);
     sf_bin("sysmon", user_sysmon_elf, user_sysmon_elf_len);
+    // [M57] ring-3 driver programs (v3 DRIVER manifest; udrv_user: plain manifest).
+    sf_bin("udrv_edu", user_udrv_edu_elf, user_udrv_edu_elf_len);
+    sf_bin("udrv_negtest", user_udrv_negtest_elf, user_udrv_negtest_elf_len);
+    sf_bin("udrv_user", user_udrv_user_elf, user_udrv_user_elf_len);
 #ifndef SECOS_NO_BUSYBOX
     // BusyBox 1.36.1 from source: replaces the coreutils applets of the same
     // name. On ramfs every applet is the signed re-exec stub (user/bbstub.c).
