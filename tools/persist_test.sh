@@ -136,10 +136,10 @@ if [[ $GROW -eq 1 ]]; then
     ok "grown disk e2fsck -fn clean, 2097152 blocks" $?
     # Use up the first 8 groups (the old 1 GiB): from here on every block
     # SecOS allocates comes from a group resize2fs created.
-    used=$(dumpe2fs -h "$IMG" 2>/dev/null | awk -F: '/^Block count/{b=$2} /^Free blocks/{f=$2} END{print b-f}')
-    printf 'fallocate /var/filler 0 %d\n' $(( 262144 - used - 600 )) >"$W/grow2.cmds"
+    oldfree() { dumpe2fs "$IMG" 2>/dev/null | awk '/^Group [0-9]+:/{g=($2+0 < 8)} g && /free blocks,/{f+=$1} END{print f+0}'; }
+    printf 'fallocate /var/filler 0 %d\n' $(( $(oldfree) - 600 )) >"$W/grow2.cmds"
     debugfs -w -f "$W/grow2.cmds" "$IMG" >/dev/null 2>&1
-    fsck_clean "$IMG" && dumpe2fs "$IMG" 2>/dev/null | awk '/^Group [0-7]:/{g=1} /^Group 8:/{g=0} g && /free blocks,/{n+=$1} END{exit !(n < 2000)}'
+    fsck_clean "$IMG" && (( $(oldfree) < 2000 ))
     ok "old 1 GiB filled (new writes go to the added groups), still clean" $?
     NEWFREE0=$(newfree)
 fi

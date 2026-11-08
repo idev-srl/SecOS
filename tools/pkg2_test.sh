@@ -182,10 +182,10 @@ fsck_clean "$IMG" && [[ "$(dumpe2fs -h "$IMG" 2>/dev/null | sed -n 's/^Block cou
 ok "grown disk e2fsck -fn clean, 2097152 blocks (8 GiB)" $?
 make --no-print-directory grow-root ROOT_IMG="$IMG" SIZE=4G BACKUP=0 >/dev/null 2>&1
 [[ $? -ne 0 && $(stat -c %s "$IMG") -eq 8589934592 ]]; ok "grow-root refuses to shrink" $?
-used=$(dumpe2fs -h "$IMG" 2>/dev/null | awk -F: '/^Block count/{b=$2} /^Free blocks/{f=$2} END{print b-f}')
-printf 'write /dev/null /var/filler\nfallocate /var/filler 0 %d\n' $(( 262144 - used - 600 )) >"$W/fill.cmds"
+oldfree() { dumpe2fs "$IMG" 2>/dev/null | awk '/^Group [0-9]+:/{g=($2+0 < 8)} g && /free blocks,/{f+=$1} END{print f+0}'; }
+printf 'write /dev/null /var/filler\nfallocate /var/filler 0 %d\n' $(( $(oldfree) - 600 )) >"$W/fill.cmds"
 debugfs -w -f "$W/fill.cmds" "$IMG" >/dev/null 2>&1
-fsck_clean "$IMG"; ok "old 1 GiB filled with an unwritten extent, still clean" $?
+fsck_clean "$IMG" && (( $(oldfree) < 2000 )); ok "old 1 GiB filled with an unwritten extent ($(oldfree) blocks left there), still clean" $?
 NF0=$(newfree)
 
 # ---- 3. install from the transfer disk ----------------------------------------------------
