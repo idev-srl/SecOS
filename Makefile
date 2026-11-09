@@ -132,6 +132,10 @@ SRC_C   = \
 	$(KERNEL_DIR)/driver_if.c \
 	$(KERNEL_DIR)/ipc.c \
 	$(KERNEL_DIR)/pipe.c \
+	$(KERNEL_DIR)/anonfd.c \
+	$(KERNEL_DIR)/lx_event.c \
+	$(KERNEL_DIR)/lx_net.c \
+	$(KERNEL_DIR)/unix_sock.c \
 	$(KERNEL_DIR)/tty.c \
 	$(KERNEL_DIR)/tty_test.c \
 	$(KERNEL_DIR)/pty.c \

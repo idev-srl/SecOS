@@ -32,7 +32,12 @@ extern uint64_t timer_get_ticks(void);
  * and its TIME-WAIT/orphaned closes exhausted the table). The buffers are no
  * longer static: tcp_alloc() takes them from the kernel heap and conn_free()
  * returns them, and a listener needs none. */
-#define TCP_MAX_CONN 64
+#define TCP_MAX_CONN 1024          /* [U10] was 64 (Linux-shaped sockets: 1024).
+                                    * ~180 B of table per slot; a connection's
+                                    * 128 KiB of buffers come from the heap
+                                    * only while it is open (none for a
+                                    * listener), so the table itself costs
+                                    * ~180 KiB and memory scales with use. */
 /* [M25] 64 KiB send/receive buffers. The advertised receive window is
  * min(TCP_RXBUF - rx_len, 65535) — 64 KiB is the largest window expressible
  * without the window-scaling option, so this raises the window/RTT throughput
@@ -43,7 +48,7 @@ extern uint64_t timer_get_ticks(void);
 #define TCP_RTO      600           /* ~600 ms at 1 kHz */
 #define TCP_MAX_RETX 6
 #define TCP_TIMEWAIT 2000          /* ~2 s linger */
-#define TCP_MAX_BACKLOG 4          /* per-listener queued children (16-entry table) */
+#define TCP_MAX_BACKLOG 128        /* [U10] per-listener queued children (was 4) */
 #define TCP_ORPHAN_MS 10000        /* a released conn gets this long to finish FIN */
 #define TCP_ARP_RETRY 20           /* SYN not sent yet (ARP pending): retry every 20 ms */
 
@@ -234,10 +239,10 @@ static void tcp_output(struct tcp_conn* c){
 }
 
 // ---- public non-blocking API ----
-int tcp_start_connect(tcp_conn_t* c, net_dev_t* dev, uint32_t dip, uint16_t dport){
+int tcp_start_connect(tcp_conn_t* c, net_dev_t* dev, uint32_t dip, uint16_t dport, uint16_t lport){
     if(!c||!dev) return -1;
     c->dev=dev; c->remote_ip=dip; c->remote_port=dport;
-    c->local_port=eph_port();
+    c->local_port=lport ? lport : eph_port();      /* [U10] a bound socket keeps its port */
     c->iss = csprng_u32();                          /* unpredictable ISN (blind injection) */
     c->snd_una=c->iss; c->snd_nxt=c->iss; c->rcv_nxt=0;
     c->state=TCP_SYN_SENT;
@@ -528,7 +533,7 @@ void tcp_tick(void){
 tcp_conn_t* tcp_connect(net_dev_t* dev, uint32_t dip, uint16_t dport){
     uint64_t fl=net_lock();
     tcp_conn_t* c=tcp_alloc();
-    if(c && tcp_start_connect(c, dev, dip, dport)!=0){ tcp_free(c); c=NULL; }
+    if(c && tcp_start_connect(c, dev, dip, dport, 0)!=0){ tcp_free(c); c=NULL; }
     net_unlock(fl);
     if(!c) return NULL;
     uint64_t deadline=timer_get_ticks()+8000;
@@ -605,6 +610,36 @@ void tcp_release(tcp_conn_t* c){
     c->orphan=1; c->orphan_deadline=timer_get_ticks()+TCP_ORPHAN_MS;
     tcp_start_close(c);
 }
+/* [U10] MSG_PEEK: copy buffered bytes without consuming them. */
+int tcp_peek(const tcp_conn_t* c, void* buf, uint32_t len){
+    if(!c || !c->rx) return 0;
+    uint32_t n = len; if(n>c->rx_len) n=c->rx_len;
+    uint8_t* d=(uint8_t*)buf;
+    for(uint32_t i=0;i<n;i++) d[i]=c->rx[(c->rx_head+i)%TCP_RXBUF];
+    return (int)n;
+}
+/* [U10] SO_LINGER {1, 0}: close = RST + free at once. */
+void tcp_abort(tcp_conn_t* c){
+    if(!c || !c->used) return;
+    if(c->state==TCP_LISTEN || c->state==TCP_CLOSED){ tcp_release(c); return; }
+    conn_abort(c);
+}
+/* [U10] Port use for bind(): 2 = a listener on it, 1 = any other connection
+ * (incl. TIME-WAIT) uses it as its local port, 0 = free. */
+int tcp_port_use(uint16_t port){
+    int r=0;
+    for(int i=0;i<TCP_MAX_CONN;i++){
+        const struct tcp_conn* c=&g_conns[i];
+        if(!c->used || c->local_port!=port) continue;
+        if(c->state==TCP_LISTEN) return 2;
+        if(c->state!=TCP_CLOSED) r=1;
+    }
+    return r;
+}
+uint16_t tcp_ephemeral_port(void){ return eph_port(); }
+uint32_t tcp_rcvbuf_size(void){ return TCP_RXBUF; }
+uint32_t tcp_sndbuf_size(void){ return TCP_TXBUF; }
+uint32_t tcp_mss(void){ return TCP_MSS; }
 int tcp_tx_space(const tcp_conn_t* c){ return c ? (int)(TCP_TXBUF - c->tx_len) : 0; }
 int tcp_was_reset(const tcp_conn_t* c){ return c ? c->reset : 0; }
 void tcp_get_addrs(const tcp_conn_t* c, uint32_t* lip, uint16_t* lport, uint32_t* rip, uint16_t* rport){

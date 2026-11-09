@@ -67,6 +67,15 @@
                                    poll only trylocks it and delivers reports
                                    under it (input S15, proc S30, kbd S50,
                                    xhci S45 nest inside) (B3)                   */
+#define LK_S13_UNIX        113  /* g_unix_lock (kernel/unix_sock.c, U10): every
+                                   AF_UNIX socket, its queues and the name
+                                   table. Inside: heap only. Never across a
+                                   user copy or a wake (anonfd_wake runs
+                                   after the unlock)                         */
+#define LK_S14_LXEVENT     114  /* g_ev_lock (kernel/lx_event.c, U10): eventfd
+                                   counters, timerfd state, epoll interest
+                                   lists. Inside: heap only; epoll evaluates
+                                   the watched fds with it dropped          */
 #define LK_S15_SUBSYS      115  /* procfs g_proc_lock, g_sysfs_lock,
                                    g_input_lock, g_pipe_lock, g_ipc_lock,
                                    driver_if_lock (B1), g_devfs_lock (C2: only

@@ -15,7 +15,7 @@
 #include <stddef.h>
 
 #define IP_PROTO_UDP 17
-#define UDP_MAX_BIND 64         /* [M47] was 16 (one per UDP socket) */
+#define UDP_MAX_BIND 1024       /* [U10] one per UDP socket (MAX_SOCK); [M47] was 16 */
 
 struct udp_binding { uint16_t port; udp_recv_cb cb; void* ctx; int used; };
 static struct udp_binding g_bind[UDP_MAX_BIND];

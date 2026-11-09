@@ -190,7 +190,9 @@ typedef struct process {
     // socket so no file path can mistake it for a vfs_inode_t.
     // cloexec: FD_CLOEXEC — the fd is closed by a successful execve() (fcntl
     // F_SETFD, O_CLOEXEC on open, pipe2(O_CLOEXEC), F_DUPFD_CLOEXEC).
-    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; int cloexec; int is_sock; } fds[32];
+    // gen: [U10] a number unique to this fd opening (set by fd_alloc), so epoll
+    // notices a registered fd that was closed and its number reused.
+    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; int cloexec; int is_sock; uint32_t gen; } fds[32];
     // Kernel-interface bookkeeping (kernel/kiface.c): procfs identity + CPU
     // accounting, umask, and the in-progress state of the blocking nanosleep /
     // poll syscalls. Set up by kiface_proc_init() at creation; fork copies it
@@ -240,6 +242,15 @@ typedef struct process {
     uint64_t fs_base;
     uint64_t clear_child_tid;
     uint64_t auxv_va;
+    // [U10] Linux-shaped blocking calls (kernel/syscall_trap.c lx_wait): the
+    // call site (user rip) whose timeout lx_deadline (monotonic ns, 0 = none)
+    // belongs to; a re-run of the same blocked call keeps it, any completed
+    // call clears it. ITIMER_REAL (setitimer/alarm): next expiry (monotonic
+    // ns, 0 = disarmed) and reload interval; the BSP tick posts SIGALRM.
+    uint64_t lx_wait_rip;
+    uint64_t lx_deadline;
+    volatile uint64_t itimer_next_ns;
+    uint64_t itimer_int_ns;
     spinlock_t mm_lock;
 } process_t;
 

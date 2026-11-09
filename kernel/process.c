@@ -25,6 +25,7 @@
 #include "input.h"      // [M40] evdev client references
 #include "fbdev.h"      // [M40] graphics-owner exit -> text console
 #include "udrv.h"       // [M57] ring-3 driver claims and their fds
+#include "anonfd.h"     // [U10] eventfd/timerfd/epoll/AF_UNIX fd references
 
 #define MAX_PROCESSES 32
 static process_t* volatile proc_table[MAX_PROCESSES];
@@ -925,6 +926,7 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     // shell sets pgid for pipelines after creation). pid is assigned above.
     { extern void signal_init_proc(process_t*); signal_init_proc(p); }
     p->fs_base = 0; p->clear_child_tid = 0; p->auxv_va = 0;   // [U1]
+    p->lx_wait_rip = 0; p->lx_deadline = 0; p->itimer_next_ns = 0; p->itimer_int_ns = 0;   // [U10]
     p->pgid = p->pid; p->ppid = 0; p->spawner_pid = 0;
     p->stop_report = 0; p->cont_report = 0; p->stop_sig = 0;
     p->wait_tty = 0; p->power_phase = 0; p->power_deadline = 0;
@@ -1195,6 +1197,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
             pty_unref(e.inode);                    // a pty end: drop this holder
             input_obj_unref(e.inode);              // [M40] an evdev client
             udrv_fd_unref(e.inode);                // [M57] a claim fd
+            anonfd_unref(e.inode);                 // [U10] eventfd/timerfd/epoll/AF_UNIX
         }
     }
     // Signals (POSIX): caught signals revert to SIG_DFL (their handlers lived in
@@ -1307,6 +1310,8 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->wait_udrv = NULL;                       // [M57] the child owns no claim
     c->sigsusp_active = 0; c->sigsusp_saved = 0;
     c->state = PROC_EMBRYO;                    // not runnable until fully built (M52)
+    c->lx_wait_rip = 0; c->lx_deadline = 0;    // [U10] the parent's blocked call is not ours
+    c->itimer_next_ns = 0; c->itimer_int_ns = 0;   // POSIX: a fork child has no interval timer
     { extern void kiface_proc_fork(process_t*); kiface_proc_fork(c); }
 
     // [M25] The child inherits the parent's open pipe ends (fds were shallow
@@ -1318,7 +1323,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
           if (!c->fds[i].used) continue;
           if (c->fds[i].is_pipe) pipe_ref(c->fds[i].inode, c->fds[i].pipe_w);
           else if (c->fds[i].is_sock) socket_ref(c->fds[i].is_sock - 1);
-          else { pty_ref(c->fds[i].inode); input_obj_ref(c->fds[i].inode); udrv_fd_ref(c->fds[i].inode); }
+          else { pty_ref(c->fds[i].inode); input_obj_ref(c->fds[i].inode); udrv_fd_ref(c->fds[i].inode); anonfd_ref(c->fds[i].inode); }
       }
       pty_ctty_ref(c->ctty); }
 
@@ -1368,7 +1373,7 @@ void process_release_pipes(process_t* p) {
         if (!p->fds[i].used) continue;
         int kind = p->fds[i].is_sock ? 1 : p->fds[i].is_pipe ? 2 :
                    pty_is_inode(p->fds[i].inode) ? 3 : input_is_client(p->fds[i].inode) ? 4 :
-                   udrv_is_fd(p->fds[i].inode) ? 5 : 0;
+                   udrv_is_fd(p->fds[i].inode) ? 5 : anonfd_is(p->fds[i].inode) ? 6 : 0;
         if (!kind) continue;                         // plain files stay until reap
         uint64_t ffl = mm_lock(p);
         struct proc_fd_entry e = p->fds[i];
@@ -1378,8 +1383,10 @@ void process_release_pipes(process_t* p) {
         else if (kind == 2) pipe_unref(e.inode, e.pipe_w);
         else if (kind == 3) pty_unref(e.inode);
         else if (kind == 4) input_obj_unref(e.inode); // [M40] evdev client (drops a grab)
-        else udrv_fd_unref(e.inode);                 // [M57] claim fd
+        else if (kind == 5) udrv_fd_unref(e.inode);  // [M57] claim fd
+        else anonfd_unref(e.inode);                  // [U10] eventfd/timerfd/epoll/AF_UNIX
     }
+    { extern void lx_itimer_exit(process_t*); lx_itimer_exit(p); }   // [U10] no SIGALRM for the dead
     pty_proc_exit(p);
     vtcon_proc_exit(p);                            // [M40] graphics owner gone: text console back
 }

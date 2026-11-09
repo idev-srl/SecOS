@@ -231,6 +231,7 @@ void sched_on_timer_tick(trapframe_t* tf) {
       // whole table; with N CPUs they ran N times per millisecond).
       if (me->index == 0) {
           sched_wake_sleepers(now);                                   // [M17]
+          extern void lx_itimer_tick(void); lx_itimer_tick();         // [U10] ITIMER_REAL -> SIGALRM
           extern void tty_wake_readers(uint64_t); tty_wake_readers(now);   // blocked console readers
           extern void debugcon_user_tick(uint64_t); debugcon_user_tick(now);  // [M46] prompt tail
       }
