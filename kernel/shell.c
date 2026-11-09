@@ -910,7 +910,7 @@ static void rf_entry_line(const ramfs_entry_t* e, sh_lines_t* L){
     line[k]=0; sh_lines_add(L, line);
 }
 static void sh_rfls(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else path_resolve("",abs);
-    const ramfs_entry_t* arr[RAMFS_MAX_FILES]; sh_lines_t L = {0};
+    static const ramfs_entry_t* arr[RAMFS_MAX_FILES]; sh_lines_t L = {0};   // the shell runs under the BKL
     klock_lock(ramfs_fs_lock());
     size_t n = ramfs_list_path_locked(abs[0] ? abs : "", arr, RAMFS_MAX_FILES);
     for(size_t i=0;i<n;i++) rf_entry_line(arr[i], &L);
@@ -963,13 +963,17 @@ static void sh_rfcd(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writes
 // RAMFS: mostra working directory
 static void sh_rfpwd(const char* a){ (void)a; terminal_writestring("CWD: "); path_print_cwd(); }
 // RAMFS: stampa albero ricorsivo (collected under the ramfs lock, then paged)
-static void rftree_collect(const char* path,int depth, sh_lines_t* L){ if(depth > 16) return; const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t n = ramfs_list_path_locked((path && path[0]) ? path : "", arr, RAMFS_MAX_FILES); for(size_t i=0;i<n;i++){ const ramfs_entry_t* e=arr[i]; const char* last=e->name; for(const char* p=e->name; *p; p++){ if(*p=='/') last=p+1; } char line[RAMFS_NAME_MAX+16]; int k=0; for(int d=0; d<depth && k < (int)sizeof(line)-4; d++){ line[k++]=' '; line[k++]=' '; line[k++]='|'; line[k++]=' '; } if(i+1<n){ line[k++]='|'; line[k++]='-'; line[k++]=' '; } else { line[k++]='`'; line[k++]='-'; line[k++]=' '; } const char* q=last; while(*q && k < (int)sizeof(line)-2) line[k++]=*q++; if(e->flags & 2 && k < (int)sizeof(line)-2) line[k++]='/'; line[k]=0; sh_lines_add(L, line); if(e->flags & 2) rftree_collect(e->name, depth+1, L); } }
+static void rftree_collect(const char* path,int depth, sh_lines_t* L){ if(depth > 16) return;
+    const ramfs_entry_t** arr = (const ramfs_entry_t**)kmalloc(RAMFS_MAX_FILES * sizeof(*arr));   // not on the stack: recursive
+    if(!arr) return;
+    size_t n = ramfs_list_path_locked((path && path[0]) ? path : "", arr, RAMFS_MAX_FILES); for(size_t i=0;i<n;i++){ const ramfs_entry_t* e=arr[i]; const char* last=e->name; for(const char* p=e->name; *p; p++){ if(*p=='/') last=p+1; } char line[RAMFS_NAME_MAX+16]; int k=0; for(int d=0; d<depth && k < (int)sizeof(line)-4; d++){ line[k++]=' '; line[k++]=' '; line[k++]='|'; line[k++]=' '; } if(i+1<n){ line[k++]='|'; line[k++]='-'; line[k++]=' '; } else { line[k++]='`'; line[k++]='-'; line[k++]=' '; } const char* q=last; while(*q && k < (int)sizeof(line)-2) line[k++]=*q++; if(e->flags & 2 && k < (int)sizeof(line)-2) line[k++]='/'; line[k]=0; sh_lines_add(L, line); if(e->flags & 2) rftree_collect(e->name, depth+1, L); }
+    kfree(arr); }
 static void sh_rftree(const char* a){ while(*a==' ') a++; char abs[RAMFS_NAME_MAX]; if(*a) path_resolve(a,abs); else abs[0]=0; if(abs[0] && ramfs_is_dir(abs)!=1){ terminal_writestring("[rftree] not a directory\n"); return; } terminal_writestring("[rftree] tree:\n");
     sh_lines_t L = {0};
     klock_lock(ramfs_fs_lock()); rftree_collect(abs, 0, &L); klock_unlock(ramfs_fs_lock());
     pager_begin(); sh_lines_page(&L); pager_end(); }
 // RAMFS: uso totale
-static void sh_rfusage(const char* a){ (void)a; const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t bytes=0; size_t files=0; size_t dirs=0;
+static void sh_rfusage(const char* a){ (void)a; static const ramfs_entry_t* arr[RAMFS_MAX_FILES]; size_t bytes=0; size_t files=0; size_t dirs=0;
     klock_lock(ramfs_fs_lock());
     size_t n = ramfs_list_locked(arr,RAMFS_MAX_FILES);
     for(size_t i=0;i<n;i++){ if(arr[i]->flags & 2) dirs++; else { files++; bytes += arr[i]->size; } }
