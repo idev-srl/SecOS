@@ -84,6 +84,7 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_udrv_e1000e_elf.h"  // [M58] /sbin/udrv-e1000e
 #include "udrv.h"                            // [M58] udrv_has_net (inittab)
 #include "../crypto/user_taskmgr_elf.h"  // [U5] LVGL task manager (make port-lvgl)
+#include "../crypto/user_thrstress_elf.h" // [U9] pthread stress on musl (make thrstress)
 #ifndef SECOS_NO_BUSYBOX
 #include "../crypto/user_busybox_elf.h"
 #include "../crypto/user_bbstub_elf.h"
@@ -413,6 +414,7 @@ static void build_table(void){
     // [M58] the 82574L driver in ring 3 (started by init when udrv= names a NIC).
     sf_add(SF_BIN, "/sbin/udrv-e1000e", user_udrv_e1000e_elf, user_udrv_e1000e_elf_len, 0, 0, 0755);
     sf_bin("taskmgr", user_taskmgr_elf, user_taskmgr_elf_len);   // [U5]
+    sf_bin("thrstress", user_thrstress_elf, user_thrstress_elf_len);   // [U9] THREADS gate
 #ifndef SECOS_NO_BUSYBOX
     // BusyBox 1.36.1 from source: replaces the coreutils applets of the same
     // name. On ramfs every applet is the signed re-exec stub (user/bbstub.c).
