@@ -107,3 +107,9 @@ int elf_signature_verify(const void* elf_buf, size_t size) {
         return ELF_SIG_BAD;
     return ELF_SIG_OK;
 }
+
+int secos_sig_verify_digest(const uint8_t digest[32], const uint8_t sig[64], uint32_t key_id) {
+    if (elf_sign_key_revoked(key_id)) return ELF_SIG_BAD;
+    if (ed25519_verify(digest, 32, sig, secos_trusted_pubkey) != 1) return ELF_SIG_BAD;
+    return ELF_SIG_OK;
+}

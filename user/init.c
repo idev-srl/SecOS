@@ -44,6 +44,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
+#include <dirent.h>
 #include "libsecos.h"
 
 #define MAX_ENTRIES      16
@@ -363,6 +364,18 @@ static void do_shutdown(int cmd) {
             g_tab[i].restart_at = now_ms();
 }
 
+/* [U6] /var/lib/spkg holds a transaction journal or staging files. */
+static int spkg_pending(void) {
+    if (access("/var/lib/spkg/txn", F_OK) == 0) return 1;
+    DIR* d = opendir("/var/lib/spkg/staging");
+    if (!d) return 0;
+    struct dirent* e; int n = 0;
+    while ((e = readdir(d)))
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) { n = 1; break; }
+    closedir(d);
+    return n;
+}
+
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
     signal(SIGTERM, on_signal);
@@ -381,6 +394,16 @@ int main(int argc, char** argv) {
     say("SecOS init (pid %d): %d entr%s from %s\n", getpid(), g_n, g_n == 1 ? "y" : "ies", tab);
     if (getpid() != 1) say("warning: not running as PID 1\n");
 
+    /* [U6] A package operation was cut by a crash: finish it (committed) or
+     * drop its staging files (not committed) before anything else runs, so no
+     * service sees a half-old, half-new package (/bin/spkg,
+     * docs/devlog/U6-pkg2.md). */
+    if (spkg_pending() && access("/bin/spkg", X_OK) == 0) {
+        static struct entry rec;
+        char line[] = "pkg:sysinit:/bin/spkg recover";
+        say("finishing an interrupted package operation\n");
+        if (parse_line(line, &rec) == 0) run_wait(&rec, SYSINIT_TIMEOUT * 5);
+    }
     for (int i = 0; i < g_n && !g_shutdown; i++)
         if (g_tab[i].action == A_SYSINIT) run_wait(&g_tab[i], SYSINIT_TIMEOUT);
     for (int i = 0; i < g_n; i++)

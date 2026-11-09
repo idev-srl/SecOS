@@ -19,7 +19,7 @@ set -euo pipefail
 reset=0
 if [[ "${1:-}" == "--reset" ]]; then reset=1; shift; fi
 img="${1:?usage: mkroot.sh [--reset] <image> [size]}"
-size="${2:-1G}"
+size="${2:-8G}"   # [U6] 8 GiB sparse: costs only what is used on the host
 
 if [[ -e "$img" && $reset -eq 0 ]]; then
     echo "mkroot: $img already exists (kept; 'make reset-root' recreates it)"

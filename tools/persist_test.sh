@@ -16,18 +16,25 @@
 #   5. a disk with a broken superblock checksum and one with a lost primary
 #      superblock: the boot falls back to RAMFS with a warning and the disk is
 #      left byte-identical.
+# --grow (U6, PKG2 gate): the disk starts as a 1 GiB root holding user data
+# (written on the host), is grown to 8 GiB with `make grow-root` (resize2fs
+# offline) and filled up to its old end, so every write SecOS makes in the
+# whole test lands in block groups resize2fs added; the data must come
+# through intact and df must show the new size.
 # Output: "  [PASS] ..." / "  [FAIL] ..." lines (tools/selftest.sh counts them).
 # Everything lives in a private mktemp directory; the host port is per run
 # (24000-24999), never 2222. Only QEMU processes started here are killed.
 #
-# Usage: tools/persist_test.sh [--crash-runs N] [--keep]
+# Usage: tools/persist_test.sh [--crash-runs N] [--keep] [--grow]
 set -uo pipefail
 CRASH_RUNS=3
 KEEP=0
+GROW=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --crash-runs) shift; CRASH_RUNS=$1 ;;
         --keep) KEEP=1 ;;
+        --grow) GROW=1 ;;
         *) echo "persist_test: unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -38,8 +45,9 @@ W=$(mktemp -d "${TMPDIR:-/tmp}/secos_persist.XXXXXX")
 PORT=$((24000 + $$ % 1000))
 IMG=$W/root.img
 PASSN=0; FAILN=0
-ok() { if [[ "$2" -eq 0 ]]; then echo "  [PASS] PERSIST $1"; PASSN=$((PASSN+1));
-       else echo "  [FAIL] PERSIST $1"; FAILN=$((FAILN+1)); fi; }
+TAGP=PERSIST; [[ $GROW -eq 1 ]] && TAGP="PERSIST(grown)"
+ok() { if [[ "$2" -eq 0 ]]; then echo "  [PASS] $TAGP $1"; PASSN=$((PASSN+1));
+       else echo "  [FAIL] $TAGP $1"; FAILN=$((FAILN+1)); fi; }
 QPID=
 cleanup() {
     [[ -n "$QPID" ]] && kill -9 "$QPID" 2>/dev/null
@@ -114,6 +122,27 @@ dumpf() { debugfs -R "dump $1 $2" "$IMG" >/dev/null 2>&1; }
 
 # ---- 1. first boot on a fresh disk -------------------------------------------------
 bash tools/mkroot.sh "$IMG" 1G >/dev/null
+newfree() { # free blocks in the groups grow-root added (8..63)
+    dumpe2fs "$IMG" 2>/dev/null | awk '/^Group [0-9]+:/{g=($2+0 >= 8)} g && /free blocks,/{f+=$1} END{print f+0}'
+}
+if [[ $GROW -eq 1 ]]; then
+    # A 1 GiB root with data, grown in place, its old space then used up.
+    head -c 8M /dev/urandom >"$W/userdata"
+    printf 'mkdir /home/bob\nwrite %s /home/bob/data.bin\nwrite /dev/null /var/filler\n' "$W/userdata" >"$W/grow1.cmds"
+    debugfs -w -f "$W/grow1.cmds" "$IMG" >/dev/null 2>&1
+    make --no-print-directory grow-root ROOT_IMG="$IMG" SIZE=8G BACKUP=0 >"$W/grow.log" 2>&1; rc=$?
+    ok "make grow-root 1 GiB -> 8 GiB (rc=$rc)" $rc
+    fsck_clean "$IMG" && [[ "$(dumpe2fs -h "$IMG" 2>/dev/null | sed -n 's/^Block count: *//p')" == 2097152 ]]
+    ok "grown disk e2fsck -fn clean, 2097152 blocks" $?
+    # Use up the first 8 groups (the old 1 GiB): from here on every block
+    # SecOS allocates comes from a group resize2fs created.
+    oldfree() { dumpe2fs "$IMG" 2>/dev/null | awk '/^Group [0-9]+:/{g=($2+0 < 8)} g && /free blocks,/{f+=$1} END{print f+0}'; }
+    printf 'fallocate /var/filler 0 %d\n' $(( $(oldfree) - 600 )) >"$W/grow2.cmds"
+    debugfs -w -f "$W/grow2.cmds" "$IMG" >/dev/null 2>&1
+    fsck_clean "$IMG" && (( $(oldfree) < 2000 ))
+    ok "old 1 GiB filled (new writes go to the added groups), still clean" $?
+    NEWFREE0=$(newfree)
+fi
 echo "[persist] boot 1 (image A, fresh disk)..."
 start_vm "$W/a.iso" p1
 waitfor "$PROMPT" 150; ok "boot 1 reaches the bash prompt" $?
@@ -129,8 +158,8 @@ send 'poweroff'
 stop_vm 90; rc=$?
 ok "boot 1 poweroff makes QEMU exit by itself (rc=$rc)" $rc
 grep -aq "\[ROOT\] persistent root fs=ext4 dev=vda journal=on csum=on" "$W/p1.log"; ok "boot 1 root is the journalled metadata_csum ext4 disk" $?
-grep -aEq "\[SYSROOT\] persistent root: written=34 unchanged=0 linked=[1-9][0-9]* .*failed=0" "$W/p1.log"
-ok "boot 1 installs the system files (34 programs + symlinks, no failure)" $?
+grep -aEq "\[SYSROOT\] persistent root: written=35 unchanged=0 linked=[1-9][0-9]* .*failed=0" "$W/p1.log"
+ok "boot 1 installs the system files (35 programs + symlinks, no failure)" $?
 grep -aq "loadkeys: keyboard layout it (saved in /etc/vconsole.conf)" "$W/p1.ser"; ok "boot 1 loadkeys saves the layout" $?
 fsck_clean "$IMG"; ok "boot 1 disk e2fsck-clean after poweroff" $?
 dumpf /etc/dropbear/dropbear_ed25519_host_key "$W/hk1"
@@ -154,6 +183,7 @@ ok "old-format disk simulated ($NBIN programs set to 0644, /tmp 0755)" $?
 echo "[persist] boot 2 (image A again)..."
 start_vm "$W/a.iso" p2
 waitfor "$PROMPT" 150
+[[ $GROW -eq 1 ]] && send "df -k / | tail -n1 | awk '{print \"DF \" \$2}'; md5sum /home/bob/data.bin"
 send 'cat /root/notes.txt /home/alice/f.txt; loadkeys; grep -c ssh-ed25519 /root/.ssh/authorized_keys; tail -n1 /etc/inittab; echo M4-$((20+4))'
 waitfor '^M4-24' 30
 send "stat -c 'MODE %a %U:%G %n' /bin/bash /bin/busybox /bin/ls /tmp /root /root/notes.txt /home/alice /etc/shadow; echo M6-\$((20+6))"
@@ -178,6 +208,13 @@ grep -aq "^# user edit 77" "$W/p2.ser"; ok "boot 2 /etc/inittab edit persisted" 
 dumpf /etc/dropbear/dropbear_ed25519_host_key "$W/hk2"
 cmp -s "$W/hk1" "$W/hk2" && [[ "$HK2" == "$HK1" ]]; ok "boot 2 SSH host key unchanged (file and fingerprint)" $?
 [[ $rc -eq 0 ]] && fsck_clean "$IMG"; ok "boot 2 clean poweroff, e2fsck clean" $?
+if [[ $GROW -eq 1 ]]; then
+    dfk=$(grep -a "^DF " "$W/p2.ser" | head -1 | awk '{print $2}' | tr -d '\r')
+    [[ -n "$dfk" ]] && (( dfk > 8000000 && dfk <= 8388608 )); ok "boot 2 df shows the grown size (${dfk:-?} KiB, about 8 GiB)" $?
+    grep -aq "^$(md5sum <"$W/userdata" | cut -c1-32)  /home/bob/data.bin" "$W/p2.ser"; ok "boot 2 data written before the grow is intact" $?
+    nf=$(newfree)
+    (( NEWFREE0 - nf > 100 )); ok "boot 1+2 writes were allocated in the groups grow-root added ($((NEWFREE0 - nf)) blocks)" $?
+fi
 
 # ---- 3. upgraded kernel image ------------------------------------------------------
 echo "[persist] boot 3 (image B: one program changed, one more baked key)..."
@@ -261,5 +298,9 @@ cp --sparse=always "$IMG" "$W/nosb.img"
 dd if=/dev/zero of="$W/nosb.img" bs=1 seek=$((1024 + 56)) count=2 conv=notrunc status=none # primary magic gone
 corrupt_boot nosb "primary superblock damaged"
 
+if [[ $GROW -eq 1 ]]; then
+    dumpf /home/bob/data.bin "$W/bob.out"
+    cmp -s "$W/userdata" "$W/bob.out"; ok "after every boot and crash, the pre-grow data is still intact" $?
+fi
 echo "[persist] RESULT: $PASSN passed, $FAILN failed"
 [[ $FAILN -eq 0 ]]
