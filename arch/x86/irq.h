@@ -65,7 +65,10 @@ void irq_vec_free(int vec);
 void irq_vec_free_block(int base, uint32_t count);
 
 /* The CPU index a vector is targeted at (-1 if not allocated), and a way to
- * record a new target after the caller reprogrammed the source. */
+ * record a new target after the caller reprogrammed the source. [M56] With
+ * interrupt remapping on, irq_vec_set_cpu also retargets the vector's
+ * remapping entry (the source itself needs no rewrite), and irq_vec_free
+ * clears it. */
 int irq_vec_cpu(int vec);
 int irq_vec_set_cpu(int vec, uint32_t cpu);
 

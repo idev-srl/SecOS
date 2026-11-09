@@ -120,10 +120,47 @@ iommu_domain_t* iommu_dev_domain(const pci_dev_t* dev);
 /* 1 if an enabled unit translates this function's DMA. */
 int  iommu_dev_covered(const pci_dev_t* dev);
 
-/* The MSI message for vector `vec` on CPU index `cpu` for `dev`: the plain
- * compatibility format until interrupt remapping (M56) plugs in. */
+/* The MSI message for vector `vec` on CPU index `cpu` for `dev`: the
+ * remappable format when interrupt remapping is on and covers `dev`, else
+ * the plain compatibility format. */
 int  iommu_irq_compose(const pci_dev_t* dev, int vec, uint32_t cpu,
                        uint64_t* addr, uint32_t* data);
+
+/* ---------------------------------------------- interrupt remapping (M56)
+ * Active only with `iommu=on` (and not `iommu.ir=off`) on hardware whose
+ * every DMA-remapping unit has interrupt remapping + queued invalidation.
+ * Then every MSI / MSI-X message (drivers/pci_msi.c msi_compose) and every
+ * routed IOAPIC line (arch/x86/lapic.c) is in remappable format: one
+ * interrupt-remapping table entry per vector, with source-id validation
+ * (SVT=01b, the requester id; SVT=10b, a bus range, behind a PCIe-to-PCI
+ * bridge; the DMAR scope id for an IOAPIC), compatibility-format interrupts
+ * blocked (GSTS.CFIS clear), x2APIC destinations through EIM when the
+ * hardware has it and the DMAR does not opt out. The IOMMU's own fault MSI
+ * is never remapped. Freeing a vector (irq_vec_free) clears its entry: a
+ * late message from its old source faults instead of being delivered. */
+
+/* 1 when interrupt remapping is on (M57 requires it for ring-3 drivers
+ * that do DMA). */
+int  iommu_ir_enabled(void);
+/* 1 when `dev`'s messages are remapped (IR on and its unit remaps). */
+int  iommu_ir_covers(const pci_dev_t* dev);
+/* irq_vec_free / irq_vec_set_cpu hooks (arch/x86/irq.c): no-ops when off. */
+void iommu_ir_vec_free(int vec);
+void iommu_ir_vec_set_cpu(int vec, uint32_t cpu);
+/* For drivers/pci_msi.c msi_compose(): the remappable message for (dev,
+ * vec, cpu). Returns 0 and fills addr/data, -1 on error, or 1 when IR does
+ * not apply to this device (the caller then uses the compatibility
+ * format). */
+int  iommu_ir_msi_compose(const pci_device_t* dev, uint8_t vec, uint32_t cpu,
+                          uint64_t* addr, uint32_t* data);
+
+typedef struct {
+    uint64_t total;          /* IR faults recorded (not in the DMA total)    */
+    uint64_t logged, suppressed;
+    uint16_t last_bdf, last_index;
+    uint8_t  last_reason;
+} iommu_ir_fault_stats_t;
+void iommu_ir_fault_stats(iommu_ir_fault_stats_t* out);
 
 /* ------------------------------------------------------------------ faults */
 /* Fault reasons are vendor codes; the name helper is vendor aware. */
@@ -133,10 +170,13 @@ typedef struct {
     uint8_t  reason;         /* vendor fault reason                          */
     uint8_t  is_write;       /* 1 write, 0 read                              */
     uint8_t  unit;
+    uint8_t  is_ir;          /* M56: an interrupt-remapping fault (iova 0)   */
+    uint16_t ir_index;       /* M56: the interrupt index it named            */
 } iommu_fault_t;
 
-/* Called for every recorded DMA fault, in interrupt context, with no IOMMU
- * lock held (M57: attribute the fault to a ring-3 binding and kill it). */
+/* Called for every recorded DMA fault and (M56) interrupt-remapping fault
+ * (is_ir set), in interrupt context, with no IOMMU lock held (M57:
+ * attribute the fault to a ring-3 binding and kill it). */
 typedef void (*iommu_fault_hook_t)(const iommu_fault_t* f);
 void iommu_set_fault_hook(iommu_fault_hook_t hook);
 
@@ -194,6 +234,13 @@ typedef struct iommu_ops {
     /* Turn translation on (after the boot attaches); 0 if any unit is on. */
     int      (*enable)(void);
     void     (*generate)(void (*emit)(void* ctx, const char* line), void* ctx);
+    /* M56 interrupt remapping (all optional). ir_init runs after enable(). */
+    int      (*ir_init)(void);
+    int      (*ir_enabled)(void);
+    int      (*ir_covers)(const pci_dev_t* dev);
+    void     (*ir_free)(int vec);
+    int      (*ir_set_cpu)(int vec, uint32_t cpu);
+    void     (*ir_generate)(void (*emit)(void* ctx, const char* line), void* ctx);
 } iommu_ops_t;
 
 /* Called by the vendor layer. */

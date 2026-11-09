@@ -567,9 +567,107 @@ static int vtd_set_context(iommu_domain_t* d, const pci_dev_t* dev) {
 static int vtd_covers(const pci_dev_t* dev) { return unit_for(dev->seg, dev_sid(dev)) != NULL; }
 
 static int vtd_irq_compose(const pci_dev_t* dev, int vec, uint32_t cpu, uint64_t* addr, uint32_t* data) {
-    /* M56: the remappable format goes here. */
-    pci_device_t pd = { dev->bus, dev->slot, dev->func, dev->vendor_id, dev->device_id };
-    return msi_compose(&pd, (uint8_t)vec, cpu, addr, data);
+    return vtd_ir_compose(dev, vec, cpu, addr, data);   /* M56: vtd_ir.c */
+}
+
+/* ------------------------------------- unit access for vtd_ir.c (M56) */
+static vtd_unit_t* unit_at(int i) {
+    return (i >= 0 && i < g_nunits && g_unit[i].used) ? &g_unit[i] : NULL;
+}
+int      vtd_unit_count(void) { return g_nunits; }
+int      vtd_unit_used(int i) { vtd_unit_t* u = unit_at(i); return u && u->active; }
+uint64_t vtd_unit_ecap(int i) { vtd_unit_t* u = unit_at(i); return u ? u->ecap : 0; }
+int      vtd_unit_has_qi(int i) { vtd_unit_t* u = unit_at(i); return u && u->use_qi; }
+uint32_t vtd_unit_index(int i) { vtd_unit_t* u = unit_at(i); return u ? u->drhd_idx : 0; }
+uint32_t vtd_unit_gsts(int i) { vtd_unit_t* u = unit_at(i); return u ? r32(u, VTD_REG_GSTS) : 0; }
+
+int vtd_unit_gcmd(int i, uint32_t bit, int on) {
+    vtd_unit_t* u = unit_at(i);
+    if (!u) return -1;
+    uint64_t f = spin_lock_irqsave(&u->lock);
+    int rc = gcmd(u, bit, on);
+    spin_unlock_irqrestore(&u->lock, f);
+    return rc;
+}
+
+static int iec_locked(vtd_unit_t* u, uint32_t index, uint32_t count) {
+    if (!u->use_qi) return -1;                 /* IEC exists only as a QI descriptor */
+    uint64_t lo = VTD_QI_IEC;
+    if (count) {
+        uint32_t im = 0;
+        while ((1u << im) < count && im < 16) im++;
+        lo |= VTD_QI_IEC_INDEX | ((uint64_t)im << 27) | ((uint64_t)(index & 0xFFFF) << 32);
+    }
+    if (qi_push(u, lo, 0)) return -1;
+    return qi_sync(u);
+}
+
+int vtd_unit_iec(int i, uint32_t index, uint32_t count) {
+    vtd_unit_t* u = unit_at(i);
+    if (!u) return -1;
+    uint64_t f = spin_lock_irqsave(&u->lock);
+    int rc = iec_locked(u, index, count);
+    spin_unlock_irqrestore(&u->lock, f);
+    return rc;
+}
+
+int vtd_unit_set_irta(int i, uint64_t irta) {
+    vtd_unit_t* u = unit_at(i);
+    if (!u) return -1;
+    uint64_t f = spin_lock_irqsave(&u->lock);
+    w64(u, VTD_REG_IRTA, irta);
+    w32(u, VTD_REG_GCMD, (r32(u, VTD_REG_GSTS) & VTD_GSTS_PERSIST) | VTD_GCMD_SIRTP);
+    int rc = wait_gsts(u, VTD_GSTS_IRTPS, VTD_GSTS_IRTPS);
+    /* The new table pointer is used only after a global IEC invalidation. */
+    if (rc == 0) rc = iec_locked(u, 0, 0);
+    spin_unlock_irqrestore(&u->lock, f);
+    return rc;
+}
+
+int vtd_unit_for_dev(const pci_dev_t* dev) {
+    vtd_unit_t* u = dev ? unit_for(dev->seg, dev_sid(dev)) : NULL;
+    return u ? (int)(u - g_unit) : -1;
+}
+
+int vtd_unit_for_sid(uint16_t seg, uint16_t sid) {
+    /* IOAPIC / HPET scopes: the DRHD that lists the special device. */
+    const acpi_dmar_t* dm = acpi_dmar_get();
+    for (int i = 0; i < g_nunits; i++) {
+        vtd_unit_t* u = &g_unit[i];
+        if (!u->used || !u->drhd || u->drhd->segment != seg) continue;
+        const dmar_drhd_t* r = u->drhd;
+        for (uint32_t k = 0; k < r->scope_count && r->scope_first + k < DMAR_MAX_SCOPES; k++) {
+            const dmar_scope_t* sc = &dm->scopes[r->scope_first + k];
+            if ((sc->type == DMAR_SCOPE_IOAPIC || sc->type == DMAR_SCOPE_HPET) &&
+                sc->resolved && sc->bdf == sid)
+                return i;
+        }
+    }
+    /* An INCLUDE_PCI_ALL unit covers every source no other unit claims. */
+    vtd_unit_t* u = unit_for(seg, sid);
+    return u ? (int)(u - g_unit) : -1;
+}
+
+void vtd_dev_requester(const pci_dev_t* dev, uint16_t* sid, uint8_t* svt) {
+    *sid = dev_sid(dev);
+    *svt = 1;
+    uint16_t alias = 0;
+    if (!dev_alias(dev, &alias) || alias == *sid) return;
+    /* The alias of a PCIe-to-PCI bridge is (secondary bus, 00.0): conventional
+     * devices behind it may present any id on that bus range, so verify the
+     * bus range (SVT=10b); a conventional bridge forwards with its own id. */
+    int hops = 0;
+    for (int16_t up = dev->parent; up >= 0 && hops++ < 32; ) {
+        const pci_dev_t* b = pci_dev_at(up);
+        if (!b) break;
+        if (b->pcie_type == PCI_EXP_PCIE_TO_PCI && DMAR_BDF(b->sec_bus, 0, 0) == alias) {
+            *sid = (uint16_t)(((uint16_t)b->sec_bus << 8) | b->sub_bus);
+            *svt = 2;
+            return;
+        }
+        up = b->parent;
+    }
+    *sid = alias;
 }
 
 static const char* vtd_fault_reason(uint8_t r) {
@@ -587,7 +685,9 @@ static const char* vtd_fault_reason(uint8_t r) {
     case 0x0B: return "reserved bit in context entry";
     case 0x0C: return "reserved bit in page-table entry";
     case 0x0D: return "translation type blocked";
-    default: return "other";
+    default:
+        if (r >= VTD_FR_IR_FIRST && r <= VTD_FR_IR_LAST) return vtd_ir_fault_reason(r);
+        return "other";
     }
 }
 
@@ -615,6 +715,11 @@ static int drain_unit(vtd_unit_t* u, iommu_fault_t* out, int max, int* ovf) {
             r->is_write = ((hi >> 62) & 1) ? 0 : 1;      /* T: 1 = read */
             r->iova = lo & ~0xFFFull;
             r->unit = (uint8_t)u->drhd_idx;
+            /* M56: interrupt-remapping faults carry the IRTE index in
+             * FI[63:48] instead of a page address. */
+            r->is_ir = (r->reason >= VTD_FR_IR_FIRST && r->reason <= VTD_FR_IR_LAST);
+            r->ir_index = r->is_ir ? (uint16_t)(lo >> 48) : 0;
+            if (r->is_ir) r->iova = 0;
             w32(u, off + 12, 0x80000000u);                /* F is RW1C */
         }
     }
@@ -881,6 +986,12 @@ static const iommu_ops_t g_vtd_ops = {
     .fault_poll = vtd_fault_poll,
     .enable = vtd_enable,
     .generate = vtd_generate,
+    .ir_init = vtd_ir_init,
+    .ir_enabled = vtd_ir_enabled,
+    .ir_covers = vtd_ir_covers,
+    .ir_free = vtd_ir_free,
+    .ir_set_cpu = vtd_ir_set_cpu,
+    .ir_generate = vtd_ir_generate,
 };
 
 /* Probe every usable DRHD, pick the common page-table format, set the

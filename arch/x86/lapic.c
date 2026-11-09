@@ -18,6 +18,7 @@
 #include "acpi.h"       /* acpi_get / acpi_irq_to_gsi — discovered topology */
 #include "vmm.h"        /* phys_to_virt / vmm_map_mmio */
 #include "debugcon.h"
+#include "spinlock.h"
 #include <stddef.h>
 
 /* IA32_APIC_BASE MSR: bit11 = global enable, bits 12.. = APIC base phys addr. */
@@ -57,7 +58,21 @@
 #define ICR_DELIVERY_PENDING (1u << 12)
 
 static volatile uint32_t* g_lapic;   /* mapped LAPIC base, NULL until enabled */
-static volatile uint32_t* g_ioapic;  /* mapped IOAPIC base, NULL until routed  */
+/* [M56] Routed IOAPIC lines, so the interrupt-remapping switchover can
+ * rewrite every live redirection entry. g_ioapic_lock (LK_S61_IOAPIC) guards
+ * the table and each IOREGSEL/IOWIN pair; the remap callback (which programs
+ * the IOMMU's remapping entry, S63/S68) runs outside it. */
+#define IOAPIC_MAX_LINES 8
+typedef struct {
+    uint8_t  used, irq, vector, ioapic, level, low;
+    uint32_t idx;                    /* pin on that IOAPIC                     */
+    uint32_t dest;                   /* destination APIC ID                    */
+    uint8_t  remapped;               /* current RTE is in remappable format    */
+} ioapic_line_t;
+static ioapic_line_t g_lines[IOAPIC_MAX_LINES];
+static volatile uint32_t* g_ioapic_regs[ACPI_MAX_IOAPICS];
+static spinlock_t g_ioapic_lock = SPINLOCK_INIT_CLASS(LK_S61_IOAPIC, "ioapic");
+static ioapic_remap_fn g_ioapic_remap;   /* NULL: compatibility format         */
 static int g_apic_mode;              /* 1 once the APIC owns hardware IRQs      */
 static uint32_t g_timer_init;        /* periodic LAPIC-timer count (BSP-calibrated) */
 static int g_x2apic;                 /* [M48] 1 = LAPICs run in x2APIC (MSR) mode   */
@@ -168,47 +183,170 @@ void irq_eoi(void) {
 }
 
 /* IOAPIC indirect register access: select via IOREGSEL (base+0x00), read/write
- * the 32-bit window IOWIN (base+0x10). */
-static void ioapic_write(uint32_t reg, uint32_t val) {
-    g_ioapic[0x00 / 4] = reg;
-    g_ioapic[0x10 / 4] = val;
+ * the 32-bit window IOWIN (base+0x10). g_ioapic_lock held. */
+static void ioapic_write(volatile uint32_t* io, uint32_t reg, uint32_t val) {
+    io[0x00 / 4] = reg;
+    io[0x10 / 4] = val;
+}
+
+#define RTE_MASKED       (1u << 16)
+#define RTE_ACTIVE_LOW   (1u << 13)
+#define RTE_LEVEL        (1u << 15)
+#define RTE_HANDLE15     (1u << 11)      /* remappable: handle[15]            */
+#define RTE_HI_REMAP     (1u << 16)      /* bit 48: interrupt format = remap  */
+
+/* Build a line's redirection entry. Compatibility format: fixed delivery,
+ * physical destination (8-bit APIC ID in bits 63:56). [M56] Remappable
+ * format (VT-d 5.1.5.1): bit 48 set, handle[14:0] in bits 63:49, handle[15]
+ * in bit 11, delivery mode 0, vector = the remapping entry's vector (the
+ * EOI broadcast matches on it); trigger mode and polarity as before. */
+static void rte_build(const ioapic_line_t* ln, int remap, uint16_t handle, int masked,
+                      uint32_t* low, uint32_t* high) {
+    uint32_t lo = ln->vector;
+    if (ln->low)   lo |= RTE_ACTIVE_LOW;
+    if (ln->level) lo |= RTE_LEVEL;
+    if (masked)    lo |= RTE_MASKED;
+    uint32_t hi;
+    if (remap) {
+        if (handle & 0x8000) lo |= RTE_HANDLE15;
+        hi = RTE_HI_REMAP | ((uint32_t)(handle & 0x7FFF) << 17);
+    } else {
+        hi = (ln->dest & 0xFF) << 24;
+    }
+    *low = lo; *high = hi;
+}
+
+/* Write one line's entry: destination word first, then the low word (which
+ * carries the mask bit). g_ioapic_lock held. */
+static void rte_write(const ioapic_line_t* ln, uint32_t low, uint32_t high) {
+    volatile uint32_t* io = g_ioapic_regs[ln->ioapic];
+    if (!io) return;
+    ioapic_write(io, 0x10 + 2 * ln->idx, low | RTE_MASKED);   /* never half-written live */
+    ioapic_write(io, 0x11 + 2 * ln->idx, high);
+    ioapic_write(io, 0x10 + 2 * ln->idx, low);
+}
+
+/* The remappable handle for a line (the callback programs the remapping
+ * entry; no IOAPIC lock held). 0 or -1. */
+static int line_remap(const ioapic_line_t* ln, ioapic_remap_fn fn, uint16_t* handle) {
+    const acpi_topology_t* t = acpi_get();
+    return fn(t->ioapics[ln->ioapic].id, ln->vector, ln->dest, ln->level, handle);
 }
 
 /* Route one ISA IRQ through the IOAPIC to `vector`, delivered to `dest_apic_id`.
  * Honours the MADT interrupt-source-override polarity/trigger flags. */
-static void ioapic_route_irq(uint8_t irq, uint8_t vector, uint8_t dest_apic_id) {
+static void ioapic_route_irq(uint8_t irq, uint8_t vector, uint32_t dest_apic_id) {
     const acpi_topology_t* t = acpi_get();
     uint16_t flags = 0;
     uint32_t gsi = acpi_irq_to_gsi(irq, &flags);
 
     /* Pick the IOAPIC whose GSI window contains this GSI (almost always #0). */
-    uint64_t base = t->ioapics[0].base;
-    uint32_t gsi_base = t->ioapics[0].gsi_base;
-    for (uint32_t i = 0; i < t->ioapic_count; i++)
-        if (gsi >= t->ioapics[i].gsi_base) { base = t->ioapics[i].base; gsi_base = t->ioapics[i].gsi_base; }
-    uint32_t idx = gsi - gsi_base;
+    uint32_t which = 0;
+    for (uint32_t i = 0; i < t->ioapic_count && i < ACPI_MAX_IOAPICS; i++)
+        if (gsi >= t->ioapics[i].gsi_base) which = i;
+    uint32_t idx = gsi - t->ioapics[which].gsi_base;
 
-    uint64_t iv = vmm_map_mmio(base, 0x1000, VMM_CACHE_UC);   /* [M49] uncached MMIO */
+    uint64_t iv = vmm_map_mmio(t->ioapics[which].base, 0x1000, VMM_CACHE_UC);   /* [M49] uncached MMIO */
     if (!iv) return;
-    g_ioapic = (volatile uint32_t*)iv;
 
+    ioapic_line_t ln = { 1, irq, vector, (uint8_t)which, 0, 0, idx, dest_apic_id, 0 };
     /* MADT flags: bits[1:0] polarity (11=active-low), bits[3:2] trigger (11=level).
      * 0/conforms => ISA default: active-high, edge. */
-    uint32_t low = vector;                 /* fixed delivery, physical dest, unmasked */
-    if ((flags & 0x3) == 0x3)  low |= (1u << 13);   /* active low  */
-    if ((flags & 0xC) == 0xC)  low |= (1u << 15);   /* level trig  */
-    uint32_t high = (uint32_t)dest_apic_id << 24;
+    ln.low = (flags & 0x3) == 0x3;
+    ln.level = (flags & 0xC) == 0xC;
 
-    /* Redirection entry: low = 0x10 + 2*idx, high = 0x11 + 2*idx. Program high
-     * (destination) before unmasking via the low word. */
-    ioapic_write(0x11 + 2 * idx, high);
-    ioapic_write(0x10 + 2 * idx, low);
+    /* [M56] Remappable format once interrupt remapping owns the IOAPIC: the
+     * remapping entry first (outside the IOAPIC lock); a line that cannot be
+     * remapped stays masked (a compatibility-format request would be
+     * blocked anyway). */
+    ioapic_remap_fn fn = __atomic_load_n(&g_ioapic_remap, __ATOMIC_ACQUIRE);
+    uint16_t handle = 0;
+    int masked = 0;
+    if (fn) {
+        if (line_remap(&ln, fn, &handle) == 0) ln.remapped = 1;
+        else { masked = 1; debugcon_writestring("[APIC] IOAPIC line left masked: no remapping entry\n"); }
+    }
+    uint32_t low, high;
+    rte_build(&ln, ln.remapped, handle, masked, &low, &high);
+
+    uint64_t f = spin_lock_irqsave(&g_ioapic_lock);
+    g_ioapic_regs[which] = (volatile uint32_t*)iv;
+    int slot = -1;
+    for (int i = 0; i < IOAPIC_MAX_LINES; i++) {
+        if (g_lines[i].used && g_lines[i].ioapic == which && g_lines[i].idx == idx) { slot = i; break; }
+        if (!g_lines[i].used && slot < 0) slot = i;
+    }
+    if (slot >= 0) g_lines[slot] = ln;
+    rte_write(&ln, low, high);
+    spin_unlock_irqrestore(&g_ioapic_lock, f);
 
     debugcon_writestring("[APIC] IOAPIC route irq="); debugcon_print_hex(irq);
     debugcon_writestring(" gsi="); debugcon_print_hex(gsi);
     debugcon_writestring(" vec="); debugcon_print_hex(vector);
     debugcon_writestring(" flags="); debugcon_print_hex(flags);
-    debugcon_writestring("\n");
+    debugcon_writestring(ln.remapped ? " remapped\n" : "\n");
+}
+
+/* [M56] Interrupt-remapping switchover for the IOAPIC (see lapic.h). */
+int ioapic_remap_switch(ioapic_remap_fn fn, int (*enable)(void* ctx), void* ctx) {
+    ioapic_line_t snap[IOAPIC_MAX_LINES];
+    uint16_t handle[IOAPIC_MAX_LINES];
+    int ok[IOAPIC_MAX_LINES];
+    uint32_t low, high;
+
+    /* 1. Mask every live line (compatibility format, still deliverable
+     *    until IR is on). */
+    uint64_t f = spin_lock_irqsave(&g_ioapic_lock);
+    for (int i = 0; i < IOAPIC_MAX_LINES; i++) {
+        snap[i] = g_lines[i];
+        if (!snap[i].used) continue;
+        rte_build(&snap[i], 0, 0, 1, &low, &high);
+        rte_write(&snap[i], low, high);
+    }
+    spin_unlock_irqrestore(&g_ioapic_lock, f);
+
+    /* 2. Remapping entries for each line (IR still off: nothing uses them). */
+    int bad = 0;
+    for (int i = 0; i < IOAPIC_MAX_LINES; i++) {
+        ok[i] = 0; handle[i] = 0;
+        if (!snap[i].used) continue;
+        ok[i] = line_remap(&snap[i], fn, &handle[i]) == 0;
+        if (!ok[i]) bad++;
+    }
+
+    /* 3. Interrupt remapping on (every unit), unless a line has no entry. */
+    int rc = bad ? -1 : enable(ctx);
+
+    /* 4. Rewrite + unmask: remappable format on success, else the old
+     *    compatibility entries come back as they were. */
+    f = spin_lock_irqsave(&g_ioapic_lock);
+    for (int i = 0; i < IOAPIC_MAX_LINES; i++) {
+        if (!snap[i].used) continue;
+        rte_build(&snap[i], rc == 0, handle[i], 0, &low, &high);
+        rte_write(&snap[i], low, high);
+        if (g_lines[i].used) g_lines[i].remapped = (rc == 0);
+    }
+    if (rc == 0) __atomic_store_n(&g_ioapic_remap, fn, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&g_ioapic_lock, f);
+
+    /* 5. An edge that arrived while a line was masked may be lost (a real
+     *    IOAPIC drops it; the 8042 then keeps its output buffer full and never
+     *    raises a new edge): if the controller holds a byte, run its handler
+     *    once by a self-IPI on that line's vector. Handlers read the status
+     *    port first, so a spurious call is harmless. */
+    uint8_t st = inb(0x64);
+    if (st & 1) {
+        uint8_t want = (st & 0x20) ? 12 : 1;
+        for (int i = 0; i < IOAPIC_MAX_LINES; i++)
+            if (snap[i].used && snap[i].irq == want) { lapic_ipi(lapic_get_id(), snap[i].vector); break; }
+    }
+    return rc;
+}
+
+int ioapic_line_count(void) {
+    int n = 0;
+    for (int i = 0; i < IOAPIC_MAX_LINES; i++) n += g_lines[i].used;
+    return n;
 }
 
 /* Calibrate the LAPIC timer against PIT channel 2 (which is independent of the
@@ -282,7 +420,7 @@ int apic_switchover(uint32_t hz) {
     outb(0xA1, 0xFF);
 
     /* Route the keyboard (ISA IRQ1) to VEC_KEYBOARD on the boot CPU. */
-    ioapic_route_irq(1, VEC_KEYBOARD, (uint8_t)t->bsp_lapic_id);
+    ioapic_route_irq(1, VEC_KEYBOARD, t->bsp_lapic_id);
 
     uint64_t tps = lapic_timer_start(hz);
     if (tps == 0) {
@@ -305,7 +443,7 @@ int apic_switchover(uint32_t hz) {
  * cascade line on the master). */
 void irq_enable_aux(void) {
     if (g_apic_mode) {
-        ioapic_route_irq(12, VEC_MOUSE, (uint8_t)acpi_get()->bsp_lapic_id);
+        ioapic_route_irq(12, VEC_MOUSE, acpi_get()->bsp_lapic_id);
     } else {
         outb(0xA1, (uint8_t)(inb(0xA1) & ~(1u << 4)));   /* IRQ12 = slave line 4 */
         outb(0x21, (uint8_t)(inb(0x21) & ~(1u << 2)));   /* cascade (IRQ2) */

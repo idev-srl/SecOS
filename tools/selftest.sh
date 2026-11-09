@@ -3280,6 +3280,26 @@ while IFS= read -r l; do
 done </tmp/secos_selftest_m54.out
 grep -q "^\[iommu-gate\] [0-9]* passed, 0 failed" /tmp/secos_selftest_m54.out; check "M54 VT-d gate ran to completion, no failure" $?
 
+# ---- M56: VT-d interrupt remapping (tools/ir_gate.sh) ----
+# q35 + intel-iommu,intremap=on with iommu=on: in-kernel IR tests (edu MSI
+# delivered / retargeted / source-id mismatch blocked / stale entry after
+# irq_vec_free blocked / DMA-injected messages blocked / injection storm),
+# every driver's I/O with remapped MSI-X / MSI (incl. -DXHCI_USE_IRQ
+# -DNVME_USE_IRQ), PS/2 keyboard + mouse on remapped IOAPIC lines, QEMU 9.2
+# x2APIC + EIM, SMP stress (IPIs / shootdowns), iommu.ir=off, no-IR
+# hardware, iommu.qi=off, the default image, lockdep -smp 4.
+echo "[selftest] Running the M56 interrupt-remapping gate (~30-40 min)..."
+tools/ir_gate.sh >/tmp/secos_selftest_m56.out 2>&1
+while IFS= read -r l; do
+    case "$l" in
+        "[iommu] "*": PASS") n="${l#\[iommu\] }"; check "M56 IR ${n%: PASS}" 0 ;;
+        "[iommu] "*": FAIL"*) n="${l#\[iommu\] }"; check "M56 IR ${n%%: FAIL*}" 1 ;;
+        "[iommu] "*" FAIL"*) echo "    $l" ;;
+        "[ir-gate] SKIP"*) echo "  [SKIP] ${l#\[ir-gate\] SKIP }" ;;
+    esac
+done </tmp/secos_selftest_m56.out
+grep -q "^\[ir-gate\] [0-9]* passed, 0 failed" /tmp/secos_selftest_m56.out; check "M56 IR gate ran to completion, no failure" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
