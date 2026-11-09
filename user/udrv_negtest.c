@@ -168,7 +168,7 @@ static void pre_close(void) { close(g_fd); }
 /* Table A: no claim needed. Columns: DMA, MMIO, NODEV, USER. */
 static const row_t g_a[] = {
     { "A01", "op 0", C_UDRV, 0, H_NONE, A_BUF, 0, 0, 0, 0, ALL(-EINVAL_), NULL },
-    { "A02", "op 11 (past RELEASE)", C_UDRV, 11, H_NONE, A_BUF, 0, 0, 0, 0, ALL(-EINVAL_), NULL },
+    { "A02", "op 12 (past NET_ATTACH)", C_UDRV, 12, H_NONE, A_BUF, 0, 0, 0, 0, ALL(-EINVAL_), NULL },
     { "A03", "op 2^32+1 (upper bits set)", C_UDRV, 0x100000001L, H_NONE, A_BUF, SZ_EXACT, EDU_BYID, 0, ALL(-EINVAL_), NULL },
     { "A04", "op -1", C_UDRV, -1L, H_NONE, A_BUF, 0, 0, 0, 0, ALL(-EINVAL_), NULL },
     { "A05", "CLAIM size sizeof-1", C_UDRV, UDRV_OP_CLAIM, H_NONE, A_BUF, SZ_MINUS1, EDU_BYID, 0, ALL(-EINVAL_), NULL },

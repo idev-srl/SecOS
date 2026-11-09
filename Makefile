@@ -362,6 +362,12 @@ $(KERNEL): $(OBJS) linker.ld $(KASLR_TOOL)
 # Create bootable ISO image. KERNEL_CMDLINE is passed on the multiboot2 line
 # (e.g. `make iso KERNEL_CMDLINE=nokaslr` disables KASLR for that image).
 KERNEL_CMDLINE ?=
+# [M58] `make iso UDRV=8086:10d3` gives that PCI function (vvvv:dddd or
+# bb:dd.f, comma-separated) to a ring-3 driver: adds `iommu=on udrv=...` to
+# the default boot entry (ring-3 DMA needs the IOMMU with interrupt remapping;
+# docs/devlog/M58-udrv-e1000e.md).
+UDRV ?=
+override KERNEL_CMDLINE := $(strip $(KERNEL_CMDLINE) $(if $(strip $(UDRV)),iommu=on udrv=$(strip $(UDRV))))
 iso: $(KERNEL)
 	mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/kernel.bin
@@ -676,6 +682,12 @@ udrv-progs:
 	    python3 tools/secos-sign user/$$n.elf --dev || exit 1; \
 	    python3 tools/elf2h.py user/$$n.elf user_$${n}_elf crypto/user_$${n}_elf.h || exit 1; \
 	done
+	@# [M58] /sbin/udrv-e1000e, the 82574L driver in ring 3 (docs/devlog/M58-udrv-e1000e.md).
+	$(CC) $(USER_CFLAGS) -c user/udrv/note_e1000e.S -o user/udrv/note_e1000e.o
+	$(CC) $(USER_CFLAGS) -c user/udrv/e1000e.c      -o user/udrv/e1000e.o
+	$(LD) --gc-sections -T user/user.ld -o user/udrv/e1000e.elf user/crt0.o user/udrv/note_e1000e.o user/libsecos.o user/libc.o user/udrv/e1000e.o
+	python3 tools/secos-sign user/udrv/e1000e.elf --dev
+	python3 tools/elf2h.py user/udrv/e1000e.elf user_udrv_e1000e_elf crypto/user_udrv_e1000e_elf.h
 
 # [U6] /bin/spkg, the package installer v2 (docs/devlog/U6-pkg2.md): confined
 # manifest (CAP_ENFORCE|FS_READ|FS_WRITE|SIGNAL|TIME), SHA-256 from crypto/,

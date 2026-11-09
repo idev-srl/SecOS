@@ -81,6 +81,8 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_udrv_edu_elf.h"
 #include "../crypto/user_udrv_negtest_elf.h"
 #include "../crypto/user_udrv_user_elf.h"
+#include "../crypto/user_udrv_e1000e_elf.h"  // [M58] /sbin/udrv-e1000e
+#include "udrv.h"                            // [M58] udrv_has_net (inittab)
 #include "../crypto/user_taskmgr_elf.h"  // [U5] LVGL task manager (make port-lvgl)
 #ifndef SECOS_NO_BUSYBOX
 #include "../crypto/user_busybox_elf.h"
@@ -207,6 +209,7 @@ static void sf_conf(const char* path, const char* text){ sf_conf_mode(path, text
 static const struct { const char* p; uint16_t mode; uint8_t flags; } g_dirs[] = {
     { "/",              0755,  0 },
     { "/bin",           0755,  SD_CREATE },
+    { "/sbin",          0755,  SD_CREATE },   /* [M58] ring-3 drivers */
     { "/etc",           0755,  SD_CREATE },
     { "/etc/dropbear",  0700,  SD_CREATE },   /* the SSH host key */
     { "/etc/skel",      0755,  SD_CREATE },   /* copied into new homes (useradd) */
@@ -247,7 +250,7 @@ static const char g_default_passwd[] = "root:x:0:0:root:/root:/bin/bash\n";
 // hook (`startgui --auto` is a no-op unless /etc/gui-autostart, or the build
 // default on /proc/cmdline when the file is absent, enables it). Format:
 // docs/devlog/M40-init.md.
-#define INITTAB_TEXT(console_line) \
+#define INITTAB_TEXT(driver_line, console_line) \
     "# /etc/inittab - SecOS init (PID 1). One entry per line:\n" \
     "#   <id>:<action>:<command> [args...]\n" \
     "# id       short name, used in messages and for /var/log/<id>.log\n" \
@@ -258,7 +261,10 @@ static const char g_default_passwd[] = "root:x:0:0:root:/root:/bin/bash\n";
     "#                    console as controlling tty and foreground group\n" \
     "#          once      start at boot, never restarted\n" \
     "#          shutdown  run (and waited for) when the system goes down\n" \
+    "#          driver    a ring-3 device driver: started before the sysinit\n" \
+    "#                    entries, restarted within 1-2 s when it dies\n" \
     "# The command is split on blanks and run directly (no shell, no quoting).\n" \
+    driver_line \
     "net:sysinit:/bin/ifup -t 10\n" \
     "sshd:respawn:/bin/dropbearmulti dropbear -F -R -p 22\n" \
     console_line \
@@ -268,12 +274,17 @@ static const char g_default_passwd[] = "root:x:0:0:root:/root:/bin/bash\n";
 // [M43] The console runs /bin/login (getty-style, docs/USERS.md); a build with
 // CONSOLE=root (-DSECOS_CONSOLE_ROOT, what the selftest uses) keeps the root
 // bash of before. The text before M43 is exactly the root variant.
-static const char g_inittab_login[] = INITTAB_TEXT("console:console:/bin/login\n");
-static const char g_inittab_root[]  = INITTAB_TEXT("console:console:/bin/bash -i\n");
+static const char g_inittab_login[] = INITTAB_TEXT("", "console:console:/bin/login\n");
+static const char g_inittab_root[]  = INITTAB_TEXT("", "console:console:/bin/bash -i\n");
+// [M58] The same with the ring-3 NIC driver, used when udrv= gives a network
+// function to ring 3 on this boot (docs/devlog/M58-udrv-e1000e.md).
+#define INITTAB_DRV "net0:driver:/sbin/udrv-e1000e\n"
+static const char g_inittab_login_drv[] = INITTAB_TEXT(INITTAB_DRV, "console:console:/bin/login\n");
+static const char g_inittab_root_drv[]  = INITTAB_TEXT(INITTAB_DRV, "console:console:/bin/bash -i\n");
 #ifdef SECOS_CONSOLE_ROOT
-#define g_default_inittab g_inittab_root
+#define g_default_inittab (udrv_has_net() ? g_inittab_root_drv : g_inittab_root)
 #else
-#define g_default_inittab g_inittab_login
+#define g_default_inittab (udrv_has_net() ? g_inittab_login_drv : g_inittab_login)
 #endif
 #endif
 #ifndef SECOS_NO_BASH
@@ -388,6 +399,8 @@ static void build_table(void){
     sf_bin("udrv_edu", user_udrv_edu_elf, user_udrv_edu_elf_len);
     sf_bin("udrv_negtest", user_udrv_negtest_elf, user_udrv_negtest_elf_len);
     sf_bin("udrv_user", user_udrv_user_elf, user_udrv_user_elf_len);
+    // [M58] the 82574L driver in ring 3 (started by init when udrv= names a NIC).
+    sf_add(SF_BIN, "/sbin/udrv-e1000e", user_udrv_e1000e_elf, user_udrv_e1000e_elf_len, 0, 0, 0755);
     sf_bin("taskmgr", user_taskmgr_elf, user_taskmgr_elf_len);   // [U5]
 #ifndef SECOS_NO_BUSYBOX
     // BusyBox 1.36.1 from source: replaces the coreutils applets of the same
@@ -578,6 +591,20 @@ static int file_equals(const char* path, const void* data, size_t len){
         for(size_t i=0;i<n;i++) if(g_cmpbuf[i]!=d[off+i]) return 0;
     }
     return 1;
+}
+/* [M58] Does the (small) text file contain `word`? Reads the first 4 KiB. */
+static uint8_t g_scanbuf[4096];
+static int file_contains(const char* path, const char* word){
+    vfs_inode_t* ino=vfs_lookup(path);
+    if(!ino || ino->type!=VFS_NODE_FILE || !ino->ops || !ino->ops->read) return 0;
+    size_t len = ino->size < sizeof(g_scanbuf) ? ino->size : sizeof(g_scanbuf);
+    int n = ino->ops->read(ino, 0, g_scanbuf, len);
+    size_t wl = sr_len(word);
+    for(int i=0; n>0 && (size_t)i + wl <= (size_t)n; i++){
+        size_t k=0; while(k<wl && g_scanbuf[i+k]==(uint8_t)word[k]) k++;
+        if(k==wl) return 1;
+    }
+    return 0;
 }
 /* Kernel-owned text file (release stamp): rewrite only when it differs. */
 static int write_if_changed(const char* path, const char* text){
@@ -783,13 +810,26 @@ static void ensure_groups(void){
  * so switching the build switches an untouched system too. */
 static void update_default_inittab(void){
 #ifndef SECOS_NO_INIT
+    // [M58] Four default texts: console login or root bash, each with or
+    // without the ring-3 NIC driver line. An untouched default follows this
+    // boot's console policy and udrv= assignment; an edited one is left.
     const char* want = g_default_inittab;
-    const char* other = (want == g_inittab_login) ? g_inittab_root : g_inittab_login;
+    static const char* const all[] = { g_inittab_login, g_inittab_root, g_inittab_login_drv, g_inittab_root_drv };
     if(file_equals("/etc/inittab", want, sr_len(want))) return;
-    if(!file_equals("/etc/inittab", other, sr_len(other))) return;
+    int dflt = 0;
+    for(int i=0;i<4;i++) if(all[i]!=want && file_equals("/etc/inittab", all[i], sr_len(all[i]))) dflt = 1;
+    if(!dflt){
+        if(udrv_has_net() && !file_contains("/etc/inittab", "udrv-e1000e"))
+            debugcon_writestring("[SYSROOT] udrv= gives a NIC to ring 3 but the edited /etc/inittab has no "
+                                 "driver entry; add: net0:driver:/sbin/udrv-e1000e\n");
+        return;
+    }
     if(install_file("/etc/inittab", (const uint8_t*)want, sr_len(want), 0644)==0){
-        debugcon_writestring(want == g_inittab_login ? "[SYSROOT] default /etc/inittab: console login\n"
-                                                     : "[SYSROOT] default /etc/inittab: root console (CONSOLE=root)\n");
+        int root = (want == g_inittab_root || want == g_inittab_root_drv);
+        int drv = (want == g_inittab_login_drv || want == g_inittab_root_drv);
+        debugcon_writestring(root ? "[SYSROOT] default /etc/inittab: root console (CONSOLE=root)"
+                                  : "[SYSROOT] default /etc/inittab: console login");
+        debugcon_writestring(drv ? ", ring-3 NIC driver\n" : "\n");
     } else g_st.failed++;
 #endif
 }

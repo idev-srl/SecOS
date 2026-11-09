@@ -22,6 +22,13 @@
  *            once      like respawn, but never restarted
  *            shutdown  run on the console at shutdown, before the services
  *                      are stopped, and waited for
+ *            driver    [M58] a ring-3 device driver (/sbin/udrv-*): like
+ *                      respawn, but started before the sysinit entries
+ *                      (init then waits up to DRIVER_SETTLE s until
+ *                      /proc/udrv reports net_waiting=0, so `ifup` finds a
+ *                      live interface), restarted after at most
+ *                      DRIVER_BACKOFF_MAX s, and not restarted when it exits
+ *                      with status 0 ("nothing to drive")
  *   command  absolute path and arguments, split on blanks (no shell, no
  *            quoting). PATH/HOME/TERM/SHELL are set in the environment.
  *
@@ -40,6 +47,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -54,9 +62,11 @@
 #define BACKOFF_RESET    10
 #define BACKOFF_MAX      30
 #define STOP_GRACE        3
+#define DRIVER_SETTLE     5
+#define DRIVER_BACKOFF_MAX 2
 
-enum { A_SYSINIT, A_RESPAWN, A_CONSOLE, A_ONCE, A_SHUTDOWN };
-static const char* const g_action_names[] = { "sysinit", "respawn", "console", "once", "shutdown" };
+enum { A_SYSINIT, A_RESPAWN, A_CONSOLE, A_ONCE, A_SHUTDOWN, A_DRIVER };
+static const char* const g_action_names[] = { "sysinit", "respawn", "console", "once", "shutdown", "driver" };
 
 struct entry {
     char          id[16];
@@ -210,7 +220,7 @@ static void child_setup(const struct entry* e) {
         fchmod(0, 0600);
         ioctl(0, TIOCSCTTY, 0);                /* the console is our controlling tty */
         tcsetpgrp(0, getpid());                /* ... and we are its foreground */
-    } else if (e->action == A_RESPAWN || e->action == A_ONCE) {
+    } else if (e->action == A_RESPAWN || e->action == A_ONCE || e->action == A_DRIVER) {
         char log[48];
         snprintf(log, sizeof(log), "/var/log/%s.log", e->id);
         int in = open("/dev/null", O_RDWR);
@@ -262,23 +272,30 @@ static void child_exited(int pid, int st) {
     unsigned long ran = (now_ms() - e->started) / 1000;
     e->pid = 0;
     e->finished = 1;
-    if (e->action != A_RESPAWN && e->action != A_CONSOLE) {
+    if (e->action != A_RESPAWN && e->action != A_CONSOLE && e->action != A_DRIVER) {
         if (e->action == A_ONCE) describe_exit(e, pid, st, ran);
         return;
     }
     if (g_shutdown) return;
+    if (e->action == A_DRIVER && WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+        describe_exit(e, pid, st, ran);
+        say("%s: nothing to drive; not restarted\n", e->id);
+        e->restart_at = ~0ul;
+        return;
+    }
+    unsigned max = e->action == A_DRIVER ? DRIVER_BACKOFF_MAX : BACKOFF_MAX;
     unsigned delay = 0;
     if (ran >= BACKOFF_RESET) {
         e->backoff = 1;
     } else {
-        delay = e->backoff;
-        e->backoff = e->backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : e->backoff * 2;
+        delay = e->backoff > max ? max : e->backoff;
+        e->backoff = e->backoff * 2 > max ? max : e->backoff * 2;
     }
     e->restart_at = now_ms() + (unsigned long)delay * 1000;
     if (e->action == A_CONSOLE && delay == 0) return;    /* `exit` on the console: quiet */
     if (e->quiet && delay > 0) return;                   /* already said it keeps failing */
     describe_exit(e, pid, st, ran);
-    if (delay >= BACKOFF_MAX) {
+    if (delay >= BACKOFF_MAX) {   /* drivers stay at <= 2 s and keep saying so */
         say("%s keeps failing; retrying every %u s (see /var/log/%s.log)\n", e->id, delay, e->id);
         e->quiet = 1;
     } else {
@@ -360,8 +377,41 @@ static void do_shutdown(int cmd) {
     say("SYS_REBOOT failed (%d); resuming service supervision\n", r);
     g_shutdown = 0;
     for (int i = 0; i < g_n; i++)
-        if ((g_tab[i].action == A_RESPAWN || g_tab[i].action == A_CONSOLE) && g_tab[i].pid <= 0)
+        if ((g_tab[i].action == A_RESPAWN || g_tab[i].action == A_CONSOLE || g_tab[i].action == A_DRIVER) &&
+            g_tab[i].pid <= 0 && g_tab[i].restart_at != ~0ul)
             g_tab[i].restart_at = now_ms();
+}
+
+/* [M58] /proc/udrv first line: "... net_waiting=N". -1 when absent. */
+static int udrv_net_waiting(void) {
+    char b[512];
+    int fd = open("/proc/udrv", O_RDONLY);
+    if (fd < 0) return -1;
+    int n = (int)read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    b[n] = 0;
+    char* p = strstr(b, "net_waiting=");
+    return p ? atoi(p + 12) : -1;
+}
+
+/* [M58] Wait (bounded) until every ring-3 NIC proxy has its driver, or every
+ * driver entry has exited. Reaps meanwhile. */
+static void settle_drivers(void) {
+    unsigned long deadline = now_ms() + DRIVER_SETTLE * 1000ul;
+    while (now_ms() < deadline) {
+        int st = 0, pid;
+        while ((pid = reap(&st, 1)) > 0) child_exited(pid, st);
+        int alive = 0;
+        for (int i = 0; i < g_n; i++) if (g_tab[i].action == A_DRIVER && g_tab[i].pid > 0) alive++;
+        int w = udrv_net_waiting();
+        if (w <= 0 || !alive) {
+            if (w > 0) say("driver(s) exited; %d interface(s) still without a driver\n", w);
+            return;
+        }
+        usleep(20000);
+    }
+    say("ring-3 driver(s) not attached after %d s; continuing\n", DRIVER_SETTLE);
 }
 
 /* [U6] /var/lib/spkg holds a transaction journal or staging files. */
@@ -404,6 +454,12 @@ int main(int argc, char** argv) {
         say("finishing an interrupted package operation\n");
         if (parse_line(line, &rec) == 0) run_wait(&rec, SYSINIT_TIMEOUT * 5);
     }
+    /* [M58] Ring-3 drivers first, so the sysinit steps (ifup) find their
+     * devices; bounded wait for them to attach. */
+    int ndrv = 0;
+    for (int i = 0; i < g_n && !g_shutdown; i++)
+        if (g_tab[i].action == A_DRIVER && start(&g_tab[i]) > 0) ndrv++;
+    if (ndrv) settle_drivers();
     for (int i = 0; i < g_n && !g_shutdown; i++)
         if (g_tab[i].action == A_SYSINIT) run_wait(&g_tab[i], SYSINIT_TIMEOUT);
     for (int i = 0; i < g_n; i++)
@@ -417,6 +473,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < g_n; i++) {
             struct entry* e = &g_tab[i];
             int wants = (e->action == A_RESPAWN || e->action == A_CONSOLE ||
+                         (e->action == A_DRIVER && e->restart_at != ~0ul) ||
                          (e->action == A_ONCE && !e->finished));
             if (!wants || e->pid > 0) continue;
             if (now >= e->restart_at) {
