@@ -10,7 +10,9 @@
  *   mtest tls N          N yields with a __thread value checked each time
  *                        (FS base across context switches; run several at once)
  *   mtest enosys         calls an unsupported Linux syscall (inotify_init1)
- *   mtest child CODE     exec target: checks argv/envp, exits with CODE
+ *   mtest spawn          starts "mtest child 3 noenv" with SYS_SPAWN (libsecos):
+ *                        the kernel-made stack + auxv path, no environment
+ *   mtest child CODE [noenv]  exec target: checks argv/envp, exits with CODE
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -35,6 +37,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
+#include <secos/secos.h>
 
 static int g_pass, g_fail;
 static char g_self[256];
@@ -402,6 +405,18 @@ int main(int argc, char **argv)
         long r = syscall(SYS_inotify_init1, 0);
         printf("MT ENOSYS r=%ld errno=%d\n", r, errno);
         return (r == -1 && errno == ENOSYS) ? 0 : 1;
+    }
+    if (argc > 1 && !strcmp(argv[1], "spawn")) {
+        char *av[] = { g_self, "child", "3", "noenv", 0 };
+        int pid = secos_spawn(g_self, av);
+        int st = pid > 0 ? secos_wait(pid) : -1;
+        printf("MT SPAWN pid=%d status=%x\n", pid, st);
+        return (pid > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 3) ? 0 : 1;
+    }
+    if (argc > 3 && !strcmp(argv[1], "child") && !strcmp(argv[3], "noenv")) {
+        /* spawned by the kernel: argv only, and musl initialised from the auxv */
+        if (getenv("MTEST_ENV") || t_tls != 1234 || getauxval(AT_PAGESZ) != 4096 || !getauxval(AT_RANDOM)) return 60;
+        return atoi(argv[2]);
     }
     if (argc > 2 && !strcmp(argv[1], "child")) {
         const char *e = getenv("MTEST_ENV");
