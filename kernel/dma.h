@@ -75,6 +75,15 @@ void dma_init(void);
  * no IOMMU domain). In strict mode the first call moves the function into the
  * kernel DMA domain, so call it before enabling bus mastering. */
 dma_dev_t* dma_dev(const pci_dev_t* pd);
+/* [M58] The driver lets go of the function (a failed probe, or a function
+ * handed to ring 3): it leaves the strict kernel domain for the passthrough
+ * domain it came from (iommu_attach returns after the context-cache + IOTLB
+ * invalidation) and the handle is freed; a later dma_dev() starts afresh.
+ * Bus mastering must already be off. Every coherent/streaming mapping the
+ * driver made must be freed first (they live in the shared strict domain). */
+void dma_dev_release(dma_dev_t* dd);
+/* The handle of pd if a driver registered one, else NULL (never creates). */
+dma_dev_t* dma_dev_peek(const pci_dev_t* pd);
 /* Convenience for drivers holding the legacy pci_device_t. */
 dma_dev_t* dma_dev_legacy(const pci_device_t* d);
 

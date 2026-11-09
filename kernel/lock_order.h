@@ -77,6 +77,12 @@
 #define LK_N2_NET_STACK    118
 #define LK_N3_NET_TX       119
 #define LK_S20_MOUNT       120  /* g_mount_lock: mount table only               */
+#define LK_S22_UDRV_NET    122  /* net_udrv.lk (net/net_udrv.c, M58, one per
+                                   ring-3 NIC proxy): the shared ring state.
+                                   Taken inside tx_lock N3 (transmit) and
+                                   rx_lock N1 (poll), never across net_rx
+                                   (stack N2); inside it: udrv ev S25 (TX
+                                   kick, kill) -> proc S30                   */
 #define LK_S24_UDRV_FD     124  /* g_udrv_fd_lock (kernel/udrv.c, M57): the claim
                                    fd pool (references taken/dropped by fork,
                                    dup, close, exit); event S25 nests inside  */

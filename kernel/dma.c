@@ -252,6 +252,40 @@ dma_dev_t* dma_dev(const pci_dev_t* pd) {
     return dd;
 }
 
+dma_dev_t* dma_dev_peek(const pci_dev_t* pd) {
+    int idx = pd ? pci_dev_index(pd) : -1;
+    if (idx < 0 || idx >= PCI_MAX_DEVS) return NULL;
+    uint64_t f = spin_lock_irqsave(&g_dma_lock);
+    dma_dev_t* dd = g_dd[idx].used ? &g_dd[idx] : NULL;
+    spin_unlock_irqrestore(&g_dma_lock, f);
+    return dd;
+}
+
+void dma_dev_release(dma_dev_t* dd) {
+    if (!dd || dd == &g_dd_none) return;
+    uint64_t f = spin_lock_irqsave(&g_dma_lock);
+    if (!dd->used) { spin_unlock_irqrestore(&g_dma_lock, f); return; }
+    const pci_dev_t* pd = dd->pd;
+    int was_strict = dd->strict, rc = 0;
+    if (was_strict) {
+        iommu_domain_t* pt = iommu_kernel_domain();
+        rc = pt ? iommu_attach(pt, pd) : -1;
+        if (rc != 0) iommu_detach(pd);          /* no passthrough domain: blocked */
+        __atomic_sub_fetch(&g_nstrict, 1, __ATOMIC_RELAXED);
+    }
+    dd->used = 0; dd->strict = 0; dd->mask = DMA_MASK_64;
+    __atomic_sub_fetch(&g_ndev, 1, __ATOMIC_RELAXED);
+    spin_unlock_irqrestore(&g_dma_lock, f);
+    if (g_strict || was_strict) {
+        iommu_line_t l; l.n = 0;
+        iommu_ln_s(&l, "[DMA] "); ln_dev(&l, dd);
+        iommu_ln_s(&l, was_strict ? (rc == 0 ? ": released, back to the passthrough domain"
+                                              : ": released, blocked (no passthrough domain)")
+                                   : ": released");
+        debugcon_writestring(iommu_ln_end(&l));
+    }
+}
+
 dma_dev_t* dma_dev_legacy(const pci_device_t* d) {
     return dma_dev(d ? pci_dev_of(d) : NULL);
 }

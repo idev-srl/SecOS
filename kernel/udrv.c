@@ -13,7 +13,8 @@
  *   3. FLR / PM reset when the function has one (header restored after);
  *   4. detach to the blocked domain (returns after the context-cache + IOTLB
  *      invalidation completed);
- *   5. (no kernel proxy yet: M58);
+ *   5. [M58] the kernel network proxy stops using the shared region (link
+ *      down; the interface stays registered);
  *   6. the driver's BAR and DMA mappings unmapped (TLB shootdown);
  *   7. only now the IOMMU tables and the DMA frames are freed.
  *
@@ -21,6 +22,9 @@
  */
 #include "udrv.h"
 #include "../user/include/secos/udrv.h"
+#include "../user/include/secos/udrv_net.h"
+#include "net_udrv.h"
+#include "dma.h"
 #include "process.h"
 #include "sched.h"
 #include "signal.h"
@@ -125,6 +129,12 @@ typedef struct udrv_dev {
     uint64_t faults;
     uint64_t kill_ms[UDRV_QUAR_N];
     uint32_t kill_head;
+    /* [M58] network proxy (g_udrv_lock) */
+    net_udrv_t* net_px;             /* the proxy interface, or NULL           */
+    uint8_t  net_attached;          /* this claim attached it                  */
+    uint8_t  net_killed;            /* ev: the proxy asked for a kill          */
+    uint64_t net_ctrl_phys, net_ctrl_uva, net_slots_phys, net_slots_iova;
+    uint32_t net_kills;
 } udrv_dev_t;
 
 typedef struct udrv_fdo {
@@ -144,6 +154,11 @@ static uint64_t   g_refused_dma, g_refused_claim;
 /* Pages currently given to ring-3 drivers (g_udrv_lock): DMA frames and BAR
  * mappings. Both return to 0 when no claim is held (leak checks). */
 static uint64_t   g_live_dma_pages, g_live_map_pages;
+/* [M58] Frames of the network proxy regions (control + packet slots). */
+static uint64_t   g_live_net_pages;
+static int        g_watchdog_kill;     /* udrv.watchdog=kill */
+#define NET_CTRL_PAGES   UDRV_NET_CTRL_PAGES
+#define NET_SLOT_PAGES   ((UDRV_NET_NSLOTS * UDRV_NET_SLOT_SIZE) / 4096)
 
 /* ---------------------------------------------------------------- helpers */
 static uint64_t now_ms(void) { return ktime_ns() / 1000000ull; }
@@ -217,6 +232,54 @@ static void owner_wake_locked(udrv_dev_t* d) {
         p->wait_udrv = NULL;
         sched_wake_task(p, PROC_BLOCKED);
     }
+}
+
+/* [M58] The network proxy (net/net_udrv.c, its lock held) queued frames for
+ * the driver: UDRV_EV_TX_KICK on the claim fd. Any context. */
+void udrv_net_notify(void* cookie, uint32_t gen) {
+    udrv_dev_t* d = (udrv_dev_t*)cookie;
+    if (!d) return;
+    uint64_t fl = spin_lock_irqsave(&d->ev);
+    if (d->claimed && d->gen == gen) {
+        d->evflags |= UDRV_EV_TX_KICK;
+        owner_wake_locked(d);
+    }
+    spin_unlock_irqrestore(&d->ev, fl);
+}
+
+/* [M58] The network proxy saw too many bad ring entries (or a TX stall with
+ * udrv.watchdog=kill): stop bus mastering, SIGKILL the driver; teardown runs
+ * in its exit path, init restarts it. Any context. */
+void udrv_net_kill(void* cookie, uint32_t gen, const char* why) {
+    udrv_dev_t* d = (udrv_dev_t*)cookie;
+    if (!d) return;
+    uint64_t fl = spin_lock_irqsave(&d->ev);
+    if (d->claimed && d->gen == gen && d->owner && !d->net_killed) {
+        d->net_killed = 1;
+        d->net_kills++;
+        cmd_write(d, (uint16_t)((cmd_read(d) & ~CMD_BM) | CMD_INTX_DIS));
+        iommu_line_t l; l.n = 0;
+        iommu_ln_s(&l, "[UDRV] "); ln_dev(&l, d);
+        iommu_ln_s(&l, " network driver pid="); iommu_ln_dec(&l, d->owner_pid);
+        iommu_ln_s(&l, " killed: "); iommu_ln_s(&l, why);
+        log_line(&l);
+        d->evflags |= UDRV_EV_STOP;
+        signal_post(d->owner, SIGKILL);
+        owner_wake_locked(d);
+    }
+    spin_unlock_irqrestore(&d->ev, fl);
+}
+
+int udrv_watchdog_kill(void) { return g_watchdog_kill; }
+
+/* The i-th function given to ring 3 (boot order), NULL past the end. */
+const pci_dev_t* udrv_assigned(int i) {
+    return (i >= 0 && i < g_ndev) ? g_dev[i].pd : NULL;
+}
+
+int udrv_has_net(void) {
+    for (int i = 0; i < g_ndev; i++) if (g_dev[i].pd->class_code == 0x02) return 1;
+    return 0;
 }
 
 /* The device's MSI/MSI-X handler (hardware IRQ context, IF=0). Masks the
@@ -385,7 +448,11 @@ int udrv_fd_write(process_t* c, void* ino, const void* ubuf, int len) {
     uint32_t m = a.vec_mask & valid;
     d->pending &= ~m;
     for (int i = 0; i < d->nvec; i++) if (m & (1u << i)) vec_unmask_locked(d, i);
+    /* [M58] A kick: the proxy drains rx[] / txc[] now, in this context, with
+     * no lock held (the pointer is a static proxy; a detached one ignores it). */
+    net_udrv_t* px = ((a.flags & UDRV_ACK_NET_KICK) && d->net_attached) ? d->net_px : NULL;
     spin_unlock_irqrestore(&d->ev, fl);
+    if (px) net_udrv_kick(px);
     return len;
 }
 
@@ -524,12 +591,15 @@ static void release_locked(udrv_dev_t* d, const char* why) {
     int rr = do_reset(d, &how);
     /* 4. Blocked domain: returns after the invalidation completed. */
     if (d->dom) iommu_detach(d->pd);
+    /* 5. [M58] The proxy stops touching the region (link down). */
+    if (d->net_attached) net_udrv_detach(d->net_px, why);
     /* 6. The driver's mappings. */
     for (uint32_t i = 0; i < d->nmap; i++) {
         unmap_region(owner, d->map[i].uva, d->map[i].len);
         g_live_map_pages -= d->map[i].len / 4096;
     }
     for (int i = 0; i < UDRV_MAX_DMA; i++) if (d->dma[i].used) unmap_region(owner, d->dma[i].uva, d->dma[i].len);
+    if (d->net_attached) unmap_region(owner, d->net_ctrl_uva, NET_CTRL_PAGES * 4096ull);
     /* 7. Only now: IOMMU tables, then the frames. */
     if (d->dom) { iommu_domain_free(d->dom); d->dom = NULL; }
     uint64_t freed = 0;
@@ -539,6 +609,13 @@ static void release_locked(udrv_dev_t* d, const char* why) {
         freed += d->dma[i].len;
         g_live_dma_pages -= d->dma[i].len / 4096;
         d->dma[i].used = 0;
+    }
+    if (d->net_attached) {
+        pmm_free_contiguous((void*)d->net_ctrl_phys, NET_CTRL_PAGES);
+        pmm_free_contiguous((void*)d->net_slots_phys, NET_SLOT_PAGES);
+        g_live_net_pages -= NET_CTRL_PAGES + NET_SLOT_PAGES;
+        d->net_attached = 0;
+        d->net_ctrl_phys = d->net_slots_phys = d->net_ctrl_uva = d->net_slots_iova = 0;
     }
     d->nmap = 0; d->dma_used = 0;
     for (int i = 0; i < 6; i++) d->bar_uva[i] = 0;
@@ -653,6 +730,7 @@ static long op_claim(process_t* c, const struct udrv_claim* a) {
     d->bar_mask = mf->bar_mask; d->cfgw = mf->cfg_write_mask;
     d->irq_max = mf->irq_max > UDRV_MAX_VEC ? UDRV_MAX_VEC : mf->irq_max;
     d->dma_max = mf->dma_max; d->dma_used = 0; d->nmap = 0;
+    d->net_px = net_udrv_find(d->pd); d->net_attached = 0;      /* [M58] */
     for (int i = 0; i < 6; i++) d->bar_uva[i] = 0;
     for (int i = 0; i < UDRV_MAX_DMA; i++) d->dma[i].used = 0;
     for (int i = 0; i < UDRV_MAX_VEC; i++) { d->vec[i].d = d; d->vec[i].idx = (uint8_t)i; d->vec[i].vec = -1; }
@@ -660,7 +738,7 @@ static long op_claim(process_t* c, const struct udrv_claim* a) {
     cmd_write(d, CMD_MEM | CMD_INTX_DIS);
     uint64_t fl = spin_lock_irqsave(&d->ev);
     d->gen = gen; d->owner = c; d->owner_pid = c->pid;
-    d->faulted = 0; d->irq_mode = UDRV_IRQ_NONE; d->nvec = 0;
+    d->faulted = 0; d->net_killed = 0; d->irq_mode = UDRV_IRQ_NONE; d->nvec = 0;
     d->irq_count = 0; d->last_read = 0; d->pending = 0; d->masked = 0; d->evflags = 0;
     d->claimed = 1;
     spin_unlock_irqrestore(&d->ev, fl);
@@ -901,6 +979,68 @@ static long op_dma_free(process_t* c, udrv_dev_t* d, const struct udrv_dma* a) {
     return 0;
 }
 
+/* [M58] The kernel network proxy: allocate the shared region (control pages
+ * mapped into the driver only, packet slots mapped into the device's IOMMU
+ * domain only) and attach the proxy interface to it. */
+static long op_net_attach(process_t* c, udrv_dev_t* d, struct udrv_net_attach* a) {
+    const elf_manifest_t* mf = (const elf_manifest_t*)c->manifest;
+    if (!mf || !(mf->udrv_flags & UDRV_DRV_NET)) { op_log(c, d, "net_attach", "refused(manifest: no DRV_NET)"); return -U_EPERM; }
+    if (a->flags || a->pad) return -U_EINVAL;
+    if (d->pd->class_code != 0x02 || !d->net_px) { op_log(c, d, "net_attach", "refused(not a network function)"); return -U_ENODEV; }
+    if (!d->dma_ok) { op_log(c, d, "net_attach", "refused(no DMA rights)"); return -U_ENODEV; }
+    if (d->net_attached) return -U_EBUSY;
+    if ((a->mac[0] & 1) || !(a->mac[0] | a->mac[1] | a->mac[2] | a->mac[3] | a->mac[4] | a->mac[5])) {
+        op_log(c, d, "net_attach", "refused(MAC not a unicast address)");
+        return -U_EINVAL;
+    }
+    void* cp = pmm_alloc_contiguous(NET_CTRL_PAGES);
+    void* sp = cp ? pmm_alloc_contiguous(NET_SLOT_PAGES) : NULL;
+    if (!sp) { if (cp) pmm_free_contiguous(cp, NET_CTRL_PAGES); return -U_ENOMEM; }
+    uint64_t cphys = (uint64_t)cp, sphys = (uint64_t)sp;
+    uint64_t slen = (uint64_t)NET_SLOT_PAGES * 4096;
+    bzero8((void*)phys_to_virt(cphys), NET_CTRL_PAGES * 4096ull);
+    bzero8((void*)phys_to_virt(sphys), slen);
+    uint64_t iova = sphys;                        /* udrv.unsafe: no IOMMU */
+    if (d->dom) {
+        iova = iommu_iova_alloc(d->dom, slen);
+        if (!iova || iommu_map(d->dom, iova, sphys, slen, IOMMU_READ | IOMMU_WRITE) != 0) {
+            pmm_free_contiguous(sp, NET_SLOT_PAGES); pmm_free_contiguous(cp, NET_CTRL_PAGES);
+            return -U_ENOMEM;
+        }
+    }
+    uint64_t clen = NET_CTRL_PAGES * 4096ull;
+    uint64_t va = va_reserve(c, clen);
+    if (!va || !map_region(c, va, cphys, clen, VMA_VF_WB)) {
+        if (d->dom) iommu_unmap(d->dom, iova, slen);
+        pmm_free_contiguous(sp, NET_SLOT_PAGES); pmm_free_contiguous(cp, NET_CTRL_PAGES);
+        return -U_ENOMEM;
+    }
+    char ifname[16];
+    int r = net_udrv_attach(d->net_px, (void*)phys_to_virt(cphys), (void*)phys_to_virt(sphys), a->mac,
+                            d, d->gen, c->pid, ifname);
+    if (r != 0) {
+        unmap_region(c, va, clen);
+        if (d->dom) iommu_unmap(d->dom, iova, slen);
+        pmm_free_contiguous(sp, NET_SLOT_PAGES); pmm_free_contiguous(cp, NET_CTRL_PAGES);
+        return -U_EBUSY;
+    }
+    d->net_attached = 1;
+    d->net_ctrl_phys = cphys; d->net_ctrl_uva = va;
+    d->net_slots_phys = sphys; d->net_slots_iova = iova;
+    g_live_net_pages += NET_CTRL_PAGES + NET_SLOT_PAGES;
+    a->ctrl_uva = va; a->ctrl_len = clen; a->slots_iova = iova;
+    for (int i = 0; i < 16; i++) a->ifname[i] = ifname[i];
+    iommu_line_t l; l.n = 0;
+    iommu_ln_s(&l, "[UDRV] net_attach pid="); iommu_ln_dec(&l, c->pid);
+    iommu_ln_s(&l, " bdf="); ln_dev(&l, d);
+    iommu_ln_s(&l, " if="); iommu_ln_s(&l, ifname);
+    iommu_ln_s(&l, " ctrl_pages="); iommu_ln_dec(&l, NET_CTRL_PAGES);
+    iommu_ln_s(&l, " slot_pages="); iommu_ln_dec(&l, NET_SLOT_PAGES);
+    iommu_ln_s(&l, d->dom ? " slots in the device domain" : " slots iova=phys (unsafe)");
+    log_line(&l);
+    return 0;
+}
+
 static long op_irq_setup(process_t* c, udrv_dev_t* d, struct udrv_irq* a) {
     if (d->nvec) return -U_EBUSY;
     if (!d->dma_ok) {
@@ -985,6 +1125,7 @@ long udrv_syscall(uint64_t op, uint64_t handle, uint64_t arg, uint64_t size) {
     union {
         struct udrv_claim cl; struct udrv_info in; struct udrv_map_bar mb;
         struct udrv_cfg cf; struct udrv_dma dm; struct udrv_irq iq;
+        struct udrv_net_attach na;
     } k;
     uint64_t want;
     int out = 0;
@@ -997,6 +1138,7 @@ long udrv_syscall(uint64_t op, uint64_t handle, uint64_t arg, uint64_t size) {
     case UDRV_OP_DMA_ALLOC: want = sizeof(k.dm); out = 1; break;
     case UDRV_OP_DMA_FREE:  want = sizeof(k.dm); break;
     case UDRV_OP_IRQ_SETUP: want = sizeof(k.iq); out = 1; break;
+    case UDRV_OP_NET_ATTACH: want = sizeof(k.na); out = 1; break;
     case UDRV_OP_RESET:
     case UDRV_OP_RELEASE:   want = 0; break;
     default: return -U_EINVAL;
@@ -1030,6 +1172,7 @@ long udrv_syscall(uint64_t op, uint64_t handle, uint64_t arg, uint64_t size) {
         case UDRV_OP_DMA_ALLOC: r = op_dma_alloc(c, d, &k.dm); break;
         case UDRV_OP_DMA_FREE:  r = op_dma_free(c, d, &k.dm); break;
         case UDRV_OP_IRQ_SETUP: r = op_irq_setup(c, d, &k.iq); break;
+        case UDRV_OP_NET_ATTACH: r = op_net_attach(c, d, &k.na); break;
         case UDRV_OP_RESET:     r = op_reset(c, d); break;
         case UDRV_OP_RELEASE:   release_locked(d, "release"); r = 0; break;
         default:                r = -U_EINVAL; break;
@@ -1171,6 +1314,10 @@ static void assign(const pci_dev_t* pd) {
     build_cap_bytes(d);
     read_irq_geometry(d);
     enable_acs_path(pd);
+    /* [M58] A kernel driver that already took a DMA handle (none should: the
+     * probes run after udrv_init) lets go of it first, so the function is
+     * not left in the strict kernel domain. */
+    { dma_dev_t* kd = dma_dev_peek(pd); if (kd) dma_dev_release(kd); }
     int covered = iommu_present() && iommu_dev_covered(pd);
     if (covered) iommu_detach(pd);            /* blocked until a driver claims it */
     g_ndev++;
@@ -1186,6 +1333,8 @@ void udrv_init(void) {
     int n = iommu_cmdline_value("udrv", buf, sizeof(buf));
     g_unsafe = iommu_cmdline_has("udrv.unsafe");
     g_noir = iommu_cmdline_has("udrv.noir");
+    { char w[8]; g_watchdog_kill = iommu_cmdline_value("udrv.watchdog", w, sizeof(w)) > 0 &&
+                                   w[0] == 'k' && w[1] == 'i' && w[2] == 'l' && w[3] == 'l' && w[4] == 0; }
     for (int i = 0; i < UDRV_MAX_DEV; i++) g_dev[i].bdf = 0xFFFF;
     if (n <= 0) {
         if (g_unsafe || g_noir) debugcon_writestring("[UDRV] udrv.unsafe/udrv.noir ignored: no udrv= devices\n");
@@ -1250,7 +1399,12 @@ void udrv_generate(void (*emit)(void* ctx, const char* line), void* ctx) {
     iommu_ln_s(&l, " refused_dma="); iommu_ln_dec(&l, g_refused_dma);
     iommu_ln_s(&l, " live_dma_pages="); iommu_ln_dec(&l, g_live_dma_pages);
     iommu_ln_s(&l, " live_bar_pages="); iommu_ln_dec(&l, g_live_map_pages);
+    iommu_ln_s(&l, " live_net_pages="); iommu_ln_dec(&l, g_live_net_pages);
+    iommu_ln_s(&l, " net_waiting="); iommu_ln_dec(&l, (uint64_t)net_udrv_waiting());
     emit(ctx, iommu_ln_end(&l));
+    /* [M58] Shown on every boot with a ring-3 driver: QEMU does not model
+     * this, so the gates cannot check it. */
+    if (g_ndev) emit(ctx, "note: blocking of compatibility-format and DMA-injected interrupt messages is enforced by the IOMMU hardware and verifiable only on real hardware (QEMU does not block them)\n");
     if (g_unsafe || g_tainted) {
         l.n = 0;
         iommu_ln_s(&l, g_tainted ? "TAINTED: ring-3 DMA without IOMMU" : "WARNING: udrv.unsafe set (ring-3 DMA without IOMMU allowed)");
@@ -1278,6 +1432,8 @@ void udrv_generate(void (*emit)(void* ctx, const char* line), void* ctx) {
         iommu_ln_s(&l, " pending="); iommu_ln_hex(&l, pend);
         iommu_ln_s(&l, " masked="); iommu_ln_hex(&l, msk);
         iommu_ln_s(&l, " dma="); iommu_ln_dec(&l, claimed ? d->dma_used : 0);
+        iommu_ln_s(&l, " net_kills="); iommu_ln_dec(&l, d->net_kills);
         emit(ctx, iommu_ln_end(&l));
     }
+    net_udrv_generate(emit, ctx);
 }

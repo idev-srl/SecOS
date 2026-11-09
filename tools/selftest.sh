@@ -194,6 +194,22 @@ while IFS= read -r l; do
 done </tmp/secos_selftest_m57.out
 grep -q "^\[udrv-gate\] [0-9]* passed, 0 failed" /tmp/secos_selftest_m57.out; check "M57 UDRV gate ran to completion, no failure" $?
 
+# ---- M58: e1000e in ring 3 (tools/net_udrv_gate.sh) ----
+# /sbin/udrv-e1000e drives the NIC through the kernel network proxy on q35 +
+# intel-iommu(intremap): DHCP, TCP down/upload with MD5, DNS, SSH, 20 kill -9
+# respawns with steady memory, the NETSMP netstress workload at -smp 2/4, the
+# in-kernel fallback without udrv=, and a lockdep -smp 4 run.
+echo "[selftest] Running the M58 ring-3 e1000e gate (~30-45 min)..."
+tools/net_udrv_gate.sh >/tmp/secos_selftest_m58.out 2>&1
+while IFS= read -r l; do
+    case "$l" in
+        "[nud] "*": PASS") n="${l#\[nud\] }"; check "M58 NET-UDRV ${n%: PASS}" 0 ;;
+        "[nud] "*": FAIL"*) n="${l#\[nud\] }"; check "M58 NET-UDRV ${n%%: FAIL*}" 1 ;;
+        "[nud] "*" FAIL"*) echo "    $l" ;;
+    esac
+done </tmp/secos_selftest_m58.out
+grep -q "^\[nud-gate\] [0-9]* passed, 0 failed" /tmp/secos_selftest_m58.out; check "M58 NET-UDRV gate ran to completion, no failure" $?
+
 # ---- M12: memory scalability + W^X hard gate ----
 M12LOG=/tmp/secos_selftest_m12.log
 echo "[selftest] Building M12 image (default; W^X + heap selftests run at boot)..."
