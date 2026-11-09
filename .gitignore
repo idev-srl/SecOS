@@ -49,3 +49,5 @@ tools/ntfs_fuzz/ntfs_fuzz
 *.img.list
 .console.stamp
 .bkl-default.stamp
+.cflags.stamp
+.uefi-cflags.stamp

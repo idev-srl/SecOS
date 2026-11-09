@@ -70,6 +70,23 @@ CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-
 DEPFLAGS = -MMD -MP
 CFLAGS  += $(DEPFLAGS)
 LDFLAGS = -n -T linker.ld
+# Compiler-flag tracking: -MMD tracks headers, not flags, so an object built
+# with other flags (CFLAGS_EXTRA, KEYMAP, a compiler upgrade...) was linked as
+# is. That happened: a months-old tsc.o with the pre-M44 %gs:0x28 stack canary
+# panicked the boot. FLAGS_STAMP holds the effective compiler/assembler flags
+# and the compiler version, and is rewritten (at parse time, with $(file), so
+# quotes in the defines need no shell escaping) only when they change; every
+# kernel object depends on it. BUILD_TS and GIT_HASH are left out, or every
+# build (and every commit) would recompile everything; as before, they are
+# refreshed only in the files that get recompiled.
+FLAGS_STAMP := .cflags.stamp
+FLAGS_SIG := cc=$(CC) $(shell $(CC) -dumpfullversion 2>/dev/null) \
+	cflags=$(filter-out -DBUILD_TS=% -DGIT_HASH=%,$(CFLAGS)) as=$(AS) asflags=$(ASFLAGS)
+ifneq ($(file <$(FLAGS_STAMP)),$(FLAGS_SIG))
+$(file >$(FLAGS_STAMP),$(FLAGS_SIG))
+endif
+$(FLAGS_STAMP):
+	$(file >$@,$(FLAGS_SIG))
 
 SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.asm $(ARCH_DIR)/context_switch_asm.asm \
           $(ARCH_DIR)/uaccess.asm
@@ -190,6 +207,9 @@ KASLR_CORE = $(BOOT_DIR)/kaslr_core.o
 OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE) $(KASLR_CORE) $(ATH9K_HW)
 DEPS     = $(OBJS_C:%.o=%.d)
 -include $(DEPS)
+# Every object built here is rebuilt when the flags change (not the prebuilt,
+# committed ath9k_hw.o).
+$(filter-out $(ATH9K_HW),$(OBJS)): $(FLAGS_STAMP)
 
 # Keep `make` (no target) building the kernel: the rule below would otherwise be
 # the first target in the file and become the default goal.
@@ -1076,11 +1096,12 @@ bklstress:
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
-	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP) $(CONSOLE_STAMP) $(BKL_STAMP)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP) $(CONSOLE_STAMP) $(BKL_STAMP) $(FLAGS_STAMP)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin $(BOOT_DIR)/kaslr_core.raw.o
 	rm -f build/kernel.pass1.elf build/kernel.pass2.elf $(KASLR_BIN) $(KASLR_OBJ)
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)
+	rm -f $(UEFI_CRT0) $(UEFI_OBJS) $(UEFI_CRYPTO_OBJS) $(UEFI_FLAGS_STAMP)
 
 tree:
 	@echo "ASM: $(SRC_ASM)"
@@ -1104,6 +1125,17 @@ ifeq ($(SECURE_BOOT),1)
 UEFI_CFLAGS += -DSECOS_SECURE_BOOT
 endif
 UEFI_CRT0 = uefi/crt0.o
+
+# Same flag tracking as the kernel (FLAGS_STAMP): e.g. a SECURE_BOOT=0 build
+# must not leave a non-enforcing loader object behind for the next build.
+UEFI_FLAGS_STAMP := .uefi-cflags.stamp
+UEFI_FLAGS_SIG := cc=$(CC) $(shell $(CC) -dumpfullversion 2>/dev/null) cflags=$(UEFI_CFLAGS)
+ifneq ($(file <$(UEFI_FLAGS_STAMP)),$(UEFI_FLAGS_SIG))
+$(file >$(UEFI_FLAGS_STAMP),$(UEFI_FLAGS_SIG))
+endif
+$(UEFI_FLAGS_STAMP):
+	$(file >$@,$(UEFI_FLAGS_SIG))
+$(UEFI_CRT0) $(UEFI_OBJS) $(UEFI_CRYPTO_OBJS): $(UEFI_FLAGS_STAMP)
 
 uefi/%.o: uefi/%.c uefi/efi.h $(BOOT_DIR)/kaslr.h
 	$(CC) $(UEFI_CFLAGS) -c $< -o $@
