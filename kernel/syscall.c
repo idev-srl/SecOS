@@ -1453,6 +1453,11 @@ int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
             if(cmd == TTY_FIONBIO) FD_SET_NONBLOCK();
             return input_ioctl(c->fds[fd].inode, cmd, arg);
         }
+        extern int devfs_is_rtc(void* inode);
+        if(devfs_is_rtc(c->fds[fd].inode)){                 // [U10] hwclock
+            extern int devfs_rtc_ioctl(void*, uint64_t, uint64_t, int);
+            return devfs_rtc_ioctl(c, cmd, arg, (c->fds[fd].flags & 3) != 0);
+        }
         if(devfs_is_fb(c->fds[fd].inode)){
             if(cmd == TTY_FIONBIO) FD_SET_NONBLOCK();
             int r = fbdev_ioctl(cmd, arg);
