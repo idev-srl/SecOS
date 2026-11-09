@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# secos-cc — compile and link SecOS programs against musl (U1). SPDX-License-Identifier: MIT
+#
+#   tools/secos-cc [secos options] [gcc options] files...
+#
+# A thin driver around the host gcc and the musl sysroot built by
+# tools/port-musl.sh (build/sysroot, or $SECOS_SYSROOT):
+#   compile  -nostdinc -isystem <sysroot>/include (+ gcc's own intrinsics
+#            headers), -fPIE, -D__secos__;
+#   link     static-PIE (rcrt1.o crti.o crtbeginS.o ... -lc -lgcc crtendS.o
+#            crtn.o), 4 KiB segment alignment, non-executable stack, an 8 MiB
+#            stack (PT_GNU_STACK size, honoured by the SecOS loader), plus the
+#            default manifest note (lib/secos-note.o: ambient user, no limits);
+#   sign     the output with tools/secos-sign (dev key) after a successful link.
+# SecOS options (removed before gcc sees the arguments):
+#   --secos-note=FILE   manifest note object or .S source instead of the default
+#   --secos-unsigned    link but do not sign (the loader then refuses it)
+#   --secos-key=HEX     sign with this Ed25519 seed instead of the dev key
+# The SecOS-only calls are in -lsecos (<secos/secos.h>).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SYSROOT="${SECOS_SYSROOT:-$ROOT/build/sysroot}"
+CC="${SECOS_HOSTCC:-gcc}"
+if [ ! -f "$SYSROOT/lib/libc.a" ]; then
+    echo "secos-cc: no musl sysroot in $SYSROOT (run tools/port-musl.sh)" >&2
+    exit 2
+fi
+GCCINC="$("$CC" -print-file-name=include)"
+
+note="$SYSROOT/lib/secos-note.o"; sign=1; key=()
+args=(); link=1; out="a.out"; prev=""
+for a in "$@"; do
+    case "$a" in
+        --secos-note=*) note="${a#--secos-note=}"; continue ;;
+        --secos-unsigned) sign=0; continue ;;
+        --secos-key=*) key=(--seed-hex "${a#--secos-key=}"); continue ;;
+        -c|-S|-E|-M|-MM) link=0 ;;
+    esac
+    [ "$prev" = "-o" ] && out="$a"
+    args+=("$a"); prev="$a"
+done
+
+cflags=(-nostdinc -isystem "$SYSROOT/include" -isystem "$GCCINC" -fPIE -D__secos__)
+if [ $link -eq 0 ]; then
+    exec "$CC" "${cflags[@]}" "${args[@]}"
+fi
+
+tmp=""
+cleanup() { [ -n "$tmp" ] && rm -rf "$tmp"; return 0; }
+trap cleanup EXIT
+case "$note" in
+    *.S|*.s) tmp="$(mktemp -d)"; "$CC" -c "$note" -o "$tmp/note.o"; note="$tmp/note.o" ;;
+esac
+crtb="$("$CC" -print-file-name=crtbeginS.o)"
+crte="$("$CC" -print-file-name=crtendS.o)"
+"$CC" "${cflags[@]}" -static-pie -nostdlib -nostartfiles \
+    -Wl,-z,max-page-size=4096 -Wl,-z,noexecstack -Wl,-z,stack-size=8388608 \
+    -Wl,--hash-style=gnu -Wl,--no-dynamic-linker \
+    "$SYSROOT/lib/rcrt1.o" "$SYSROOT/lib/crti.o" "$crtb" \
+    "${args[@]}" "$note" \
+    -L"$SYSROOT/lib" -Wl,--start-group -lc -lgcc -lgcc_eh -Wl,--end-group \
+    "$crte" "$SYSROOT/lib/crtn.o"
+if [ $sign -eq 1 ]; then
+    if [ -n "${key[*]:-}" ]; then python3 "$ROOT/tools/secos-sign" "$out" "${key[@]}"
+    else python3 "$ROOT/tools/secos-sign" "$out" --dev; fi
+fi

@@ -1,0 +1,16 @@
+--- a/src/process/posix_spawn.c	2026-11-09 14:59:57.075196821 +0100
++++ b/src/process/posix_spawn.c	2026-11-09 14:59:57.146656108 +0100
+@@ -195,8 +195,11 @@
+ 		goto fail;
+ 	}
+ 
+-	pid = __clone(child, stack+sizeof stack,
+-		CLONE_VM|CLONE_VFORK|SIGCHLD, &args);
++	/* SecOS: no clone yet (U9). A forked child runs the same code; it
++	 * has its own copy of args, and the pipe still reports exec errors. */
++	(void)stack;
++	pid = __syscall(SYS_fork);
++	if (pid == 0) child(&args);
+ 	close(args.p[1]);
+ 	UNLOCK(__abort_lock);
+ 
