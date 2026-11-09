@@ -80,6 +80,11 @@ void vma_remove(vma_set_t* s, vma_t* v);
 // [start, addr) and a new slot gets [addr, end) with the same type/flags and
 // its backing (image window / page-cache offset) rebased. 0, or -1 if full.
 int vma_split(vma_set_t* s, vma_t* v, uint64_t addr);
+// [U8] Grow a live anonymous VMA that ends exactly at 'start' and has these
+// leaf flags (and no M57 vflags) to cover [start, end): an anonymous mmap
+// placed right after the previous one uses no new slot, as Linux merges
+// adjacent anonymous mappings. 0 if merged, -1 if no such VMA.
+int vma_extend_anon(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags);
 // [M18] Does any live VMA overlap [start,end)?
 int vma_overlaps(const vma_set_t* s, uint64_t start, uint64_t end);
 // [M57] Does any live VMA_VF_PINNED region overlap [start,end)?

@@ -85,6 +85,17 @@ vma_t* vma_find_mut(vma_set_t* s, uint64_t addr) {
     return 0;
 }
 
+int vma_extend_anon(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags) {
+    if (!s || end <= start) return -1;
+    for (uint32_t i = 0; i < s->count; i++) {
+        vma_t* v = &s->v[i];
+        if (v->type != VMA_TYPE_ANON || v->vflags || v->end != start || v->flags != flags) continue;
+        v->end = end;
+        return 0;
+    }
+    return -1;
+}
+
 void vma_remove(vma_set_t* s, vma_t* v) {
     if (!s || !v) return;
     v->type = VMA_TYPE_NONE;       // tombstone; indices stay stable
