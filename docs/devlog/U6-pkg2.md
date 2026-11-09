@@ -248,6 +248,16 @@ Also run by hand:
   "largest size without meta_bg: 1024 GiB");
 - `secos-pkg --v1` reproduces `crypto/user_testpkg_spkg.h` byte for byte.
 
+**M41 persistent-root gate** (`tools/persist_test.sh`, 3 hard kills): 30/30
+(35 system programs now). **`tools/persist_test.sh --grow`** (new, also in
+the PKG2 selftest section): the same gate on a 1 GiB disk with host-written
+data, grown with `make grow-root`, its old groups filled, so boots, the
+kernel upgrade, the crash runs and the corrupt-disk fallbacks all run on
+blocks resize2fs added: 37/37 (df 8388608 KiB, the pre-grow data intact
+after every boot and crash). `tools/smoke.sh --mb2` and `--uefi`: PASS.
+Not run: the full `tools/selftest.sh` (brief); the PKG2 section is wired
+in and was run on its own.
+
 Builds: `-Wall -Wextra` warnings 0 → 0 for the kernel, normal and
 `-DSECOS_LOCKDEP`; `user/spkg.c`, `user/init.c` clean with `-Wextra`.
 
