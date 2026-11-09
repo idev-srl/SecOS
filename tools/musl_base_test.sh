@@ -66,6 +66,10 @@ done
 if [[ $need -eq 1 ]]; then
     bash tools/port-musl.sh >"$W/port.log" 2>&1; rc=$?
 else rc=0; fi
+if [[ $rc -eq 3 ]]; then   # offline and no cached tarball: nothing to test
+    echo "  [SKIP] MUSL-BASE (musl sources not cached and not downloadable)"
+    echo "[musl] RESULT: 0 passed, 0 failed (skipped)"; exit 0
+fi
 ok "musl sysroot built (no raw syscall instruction in libc.a)" $rc
 [[ $rc -eq 0 ]] || { tail -20 "$W/port.log"; echo "[musl] RESULT: $PASSN passed, $FAILN failed"; exit 1; }
 
