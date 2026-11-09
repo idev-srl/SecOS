@@ -232,6 +232,26 @@ the per-frame latency. Ranges are over two runs.
 - `nc` with stdin from `/dev/urandom` is very slow under TCG (csprng in
   256-byte chunks); the gate uploads a downloaded file instead.
 
+## Known QEMU flake: e1000e assert after `kill -9` of the driver
+
+Seen once during integration (`integ/m58-u1`, gate guest `udrv-smp4`, about 1 in
+28 kills; the rerun and the full selftest run passed): QEMU 6.2 itself aborts
+with
+
+    hw/net/e1000e_core.c:175: e1000e_intrmgr_on_msix_throttling_timer:
+    Assertion `msix_enabled(timer->core->owner)' failed.
+
+The guest is healthy (no `[EXC]`/panic; the gate reports `BrokenPipeError` on
+the dead serial pipe). QEMU's emulated e1000e arms an MSI-X throttling (EITR)
+timer for each interrupt it raises; the claim teardown (`release_locked`,
+step 2) turns MSI-X off before the function reset (step 3), and when the timer
+fires in that window QEMU 6.2 asserts. Real hardware has no such check.
+QEMU 9.2 (`~/qemu-local`) no longer has this assert: the assertion text is
+present in the 6.2 binary and absent from the 9.2 one. A cheap guest-side
+mitigation, if the flake gets in the way: in `irq_teardown_locked`, wait about
+1 ms (longer than the default EITR interval) between masking the vectors and
+disabling MSI-X, so any armed timer fires while MSI-X is still on.
+
 ## Not covered
 
 The proxy's ring checks are separate pure functions (`udrv_net_check_index`,
