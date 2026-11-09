@@ -4,6 +4,11 @@
 # Usage:
 #   tools/smoke.sh --mb2 [--timeout N] [--log /tmp/foo.log]
 #   tools/smoke.sh --uefi [--timeout N] [--log /tmp/foo.log]
+#   --keep-kernel (or SMOKE_KEEP_KERNEL=1): boot the kernel.bin already built
+#   (e.g. by `make CFLAGS_EXTRA=-DM8_SCHED_DEMO=1`) instead of rebuilding it.
+#   Without it `make iso` rebuilds kernel.bin with the default flags, because
+#   the Makefile tracks compiler flags (.cflags.stamp); tools/selftest.sh
+#   exports SMOKE_KEEP_KERNEL=1, since every gate builds its own kernel first.
 #
 # Exit codes:
 #   0  PASS — QEMU was killed by timeout (kernel alive after N seconds)
@@ -28,6 +33,7 @@ set -euo pipefail
 MODE=""
 TIMEOUT=20
 LOG=""
+KEEP_KERNEL="${SMOKE_KEEP_KERNEL:-0}"
 
 # ── argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -36,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --uefi)   MODE=uefi ;;
         --timeout) shift; TIMEOUT=$1 ;;
         --log)     shift; LOG=$1 ;;
+        --keep-kernel) KEEP_KERNEL=1 ;;
         -h|--help)
             sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \?//'
             exit 0 ;;
@@ -73,9 +80,17 @@ check_cmd qemu-system-x86_64
 check_cmd timeout
 
 # ── build ─────────────────────────────────────────────────────────────────────
+# With --keep-kernel, `make -o kernel.bin` treats kernel.bin as up to date, so
+# only the ISO / loader around it is (re)built.
+MAKE_KEEP=()
+if [[ "$KEEP_KERNEL" == 1 ]]; then
+    [[ -f kernel.bin ]] || { echo "[smoke] ERROR: --keep-kernel but no kernel.bin" >&2; exit 2; }
+    MAKE_KEEP=(-o kernel.bin)
+    echo "[smoke] Using the kernel.bin already built (--keep-kernel)"
+fi
 build_mb2() {
     echo "[smoke] Building Multiboot2 ISO..."
-    if ! make iso 2>&1; then
+    if ! make "${MAKE_KEEP[@]}" iso 2>&1; then
         echo "[smoke] BUILD FAILED (make iso)" >&2
         exit 2
     fi
@@ -90,7 +105,7 @@ build_uefi() {
     echo "[smoke] Building kernel + UEFI loader..."
     # 'make uefi' depends on 'make all', so one invocation is enough.
     # It also copies kernel.bin → dist/kernel.elf (Makefile line 153).
-    if ! make uefi 2>&1; then
+    if ! make "${MAKE_KEEP[@]}" uefi 2>&1; then
         echo "[smoke] BUILD FAILED (make uefi)" >&2
         exit 2
     fi

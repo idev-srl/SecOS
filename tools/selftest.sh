@@ -37,6 +37,10 @@ done
 # image with the pre-login console policy (make CONSOLE=root). A gate that
 # tests the console login itself passes CONSOLE=login on its make line.
 export CONSOLE=root
+# Every gate that boots through tools/smoke.sh builds its own kernel first
+# (often `make CFLAGS_EXTRA=-D<demo>`): smoke must boot that kernel.bin, not
+# rebuild it with the default flags (the Makefile tracks compiler flags).
+export SMOKE_KEEP_KERNEL=1
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
