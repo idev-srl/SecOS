@@ -350,7 +350,10 @@ int main(int argc, char** argv) {
         pending = 0;
         if (kick) continue;                        /* the kernel posted free slots */
         struct pollfd pf = { g_fd, POLLIN, 0 };
-        int pr = poll(&pf, 1, g_irq ? 10 : 1);
+        /* Frames on the wire: look again within 1 ms even if the TX-done
+         * interrupt is late, so the kernel's TX slots come back quickly. */
+        int busy = g_tx_clean != g_tx_tail;
+        int pr = poll(&pf, 1, (g_irq && !busy) ? 10 : 1);
         if (pr > 0 && (pf.revents & (POLLHUP | POLLERR))) { say("[udrv-e1000e] claim ended; exiting\n"); return 2; }
         if (pr > 0 && (pf.revents & POLLIN)) {
             struct udrv_events ev;
