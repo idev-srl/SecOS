@@ -851,6 +851,18 @@ port-lvgl:
 	bash tools/port-lvgl.sh
 	@echo "port-lvgl: LVGL $(shell sed -n 's/^LV=//p' tools/port-lvgl.sh) built from source, sysmon signed -> crypto/user_sysmon_elf.h"
 
+# [U8] ncurses 6.6 (MIT-X11) + GNU nano 8.7.1 (GPL-3.0) from source on musl:
+# tools/port-musl.sh (sysroot), tools/port-ncurses.sh (libncursesw.a +
+# kernel/terminfo_db.h), tools/port-nano.sh (signed static-PIE ->
+# crypto/user_nano_elf.h + kernel/nano_syntax.h), installed as /usr/bin/nano.
+# Both tarballs are SHA-256 pinned and GPG-checked against the GNU keyring.
+.PHONY: port-nano
+port-nano:
+	bash tools/port-musl.sh
+	bash tools/port-ncurses.sh
+	bash tools/port-nano.sh
+	@echo "port-nano: GNU nano built from source on musl + ncursesw, signed -> crypto/user_nano_elf.h"
+
 .PHONY: port-busybox
 port-busybox:
 	bash tools/port-busybox.sh
