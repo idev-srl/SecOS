@@ -102,9 +102,9 @@ readelf -l "$ELF" | grep -q INTERP && { echo "[port-nano] dynamic binary?"; exit
 echo "[port-nano] 3/4 embed: crypto/user_nano_elf.h + kernel/nano_syntax.h"
 cp "$ELF" "$ROOT/user/nano.elf"
 python3 "$ROOT/tools/elf2h.py" "$ROOT/user/nano.elf" user_nano_elf "$ROOT/crypto/user_nano_elf.h"
-python3 - "$SRC/syntax" "$ROOT/kernel/nano_syntax.h" "$V" $SYNTAX <<'PY'
+python3 - "$SRC/syntax" "$ROOT/kernel/nano_syntax.h" "$V" "$ROOT/user/nano/nanorc" $SYNTAX <<'PY'
 import os, sys
-d, out, v, names = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+d, out, v, rc, names = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
 def cstr(b):
     s = []
     for ch in b:
@@ -125,16 +125,25 @@ with open(out, "w") as f:
     for i, n in enumerate(names):
         f.write('    { "%s.nanorc", nano_syn%d },\n' % (n, i))
     f.write("    { 0, 0 }\n};\n")
-print("[port-nano]   %d syntax files" % len(names))
+    f.write("// The default /etc/nanorc (user/nano/nanorc, MIT).\n")
+    f.write("static const char nano_nanorc[] =\n    %s;\n" % cstr(open(rc, "rb").read()))
+print("[port-nano]   %d syntax files + /etc/nanorc" % len(names))
 PY
 
 if [ "${NANO_SPKG:-0}" = 1 ]; then
     echo "[port-nano] 4/4 package build/nano-$V.spkg"
-    P="$OBJ/pkgroot"; rm -rf "$P"; mkdir -p "$P/usr/bin" "$P/usr/share/nano"
+    # The same files the kernel image installs (kernel/sysroot.c).
+    P="$OBJ/pkgroot"; rm -rf "$P"; mkdir -p "$P/usr/bin" "$P/usr/share/nano" "$P/etc"
     cp "$ELF" "$P/usr/bin/nano"
     for n in $SYNTAX; do cp "$SRC/syntax/$n.nanorc" "$P/usr/share/nano/"; done
-    python3 "$ROOT/tools/secos-pkg" --help >/dev/null 2>&1 || true
-    echo "[port-nano]   see docs/devlog/U8-nano.md for the secos-pkg invocation"
+    cp "$ROOT/user/nano/nanorc" "$P/etc/nanorc"
+    # The terminfo entries kernel/terminfo_db.h carries (tools/port-ncurses.sh).
+    for e in $(sed -n 's/^    { "\([a-z]\/[^"]*\)", terminfo_e.*/\1/p' "$ROOT/kernel/terminfo_db.h"); do
+        mkdir -p "$P/usr/share/terminfo/${e%%/*}"; cp "$ROOT/build/terminfo/$e" "$P/usr/share/terminfo/$e"
+    done
+    python3 "$ROOT/tools/secos-pkg" create "$ROOT/build/nano-$V.spkg" --name nano --version "$V" \
+        --tree "$P/usr:/usr" --tree "$P/etc:/etc" --mode 0755:/usr/bin/nano
+    python3 "$ROOT/tools/secos-pkg" verify "$ROOT/build/nano-$V.spkg"
 else
     echo "[port-nano] 4/4 (NANO_SPKG=1 for a package)"
 fi

@@ -890,3 +890,20 @@ static const struct { const char* name; const char* text; } nano_syntax[] = {
     { "yaml.nanorc", nano_syn21 },
     { 0, 0 }
 };
+// The default /etc/nanorc (user/nano/nanorc, MIT).
+static const char nano_nanorc[] =
+    "# /etc/nanorc - system-wide GNU nano settings (SecOS). See nanorc(5).\n"
+    "# Personal settings go in ~/.config/nano/nanorc or ~/.nanorc.\n"
+    "\n"
+    "# Show the cursor position in the status bar.\n"
+    "set constantshow\n"
+    "# Keep the indentation of the previous line.\n"
+    "set autoindent\n"
+    "# A tab is 4 columns wide (the file keeps its tab characters).\n"
+    "set tabsize 4\n"
+    "# Do not leave nano's lock files (.name.swp) next to edited files.\n"
+    "unset locking\n"
+    "\n"
+    "# Syntax highlighting for the languages installed with nano.\n"
+    "include \"/usr/share/nano/*.nanorc\"\n"
+    "";

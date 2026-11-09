@@ -313,25 +313,6 @@ static const char g_inputrc[] =
     "\"\\e[1;5D\": backward-word\n";
 #endif
 
-#ifndef SECOS_NO_NANO
-// [U8] System-wide nano settings: created only when missing, then the admin's.
-static const char g_nanorc[] =
-    "# /etc/nanorc - system-wide GNU nano settings (SecOS). See nanorc(5).\n"
-    "# Personal settings go in ~/.config/nano/nanorc or ~/.nanorc.\n"
-    "\n"
-    "# Show the cursor position in the status bar.\n"
-    "set constantshow\n"
-    "# Keep the indentation of the previous line.\n"
-    "set autoindent\n"
-    "# A tab is 4 columns wide (the file keeps its tab characters).\n"
-    "set tabsize 4\n"
-    "# Do not leave nano's lock files (.name.swp) next to edited files.\n"
-    "unset locking\n"
-    "\n"
-    "# Syntax highlighting for the languages installed with nano.\n"
-    "include \"/usr/share/nano/*.nanorc\"\n";
-#endif
-
 // [M43] Login shells (login, su -, sudo -i) read /etc/profile; new homes get
 // /etc/skel. Created only when missing, like every SF_CONF.
 static const char g_profile[] =
@@ -449,7 +430,7 @@ static void build_table(void){
         char p[64]; sr_cpy(p, "/usr/share/terminfo/", sizeof(p)); sr_cat(p, terminfo_db[i].path, sizeof(p));
         sf_data(p, terminfo_db[i].data, terminfo_db[i].len);
     }
-    sf_conf("/etc/nanorc", g_nanorc);
+    sf_conf("/etc/nanorc", nano_nanorc);   // user/nano/nanorc, via nano_syntax.h
 #endif
     sf_bin("poweroff", user_power_elf, user_power_elf_len);
     sf_alias("reboot", "poweroff", user_power_elf, user_power_elf_len, 0);
