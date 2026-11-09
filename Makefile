@@ -663,7 +663,7 @@ user-progs: libcrypt
 	$(MAKE) --no-print-directory pkg-progs
 	@echo "user-progs: built+signed hello + udrv_edu + udrv_negtest + udrv_user + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + smptest + pcstress + fsstress + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest + spkg -> crypto/*.h"
 
-# [M57] Ring-3 driver test programs (docs/devlog/M57-udrv-core.md): udrv_edu
+# [M57] Ring-3 driver test programs (docs/devlog/M57-udrv-edu.md): udrv_edu
 # (positive: edu BAR, IRQ fd, DMA) and udrv_negtest (inputs the kernel must
 # refuse) carry the v3 DRIVER manifest note_udrv; udrv_user is the same
 # negative-test binary with a plain manifest (every claim must be refused).
