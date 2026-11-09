@@ -1124,6 +1124,13 @@ int vmm_cow_fault(vmm_space_t* space, uint64_t addr) {
     if (!pt) return -1;
     int i = (va >> 12) & 0x1FF;
     uint64_t pte = pt[i];
+    // [U9] Already writable: another thread of this address space resolved
+    // the same COW page first (we faulted on the read-only entry it replaced,
+    // under mm_lock now). Retry the write; drop our stale TLB entry.
+    if ((pte & VMM_FLAG_PRESENT) && (pte & VMM_FLAG_RW) && (pte & VMM_FLAG_USER) && !(pte & VMM_FLAG_COW)) {
+        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+        return 0;
+    }
     if (!(pte & VMM_FLAG_PRESENT) || !(pte & VMM_FLAG_COW)) return -1;
     {   // Only a region that is writable NOW may be COW-resolved: a COW page
         // later mprotect()ed read-only keeps its COW bit (it is still shared),
