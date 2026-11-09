@@ -5,8 +5,9 @@
 # Builds CONSOLE=root images and boots them on q35 with QEMU's edu device at
 # 00:04.0, driven by /bin/udrv_edu (user/udrv_edu.c) and checked by
 # tools/udrv_check.py:
-#   run          q35 + intel-iommu, `iommu=on udrv=00:04.0 udrv.noir`
-#                (interrupt remapping is M56): udrv_edu passes (claim, INFO,
+#   run          q35 + intel-iommu,intremap=on, `iommu=on udrv=00:04.0`:
+#                interrupt remapping covers edu, so the claim gets DMA and
+#                MSI with no override; udrv_edu passes (claim, INFO,
 #                BAR 0 id/liveness/factorial, 10000 MSI round trips through
 #                the claim fd + one through poll(), 2 KiB edu DMA both ways
 #                through the device's own IOMMU domain); then 8 more runs,
@@ -27,9 +28,11 @@
 #                -ENODEV, bus mastering and IRQ_SETUP -EPERM), the BAR works;
 #   default      an image without udrv= on q35 + intel-iommu + edu: no [UDRV]
 #                line, /proc/udrv empty, edu left to nobody;
-#   noir         q35 + intel-iommu without udrv.noir (no interrupt
-#                remapping before M56): the claim is MMIO only, bus mastering
-#                and DMA refused for that reason;
+#   noir         q35 + intel-iommu,intremap=off (no interrupt remapping),
+#                no udrv.noir: the claim is MMIO only, bus mastering and DMA
+#                refused for that reason;
+#   noir-override the same machine with udrv.noir: DMA granted anyway, the
+#                claim says ir=no(udrv.noir); the "run" checks, 2000 rounds;
 #   unsafe       plain q35 with udrv.unsafe: DMA without an IOMMU works and
 #                the kernel reports the taint;
 #   lockdep-smp4 the "run" guest on a -DSECOS_LOCKDEP image at -smp 4;
@@ -109,23 +112,28 @@ mkroot_service() {
     debugfs -R 'cat /etc/inittab' "$img" 2>/dev/null | grep -q 'udrv_edu -n 1000 --serve'
 }
 
-UD="iommu=on udrv=00:04.0 udrv.noir"
-# ---------------------------------------------------------------- images
-if selected run || selected service || selected nommu; then build udrv "$UD" ""; fi
+# [M56] QEMU's intel-iommu turns interrupt remapping on by itself under TCG,
+# so every IOMMU guest names it: intremap=on (the production path: IR covers
+# edu, the claim gets DMA + MSI with no override) or intremap=off (no IR:
+# DMA refused, or granted only by the udrv.noir override).
+UD="iommu=on udrv=00:04.0"
+IRON="-machine q35,kernel-irqchip=split -device intel-iommu,intremap=on"
+IROFF="-machine q35 -device intel-iommu,intremap=off"
+if selected run || selected service || selected nommu || selected noir; then build udrv "$UD" ""; fi
 selected default && build default "" ""
-selected noir && build noir "iommu=on udrv=00:04.0" ""
+selected noir-override && build noirovr "$UD udrv.noir" ""
 selected unsafe && build unsafe "udrv=00:04.0 udrv.unsafe" ""
 selected lockdep-smp4 && build lockdep "$UD" "-DSECOS_LOCKDEP"
 selected bkl-on && build bklon "$UD bkl=on" ""
 
-# ---------------------------------------------------------------- guests
+IRLINE='\[IOMMU\] IR: on: 1 unit\(s\)'
 guest run udrv.iso --mode run --rounds 10000 --leak-runs 8 --negtest translated \
-    --expect '\[UDRV\] 1 device\(s\) for ring-3 drivers; iommu=on ir=off udrv\.noir' -- \
-    -machine q35 -device intel-iommu -smp 2
+    --expect "$IRLINE" --expect '\[UDRV\] 1 device\(s\) for ring-3 drivers; iommu=on ir=on\n' -- \
+    $IRON -smp 2
 if selected service; then
     if mkroot_service; then
         guest service udrv.iso --mode service --kills 3 --expect '\[ROOT\] persistent root fs=ext4 dev=vda' -- \
-            -machine q35 -device intel-iommu -smp 2 -drive file="$WD/service-root.img",format=raw,if=virtio
+            $IRON -smp 2 -drive file="$WD/service-root.img",format=raw,if=virtio
     else
         echo "[udrv] service: FAIL (root image, see $WD/mkroot.log)"; FAILN=$((FAILN+1))
     fi
@@ -133,15 +141,17 @@ fi
 guest nommu udrv.iso --mode nommu --negtest nommu \
     --expect '\[IOMMU\] iommu=on: off \(no DMA-remapping hardware\)' -- -machine q35 -smp 2
 guest default default.iso --mode default --negtest nodev --expect '\[IOMMU\] DMA remapping off \(default' -- \
-    -machine q35 -device intel-iommu -smp 2
-guest noir noir.iso --mode negtest --negtest noir \
-    --expect '\[UDRV\] 1 device\(s\) for ring-3 drivers; iommu=on ir=off\n' -- -machine q35 -device intel-iommu -smp 2
+    $IRON -smp 2
+guest noir udrv.iso --mode negtest --negtest noir \
+    --expect '\[UDRV\] 1 device\(s\) for ring-3 drivers; iommu=on ir=off\n' -- $IROFF -smp 2
+guest noir-override noirovr.iso --mode run --claim-ir noir --rounds 2000 --leak-runs 2 --negtest translated \
+    --expect '\[UDRV\] 1 device\(s\) for ring-3 drivers; iommu=on ir=off udrv\.noir' -- $IROFF -smp 2
 guest unsafe unsafe.iso --mode negtest --negtest unsafe \
     --expect '\[UDRV\] \*\*\* WARNING: udrv\.unsafe' -- -machine q35 -smp 2
 guest lockdep-smp4 lockdep.iso --mode run --rounds 2000 --leak-runs 4 --timeout 900 --negtest translated \
-    --expect '\[LDTEST\] all 0x0*A/0x0*A' -- -machine q35 -device intel-iommu -smp 4
+    --expect '\[LDTEST\] all 0x0*A/0x0*A' --expect "$IRLINE" -- $IRON -smp 4
 guest bkl-on bklon.iso --mode run --rounds 10000 --leak-runs 4 --negtest translated \
-    --expect '\[BKL\] kernel lock mode: bkl=on' -- -machine q35 -device intel-iommu -smp 2
+    --expect '\[BKL\] kernel lock mode: bkl=on' --expect "$IRLINE" -- $IRON -smp 2
 
 make clean >/dev/null 2>&1
 echo "[udrv-gate] $PASS passed, $FAILN failed"

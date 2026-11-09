@@ -55,6 +55,8 @@ ap.add_argument('--timeout', type=float, default=600, help='boot timeout (s)')
 ap.add_argument('--rounds', type=int, default=10000, help='IRQ round trips of the main run')
 ap.add_argument('--leak-runs', type=int, default=8, help='extra short runs for the leak check')
 ap.add_argument('--kills', type=int, default=3, help='service mode: kill -9 / restart cycles')
+ap.add_argument('--claim-ir', default='on', choices=['on', 'noir'],
+                help='--mode run: the claim line of an IR-covered function (on) or of the udrv.noir override (noir)')
 ap.add_argument('--negtest', default='', help='environment for udrv_negtest (translated|unsafe|noir|nommu|nodev)')
 ap.add_argument('--expect', action='append', default=[])
 ap.add_argument('--absent', action='append', default=[])
@@ -335,8 +337,12 @@ if a.mode == 'run':
     for l in re.findall(r'\[udrv_edu\] (?:irq-rounds|dma-data|dma-alloc|id-register|factorial)[^\n]*', o or ''):
         print('[udrv] %s: %s' % (a.name, l), flush=True)
     d = dlog()
-    check('log-claim', re.search(r'\[UDRV\] claim pid=\d+ bdf=00:04\.0 ok fd=\d+ iommu=translated dma=yes ir=no\(udrv\.noir\)', d)
-          is not None)
+    # [M56] With interrupt remapping covering edu the claim line ends at
+    # dma=yes; only the udrv.noir override (IR off) adds ir=no(udrv.noir).
+    claim_re = (r'\[UDRV\] claim pid=\d+ bdf=00:04\.0 ok fd=\d+ iommu=translated dma=yes ir=no\(udrv\.noir\)'
+                if a.claim_ir == 'noir' else
+                r'(?m)\[UDRV\] claim pid=\d+ bdf=00:04\.0 ok fd=\d+ iommu=translated dma=yes\r?$')
+    check('log-claim', re.search(claim_re, d) is not None)
     check('log-irq-setup', re.search(r'\[UDRV\] irq_setup pid=\d+ bdf=00:04\.0 msi nvec=1', d) is not None)
     check('log-release', re.search(r'\[UDRV\] release pid=\d+ bdf=00:04\.0 \(release\)', d) is not None)
     m = re.search(r'dma-alloc ok rc=0 uva=0x[0-9a-f]+ iova=(0x[0-9a-f]+)', o or '')
