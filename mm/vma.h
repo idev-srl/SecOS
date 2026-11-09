@@ -85,6 +85,8 @@ int vma_split(vma_set_t* s, vma_t* v, uint64_t addr);
 // placed right after the previous one uses no new slot, as Linux merges
 // adjacent anonymous mappings. 0 if merged, -1 if no such VMA.
 int vma_extend_anon(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags);
+// [U8] Slots a vma_add can still take (tombstones + never used).
+uint32_t vma_free_slots(const vma_set_t* s);
 // [M18] Does any live VMA overlap [start,end)?
 int vma_overlaps(const vma_set_t* s, uint64_t start, uint64_t end);
 // [M57] Does any live VMA_VF_PINNED region overlap [start,end)?

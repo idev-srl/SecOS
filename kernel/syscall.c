@@ -506,6 +506,15 @@ int ksys_munmap(uint64_t addr, uint64_t len){
     uint64_t end = addr + len;
     uint64_t fl = mm_lock(c);
     if (vma_pinned_overlap(&c->vmas, addr, end)) { mm_unlock(c, fl); return -22; }  // [M57] -EINVAL
+    // [U8] A hole inside one VMA splits it and needs a free slot: check first,
+    // so a full set fails the call (-ENOMEM, as Linux at its map limit)
+    // before anything is unmapped, instead of dropping the tail's VMA.
+    { uint32_t holes = 0;
+      for (uint32_t i = 0; i < c->vmas.count; i++) {
+          const vma_t* v = &c->vmas.v[i];
+          if (v->type != VMA_TYPE_NONE && v->start < addr && end < v->end) holes++;
+      }
+      if (holes > vma_free_slots(&c->vmas)) { mm_unlock(c, fl); return -12; } }
     // Every user page is VMA-backed (M14), so only VMA intersections can hold
     // present PTEs: unmap those instead of walking the whole (maybe huge) range.
     for (uint32_t i = 0; i < c->vmas.count; i++) {
@@ -522,14 +531,9 @@ int ksys_munmap(uint64_t addr, uint64_t len){
         if (addr <= v->start && end >= v->end)      vma_remove(&c->vmas, v);   // fully covered
         else if (addr <= v->start)                  v->start = end;            // trim front
         else if (end >= v->end)                     v->end = addr;             // trim back
-        else if (v->type == VMA_TYPE_PHYS) {                                   // hole in a device map:
-            if (vma_split(&c->vmas, v, end) != 0) { /* set full: the tail is dropped */ }
-            v->end = addr;                                                     // tail kept, rebased
-        }
-        else {                                                                 // hole: split (ANON)
-            uint64_t old_end = v->end; v->end = addr;
-            if (v->type == VMA_TYPE_ANON)
-                vma_add(&c->vmas, end, old_end, v->flags, VMA_TYPE_ANON,0,0,0,0);
+        else {                                     // hole: split (tail kept, backing rebased)
+            if (vma_split(&c->vmas, v, end) != 0) { /* cannot happen: slots checked above */ }
+            v->end = addr;
         }
     }
     mm_unlock(c, fl);
