@@ -401,7 +401,8 @@ uint32_t   process_take_jobctl_child(uint32_t ppid, int want_stop, int want_cont
 int        process_has_children(uint32_t ppid);
 // [M50-B1] Credentials: cross-process readers (kill permission, procfs owner)
 // read p->cred under proc_lock; the owner writes it under proc_lock.
-void       process_set_cred(process_t* p, const struct proc_cred* cr);
+void       process_set_cred(process_t* p, const struct proc_cred* cr);      // [U9] + its threads
+void       process_set_cred_task(process_t* p, const struct proc_cred* cr); // [U9] this task only
 // [M48] SMP scheduler support (kernel/process.c).
 process_t* process_claim_next(uint32_t cpu, process_t* after); // pick+claim (RUNNING, on_cpu)
 uint32_t process_pick_home(void);          // least-loaded online CPU for a new task

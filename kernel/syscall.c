@@ -1944,7 +1944,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         if (!c) return (uint64_t)(int64_t)-22;
         if (a0 == PR_SET_NO_NEW_PRIVS) {
             if (a1 != 1) return (uint64_t)(int64_t)-22;   // can never be cleared
+            uint64_t pfl = process_lock_irqsave();
             c->no_new_privs = 1;
+            thread_group_sync_locked(c, TG_SYNC_NNP);       // [U9] every thread
+            process_unlock_irqrestore(pfl);
             debugcon_writestring("[CAPX] pid="); debugcon_print_hex(c->pid);
             debugcon_writestring(" set no_new_privs\n");
             return 0;

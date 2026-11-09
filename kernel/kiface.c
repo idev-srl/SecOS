@@ -18,6 +18,7 @@
  */
 #include "udrv.h"          /* [M57] claim fds in poll() */
 #include "kiface.h"
+#include "klock.h"
 #include "cred.h"
 #include "process.h"
 #include "sched.h"
@@ -497,6 +498,11 @@ static uint64_t sys_poll(process_t* c, trapframe_t* tf, uint64_t ufds, uint64_t 
         else c->ki.poll_deadline = now + (uint64_t)timeout_ms * 1000000ull;
     }
     int ready = 0, watch = 0;
+    /* [U9] Another thread of the process may close a polled fd and drop the
+     * last reference of its object meanwhile: the scan (no user copy, no
+     * block) runs under the group's fd_lock, like close() does. */
+    int mt = c->tg && __atomic_load_n(&c->tg->nr_live, __ATOMIC_RELAXED) > 1;
+    if (mt) klock_lock(&c->tg->fd_lock);
     for (uint64_t i = 0; i < nfds; i++) {
         pf[i].revents = 0;
         if (pf[i].fd < 0) continue;
@@ -512,6 +518,7 @@ static uint64_t sys_poll(process_t* c, trapframe_t* tf, uint64_t ufds, uint64_t 
         pf[i].revents = (int16_t)got;
         if (got) ready++;
     }
+    if (mt) klock_unlock(&c->tg->fd_lock);
     if (ready || now >= c->ki.poll_deadline) {
         c->ki.poll_active = 0; c->ki.poll_wait = 0; c->sleep_until = 0;
         if (nfds && copy_to_user((void*)ufds, pf, nfds * sizeof(pf[0]))) return NEG(E_FAULT);
@@ -676,10 +683,10 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
          * the check, as with Linux's access() override credentials. */
         struct proc_cred saved = c->cred, tmp = c->cred;
         tmp.euid = tmp.ruid; tmp.egid = tmp.rgid;
-        process_set_cred(c, &tmp);
+        process_set_cred_task(c, &tmp);          /* [U9] not the sibling threads */
         vfs_inode_t* ino = 0;
         e = cred_check_path(c, p0, 1, mode, 0, 0, &ino);
-        process_set_cred(c, &saved);
+        process_set_cred_task(c, &saved);
         r = e ? NEG(-e) : 0;
         break;
     }

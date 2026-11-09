@@ -346,6 +346,14 @@ void process_set_cred(process_t* p, const struct proc_cred* cr) {
     thread_group_sync_locked(p, TG_SYNC_CRED);   // [U9] one set of ids per process
     spin_unlock_irqrestore(&proc_lock, fl);
 }
+// [U9] This task only (access()'s temporary real-id check must not change
+// the ids its sibling threads run with).
+void process_set_cred_task(process_t* p, const struct proc_cred* cr) {
+    if (!p || !cr) return;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    p->cred = *cr;
+    spin_unlock_irqrestore(&proc_lock, fl);
+}
 
 // [M52] Does any process hold `ino` in its fd table or a file mapping? Read
 // under each owner's mm_lock (callable under an FS klock: K30 -> S30 -> S35).
