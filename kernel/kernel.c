@@ -1756,6 +1756,12 @@ static void kernel_main_phase2(void) {
     // negative, block alignment, exhaustion. Before any driver allocates one.
     { extern void irq_vec_selftest(void); irq_vec_selftest(); }
 
+    // [M54] VT-d DMA remapping, opt-in (boot word iommu=on): every PCI function
+    // goes into one passthrough domain, so the drivers probed below are
+    // unchanged. Needs the PCI registry, the DMAR and a free vector (fault
+    // event); before any driver enables bus mastering. No-op by default.
+    { extern void iommu_init(void); iommu_init(); }
+
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();
 #endif

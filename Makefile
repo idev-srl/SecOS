@@ -84,6 +84,7 @@ SRC_C   = \
 	$(ARCH_DIR)/percpu.c \
 	$(ARCH_DIR)/tlb.c \
 	$(ARCH_DIR)/irq.c \
+	$(ARCH_DIR)/vtd.c $(ARCH_DIR)/vtd_pt.c \
 	$(DRIVERS_DIR)/keyboard.c $(DRIVERS_DIR)/timer.c $(DRIVERS_DIR)/rtc.c \
 	$(DRIVERS_DIR)/serial.c \
 	$(DRIVERS_DIR)/fb.c $(DRIVERS_DIR)/fb_console.c $(DRIVERS_DIR)/vt.c \
@@ -126,6 +127,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/pkg.c \
 	$(KERNEL_DIR)/selftest.c \
 	$(KERNEL_DIR)/exec_test.c \
+	$(KERNEL_DIR)/iommu.c $(KERNEL_DIR)/iommu_test.c \
 	user/testdriver.c \
 	$(LIB_DIR)/terminal.c \
 	$(FS_DIR)/ramfs.c \

@@ -102,9 +102,22 @@
 #define LK_S64_LEAF        164  /* kclock, csprng, elf-revoke (C6, writers
                                    only), pci_cfg_lock (M53a: one CF8/CFC
                                    pair or RMW): leaf locks (plan: S60)        */
+#define LK_S65_IOMMU_DEV   165  /* g_dev_lock (kernel/iommu.c, M54): the device
+                                   -> IOMMU domain table, held across a context
+                                   change; S67/S68 and the PMM nest inside   */
 #define LK_S66_IRQVEC      166  /* g_irqvec_lock (arch/x86/irq.c, M53c): the
                                    dynamic vector allocator; leaf, IRQ-safe.
                                    irq_dispatch never takes it               */
+#define LK_S67_IOMMU_DOM   167  /* iommu_domain.lock (M54, one per domain):
+                                   page-table edits + the IOTLB flush that
+                                   follows (unit S68 inside), table pages from
+                                   the PMM (S75). Callable under N3 tx_lock
+                                   and S45 xhci_lock (plan: S66, taken by the
+                                   vector allocator)                         */
+#define LK_S68_IOMMU_UNIT  168  /* vtd_unit.lock (arch/x86/vtd.c, M54, one per
+                                   DMA-remapping unit): registers, invalidation
+                                   queue, context tables, fault records. The
+                                   fault interrupt takes only this one         */
 #define LK_S70_HEAP        170  /* heap_lock (expand_heap calls the PMM)        */
 #define LK_S75_PMM         175  /* pmm_lock: innermost                          */
 

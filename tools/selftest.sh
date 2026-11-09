@@ -3261,6 +3261,25 @@ else
     check "M53a PCI gate build" 1
 fi
 
+# ---- M54: VT-d DMA remapping, opt-in (tools/iommu_gate.sh) ----
+# q35 + intel-iommu with iommu=on: in-kernel edu DMA tests (unmap-then-DMA
+# must fault, read-only, mask, blocked, passthrough, 1000-round loop, fault
+# storm), every driver doing I/O in the passthrough domain, the aw-bits /
+# caching-mode / pt / register-invalidation matrix, NOFLUSH and blocked-AHCI
+# negatives, no-IOMMU and AMD-Vi fallbacks, lockdep -smp 4, UEFI, QEMU 9.2
+# x2APIC, fsstress on the AHCI ext4 root; the default (iommu=off) image too.
+echo "[selftest] Running the M54 VT-d gate (~35-50 min)..."
+tools/iommu_gate.sh >/tmp/secos_selftest_m54.out 2>&1
+while IFS= read -r l; do
+    case "$l" in
+        "[iommu] "*": PASS") n="${l#\[iommu\] }"; check "M54 VT-d ${n%: PASS}" 0 ;;
+        "[iommu] "*": FAIL"*) n="${l#\[iommu\] }"; check "M54 VT-d ${n%%: FAIL*}" 1 ;;
+        "[iommu] "*" FAIL"*) echo "    $l" ;;
+        "[iommu-gate] SKIP"*) echo "  [SKIP] ${l#\[iommu-gate\] SKIP }" ;;
+    esac
+done </tmp/secos_selftest_m54.out
+grep -q "^\[iommu-gate\] [0-9]* passed, 0 failed" /tmp/secos_selftest_m54.out; check "M54 VT-d gate ran to completion, no failure" $?
+
 echo "[selftest] ---"
 echo "[selftest] RESULT: $PASS passed, $FAIL failed"
 if [[ "$FAIL" -eq 0 ]]; then echo "[selftest] DONE: ALL PASS"; exit 0; fi
