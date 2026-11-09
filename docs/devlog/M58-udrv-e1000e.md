@@ -184,6 +184,12 @@ lockdep-netstress-smp4). Builds: 0 warnings in all three images (base
 - netstress: 25/25 checks in each of the three runs (no socket, TCP, UDP or
   memory leak).
 
+Also run on the final branch: `tools/udrv_gate.sh` (M57, edu; the
+negative-test table with the A02 change) **9 passed, 0 failed**;
+`tools/persist_test.sh` (CONSOLE=root, as the selftest exports it) **30
+PASS, 0 FAIL** (40 programs on the persistent root); `tools/smoke.sh --mb2`
+and `--uefi` PASS, no `[EXC]`.
+
 ### Performance (QEMU 6.2 TCG, -smp 2, same host, not a gate)
 
 | | ring-3 e1000e | in-kernel e1000e |
