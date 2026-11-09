@@ -293,6 +293,17 @@ if "con" in modes:
     serial(b"\x18", 1.5)
     check("con-nano-exits", wait_for(r"bash-5\.2# ", 15, p) is not None)
     od_check("con-file-bytes", "/tmp/nanocon.txt", expected(L1, L2, L3), pos)
+    # Edit the existing file: read it back, insert at the top, overwrite it.
+    p = len(logtext())
+    type_serial("  nano /tmp/nanocon.txt")
+    check("con-reopen-reads", wait_for(r"Read 3 lines", 15, p) is not None)
+    time.sleep(1)
+    serial("nuova \u00f2\r".encode(), 1.0)
+    serial(b"\x0f", 1.0); serial(b"\r", 1.5)
+    check("con-overwrite-saved", wait_for(r"Wrote 4 lines", 10, p) is not None)
+    serial(b"\x18", 1.5)
+    wait_for(r"bash-5\.2# ", 15, p)
+    od_check("con-overwrite-bytes", "/tmp/nanocon.txt", "nuova \u00f2\n".encode() + expected(L1, L2, L3), p)
 
 # ============================================================== gui session ====
 if "gui" in modes:
