@@ -63,10 +63,14 @@ pid=N killed: ...`). Received frames are copied out of the slot into a
 kernel buffer (batches of 16) before `net_rx`, outside the proxy lock.
 
 - **TX** (`px_transmit`, under `tx_lock`): reap completions, take a free TX
-  slot (none: the frame is dropped, `tx_full` counted, the driver nudged),
-  copy, publish `tx[]`, set `UDRV_EV_TX_KICK` on the claim fd.
+  slot, copy, publish `tx[]`, set `UDRV_EV_TX_KICK` on the claim fd. When
+  every slot is out the frame waits in a bounded kernel queue (256 frames,
+  `tx_queued`) and goes out as slots come back; only a full queue drops
+  (`tx_full`). See "Bugs found" for why.
 - **RX** (`px_poll`, under `rx_lock`): reap TX completions, read `link`,
-  consume `rx[]`, repost each slot on `rxf[]`, then `net_rx`. Runs on the
+  consume `rx[]`, repost each slot on `rxf[]`, then `net_rx`. If the pass
+  was not the driver's own and the driver held fewer than half of the RX
+  slots, it is woken (its NIC ring was running dry). Runs on the
   driver's kick (`write()` of `struct udrv_ack` with `UDRV_ACK_NET_KICK`, in
   the driver's own syscall, no lock held) and from the 1 kHz tick.
 - **Stall watchdog**: TX frames queued with no completion for 5 s →
@@ -142,9 +146,85 @@ FS_READ | PROC | TIME`, so `no_new_privs`), match `8086:10d3` only,
 - `user/udrv_negtest.c` row A02 uses op 12 (11 is NET_ATTACH now).
 - `tools/persist_test.sh`: 40 programs.
 
-## Tests
+## Gate (`tools/net_udrv_gate.sh`, `tools/net_udrv_check.py`)
 
-(see "Test record" below)
+Every guest: q35, `-device intel-iommu,intremap=on` (named explicitly: QEMU
+turns IR on by itself under TCG), `kernel-irqchip=split`, e1000e on QEMU
+user networking, MB2 ISO `-boot d`, CONSOLE=root, a throwaway SSH key baked
+in. Host peers on 127.0.0.1 with kernel-chosen ports (never 2222/8000): an
+HTTP server with random 8/32 MiB payloads, a TCP sink that hashes what it
+gets, a one-shot echo server; SSH through a hostfwd port.
+
+| guest | image | checks |
+|---|---|---|
+| udrv-smp2 | `UDRV=8086:10d3` | claim translated + DMA, MSI-X, proxy attached, no in-kernel e1000e; DHCP; 8 MiB download and upload with MD5; DNS (`nslookup` via QEMU's resolver); SSH; perf; 20× `kill -9` of the driver during a download loop: new driver attached with link within 5 s, traffic resumes, `driver died` lines, MemFree+Slab drift of the kill phase within 1 MiB of a control phase with the same commands and no kill, SUnreclaim within 2 MiB, ring-3 page counters (`live_dma/bar/net_pages`) equal, 0 bad entries, download after the loop |
+| udrv-smp4 | same | the same with 5 kills at -smp 4 |
+| kern-smp2 | `KERNEL_CMDLINE=iommu=on` (no `udrv=`) | fallback: in-kernel e1000e (MSI-X NAPI), no `[UDRV]`, the same data checks, perf |
+| netstress-smp2/-smp4 | udrv | `tools/net_stress_drive.py` (the NETSMP workload: TCP echo, firehose closes, UDP floods, DNS, a server with resets, parallel ssh; socket/TCP/UDP leak checks) through the ring-3 driver |
+| lockdep-smp4 | udrv + `-DSECOS_LOCKDEP` | the udrv checks (5 kills), `[LDTEST] all 0xA/0xA`, then netstress on it |
+
+Every guest also fails on `[EXC]`, panic, lockdep report, nested fault,
+stack smashing, `[SMAP] violation`, `[DMA] BUG`, TLB/invalidation timeouts.
+`ping`: BusyBox `ping` needs raw sockets, which SecOS does not have (for any
+driver); ICMP echo is not in the gate. The TCP connect+echo round trips
+stand in for latency.
+
+## Test record (2026-11-09, `feat/udrv-e1000e`)
+
+`tools/net_udrv_gate.sh`: **7 passed, 0 failed** (udrv-smp2, udrv-smp4,
+kern-smp2, netstress-smp2, netstress-smp4, lockdep-smp4,
+lockdep-netstress-smp4). Builds: 0 warnings in all three images (base
+`0f5ba0d`: 0 normal, 0 lockdep with `make iso CONSOLE=root`).
+
+- kill loop: 20/20 (smp2), 5/5 (smp4, lockdep); respawn 0.1–2.1 s (init's
+  driver backoff is at most 2 s after a short run);
+- memory, udrv-smp2: kill phase MemFree+Slab drift 940 kB vs control phase
+  1480 kB; SUnreclaim 32855 → 31005 kB; ring-3 pages 2 DMA / 32 BAR / 259 net
+  before and after; lockdep-smp4: drift −892 kB vs control 984 kB;
+- netstress: 25/25 checks in each of the three runs (no socket, TCP, UDP or
+  memory leak).
+
+### Performance (QEMU 6.2 TCG, -smp 2, same host, not a gate)
+
+| | ring-3 e1000e | in-kernel e1000e |
+|---|---|---|
+| 32 MiB download (host → guest, wget) | 237–295 Mbit/s | 253–289 Mbit/s |
+| 16 MiB upload (guest → host, nc) | 25.6–26.8 Mbit/s | 45.0–46.1 Mbit/s |
+| 200 TCP connect + echo round trips (one nc each) | 60.6–60.9 ms each | 59.1–59.9 ms each |
+
+Download is the same within noise (receive is bounded by the guest stack
+and the copy out of the slot). Upload is ~0.55× the in-kernel driver: every
+frame is copied into a slot and handed over by a wakeup of a separate
+process, and TX completions come back through it too. The round trips are
+dominated by starting `nc` (process creation under TCG), so they do not show
+the per-frame latency. Ranges are over two runs.
+
+## Bugs found
+
+- **TX drops stalled TCP and lost UDP** (proxy, fixed in `e0bfebd` /
+  `192d9cc`). With 128 TX slots and drop-on-full, an 8 MiB upload stalled
+  (`tx_full=176`) and NETSMP lost UDP datagrams and DNS replies. The
+  in-kernel driver never drops on TX (its transmit waits for the
+  descriptor). Two things made drops expensive: the driver is an ordinary
+  process and can be off-CPU for a while, and the kernel TCP
+  (`net/tcp.c`, unchanged) retransmits only the oldest unacked segment per
+  RTO with backoff, so several lost segments take many timeouts. Fix: 256 TX
+  slots and the bounded TX queue. **For later:** TCP go-back-N or SACK-less
+  fast retransmit would make any lossy NIC (or a real lossy link) behave much
+  better; it is a stack change outside M58.
+- **The driver must reset the NIC before enabling bus mastering**
+  (`becf34d`). The claim teardown's reset is the PM D3hot→D0 cycle (82574L
+  in QEMU has no FLR), which does not clear QEMU's descriptor base
+  registers. The first version turned bus mastering on, then reset the NIC:
+  in the window between the two the device resumed DMA at the old driver's
+  IOVAs, which do not exist in the new claim's domain → `[IOMMU] DMA fault`
+  → the new driver killed; three in a row quarantined the device (no
+  network until reboot). Seen once in the third kill of a 3-kill run.
+  For M59: a quarantine after kills that are really the previous claim's
+  in-flight DMA is harsh; a device-specific reset hook in the kernel (CTRL.RST
+  for 8086:10d3) would make the teardown complete regardless of the driver.
+- `nc` with stdin from `/dev/urandom` is very slow under TCG (csprng in
+  256-byte chunks); the gate uploads a downloaded file instead.
 
 ## Not covered
 
