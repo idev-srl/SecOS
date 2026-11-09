@@ -1150,14 +1150,30 @@ static long dispatch(long n, long a, long b, long c, long d, long e, long f)
                          return nosys(n, "rlimits (U2)");
     case SYS_getrusage:  return nosys(n, "getrusage (U2)");
     case SYS_times:      return nosys(n, "times (U2)");
-    case SYS_alarm: case SYS_setitimer: case SYS_getitimer:
-                         return nosys(n, "interval timers (U2)");
+    case SYS_getitimer: case SYS_setitimer:       /* [U10] ITIMER_REAL; musl's alarm() uses setitimer */
+                         if (a != 0 /* ITIMER_REAL */) return nosys(n, "ITIMER_VIRTUAL/PROF");
+                         return sc(S_LX + n, a, b, c, 0, 0, 0);
+    case SYS_alarm: {
+        long it[4] = { 0, 0, (long)(unsigned)a, 0 }, old[4];
+        long r = sc(S_LX + SYS_setitimer, 0, (long)it, (long)old, 0, 0, 0);
+        if (r < 0) return r;
+        return old[2] + (old[3] ? 1 : 0);
+    }
+    /* [U10] Linux-shaped in the kernel (kernel/lx_net.c, kernel/lx_event.c):
+     * sockets (AF_INET TCP/UDP/ICMP/raw, AF_UNIX), epoll, eventfd, timerfd. */
     case SYS_socket: case SYS_socketpair: case SYS_connect: case SYS_bind:
     case SYS_listen: case SYS_accept: case SYS_accept4: case SYS_sendto:
     case SYS_recvfrom: case SYS_sendmsg: case SYS_recvmsg: case SYS_shutdown:
     case SYS_getsockname: case SYS_getpeername: case SYS_setsockopt:
     case SYS_getsockopt:
-                         return nosys(n, "sockets (U3/U10)");
+    case SYS_epoll_create: case SYS_epoll_create1: case SYS_epoll_ctl:
+    case SYS_epoll_wait: case SYS_epoll_pwait:
+#ifdef SYS_epoll_pwait2
+    case SYS_epoll_pwait2:
+#endif
+    case SYS_eventfd: case SYS_eventfd2:
+    case SYS_timerfd_create: case SYS_timerfd_settime: case SYS_timerfd_gettime:
+                         return sc(S_LX + n, a, b, c, d, e, f);
     default:             return nosys(n, 0);
     }
 }
