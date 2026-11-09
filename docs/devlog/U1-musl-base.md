@@ -141,7 +141,7 @@ read from `%fs:0x28`.
 
 ### The translation table (`src/secos/syscall.c`)
 
-About 120 Linux numbers. The layer never touches errno, calls no libc
+161 Linux numbers have an entry (about 125 served, the rest an explicit `-ENOSYS` with a reason). The layer never touches errno, calls no libc
 function and returns what Linux returns (`-errno`); a SecOS call that still
 answers a bare `-1` gets the most likely errno for that call (checked against
 the kernel paths: `EBADF` for fd calls, `ENOENT`/`ENOTDIR`/`EACCES` from a
@@ -232,6 +232,18 @@ tampered binaries are refused by the signature gate (rc 126, `[SEC] REFUSED`),
 the signed exec-stack one by the loader; old-libc BusyBox, lua and bash still
 run; no panic, SMAP violation, TLB bug or lockdep report. 54 checks.
 `--lockdep` repeats it on a `-DSECOS_LOCKDEP` image.
+
+## Tests run (at the end of U1)
+
+| Run | Result |
+|---|---|
+| `tools/musl_base_test.sh` (default image, `-smp 4`, `-cpu max`: SMAP + KASLR on) | 55/55 |
+| `tools/musl_base_test.sh --lockdep` (`-DSECOS_LOCKDEP` image) | 56/56, no lockdep report |
+| `mtest all` with `SECOS_SYSCALL_TRACE=1` | no ENOSYS or partial call in the whole workload |
+| selftest sections M16, M19, M30, M31/M32, M46, M39 POSIX + ASLR, M45 (MB2 + UEFI KASLR), M36/M37/M44 default image, M39 bash boot + bash regressions (cmdsubst, jobs, execve, line editing), M44 SMAP violation + uaccess/ABI | 220/220 |
+| selftest sections M43 account tools, PERM, MUPORTS (set-id exec: the auxv creds patch) | 69/69 |
+| `tools/smoke.sh --mb2` / `--uefi` | PASS / PASS |
+| warnings (`make`, `make CFLAGS_EXTRA=-DSECOS_LOCKDEP`), base 0f5ba0d vs U1 | 0 / 0 vs 0 / 0 |
 
 ## Deviations from the plan
 
