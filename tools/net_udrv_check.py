@@ -272,12 +272,13 @@ try:
     check('dhcp-bound', 'inet 10.0.2.15' in o and 'dhcp' in o, o.strip().replace('\n', ' | ')[:200])
     check('tcp-download-8M-md5', download('/f8'))
     n0 = len(sink_md5)
-    run('head -c 4194304 /dev/urandom > /tmp/up; md5sum /tmp/up > /tmp/up.md5; nc -w 3 10.0.2.2 %d < /tmp/up' % P_SINK, 300)
+    # Upload the 8 MiB payload back (fetched again; /dev/urandom is slow
+    # under TCG): the host sink must see exactly its bytes.
+    run('wget -q -O /tmp/up http://10.0.2.2:%d/f8; nc -w 3 10.0.2.2 %d < /tmp/up; rm -f /tmp/up' % (P_HTTP, P_SINK), 300)
     t0 = time.time()
     while len(sink_md5) == n0 and time.time() - t0 < 30: time.sleep(0.2)
-    o = run('cat /tmp/up.md5') or ''
-    ok = len(sink_md5) > n0 and sink_md5[-1][0] == 4194304 and sink_md5[-1][1] in o
-    check('tcp-upload-4M-md5', ok, str(sink_md5[-1:]))
+    ok = len(sink_md5) > n0 and sink_md5[-1] == (len(PAYLOAD), MD5['/f8'])
+    check('tcp-upload-8M-md5', ok, str(sink_md5[-1:]))
     o = run('nslookup localhost 10.0.2.3', 60) or ''
     check('dns', re.search(r'Address:?\s+127\.0\.0\.1', o) is not None, o.strip().replace('\n', ' | ')[:200])
     rc, so = ssh('echo NUD-SSH-OK; cat /proc/udrv | head -n1')
