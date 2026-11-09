@@ -1,11 +1,13 @@
-# M57 — the edu sample driver and the positive Driver Space v2 gate
+# M57 — the edu sample driver, the argument-validation table and the Driver Space v2 gate
 
 Part of Phase 5 step M57 (`feat/udrv-core`, plan `docs/PHASE5_PLAN.md` §3
 "M57", design D5–D10). The kernel side (`kernel/udrv.{c,h}`, ABI
 `user/include/secos/udrv.h`) came first; this part adds the first ring-3
 driver that uses it, the gate that runs it, and the kernel changes the gate
-needed. The negative tests (`user/udrv_negtest.c`, still a placeholder) are a
-separate step.
+needed, and the SYS_UDRV argument-validation table (`user/udrv_negtest.c`).
+The hostile-driver modes of the plan (`udrv_evil`: DMA/MSI injection faults,
+MSI-X table hole, DONTFORK touch, IRQ flood, kill during DMA) are not in this
+step.
 
 ## `/bin/udrv_edu` (`user/udrv_edu.c`)
 
@@ -81,13 +83,71 @@ removed in `109efc5`). Every guest is q35, MB2 ISO with `-boot d`,
 | service | same | + fresh ext4 root on vda (`tools/mkroot.sh`, `/etc/inittab` written with `debugfs`) | `edu:respawn:/bin/udrv_edu -n 1000 --serve` passes and holds the claim; 3× `kill -9` of the pid from `/proc/udrv`: `[UDRV] release pid=<old> (exit)`, init restarts it, the new pid passes and serves; counters after kill 3 equal those after kill 2; only SIGKILL `[KILL]` lines |
 | nommu | same | plain q35 | assigned "MMIO only", claim `iommu=none dma=no`, id/liveness/factorial ok, DMA_ALLOC -19, BM and IRQ_SETUP -1, refusals logged |
 | default | (none) | intel-iommu | no `[UDRV]` line, `/proc/udrv` "udrv devices 0", edu listed in `/proc/bus/pci/devices` |
+| noir | `iommu=on udrv=00:04.0` | intel-iommu (no interrupt remapping before M56) | claim `iommu=translated dma=no`; udrv_edu MMIO-only path passes; BM and DMA_ALLOC refused "no interrupt remapping" |
+| unsafe | `udrv=00:04.0 udrv.unsafe` | plain q35 | boot warning; udrv_edu 100 rounds + DMA pass with iova = phys; claim `TAINTED(unsafe)`, taint line in the log and in `/proc/udrv` |
 | lockdep-smp4 | same + `-DSECOS_LOCKDEP` | intel-iommu, -smp 4 | as run (2000 rounds, 4 leak runs), `[LDTEST] all 0xA/0xA`, no lockdep report |
 | bkl-on | same + `bkl=on` | intel-iommu | as run (4 leak runs), `[BKL] kernel lock mode: bkl=on` |
 
-Every guest also fails on `[EXC]`, panic, lockdep, nested fault, stack
+Every guest also runs the argument-validation table (next section) for its
+environment, and fails on `[EXC]`, panic, lockdep, nested fault, stack
 smashing, `[SMAP] violation`, TLB/shootdown/invalidation timeouts.
 
-## For the negative-test step
+## Argument-validation table (`user/udrv_negtest.c`)
+
+A conformance table: each row is one call with one invalid (or, for the
+stateful rows, valid) argument and its expected raw return value (0 or
+-errno). `/bin/udrv_negtest --env E` carries the v3 DRIVER manifest;
+`/bin/udrv_user` is the same source with a plain manifest. Output: one
+`[udrv_negtest] <id> <what>: PASS|FAIL|SKIP rc=... want=...` line per row,
+`RESULT rows= pass= fail= skip=`, `PASS|FAIL pid=`.
+
+Expectation columns: claim with DMA rights (`translated`, `unsafe`), MMIO-only
+claim (`noir`, `nommu`), no `udrv=` device (`nodev`), non-driver manifest
+(`user`).
+
+- **Table A** (30 rows, every environment, no claim): op 0 / 11 / 2^32+1 / -1;
+  CLAIM size ±1, 0, ~0; CLAIM struct at NULL, an unmapped user page, the
+  kernel half, a non-canonical address, straddling the top of user space;
+  unknown claim flags; BDFs/ids not in `udrv=` (incl. one the manifest
+  matches); euid 65534 (real/saved uid 0, restored afterwards); a fork child
+  (USER after fork); INFO/MAP_BAR/DMA_ALLOC/RELEASE on stdin, fd 31, 32, -1,
+  2^40; RESET with a size.
+- **Table B** (88 rows, on a claim of edu, in order): second claim by id and
+  by BDF (-EBUSY); INFO size/NULL/kernel/read-only result; MAP_BAR bar 6,
+  0xffffffff, absent BARs, flags; MAP_BAR into a read-only struct (-EFAULT)
+  followed by MAP_BAR 0 succeeding (nothing was left mapped) and a third one
+  (-EBUSY); CFG_READ widths 0/3/8, offset 0x1000, unaligned; CFG_WRITE header,
+  BAR 0/5, ROM, interrupt line, inside the MSI capability (found by walking
+  the list), 0x100, 0xffc, I/O-space bit, bus mastering (0 / -EPERM), status
+  bytes (0, ignored); DMA_ALLOC size 0, 4 MiB+4 KiB, 2^64-4096 (round-up
+  overflow), 2^64-1, dir 0/4, flags, 128 KiB over `dma_max`, read-only result,
+  then 64 KiB (all of `dma_max`) and 4 KiB more (-ENOMEM); DMA_FREE of 0, of a
+  page inside the buffer, size+1, double free; munmap/mprotect of a DMA page
+  and of a BAR page (-EINVAL); mmap of the claim fd (-ENODEV); IRQ_SETUP nvec
+  0/5/33/0xffffffff/2, read-only result, then 1 and again (-EBUSY); fd
+  read/write short lengths, NULL/unmapped/kernel buffers, O_NONBLOCK with
+  nothing pending (-EAGAIN), a pending interrupt read into a read-only page
+  (-EFAULT); RESET (-EOPNOTSUPP on edu); INFO/read/write/RELEASE from a fork
+  child (-EPERM); RELEASE size 4, RELEASE, every op after it (-ENODEV), INFO on
+  the closed fd (-EBADF). Afterwards a fresh claim + RELEASE must succeed.
+- MMIO-only environments: every DMA_ALLOC row is -ENODEV, IRQ_SETUP -EPERM,
+  bus mastering -EPERM; the rows that need a DMA buffer are SKIP (3 rows).
+
+The checker also requires the `refused(not-root)`, `refused(not-a-driver)` and
+`refused(busy)` log lines, the device free afterwards with no live DMA/BAR
+pages, and in the `run` guests unchanged resources (vectors, domains, VT-d
+table pages, PMM/heap within slack) and no IOMMU fault.
+
+Found while writing it: `read()`/`write()` of length 0 return -EFAULT from the
+generic `SYS_READ`/`SYS_WRITE` entry (`kernel/syscall.c`, the M3 rule
+`len <= 0 || !user_range_valid` → -EFAULT, for every fd) before the claim fd
+is looked at, so the udrv "len < 16 → -EINVAL" path only sees 1..15. Linux
+returns 0 for a zero-length read; that is a pre-existing difference of every
+fd, not changed here. The same entry rejects kernel-half buffers, so the
+table also uses an unmapped user page and a read-only page to reach the
+claim fd's own copy paths.
+
+## Error codes
 
 Error codes as implemented (kernel `-errno`, Linux numbers; libc `read`/`write`
 map them to -1/errno, so use raw `secos_syscall` for the claim fd):
@@ -133,3 +193,20 @@ map them to -1/errno, so use raw `secos_syscall` for the claim fd):
 
 Also worth knowing: closing the claim fd does **not** end the claim (it ends
 at RELEASE, exit or exec); edu has no reset, so `release` logs `reset=none`.
+
+## Test record (2026-11-09, HEAD of `feat/udrv-core`)
+
+- `tools/udrv_gate.sh` (QEMU 6.2): **8 passed, 0 failed** — run, service,
+  nommu, default, noir, unsafe, lockdep-smp4, bkl-on. Table results: 118 rows
+  (30 + 88) all PASS in translated / unsafe (run, lockdep-smp4, bkl-on,
+  unsafe); 115 PASS + 3 SKIP in noir / nommu; 30/30 in nodev (default guest,
+  both binaries) and for `udrv_user` everywhere.
+- `tools/smoke.sh --mb2` and `--uefi`, normal and `-DSECOS_LOCKDEP` builds:
+  all PASS, no `[EXC]`, `[LDTEST] all 0xA/0xA` on the lockdep build.
+- `-Wall -Wextra` warnings: 0 in every gate image (normal, lockdep, bkl=on,
+  four cmdlines) and in both smoke builds, as on the base (`cba08ac`: 0 normal,
+  0 lockdep, 0 UEFI loader).
+
+The first rerun after the host reboot failed only on rows of the new table
+whose expectation was wrong (zero-length read/write, see above); every other
+check of every guest passed on that run.
