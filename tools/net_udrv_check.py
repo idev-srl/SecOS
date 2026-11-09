@@ -294,9 +294,19 @@ try:
         say('perf 200 TCP connect+echo round trips %.2f s = %.1f ms each' % (t, t * 5) if t else 'perf echo failed')
 
     if a.mode == 'udrv' and a.kills:
+        # The root is ramfs: every command run, log line and /tmp file costs
+        # frames (MemFree+Slab drifts ~50 kB per program run, see
+        # tools/udrv_check.py). A control phase runs the same commands without
+        # the kill, so the leak check compares the two drifts.
+        run('(while :; do wget -q -O /dev/null http://10.0.2.2:%d/f8; done) >/dev/null 2>&1 & echo $! > /tmp/loop.pid' % P_HTTP)
+        frc0, _ = mem()
+        for k in range(a.kills):
+            udrv_state(); time.sleep(1.0); run('true')
+            for _ in range(3): udrv_state()
+            download('/f64k', 120)
+        frc1, _ = mem()
         base_st = udrv_state()
         fr0, hp0 = mem()
-        run('(while :; do wget -q -O /dev/null http://10.0.2.2:%d/f8; done) >/dev/null 2>&1 & echo $! > /tmp/loop.pid' % P_HTTP)
         times, bad = [], 0
         for k in range(a.kills):
             st = udrv_state()
@@ -320,7 +330,9 @@ try:
         time.sleep(3)
         fr1, hp1 = mem()
         st = udrv_state()
-        check('memfree+slab-steady', fr0 - fr1 <= FRAME_SLACK_KB, 'before %d after %d kB' % (fr0, fr1))
+        ctrl = frc0 - frc1
+        check('memfree+slab-steady', (fr0 - fr1) - max(ctrl, 0) <= FRAME_SLACK_KB,
+              'kill phase: before %d after %d kB (drift %d); control phase drift %d kB' % (fr0, fr1, fr0 - fr1, ctrl))
         check('heap-steady', hp1 - hp0 <= HEAP_SLACK_KB, 'before %d after %d kB' % (hp0, hp1))
         check('ring3-pages-equal', all(st.get(k) == base_st.get(k) for k in ('dma', 'bar', 'net')),
               'before %s after %s' % (base_st, st))

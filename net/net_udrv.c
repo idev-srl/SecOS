@@ -24,6 +24,7 @@
 #include "iommu.h"
 #include "debugcon.h"
 #include "tsc.h"
+#include "heap.h"
 #include <stddef.h>
 
 _Static_assert(sizeof(struct udrv_net_ctrl) <= UDRV_NET_CTRL_PAGES * 4096, "ctrl region");
@@ -36,6 +37,7 @@ _Static_assert(UDRV_NET_FRAME_MAX == NET_FRAME_MAX, "frame max");
 _Static_assert((UDRV_NET_TX_RING & (UDRV_NET_TX_RING - 1)) == 0 && (UDRV_NET_RX_RING & (UDRV_NET_RX_RING - 1)) == 0, "rings");
 
 #define NET_UDRV_MAX    2
+#define TX_BACKLOG      256             /* frames queued while every TX slot is out */
 #define RX_BATCH        16
 #define STALL_MS        5000ull
 #define VIOL_LOG_MAX    UDRV_NET_VIOL_KILL   /* every bad entry up to the kill is logged */
@@ -77,6 +79,8 @@ int udrv_net_reject_count(uint32_t* count, int* kill_sent) {
     return 0;
 }
 
+typedef struct { uint16_t len; uint8_t data[UDRV_NET_FRAME_MAX]; } tx_backlog_t;
+
 struct net_udrv {
     net_dev_t        dev;               /* first: poll/transmit get &dev */
     const pci_dev_t* pd;
@@ -93,10 +97,13 @@ struct net_udrv {
     uint32_t ntxfree, tx_inflight;
     uint64_t tx_progress_ms;
     int      stall_logged;
+    tx_backlog_t* bl;                   /* TX_BACKLOG entries (kmalloc at boot) */
+    uint32_t bl_head, bl_count;
+    uint32_t rx_own;                    /* RX slots the driver holds */
     uint32_t viol;                      /* this claim */
     int      kill_sent;
     /* statistics (lk) */
-    uint64_t viol_total, attaches, deaths, tx_full, tx_frames, rx_frames, stalls;
+    uint64_t viol_total, attaches, deaths, tx_full, tx_queued, tx_frames, rx_frames, stalls;
     /* received frames, copied out of the slots (rx_lock: poll only) */
     uint8_t  rxb[RX_BATCH][UDRV_NET_FRAME_MAX];
     uint16_t rxl[RX_BATCH];
@@ -143,6 +150,7 @@ static void post_rx_locked(net_udrv_t* px, uint16_t slot) {
     struct udrv_net_desc* e = &px->ctrl->rxf[px->k_rxf_prod & (UDRV_NET_RX_RING - 1)];
     e->slot = slot; e->len = 0; e->rsvd = 0;
     px->own[slot] = OWN_RX;
+    px->rx_own++;
     px->k_rxf_prod++;
 }
 
@@ -197,18 +205,8 @@ static void stall_check_locked(net_udrv_t* px) {
 }
 
 /* ---------------------------------------------------------- net_dev ops */
-static int px_transmit(net_dev_t* dev, const void* frame, uint32_t len) {
-    net_udrv_t* px = (net_udrv_t*)dev;
-    if (!frame || len < UDRV_NET_FRAME_MIN || len > UDRV_NET_FRAME_MAX) return -1;
-    uint64_t fl = spin_lock_irqsave(&px->lk);
-    if (!px->attached) { spin_unlock_irqrestore(&px->lk, fl); return -1; }
-    reap_tx_locked(px);
-    if (!px->attached || px->ntxfree == 0) {
-        px->tx_full++;
-        if (px->attached) udrv_net_notify(px->cookie, px->gen);   /* let it reclaim */
-        spin_unlock_irqrestore(&px->lk, fl);
-        return -1;
-    }
+/* One frame into a free TX slot and tx[] (lk held, a free slot exists). */
+static void post_tx_locked(net_udrv_t* px, const void* frame, uint32_t len) {
     uint16_t slot = px->txfree[--px->ntxfree];
     copy_bytes(px->slots + (uint64_t)slot * UDRV_NET_SLOT_SIZE, frame, len);
     struct udrv_net_desc* e = &px->ctrl->tx[px->k_tx_prod & (UDRV_NET_TX_RING - 1)];
@@ -216,12 +214,57 @@ static int px_transmit(net_dev_t* dev, const void* frame, uint32_t len) {
     px->own[slot] = OWN_TX;
     if (px->tx_inflight++ == 0) px->tx_progress_ms = now_ms();
     px->k_tx_prod++;
+    px->tx_frames++;
+}
+
+static void publish_tx_locked(net_udrv_t* px) {
     __atomic_thread_fence(__ATOMIC_RELEASE);
     px->ctrl->tx_prod = px->k_tx_prod;
-    px->tx_frames++;
+}
+
+/* Move queued frames into freed TX slots, oldest first. Returns how many. */
+static uint32_t flush_backlog_locked(net_udrv_t* px) {
+    uint32_t n = 0;
+    while (px->bl_count && px->ntxfree) {
+        tx_backlog_t* b = &px->bl[px->bl_head];
+        post_tx_locked(px, b->data, b->len);
+        px->bl_head = (px->bl_head + 1) % TX_BACKLOG;
+        px->bl_count--;
+        n++;
+    }
+    return n;
+}
+
+/* Under tx_lock. The driver may not run for a while (a ring-3 process is
+ * scheduled like any other): when every TX slot is in use, frames wait in a
+ * bounded kernel queue and go out as slots come back, instead of being
+ * dropped (UDP has no retransmit, and TCP here retransmits one segment per
+ * timeout). Only a full queue drops. */
+static int px_transmit(net_dev_t* dev, const void* frame, uint32_t len) {
+    net_udrv_t* px = (net_udrv_t*)dev;
+    if (!frame || len < UDRV_NET_FRAME_MIN || len > UDRV_NET_FRAME_MAX) return -1;
+    uint64_t fl = spin_lock_irqsave(&px->lk);
+    if (!px->attached) { spin_unlock_irqrestore(&px->lk, fl); return -1; }
+    reap_tx_locked(px);
+    if (!px->attached) { spin_unlock_irqrestore(&px->lk, fl); return -1; }
+    flush_backlog_locked(px);
+    int r = 0;
+    if (!px->bl_count && px->ntxfree) {
+        post_tx_locked(px, frame, len);
+    } else if (px->bl && px->bl_count < TX_BACKLOG) {
+        tx_backlog_t* b = &px->bl[(px->bl_head + px->bl_count) % TX_BACKLOG];
+        copy_bytes(b->data, frame, len);
+        b->len = (uint16_t)len;
+        px->bl_count++;
+        px->tx_queued++;
+    } else {
+        px->tx_full++;
+        r = -1;
+    }
+    publish_tx_locked(px);
     udrv_net_notify(px->cookie, px->gen);
     spin_unlock_irqrestore(&px->lk, fl);
-    return 0;
+    return r;
 }
 
 /* rx_lock held (net_dev_poll). Copy up to RX_BATCH frames out under lk, hand
@@ -234,6 +277,8 @@ static void px_poll(net_dev_t* dev) {
         if (!px->attached) { spin_unlock_irqrestore(&px->lk, fl); return; }
         struct udrv_net_ctrl* c = px->ctrl;
         reap_tx_locked(px);
+        int wake = 0;
+        if (px->attached && flush_backlog_locked(px)) { publish_tx_locked(px); wake = 1; }
         if (px->attached) {
             dev->link_up = (__atomic_load_n(&c->link, __ATOMIC_RELAXED) == 1);
             uint32_t prod = __atomic_load_n(&c->rx_prod, __ATOMIC_ACQUIRE);
@@ -242,7 +287,7 @@ static void px_poll(net_dev_t* dev) {
                 violation(px, "rx producer index outside the ring", prod, 0, 0);
                 avail = 0;
             }
-            uint32_t posted = 0;
+            uint32_t posted = 0, own_before = px->rx_own;
             while (avail && n < RX_BATCH) {
                 avail--;
                 uint32_t idx = px->k_rx_cons & (UDRV_NET_RX_RING - 1);
@@ -257,6 +302,7 @@ static void px_poll(net_dev_t* dev) {
                     continue;
                 }
                 px->own[e.slot] = OWN_KERNEL;
+                px->rx_own--;
                 if (v == UNV_BAD_LEN) {
                     violation(px, "rx length out of range", px->k_rx_cons - 1, e.slot, e.len);
                     post_rx_locked(px, e.slot);
@@ -272,6 +318,11 @@ static void px_poll(net_dev_t* dev) {
             more = avail != 0;
             c->rx_done = px->k_rx_cons;
             if (posted) publish_rxf_locked(px);
+            /* The driver's NIC ring was running dry: tell it slots are back
+             * (it may be asleep if this pass did not come from its kick). */
+            uint32_t taken = own_before + posted - px->rx_own;
+            if (posted && own_before - taken < UDRV_NET_RX_SLOTS / 2) wake = 1;
+            if (wake) udrv_net_notify(px->cookie, px->gen);
             px->rx_frames += (uint64_t)n;
             stall_check_locked(px);
         }
@@ -290,6 +341,8 @@ int net_udrv_init(void) {
         if (g_npx >= NET_UDRV_MAX) { debugcon_writestring("[NET] too many ring-3 NICs; proxy skipped\n"); break; }
         net_udrv_t* px = &g_px[g_npx];
         px->pd = pd;
+        px->bl = (tx_backlog_t*)kmalloc(sizeof(tx_backlog_t) * TX_BACKLOG);
+        if (!px->bl) debugcon_writestring("[NET] ring-3 NIC proxy: no TX backlog (frames drop when the slots run out)\n");
         spin_init_class_dynamic(&px->lk, LK_S22_UDRV_NET, "net-udrv");
         px->dev.transmit = px_transmit;
         px->dev.poll = px_poll;
@@ -339,6 +392,7 @@ int net_udrv_attach(net_udrv_t* px, void* ctrl, void* slots, const uint8_t mac[6
     px->ntxfree = 0;
     for (uint32_t i = UDRV_NET_TX_SLOTS; i-- > 0; ) px->txfree[px->ntxfree++] = (uint16_t)(UDRV_NET_TX_BASE + i);
     px->tx_inflight = 0; px->tx_progress_ms = now_ms(); px->stall_logged = 0;
+    px->bl_head = px->bl_count = 0; px->rx_own = 0;
     px->viol = 0; px->kill_sent = 0;
     for (uint32_t i = 0; i < UDRV_NET_RX_SLOTS; i++) post_rx_locked(px, (uint16_t)(UDRV_NET_RX_BASE + i));
     publish_rxf_locked(px);
@@ -361,7 +415,8 @@ void net_udrv_detach(net_udrv_t* px, const char* why) {
     if (!px) return;
     uint64_t fl = spin_lock_irqsave(&px->lk);
     int was = px->attached;
-    uint32_t pid = px->pid, inflight = px->tx_inflight;
+    uint32_t pid = px->pid, inflight = px->tx_inflight + px->bl_count;
+    px->bl_count = 0;
     int died = !(why[0] == 'r' && why[1] == 'e' && why[2] == 'l');   /* not "release" */
     px->attached = 0;
     px->ctrl = NULL; px->slots = NULL; px->cookie = NULL;
@@ -394,7 +449,7 @@ void net_udrv_generate(void (*emit)(void* ctx, const char* line), void* ctx) {
         uint64_t fl = spin_lock_irqsave(&px->lk);
         int att = px->attached, link = px->dev.link_up;
         uint32_t pid = px->pid, inflight = px->tx_inflight, viol = px->viol;
-        uint64_t vt = px->viol_total, at = px->attaches, de = px->deaths, full = px->tx_full;
+        uint64_t vt = px->viol_total, at = px->attaches, de = px->deaths, full = px->tx_full, q = px->tx_queued;
         uint64_t txf = px->tx_frames, rxf = px->rx_frames, st = px->stalls;
         spin_unlock_irqrestore(&px->lk, fl);
         iommu_line_t l; l.n = 0;
@@ -408,6 +463,7 @@ void net_udrv_generate(void (*emit)(void* ctx, const char* line), void* ctx) {
         iommu_ln_s(&l, " tx="); iommu_ln_dec(&l, txf);
         iommu_ln_s(&l, " rx="); iommu_ln_dec(&l, rxf);
         iommu_ln_s(&l, " tx_inflight="); iommu_ln_dec(&l, inflight);
+        iommu_ln_s(&l, " tx_queued="); iommu_ln_dec(&l, q);
         iommu_ln_s(&l, " tx_full="); iommu_ln_dec(&l, full);
         iommu_ln_s(&l, " bad_entries="); iommu_ln_dec(&l, viol);
         iommu_ln_s(&l, " bad_total="); iommu_ln_dec(&l, vt);
