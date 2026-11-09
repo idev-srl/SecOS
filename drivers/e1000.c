@@ -6,13 +6,15 @@
  *
  * The reference NIC driver: QEMU's default `-device e1000` (8086:100E) and a
  * classic VMware adapter option. Implements the net_dev_t contract — legacy
- * RX/TX descriptor rings (static page-aligned DMA, kvirt_to_phys), polled drain
+ * RX/TX descriptor rings (static page-aligned __dma buffers, bus addresses from
+ * the DMA API, kernel/dma.h [M55]), polled drain
  * via dev->poll. MMIO BAR0 through the physmap.
  */
 #include "net.h"
 #include "pci.h"
 #include "io.h"
 #include "vmm.h"
+#include "dma.h"
 #include "debugcon.h"
 #include <stddef.h>
 
@@ -73,16 +75,16 @@ struct tx_desc { uint64_t addr; uint16_t len; uint8_t cso; uint8_t cmd; uint8_t 
 
 // volatile: the NIC DMA-writes the descriptor status (DD) back to memory; the
 // poll loop must re-read it each iteration rather than caching it in a register.
-static volatile struct rx_desc g_rx[RX_DESC] __attribute__((aligned(4096)));
-static volatile struct tx_desc g_tx[TX_DESC] __attribute__((aligned(4096)));
-static uint8_t g_rxbuf[RX_DESC][BUF_SZ] __attribute__((aligned(16)));
-static uint8_t g_txbuf[TX_DESC][BUF_SZ] __attribute__((aligned(16)));
+static volatile struct rx_desc g_rx[RX_DESC] __dma __attribute__((aligned(4096)));
+static volatile struct tx_desc g_tx[TX_DESC] __dma __attribute__((aligned(4096)));
+static uint8_t g_rxbuf[RX_DESC][BUF_SZ] __dma __attribute__((aligned(16)));
+static uint8_t g_txbuf[TX_DESC][BUF_SZ] __dma __attribute__((aligned(16)));
 
 static volatile uint8_t* g_mmio;
 static uint32_t g_rx_cur, g_tx_cur;
 static net_dev_t g_dev;
 
-static inline uint64_t phys_of(const void* p) { return kvirt_to_phys((uint64_t)(uintptr_t)p); }
+static dma_dev_t* g_dd;     // [M55]
 static inline uint32_t rd(uint32_t r) { return *(volatile uint32_t*)(g_mmio + r); }
 static inline void     wr(uint32_t r, uint32_t v) { *(volatile uint32_t*)(g_mmio + r) = v; }
 
@@ -92,7 +94,7 @@ static int e1000_transmit(net_dev_t* dev, const void* frame, uint32_t len) {
     uint32_t i = g_tx_cur;
     const uint8_t* p = (const uint8_t*)frame;
     for (uint32_t k = 0; k < len; k++) g_txbuf[i][k] = p[k];
-    g_tx[i].addr = phys_of(g_txbuf[i]);
+    g_tx[i].addr = dma_static(g_dd, g_txbuf[i], BUF_SZ);
     g_tx[i].len = (uint16_t)len;
     g_tx[i].cso = 0;
     g_tx[i].cmd = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
@@ -146,6 +148,7 @@ int e1000_init(void) {
         debugcon_writestring("[E1000] no 8086:100E/100F on PCI\n");
         return -1;
     }
+    g_dd = dma_dev_legacy(&pci);    // [M55] joins the kernel DMA domain first
     pci_enable_mem_and_busmaster(&pci);
     uint64_t bar = pci_bar_mem64(&pci, 0);
     if (bar == 0) { debugcon_writestring("[E1000] BAR0 not memory\n"); return -1; }
@@ -172,8 +175,8 @@ int e1000_init(void) {
     for (int i = 0; i < 128; i++) wr(REG_MTA + i*4, 0);
 
     // RX ring.
-    for (int i = 0; i < RX_DESC; i++) { g_rx[i].addr = phys_of(g_rxbuf[i]); g_rx[i].status = 0; }
-    uint64_t rp = phys_of((const void*)g_rx);
+    for (int i = 0; i < RX_DESC; i++) { g_rx[i].addr = dma_static(g_dd, g_rxbuf[i], BUF_SZ); g_rx[i].status = 0; }
+    uint64_t rp = dma_static(g_dd, (const void*)g_rx, sizeof(g_rx));
     wr(REG_RDBAL, (uint32_t)rp); wr(REG_RDBAH, (uint32_t)(rp>>32));
     wr(REG_RDLEN, RX_DESC * (uint32_t)sizeof(struct rx_desc));
     wr(REG_RDH, 0); wr(REG_RDT, RX_DESC - 1);
@@ -184,7 +187,7 @@ int e1000_init(void) {
 
     // TX ring.
     for (int i = 0; i < TX_DESC; i++) { g_tx[i].addr = 0; g_tx[i].status = DESC_DD; }
-    uint64_t tp = phys_of((const void*)g_tx);
+    uint64_t tp = dma_static(g_dd, (const void*)g_tx, sizeof(g_tx));
     wr(REG_TDBAL, (uint32_t)tp); wr(REG_TDBAH, (uint32_t)(tp>>32));
     wr(REG_TDLEN, TX_DESC * (uint32_t)sizeof(struct tx_desc));
     wr(REG_TDH, 0); wr(REG_TDT, 0);

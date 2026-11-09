@@ -3,9 +3,8 @@
  *
  * Targets the legacy virtio interface exposed by QEMU's transitional
  * virtio-blk-pci device (PCI vendor 0x1AF4, device 0x1001) over the BAR0 I/O
- * region. A single split virtqueue is placed in a page-aligned static buffer:
- * the kernel is identity-mapped (phys == virt below 128 MB), so the buffer's
- * virtual address doubles as the guest-physical address handed to the device.
+ * region. A single split virtqueue is placed in a page-aligned static __dma
+ * buffer whose bus address comes from the DMA API (kernel/dma.h).
  *
  * DMA always targets an internal page-aligned bounce buffer (physically
  * contiguous because it lives in the contiguously-loaded kernel image), so the
@@ -25,7 +24,7 @@
 #include "io.h"
 #include "block.h"
 #include "debugcon.h"
-#include "vmm.h"   // [M12] kvirt_to_phys for higher-half DMA address translation
+#include "dma.h"   // [M55] bus addresses of the __dma buffers
 #include <stddef.h>
 
 /* ── PCI identity ────────────────────────────────────────────────────────── */
@@ -97,10 +96,10 @@ struct virtio_blk_req_hdr {
 #define BOUNCE_SECTORS  64
 #define BOUNCE_BYTES    (BOUNCE_SECTORS * VIRTIO_BLK_SECTOR)
 
-static uint8_t g_vq_mem[VQ_REGION_BYTES]   __attribute__((aligned(4096)));
-static uint8_t g_bounce[BOUNCE_BYTES]      __attribute__((aligned(4096)));
-static struct virtio_blk_req_hdr g_hdr     __attribute__((aligned(16)));
-static volatile uint8_t g_status_byte      __attribute__((aligned(16)));
+static uint8_t g_vq_mem[VQ_REGION_BYTES]   __dma __attribute__((aligned(4096)));
+static uint8_t g_bounce[BOUNCE_BYTES]      __dma __attribute__((aligned(4096)));
+static struct virtio_blk_req_hdr g_hdr     __dma __attribute__((aligned(16)));
+static volatile uint8_t g_status_byte      __dma __attribute__((aligned(16)));
 
 /* Virtqueue pointers into g_vq_mem. */
 static struct virtq_desc*  g_desc;
@@ -111,12 +110,13 @@ static uint16_t            g_last_used;    /* last seen used->idx */
 
 static uint16_t g_io_base;
 static int      g_ready;
+static dma_dev_t* g_dd;    /* [M55] */
 
-/* [M12] Higher-half: a kernel-image static's symbol address is a high VMA, not
- * its physical address. Translate to physical for the device (DMA descriptors,
- * queue PFN). [M44] The CPU pointers (g_desc/g_avail/g_used) use the kernel
- * VMA of the same buffer: the low identity map they used to address is gone. */
-static inline uint64_t phys_of(const void* p) { return kvirt_to_phys((uint64_t)(uintptr_t)p); }
+/* [M55] Bus addresses come from the DMA API (dma_static on the __dma
+ * buffers). The CPU pointers (g_desc/g_avail/g_used) use the kernel VMA of the
+ * same buffer. A legacy/transitional virtio device has no ACCESS_PLATFORM, so
+ * QEMU's vIOMMU never translates it: bus == phys and it is NOT confined even in
+ * the strict kernel DMA domain (a modern virtio driver is plan item M63). */
 
 /* Round up to the next 4 KiB boundary. */
 static inline uint64_t align4k(uint64_t x) { return (x + 0xFFF) & ~0xFFFULL; }
@@ -140,17 +140,17 @@ static int virtio_blk_xfer(uint64_t sector, uint32_t nsec, int write) {
     g_status_byte  = 0xFF;
 
     /* Three-descriptor chain: header (RO), data, status (device-writable). */
-    g_desc[0].addr  = phys_of(&g_hdr);
+    g_desc[0].addr  = dma_static(g_dd, &g_hdr, sizeof(g_hdr));
     g_desc[0].len   = sizeof(struct virtio_blk_req_hdr);
     g_desc[0].flags = VIRTQ_DESC_F_NEXT;
     g_desc[0].next  = 1;
 
-    g_desc[1].addr  = phys_of(g_bounce);
+    g_desc[1].addr  = dma_static(g_dd, g_bounce, (size_t)nsec * VIRTIO_BLK_SECTOR);
     g_desc[1].len   = nsec * VIRTIO_BLK_SECTOR;
     g_desc[1].flags = VIRTQ_DESC_F_NEXT | (write ? 0 : VIRTQ_DESC_F_WRITE);
     g_desc[1].next  = 2;
 
-    g_desc[2].addr  = phys_of((const void*)&g_status_byte);
+    g_desc[2].addr  = dma_static(g_dd, (const void*)&g_status_byte, 1);
     g_desc[2].len   = 1;
     g_desc[2].flags = VIRTQ_DESC_F_WRITE;
     g_desc[2].next  = 0;
@@ -228,6 +228,9 @@ int virtio_blk_init(void) {
         debugcon_writestring("[VIRTIO-BLK] no device found on PCI\n");
         return -1;
     }
+    g_dd = dma_dev_legacy(&dev);            /* [M55] before bus mastering */
+    /* The legacy QUEUE_PFN register is 32 bits of 4 KiB pages. */
+    dma_set_mask(g_dd, DMA_MASK_BITS(44));
     pci_enable_io_and_busmaster(&dev);
     g_io_base = pci_bar0_io_base(&dev);
     if (g_io_base == 0) {
@@ -259,7 +262,7 @@ int virtio_blk_init(void) {
     g_last_used = 0;
 
     /* Hand the queue's guest-physical page number to the device. */
-    uint64_t pfn = phys_of(g_vq_mem) >> 12;
+    uint64_t pfn = dma_static(g_dd, g_vq_mem, sizeof(g_vq_mem)) >> 12;
     io_outl(g_io_base + VIRTIO_PCI_QUEUE_PFN, (uint32_t)pfn);
 
     io_outb(g_io_base + VIRTIO_PCI_STATUS,

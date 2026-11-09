@@ -71,6 +71,8 @@ void iommu_init(void);
 
 /* 1 if at least one DMA-remapping unit has translation enabled. */
 int  iommu_present(void);
+/* [M55] Replace the /proc/iommu state text (static string; only while on). */
+void iommu_set_state(const char* st);
 
 /* A new domain of `kind` (NULL on failure or with no IOMMU). */
 iommu_domain_t* iommu_domain_new(int kind);

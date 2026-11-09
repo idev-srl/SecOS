@@ -99,6 +99,10 @@
 #define LK_S60_KSTACK      160  /* kstack_lock, g_pm_lock, kvmm_lock (future)   */
 #define LK_S62_TLB         162  /* tlb_lock: shootdowns are issued from inside
                                    kstack_lock / g_pm_lock sections (plan: S60) */
+#define LK_S63_DMA         163  /* g_dma_lock (kernel/dma.c, M55): the DMA device
+                                   table + coherent/streaming mapping table;
+                                   IOMMU S65/S67/S68, heap and PMM inside.
+                                   Taken under driver locks (S45, N3, K40) */
 #define LK_S64_LEAF        164  /* kclock, csprng, elf-revoke (C6, writers
                                    only), pci_cfg_lock (M53a: one CF8/CFC
                                    pair or RMW): leaf locks (plan: S60)        */

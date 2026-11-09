@@ -21,6 +21,7 @@ waits for the prompt and checks:
                    the host writes 1 MiB of random data at offset 0 of IMG,
                    the guest must read the same md5, then writes 1 MiB at
                    offset 1 MiB that the host checks after QEMU exits;
+  --proc-expect RE /proc/iommu must match RE (repeatable; [M55] dma lines);
   --faults N       /proc/iommu must show exactly N faults (default: 0, or the
                    edu test count with --edu; -1 = don't check).
 
@@ -42,6 +43,7 @@ ap.add_argument('--absent', action='append', default=[])
 ap.add_argument('--edu', action='store_true')
 ap.add_argument('--io', default='')
 ap.add_argument('--faults', type=int, default=None)
+ap.add_argument('--proc-expect', action='append', default=[])
 ap.add_argument('--cmd', action='append', default=[], help='run in bash and print the output (debugging)')
 ap.add_argument('--disk', action='append', default=[],
                 help='dev=IMAGE: the host fills 1 MiB at offset 0 before the boot; the guest '
@@ -244,7 +246,7 @@ if ok_prompt and not a.no_prompt:
             check('hid-keyboard', o is not None and 'HID-OK' in o)
         except Exception as e:
             check('hid-keyboard', False, 'QMP: %s' % e)
-    o = run('cat /proc/iommu', 30) if ('proc' in io or a.edu or a.faults is not None) else None
+    o = run('cat /proc/iommu', 30) if ('proc' in io or a.edu or a.faults is not None or a.proc_expect) else None
     if o is not None:
         open(os.path.join(W, a.name + '.proc'), 'w').write(o)
     if 'proc' in io and a.proc_off:
@@ -253,6 +255,9 @@ if ok_prompt and not a.no_prompt:
     elif 'proc' in io:
         check('proc-iommu', o is not None and re.search(r'iommu vt-d state on', o) is not None and
               re.search(r'unit 0 base 0x[0-9a-f]+ translating', o) is not None,
+              '' if o else 'no output')
+    for r in a.proc_expect:
+        check('proc-expect /%s/' % r, o is not None and re.search(r, o) is not None,
               '' if o else 'no output')
 
 d = dlog()

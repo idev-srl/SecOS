@@ -8,8 +8,10 @@
  * operational, runtime, doorbell) are reached through the physmap. One command
  * ring + one event ring (single ERST segment) drive the controller; each device
  * gets an EP0 ring plus up to XHCI_EPR_PER_DEV data-endpoint rings. All DMA
- * structures are static, suitably aligned kernel buffers; physical addresses
- * come from kvirt_to_phys. Completions are found by draining the event ring.
+ * structures are static, suitably aligned __dma kernel buffers; bus addresses
+ * come from the DMA API (kernel/dma.h, [M55]). A caller's data buffer that is
+ * not DMA memory (stack, heap) bounces through g_bounce32. Completions are
+ * found by draining the event ring.
  *
  * [M50 B3] Locking. Two locks:
  *  - xhci_lock (spinlock, LK_S45_XHCI, irqsave): the command ring, the event
@@ -36,6 +38,7 @@
 #include "io.h"
 #include "debugcon.h"
 #include "vmm.h"
+#include "dma.h"      // [M55] bus addresses, DMA mask
 #include "irq.h"      /* [M53c] dynamic vectors */
 #include "pci_msi.h"
 #include "lapic.h"
@@ -112,26 +115,29 @@
 #define MAX_DEV 4
 
 // ---- Static DMA structures ----
-static xhci_trb_t g_cmd[XHCI_RING_SIZE] __attribute__((aligned(1024)));
-static xhci_trb_t g_evt[XHCI_RING_SIZE] __attribute__((aligned(1024)));
-static uint8_t    g_erst[64]            __attribute__((aligned(64)));
-static uint64_t   g_dcbaa[256]          __attribute__((aligned(4096)));
-static uint64_t   g_scratch_arr[64]     __attribute__((aligned(4096)));
-static uint8_t    g_scratch_buf[16][4096] __attribute__((aligned(4096)));
+static xhci_trb_t g_cmd[XHCI_RING_SIZE] __dma __attribute__((aligned(1024)));
+static xhci_trb_t g_evt[XHCI_RING_SIZE] __dma __attribute__((aligned(1024)));
+static uint8_t    g_erst[64]            __dma __attribute__((aligned(64)));
+static uint64_t   g_dcbaa[256]          __dma __attribute__((aligned(4096)));
+static uint64_t   g_scratch_arr[64]     __dma __attribute__((aligned(4096)));
+static uint8_t    g_scratch_buf[16][4096] __dma __attribute__((aligned(4096)));
 
-static uint8_t    d_input[MAX_DEV][4096] __attribute__((aligned(64)));
-static uint8_t    d_output[MAX_DEV][4096] __attribute__((aligned(64)));
-static xhci_trb_t d_ep0[MAX_DEV][XHCI_RING_SIZE] __attribute__((aligned(1024)));
-static xhci_trb_t d_epr[MAX_DEV][XHCI_EPR_PER_DEV][XHCI_RING_SIZE] __attribute__((aligned(1024)));
+static uint8_t    d_input[MAX_DEV][4096] __dma __attribute__((aligned(64)));
+static uint8_t    d_output[MAX_DEV][4096] __dma __attribute__((aligned(64)));
+static xhci_trb_t d_ep0[MAX_DEV][XHCI_RING_SIZE] __dma __attribute__((aligned(1024)));
+static xhci_trb_t d_epr[MAX_DEV][XHCI_EPR_PER_DEV][XHCI_RING_SIZE] __dma __attribute__((aligned(1024)));
 
 // [M49] DMA reach. HCCPARAMS1.AC64 = 0 means the controller only generates
-// 32-bit addresses. Its rings and contexts are static (kernel image, low RAM),
-// but a caller's data buffer can be a heap or kernel-stack frame anywhere in RAM
-// (the PMM prefers frames above 4 GiB), so synchronous transfers to such a
-// buffer bounce through g_bounce32; an async submit of one is refused.
+// 32-bit addresses (DMA mask, [M55]). Its rings and contexts are static __dma
+// buffers, but a caller's data buffer can be a heap or kernel-stack frame
+// anywhere in RAM: [M55] such a buffer is not DMA memory at all (the strict
+// kernel DMA domain does not map it), so synchronous transfers to any buffer
+// that is not device-reachable bounce through g_bounce32; an async submit of
+// one is refused.
 #define XHCI_BOUNCE_BYTES (64 * 1024)
 static int     g_ac64 = 1;
-static uint8_t g_bounce32[XHCI_BOUNCE_BYTES] __attribute__((aligned(4096)));
+static uint8_t g_bounce32[XHCI_BOUNCE_BYTES] __dma __attribute__((aligned(4096)));
+static dma_dev_t* g_dd;     // [M55] the controller's DMA handle
 
 static usb_device_t g_dev[MAX_DEV];
 static int g_ndev;
@@ -169,7 +175,7 @@ static uint32_t g_ctx_stride;       // 32 or 64 bytes per context
 static xhci_ring_t g_cmd_ring;
 static struct { xhci_trb_t* trb; uint64_t phys; uint32_t deq; uint32_t cycle; } g_evt_ring;
 
-static inline uint64_t phys_of(const void* p) { return kvirt_to_phys((uint64_t)(uintptr_t)p); }
+static inline uint64_t bus_of(const void* p, uint64_t len) { return dma_static(g_dd, p, len); }
 static inline uint32_t cap_rd(uint32_t o) { return *(volatile uint32_t*)(g_cap + o); }
 static inline uint32_t op_rd(uint32_t o) { return *(volatile uint32_t*)(g_op + o); }
 static inline void     op_wr(uint32_t o, uint32_t v) { *(volatile uint32_t*)(g_op + o) = v; }
@@ -189,7 +195,7 @@ static void zero(uint8_t* p, uint32_t n) { for (uint32_t i = 0; i < n; i++) p[i]
 static uint32_t* ctx_dw(uint8_t* block, int index) { return (uint32_t*)(block + index * g_ctx_stride); }
 
 static void ring_init(xhci_ring_t* r, xhci_trb_t* mem, uint8_t dci) {
-    r->trb = mem; r->phys = phys_of(mem); r->enq = 0; r->cycle = 1; r->dci = dci;
+    r->trb = mem; r->phys = bus_of(mem, XHCI_RING_SIZE * sizeof(xhci_trb_t)); r->enq = 0; r->cycle = 1; r->dci = dci;
     for (int i = 0; i < XHCI_RING_SIZE; i++) r->trb[i].d[0] = r->trb[i].d[1] = r->trb[i].d[2] = r->trb[i].d[3] = 0;
     // Last TRB is a Link back to the start, toggling cycle on wrap.
     r->trb[XHCI_RING_SIZE - 1].d[0] = (uint32_t)r->phys;
@@ -294,10 +300,11 @@ static int cmd_run(uint32_t p0, uint32_t p1, uint32_t st, uint32_t ctrl, int* sl
     return (int)((ev.d[2] >> 24) & 0xFF);   // completion code
 }
 
-// [M49] 1 if [p, p+len) is not reachable by a 32-bit-only controller.
+// [M49] 1 if [p, p+len) is not reachable by the controller: [M55] not DMA
+// memory, or above its DMA mask (AC64 = 0).
 static int needs_bounce(const void* p, int len) {
-    if (g_ac64 || len <= 0) return 0;
-    return phys_of(p) + (uint64_t)len > 0x100000000ULL;
+    if (len <= 0) return 0;
+    return !dma_reachable(g_dd, p, (uint64_t)len);
 }
 static void xcopy(void* dst, const void* src, int n) {
     uint8_t* d = (uint8_t*)dst; const uint8_t* s = (const uint8_t*)src;
@@ -332,7 +339,7 @@ static int xhci_control_raw(usb_device_t* d, const void* setup, void* data, int 
     uint32_t trt = (len == 0) ? 0u : (in ? 3u : 2u);
     ring_push(&d->ep0, sp0, sp1, 8, TRB_TYPE(TRB_SETUP) | TRB_IDT | (trt << 16));
     if (len > 0) {
-        uint64_t dp = phys_of(data);
+        uint64_t dp = bus_of(data, (uint64_t)len);
         ring_push(&d->ep0, (uint32_t)dp, (uint32_t)(dp >> 32), (uint32_t)len,
                   TRB_TYPE(TRB_DATA) | (in ? TRB_DIR_IN : 0));
     }
@@ -359,7 +366,8 @@ static int set_ep0_mps_locked(usb_device_t* d, uint16_t mps) {
     ep0[2] = (uint32_t)rp | 1u;                              // DCS=1 (ignored by Evaluate Context)
     ep0[3] = (uint32_t)(rp >> 32);
     ep0[4] = 8;
-    int cc = cmd_run((uint32_t)phys_of(in), (uint32_t)(phys_of(in) >> 32), 0,
+    uint64_t ip = bus_of(in, sizeof(d_input[0]));
+    int cc = cmd_run((uint32_t)ip, (uint32_t)(ip >> 32), 0,
                      TRB_TYPE(TRB_EVAL_CTX) | ((uint32_t)d->slot_id << 24), NULL);
     return (cc == CC_SUCCESS) ? 0 : -1;
 }
@@ -413,7 +421,8 @@ static int configure_endpoints_locked(usb_device_t* d, const usb_endpoint_t* eps
         slot[2] = ((uint32_t)d->parent_slot & 0xFF) |
                   (((uint32_t)d->parent_port & 0xFF) << 8);
     }
-    int cc = cmd_run((uint32_t)phys_of(in), (uint32_t)(phys_of(in) >> 32), 0,
+    uint64_t ip = bus_of(in, sizeof(d_input[0]));
+    int cc = cmd_run((uint32_t)ip, (uint32_t)(ip >> 32), 0,
                      TRB_TYPE(TRB_CONFIG_EP) | ((uint32_t)d->slot_id << 24), NULL);
     return (cc == CC_SUCCESS) ? 0 : -1;
 }
@@ -430,7 +439,7 @@ static int submit_raw(usb_device_t* d, uint8_t ep_addr, void* data, int len) {
     xhci_ring_t* r = NULL;
     for (int i = 0; i < d->n_epr; i++) if (d->epr[i].dci == dci) { r = &d->epr[i]; break; }
     if (!r) return -1;
-    uint64_t dp = phys_of(data);
+    uint64_t dp = bus_of(data, len > 0 ? (uint64_t)len : 1);
     ring_push(r, (uint32_t)dp, (uint32_t)(dp >> 32), (uint32_t)len,
               TRB_TYPE(TRB_NORMAL) | TRB_IOC | (1u << 2 /* ISP */));
     ring_db(d->slot_id, dci);
@@ -620,7 +629,7 @@ static usb_device_t* address_locked(int port, int speed, uint32_t route_string,
     d->n_epr = 0; d->class_id = 0; d->class_priv = NULL; d->last_cc = 0;
     ring_init(&d->ep0, d_ep0[g_ndev], 1);
     zero(d->output_ctx, sizeof(d_output[0]));
-    g_dcbaa[slot] = phys_of(d->output_ctx);
+    g_dcbaa[slot] = bus_of(d->output_ctx, sizeof(d_output[0]));
 
     // Address Device: input ctx with A0 (slot) + A1 (EP0).
     uint8_t* in = d->input_ctx;
@@ -650,7 +659,8 @@ static usb_device_t* address_locked(int port, int speed, uint32_t route_string,
     ep0[2] = (uint32_t)d->ep0.phys | 1u;
     ep0[3] = (uint32_t)(d->ep0.phys >> 32);
     ep0[4] = 8;
-    cc = cmd_run((uint32_t)phys_of(in), (uint32_t)(phys_of(in) >> 32), 0,
+    uint64_t ip = bus_of(in, sizeof(d_input[0]));
+    cc = cmd_run((uint32_t)ip, (uint32_t)(ip >> 32), 0,
                  TRB_TYPE(TRB_ADDRESS_DEV) | ((uint32_t)slot << 24), NULL);
     if (cc != CC_SUCCESS) { debugcon_writestring("[XHCI] address device failed\n"); return NULL; }
     g_ndev++;
@@ -704,6 +714,7 @@ int xhci_init(void) {
         return -1;
     }
     g_pci = dev;   // remembered for optional MSI-X (gated, NOT enabled by default)
+    g_dd = dma_dev_legacy(&dev);    // [M55] joins the kernel DMA domain first
     pci_enable_mem_and_busmaster(&dev);
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[XHCI] BAR0 not memory\n"); return -1; }
@@ -720,9 +731,11 @@ int xhci_init(void) {
     uint32_t hcc1 = cap_rd(CAP_HCCPARAMS1);
     g_ctx_stride = (hcc1 & (1u << 2)) ? 64 : 32;
     g_ac64 = (hcc1 & 1u) != 0;                   // [M49] AC64: 64-bit DMA addresses
-    if (!g_ac64 && (phys_of(d_epr) + sizeof(d_epr) > 0x100000000ULL ||
-                    phys_of(g_scratch_buf) + sizeof(g_scratch_buf) > 0x100000000ULL ||
-                    phys_of(g_bounce32) + sizeof(g_bounce32) > 0x100000000ULL)) {
+    if (!g_ac64) dma_set_mask(g_dd, DMA_MASK_32);
+    if (!dma_reachable(g_dd, d_epr, sizeof(d_epr)) || !dma_reachable(g_dd, d_ep0, sizeof(d_ep0)) ||
+        !dma_reachable(g_dd, d_input, sizeof(d_input)) || !dma_reachable(g_dd, d_output, sizeof(d_output)) ||
+        !dma_reachable(g_dd, g_scratch_buf, sizeof(g_scratch_buf)) ||
+        !dma_reachable(g_dd, g_bounce32, sizeof(g_bounce32)) || !dma_reachable(g_dd, g_dcbaa, sizeof(g_dcbaa))) {
         debugcon_writestring("[XHCI] 32-bit DMA controller but the kernel image is above 4 GiB\n");
         return -1;
     }
@@ -750,11 +763,11 @@ int xhci_init(void) {
     if (spb > 0) {
         for (uint32_t i = 0; i < spb; i++) {
             zero(g_scratch_buf[i], 4096);
-            g_scratch_arr[i] = phys_of(g_scratch_buf[i]);
+            g_scratch_arr[i] = bus_of(g_scratch_buf[i], 4096);
         }
-        g_dcbaa[0] = phys_of(g_scratch_arr);
+        g_dcbaa[0] = bus_of(g_scratch_arr, sizeof(g_scratch_arr));
     }
-    op_wr64(OP_DCBAAP, phys_of(g_dcbaa));
+    op_wr64(OP_DCBAAP, bus_of(g_dcbaa, sizeof(g_dcbaa)));
     op_wr(OP_CONFIG, max_slots);
 
     // Command ring.
@@ -762,7 +775,7 @@ int xhci_init(void) {
     op_wr64(OP_CRCR, g_cmd_ring.phys | 1u /* RCS */);
 
     // Event ring (single ERST segment).
-    g_evt_ring.trb = g_evt; g_evt_ring.phys = phys_of(g_evt);
+    g_evt_ring.trb = g_evt; g_evt_ring.phys = bus_of(g_evt, sizeof(g_evt));
     g_evt_ring.deq = 0; g_evt_ring.cycle = 1;
     for (int i = 0; i < XHCI_RING_SIZE; i++) g_evt[i].d[0] = g_evt[i].d[1] = g_evt[i].d[2] = g_evt[i].d[3] = 0;
     uint64_t* erst = (uint64_t*)g_erst;
@@ -770,7 +783,7 @@ int xhci_init(void) {
     erst[1] = XHCI_RING_SIZE;             // segment size (low 16 bits)
     rt_wr(IR0_ERSTSZ, 1);
     rt_wr64(IR0_ERDP, g_evt_ring.phys | (1u << 3));
-    rt_wr64(IR0_ERSTBA, phys_of(g_erst));
+    rt_wr64(IR0_ERSTBA, bus_of(g_erst, sizeof(g_erst)));
     rt_wr(IR0_IMAN, rt_rd(IR0_IMAN) | 0x3);   // clear IP, set IE (we still poll)
 
     // Run.

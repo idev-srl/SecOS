@@ -91,7 +91,18 @@ SECTIONS
     .bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_VMA) {
         _bss_start = .;
         *(COMMON)
-        *(.bss*)
+        *(.bss)
+        /* [M55] The DMA region (.dmabss): every static driver buffer a device
+         * may reach, tagged __dma (kernel/dma.h) = input section .bss.dma.
+         * Page-aligned at both ends so the strict kernel DMA domain maps
+         * exactly these pages; after the boot stack (stack_bottom must stay
+         * the first .bss symbol, see vmm_setup_kernel_guard_pages). */
+        . = ALIGN(4K);
+        __dma_start = .;
+        *(.bss.dma)
+        . = ALIGN(4K);
+        __dma_end = .;
+        *(.bss.*)
         _bss_end = .;
     }
 

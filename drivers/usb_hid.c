@@ -37,6 +37,7 @@
 #include "input.h"
 #include "debugcon.h"
 #include "spinlock.h"
+#include "dma.h"      // [M55] __dma: device-reachable static buffers
 #include <stddef.h>
 
 #define HID_SET_PROTOCOL  0x0B
@@ -73,9 +74,9 @@ typedef struct {
 static hid_slot_t g_hid[HID_MAX];
 static int g_nhid;
 static spinlock_t hid_lock = SPINLOCK_INIT_CLASS(LK_S12_HID, "usb-hid");
-static uint8_t g_rep[HID_MAX][HID_REPORT_MAX] __attribute__((aligned(64)));
-static uint8_t g_rdesc[512] __attribute__((aligned(64)));
-static uint8_t g_strbuf[128] __attribute__((aligned(64)));
+static uint8_t g_rep[HID_MAX][HID_REPORT_MAX] __dma __attribute__((aligned(64)));
+static uint8_t g_rdesc[512] __dma __attribute__((aligned(64)));
+static uint8_t g_strbuf[128] __dma __attribute__((aligned(64)));
 
 /* HID keyboard usage (page 7) -> Linux key code (drivers/hid/hid-input.c). */
 static const uint8_t hid_kc[0x68] = {

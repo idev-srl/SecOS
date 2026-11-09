@@ -9,7 +9,8 @@
  * single command slot. Registers each disk as "sda", "sdb", ... so the mount
  * logic can try each (on VMware the boot ESP and the data disk are both SATA, so
  * we must not assume the first port is the data disk). DMA structures are static,
- * aligned kernel buffers; physical addresses come from kvirt_to_phys. Transfers
+ * aligned __dma kernel buffers; their bus addresses come from the DMA API
+ * (kernel/dma.h, [M55]: with iommu=on the HBA can reach only those). Transfers
  * bounce through a per-port static buffer (commands are polled).
  *
  * [M50 B3] Locking: AHCI ports are independent (own command list, FIS area,
@@ -23,7 +24,8 @@
 #include "io.h"
 #include "block.h"
 #include "debugcon.h"
-#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_map_mmio
+#include "vmm.h"        // vmm_map_mmio
+#include "dma.h"        // [M55] bus addresses, DMA mask
 #include <stddef.h>
 
 // ---- HBA / port registers ----
@@ -54,6 +56,10 @@
 #define TFD_DRQ  (1u << 3)
 #define TFD_ERR  (1u << 0)
 #define IS_TFES  (1u << 30)
+#define IS_HBFS  (1u << 29)    // host bus fatal error (e.g. an IOMMU-blocked DMA)
+#define IS_HBDS  (1u << 28)    // host bus data error
+#define IS_IFS   (1u << 27)    // interface fatal error
+#define IS_ERR   (IS_TFES | IS_HBFS | IS_HBDS | IS_IFS)
 #define SIG_SATA 0x00000101u
 
 #define ATA_READ_DMA_EX   0x25
@@ -63,19 +69,18 @@
 #define AHCI_MAX_DISKS 4
 
 // Per-port command list + received-FIS (the HBA reads these continuously).
-static uint8_t g_clb[AHCI_MAX_DISKS][1024] __attribute__((aligned(1024)));
-static uint8_t g_fis[AHCI_MAX_DISKS][256]  __attribute__((aligned(256)));
+static uint8_t g_clb[AHCI_MAX_DISKS][1024] __dma __attribute__((aligned(1024)));
+static uint8_t g_fis[AHCI_MAX_DISKS][256]  __dma __attribute__((aligned(256)));
 // Per port (one command in flight per port): command table + DMA bounce.
-static uint8_t g_ctba[AHCI_MAX_DISKS][256]      __attribute__((aligned(128)));
-static uint8_t g_dma[AHCI_MAX_DISKS][64 * 1024] __attribute__((aligned(4096)));
+static uint8_t g_ctba[AHCI_MAX_DISKS][256]      __dma __attribute__((aligned(128)));
+static uint8_t g_dma[AHCI_MAX_DISKS][64 * 1024] __dma __attribute__((aligned(4096)));
 #define DMA_SECTORS (sizeof(g_dma[0]) / 512)
 
 struct ahci_disk { int port; int idx; block_dev_t dev; };
 static struct ahci_disk g_disks[AHCI_MAX_DISKS];
 static int g_ndisks;
 static volatile uint8_t* g_abar;
-
-static inline uint64_t phys_of(const void* p) { return kvirt_to_phys((uint64_t)(uintptr_t)p); }
+static dma_dev_t* g_dd;                 // [M55] the HBA's DMA handle
 static inline uint32_t hr(uint32_t off) { return *(volatile uint32_t*)(g_abar + off); }
 static inline void     hw(uint32_t off, uint32_t v) { *(volatile uint32_t*)(g_abar + off) = v; }
 static inline uint32_t pr(int port, uint32_t r) { return hr(PORT_BASE(port) + r); }
@@ -95,7 +100,8 @@ static void port_start(int port) {
 }
 static void port_rebase(int port, int idx) {
     port_stop(port);
-    uint64_t clb = phys_of(g_clb[idx]), fb = phys_of(g_fis[idx]);
+    uint64_t clb = dma_static(g_dd, g_clb[idx], sizeof(g_clb[idx]));
+    uint64_t fb  = dma_static(g_dd, g_fis[idx], sizeof(g_fis[idx]));
     pw(port, PxCLB,  (uint32_t)clb);  pw(port, PxCLBU, (uint32_t)(clb >> 32));
     pw(port, PxFB,   (uint32_t)fb);   pw(port, PxFBU,  (uint32_t)(fb >> 32));
     zero(g_clb[idx], 1024); zero(g_fis[idx], 256);
@@ -103,15 +109,24 @@ static void port_rebase(int port, int idx) {
     port_start(port);
 }
 
-// Issue one ATA command on a disk's port/slot, single PRDT over its g_dma.
-static int ahci_cmd(struct ahci_disk* d, uint8_t cmd, uint64_t lba,
-                    uint32_t count, uint32_t nbytes, int write) {
+// [M55] After a failed command (task-file error, or a host-bus error such as
+// a DMA the IOMMU blocked) the port stops processing its command list until
+// software restarts it: stop (clears PxCI), clear the error status, start.
+static void port_recover(int port) {
+    port_stop(port);
+    pw(port, PxSERR, 0xFFFFFFFFu); pw(port, PxIS, 0xFFFFFFFFu);
+    port_start(port);
+}
+
+// Issue one ATA command on a disk's port/slot, single PRDT at bus address dba.
+static int ahci_cmd_at(struct ahci_disk* d, uint8_t cmd, uint64_t lba,
+                       uint32_t count, uint32_t nbytes, int write, uint64_t dba) {
     int port = d->port;
     uint8_t* ctba = g_ctba[d->idx];
     pw(port, PxIS, 0xFFFFFFFFu);
 
     uint32_t* hdr = (uint32_t*)g_clb[d->idx];   // command header, slot 0
-    uint64_t ctba_phys = phys_of(ctba);
+    uint64_t ctba_phys = dma_static(g_dd, ctba, sizeof(g_ctba[0]));
     hdr[0] = 5u | ((uint32_t)(write ? 1u : 0u) << 6) | (1u << 16); // CFL=5, W, PRDTL=1
     hdr[1] = 0;
     hdr[2] = (uint32_t)ctba_phys; hdr[3] = (uint32_t)(ctba_phys >> 32);
@@ -126,7 +141,6 @@ static int ahci_cmd(struct ahci_disk* d, uint8_t cmd, uint64_t lba,
     cfis[12] = (uint8_t)count; cfis[13] = (uint8_t)(count >> 8);
 
     uint32_t* prdt = (uint32_t*)(ctba + 0x80);
-    uint64_t dba = phys_of(g_dma[d->idx]);
     prdt[0] = (uint32_t)dba; prdt[1] = (uint32_t)(dba >> 32);
     prdt[2] = 0; prdt[3] = (nbytes - 1) & 0x3FFFFF;
 
@@ -136,11 +150,17 @@ static int ahci_cmd(struct ahci_disk* d, uint8_t cmd, uint64_t lba,
     pw(port, PxCI, 1u << 0);
     for (volatile uint64_t i = 0; ; i++) {
         if (!(pr(port, PxCI) & (1u << 0))) break;
-        if (pr(port, PxIS) & IS_TFES) return -1;
-        if (i > 50000000ull) return -1;
+        if (pr(port, PxIS) & IS_ERR) { port_recover(port); return -1; }
+        if (i > 50000000ull) { port_recover(port); return -1; }
     }
-    if (pr(port, PxTFD) & TFD_ERR) return -1;
+    if ((pr(port, PxIS) & IS_ERR) || (pr(port, PxTFD) & TFD_ERR)) { port_recover(port); return -1; }
     return 0;
+}
+
+static int ahci_cmd(struct ahci_disk* d, uint8_t cmd, uint64_t lba,
+                    uint32_t count, uint32_t nbytes, int write) {
+    return ahci_cmd_at(d, cmd, lba, count, nbytes, write,
+                       dma_static(g_dd, g_dma[d->idx], nbytes));
 }
 
 static struct ahci_disk* disk_of(block_dev_t* dev) {
@@ -183,12 +203,92 @@ static uint64_t ahci_identify(struct ahci_disk* d) {
     return lba28;
 }
 
+#ifdef SECOS_DMA_TEST
+#include "iommu.h"
+// [M55] Negative test (-DSECOS_DMA_TEST, strict kernel DMA domain only): point
+// one PRD at memory outside .dmabss/coherent and check that the IOMMU blocks
+// the transfer and the kernel survives:
+//   1. READ DMA into a .text page  -> device write fault, .text hash unchanged;
+//   2. WRITE DMA from a heap page  -> device read fault, the page's bytes do
+//      not reach the disk (the sector keeps the marker written before);
+//   3. a normal read afterwards     -> works.
+// The command status is logged but not required: QEMU's ich9-ahci completes a
+// command whose DMA the IOMMU refused with success (no HBFS/TFES; it drops the
+// data), real HBAs report a host bus error (handled by port_recover()).
+static int dmat_fault_seen(uint64_t before, uint64_t iova, int is_write) {
+    for (int i = 0; i < 200; i++) {
+        iommu_fault_poll();
+        iommu_fault_stats_t st; iommu_fault_stats(&st);
+        if (st.total > before)
+            return (st.last.iova & ~0xFFFull) == (iova & ~0xFFFull) && st.last.is_write == (is_write ? 1 : 0);
+        for (volatile int k = 0; k < 100000; k++) { }
+    }
+    return 0;
+}
+static void ahci_dma_negative_test(struct ahci_disk* d) {
+    int pass = 0, fail = 0;
+    if (!dma_dev_strict(g_dd)) {
+        debugcon_writestring("[DMA-TEST] SKIP: the AHCI HBA is not in the strict kernel DMA domain\n");
+        return;
+    }
+    uint64_t far_lba = d->dev.sector_count > 64 ? d->dev.sector_count - 16 : 0;
+    uint8_t* dma = g_dma[d->idx];
+    // 1. Device writes into .text.
+    uint8_t h0[32], h1[32];
+    dma_test_text_hash(h0);
+    void* kva = 0;
+    uint64_t bad = dma_test_bad_addr(0, &kva);
+    iommu_fault_stats_t st; iommu_fault_stats(&st);
+    int rc = ahci_cmd_at(d, ATA_READ_DMA_EX, 0, 8, 4096, 0, bad);
+    int seen = dmat_fault_seen(st.total, bad, 1);
+    dma_test_text_hash(h1);
+    int same = 1; for (int i = 0; i < 32; i++) if (h0[i] != h1[i]) same = 0;
+    debugcon_writestring("[DMA-TEST] ahci read into .text phys="); debugcon_print_hex(bad);
+    debugcon_writestring(rc ? " (command failed)" : " (command completed)");
+    debugcon_writestring(seen ? ", IOMMU write fault seen" : ", NO matching IOMMU fault");
+    debugcon_writestring(same ? ", .text hash unchanged\n" : ", .text hash CHANGED\n");
+    if (seen && same) pass++; else fail++;
+    // 2. Device reads a heap page (would leak kernel memory to the disk).
+    for (int i = 0; i < 4096; i++) dma[i] = 0xC3;              // marker sector
+    int mk = ahci_cmd(d, ATA_WRITE_DMA_EX, far_lba, 8, 4096, 1);
+    bad = dma_test_bad_addr(1, &kva);
+    if (bad != DMA_ADDR_ERROR && mk == 0) {
+        for (int i = 0; i < 3 * 4096; i++) ((uint8_t*)kva)[i] = 0x5A;   // "secret"
+        iommu_fault_stats(&st);
+        rc = ahci_cmd_at(d, ATA_WRITE_DMA_EX, far_lba, 8, 4096, 1, bad);
+        seen = dmat_fault_seen(st.total, bad, 0);
+        int leaked = 0;
+        for (int i = 0; i < 4096; i++) dma[i] = 0;
+        if (ahci_cmd(d, ATA_READ_DMA_EX, far_lba, 8, 4096, 0) != 0) leaked = -1;
+        else for (int i = 0; i < 4096; i++) if (dma[i] == 0x5A) { leaked = 1; break; }
+        debugcon_writestring("[DMA-TEST] ahci write from a heap page phys="); debugcon_print_hex(bad);
+        debugcon_writestring(rc ? " (command failed)" : " (command completed)");
+        debugcon_writestring(seen ? ", IOMMU read fault seen" : ", NO matching IOMMU fault");
+        debugcon_writestring(leaked == 0 ? ", heap bytes not on disk\n"
+                             : leaked > 0 ? ", heap bytes LEAKED to disk\n" : ", read-back FAILED\n");
+        if (seen && leaked == 0) pass++; else fail++;
+        dma_test_free(kva);
+    } else {
+        debugcon_writestring("[DMA-TEST] heap page / marker write failed\n"); fail++;
+        if (kva) dma_test_free(kva);
+    }
+    // 3. The port still works.
+    rc = ahci_cmd(d, ATA_READ_DMA_EX, 0, 8, 4096, 0);
+    debugcon_writestring(rc ? "[DMA-TEST] ahci read after the faults FAILED\n"
+                            : "[DMA-TEST] ahci read after the faults ok\n");
+    if (rc == 0) pass++; else fail++;
+    debugcon_writestring("[DMA-TEST] RESULT pass="); debugcon_print_hex((uint64_t)pass);
+    debugcon_writestring(" fail="); debugcon_print_hex((uint64_t)fail); debugcon_writestring("\n");
+}
+#endif
+
 int ahci_init(void) {
     pci_device_t dev;
     if (pci_find_class(0x01, 0x06, 0x01, &dev) != 0) {
         debugcon_writestring("[AHCI] no controller on PCI\n");
         return -1;
     }
+    g_dd = dma_dev_legacy(&dev);    // [M55] joins the kernel DMA domain first
     pci_enable_mem_and_busmaster(&dev);
     uint32_t abar_phys = pci_bar_mem(&dev, 5);
     if (abar_phys == 0) { debugcon_writestring("[AHCI] BAR5 not memory\n"); return -1; }
@@ -198,10 +298,10 @@ int ahci_init(void) {
     hw(HBA_GHC, hr(HBA_GHC) | GHC_AE);
     // [M49] Every DMA structure is a static kernel buffer (command lists, FIS
     // areas, command table, the 64 KB bounce): an HBA without CAP.S64A can only
-    // reach them while the kernel image sits below 4 GiB.
-    if (!(hr(HBA_CAP) & CAP_S64A) &&
-        (phys_of(g_dma) + sizeof(g_dma) > 0x100000000ULL ||
-         phys_of(g_clb) + sizeof(g_clb) > 0x100000000ULL)) {
+    // reach them while the kernel image sits below 4 GiB. [M55] = the DMA mask.
+    if (!(hr(HBA_CAP) & CAP_S64A)) dma_set_mask(g_dd, DMA_MASK_32);
+    if (!dma_reachable(g_dd, g_dma, sizeof(g_dma)) || !dma_reachable(g_dd, g_clb, sizeof(g_clb)) ||
+        !dma_reachable(g_dd, g_fis, sizeof(g_fis)) || !dma_reachable(g_dd, g_ctba, sizeof(g_ctba))) {
         debugcon_writestring("[AHCI] 32-bit DMA HBA but the kernel image is above 4 GiB\n");
         return -1;
     }
@@ -235,5 +335,8 @@ int ahci_init(void) {
     if (g_ndisks == 0) { debugcon_writestring("[AHCI] no SATA disk found\n"); return -1; }
     debugcon_writestring("[AHCI] ready, disks="); debugcon_print_hex((uint64_t)g_ndisks);
     debugcon_writestring("\n");
+#ifdef SECOS_DMA_TEST
+    ahci_dma_negative_test(&g_disks[g_ndisks - 1]);
+#endif
     return 0;
 }

@@ -127,7 +127,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/pkg.c \
 	$(KERNEL_DIR)/selftest.c \
 	$(KERNEL_DIR)/exec_test.c \
-	$(KERNEL_DIR)/iommu.c $(KERNEL_DIR)/iommu_test.c \
+	$(KERNEL_DIR)/iommu.c $(KERNEL_DIR)/iommu_test.c $(KERNEL_DIR)/dma.c \
 	user/testdriver.c \
 	$(LIB_DIR)/terminal.c \
 	$(FS_DIR)/ramfs.c \

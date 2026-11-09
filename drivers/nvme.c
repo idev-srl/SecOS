@@ -8,8 +8,8 @@
  * through the physmap, reset+enable it with a single admin queue pair, IDENTIFY
  * the controller and namespace 1, create one I/O queue pair, and read/write
  * sectors with polled DMA on a single command at a time. Every DMA structure is
- * a static page-aligned kernel buffer; physical addresses come from
- * kvirt_to_phys. Transfers bounce through a shared 64 KB buffer described by a
+ * a static page-aligned __dma kernel buffer; bus addresses come from the DMA
+ * API (kernel/dma.h, [M55]). Transfers bounce through a shared 64 KB buffer described by a
  * PRP1 + PRP-list page. Registers the namespace as block device "nvme0n1".
  *
  * [M50 B3] Locking: one namespace on one I/O queue pair with one shared bounce,
@@ -23,7 +23,8 @@
 #include "io.h"
 #include "block.h"
 #include "debugcon.h"
-#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_map_mmio
+#include "vmm.h"        // vmm_map_mmio
+#include "dma.h"        // [M55] bus addresses
 #include "irq.h"      /* [M53c] dynamic vectors */
 #include "pci_msi.h"
 #include "lapic.h"
@@ -55,13 +56,13 @@
 #define NVME_NSID   1
 
 // Static, page-aligned DMA structures. SQ entry = 64 B, CQ entry = 16 B.
-static uint8_t g_asq[QDEPTH * 64] __attribute__((aligned(4096)));
-static uint8_t g_acq[QDEPTH * 16] __attribute__((aligned(4096)));
-static uint8_t g_iosq[QDEPTH * 64] __attribute__((aligned(4096)));
-static uint8_t g_iocq[QDEPTH * 16] __attribute__((aligned(4096)));
-static uint8_t g_idbuf[4096]       __attribute__((aligned(4096)));
-static uint8_t g_prplist[4096]     __attribute__((aligned(4096)));
-static uint8_t g_dma[64 * 1024]    __attribute__((aligned(4096)));
+static uint8_t g_asq[QDEPTH * 64] __dma __attribute__((aligned(4096)));
+static uint8_t g_acq[QDEPTH * 16] __dma __attribute__((aligned(4096)));
+static uint8_t g_iosq[QDEPTH * 64] __dma __attribute__((aligned(4096)));
+static uint8_t g_iocq[QDEPTH * 16] __dma __attribute__((aligned(4096)));
+static uint8_t g_idbuf[4096]       __dma __attribute__((aligned(4096)));
+static uint8_t g_prplist[4096]     __dma __attribute__((aligned(4096)));
+static uint8_t g_dma[64 * 1024]    __dma __attribute__((aligned(4096)));
 #define DMA_PAGES (sizeof(g_dma) / 4096)
 
 struct nvme_queue {
@@ -84,7 +85,7 @@ static block_dev_t g_dev;
 static uint32_t g_sector_size;
 static uint64_t g_sector_count;
 
-static inline uint64_t phys_of(const void* p) { return kvirt_to_phys((uint64_t)(uintptr_t)p); }
+static dma_dev_t* g_dd;              // [M55] the controller's DMA handle
 static inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t*)(g_bar + off); }
 static inline void     wr32(uint32_t off, uint32_t v) { *(volatile uint32_t*)(g_bar + off) = v; }
 static inline uint64_t rd64(uint32_t off) {
@@ -130,7 +131,7 @@ static uint16_t nvme_identify(uint32_t cns, uint32_t nsid, const void* buf) {
     uint32_t c[16]; for (int i = 0; i < 16; i++) c[i] = 0;
     c[0] = ADMIN_IDENTIFY | ((uint32_t)(g_cid++) << 16);
     c[1] = nsid;
-    uint64_t prp1 = phys_of(buf);
+    uint64_t prp1 = dma_static(g_dd, buf, 4096);
     c[6] = (uint32_t)prp1; c[7] = (uint32_t)(prp1 >> 32);
     c[10] = cns;
     return nvme_submit(&g_admin, c);
@@ -138,7 +139,7 @@ static uint16_t nvme_identify(uint32_t cns, uint32_t nsid, const void* buf) {
 
 // Fill PRP1/PRP2 for a transfer of nbytes from the page-aligned g_dma buffer.
 static void fill_prp(uint32_t* c, uint32_t nbytes) {
-    uint64_t base = phys_of(g_dma);
+    uint64_t base = dma_static(g_dd, g_dma, nbytes);
     c[6] = (uint32_t)base; c[7] = (uint32_t)(base >> 32);    // PRP1 = page 0
     if (nbytes <= 4096) {
         c[8] = 0; c[9] = 0;
@@ -149,7 +150,7 @@ static void fill_prp(uint32_t* c, uint32_t nbytes) {
         uint32_t pages = (nbytes + 4095) / 4096;
         uint64_t* list = (uint64_t*)g_prplist;
         for (uint32_t i = 1; i < pages; i++) list[i - 1] = base + (uint64_t)i * 4096;
-        uint64_t lp = phys_of(g_prplist);
+        uint64_t lp = dma_static(g_dd, g_prplist, (pages - 1) * sizeof(uint64_t));
         c[8] = (uint32_t)lp; c[9] = (uint32_t)(lp >> 32);    // PRP2 = PRP list
     }
 }
@@ -194,6 +195,7 @@ int nvme_init(void) {
         return -1;
     }
     g_pci = dev;   // remembered for optional MSI-X (gated, NOT enabled by default)
+    g_dd = dma_dev_legacy(&dev);    // [M55] joins the kernel DMA domain first
     pci_enable_mem_and_busmaster(&dev);
     uint64_t bar = pci_bar_mem64(&dev, 0);
     if (bar == 0) { debugcon_writestring("[NVME] BAR0 not memory\n"); return -1; }
@@ -216,8 +218,8 @@ int nvme_init(void) {
     zero(g_asq, sizeof(g_asq)); zero(g_acq, sizeof(g_acq));
     queue_doorbells(&g_admin, 0);
     wr32(NVME_AQA, ((QDEPTH - 1) << 16) | (QDEPTH - 1));
-    wr64(NVME_ASQ, phys_of(g_asq));
-    wr64(NVME_ACQ, phys_of(g_acq));
+    wr64(NVME_ASQ, dma_static(g_dd, g_asq, sizeof(g_asq)));
+    wr64(NVME_ACQ, dma_static(g_dd, g_acq, sizeof(g_acq)));
 
     // Enable: CSS=0 (NVM), MPS=0 (4 KB), IOSQES=6 (64 B), IOCQES=4 (16 B), EN=1.
     uint32_t cc = (6u << 16) | (4u << 20) | CC_EN;
@@ -260,7 +262,7 @@ int nvme_init(void) {
     {
         uint32_t c[16]; for (int i = 0; i < 16; i++) c[i] = 0;
         c[0] = ADMIN_CREATE_IO_CQ | ((uint32_t)(g_cid++) << 16);
-        uint64_t cqp = phys_of(g_iocq);
+        uint64_t cqp = dma_static(g_dd, g_iocq, sizeof(g_iocq));
         c[6] = (uint32_t)cqp; c[7] = (uint32_t)(cqp >> 32);
         c[10] = ((QDEPTH - 1) << 16) | IO_QID;
 #ifdef NVME_USE_IRQ
@@ -273,7 +275,7 @@ int nvme_init(void) {
     {
         uint32_t c[16]; for (int i = 0; i < 16; i++) c[i] = 0;
         c[0] = ADMIN_CREATE_IO_SQ | ((uint32_t)(g_cid++) << 16);
-        uint64_t sqp = phys_of(g_iosq);
+        uint64_t sqp = dma_static(g_dd, g_iosq, sizeof(g_iosq));
         c[6] = (uint32_t)sqp; c[7] = (uint32_t)(sqp >> 32);
         c[10] = ((QDEPTH - 1) << 16) | IO_QID;
         c[11] = ((uint32_t)IO_QID << 16) | 1u;  // CQID=IO_QID, PC=1

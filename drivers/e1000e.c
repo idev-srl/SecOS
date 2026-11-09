@@ -12,7 +12,7 @@
  * physmap, reset the device, set auto-speed + link-up, read the MAC from
  * RAL/RAH, and bring up legacy RX/TX descriptor rings with per-descriptor DMA
  * packet buffers. Every DMA structure is a static page-aligned kernel buffer;
- * physical addresses come from kvirt_to_phys. transmit() copies into the next
+ * bus addresses come from the DMA API ([M55], __dma). transmit() copies into the next
  * TX buffer and bumps TDT; poll() drains the RX ring NAPI-style, handing each
  * frame to net_rx(). Interrupt wiring is delegated to net_request_irq() (the
  * core picks MSI-X / INTx / timer-tick polling); this driver only supplies the
@@ -24,7 +24,8 @@
 #include "pci.h"
 #include "io.h"
 #include "debugcon.h"
-#include "vmm.h"        // phys_to_virt / kvirt_to_phys / vmm_map_mmio
+#include "vmm.h"        // vmm_map_mmio
+#include "dma.h"        // [M55] bus addresses
 #include <stddef.h>
 
 /* ---- Device register offsets (BAR0 MMIO) ---- */
@@ -110,16 +111,16 @@ struct e1000_tx_desc {
 } __attribute__((packed));
 
 /* Static, page-aligned DMA structures (kernel is identity/physmap mapped). */
-static struct e1000_rx_desc g_rx_ring[E1000_RX_DESCS] __attribute__((aligned(4096)));
-static struct e1000_tx_desc g_tx_ring[E1000_TX_DESCS] __attribute__((aligned(4096)));
-static uint8_t g_rx_buf[E1000_RX_DESCS][E1000_BUF_SIZE] __attribute__((aligned(4096)));
-static uint8_t g_tx_buf[E1000_TX_DESCS][E1000_BUF_SIZE] __attribute__((aligned(4096)));
+static struct e1000_rx_desc g_rx_ring[E1000_RX_DESCS] __dma __attribute__((aligned(4096)));
+static struct e1000_tx_desc g_tx_ring[E1000_TX_DESCS] __dma __attribute__((aligned(4096)));
+static uint8_t g_rx_buf[E1000_RX_DESCS][E1000_BUF_SIZE] __dma __attribute__((aligned(4096)));
+static uint8_t g_tx_buf[E1000_TX_DESCS][E1000_BUF_SIZE] __dma __attribute__((aligned(4096)));
 
 static volatile uint8_t* g_mmio;
 static uint32_t g_tx_tail;          // next TX descriptor to fill
 static net_dev_t g_dev;
 
-static inline uint64_t phys_of(const void* p) { return kvirt_to_phys((uint64_t)(uintptr_t)p); }
+static dma_dev_t* g_dd;     /* [M55] the device's DMA handle */
 static inline uint32_t reg_rd(uint32_t off) { return *(volatile uint32_t*)(g_mmio + off); }
 static inline void     reg_wr(uint32_t off, uint32_t v) { *(volatile uint32_t*)(g_mmio + off) = v; }
 
@@ -161,12 +162,12 @@ static void e1000e_read_mac(net_dev_t* dev) {
 
 static void e1000e_setup_rx(void) {
     for (uint32_t i = 0; i < E1000_RX_DESCS; i++) {
-        g_rx_ring[i].addr   = phys_of(g_rx_buf[i]);
+        g_rx_ring[i].addr   = dma_static(g_dd, g_rx_buf[i], sizeof(g_rx_buf[i]));
         g_rx_ring[i].length = 0;
         g_rx_ring[i].status = 0;
         g_rx_ring[i].errors = 0;
     }
-    uint64_t base = phys_of(g_rx_ring);
+    uint64_t base = dma_static(g_dd, g_rx_ring, sizeof(g_rx_ring));
     reg_wr(E1000_RDBAL, (uint32_t)base);
     reg_wr(E1000_RDBAH, (uint32_t)(base >> 32));
     reg_wr(E1000_RDLEN, E1000_RX_DESCS * (uint32_t)sizeof(struct e1000_rx_desc));
@@ -181,12 +182,12 @@ static void e1000e_setup_rx(void) {
 
 static void e1000e_setup_tx(void) {
     for (uint32_t i = 0; i < E1000_TX_DESCS; i++) {
-        g_tx_ring[i].addr   = phys_of(g_tx_buf[i]);
+        g_tx_ring[i].addr   = dma_static(g_dd, g_tx_buf[i], sizeof(g_tx_buf[i]));
         g_tx_ring[i].length = 0;
         g_tx_ring[i].cmd    = 0;
         g_tx_ring[i].status = TXD_STA_DD;   // mark free so transmit() can reuse
     }
-    uint64_t base = phys_of(g_tx_ring);
+    uint64_t base = dma_static(g_dd, g_tx_ring, sizeof(g_tx_ring));
     reg_wr(E1000_TDBAL, (uint32_t)base);
     reg_wr(E1000_TDBAH, (uint32_t)(base >> 32));
     reg_wr(E1000_TDLEN, E1000_TX_DESCS * (uint32_t)sizeof(struct e1000_tx_desc));
@@ -214,7 +215,7 @@ static int e1000e_transmit(net_dev_t* dev, const void* frame, uint32_t len) {
     const uint8_t* src = (const uint8_t*)frame;
     for (uint32_t i = 0; i < len; i++) g_tx_buf[idx][i] = src[i];
 
-    g_tx_ring[idx].addr   = phys_of(g_tx_buf[idx]);
+    g_tx_ring[idx].addr   = dma_static(g_dd, g_tx_buf[idx], sizeof(g_tx_buf[idx]));
     g_tx_ring[idx].length = (uint16_t)len;
     g_tx_ring[idx].cso    = 0;
     g_tx_ring[idx].cmd    = (uint8_t)(TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS);
@@ -247,7 +248,7 @@ static void e1000e_poll(net_dev_t* dev) {
         /* Recycle: reset the descriptor and hand it back to the NIC. */
         rd->status = 0;
         rd->length = 0;
-        rd->addr   = phys_of(g_rx_buf[idx]);
+        rd->addr   = dma_static(g_dd, g_rx_buf[idx], sizeof(g_rx_buf[idx]));
         tail = idx;
         io_mfence();
         reg_wr(E1000_RDT, tail);
@@ -285,6 +286,7 @@ int e1000e_init(void) {
         debugcon_writestring("[E1000E] no controller on PCI\n");
         return -1;
     }
+    g_dd = dma_dev_legacy(&dev);    /* [M55] joins the kernel DMA domain first */
     pci_enable_mem_and_busmaster(&dev);
 
     uint64_t bar = pci_bar_mem64(&dev, 0);
