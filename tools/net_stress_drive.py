@@ -38,6 +38,7 @@ ap.add_argument("--rounds", type=int, default=4)
 ap.add_argument("--conns", type=int, default=12)
 ap.add_argument("--stress-rounds", type=int, default=2)
 ap.add_argument("--nic", default="e1000", help="QEMU NIC model (e1000e exercises MSI-X NAPI RX)")
+ap.add_argument("--qemu-extra", default="", help="[M58] extra QEMU arguments (e.g. q35 + intel-iommu)")
 args = ap.parse_args()
 
 out = open(args.out, "w")
@@ -181,7 +182,7 @@ qemu = subprocess.Popen(
      % (P_SSH, P_LISTEN, GUEST_LISTEN),
      "-device", args.nic + ",netdev=n0",
      "-debugcon", "file:" + args.log, "-global", "isa-debugcon.iobase=0xe9",
-     "-no-reboot", "-display", "none", "-serial", "null"],
+     "-no-reboot", "-display", "none", "-serial", "null"] + args.qemu_extra.split(),
     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
