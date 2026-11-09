@@ -2219,6 +2219,38 @@ else
 fi
 
 # ============================================================================
+# [U10] NETPOSIX GATE: the network userland for musl programs.
+# tools/netposix_test.sh boots a CONSOLE=root image with nptest (CAP_NET,
+# CAP_NET|CAP_NET_RAW, no CAP_NET) on an ext2 disk inside a private network
+# namespace whose host services are all local: TCP/UDP sockets (non-blocking
+# connect + poll + SO_ERROR, refused port, ICMP port unreachable, options,
+# timeouts, MSG_* flags), DNS through musl's resolver (UDP + TCP fallback),
+# AF_UNIX with file permissions, epoll/eventfd/timerfd/setitimer, ICMP ping
+# sockets (identifier isolation, ICMP errors) and raw sockets (root or
+# CAP_NET_RAW only), iputils ping as a user and as root, ntpd + hwclock, a
+# guest TCP server. Run once on the in-kernel e1000 and once on the ring-3
+# e1000e (M58: q35 + intel-iommu, make iso UDRV=8086:10d3).
+# ============================================================================
+if command -v mke2fs >/dev/null 2>&1 && command -v ip >/dev/null 2>&1; then
+    for NPV in "" "--udrv"; do
+        echo "[selftest] NETPOSIX gate (tools/netposix_test.sh $NPV)..."
+        NP_OUT=$(mktemp /tmp/secos_selftest_netposix.XXXXXX)
+        tools/netposix_test.sh $NPV >"$NP_OUT" 2>&1
+        while IFS= read -r l; do
+            case "$l" in
+                "  [PASS] "*) check "${l#  \[PASS\] }${NPV:+ (ring-3 e1000e)}" 0 ;;
+                "  [FAIL] "*) check "${l#  \[FAIL\] }${NPV:+ (ring-3 e1000e)}" 1 ;;
+                "  [SKIP] "*) echo "$l" ;;
+            esac
+        done <"$NP_OUT"
+        grep -q "RESULT:" "$NP_OUT" || { check "NETPOSIX gate $NPV ran to completion" 1; tail -20 "$NP_OUT"; }
+        rm -f "$NP_OUT"
+    done
+else
+    echo "  [SKIP] NETPOSIX gate (needs mke2fs and ip)"
+fi
+
+# ============================================================================
 # INIT GATE: /bin/init as PID 1 — a ready system with no manual steps.
 # (a) An image built with SSH_AUTHORIZED_KEYS=<throwaway key generated here>
 #     boots with a user-net NIC: init must be PID 1, ifup must take a DHCP

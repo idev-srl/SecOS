@@ -1427,6 +1427,10 @@ int ksys_fstat(int fd, struct secos_stat* st){
 int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
+    // [U10] The request is an unsigned int (Linux): musl passes ioctl's int
+    // request sign-extended, so 0x80247009 (RTC_RD_TIME) arrived as
+    // 0xffffffff80247009 and matched nothing.
+    cmd &= 0xFFFFFFFFull;
     // FIONBIO (ioctl form of fcntl O_NONBLOCK) on a terminal fd.
     #define FD_SET_NONBLOCK() do { int v_; \
         if(copy_from_user(&v_,(void*)arg,sizeof(v_))!=0) return -EFAULT; \
