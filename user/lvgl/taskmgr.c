@@ -2,8 +2,8 @@
  * SPDX-License-Identifier: MIT
  *
  * Modelled on the Windows Task Manager:
- *   Processes   - sortable list (name, PID, user, status, CPU %, memory,
- *                 command line); "End task" sends SIGTERM after a
+ *   Processes   - sortable list (name, PID, user, status, threads, CPU %,
+ *                 memory, command line); "End task" sends SIGTERM after a
  *                 confirmation and offers SIGKILL when the process is still
  *                 there 3 s later. Ending another user's process is refused
  *                 by the kernel (cred_may_signal, probed with kill(pid, 0))
@@ -56,7 +56,7 @@
 #define MAXCPU  64
 #define MAXNIC  4
 #define MAXUSER 32
-#define NCOL    7
+#define NCOL    8
 
 #define C_BG       0x12171E
 #define C_PANEL    0x182029
@@ -169,6 +169,7 @@ static const char* user_name(int uid, char* tmp, int n) {
 /* ---- sampling ---------------------------------------------------------------- */
 typedef struct {
     int pid, ppid, uid;
+    int threads;               /* [U9] /proc/<pid>/stat num_threads */
     char state;
     char comm[32];
     char cmd[96];
@@ -214,7 +215,8 @@ static int parse_stat(int pid, proc_t* p) {
     p->pid = pid;
     p->state = t[0][0];
     p->ppid = atoi(t[1]);
-    p->ticks = strtoul(t[11], 0, 10) + strtoul(t[12], 0, 10);
+    p->ticks = strtoul(t[11], 0, 10) + strtoul(t[12], 0, 10);   /* utime + stime: all threads */
+    p->threads = atoi(t[17]);
     p->start = strtoul(t[19], 0, 10);
     p->rss_kb = (long)strtoul(t[21], 0, 10) * 4;
     return 0;
@@ -745,13 +747,13 @@ static uint32_t foot_until;
 
 static const lcol_t proc_cols[] = {
     { "Name", 168, 0, 0, 0 }, { "PID", 64, 1, 1, 0 }, { "User", 96, 0, 0, 0 }, { "Status", 92, 0, 0, 0 },
-    { "CPU", 72, 1, 1, 1 }, { "Memory", 96, 1, 1, 1 }, { "Command line", 0, 0, 0, 0 },
+    { "Threads", 72, 1, 1, 1 }, { "CPU", 72, 1, 1, 1 }, { "Memory", 96, 1, 1, 1 }, { "Command line", 0, 0, 0, 0 },
 };
 static const lcol_t user_cols[] = {
     { "User", 220, 0, 0, 0 }, { "UID", 80, 1, 1, 0 }, { "Processes", 110, 1, 1, 1 },
     { "CPU", 90, 1, 1, 1 }, { "Memory", 120, 1, 1, 1 }, { "", 0, 0, 0, 0 },
 };
-enum { PC_NAME, PC_PID, PC_USER, PC_STATUS, PC_CPU, PC_MEM, PC_CMD };
+enum { PC_NAME, PC_PID, PC_USER, PC_STATUS, PC_THREADS, PC_CPU, PC_MEM, PC_CMD };
 
 /* Performance tab */
 enum { PK_CPU, PK_MEM, PK_NIC };
@@ -823,6 +825,7 @@ static void fill_proc_rows(void) {
         snprintf(r->txt[PC_PID], sizeof(r->txt[0]), "%d", p->pid); r->num[PC_PID] = p->pid;
         snprintf(r->txt[PC_USER], sizeof(r->txt[0]), "%s", user_name(p->uid, tmp, sizeof(tmp)));
         snprintf(r->txt[PC_STATUS], sizeof(r->txt[0]), "%s", status_name(p->state));
+        snprintf(r->txt[PC_THREADS], sizeof(r->txt[0]), "%d", p->threads); r->num[PC_THREADS] = p->threads;
         fmt_pct10(r->txt[PC_CPU], sizeof(r->txt[0]), p->cpu10); r->num[PC_CPU] = p->cpu10; r->heat[PC_CPU] = p->cpu10;
         fmt_kb(r->txt[PC_MEM], sizeof(r->txt[0]), p->rss_kb); r->num[PC_MEM] = p->rss_kb;
         r->heat[PC_MEM] = mem_total_kb > 0 ? (int)(p->rss_kb * 4000 / mem_total_kb) : 0;   /* 25% of RAM = full */
@@ -882,7 +885,8 @@ static void trace_list(void) {
     char tmp[16];
     printf("TASKMGR-LIST n=%d\n", nprocs);
     for (int i = 0; i < nprocs; i++)
-        printf("TASKMGR-P %d %s %s %c\n", procs[i].pid, procs[i].comm, user_name(procs[i].uid, tmp, sizeof(tmp)), procs[i].state);
+        printf("TASKMGR-P %d %s %s %c %d\n", procs[i].pid, procs[i].comm, user_name(procs[i].uid, tmp, sizeof(tmp)),
+               procs[i].state, procs[i].threads);
     printf("TASKMGR-LIST-END\n");
 }
 
