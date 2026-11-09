@@ -264,8 +264,10 @@ fi
 echo "[selftest] Running M14 (mb2, ${TIMEOUT}s)..."
 tools/smoke.sh --mb2 --timeout "$TIMEOUT" --log "$M14LOG" >/dev/null 2>&1 || true
 
-# Headline: a non-zero reserved footprint but ZERO pages mapped at load (no eager mapping).
-grep -qE "reserved footprint=0x0*[1-9A-F][0-9A-F]* mapped at load=0x0000000000000000" "$M14LOG"; check "M14 lazy load: footprint reserved, 0 pages mapped at load (headline)" $?
+# Headline: a non-zero reserved footprint but ZERO image pages mapped at load (no
+# eager mapping). [U1] The initial stack (argv + auxv) is written at load, so
+# only its top page(s) may be present: at most 2 pages in total.
+grep -qE "reserved footprint=0x0*[1-9A-F][0-9A-F]* image pages at load=0x0000000000000000 mapped at load=0x000000000000000[0-2]" "$M14LOG"; check "M14 lazy load: footprint reserved, 0 image pages mapped at load (headline)" $?
 # Pages materialize on first touch via the #PF handler.
 n_pf=$(grep -c "\[PF\] demand page" "$M14LOG"); [[ "$n_pf" -ge 1 ]]; check "M14 pages materialize on demand ([PF] demand page x$n_pf)" $?
 # The lazily-paged program actually ran (code+stack faulted in) and printed.
