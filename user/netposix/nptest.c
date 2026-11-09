@@ -341,6 +341,7 @@ static int ping_once(int fd, const char *host, int seq, int *rid, int timeout_ms
         if (poll(&p, 1, 200) <= 0) continue;
         unsigned char in[256];
         int n = recv(fd, in, sizeof in, 0);
+        if (n < 0 && errno != EAGAIN && errno != EINTR) return -5;   /* an ICMP error (sk_err) */
         if (n < 8) continue;
         if (in[0] != ICMP_ECHOREPLY) return -2;
         if (((in[6] << 8) | in[7]) != seq) continue;
@@ -405,7 +406,7 @@ static void t_ping(const char *host)
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&em); c; c = CMSG_NXTHDR(&em, c))
         if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_RECVERR) ee = (struct sock_extended_err *)CMSG_DATA(c);
     CHECK("ICMP net unreachable delivered to the ping socket (IP_RECVERR)",
-          r == -1 && n >= 8 && ee && ee->ee_type == 3 && ee->ee_origin == SO_EE_ORIGIN_ICMP &&
+          r == -5 && e1 == ENETUNREACH && n >= 8 && ee && ee->ee_type == 3 && ee->ee_origin == SO_EE_ORIGIN_ICMP &&
           ee->ee_errno == ENETUNREACH && ((unsigned char *)eb)[0] == ICMP_ECHO &&
           orig.sin_addr.s_addr == inet_addr("192.0.2.1"),
           "r=%d errno=%d n=%d ee=%p type=%d", r, e1, n, (void *)ee, ee ? ee->ee_type : -1);
