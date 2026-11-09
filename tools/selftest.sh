@@ -2168,6 +2168,31 @@ else
 fi
 
 # ============================================================================
+# [U1] MUSL-BASE GATE: the musl C library on SecOS. tools/musl_base_test.sh
+# builds the sysroot (tools/port-musl.sh: pinned musl 1.2.6 + upstream fixes,
+# cached in build/dl) and signed static-PIE test programs (tools/secos-cc),
+# boots them from an ext2 disk at -smp 4: libc behaviour (stdio, TLS, locale,
+# iconv, malloc, signals, fork/exec/wait, files, dirs), PIE ASLR, the FS base
+# across switches, the ENOSYS trace, unsigned/tampered/exec-stack refusal.
+# ============================================================================
+if command -v mke2fs >/dev/null 2>&1; then
+    echo "[selftest] MUSL-BASE gate (tools/musl_base_test.sh)..."
+    MB_OUT=$(mktemp /tmp/secos_selftest_musl.XXXXXX)
+    tools/musl_base_test.sh >"$MB_OUT" 2>&1
+    while IFS= read -r l; do
+        case "$l" in
+            "  [PASS] "*) check "${l#  \[PASS\] }" 0 ;;
+            "  [FAIL] "*) check "${l#  \[FAIL\] }" 1 ;;
+            "  [SKIP] "*) echo "$l" ;;
+        esac
+    done <"$MB_OUT"
+    grep -q "RESULT:" "$MB_OUT" || { check "MUSL-BASE gate ran to completion" 1; tail -20 "$MB_OUT"; }
+    rm -f "$MB_OUT"
+else
+    echo "  [SKIP] MUSL-BASE gate (needs mke2fs)"
+fi
+
+# ============================================================================
 # INIT GATE: /bin/init as PID 1 — a ready system with no manual steps.
 # (a) An image built with SSH_AUTHORIZED_KEYS=<throwaway key generated here>
 #     boots with a user-net NIC: init must be PID 1, ifup must take a DHCP

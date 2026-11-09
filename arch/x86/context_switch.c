@@ -22,6 +22,7 @@ void arch_switch_to_process(process_t* next) {
     if (vmm_switch_space(next->space) != 0)
         kernel_panic("[M6] arch_switch_to_process: vmm_switch_space failed", __FILE__, __LINE__);
 
+    arch_set_fs_base(next->fs_base);   // [U1] user thread pointer
     arch_iret_to_tf(next->tf);
     /* never reached */
 }
@@ -34,6 +35,7 @@ void arch_enter_user_mode(process_t* p) {
         kernel_panic("[M6] arch_enter_user_mode: vmm_switch_space failed", __FILE__, __LINE__);
 
     tss_set_kernel_stack(p->kstack_top);
+    arch_set_fs_base(p->fs_base);      // [U1] user thread pointer
     arch_iret_to_tf(p->tf);
     /* never reached */
 }

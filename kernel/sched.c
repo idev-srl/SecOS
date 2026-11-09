@@ -178,6 +178,10 @@ static void switch_to(process_t* next) {
     klock_on_switch(prev, me->idle_task);   // [M50] nothing else held; IRQ nesting reset
     { extern void kiface_count_switch(void); kiface_count_switch(); }   // /proc/stat ctxt
     fpu_switch(prev, next, me->idle_task);
+    // [U1] The user thread pointer: the kernel never uses %fs, so the MSR only
+    // has to hold the running task's value. A task's fs_base changes only
+    // through itself (arch_prctl, exec), which also loads the MSR at once.
+    if (next != me->idle_task && next->pid != 0) arch_set_fs_base(next->fs_base);
     me->current = next;
     me->in_idle = (next == me->idle_task);
     next->state = PROC_RUNNING;

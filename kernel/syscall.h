@@ -113,6 +113,16 @@
 #define SYS_SETGROUPS   109 // setgroups(size, const gid_t*)   (root only)
 #define SYS_NETCTL      95 // netctl(op, ifindex, arg): NIC info / static config / DHCP (CAP_NET; net/netctl.c)
 
+// [U1] Linux-shaped syscalls: number = SYS_LX_BASE + the Linux x86-64 number,
+// Linux argument order, structs, flags and -errno (docs/USERLAND_PLAN.md D3).
+// musl's translation layer (user/musl-secos/src/secos/syscall.c) passes them
+// through unchanged. kernel/syscall_lx.c.
+#define SYS_LX_BASE             512
+#define SYS_LX_ARCH_PRCTL       (SYS_LX_BASE + 158) // arch_prctl(ARCH_SET_FS/ARCH_GET_FS, addr)
+#define SYS_LX_SET_TID_ADDRESS  (SYS_LX_BASE + 218) // set_tid_address(int*) -> tid (= pid until U9 threads)
+#define SYS_LX_EXIT_GROUP       (SYS_LX_BASE + 231) // exit_group(status) = SYS_EXIT until U9
+#define SYS_LX_MAX              (SYS_LX_BASE + 512) // first number above the Linux range
+
 // Kernel interfaces for standard userland tools (kernel/kiface.c; semantics +
 // Linux struct layouts in kernel/kiface.c). Errors are -errno (Linux values).
 #define SYS_CLOCK_GETTIME 65 // clock_gettime(clockid, struct timespec*)

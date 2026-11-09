@@ -55,3 +55,6 @@ tools/acpi_fuzz/acpi_fuzz
 .bkl-default.stamp
 .cflags.stamp
 .uefi-cflags.stamp
+
+# [U1] musl: pristine upstream tree fetched by tools/port-musl.sh (SecOS changes: user/musl-secos/)
+third_party/musl/

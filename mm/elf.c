@@ -5,6 +5,7 @@
 #include "panic.h"
 #include "pmm.h"
 #include "heap.h"
+#include "debugcon.h"
 /*
 
  * Copyright (c) 2025 iDev srl
@@ -143,44 +144,130 @@ int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t
 // per loadable segment. No frame is touched; pages materialize on first access
 // in vmm_handle_page_fault() -> vma_fault_in(). 'image' is pinned for the
 // process lifetime (the VMAs point into it).
-int elf_load_image_lazy(const uint8_t* image, size_t size, vmm_space_t* space,
-                        uint64_t* entry_out, vma_set_t* vset, uint64_t* footprint_out) {
-    (void)space; // page tables are not touched here
-    if (!image || size < sizeof(Elf64_Ehdr) || !vset) return ELF_ERR_FMT;
+//
+// [U1] Layout rules (docs/devlog/U1-musl-base.md):
+//  - ET_EXEC: any PT_LOAD layout inside the user image window
+//    [USER_CODE_BASE, USER_HEAP_BASE) (4..10 GiB). Code no longer has to sit
+//    in [4, 8) GiB and data in [8, 16) GiB: SecOS user.ld binaries are one
+//    valid layout, a static-PIE linked at 0 relocated into the window another.
+//  - ET_DYN without PT_INTERP (static-PIE) is loaded at a random page-aligned
+//    base inside the same window ('rnd' supplies the randomness).
+//  - PT_INTERP (dynamic linking) and an executable PT_GNU_STACK are refused.
+//  - Segments may not overlap (not even share a page): each page has exactly
+//    one protection, so W^X holds per page.
+#define PT_INTERP_    3
+#define PT_PHDR_      6
+#define PT_GNU_STACK_ 0x6474e551u
+#define ET_EXEC_      2
+#define ET_DYN_       3
+#define ELF_MAX_PHNUM 64
+#define ELF_MAX_STACK (64ULL << 20)          // PT_GNU_STACK size cap
+
+static void elf_log(const char* what) {
+    terminal_writestring(what);
+    debugcon_writestring(what);
+}
+
+int elf_load_image_lazy(const uint8_t* image, size_t size, uint64_t rnd,
+                        vma_set_t* vset, elf_load_info_t* info) {
+    if (!image || size < sizeof(Elf64_Ehdr) || !vset || !info) return ELF_ERR_FMT;
     const Elf64_Ehdr* eh = (const Elf64_Ehdr*)image;
     if (check_magic(eh) != 0) { terminal_writestring("[ELF] Magic err\n"); return ELF_ERR_MAGIC; }
     if (eh->e_phoff == 0 || eh->e_phnum == 0) { terminal_writestring("[ELF] No PH\n"); return ELF_ERR_FMT; }
     if (eh->e_phentsize != sizeof(Elf64_Phdr)) { terminal_writestring("[ELF] PH size mismatch\n"); return ELF_ERR_FMT; }
+    if (eh->e_type != ET_EXEC_ && eh->e_type != ET_DYN_) { elf_log("[ELF] not an executable (e_type)\n"); return ELF_ERR_FMT; }
+    if (eh->e_phnum > ELF_MAX_PHNUM) { elf_log("[ELF] too many program headers\n"); return ELF_ERR_FMT; }
+    if (eh->e_phoff > size || (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) > size - eh->e_phoff) {
+        terminal_writestring("[ELF] PH outside the file\n");
+        return ELF_ERR_RANGE;
+    }
+    const Elf64_Phdr* phs = (const Elf64_Phdr*)(image + eh->e_phoff);
+    const int pie = (eh->e_type == ET_DYN_);
 
-    if (entry_out) *entry_out = eh->e_entry;
-    uint64_t footprint = 0;
-
+    // Pass 1: validate every header, find the image span (page-rounded).
+    uint64_t lo = ~0ULL, hi = 0, phdr_vaddr = 0, stack_size = 0;
+    int have_phdr = 0, nload = 0;
     for (int i = 0; i < eh->e_phnum; i++) {
-        const Elf64_Phdr* ph = (const Elf64_Phdr*)(image + eh->e_phoff + i * sizeof(Elf64_Phdr));
-        if ((const uint8_t*)ph + sizeof(Elf64_Phdr) > image + size) return ELF_ERR_RANGE;
+        const Elf64_Phdr* ph = &phs[i];
+        if (ph->p_type == PT_INTERP_) {
+            elf_log("[ELF] PT_INTERP refused (no dynamic linking)\n");
+            return ELF_ERR_FMT;
+        }
+        if (ph->p_type == PT_GNU_STACK_) {
+            if (ph->p_flags & PF_X) { elf_log("[ELF] executable stack refused (PT_GNU_STACK X)\n"); return ELF_ERR_FLAG; }
+            stack_size = ph->p_memsz;
+            continue;
+        }
+        if (ph->p_type == PT_PHDR_) { phdr_vaddr = ph->p_vaddr; have_phdr = 1; continue; }
         if (ph->p_type != PT_LOAD) continue;
         if (ph->p_memsz == 0 && ph->p_filesz == 0) continue;
         // Security invariants enforced at load time (fail fast), mirroring the
         // eager loader: reject W|X, validate file range, virtual range, p_align.
         if ((ph->p_flags & PF_X) && (ph->p_flags & PF_W)) { terminal_writestring("[ELF] segment W|X rifiutato\n"); return ELF_ERR_FLAG; }
-        if (ph->p_offset + ph->p_filesz > size) { terminal_writestring("[ELF] segment range oltre file\n"); return ELF_ERR_RANGE; }
-        if (ph->p_flags & PF_X) {
-            if (ph->p_vaddr < USER_CODE_BASE || ph->p_vaddr >= USER_DATA_BASE) { terminal_writestring("[ELF] code fuori range\n"); return ELF_ERR_RANGE; }
-        } else {
-            if (ph->p_vaddr < USER_DATA_BASE || ph->p_vaddr >= USER_STACK_TOP - 0x100000) { terminal_writestring("[ELF] data fuori range\n"); return ELF_ERR_RANGE; }
-        }
+        if (ph->p_offset > size || ph->p_filesz > size - ph->p_offset) { terminal_writestring("[ELF] segment range oltre file\n"); return ELF_ERR_RANGE; }
         if (ph->p_align != 0 && ph->p_align != 0x1000ULL) { terminal_writestring("[ELF] p_align non supportato\n"); return ELF_ERR_FMT; }
+        uint64_t memsz = ph->p_memsz < ph->p_filesz ? ph->p_filesz : ph->p_memsz;
+        uint64_t win = USER_HEAP_BASE - USER_CODE_BASE;
+        if (ph->p_vaddr >= VMM_USER_TOP || memsz > win) { elf_log("[ELF] segment outside the user image window\n"); return ELF_ERR_RANGE; }
+        uint64_t s = ph->p_vaddr & ~0xFFFULL;
+        uint64_t e = (ph->p_vaddr + memsz + 0xFFFULL) & ~0xFFFULL;
+        if (s < lo) lo = s;
+        if (e > hi) hi = e;
+        nload++;
+    }
+    if (!nload) { elf_log("[ELF] no loadable segment\n"); return ELF_ERR_FMT; }
 
-        uint64_t vaddr  = ph->p_vaddr;
+    // Load bias: 0 for ET_EXEC, a random page-aligned base for a static-PIE.
+    const uint64_t win_lo = USER_CODE_BASE, win_hi = USER_HEAP_BASE;
+    uint64_t bias = 0;
+    if (pie) {
+        uint64_t span = hi - lo;
+        if (span > win_hi - win_lo) { elf_log("[ELF] PIE image larger than the window\n"); return ELF_ERR_RANGE; }
+        uint64_t slots = ((win_hi - win_lo - span) >> 12) + 1;
+#ifdef SECOS_NO_ASLR
+        rnd = 0;
+#endif
+        uint64_t base = win_lo + ((rnd % slots) << 12);
+        bias = base - lo;
+    }
+    if (lo + bias < win_lo || hi + bias > win_hi || hi + bias < lo + bias) {
+        elf_log("[ELF] segment outside the user image window\n");
+        return ELF_ERR_RANGE;
+    }
+
+    // Pass 2: no two segments may share a page (one protection per page).
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr* a = &phs[i];
+        if (a->p_type != PT_LOAD || (a->p_memsz == 0 && a->p_filesz == 0)) continue;
+        uint64_t am = a->p_memsz < a->p_filesz ? a->p_filesz : a->p_memsz;
+        uint64_t as = a->p_vaddr & ~0xFFFULL, ae = (a->p_vaddr + am + 0xFFFULL) & ~0xFFFULL;
+        for (int j = i + 1; j < eh->e_phnum; j++) {
+            const Elf64_Phdr* b = &phs[j];
+            if (b->p_type != PT_LOAD || (b->p_memsz == 0 && b->p_filesz == 0)) continue;
+            uint64_t bm = b->p_memsz < b->p_filesz ? b->p_filesz : b->p_memsz;
+            uint64_t bs = b->p_vaddr & ~0xFFFULL, be = (b->p_vaddr + bm + 0xFFFULL) & ~0xFFFULL;
+            if (as < be && bs < ae) { elf_log("[ELF] overlapping segments refused\n"); return ELF_ERR_RANGE; }
+        }
+    }
+
+    // Pass 3: register the VMAs.
+    uint64_t footprint = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr* ph = &phs[i];
+        if (ph->p_type != PT_LOAD) continue;
+        if (ph->p_memsz == 0 && ph->p_filesz == 0) continue;
+        uint64_t vaddr  = ph->p_vaddr + bias;
         uint64_t memsz  = ph->p_memsz; if (memsz < ph->p_filesz) memsz = ph->p_filesz;
-        if (memsz == 0) continue;
         uint64_t start  = vaddr & ~0xFFFULL;
         uint64_t end    = (vaddr + memsz + 0xFFFULL) & ~0xFFFULL;
         int exec = (ph->p_flags & PF_X) ? 1 : 0;
-        // Leaf flags: code is RX (no RW, executable -> no NX); data is RW + NX.
+        int wr   = (ph->p_flags & PF_W) ? 1 : 0;
+        // Leaf flags: code is RX (no RW, executable -> no NX); data is RW + NX,
+        // read-only data (R, no W/X: .rodata, RELRO) is RO + NX.
         // vmm_map_in_space() adds PRESENT and enforces the W^X gate.
         uint64_t flags = exec ? (VMM_FLAG_USER)
-                              : (VMM_FLAG_USER | VMM_FLAG_RW | VMM_FLAG_NOEXEC);
+                       : wr   ? (VMM_FLAG_USER | VMM_FLAG_RW | VMM_FLAG_NOEXEC)
+                              : (VMM_FLAG_USER | VMM_FLAG_NOEXEC);
         uint64_t file_pad = vaddr - start;       // leading in-page padding -> zero
         if (vma_add(vset, start, end, flags, VMA_TYPE_FILE, image,
                     ph->p_offset, file_pad, ph->p_filesz) != 0) {
@@ -191,10 +278,37 @@ int elf_load_image_lazy(const uint8_t* image, size_t size, vmm_space_t* space,
         if (g_kverbose) {
             terminal_writestring("[ELF] lazy seg vaddr=");
             char hx[]="0123456789ABCDEF"; for(int b=60;b>=0;b-=4) terminal_putchar(hx[(vaddr>>b)&0xF]);
-            terminal_writestring(exec?" X-":" -W"); terminal_writestring("\n");
+            terminal_writestring(exec?" X-":wr?" -W":" --"); terminal_writestring("\n");
         }
     }
-    if (footprint_out) *footprint_out = footprint;
+
+    // Where the program headers are in the new image (AT_PHDR): PT_PHDR, else
+    // the PT_LOAD whose file bytes contain them; 0 if they are not loaded.
+    uint64_t phdr = 0;
+    uint64_t phsz = (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr);
+    if (have_phdr) phdr = phdr_vaddr + bias;
+    else {
+        for (int i = 0; i < eh->e_phnum; i++) {
+            const Elf64_Phdr* ph = &phs[i];
+            if (ph->p_type != PT_LOAD) continue;
+            if (eh->e_phoff >= ph->p_offset && eh->e_phoff - ph->p_offset <= ph->p_filesz &&
+                phsz <= ph->p_filesz - (eh->e_phoff - ph->p_offset)) {
+                phdr = ph->p_vaddr + (eh->e_phoff - ph->p_offset) + bias;
+                break;
+            }
+        }
+    }
+    if (stack_size > ELF_MAX_STACK) stack_size = ELF_MAX_STACK;
+
+    info->entry      = eh->e_entry + bias;
+    info->link_entry = eh->e_entry;
+    info->bias       = bias;
+    info->phdr       = phdr;
+    info->phent      = sizeof(Elf64_Phdr);
+    info->phnum      = eh->e_phnum;
+    info->stack_size = (stack_size + 0xFFFULL) & ~0xFFFULL;
+    info->footprint  = footprint;
+    info->pie        = pie;
     kvlog("[ELF] lazy load completato\n");
     return ELF_OK;
 }

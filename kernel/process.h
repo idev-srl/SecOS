@@ -232,6 +232,14 @@ typedef struct process {
     // proc_lock deadlocked both CPUs (seen at -smp 8 once syscalls ran off
     // the BKL: CPU A holds mm, its tick spins on proc; CPU B holds proc,
     // spins on mm). The cost: the BSP tick waits behind a long fork walk.
+    // [U1] Linux-shaped thread state (syscalls 512 + Linux nr): the FS base
+    // (thread pointer, set by arch_prctl(ARCH_SET_FS); loaded on every switch
+    // to the task, inherited by fork, cleared by exec), the set_tid_address
+    // pointer (stored; used by threads in U9) and the user address of the
+    // auxv of the current image (process_auxv_set_creds).
+    uint64_t fs_base;
+    uint64_t clear_child_tid;
+    uint64_t auxv_va;
     spinlock_t mm_lock;
 } process_t;
 
@@ -260,9 +268,17 @@ process_t* process_fork(process_t* parent, trapframe_t* tf); // [M19] COW fork
 // envc envp strings, each NUL-terminated, 'blen' bytes total. Builds and
 // validates the new address space first; on any failure returns -errno with p
 // untouched. On success p (== current, 'tf' its live syscall trapframe) resumes
-// at the new entry point when the syscall returns. Returns 0 / -errno.
+// at the new entry point when the syscall returns. [U1] 'execfn' is the path
+// handed to the new image as AT_EXECFN (NULL: argv[0]). Returns 0 / -errno.
 int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
-                 const char* blob, uint64_t blen, int argc, int envc);
+                 const char* blob, uint64_t blen, int argc, int envc, const char* execfn);
+// [U1] Patch the auxv credential entries (AT_UID..AT_SECURE) of p's freshly
+// built initial stack from p->cred (after a spawn's or set-id exec's creds).
+void process_auxv_set_creds(process_t* p);
+// [U1] The FS base (user thread pointer): MSR_FS_BASE on this CPU.
+static inline void arch_set_fs_base(uint64_t v) {
+    __asm__ volatile("wrmsr" : : "c"(0xC0000100u), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)) : "memory");
+}
 void process_print(const process_t* p);
 int  process_manifest_setid(const process_t* p);   // [M43] MANIFEST_FLAG_SETID in the signed manifest
 // [M50-B1] Process references. process_get_by_pid() returns the process with a
