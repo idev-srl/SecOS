@@ -125,7 +125,9 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
 
     // [M8] SYS_EXIT: terminate the caller. Marks it ZOMBIE and switches away;
     // does NOT return (the task is reaped later from the idle/scheduler context).
-    if (num == SYS_EXIT) {
+    // [U1] exit_group (Linux-shaped, 512+231) is SYS_EXIT while a process has
+    // one thread.
+    if (num == SYS_EXIT || num == SYS_LX_EXIT_GROUP) {
         if (cur) cur->exit_code = W_EXITCODE(tf->rdi); // [M16] POSIX status: (st&0xff)<<8
         sched_exit_current(tf);
         return 0; // not reached when a switch occurs
@@ -427,6 +429,12 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
     else if (num >= SYS_CLOCK_GETTIME && num <= SYS_SYSINFO) {
         extern int kiface_syscall(trapframe_t*, uint64_t, uint64_t*);
         kiface_syscall(tf, num, &ret);
+    }
+    else if (num >= SYS_LX_BASE && num < SYS_LX_MAX) {
+        // [U1] Linux-shaped calls (kernel/syscall_lx.c): 6 arguments, -errno.
+        extern uint64_t syscall_lx_dispatch(uint64_t, uint64_t, uint64_t, uint64_t,
+                                            uint64_t, uint64_t, uint64_t);
+        ret = syscall_lx_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8, tf->r9);
     }
     else if (num == SYS_MMAP) {
         // [M40] mmap takes a 6th argument (file offset, r9) for device maps.

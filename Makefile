@@ -125,6 +125,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/panic.c $(KERNEL_DIR)/shell.c $(KERNEL_DIR)/sched.c \
 	$(KERNEL_DIR)/syscall.c \
 	$(KERNEL_DIR)/syscall_trap.c \
+	$(KERNEL_DIR)/syscall_lx.c \
 	$(KERNEL_DIR)/signal.c \
 	$(KERNEL_DIR)/cap.c \
 	$(KERNEL_DIR)/cred.c \

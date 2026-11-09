@@ -156,8 +156,17 @@ void bkl_init_mode(void) {
     debugcon_writestring("/0x100\n");
 }
 
+// [U1] Linux-shaped calls (512 + Linux nr) that need no kernel lock: they
+// touch only the caller's own process_t (kernel/syscall_lx.c). Every other
+// number at or above SYSCALL_BKL_NR takes the BKL until it is listed here.
+static int lx_lockfree(uint64_t num) {
+    return num == SYS_LX_ARCH_PRCTL || num == SYS_LX_SET_TID_ADDRESS ||
+           num == SYS_LX_EXIT_GROUP;
+}
+
 int syscall_needs_bkl(uint64_t num) {
-    if (g_bkl_mode || num >= SYSCALL_BKL_NR) return 1;
+    if (g_bkl_mode) return 1;
+    if (num >= SYSCALL_BKL_NR) return !lx_lockfree(num);
     return (int)((syscall_bkl_mask[num >> 6] >> (num & 63)) & 1);
 }
 

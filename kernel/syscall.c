@@ -231,7 +231,8 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0) p->ki.umask = sp->ki.umask;
       if (sp && sp->pid != 0) process_set_cred(p, &sp->cred);   // [M43] same user as the spawner
-      cred_exec_setid(p, fmode, fuid, fgid, setid_allowed(p, fmode, setid_fs, bound.valid && bound.nnp)); }
+      cred_exec_setid(p, fmode, fuid, fgid, setid_allowed(p, fmode, setid_fs, bound.valid && bound.nnp));
+      process_auxv_set_creds(p); }                 // [U1] the child's final ids in its auxv
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0 && sp->cwd[0]) {
           uint64_t fl = mm_lock(p);    // [M52] cwd writers publish under mm_lock (procfs reads it)
@@ -314,8 +315,11 @@ long ksys_execve(struct trapframe* tf, uint64_t upath, uint64_t uargv, uint64_t 
     debugcon_writestring("[EXEC] execve pid="); debugcon_print_hex(c->pid);
     debugcon_writestring(" path="); debugcon_writestring(rp); debugcon_writestring("\n");
     int nnp_before = c->no_new_privs;                             // [M46]
-    r = process_exec(c, tf, img, size, blob, used, argc, envc);   // owns img
-    if(r == 0) cred_exec_setid(c, fmode, fuid, fgid, setid_allowed(c, fmode, setid_fs, nnp_before));
+    r = process_exec(c, tf, img, size, blob, used, argc, envc, rp);   // owns img
+    if(r == 0){
+        cred_exec_setid(c, fmode, fuid, fgid, setid_allowed(c, fmode, setid_fs, nnp_before));
+        process_auxv_set_creds(c);                                // [U1] AT_UID..AT_SECURE
+    }
     if(r == 0){
         // /proc/<pid>/{cmdline,comm,stat}: the new image's argv (the blob holds
         // argc NUL-terminated strings first; cmdline keeps at most 256 bytes).

@@ -288,6 +288,8 @@ void signal_dispatch(trapframe_t* tf) {
         tf->rip = disp;                          // handler entry
         tf->rsp = ret_slot;                      // rsp%16==8 at entry (ABI)
         tf->rdi = (uint64_t)sig;                 // first arg: signum
+        tf->rsi = 0;                             // [U1] no siginfo_t / ucontext_t yet (U2):
+        tf->rdx = 0;                             //  an SA_SIGINFO handler sees NULLs, not junk
         tf->rax = 0;
         tf->rflags &= ~0x400ULL;                 // DF=0 at handler entry (SysV ABI;
                                                  // sigreturn restores the saved DF)

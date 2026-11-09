@@ -47,6 +47,7 @@ typedef struct {
 // Program header types
 #define PT_LOAD 1
 #define PT_NOTE 4
+#define PT_TLS  7
 
 // p_flags bits
 #define PF_X 1
@@ -73,10 +74,23 @@ int elf_load_image(const void* buffer, size_t size, vmm_space_t* space, uint64_t
 // FILE-backed VMA per segment in 'vset'. No frame is allocated and no page table
 // is touched here — pages materialize on first touch via the #PF handler.
 // 'image' must be a kernel buffer pinned for the process lifetime (FILE VMAs
-// reference it). 'footprint_out' returns the reserved virtual footprint (sum of
-// segment page ranges) for manifest max_mem enforcement.
-int elf_load_image_lazy(const uint8_t* image, size_t size, vmm_space_t* space,
-                        uint64_t* entry_out, vma_set_t* vset, uint64_t* footprint_out);
+// reference it).
+// [U1] Any PT_LOAD layout inside [USER_CODE_BASE, USER_HEAP_BASE); a static-PIE
+// (ET_DYN without PT_INTERP) is placed at a random page-aligned base derived
+// from 'rnd'; PT_INTERP and an executable PT_GNU_STACK are refused.
+typedef struct elf_load_info {
+    uint64_t entry;       // runtime entry point (link entry + bias)
+    uint64_t link_entry;  // e_entry as linked (the manifest entry_hint compares to it)
+    uint64_t bias;        // load bias: 0 for ET_EXEC
+    uint64_t phdr;        // runtime address of the program headers (AT_PHDR), 0 = not loaded
+    uint64_t phent;       // AT_PHENT
+    uint64_t phnum;       // AT_PHNUM
+    uint64_t stack_size;  // PT_GNU_STACK p_memsz, page-rounded (0 = loader default)
+    uint64_t footprint;   // reserved bytes (sum of segment page ranges), for max_mem
+    int      pie;         // 1 = static-PIE (ET_DYN)
+} elf_load_info_t;
+int elf_load_image_lazy(const uint8_t* image, size_t size, uint64_t rnd,
+                        vma_set_t* vset, elf_load_info_t* info);
 
 int elf_unload_process(struct process* p); // forward dichiarazione process
 

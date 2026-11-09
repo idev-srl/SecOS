@@ -16,6 +16,8 @@
 #include "cap.h"
 #include "pmm.h"
 #include "debugcon.h"
+#include "signal.h"     // [U1] sigframe_t (AT_MINSIGSTKSZ)
+#include "../crypto/csprng.h" // [U1] AT_RANDOM, static-PIE base
 #include "spinlock.h"   // [M29] SMP: serialize the process table
 #include "percpu.h"     // [M29] smp_online_count for CPU affinity
 #include "user_copy.h"  // EFAULT
@@ -541,25 +543,88 @@ static int uwrite(vmm_space_t* space, const vma_set_t* vmas, uint64_t va,
 #define PROC_MAX_ARG_LEN 256
 #define PROC_STACK_PAGES 8
 
+// [U1] The auxiliary vector (System V / Linux x86-64 ABI). musl's startup
+// reads AT_PHDR/AT_PHNUM (TLS and static-PIE self-relocation), AT_PAGESZ,
+// AT_RANDOM (stack protector, malloc secret), AT_SECURE and the ids, AT_HWCAP.
+// The entries are written in this fixed order so the credential slots can be
+// patched after a set-id exec (process_auxv_set_creds).
+#define AT_NULL_        0
+#define AT_PHDR_        3
+#define AT_PHENT_       4
+#define AT_PHNUM_       5
+#define AT_PAGESZ_      6
+#define AT_BASE_        7
+#define AT_FLAGS_       8
+#define AT_ENTRY_       9
+#define AT_UID_         11
+#define AT_EUID_        12
+#define AT_GID_         13
+#define AT_EGID_        14
+#define AT_PLATFORM_    15
+#define AT_HWCAP_       16
+#define AT_CLKTCK_      17
+#define AT_SECURE_      23
+#define AT_RANDOM_      25
+#define AT_HWCAP2_      26
+#define AT_EXECFN_      31
+#define AT_MINSIGSTKSZ_ 51
+enum { AUXI_UID = 7, AUXI_EUID, AUXI_GID, AUXI_EGID, AUXI_SECURE, AUXV_COUNT = 20 };
+
+// What the loader learned about the image, for the auxv.
+typedef struct proc_auxinfo {
+    uint64_t phdr, phent, phnum, entry;
+    const char* execfn;      // AT_EXECFN string (NULL: argv[0])
+    const struct proc_cred* cred;
+} proc_auxinfo_t;
+
+static uint64_t cpu_hwcap(void) {
+    uint32_t a = 1, b, c = 0, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    return d;                                 // Linux x86 AT_HWCAP = CPUID.1:EDX
+}
+
+static int auxv_secure(const struct proc_cred* cr) {
+    return cr && (cr->euid != cr->ruid || cr->egid != cr->rgid);
+}
+
 // [M16] Build the System V initial stack (top-down) for a new image:
 //   strings: argv then envp, packed exactly as 'blob'          <- st_top
+//   AT_EXECFN string, "x86_64", AT_RANDOM bytes [U1]
 //   padding to 16
-//   NULL, envp[envc-1..0], NULL, argv[argc-1..0], argc         <- rsp
+//   AT_NULL, auxv pairs, NULL, envp[envc-1..0], NULL, argv[argc-1..0], argc  <- rsp
 // 'blob' holds argc+envc NUL-terminated strings back to back (blen bytes). rsp
-// is 16-byte aligned; crt0 hands rdi/rsi/rdx = argc/argv/envp to main. At least
-// one page of the stack VMA stays free for the program itself. 0 / -1.
+// is 16-byte aligned and points at argc (what musl's _start reads); the
+// SecOS crt0 gets rdi/rsi/rdx = argc/argv/envp instead. At least one page of
+// the stack VMA stays free for the program itself. *auxv_out = user address
+// of the auxv. 0 / -1.
 static int setup_user_args(vmm_space_t* space, const vma_set_t* vmas,
                            uint64_t st_top, uint64_t st_lo,
                            const char* blob, uint64_t blen, int argc, int envc,
-                           uint64_t* rsp_out, uint64_t* argv_out, uint64_t* envp_out) {
+                           const proc_auxinfo_t* ai, const uint8_t rnd16[16],
+                           uint64_t* rsp_out, uint64_t* argv_out, uint64_t* envp_out,
+                           uint64_t* auxv_out) {
     if (argc < 0 || envc < 0) return -1;
     if (blen > st_top - st_lo) return -1;
     uint64_t strbase = st_top - blen;
-    uint64_t nslots = 1ULL + (uint64_t)argc + 1ULL + (uint64_t)envc + 1ULL;
-    if (nslots * 8ULL > (strbase & ~15ULL) - st_lo) return -1;
-    uint64_t base = ((strbase & ~15ULL) - nslots * 8ULL) & ~15ULL;
+    // AT_EXECFN: the path given to execve (else argv[0], first string in blob).
+    const char* efn = ai && ai->execfn ? ai->execfn : (argc > 0 ? blob : "");
+    uint64_t elen = 0; while (efn[elen] && elen < 255) elen++;
+    static const char plat[] = "x86_64";
+    uint64_t need = blen + elen + 1 + sizeof(plat) + 16 + 64;
+    if (need > st_top - st_lo) return -1;
+    uint64_t efn_va  = strbase - (elen + 1);
+    uint64_t plat_va = efn_va - sizeof(plat);
+    uint64_t rnd_va  = (plat_va - 16) & ~15ULL;
+    uint64_t nslots = 1ULL + (uint64_t)argc + 1ULL + (uint64_t)envc + 1ULL + 2ULL * AUXV_COUNT;
+    if (nslots * 8ULL > rnd_va - st_lo) return -1;
+    uint64_t base = (rnd_va - nslots * 8ULL) & ~15ULL;
     if (base < st_lo + 0x1000ULL) return -1;
     if (blen && uwrite(space, vmas, strbase, blob, blen) != 0) return -1;
+    { char zero = 0;
+      if (elen && uwrite(space, vmas, efn_va, efn, elen) != 0) return -1;
+      if (uwrite(space, vmas, efn_va + elen, &zero, 1) != 0) return -1; }
+    if (uwrite(space, vmas, plat_va, plat, sizeof(plat)) != 0) return -1;
+    if (uwrite(space, vmas, rnd_va, rnd16, 16) != 0) return -1;
     uint64_t slot = base, z = 0, v = (uint64_t)argc, off = 0;
     if (uwrite(space, vmas, slot, &v, 8) != 0) return -1;
     slot += 8;
@@ -578,8 +643,40 @@ static int setup_user_args(vmm_space_t* space, const vma_set_t* vmas,
         if (uwrite(space, vmas, slot, &z, 8) != 0) return -1;
         slot += 8;
     }
+    const struct proc_cred* cr = ai ? ai->cred : NULL;
+    uint64_t aux[AUXV_COUNT][2] = {
+        { AT_PHDR_,   ai ? ai->phdr : 0 },  { AT_PHENT_, ai ? ai->phent : 0 },
+        { AT_PHNUM_,  ai ? ai->phnum : 0 }, { AT_PAGESZ_, 4096 },
+        { AT_BASE_,   0 },                  { AT_FLAGS_, 0 },
+        { AT_ENTRY_,  ai ? ai->entry : 0 },
+        { AT_UID_,    cr ? cr->ruid : 0 },  { AT_EUID_, cr ? cr->euid : 0 },   // AUXI_UID..
+        { AT_GID_,    cr ? cr->rgid : 0 },  { AT_EGID_, cr ? cr->egid : 0 },
+        { AT_SECURE_, (uint64_t)auxv_secure(cr) },                          // ..AUXI_SECURE
+        { AT_PLATFORM_, plat_va },          { AT_HWCAP_, cpu_hwcap() },
+        { AT_HWCAP2_, 0 },                  { AT_CLKTCK_, 100 },
+        { AT_RANDOM_, rnd_va },             { AT_EXECFN_, efn_va },
+        { AT_MINSIGSTKSZ_, (sizeof(sigframe_t) + 128 + 64 + 0xFF) & ~0xFFULL },
+        { AT_NULL_,   0 },
+    };
+    *auxv_out = slot;
+    if (uwrite(space, vmas, slot, aux, sizeof(aux)) != 0) return -1;
     *rsp_out = base;
     return 0;
+}
+
+// [U1] Rewrite AT_UID/EUID/GID/EGID/SECURE of p's initial stack from p->cred:
+// the credentials of a spawn or a set-id exec are settled after the stack was
+// built. The process has not run its new image yet (spawn: not published;
+// execve: still in the syscall), so nothing has read the values. No-op when
+// the stack has no auxv. Takes p's mm_lock.
+void process_auxv_set_creds(process_t* p) {
+    if (!p || !p->auxv_va || !p->space) return;
+    const struct proc_cred* cr = &p->cred;
+    uint64_t vals[5] = { cr->ruid, cr->euid, cr->rgid, cr->egid, (uint64_t)auxv_secure(cr) };
+    uint64_t fl = mm_lock(p);
+    for (int i = 0; i < 5; i++)
+        (void)uwrite(p->space, &p->vmas, p->auxv_va + (uint64_t)(AUXI_UID + i) * 16 + 8, &vals[i], 8);
+    mm_unlock(p, fl);
 }
 
 // A loaded, validated, not-yet-running user image: its own address space with
@@ -594,6 +691,7 @@ typedef struct proc_image {
     uint64_t        stack_lo;
     uint64_t        footprint;      // reserved bytes (sum of VMA sizes)
     elf_manifest_t* mf;
+    elf_load_info_t li;             // [U1] layout facts for the auxv
 } proc_image_t;
 
 static void proc_image_free(proc_image_t* im) {
@@ -660,17 +758,23 @@ static int proc_image_build(const void* elf_buf, size_t size, uint8_t* owned,
         return -ENOMEM;
     }
 
-    int r = elf_load_image_lazy(im->image, size, im->space, &im->entry, vmas, &im->footprint);
+    uint64_t rnd = 0;
+    csprng_get(&rnd, sizeof(rnd));               // [U1] static-PIE load base
+    int r = elf_load_image_lazy(im->image, size, rnd, vmas, &im->li);
     if (r != ELF_OK) {
         terminal_writestring("[PROC] elf lazy load fail\n");
         proc_image_free(im);
         return -ENOEXEC;
     }
+    im->entry = im->li.entry;
+    im->footprint = im->li.footprint;
     // [M14] Reserve the user stack as a demand-zero (ANON) VMA below the
     // (ASLR-randomized, [M39] <=16MB slide) stack top. Pages fault in on first
-    // push; the absence of a VMA below the region is the guard.
-    uint64_t st_bytes = (uint64_t)PROC_STACK_PAGES * 0x1000ULL
-                      + ((extra_stack + 0xFFFULL) & ~0xFFFULL);
+    // push; the absence of a VMA below the region is the guard. [U1] A
+    // PT_GNU_STACK size (secos-cc links 8 MiB) replaces the 32 KiB default.
+    uint64_t st_main = (uint64_t)PROC_STACK_PAGES * 0x1000ULL;
+    if (im->li.stack_size > st_main) st_main = im->li.stack_size;
+    uint64_t st_bytes = st_main + ((extra_stack + 0xFFFULL) & ~0xFFFULL);
     im->stack_top = USER_STACK_TOP - aslr_slide(16ULL * 1024 * 1024);
     im->stack_lo  = im->stack_top - st_bytes;
     if (vma_add(vmas, im->stack_lo, im->stack_top,
@@ -686,7 +790,7 @@ static int proc_image_build(const void* elf_buf, size_t size, uint8_t* owned,
     // memory limit, capabilities, driver claim — is trust-rooted).
     elf_manifest_t* mf = (elf_manifest_t*)kmalloc(sizeof(elf_manifest_t));
     if (mf && elf_manifest_parse(im->image, size, mf) == 0) {
-        if (elf_manifest_validate(mf, im->entry) == MANIFEST_OK) {
+        if (elf_manifest_validate(mf, im->li.link_entry) == MANIFEST_OK) {
             // [M13/M14] max_mem is checked against the RESERVED footprint (sum
             // of VMA sizes), not lazily-mapped pages.
             if (mf->max_mem && im->footprint > mf->max_mem) {
@@ -820,6 +924,7 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     // parent process (a shell-spawned program is reaped via the poll path; the
     // shell sets pgid for pipelines after creation). pid is assigned above.
     { extern void signal_init_proc(process_t*); signal_init_proc(p); }
+    p->fs_base = 0; p->clear_child_tid = 0; p->auxv_va = 0;   // [U1]
     p->pgid = p->pid; p->ppid = 0; p->spawner_pid = 0;
     p->stop_report = 0; p->cont_report = 0; p->stop_sig = 0;
     p->wait_tty = 0; p->power_phase = 0; p->power_deadline = 0;
@@ -899,12 +1004,17 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     }
     // [M16] Set up argc/argv/envp on the user stack and pass them to the entry
     // per the System V convention (rdi=argc, rsi=argv, rdx=envp). main(void)
-    // programs simply ignore the extra registers. On failure (too many/large
-    // args) fall back to argc=0 rather than refusing to run.
-    if (argc > 0) {
+    // programs simply ignore the extra registers. [U1] Always built (also for
+    // argc 0), with the auxiliary vector: rsp points at argc, as on Linux. On
+    // failure (too many/large args) fall back to argc=0 rather than refusing.
+    {
+        if (argc < 0) argc = 0;
         if (argc > PROC_MAX_ARGS) argc = PROC_MAX_ARGS;
         char* blob = (char*)kmalloc((size_t)PROC_MAX_ARGS * PROC_MAX_ARG_LEN);
-        uint64_t blen = 0, rsp = 0, argvp = 0, envp = 0;
+        uint64_t blen = 0, rsp = 0, argvp = 0, envp = 0, auxv = 0;
+        uint8_t rnd16[16];
+        csprng_get(rnd16, sizeof(rnd16));                 // AT_RANDOM
+        proc_auxinfo_t ai = { im.li.phdr, im.li.phent, im.li.phnum, entry, NULL, &p->cred };
         if (blob) {
             for (int i = 0; i < argc; i++) {
                 const char* a = (argv && argv[i]) ? argv[i] : "";
@@ -918,7 +1028,10 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
         if (blob) {
             uint64_t mfl = mm_lock(p);
             sr = setup_user_args(space, &p->vmas, st_top, im.stack_lo, blob, blen,
-                                 argc, 0, &rsp, &argvp, &envp);
+                                 argc, 0, &ai, rnd16, &rsp, &argvp, &envp, &auxv);
+            if (sr != 0 && argc > 0)                      // too big: try without args
+                sr = setup_user_args(space, &p->vmas, st_top, im.stack_lo, blob, 0,
+                                     0, 0, &ai, rnd16, &rsp, &argvp, &envp, &auxv);
             mm_unlock(p, mfl);
         }
         if (sr == 0) {
@@ -926,6 +1039,7 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
             p->tf->rdi = (uint64_t)argc;
             p->tf->rsi = argvp;
             p->tf->rdx = envp;
+            p->auxv_va = auxv;
         } else {
             terminal_writestring("[PROC] argv setup failed; running with argc=0\n");
         }
@@ -965,7 +1079,7 @@ static void proc_fpu_reset(void) {
 }
 
 int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
-                 const char* blob, uint64_t blen, int argc, int envc) {
+                 const char* blob, uint64_t blen, int argc, int envc, const char* execfn) {
     if (!p || !tf || !image) { if (image) kfree(image); return -EFAULT; }
     // A script (or anything that is not an ELF) is ENOEXEC — that is what lets a
     // shell fall back to interpreting it. Only ELFs reach the signature gate.
@@ -977,7 +1091,9 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     if (!nv) { kfree(image); return -ENOMEM; }
 
     // ---- 1. Build + validate the new image. p is not touched. ----
-    uint64_t argbytes = blen + ((uint64_t)argc + (uint64_t)envc + 3ULL) * 8ULL + 32ULL;
+    // [U1] + the auxv, AT_RANDOM, "x86_64" and the AT_EXECFN copy.
+    uint64_t argbytes = blen + ((uint64_t)argc + (uint64_t)envc + 3ULL) * 8ULL + 32ULL
+                      + 2ULL * 8ULL * 20ULL + 16ULL + 8ULL + 256ULL + 64ULL;
     proc_image_t im;
     int r = proc_image_build(image, size, image, argbytes, nv, &im);
     if (r != 0) { kfree(nv); return r; }
@@ -995,9 +1111,14 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
         if (p->no_new_privs) cap_audit(p->pid, CAP_AUDIT_DRIVER, 60 /*SYS_EXECVE*/, "execve-nnp", 0);
         else exec_driver = 1;
     }
-    uint64_t rsp = 0, argvp = 0, envp = 0;
+    uint64_t rsp = 0, argvp = 0, envp = 0, auxv = 0;
+    uint8_t rnd16[16];
+    csprng_get(rnd16, sizeof(rnd16));                     // [U1] AT_RANDOM
+    // The ids are the caller's; a set-id exec patches them afterwards
+    // (process_auxv_set_creds, from ksys_execve).
+    proc_auxinfo_t ai = { im.li.phdr, im.li.phent, im.li.phnum, im.entry, execfn, &p->cred };
     if (setup_user_args(im.space, nv, im.stack_top, im.stack_lo, blob, blen,
-                        argc, envc, &rsp, &argvp, &envp) != 0) {
+                        argc, envc, &ai, rnd16, &rsp, &argvp, &envp, &auxv) != 0) {
         debugcon_writestring("[EXEC] argv/envp do not fit the new stack\n");
         proc_image_free(&im); kfree(nv);
         return -E2BIG;
@@ -1041,6 +1162,10 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     p->user_mem_bytes = im.footprint;
     p->mapped_page_count = (uint32_t)(im.footprint / 4096ULL);
     p->regs.rip = im.entry; p->regs.rsp = rsp;
+    // [U1] A new image starts with no thread pointer and no tid address.
+    p->auxv_va = auxv; p->clear_child_tid = 0;
+    p->fs_base = 0;
+    arch_set_fs_base(0);                       // p is current: load it now
     __asm__ volatile("push %0; popfq" : : "r"(irqf) : "memory", "cc");
     mm_unlock(p, fl);
     kfree(nv);
