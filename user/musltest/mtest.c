@@ -222,6 +222,23 @@ static void t_signal(void)
           while_blocked == 0 && after == SIGUSR1 && x == 2.25,
           "r=%d/%d got=%d blocked=%d after=%d tls=%d", r1, r2, got, while_blocked, after, (int)g_sig_tls);
     CHECK("sigset-api", sigismember(&set, SIGUSR1) == 1 && sigismember(&set, SIGUSR2) == 0, "sigset");
+    /* sigsuspend: wait with SIGUSR2 unblocked for a child's kill */
+    struct sigaction s2;
+    memset(&s2, 0, sizeof s2);
+    s2.sa_handler = on_usr1;
+    sigaction(SIGUSR2, &s2, 0);
+    sigset_t b2, empty;
+    sigemptyset(&b2); sigaddset(&b2, SIGUSR2); sigemptyset(&empty);
+    sigprocmask(SIG_BLOCK, &b2, &prev);
+    g_sig = 0;
+    pid_t c = fork();
+    if (c == 0) { kill(getppid(), SIGUSR2); _exit(0); }
+    int sr = sigsuspend(&empty);
+    int se = errno, got2 = g_sig;
+    sigprocmask(SIG_SETMASK, &prev, 0);
+    waitpid(c, 0, 0);
+    signal(SIGUSR2, SIG_DFL);
+    CHECK("sigsuspend", c > 0 && sr == -1 && se == EINTR && got2 == SIGUSR2, "sr=%d errno=%d got=%d", sr, se, got2);
 }
 
 /* ---- fork / exec / wait, posix_spawn, pipes ---- */

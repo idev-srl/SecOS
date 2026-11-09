@@ -979,7 +979,7 @@ long __secos_syscall(long n, long a, long b, long c, long d, long e, long f)
     case SYS_rt_sigaction:   return x_rt_sigaction((int)a, (const struct lx_ksigaction *)b, (struct lx_ksigaction *)c, (size_t)d);
     case SYS_rt_sigprocmask: return x_rt_sigprocmask((int)a, (const uint64_t *)b, (uint64_t *)c, (size_t)d);
     case SYS_rt_sigsuspend: {
-        if (d != 0 && b != 8) return -EINVAL;
+        if (b != 8) return -EINVAL;
         long r = sc1(S_SIGSUSPEND, mask_to_k(*(const uint64_t *)a));
         return r >= 0 ? -EINTR : r;
     }
