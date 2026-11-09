@@ -100,6 +100,9 @@
 #define PR_SET_NO_NEW_PRIVS 38
 #define PR_GET_NO_NEW_PRIVS 39
 #define PR_SECOS_GET_CAPS   0x53430001
+// [U-sudo] prctl(PR_SECOS_SUDO_TS, op, arg): sudo's per-terminal-session
+// credential timestamps (ops in kernel/sudo_ts.h). euid 0 only.
+#define PR_SECOS_SUDO_TS    0x53430002
 // [M43] Credentials (kernel/cred.c). 100-109; POSIX rules for who may change ids.
 #define SYS_GETUID      100 // getuid(res*) -> ruid; res != NULL: {ruid,euid,suid} (getresuid)
 #define SYS_GETEUID     101 // geteuid()

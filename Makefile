@@ -135,6 +135,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/tty.c \
 	$(KERNEL_DIR)/tty_test.c \
 	$(KERNEL_DIR)/pty.c \
+	$(KERNEL_DIR)/sudo_ts.c \
 	$(KERNEL_DIR)/power.c \
 	$(KERNEL_DIR)/sysroot.c \
 	$(KERNEL_DIR)/kclock.c \

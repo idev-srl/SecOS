@@ -56,6 +56,9 @@ void pty_inherit_ctty(struct process* child, const struct process* parent); /* s
 /* The controlling terminal of p: a pty slave's struct tty, or NULL. With NULL,
  * *is_console says whether that means the console (1) or none at all (0). */
 struct tty* pty_proc_ctty(struct process* p, int* is_console);
+/* [U-sudo] Controlling-terminal id: pty index + 1 or PTY_CTTY_CONSOLE; -1 = none. */
+#define PTY_CTTY_CONSOLE 0x10000u
+int pty_ctty_id(struct process* p, uint32_t* id);
 
 /* ksys_open hook: if *ino is /dev/ptmx, /dev/tty or /dev/pts/N, substitute the
  * real terminal inode (a new master, the caller's controlling terminal, the

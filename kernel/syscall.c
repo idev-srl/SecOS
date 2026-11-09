@@ -6,6 +6,7 @@
  * Results written back to user space must go through copy_to_user().
  */
 #include "syscall.h"
+#include "sudo_ts.h"
 #include "terminal.h"
 #include "process.h"
 #include "sched.h"
@@ -1859,6 +1860,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
         if (a0 == PR_SECOS_GET_CAPS)
             return (uint64_t)(cap_effective(c) | (c->cap_enforce ? (1u << 30) : 0)
                               | (c->no_new_privs ? (1u << 29) : 0));
+        if (a0 == PR_SECOS_SUDO_TS)               // [U-sudo] kernel/sudo_ts.c
+            return (uint64_t)(int64_t)sudo_ts_op(c, a1, a2);
         return (uint64_t)(int64_t)-22;
     }
     case SYS_SCHED_GETAFFINITY: {
