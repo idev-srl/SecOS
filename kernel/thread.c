@@ -49,6 +49,7 @@ proc_mm_t* mm_alloc(void) {
     mm->refs = 1;
     spin_init_class_dynamic(&mm->lock, LK_S35_MM, "mm");
     klock_init(&mm->map_lock, LK_K13_MMAP, "mmap", 0);
+    mm->map_lock.reg = 0xFF;   // per-process: never in the /proc/lockstat registry (freed later)
     return mm;
 }
 void mm_get(proc_mm_t* mm) { if (mm) __atomic_add_fetch(&mm->refs, 1, __ATOMIC_RELAXED); }
@@ -65,6 +66,7 @@ void mm_put(proc_mm_t* mm) {
 // ---- thread_group_t ----
 static void tg_init_common(thread_group_t* tg, uint32_t tgid) {
     klock_init(&tg->fd_lock, LK_K12_FILES, "files", 0);
+    tg->fd_lock.reg = 0xFF;    // per-process: the lockstat registry keeps static klocks only
     tg->refs = 1;
     tg->tgid = tgid;
     tg->nr_live = 1;

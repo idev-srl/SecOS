@@ -55,6 +55,8 @@ void klock_bug(const char* what, const char* name) {
 }
 
 /* ---- /proc/lockstat registry (klocks are few and static) ------------------ */
+/* [U9] A klock in freed memory (per-process fd_lock / map_lock) sets reg =
+ * 0xFF after klock_init: it is never listed (the registry keeps pointers). */
 #define KL_REG_MAX 64
 static klock_t* g_kl_reg[KL_REG_MAX];
 static volatile uint32_t g_kl_nreg;
