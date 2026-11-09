@@ -154,6 +154,15 @@ static void net_irq_handler(uint8_t vec, void* ctx) {
     }
 }
 
+// [M58] A device serviced from the timer tick only (the ring-3 NIC proxy,
+// net/net_udrv.c: its "interrupt" is the driver's kick). 0, or -1 when full.
+int net_poll_add(net_dev_t* dev) {
+    if (!dev || g_npoll >= NET_MAX_DEV) return -1;
+    for (int i = 0; i < g_npoll; i++) if (g_poll[i] == dev) return 0;
+    g_poll[g_npoll++] = dev;
+    return 0;
+}
+
 extern void tcp_tick(void) __attribute__((weak));
 
 // Timer tick (IRQ context). [M47] One CPU at a time: protocol timers must not
@@ -296,6 +305,11 @@ int net_init(void) {
      * an Ethernet net_dev (that needs association), so it never becomes primary. */
     extern int ath9k_init(void);
     ath9k_init();
+    /* [M58] One proxy interface per network function given to a ring-3
+     * driver (udrv=; the probes above never see those). Registered now, link
+     * down, so ethN exists before its driver runs (net/net_udrv.c). */
+    extern int net_udrv_init(void);
+    net_udrv_init();
     if (g_ndev == 0) { debugcon_writestring("[NET] no Ethernet NIC found (WiFi-only systems use the ath9k scaffold)\n"); return 0; }
 
     // [M24] Static IPv4 config for the primary NIC — QEMU user-mode networking

@@ -14,6 +14,8 @@
  *                    interrupt remapping. Loud warning; /proc/udrv TAINTED.
  *   udrv.noir        allow ring-3 DMA with DMA remapping but no interrupt
  *                    remapping (tests until M56; logged).
+ *   udrv.watchdog=kill  [M58] kill a network driver whose TX makes no
+ *                    progress for 5 s (default: log "[UDRV] ethN stalled").
  * Without both an active IOMMU covering the device and interrupt remapping (or
  * an override) a claim gets MMIO only: DMA_ALLOC is -ENODEV, BUSMASTER and
  * IRQ_SETUP are -EPERM (on QEMU an MSI is a bus-master write).
@@ -54,6 +56,10 @@ void udrv_fd_unref(void* ino);
 int  udrv_fd_read(struct process* c, void* ino, void* ubuf, int len, int nonblock);
 int  udrv_fd_write(struct process* c, void* ino, const void* ubuf, int len);
 int  udrv_fd_poll(void* ino);
+
+/* [M58] 1 when udrv= gave a network-class function to ring 3 (the default
+ * /etc/inittab then starts its driver, kernel/sysroot.c). */
+int  udrv_has_net(void);
 
 /* /proc/udrv: one line per emit call. */
 void udrv_generate(void (*emit)(void* ctx, const char* line), void* ctx);

@@ -184,6 +184,7 @@ SRC_C   = \
 	$(DRIVERS_DIR)/igc.c \
 	$(NET_DIR)/net_core.c \
 	$(NET_DIR)/net_lock.c \
+	$(NET_DIR)/net_udrv.c \
 	$(NET_DIR)/eth.c \
 	$(NET_DIR)/arp.c \
 	$(NET_DIR)/ipv4.c \
