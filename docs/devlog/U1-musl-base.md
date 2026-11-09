@@ -107,8 +107,8 @@ in those registers. `siginfo_t` itself is U2.
 ### The port (`tools/port-musl.sh`)
 
 1. fetches `musl-1.2.6.tar.gz` and the two upstream patches published after
-   1.2.6 (the musl.libc.org advisories: CVE-2026-6042 iconv, CVE-2026-107891
-   regcomp), all SHA-256 pinned, into `build/dl/`;
+   1.2.6 (iconv gb18030 decoder fix, upstream commit 67219f01, openwall
+   musl list 2026/04/03/2; CVE-2026-107891 regcomp), all SHA-256 pinned, into `build/dl/`;
 2. unpacks the **pristine** tree into `third_party/musl/` (git-ignored: like
    bash and BusyBox, musl is fetched, not committed; MIT,
    `docs/licenses/musl-1.2.6-COPYRIGHT`);
@@ -258,8 +258,10 @@ run; no panic, SMAP violation, TLB bug or lockdep report. 54 checks.
 - **musl is fetched**, not committed (`third_party/musl/` is git-ignored), like
   bash/BusyBox; the plan said "vendored". The overlay is in the tree.
 - **musl 1.2.6** (latest release) **+ two upstream security patches**: the
-  musl site lists CVE-2026-6042 (iconv) and CVE-2026-107891 (regcomp) as
-  affecting every release through 1.2.6. They are upstream commits from the
+  iconv gb18030 decoder fix (upstream commit 67219f01, Rich Felker,
+  https://www.openwall.com/lists/musl/2026/04/03/2; no CVE id could be
+  confirmed for it) and CVE-2026-107891 (regcomp, commit 7813e911, Szabolcs
+  Nagy), both affecting every release through 1.2.6. They are upstream commits from the
   musl list, pinned by SHA-256; musl itself is otherwise unmodified.
 - **posix_spawn** is musl's own code with one change (fork instead of
   `clone(CLONE_VM|CLONE_VFORK)`), as a patch rather than a rewrite.

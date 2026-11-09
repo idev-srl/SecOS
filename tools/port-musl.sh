@@ -22,11 +22,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MV=1.2.6
 MSHA=d585fd3b613c66151fc3249e8ed44f77020cb5e6c1e635a616d3f9f82460512a
 URL="https://musl.libc.org/releases/musl-$MV.tar.gz"
-# Upstream fixes released after 1.2.6 (https://musl.libc.org/ advisories):
-#   CVE-2026-6042    iconv gb18030 decoder (DoS on untrusted input)
+# Upstream fixes released after 1.2.6:
+#   commit 67219f0130ec7c876ac0b299046460fad31caabf (Rich Felker), "fix
+#     pathological slowness & incorrect mappings in iconv gb18030 decoder",
+#     https://www.openwall.com/lists/musl/2026/04/03/2 (no CVE id confirmed)
 #   CVE-2026-107891  regcomp integer overflow on untrusted regular expressions
+#     (commit 7813e9119eb5fe681b6750b8a033a0490bca0941, Szabolcs Nagy)
 PATCHES=(
-  "cve-2026-6042-iconv.patch https://www.openwall.com/lists/musl/2026/04/03/2/1 444fa70e52ca158fb7d4bad560637790bbf8f72e80b82fff840dd66fa83091e3"
+  "musl-67219f01-iconv-gb18030.patch https://www.openwall.com/lists/musl/2026/04/03/2/1 444fa70e52ca158fb7d4bad560637790bbf8f72e80b82fff840dd66fa83091e3"
   "cve-2026-107891-regcomp.patch https://www.openwall.com/lists/musl/2026/10/21/1/1 0cf0090ab433e8f9ed08ae03a0c93aff557c1d3e347260f62a61a10281f5333b"
 )
 # musl files removed after the overlay so the generic C version is built.
