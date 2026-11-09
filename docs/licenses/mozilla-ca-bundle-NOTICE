@@ -1,0 +1,15 @@
+Mozilla CA certificate bundle (kernel/ca_bundle.h)
+
+Source:   https://curl.se/ca/cacert-2026-11-05.pem
+          (curl's extraction of Mozilla's root store, certdata.txt from NSS,
+          made with mk-ca-bundle.pl; index at https://curl.se/docs/caextract.html)
+SHA-256:  427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285
+          (pinned in tools/fetch-cabundle.sh, cross-checked against curl.se's
+          cacert-2026-11-05.pem.sha256)
+
+The certificate data is distributed under the Mozilla Public License,
+version 2.0 (MPL-2.0): https://www.mozilla.org/MPL/2.0/
+It is embedded unmodified; the full source form is available at the URL above
+and in Mozilla's NSS repository (security/nss/lib/ckfw/builtins/certdata.txt).
+The tools that fetch and convert it (tools/fetch-cabundle.sh,
+tools/cabundle2h.py) are MIT.

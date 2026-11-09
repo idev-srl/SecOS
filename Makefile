@@ -892,6 +892,13 @@ port-bbnet:
 	bash tools/port-bbnet.sh
 	@echo "port-bbnet: BusyBox ntpd+hwclock built on musl, signed -> crypto/user_bbnet_elf.h"
 
+# [U10] Mozilla's CA bundle as published by curl (MPL-2.0), SHA-256 pinned
+# and cross-checked with curl.se's .sha256 -> kernel/ca_bundle.h.
+.PHONY: fetch-cabundle
+fetch-cabundle:
+	bash tools/fetch-cabundle.sh
+	@echo "fetch-cabundle: Mozilla CA bundle -> kernel/ca_bundle.h"
+
 .PHONY: port-busybox
 port-busybox:
 	bash tools/port-busybox.sh
