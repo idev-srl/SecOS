@@ -32,6 +32,17 @@
 #define LK_K10_EXEC        10   /* reserved, unused: C6 made exec staging per
                                    call (no g_spawn_buf), so no exec_lock      */
 #define LK_K11_SYSROOT     11   /* sysroot_lock, pkg_lock (C6; never nested)    */
+#define LK_K12_FILES       12   /* [U9] thread_group_t.fd_lock, one per process:
+                                   an fd-table read-modify-write together with
+                                   the object reference it takes or drops
+                                   (close, dup*, fork's copy, the per-syscall
+                                   fd pin). Inside: the fd objects' locks
+                                   (pipe/pty/socket/input/udrv), mm S35 (the
+                                   publication), heap. No user copy inside   */
+#define LK_K13_MMAP        13   /* [U9] proc_mm_t.map_lock: serializes the
+                                   threads' brk/mmap/munmap/mprotect (their
+                                   page-table loops drop mm S35 to let
+                                   interrupts in). Inside: mm S35, PMM, TLB */
 #define LK_K20_VFS_NS      20   /* vfs_ns_lock: mount/umount/remount (C1)       */
 #define LK_K25_VFS_APPEND  25   /* vfs_append_lock: O_APPEND/truncate fallback
                                    for an FS without ->append; the FS (K30)
@@ -93,6 +104,9 @@
                                    by /proc/udrv under g_proc_lock (S15), so it
                                    ranks above S15 (plan: S14). Inside: proc
                                    S30 (wake / SIGKILL), MSI S58, PCI cfg S64 */
+#define LK_S28_FUTEX       128  /* [U9] g_fx_lock (kernel/futex.c): the futex
+                                   wait queues. Nothing nested inside (wakers
+                                   collect, unlock, then wake under proc S30) */
 #define LK_S30_PROC        130  /* proc_lock: process table, refcounts, creds   */
 #define LK_S35_MM          135  /* p->mm_lock (B1, per process). Since C2 it
                                    also publishes p->cwd and what each p->fds[]

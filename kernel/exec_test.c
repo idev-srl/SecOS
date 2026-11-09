@@ -112,11 +112,11 @@ static void et_one(uint32_t cpu, uint32_t i) {
     } else if (!p) {
         bad("signed image refused", im->name);
     } else {
-        if (!p->image || p->image_size != im->len || !same(p->image, im->img, im->len))
+        if (!p->mm->image || p->mm->image_size != im->len || !same(p->mm->image, im->img, im->len))
             bad("pinned image differs from the signed original", im->name);
-        else if (owned && p->image != buf)
+        else if (owned && p->mm->image != buf)
             bad("owned buffer not pinned", im->name);
-        else if (!owned && p->image == src)
+        else if (!owned && p->mm->image == src)
             bad("copy path pinned the caller's buffer", im->name);
         else
             __atomic_add_fetch(&g_ok_loads, 1, __ATOMIC_SEQ_CST);

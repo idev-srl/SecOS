@@ -25,6 +25,9 @@
 #include "lapic.h"
 #include "bkl.h"
 #include "klock.h"
+#include "thread.h"   // [U9] thread groups
+#include "pty.h"      // [U9] pty_thread_exit
+#include "signal.h"   // [U9] signal_group_stopped
 
 extern uint64_t timer_get_ticks(void);
 
@@ -114,7 +117,7 @@ void sched_set_current(process_t* p) {
 }
 void sched_set_idle(process_t* idle) {
     cpu_t* me = this_cpu();
-    if (idle) { idle->refs = 0; spin_init_class_dynamic(&idle->mm_lock, LK_S35_MM, "mm"); }
+    if (idle) { idle->refs = 0; thread_attach_kernel_task(idle); }   // [U9] own mm + group
     me->idle_task = idle;
     me->in_idle = (me->current && me->current == idle);
 }
@@ -142,6 +145,25 @@ int sched_wake_task(process_t* p, int from_state) {
     wake_seq_bump();
     sched_kick_for(p);
     return 1;
+}
+
+// [U9] BLOCKED -> READY for a waker that is not a table scan (futex): the
+// CAS is made under proc_lock, so it cannot fall between the blocker's
+// wake-sequence check and its RUNNING -> BLOCKED store (sched_block_current
+// does both under proc_lock); the sequence bump first makes a block that has
+// not reached that section yet re-run instead.
+int sched_wake_task_sync(process_t* p) {
+    if (!p) return 0;
+    wake_seq_bump();
+    uint64_t fl = process_lock_irqsave();
+    int ok = 0;
+    if (p->state == PROC_BLOCKED) {
+        p->ready_tick = timer_get_ticks();
+        ok = __sync_bool_compare_and_swap(&p->state, PROC_BLOCKED, PROC_READY);
+    }
+    process_unlock_irqrestore(fl);
+    if (ok) sched_kick_for(p);
+    return ok;
 }
 
 // ---- low-level switch: load target space + kernel stack, iretq into it ----
@@ -369,17 +391,59 @@ static void notify_parent_sigchld(process_t* child) {
 
 // An exiting process's children go to init (PID 1). When init itself exits,
 // say so on the console: the kernel shell takes over (kernel/kernel.c).
-static void exit_reparent(process_t* p) {
+static void exit_reparent(uint32_t tgid, int code) {
     uint32_t init = process_init_pid();
     if (!init) return;
-    if (p->pid == init) {
+    if (tgid == init) {
         process_set_init_pid(0);
         debugcon_writestring("[INIT] PID 1 (/bin/init) exited, status=");
-        debugcon_print_hex((uint64_t)(uint32_t)p->exit_code);
+        debugcon_print_hex((uint64_t)(uint32_t)code);
         debugcon_writestring("\n");
         return;
     }
-    if (process_reparent_children(p->pid)) sched_wake_parent_waitany(init);
+    if (process_reparent_children(tgid)) sched_wake_parent_waitany(init);
+}
+
+// [U9] The process-level end of an exit, run by the LAST thread of a group
+// (for a process with one thread: by it, as before U9): close the fds, hand
+// the children to init, SIGCHLD + wake the parent for the leader's pid (the
+// tgid) with the group's status. The leader stays a zombie until collected.
+static void exit_process_end(process_t* cur) {
+    uint32_t tgid; int code;
+    thread_exit_group_info(cur, &tgid, &code);
+    process_release_pipes(cur);        // close pipe ends now: readers see EOF before wait()
+    thread_mark_dead(cur);             // the leader may now be collected
+    process_t* lead = thread_is_leader(cur) ? process_get(cur) : process_get_by_pid(tgid);
+    exit_reparent(tgid, code);                            // children -> PID 1
+    if (lead) {
+        notify_parent_sigchld(lead);                      // [M30] SIGCHLD to parent
+        // [M16/M39] Deliver the status to a blocked waiter; if one collected
+        // it, the leader is reapable. Otherwise it persists until wait().
+        if (sched_wake_waitpid(tgid, code) > 0) lead->collected = 1;
+        sched_wake_parent_waitany(lead->ppid);            // [M39] wait-any waiters
+        process_put(lead);
+    }
+}
+
+// [U9] A thread that is not the last one leaves: only its own references
+// (the controlling tty) go; the process lives on.
+static void exit_thread_only(process_t* cur) {
+    pty_thread_exit(cur);
+}
+
+// Common exit of the current task (SYS_EXIT / exit_group / thread exit / a
+// fatal signal). NORETURN: the task becomes a ZOMBIE and the CPU moves on;
+// any CPU reaps it once switch_to has released it (on_cpu = 0).
+static void exit_current(process_t* cur, int code, int group) __attribute__((noreturn));
+static void exit_current(process_t* cur, int code, int group) {
+    thread_fd_unpin(cur);              // [U9] the per-call fd reference (syscall_trap.c)
+    int last = thread_exit_begin(cur, code, group);
+    __atomic_store_n(&cur->state, PROC_ZOMBIE, __ATOMIC_SEQ_CST);
+    if (last) exit_process_end(cur);
+    else exit_thread_only(cur);
+    // We are running on the exiting task's kernel stack, so it cannot reap
+    // itself; any CPU reaps it once switch_to has released it (on_cpu = 0).
+    switch_to(next_or_idle(cur));
 }
 
 void sched_exit_current(trapframe_t* tf) {
@@ -391,18 +455,20 @@ void sched_exit_current(trapframe_t* tf) {
     debugcon_print_hex(cur->pid);
     debugcon_writestring("\n");
     // [M16] exit_code was set by the SYS_EXIT handler from the user's status.
-    process_release_pipes(cur);        // close pipe ends now: readers see EOF before wait()
-    cur->state = PROC_ZOMBIE;
-    exit_reparent(cur);                                   // children -> PID 1
-    notify_parent_sigchld(cur);                           // [M30] SIGCHLD to parent
-    // [M16/M39] Deliver the status to a blocked waiter; if one collected it, this
-    // zombie is reapable. Otherwise it persists until the parent calls wait().
-    if (sched_wake_waitpid(cur->pid, cur->exit_code) > 0) cur->collected = 1;
-    sched_wake_parent_waitany(cur->ppid);                 // [M39] wait-any waiters
+    // [U9] exit_group: the other threads are killed and exit with this status.
+    exit_current(cur, cur->exit_code, 1);
+}
 
-    // We are running on the exiting task's kernel stack, so it cannot reap
-    // itself; any CPU reaps it once switch_to has released it (on_cpu = 0).
-    switch_to(next_or_idle(cur));
+// [U9] Linux exit(2): only the calling thread ends; the last thread to leave
+// ends the process with the status of its leader (or of an exit_group).
+void sched_thread_exit_current(int status) {
+    process_t* cur = cur_task();
+    if (!cur || cur == idle_of_cpu()) return;
+    teardown_bkl_lock();
+    debugcon_writestring("[SCHED] thread exit ");
+    debugcon_print_hex(cur->pid);
+    debugcon_writestring("\n");
+    exit_current(cur, W_EXITCODE(status), 0);
 }
 
 // [M15] Terminate the current process after an unrecoverable ring-3 fault and
@@ -411,6 +477,8 @@ void sched_exit_current(trapframe_t* tf) {
 // current (idle/none), the fault is unrecoverable and we halt (a kernel bug).
 // 'sig' is the terminating signal number (a ring-3 CPU fault is mapped to its
 // signal by the exception handler: #PF/#GP -> SIGSEGV, #DE -> SIGFPE, ...).
+// [U9] A fatal signal ends the whole thread group; a thread killed BY its
+// group (exit_group, a group SIGKILL, another thread's execve) just exits.
 void sched_kill_current(int sig) {
     process_t* cur = cur_task();
     if (!cur || cur == idle_of_cpu()) {
@@ -425,15 +493,8 @@ void sched_kill_current(int sig) {
     debugcon_print_hex((uint64_t)sig);
     debugcon_writestring("\n");
     // POSIX "killed by signal" wait status (no core dumps -> core flag clear).
-    cur->exit_code = W_SIGNALED(sig);
-    process_release_pipes(cur);        // close pipe ends now: readers see EOF before wait()
-    cur->state = PROC_ZOMBIE;
-    exit_reparent(cur);                                   // children -> PID 1
-    notify_parent_sigchld(cur);                           // [M30] SIGCHLD to parent
-    if (sched_wake_waitpid(cur->pid, cur->exit_code) > 0) cur->collected = 1;
-    sched_wake_parent_waitany(cur->ppid);                 // [M39] wait-any waiters
-
-    switch_to(next_or_idle(cur));      // NORETURN
+    if (cur->thread_killed) exit_current(cur, W_SIGNALED(sig), 0);
+    exit_current(cur, W_SIGNALED(sig), 1);
 }
 
 #define SIGBIT_SCHED(n) (1ULL << (n))     // signal.h's SIGBIT (SIGCONT 18, SIGKILL 9)
@@ -446,11 +507,27 @@ void sched_stop_current(trapframe_t* tf) {
     if (!cur || cur == idle_of_cpu()) {
         for (;;) __asm__ volatile("cli; hlt");
     }
+    thread_fd_unpin(cur);              // [U9]
     teardown_bkl_lock();               // [M48] bkl=on only (M52); switch_to drops it
     debugcon_writestring("[STOP] pid=");
     debugcon_print_hex(cur->pid);
     debugcon_writestring("\n");
     save_tf(cur, tf);
+    if (thread_group_live(cur) > 1) {
+        // [U9] A group stop: the leader reports it, once every live thread
+        // has stopped (signal_group_stopped). A SIGCONT that ended the group
+        // stop between our decision and the store below (it found us
+        // RUNNING) is caught by re-checking stop_active after the store; a
+        // SIGKILL by its pending bit.
+        if (cur->stop_sig <= 0) cur->stop_sig = 19 /*SIGSTOP*/;
+        __atomic_store_n(&cur->state, PROC_STOPPED, __ATOMIC_SEQ_CST);
+        signal_group_stopped(cur);
+        uint64_t pend = __atomic_load_n(&cur->sig_pending, __ATOMIC_SEQ_CST) |
+                        __atomic_load_n(&cur->tg->shared_pending, __ATOMIC_SEQ_CST);
+        if (!__atomic_load_n(&cur->tg->stop_active, __ATOMIC_SEQ_CST) || (pend & SIGBIT_SCHED(9)))
+            sched_wake_task(cur, PROC_STOPPED);
+        switch_to(next_or_idle(cur));  // NORETURN
+    }
     cur->stop_report = 1;              // waitpid(WUNTRACED) reports it once
     cur->cont_report = 0;
     if (cur->stop_sig <= 0) cur->stop_sig = 19 /*SIGSTOP*/;
@@ -481,6 +558,7 @@ void sched_stop_current(trapframe_t* tf) {
 void sched_block_current(trapframe_t* tf) {
     process_t* cur = cur_task();
     if (!cur || cur == idle_of_cpu()) return;
+    thread_fd_unpin(cur);              // [U9] the re-run takes it again
     save_tf(cur, tf);
     uint64_t fl = process_lock_irqsave();
     if (sched_wake_seq() != cur->wake_snap) {
@@ -552,7 +630,7 @@ int sched_wake_waitpid(uint32_t pid, int code) {
 struct wake_wa_ctx { uint32_t ppid; struct wake_kick k; };
 static void wake_waitany_cb(process_t* p, void* u) {
     struct wake_wa_ctx* c = (struct wake_wa_ctx*)u;
-    if (p->pid == c->ppid && p->state == PROC_BLOCKED && p->wait_pid == -2) {
+    if (p->tgid == c->ppid && p->state == PROC_BLOCKED && p->wait_pid == -2) {   // [U9] any thread
         p->wait_pid = -1;
         wake_locked(p, &c->k);
     }
@@ -572,6 +650,8 @@ void sched_notify_parent_cont(process_t* child) {
     notify_parent_sigchld(child);
     sched_wake_parent_waitany(child->ppid);
 }
+// [U9] A multi-threaded child completed a group stop (signal_group_stopped).
+void sched_notify_parent_stop(process_t* child) { sched_notify_parent_cont(child); }
 
 // [M17] Wake processes whose SYS_SLEEP deadline has elapsed. Time only moves
 // forward, so a sleeper that blocks just after this scan is woken by the next

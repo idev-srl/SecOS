@@ -126,6 +126,8 @@ SRC_C   = \
 	$(KERNEL_DIR)/syscall.c \
 	$(KERNEL_DIR)/syscall_trap.c \
 	$(KERNEL_DIR)/syscall_lx.c \
+	$(KERNEL_DIR)/thread.c \
+	$(KERNEL_DIR)/futex.c \
 	$(KERNEL_DIR)/signal.c \
 	$(KERNEL_DIR)/cap.c \
 	$(KERNEL_DIR)/cred.c \

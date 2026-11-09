@@ -49,6 +49,94 @@
 #define PROC_TYPE_USER    0
 #define PROC_TYPE_DRIVER  1
 
+// [U9] One fd-table entry (was declared inside process_t).
+// When is_pipe, `inode` holds a pipe_t* and pipe_w selects the end
+// (1 = write end, 0 = read end). Otherwise `inode` is a vfs_inode_t*.
+// is_sock: socket index + 1 (0 = not a socket); `inode` stays NULL for a
+// socket so no file path can mistake it for a vfs_inode_t.
+// cloexec: FD_CLOEXEC — the fd is closed by a successful execve() (fcntl
+// F_SETFD, O_CLOEXEC on open, pipe2(O_CLOEXEC), F_DUPFD_CLOEXEC).
+struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; int cloexec; int is_sock; };
+
+#define PROC_NFDS   32          // fd table size
+#define PROC_NSIG   64          // [U9] signals 1..63 (bit n of a mask = signal n)
+
+// [U9] Threads (docs/USERLAND_PLAN.md D5, option T2). process_t stays the
+// schedulable task (one per thread: kernel stack, trapframe, FPU, state, wait
+// fields, signal mask, FS base); what the threads of a process share lives in
+// two refcounted objects (kernel/thread.c):
+//   proc_mm_t       the address space: page tables, VMAs, pinned ELF image,
+//                   brk/mmap state and the lock that guards them;
+//   thread_group_t  everything else a POSIX process owns: tgid, the fd table,
+//                   cwd, umask, signal dispositions, the process-directed
+//                   pending set, group exit / exec / stop state.
+// fork and every image creation make new ones; clone(CLONE_VM|CLONE_FILES|
+// CLONE_SIGHAND|CLONE_THREAD...) shares both. Each process_t holds one
+// reference on each, dropped by process_destroy (the last one frees).
+typedef struct proc_mm {
+    volatile uint32_t refs;
+    // [M50-B1] Address-space lock (LK_S35_MM, was process_t.mm_lock): the
+    // VMA set, the user page tables of 'space' and the 'space' / 'image'
+    // pointers. Every thread takes it for its edits (mmap/munmap/mprotect/
+    // brk, exec swap, fork copy, the PTE install of a fault); other tasks take
+    // it to read (procfs, umount). It also publishes fd-table edits (see
+    // kernel/syscall.c fdt_lock). Rules: never held across a page-cache/FS
+    // call, a user copy, or anything that takes proc_lock (S30 < S35).
+    // [M52] irqsave: see mm_lock() below.
+    spinlock_t lock;
+    // [U9] Serializes the VMA editors (brk/mmap/munmap/mprotect) of the
+    // threads: their page-table loops drop 'lock' now and then (mm_relax).
+    klock_t   map_lock;
+    vmm_space_t* space;     // owned: destroyed with the last reference
+    vma_set_t vmas;
+    // [M14] The pinned ELF copy backing FILE VMAs (freed with the mm).
+    uint8_t*  image;
+    size_t    image_size;
+    // [M18] brk heap + mmap arena (bump allocator).
+    uint64_t  brk_start;
+    uint64_t  brk_cur;
+    uint64_t  mmap_next;
+} proc_mm_t;
+
+typedef struct thread_group {
+    volatile uint32_t refs;     // process_t pointing here (memory lifetime)
+    uint32_t tgid;              // the leader's pid = getpid() of every thread
+    // Under proc_lock: threads that have not exited yet. The last one to
+    // exit ends the process (fds closed, parent notified, leader collectable).
+    uint32_t nr_live;
+    // Under proc_lock: set by the last thread once the process has fully
+    // ended (fds closed, status final). Only then may the parent collect the
+    // leader (wait) and the reaper free it.
+    uint8_t  dead;
+    // Group exit (exit_group, a fatal signal): set once, under proc_lock;
+    // every other thread is SIGKILLed and exits with group_code.
+    uint8_t  group_exit;
+    int      group_code;
+    // execve from a thread: the tid that kills the others and waits for them.
+    uint32_t exec_tid;
+    // Group stop (SIGSTOP & co. acted on by one thread stops them all):
+    // stop_active from the first thread that acts on it until SIGCONT;
+    // nr_stopped counts the threads that reached PROC_STOPPED, and stop_done
+    // is set (and the parent told, once) when all live threads have.
+    uint8_t  stop_active;
+    uint8_t  stop_done;
+    int      stop_sig;
+    uint32_t nr_stopped;
+    // Process-directed pending signals (bit n = signal n), atomic.
+    uint64_t shared_pending;
+    // Shared by CLONE_FILES / CLONE_FS: process_t.fds and .cwd point here.
+    // fd_lock (LK_K12_FILES) makes an fd read-modify-write and the object
+    // reference it takes or drops one step (another thread may close the fd
+    // meanwhile); the stores themselves are still published under mm->lock.
+    klock_t  fd_lock;
+    struct proc_fd_entry fd[PROC_NFDS];
+    char     cwd[256];
+    uint32_t umask;             // file-creation mask (default 022)
+    // Shared by CLONE_SIGHAND: process_t.sig_handler points here.
+    uint64_t handler[PROC_NSIG];
+    uint64_t restorer;          // the libc trampoline that calls SYS_SIGRETURN
+} thread_group_t;
+
 typedef struct process {
     // User x87/SSE register file (fxsave image, 16-byte aligned: process_t is
     // kmalloc'd 16-aligned and this is its first member). Ring 3 uses SSE
@@ -57,12 +145,15 @@ typedef struct process {
     // the task runs again; fpu_valid = 0 means "start from the clean state".
     uint8_t  fpu[512] __attribute__((aligned(16)));
     uint8_t  fpu_valid;
-    uint32_t pid;
-    vmm_space_t* space;
+    uint32_t pid;         // [U9] the thread id (unique); getpid() is tgid
+    uint32_t tgid;        // [U9] thread-group id = the leader's pid
+    proc_mm_t* mm;        // [U9] shared address space (kernel/thread.c)
+    thread_group_t* tg;   // [U9] shared process state (kernel/thread.c)
+    vmm_space_t* space;   // == mm->space (a copy: the scheduler loads it)
     uint64_t entry;
     uint64_t stack_top;
     uint64_t kstack_top; // kernel stack top (for future trap/switch)
-    uint8_t  kstack_slot; // bounded slot index for kernel stack region
+    uint16_t kstack_slot; // bounded slot index for kernel stack region
     // [M52] PROC_EMBRYO: in the table but still being built (no kstack / tf
     // yet) or held by its creator while it is wired up. Nothing ever moves it
     // out of that state but its creator: no wake-up (signal_post, waits)
@@ -96,15 +187,9 @@ typedef struct process {
     // touch. 'image'/'image_size' is the pinned ELF copy backing FILE VMAs
     // (freed at process_destroy). Teardown of faulted frames is handled by
     // vmm_space_destroy(), which frees every present leaf in the user range.
-    vma_set_t vmas;
-    uint8_t*  image;
-    size_t    image_size;
-    // [M18] Dynamic memory: brk heap (single growable ANON region) + mmap arena
-    // (bump allocator). mem_limit mirrors the signed manifest max_mem (0 =
-    // unlimited) and bounds runtime growth so a process can't exceed its limit.
-    uint64_t  brk_start;
-    uint64_t  brk_cur;
-    uint64_t  mmap_next;
+    // [U9] The VMA set, the pinned image and the brk/mmap state live in mm.
+    // mem_limit mirrors the signed manifest max_mem (0 = unlimited) and bounds
+    // runtime growth (a per-thread copy: only an exec changes it).
     uint64_t  mem_limit;
     int      exit_code;      // POSIX wait status: W_EXITCODE(st,0) or W_SIGNALED(sig)
     uint8_t  collected;      // [M39] zombie collected by parent's wait() -> reapable
@@ -134,10 +219,12 @@ typedef struct process {
     // signal n); sig_handler[n] is the disposition (SIG_DFL/SIG_IGN or a user
     // handler VA); sig_restorer is the libc trampoline that calls SYS_SIGRETURN.
     // pgid/ppid drive Ctrl-C delivery (to the foreground group) and SIGCHLD.
+    // [U9] sig_pending is thread-directed (tgkill, faults); process-directed
+    // signals pend in tg->shared_pending. sig_blocked is per thread.
+    // sig_handler points at tg->handler (shared by CLONE_SIGHAND).
     uint64_t sig_pending;
     uint64_t sig_blocked;
-    uint64_t sig_handler[32];
-    uint64_t sig_restorer;
+    uint64_t* sig_handler;
     // Job control: a stop/continue not yet reported to the parent's
     // waitpid(WUNTRACED / WCONTINUED). stop_sig = the signal that stopped us.
     uint8_t  stop_report;
@@ -164,7 +251,7 @@ typedef struct process {
     // groups. Inherited by fork, spawn and execve; changed by the set*id
     // syscalls and a set-id exec (kernel/cred.c). Kernel-made processes: root.
     struct proc_cred cred;
-    char     cwd[256];       // [M39] per-process current working directory (for chdir/getcwd + relative paths)
+    char*    cwd;            // [M39] current working directory: [U9] points at tg->cwd (256 bytes)
     // [M48] SMP scheduling. cpu_affinity is the task's HOME CPU (a soft
     // preference: that CPU's scheduler picks it first, any idle CPU may pull
     // it, and the CPU that runs it becomes its new home). cpu_pin >= 0 is an
@@ -183,20 +270,14 @@ typedef struct process {
     // Runtime metrics
     uint64_t cpu_ticks;      // accumulated CPU ticks (scheduler)
     uint64_t user_mem_bytes; // virtual memory footprint (updated at creation / future extensions)
-    // Simple file descriptor table
-    // [M25] When is_pipe, `inode` holds a pipe_t* and pipe_w selects the end
-    // (1 = write end, 0 = read end). Otherwise `inode` is a vfs_inode_t*.
-    // is_sock: socket index + 1 (0 = not a socket); `inode` stays NULL for a
-    // socket so no file path can mistake it for a vfs_inode_t.
-    // cloexec: FD_CLOEXEC — the fd is closed by a successful execve() (fcntl
-    // F_SETFD, O_CLOEXEC on open, pipe2(O_CLOEXEC), F_DUPFD_CLOEXEC).
-    struct proc_fd_entry { void* inode; uint64_t offset; uint32_t flags; int used; int is_pipe; int pipe_w; int cloexec; int is_sock; } fds[32];
+    // File descriptor table (struct proc_fd_entry above): [U9] points at
+    // tg->fd[PROC_NFDS], shared by the threads of a process (CLONE_FILES).
+    struct proc_fd_entry* fds;
     // Kernel-interface bookkeeping (kernel/kiface.c): procfs identity + CPU
     // accounting, umask, and the in-progress state of the blocking nanosleep /
     // poll syscalls. Set up by kiface_proc_init() at creation; fork copies it
     // and kiface_proc_fork() resets the per-instance parts.
     struct proc_ki {
-        uint32_t umask;              // file-creation mask (default 022)
         uint64_t start_ns;           // monotonic creation time
         uint64_t utime_ticks;        // timer ticks spent in ring 3
         uint64_t stime_ticks;        // timer ticks spent in ring 0 (syscalls)
@@ -219,41 +300,54 @@ typedef struct process {
     // is that process, holds proc_lock (process_foreach callbacks), or created
     // it and has not published it yet.
     volatile uint32_t refs;
-    // [M50-B1] Address-space lock (LK_S35_MM): the VMA set, the user
-    // page tables of 'space' and the 'space' / 'image' pointers. The owner
-    // takes it for every edit (mmap/munmap/mprotect/brk, exec swap, fork copy,
-    // the PTE install of a fault); other tasks take it to read (procfs, umount).
-    // Rules: never held across a page-cache/FS call, a user copy, or anything
-    // that takes proc_lock (S30 < S35); see mm_lock()/mm_unlock() below.
-    // [M52] irqsave. No interrupt handler takes it, but procfs, sysfs, the
-    // umount busy check and ramfs take it under proc_lock (S30 -> S35), and
-    // the timer tick and the keyboard IRQ take proc_lock: a holder with IF
-    // on that took the tick while another CPU waited for this mm_lock under
-    // proc_lock deadlocked both CPUs (seen at -smp 8 once syscalls ran off
-    // the BKL: CPU A holds mm, its tick spins on proc; CPU B holds proc,
-    // spins on mm). The cost: the BSP tick waits behind a long fork walk.
     // [U1] Linux-shaped thread state (syscalls 512 + Linux nr): the FS base
     // (thread pointer, set by arch_prctl(ARCH_SET_FS); loaded on every switch
     // to the task, inherited by fork, cleared by exec), the set_tid_address
-    // pointer (stored; used by threads in U9) and the user address of the
+    // pointer (CLONE_CHILD_CLEARTID: zeroed + futex-woken at thread exit) and
+    // the user address of the
     // auxv of the current image (process_auxv_set_creds).
     uint64_t fs_base;
     uint64_t clear_child_tid;
     uint64_t auxv_va;
-    spinlock_t mm_lock;
+    // [U9] Threads: set_robust_list head (stored, see docs/devlog/U9-threads.md);
+    // a thread killed by its group (exit_group, SIGKILL, execve of another
+    // thread) exits with the group's status, not its own.
+    uint64_t robust_list;
+    uint8_t  thread_killed;
+    // [U9] futex wait (kernel/futex.c): on a hash chain while futex_queued;
+    // futex_woken is set by the waker, so the re-run returns 0 even when the
+    // value did not change. futex_key/futex_bits identify what we wait for.
+    struct process* futex_next;
+    uint64_t futex_key0, futex_key1;
+    uint32_t futex_bits;
+    uint8_t  futex_active;      // a FUTEX_WAIT is in progress (re-runs resume it)
+    uint8_t  futex_queued;
+    volatile uint8_t futex_woken;
+    uint64_t futex_deadline;    // absolute monotonic ns, 0 = no timeout
+    // [U9] The fd object this syscall works on, referenced for the call when
+    // the process has several threads (thread_fd_pin / thread_fd_unpin).
+    struct proc_fd_entry fd_pin;
+    uint8_t  fd_pin_on;
 } process_t;
 
-// [M50-B1] mm_lock helpers (see process_t.mm_lock). [M52] irqsave.
-static inline uint64_t mm_lock(process_t* p) { return spin_lock_irqsave(&p->mm_lock); }
-static inline void mm_unlock(process_t* p, uint64_t fl) { spin_unlock_irqrestore(&p->mm_lock, fl); }
+// [M50-B1] mm_lock helpers (proc_mm_t.lock, shared by the threads of a process).
+// [M52] irqsave. No interrupt handler takes it, but procfs, sysfs, the
+// umount busy check and ramfs take it under proc_lock (S30 -> S35), and
+// the timer tick and the keyboard IRQ take proc_lock: a holder with IF
+// on that took the tick while another CPU waited for this mm_lock under
+// proc_lock deadlocked both CPUs (seen at -smp 8 once syscalls ran off
+// the BKL: CPU A holds mm, its tick spins on proc; CPU B holds proc,
+// spins on mm). The cost: the BSP tick waits behind a long fork walk.
+static inline uint64_t mm_lock(process_t* p) { return spin_lock_irqsave(&p->mm->lock); }
+static inline void mm_unlock(process_t* p, uint64_t fl) { spin_unlock_irqrestore(&p->mm->lock, fl); }
 // Let a waiter (procfs, umount) in during a long page-table loop: drop and
 // retake the lock. Only for loops whose state does not depend on the lock
 // staying held (the owner is the only writer of its own VMAs).
 static inline void mm_relax(process_t* p, uint64_t* fl) {
-    spin_unlock_irqrestore(&p->mm_lock, *fl);    // interrupts get in here
-    *fl = spin_lock_irqsave(&p->mm_lock);
+    spin_unlock_irqrestore(&p->mm->lock, *fl);    // interrupts get in here
+    *fl = spin_lock_irqsave(&p->mm->lock);
 }
-#define MM_ASSERT_HELD(p) SPIN_ASSERT_HELD(&(p)->mm_lock)
+#define MM_ASSERT_HELD(p) SPIN_ASSERT_HELD(&(p)->mm->lock)
 
 int process_init_system(void); // initialize process table
 process_t* process_create_from_elf(const void* elf_buf, size_t size);

@@ -21,6 +21,8 @@
 #include "user_copy.h"
 #include "power.h"
 #include "bkl.h"
+#include "thread.h"   // [U9] clone, thread exit, fd pins
+#include "futex.h"
 
 #ifdef SYSCALL_DEBUG
 #include "terminal.h"
@@ -72,7 +74,13 @@ static uint64_t syscall_handler_body(trapframe_t* tf);
 // task goes back to ring 3 holding no klock.
 uint64_t syscall_handler(trapframe_t* tf) {
     int bkl = bkl_syscall_enter(tf->rax);
+    // [U9] In a multi-threaded process another thread may close the fd this
+    // call works on: hold a reference on its object for the call (dropped
+    // here, or before the task blocks/stops/exits: kernel/sched.c).
+    process_t* cur = sched_get_current();
+    if (cur) thread_fd_pin(cur, tf->rax, tf->rdi);
     uint64_t r = syscall_handler_body(tf);
+    if (cur) thread_fd_unpin(cur);
     bkl_syscall_exit(bkl);
     return r;
 }
@@ -132,6 +140,12 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
         sched_exit_current(tf);
         return 0; // not reached when a switch occurs
     }
+    // [U9] Linux exit(2): the calling thread only (pthread_exit). The last
+    // thread of a process ends it, as exit_group would.
+    if (num == SYS_LX_EXIT) {
+        sched_thread_exit_current((int)tf->rdi);
+        return 0; // not reached for a user task
+    }
 
     // Reap this CPU's reapable zombies before creating a process. Zombies were
     // only reaped from the idle context, which never runs while user tasks stay
@@ -139,7 +153,7 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
     // piled up until the process/kernel-stack slots ran out. This is safe here:
     // every zombie has already switched off its own kernel stack and address
     // space, and the caller (current) is not a zombie.
-    if (num == SYS_FORK || num == SYS_SPAWN) {
+    if (num == SYS_FORK || num == SYS_SPAWN || num == SYS_LX_CLONE) {
         extern void sched_reap_zombies(void);
         sched_reap_zombies();
     }
@@ -169,14 +183,56 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
         }
     }
     else
+    // [U9] clone(flags, newsp, ptid, ctid, tls): a thread of the caller's
+    // process (musl's pthread_create flag set), or a plain fork (SIGCHLD).
+    if (num == SYS_LX_CLONE) {
+        uint64_t fl = tf->rdi;
+        if (cur && (fl & ~0xFFULL) == 0 && (fl & 0xFF) == 17 /*SIGCHLD*/ && tf->rsi == 0) {
+            if (!cap_check(cur, CAP_PROC, num, "clone-fork")) {
+                ret = (uint64_t)(int64_t)-1;
+            } else {
+                process_t* ch = process_fork(cur, tf);
+                ret = ch ? (uint64_t)(int64_t)ch->pid : (uint64_t)(int64_t)-11;
+                if (ch) sched_make_ready(ch);
+            }
+        } else {
+            process_t* th = NULL;
+            long r = cur ? thread_clone(cur, tf, fl, tf->rsi, tf->rdx, tf->rcx, tf->r8, &th)
+                         : -22;
+            ret = (uint64_t)(int64_t)r;
+            if (th) sched_make_ready(th);              // after the tid was read
+        }
+    }
+    else
+    // [U9] futex(uaddr, op, val, timeout|val2, uaddr2, val3); WAIT may block
+    // (rip rewound, re-run resumes it).
+    if (num == SYS_LX_FUTEX) {
+        ret = (uint64_t)futex_syscall(tf, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8, tf->r9);
+    }
+    else
     // SYS_EXECVE(path, argv, envp): replace the caller's image in place. On
     // success the trapframe now enters the new image (rax=0); on failure the
     // old image continues with -errno. Needs CAP_PROC when confined (like spawn).
+    // [U9] From a multi-threaded process the other threads are killed first
+    // and the caller waits (one tick at a time, re-running the call) until
+    // it is alone; then the exec proceeds as for a single thread.
     if (num == SYS_EXECVE) {
         if (!cap_check(cur, CAP_PROC, num, "execve")) {
             ret = (uint64_t)(int64_t)-1;                // EPERM
         } else {
-            ret = (uint64_t)ksys_execve(tf, tf->rdi, tf->rsi, tf->rdx);
+            int dt = cur ? thread_exec_dethread(cur) : 0;
+            if (dt == 1) {
+                extern uint64_t timer_get_ticks(void);
+                cur->sleep_until = timer_get_ticks() + 1;
+                tf->rip -= 2;                           // re-run once the others are gone
+                sched_block_current(tf);                // NORETURN
+                ret = 0;
+            } else if (dt < 0) {
+                ret = (uint64_t)(int64_t)-4;            // being killed: EINTR, the kill follows
+            } else {
+                if (cur) cur->sleep_until = 0;
+                ret = (uint64_t)ksys_execve(tf, tf->rdi, tf->rsi, tf->rdx);
+            }
         }
     }
     else
@@ -195,12 +251,13 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
             process_t* child = process_get_by_pid((uint32_t)tf->rdi);
             if (!child) {
                 ret = (uint64_t)(int64_t)-1;            // no such pid
-            } else if (cur && child->ppid != cur->pid && child->spawner_pid != cur->pid) {
+            } else if (cur && ((child->ppid != cur->tgid && child->spawner_pid != cur->tgid) ||
+                               child->pid != child->tgid)) {   // [U9] a process, not a thread
                 // Only the parent (fork) or the spawner may wait on / collect a
                 // process; anyone else could otherwise steal its exit status and
                 // mark it collected (reapable) behind the real parent's back.
                 ret = (uint64_t)(int64_t)-10;           // ECHILD: not our child
-            } else if (child->state == PROC_ZOMBIE) {
+            } else if (child->state == PROC_ZOMBIE && child->tg->dead) {
                 ret = (uint64_t)(int64_t)child->exit_code; // already exited
                 child->collected = 1;                      // [M39] parent reaped it -> reapable
             } else if (cur && sig_interrupted(cur, tf)) {
@@ -232,10 +289,10 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
             // [M50-B1] Collected under proc_lock: only pid + status come out
             // (once collected, the reaper may free the zombie on another CPU).
             uint32_t zpid = 0; int code = 0;
-            int z = process_collect_zombie_child(cur->pid, &zpid, &code);
+            int z = process_collect_zombie_child(cur->tgid, &zpid, &code);   // [U9] tgid
             uint32_t j = 0; int jst = 0;
             if (!z && (wuntrace || wcont))
-                j = process_take_jobctl_child(cur->pid, wuntrace, wcont, &jst);
+                j = process_take_jobctl_child(cur->tgid, wuntrace, wcont, &jst);
             if (z) {
                 if (ustatus && user_range_valid(ustatus, sizeof(int)))
                     copy_to_user(ustatus, &code, sizeof(int));
@@ -244,7 +301,7 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
                 if (ustatus && user_range_valid(ustatus, sizeof(int)))
                     copy_to_user(ustatus, &jst, sizeof(int));
                 ret = (uint64_t)(int64_t)(int)j;
-            } else if (!process_has_children(cur->pid)) {
+            } else if (!process_has_children(cur->tgid)) {
                 ret = (uint64_t)(int64_t)-10;        // ECHILD
             } else if (wnohang) {
                 ret = 0;                              // children alive, none reaped yet

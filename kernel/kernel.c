@@ -537,8 +537,8 @@ __attribute__((noreturn)) static void m14_idle_entry(void) {
                 // page(s) are present; 'mapped at load' counts them too.
                 uint32_t mapped = vmm_count_user_pages(m14_proc->space);
                 uint32_t img = 0;
-                for (uint32_t i = 0; i < m14_proc->vmas.count; i++) {
-                    const vma_t* v = &m14_proc->vmas.v[i];
+                for (uint32_t i = 0; i < m14_proc->mm->vmas.count; i++) {
+                    const vma_t* v = &m14_proc->mm->vmas.v[i];
                     if (v->type != VMA_TYPE_FILE) continue;
                     for (uint64_t a = v->start; a < v->end; a += 0x1000)
                         if (vmm_translate_in_space(m14_proc->space, a)) img++;
@@ -2597,6 +2597,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
 #endif
     bkl_init_mode();   // [M50] bkl=on|off (default on)
+    { extern void thread_boot_init(void); thread_boot_init(); }   // [U9] nothreads
 
     terminal_writestring("Multiboot magic: "); print_hex(multiboot_magic);
     terminal_writestring("  info: "); print_hex(multiboot_info); terminal_writestring("\n");

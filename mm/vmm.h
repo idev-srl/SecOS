@@ -224,8 +224,11 @@ void vmm_setup_kernel_guard_pages(void);
 #define M5_KSTACK_PAGES        16
 #define M5_KSTACK_SLOT_PAGES   (M5_KSTACK_PAGES + 2)   // 18 pages per slot
 #define M5_KSTACK_SLOT_SIZE    (M5_KSTACK_SLOT_PAGES * 0x1000ULL)
-#define M5_KSTACK_REGION_TOP   (M2_STACK_REGION_BASE + 0x400000ULL) // top of 2nd 2MB block
-#define M5_MAX_KSTACK_SLOTS    32  // must match MAX_PROCESSES
+// [U9] 1024 slots (72 KiB of VA each, frames only while in use) for threads:
+// the region now ends 80 MiB above the M2 base (PML4[511] PDPT[0], far below
+// the kernel image); its page tables are created on first use.
+#define M5_KSTACK_REGION_TOP   (M2_STACK_REGION_BASE + 0x5000000ULL)
+#define M5_MAX_KSTACK_SLOTS    1024  // = MAX_PROCESSES (kernel/process.c): one per task
 
 // Allocate guarded per-process kernel stack for a bounded slot index.
 // Returns rsp0 (top of usable area, just below guard_hi). 0 on failure.

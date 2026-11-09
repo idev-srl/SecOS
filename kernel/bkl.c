@@ -161,7 +161,12 @@ void bkl_init_mode(void) {
 // number at or above SYSCALL_BKL_NR takes the BKL until it is listed here.
 static int lx_lockfree(uint64_t num) {
     return num == SYS_LX_ARCH_PRCTL || num == SYS_LX_SET_TID_ADDRESS ||
-           num == SYS_LX_EXIT_GROUP;
+           num == SYS_LX_EXIT_GROUP ||
+           // [U9] threads: the table/group state under proc_lock, futex
+           // queues under their own lock, fds under the group's fd_lock.
+           num == SYS_LX_CLONE || num == SYS_LX_EXIT || num == SYS_LX_GETTID ||
+           num == SYS_LX_TKILL || num == SYS_LX_TGKILL || num == SYS_LX_FUTEX ||
+           num == SYS_LX_SET_ROBUST_LIST || num == SYS_LX_GET_ROBUST_LIST;
 }
 
 int syscall_needs_bkl(uint64_t num) {

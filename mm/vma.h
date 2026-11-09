@@ -20,7 +20,7 @@
 #include "spinlock.h"   // [M50-B1] the owner's mm_lock
 struct vfs_inode;
 
-#define VMA_MAX        64
+#define VMA_MAX        256   // [U9] two per thread stack (guard + stack); U4a makes it dynamic
 #define VMA_TYPE_ANON  0
 #define VMA_TYPE_FILE  1
 #define VMA_TYPE_PHYS  2    // [M40] device memory (framebuffer): phys_base + (va - start), shared

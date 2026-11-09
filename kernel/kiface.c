@@ -97,7 +97,7 @@ void kiface_proc_init(process_t* p, int argc, const char* const* argv) {
     if (!p) return;
     uint8_t* z = (uint8_t*)&p->ki;
     for (unsigned i = 0; i < sizeof(p->ki); i++) z[i] = 0;
-    p->ki.umask = 022;
+    p->tg->umask = 022;
     p->ki.start_ns = kclock_mono_ns();
     ki_copy_name(p->ki.comm, "init", sizeof(p->ki.comm));
     kiface_proc_set_cmdline(p, argc, argv, 0);
@@ -195,7 +195,7 @@ static void ki_block(trapframe_t* tf) {
 
 void kiface_apply_create_mode(const char* abs, uint32_t mode, int is_dir) {
     process_t* c = sched_get_current();
-    uint32_t um = c ? c->ki.umask : 022;
+    uint32_t um = c ? c->tg->umask : 022;
     uint32_t want = ((mode ? mode : (is_dir ? 0777u : 0666u)) & 07777u) & ~um;
     uint32_t dflt = is_dir ? 0755u : 0644u;     /* what the filesystems create */
     if (want == dflt) return;
@@ -684,8 +684,8 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
         break;
     }
     case 76: {                                                          /* SYS_UMASK */
-        uint32_t old = c->ki.umask;
-        c->ki.umask = (uint32_t)a0 & 0777;
+        uint32_t old = c->tg->umask;
+        c->tg->umask = (uint32_t)a0 & 0777;
         r = old;
         break;
     }

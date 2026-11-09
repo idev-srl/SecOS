@@ -24,6 +24,7 @@
 #include "input.h"            // [M40] /dev/input/eventN clients
 #include "fbdev.h"            // [M40] /dev/fb0
 #include "udrv.h"             // [M57] ring-3 driver claims (SYS_UDRV, claim fds)
+#include "thread.h"           // [U9] threads
 #include "percpu.h"           // SMP_MAX_CPUS, smp_cpu_count (sched_getaffinity)
 
 extern uint64_t timer_get_ticks(void);
@@ -83,6 +84,9 @@ static void fd_entry_unref(struct proc_fd_entry* e){
     else if(e->is_sock){ int sx=e->is_sock-1; e->is_sock=0; socket_unref(sx); }
     else { void* ino=e->inode; e->inode=NULL; pty_unref(ino); input_obj_unref(ino); udrv_fd_unref(ino); }   // a pty end may hang up
 }
+// [U9] For the per-syscall fd pin (kernel/thread.c).
+void ksys_fd_entry_ref(struct proc_fd_entry* e){ fd_entry_ref(e); }
+void ksys_fd_entry_unref(struct proc_fd_entry* e){ fd_entry_unref(e); }
 
 // [M25] pipe(): allocate a pipe object and two fds (read end + write end).
 // pipe2(O_CLOEXEC) marks both ends close-on-exec (ksys_pipe2).
@@ -108,7 +112,7 @@ static int ksys_pipe2(int kfds[2], int flags){
     return 0;
 }
 
-int ksys_getpid(void){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); return c? (int)c->pid : 0; }
+int ksys_getpid(void){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); return c? (int)c->tgid : 0; }   // [U9] the process id
 
 // [M10] Load + signature-verify a signed ELF from a VFS path and create a
 // process for it (PROC_READY so the scheduler can pick it up). The signing
@@ -149,6 +153,7 @@ static int spawn_read_image(vfs_inode_t* ino, uint8_t** out){
 // FD_CLOEXEC. Pipe ends gain a reference.
 static void spawn_inherit_stdio(process_t* parent, process_t* child){
     if(!parent || !child) return;
+    klock_lock(&parent->tg->fd_lock);     // [U9] another thread may close them meanwhile
     for(int i=0;i<3;i++){
         if(!parent->fds[i].used) continue;
         uint64_t fl = fdt_lock(child);     // the child is already in the process table
@@ -157,6 +162,7 @@ static void spawn_inherit_stdio(process_t* parent, process_t* child){
         fdt_unlock(child, fl);
         fd_entry_ref(&child->fds[i]);
     }
+    klock_unlock(&parent->tg->fd_lock);
 }
 
 // [M43/M46] Honour a set-id bit only on the root fs, for a SETID manifest, and
@@ -217,7 +223,7 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
         cap_audit(p->pid, CAP_AUDIT_DRIVER, SYS_SPAWN, "spawn-nnp", 0);
     }
     spawn_inherit_stdio(sched_get_current(), p);   // before READY: never runs without them
-    p->spawner_pid = sched_get_current() ? sched_get_current()->pid : 0; // SYS_WAIT ownership
+    p->spawner_pid = sched_get_current() ? sched_get_current()->tgid : 0; // SYS_WAIT ownership ([U9] the process)
     // Job control: a spawned program joins its spawner's process group, so a
     // job started through SYS_SPAWN (libc spawn(), the kernel shell) is reached
     // by `kill -STOP %1`, Ctrl-C/Ctrl-Z (foreground pgid) and SIGTTIN. (libc's
@@ -229,14 +235,14 @@ int ksys_spawn_argv(const char* path, int argc, const char* const argv[]){
     // A spawned program starts in its spawner's cwd and umask, as a fork+exec
     // child would: without this `cd /tmp; tar cf a.tar f1` ran tar in "/".
     { process_t* sp = sched_get_current();
-      if (sp && sp->pid != 0) p->ki.umask = sp->ki.umask;
+      if (sp && sp->pid != 0) p->tg->umask = sp->tg->umask;
       if (sp && sp->pid != 0) process_set_cred(p, &sp->cred);   // [M43] same user as the spawner
       cred_exec_setid(p, fmode, fuid, fgid, setid_allowed(p, fmode, setid_fs, bound.valid && bound.nnp));
       process_auxv_set_creds(p); }                 // [U1] the child's final ids in its auxv
     { process_t* sp = sched_get_current();
       if (sp && sp->pid != 0 && sp->cwd[0]) {
           uint64_t fl = mm_lock(p);    // [M52] cwd writers publish under mm_lock (procfs reads it)
-          int i = 0; for (; sp->cwd[i] && i < (int)sizeof(p->cwd) - 1; i++) p->cwd[i] = sp->cwd[i];
+          int i = 0; for (; sp->cwd[i] && i < (int)sizeof(p->tg->cwd) - 1; i++) p->cwd[i] = sp->cwd[i];
           p->cwd[i] = 0;
           mm_unlock(p, fl);
       } }
@@ -387,7 +393,8 @@ static uint64_t m18_user_span(uint64_t addr, uint64_t len){
 // [M50-B1] brk/mmap/munmap/mprotect edit the caller's VMAs and page tables
 // under its mm_lock (cross-process readers: procfs, umount). Long PTE loops
 // mm_relax() every MM_RELAX_PAGES pages so interrupts get in; that is safe
-// because only the owner edits its own VMA set. Nothing in these sections
+// because only the owner edits its own VMA set ([U9] its threads: one at a
+// time, under mm->map_lock). Nothing in these sections
 // reaches the page cache, a filesystem or user memory.
 #define MM_RELAX_PAGES 256
 static void mm_unmap_range(process_t* c, uint64_t lo, uint64_t hi, uint64_t* fl){
@@ -398,39 +405,68 @@ static void mm_unmap_range(process_t* c, uint64_t lo, uint64_t hi, uint64_t* fl)
     }
 }
 
+// [U9] First fit for [base, base+len) in the mmap arena among the live VMAs:
+// each step jumps past the highest-ending VMA overlapping the candidate, so it
+// ends after at most count + 1 steps. 0 = no room. mm_lock held.
+static uint64_t mmap_find_gap(const vma_set_t* s, uint64_t len){
+    uint64_t cand = USER_MMAP_BASE;
+    for (;;) {
+        if (cand >= USER_MMAP_END || len > USER_MMAP_END - cand) return 0;
+        const vma_t* hit = 0;
+        for (uint32_t i = 0; i < s->count; i++) {
+            const vma_t* v = &s->v[i];
+            if (v->type == VMA_TYPE_NONE || !(v->start < cand + len && cand < v->end)) continue;
+            if (!hit || v->end > hit->end) hit = v;
+        }
+        if (!hit) return cand;
+        cand = (hit->end + 0xFFFULL) & ~0xFFFULL;
+    }
+}
+
+static uint64_t ksys_brk_locked(uint64_t new_brk);
+// [U9] The threads of a process edit one VMA set: brk/mmap/munmap/mprotect
+// are serialized by the mm's map_lock (their loops drop mm_lock now and then).
 uint64_t ksys_brk(uint64_t new_brk){
     process_t* c = sched_get_current();
     if (!c) return 0;
-    if (new_brk == 0) return c->brk_cur;            // query current break
+    klock_lock(&c->mm->map_lock);
+    uint64_t r = ksys_brk_locked(new_brk);
+    klock_unlock(&c->mm->map_lock);
+    return r;
+}
+static uint64_t ksys_brk_locked(uint64_t new_brk){
+    process_t* c = sched_get_current();
+    if (!c) return 0;
+    if (new_brk == 0) return c->mm->brk_cur;            // query current break
     new_brk = pgup(new_brk);
-    if (new_brk < c->brk_start || new_brk >= USER_MMAP_BASE) return c->brk_cur;
+    if (new_brk < c->mm->brk_start || new_brk >= USER_MMAP_BASE) return c->mm->brk_cur;
     uint64_t fl = mm_lock(c);
-    uint64_t old = c->brk_cur;
+    uint64_t old = c->mm->brk_cur;
     if (new_brk == old) { mm_unlock(c, fl); return old; }
     if (new_brk > old) {                            // grow
-        if (c->mem_limit && vma_total_bytes(&c->vmas) + (new_brk - old) > c->mem_limit) {
+        if (c->mem_limit && vma_total_bytes(&c->mm->vmas) + (new_brk - old) > c->mem_limit) {
             mm_unlock(c, fl);
             return old;                             // would exceed signed mem limit
         }
         // Extend the heap's LAST piece (mprotect may have split the heap) when
         // it is plain RW anon; otherwise add a fresh RW piece for [old, new).
         const uint64_t hf = VMM_FLAG_USER|VMM_FLAG_RW|VMM_FLAG_NOEXEC;
-        vma_t* h = (old > c->brk_start) ? vma_find_mut(&c->vmas, old - 1) : 0;
+        vma_t* h = (old > c->mm->brk_start) ? vma_find_mut(&c->mm->vmas, old - 1) : 0;
         if (h && h->end == old && h->type == VMA_TYPE_ANON && h->flags == hf) h->end = new_brk;
-        else if (vma_add(&c->vmas, old, new_brk, hf, VMA_TYPE_ANON,0,0,0,0) != 0) {
+        else if (vma_add(&c->mm->vmas, old, new_brk, hf, VMA_TYPE_ANON,0,0,0,0) != 0) {
             mm_unlock(c, fl);
             return old;
         }
     } else {                                        // shrink
         mm_unmap_range(c, new_brk, old, &fl);
-        for (uint32_t i = 0; i < c->vmas.count; i++) {   // trim every heap piece
-            vma_t* v = &c->vmas.v[i];
+        for (uint32_t i = 0; i < c->mm->vmas.count; i++) {   // trim every heap piece
+            vma_t* v = &c->mm->vmas.v[i];
             if (v->type == VMA_TYPE_NONE || v->end <= new_brk || v->start >= old) continue;
-            if (v->start < c->brk_start) continue;       // not a heap piece
-            if (v->start >= new_brk) vma_remove(&c->vmas, v); else v->end = new_brk;
+            if (v->start < c->mm->brk_start) continue;       // not a heap piece
+            if (v->start >= new_brk) vma_remove(&c->mm->vmas, v); else v->end = new_brk;
         }
     }
-    c->brk_cur = new_brk;
+    c->mm->brk_cur = new_brk;
     mm_unlock(c, fl);
     return new_brk;
 }
@@ -440,7 +476,16 @@ uint64_t ksys_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd){
 }
 // [M40] mmap with a file offset (6th argument, r9). Only device mappings
 // (/dev/fb0, MAP_SHARED) honour it; file mappings stay offset 0 (M20).
+static uint64_t ksys_mmap6_locked(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off);
 uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off){
+    process_t* c = sched_get_current();
+    if (!c) return (uint64_t)-1;
+    klock_lock(&c->mm->map_lock);                   // [U9] see ksys_brk
+    uint64_t r = ksys_mmap6_locked(addr, len, prot, flags, fd, off);
+    klock_unlock(&c->mm->map_lock);
+    return r;
+}
+static uint64_t ksys_mmap6_locked(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off){
     (void)addr;                                     // hint ignored (bump allocator)
     process_t* c = sched_get_current();
     if (!c || len == 0) return (uint64_t)-1;
@@ -471,12 +516,22 @@ uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
         if (!ino->ops || (ino->ops->flags & VFS_FS_NOCACHE)) return (uint64_t)(int64_t)-19;
     }
     uint64_t fl = mm_lock(c);
-    uint64_t base = c->mmap_next;
+    uint64_t base = c->mm->mmap_next;
     uint64_t r = (uint64_t)-1;
-    if (base >= USER_MMAP_END || len > USER_MMAP_END - base) goto out;  // arena exhausted (no wrap)
+    int bump = 1;
     len = pgup(len);
-    if (len > USER_MMAP_END - base) goto out;
-    if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) goto out;
+    if (!len) goto out;
+    if (base >= USER_MMAP_END || len > USER_MMAP_END - base) {
+        // [U9] The bump pointer reached the end of the arena: reuse a hole
+        // that munmap left (a thread's 8 MiB stack is unmapped at join; a
+        // process that runs a few hundred threads over its life would run
+        // out of the 3.75 GiB arena otherwise). U4a replaces both with a
+        // real allocator.
+        base = mmap_find_gap(&c->mm->vmas, len);
+        if (!base) goto out;                                  // arena exhausted
+        bump = 0;
+    }
+    if (c->mem_limit && vma_total_bytes(&c->mm->vmas) + len > c->mem_limit) goto out;
     if (!ino) {
         // [U8] Right after the previous anonymous map with the same protection
         // (the bump allocator makes that the common case): grow that VMA
@@ -484,55 +539,64 @@ uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
         // class, so a program with many live allocations (nano's compiled
         // syntax regexes) otherwise runs out of the VMA_MAX slots.
         uint64_t f = m18_prot_to_flags(prot);
-        if (vma_extend_anon(&c->vmas, base, base + len, f) != 0 &&
-            vma_add(&c->vmas, base, base + len, f, VMA_TYPE_ANON,0,0,0,0) != 0)
+        if ((!bump || vma_extend_anon(&c->mm->vmas, base, base + len, f) != 0) &&
+            vma_add(&c->mm->vmas, base, base + len, f, VMA_TYPE_ANON,0,0,0,0) != 0)
             goto out;
     } else {
-        if (vma_add_file(&c->vmas, base, base + len, m18_prot_to_flags(prot), ino, 0) != 0)
+        if (vma_add_file(&c->mm->vmas, base, base + len, m18_prot_to_flags(prot), ino, 0) != 0)
             goto out;
     }
-    c->mmap_next = base + len;
+    if (bump) c->mm->mmap_next = base + len;
     r = base;
 out:
     mm_unlock(c, fl);
     return r;
 }
 
+static int ksys_munmap_locked(uint64_t addr, uint64_t len);
 int ksys_munmap(uint64_t addr, uint64_t len){
+    process_t* c = sched_get_current();
+    if (!c) return -1;
+    klock_lock(&c->mm->map_lock);                   // [U9] see ksys_brk
+    int r = ksys_munmap_locked(addr, len);
+    klock_unlock(&c->mm->map_lock);
+    return r;
+}
+static int ksys_munmap_locked(uint64_t addr, uint64_t len){
     process_t* c = sched_get_current();
     if (!c) return -1;
     len = m18_user_span(addr, len);
     if (!len) return -1;                                     // EINVAL
     uint64_t end = addr + len;
     uint64_t fl = mm_lock(c);
-    if (vma_pinned_overlap(&c->vmas, addr, end)) { mm_unlock(c, fl); return -22; }  // [M57] -EINVAL
+    if (vma_pinned_overlap(&c->mm->vmas, addr, end)) { mm_unlock(c, fl); return -22; }  // [M57] -EINVAL
     // [U8] A hole inside one VMA splits it and needs a free slot: check first,
     // so a full set fails the call (-ENOMEM, as Linux at its map limit)
     // before anything is unmapped, instead of dropping the tail's VMA.
     { uint32_t holes = 0;
-      for (uint32_t i = 0; i < c->vmas.count; i++) {
-          const vma_t* v = &c->vmas.v[i];
+      for (uint32_t i = 0; i < c->mm->vmas.count; i++) {
+          const vma_t* v = &c->mm->vmas.v[i];
           if (v->type != VMA_TYPE_NONE && v->start < addr && end < v->end) holes++;
       }
-      if (holes > vma_free_slots(&c->vmas)) { mm_unlock(c, fl); return -12; } }
+      if (holes > vma_free_slots(&c->mm->vmas)) { mm_unlock(c, fl); return -12; } }
     // Every user page is VMA-backed (M14), so only VMA intersections can hold
     // present PTEs: unmap those instead of walking the whole (maybe huge) range.
-    for (uint32_t i = 0; i < c->vmas.count; i++) {
-        const vma_t* v = &c->vmas.v[i];
+    for (uint32_t i = 0; i < c->mm->vmas.count; i++) {
+        const vma_t* v = &c->mm->vmas.v[i];
         if (v->type == VMA_TYPE_NONE || !(addr < v->end && v->start < end)) continue;
         uint64_t lo = addr > v->start ? addr : v->start;
         uint64_t hi = end  < v->end   ? end  : v->end;
         mm_unmap_range(c, lo, hi, &fl);
     }
-    for (uint32_t i = 0; i < c->vmas.count; i++) {
-        vma_t* v = &c->vmas.v[i];
+    for (uint32_t i = 0; i < c->mm->vmas.count; i++) {
+        vma_t* v = &c->mm->vmas.v[i];
         if (v->type == VMA_TYPE_NONE) continue;
         if (!(addr < v->end && v->start < end)) continue;        // no overlap
-        if (addr <= v->start && end >= v->end)      vma_remove(&c->vmas, v);   // fully covered
+        if (addr <= v->start && end >= v->end)      vma_remove(&c->mm->vmas, v);   // fully covered
         else if (addr <= v->start)                  v->start = end;            // trim front
         else if (end >= v->end)                     v->end = addr;             // trim back
         else {                                     // hole: split (tail kept, backing rebased)
-            if (vma_split(&c->vmas, v, end) != 0) { /* cannot happen: slots checked above */ }
+            if (vma_split(&c->mm->vmas, v, end) != 0) { /* cannot happen: slots checked above */ }
             v->end = addr;
         }
     }
@@ -540,7 +604,16 @@ int ksys_munmap(uint64_t addr, uint64_t len){
     return 0;
 }
 
+static int ksys_mprotect_locked(uint64_t addr, uint64_t len, int prot);
 int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
+    process_t* c = sched_get_current();
+    if (!c) return -1;
+    klock_lock(&c->mm->map_lock);                   // [U9] see ksys_brk
+    int r = ksys_mprotect_locked(addr, len, prot);
+    klock_unlock(&c->mm->map_lock);
+    return r;
+}
+static int ksys_mprotect_locked(uint64_t addr, uint64_t len, int prot){
     process_t* c = sched_get_current();
     if (!c) return -1;
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return -1;   // W^X
@@ -549,12 +622,12 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
     uint64_t end = addr + len;
     uint64_t fl = mm_lock(c);
     int ret = -1;
-    if (!vma_overlaps(&c->vmas, addr, end)) goto out;           // must be backed
-    if (vma_pinned_overlap(&c->vmas, addr, end)) { ret = -22; goto out; }  // [M57] driver map: -EINVAL
+    if (!vma_overlaps(&c->mm->vmas, addr, end)) goto out;           // must be backed
+    if (vma_pinned_overlap(&c->mm->vmas, addr, end)) { ret = -22; goto out; }  // [M57] driver map: -EINVAL
     // [M40] Device memory (the framebuffer) is never executable.
     if (prot & PROT_EXEC) {
-        for (uint32_t i = 0; i < c->vmas.count; i++) {
-            const vma_t* v = &c->vmas.v[i];
+        for (uint32_t i = 0; i < c->mm->vmas.count; i++) {
+            const vma_t* v = &c->mm->vmas.v[i];
             if (v->type == VMA_TYPE_PHYS && addr < v->end && v->start < end) goto out;
         }
     }
@@ -563,24 +636,24 @@ int ksys_mprotect(uint64_t addr, uint64_t len, int prot){
     // exactly [addr, end): pages demand-faulted later take the VMA's flags, so a
     // partial mprotect must not leave them with the old protection (e.g. a
     // PROT_NONE guard page inside a larger mapping).
-    for (uint32_t i = 0; i < c->vmas.count; i++) {
-        vma_t* v = &c->vmas.v[i];
+    for (uint32_t i = 0; i < c->mm->vmas.count; i++) {
+        vma_t* v = &c->mm->vmas.v[i];
         if (v->type == VMA_TYPE_NONE) continue;
-        if (v->start < addr && addr < v->end && vma_split(&c->vmas, v, addr) != 0) goto out;
+        if (v->start < addr && addr < v->end && vma_split(&c->mm->vmas, v, addr) != 0) goto out;
     }
-    for (uint32_t i = 0; i < c->vmas.count; i++) {
-        vma_t* v = &c->vmas.v[i];
+    for (uint32_t i = 0; i < c->mm->vmas.count; i++) {
+        vma_t* v = &c->mm->vmas.v[i];
         if (v->type == VMA_TYPE_NONE) continue;
-        if (v->start < end && end < v->end && vma_split(&c->vmas, v, end) != 0) goto out;
+        if (v->start < end && end < v->end && vma_split(&c->mm->vmas, v, end) != 0) goto out;
     }
-    for (uint32_t i = 0; i < c->vmas.count; i++) {
-        vma_t* v = &c->vmas.v[i];
+    for (uint32_t i = 0; i < c->mm->vmas.count; i++) {
+        vma_t* v = &c->mm->vmas.v[i];
         if (v->type == VMA_TYPE_NONE) continue;
         if (addr <= v->start && v->end <= end) v->flags = newf;  // now wholly in range
     }
     // Re-protect present PTEs, VMA intersections only (see ksys_munmap).
-    for (uint32_t i = 0; i < c->vmas.count; i++) {
-        const vma_t* v = &c->vmas.v[i];
+    for (uint32_t i = 0; i < c->mm->vmas.count; i++) {
+        const vma_t* v = &c->mm->vmas.v[i];
         if (v->type == VMA_TYPE_NONE || !(addr < v->end && v->start < end)) continue;
         uint64_t lo = addr > v->start ? addr : v->start;
         uint64_t hi = end  < v->end   ? end  : v->end;
@@ -729,10 +802,16 @@ int ksys_open(const char* path, int flags){ return ksys_open_mode(path, flags, 0
 int ksys_close(int fd){ extern process_t* sched_get_current(void); process_t* c=sched_get_current(); if(!c) return -1; if(fd<0||fd>=32) return -1; if(!c->fds[fd].used) return -1;
     // Unhook the entry first (under the fd-table lock), then drop its object:
     // pipe end (EOF/EPIPE) / socket ref (FIN on the last) / pty end (hangup).
+    // [U9] Under the group's fd_lock: two threads closing the same fd must
+    // not both drop its reference, nor a pin (thread.c) take one on a freed
+    // object. The object is dropped after the lock, from our private copy.
+    klock_lock(&c->tg->fd_lock);
+    if(!c->fds[fd].used){ klock_unlock(&c->tg->fd_lock); return -1; }
     uint64_t fl = fdt_lock(c);
     struct proc_fd_entry e = c->fds[fd];
     c->fds[fd].used=0; c->fds[fd].inode=NULL; c->fds[fd].is_pipe=0; c->fds[fd].is_sock=0;
     fdt_unlock(c, fl);
+    klock_unlock(&c->tg->fd_lock);
     fd_entry_unref(&e);
     return 0; }
 // [uaccess] read()/write() never touch the user buffer directly: data moves
@@ -1248,8 +1327,8 @@ static void umount_busy_cb(process_t* p, void* u){
         if(!e->used || e->is_pipe || e->is_sock || !e->inode) continue;
         if(((const vfs_inode_t*)e->inode)->ops == b->ops){ b->busy = 1; mm_unlock(p, fl); return; }
     }
-    for(uint32_t i=0;i<p->vmas.count;i++){
-        const vma_t* v = &p->vmas.v[i];
+    for(uint32_t i=0;i<p->mm->vmas.count;i++){
+        const vma_t* v = &p->mm->vmas.v[i];
         if(v->type != VMA_TYPE_NONE && v->file_inode && v->file_inode->ops == b->ops){ b->busy = 1; break; }
     }
     mm_unlock(p, fl);
@@ -1296,8 +1375,11 @@ static int copy_user_str(const char* u, char* k, int ksz){
 int ksys_dup2(int oldfd, int newfd){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(oldfd<0||oldfd>=32||newfd<0||newfd>=32) return -1;
-    if(!c->fds[oldfd].used) return -1;
-    if(oldfd==newfd) return newfd;
+    // [U9] The check, the reference and the swap are one step under the
+    // group's fd_lock (another thread may close either fd meanwhile).
+    klock_lock(&c->tg->fd_lock);
+    if(!c->fds[oldfd].used){ klock_unlock(&c->tg->fd_lock); return -1; }
+    if(oldfd==newfd){ klock_unlock(&c->tg->fd_lock); return newfd; }
     // Take the new reference before dropping the old target, so dup2 of a pty
     // or socket fd over another fd of the same object never hits zero.
     fd_entry_ref(&c->fds[oldfd]);
@@ -1305,17 +1387,21 @@ int ksys_dup2(int oldfd, int newfd){
     struct proc_fd_entry old = c->fds[newfd];
     c->fds[newfd]=c->fds[oldfd]; c->fds[newfd].used=1; c->fds[newfd].cloexec=0; // POSIX: dup clears FD_CLOEXEC
     fdt_unlock(c, fl);
+    klock_unlock(&c->tg->fd_lock);
     if(old.used) fd_entry_unref(&old);                         // close the old newfd target
     return newfd;
 }
 int ksys_dup(int oldfd){
     process_t* c=sched_get_current(); if(!c) return -1;
-    if(oldfd<0||oldfd>=32||!c->fds[oldfd].used) return -1;
-    int n=fd_alloc(c); if(n<0) return -1;
+    if(oldfd<0||oldfd>=32) return -1;
+    klock_lock(&c->tg->fd_lock);                               // [U9] see ksys_dup2
+    if(!c->fds[oldfd].used){ klock_unlock(&c->tg->fd_lock); return -1; }
+    int n=fd_alloc(c); if(n<0){ klock_unlock(&c->tg->fd_lock); return -1; }
     uint64_t fl = fdt_lock(c);
     c->fds[n]=c->fds[oldfd]; c->fds[n].used=1; c->fds[n].cloexec=0;
     fdt_unlock(c, fl);
     fd_entry_ref(&c->fds[n]);
+    klock_unlock(&c->tg->fd_lock);
     return n;
 }
 // fcntl(fd, cmd, arg): descriptor flags (FD_CLOEXEC), status flags, and
@@ -1333,13 +1419,17 @@ int ksys_fcntl(int fd, int cmd, long arg){
     switch(cmd){
     case K_F_DUPFD: case K_F_DUPFD_CLOEXEC: {
         if(arg<0||arg>=32) return -22;                       // -EINVAL
-        int n=-1; for(int i=(int)arg;i<32;i++) if(!c->fds[i].used){ n=i; break; }
-        if(n<0) return -24;                                  // -EMFILE
+        // [U9] Scan, copy and reference as one step (see ksys_dup2); the free
+        // slot is claimed under mm_lock like fd_alloc does.
+        klock_lock(&c->tg->fd_lock);
         uint64_t fl = fdt_lock(c);
+        int n=-1; for(int i=(int)arg;i<32;i++) if(!c->fds[i].used){ n=i; break; }
+        if(n<0 || !c->fds[fd].used){ fdt_unlock(c, fl); klock_unlock(&c->tg->fd_lock); return n<0 ? -24 : -9; }
         c->fds[n]=c->fds[fd]; c->fds[n].used=1;
         c->fds[n].cloexec = (cmd==K_F_DUPFD_CLOEXEC) ? 1 : 0;
         fdt_unlock(c, fl);
         fd_entry_ref(&c->fds[n]);
+        klock_unlock(&c->tg->fd_lock);
         return n;
     }
     case K_F_GETFD: return c->fds[fd].cloexec ? 1 : 0;      // FD_CLOEXEC = 1
@@ -1408,6 +1498,10 @@ int ksys_fstat(int fd, struct secos_stat* st){
 int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
+    // [U9] The controlling terminal is held per thread (one reference each):
+    // acquiring or dropping it is single-threaded only (daemons do it before
+    // they start threads). TIOCSCTTY / TIOCNOTTY.
+    if((cmd == 0x540E || cmd == 0x5422) && thread_group_live(c) > 1) return -1;   // EPERM
     // FIONBIO (ioctl form of fcntl O_NONBLOCK) on a terminal fd.
     #define FD_SET_NONBLOCK() do { int v_; \
         if(copy_from_user(&v_,(void*)arg,sizeof(v_))!=0) return -EFAULT; \

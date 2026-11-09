@@ -87,6 +87,7 @@ enum pk {
     PK_PID_DIR, PK_PID_STAT, PK_PID_STATUS, PK_PID_STATM, PK_PID_CMDLINE,
     PK_PID_COMM, PK_PID_ENVIRON, PK_PID_MAPS, PK_PID_CWD, PK_PID_EXE,
     PK_PID_ROOT, PK_PID_FDDIR, PK_PID_FD,
+    PK_PID_TASKDIR,                  /* [U9] /proc/<pid>/task (its entries are pid dirs of the tids) */
 };
 #define KEY(kind,pid,fd) ((uint64_t)(kind) | ((uint64_t)(pid)<<8) | ((uint64_t)(fd)<<40))
 #define K_KIND(k) ((int)((k)&0xff))
@@ -106,17 +107,18 @@ static const struct { const char* name; int kind; } g_pidf[] = {
     {"stat",PK_PID_STAT}, {"status",PK_PID_STATUS}, {"statm",PK_PID_STATM},
     {"cmdline",PK_PID_CMDLINE}, {"comm",PK_PID_COMM}, {"environ",PK_PID_ENVIRON},
     {"maps",PK_PID_MAPS}, {"cwd",PK_PID_CWD}, {"exe",PK_PID_EXE},
-    {"root",PK_PID_ROOT}, {"fd",PK_PID_FDDIR},
+    {"root",PK_PID_ROOT}, {"fd",PK_PID_FDDIR}, {"task",PK_PID_TASKDIR},
 };
 #define NPIDF (int)(sizeof(g_pidf)/sizeof(g_pidf[0]))
 
 static int seq(const char* a, const char* b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
 
 /* ------------------------------------------------------------ process snapshot */
-#define PS_MAXVMA 64
+#define PS_MAXVMA 256
 struct psnap {
     int      found;
     uint32_t pid, ppid, pgid, cpu;
+    uint32_t tgid, threads;  /* [U9] the process; live threads (leader: all of them) */
     int32_t  pin;            /* hard affinity (cpu_pin), -1 = any online CPU */
     int      state;
     char     comm[16];
@@ -144,6 +146,7 @@ static void snap_cb(process_t* p, void* u){
     struct psnap* s = &g_ps;
     s->found = 1;
     s->pid = p->pid; s->ppid = p->ppid; s->pgid = p->pgid; s->cpu = p->cpu_affinity; s->pin = p->cpu_pin;
+    s->tgid = p->tgid; s->threads = 1;
     s->cred = p->cred;
     s->inspect_ok = cred_may_inspect(sched_get_current(), p);
     s->state = p->state;
@@ -162,12 +165,12 @@ static void snap_cb(process_t* p, void* u){
     uint64_t mfl = mm_lock(p);
     for(int i=0;i<256;i++){ s->cwd[i]=p->cwd[i]; if(!p->cwd[i]) break; }
     s->cwd[255]=0;
-    s->vsz = vma_total_bytes(&p->vmas);
+    s->vsz = vma_total_bytes(&p->mm->vmas);
     s->rss_pages = (p->state!=PROC_ZOMBIE && p->space) ? vmm_count_user_pages(p->space) : 0;
-    s->brk_start=p->brk_start; s->brk_cur=p->brk_cur; s->stack_top=p->stack_top;
+    s->brk_start=p->mm->brk_start; s->brk_cur=p->mm->brk_cur; s->stack_top=p->stack_top;
     s->nvma=0;
-    for(uint32_t i=0;i<p->vmas.count && s->nvma<PS_MAXVMA;i++){
-        const vma_t* v=&p->vmas.v[i];
+    for(uint32_t i=0;i<p->mm->vmas.count && s->nvma<PS_MAXVMA;i++){
+        const vma_t* v=&p->mm->vmas.v[i];
         if(v->type==VMA_TYPE_NONE) continue;
         s->vma[s->nvma].start=v->start; s->vma[s->nvma].end=v->end; s->vma[s->nvma].flags=v->flags;
         s->vma[s->nvma].type=v->type; s->vma[s->nvma].has_inode = v->file_inode ? 1 : 0;
@@ -195,19 +198,41 @@ static void snap_cb(process_t* p, void* u){
     mm_unlock(p, mfl);
     s->sig_pending=p->sig_pending; s->sig_blocked=p->sig_blocked;
     s->sig_ign=0; s->sig_catch=0;
-    for(int i=1;i<32;i++){ if(p->sig_handler[i]==1) s->sig_ign|=1ull<<(i-1); else if(p->sig_handler[i]>1) s->sig_catch|=1ull<<(i-1); }
-    s->umask=p->ki.umask; s->exit_code=p->exit_code;
+    for(int i=1;i<64;i++){ if(p->sig_handler[i]==1) s->sig_ign|=1ull<<(i-1); else if(p->sig_handler[i]>1) s->sig_catch|=1ull<<(i-1); }
+    s->umask=p->tg->umask; s->exit_code=p->exit_code;
+}
+/* [U9] A leader stands for its process: CPU times summed over the threads,
+ * Threads: = the live ones. (The threads' own views: /proc/<pid>/task/<tid>.) */
+static void group_cb(process_t* p, void* u){
+    (void)u;
+    if(p->tgid != g_ps.tgid || p->pid == g_ps.pid) return;
+    if(p->state != PROC_ZOMBIE) g_ps.threads++;
+    g_ps.utime += p->ki.utime_ticks; g_ps.stime += p->ki.stime_ticks; g_ps.nvcsw += p->ki.nvcsw;
 }
 static int snap(uint32_t pid){
     g_ps.found=0; g_ps_want=pid;
     process_foreach(snap_cb, 0);
+    if(g_ps.found && g_ps.pid == g_ps.tgid){
+        if(g_ps.state == PROC_ZOMBIE) g_ps.threads = 0;
+        process_foreach(group_cb, 0);
+    }
     return g_ps.found;
 }
 
-struct pidlist { uint32_t pid[64]; int n; };
+#define PIDLIST_MAX 512
+struct pidlist { uint32_t pid[PIDLIST_MAX]; int n; };
 static void pids_cb(process_t* p, void* u){
     struct pidlist* l=(struct pidlist*)u;
-    if(p->pid==0 || l->n>=64) return;
+    if(p->pid==0 || l->n>=PIDLIST_MAX) return;
+    if(p->pid != p->tgid) return;                  /* [U9] processes; threads: <pid>/task */
+    l->pid[l->n++]=p->pid;
+}
+/* [U9] The threads of process tgid (for /proc/<pid>/task). */
+struct tidlist { uint32_t tgid; uint32_t pid[PIDLIST_MAX]; int n; };
+static void tids_cb(process_t* p, void* u){
+    struct tidlist* l=(struct tidlist*)u;
+    if(p->tgid != l->tgid || p->pid==0 || l->n>=PIDLIST_MAX) return;
+    if(p->state == PROC_ZOMBIE && p->pid != p->tgid) return;   /* an exited thread */
     l->pid[l->n++]=p->pid;
 }
 static void list_pids(struct pidlist* l){
@@ -419,7 +444,7 @@ static void gen_pid_stat(struct sb* s){
     sb_i64(s, g_ps.on_console ? (int64_t)(fg?fg:g_ps.pgid) : -1); sb_putc(s,' ');  /* tpgid */
     sb_str(s,"0 0 0 0 0 ");                                                     /* flags minflt cminflt majflt cmajflt */
     sb_u64(s,g_ps.utime*100/hz); sb_putc(s,' '); sb_u64(s,g_ps.stime*100/hz);
-    sb_str(s," 0 0 20 0 1 0 ");                                                 /* cutime cstime prio nice threads itreal */
+    sb_str(s," 0 0 20 0 "); sb_u64(s,g_ps.threads); sb_str(s," 0 ");            /* cutime cstime prio nice threads itreal */
     sb_u64(s,g_ps.start_ns/10000000ull); sb_putc(s,' ');                        /* starttime (USER_HZ) */
     sb_u64(s,g_ps.vsz); sb_putc(s,' '); sb_u64(s,g_ps.rss_pages);
     sb_str(s," 18446744073709551615 ");
@@ -443,7 +468,7 @@ static void gen_pid_status(struct sb* s){
     sb_str(s,"Name:\t"); sb_str(s,g_ps.comm);
     sb_str(s,"\nUmask:\t"); sb_oct4(s,g_ps.umask);
     sb_str(s,"\nState:\t"); sb_str(s,state_name(g_ps.state));
-    sb_str(s,"\nTgid:\t"); sb_u64(s,g_ps.pid);
+    sb_str(s,"\nTgid:\t"); sb_u64(s,g_ps.tgid);
     sb_str(s,"\nNgid:\t0\nPid:\t"); sb_u64(s,g_ps.pid);
     sb_str(s,"\nPPid:\t"); sb_u64(s,g_ps.ppid);
     sb_str(s,"\nTracerPid:\t0\nUid:\t"); sb_u64(s,g_ps.cred.ruid); sb_putc(s,'\t'); sb_u64(s,g_ps.cred.euid);
@@ -460,7 +485,8 @@ static void gen_pid_status(struct sb* s){
     sb_kv_kb(s,"VmRSS:",g_ps.rss_pages*4);
     sb_kv_kb(s,"VmData:",vm_kb_where(0));
     sb_kv_kb(s,"VmStk:",vm_kb_where(1));
-    sb_str(s,"Threads:\t1\nSigQ:\t0/0\nSigPnd:\t"); sb_hex(s,g_ps.sig_pending,16);
+    sb_str(s,"Threads:\t"); sb_u64(s,g_ps.threads);
+    sb_str(s,"\nSigQ:\t0/0\nSigPnd:\t"); sb_hex(s,g_ps.sig_pending,16);
     sb_str(s,"\nShdPnd:\t0000000000000000\nSigBlk:\t"); sb_hex(s,g_ps.sig_blocked,16);
     sb_str(s,"\nSigIgn:\t"); sb_hex(s,g_ps.sig_ign,16);
     sb_str(s,"\nSigCgt:\t"); sb_hex(s,g_ps.sig_catch,16);
@@ -636,7 +662,8 @@ static void gen_udrv(struct sb* s){ udrv_generate(lockstat_emit, s); }
  * whose effective ids equal all of the target's ids (cred_may_inspect). */
 static int is_private(int k){ return k==PK_PID_ENVIRON||k==PK_PID_MAPS||k==PK_PID_CWD||k==PK_PID_EXE||
                                      k==PK_PID_ROOT||k==PK_PID_FDDIR||k==PK_PID_FD; }
-static int is_dir(int k){ return k==PK_ROOT||k==PK_NET||k==PK_PID_DIR||k==PK_PID_FDDIR||k==PK_BUS||k==PK_BUS_PCI; }
+static int is_dir(int k){ return k==PK_ROOT||k==PK_NET||k==PK_PID_DIR||k==PK_PID_FDDIR||k==PK_BUS||k==PK_BUS_PCI||
+                                  k==PK_PID_TASKDIR; }
 
 /* Generate node `key` into g_genbuf; returns its length (-1 = gone). Caller
  * holds g_proc_lock. kmsg is served straight from the log ring instead. */
@@ -687,7 +714,7 @@ static int gen_key(uint64_t key){
     case PK_INTERRUPTS: gen_interrupts(&s); break;
     case PK_IOMMU: gen_iommu(&s); break;
     case PK_UDRV: gen_udrv(&s); break;
-    case PK_SELF: { process_t* c=sched_get_current(); if(!c||!c->pid) return -1; sb_u64(&s,c->pid); break; }
+    case PK_SELF: { process_t* c=sched_get_current(); if(!c||!c->pid) return -1; sb_u64(&s,c->tgid); break; }
     case PK_PID_STAT: gen_pid_stat(&s); break;
     case PK_PID_STATUS: gen_pid_status(&s); break;
     case PK_PID_STATM: gen_pid_statm(&s); break;
@@ -796,7 +823,7 @@ static uint64_t path_key(const char* rel){
     if(seq(c1,"self")){
         process_t* c=sched_get_current(); if(!c||!c->pid) return 0;
         if(!*rest) return KEY(PK_SELF,0,0);
-        pid=c->pid;
+        pid=c->tgid;                                   /* [U9] the process */
     } else if(seq(c1,"bus")){                       /* [M53a] /proc/bus/pci/... */
         if(!*rest) return KEY(PK_BUS,0,0);
         if(rest[0]=='p' && rest[1]=='c' && rest[2]=='i'){
@@ -823,6 +850,20 @@ static uint64_t path_key(const char* rel){
     if(rest[n2] && rest[n2]!='/') return 0;
     const char* r3=rest+n2; while(*r3=='/') r3++;
     for(int i=0;i<NPIDF;i++) if(seq(g_pidf[i].name,c2)){
+        if(g_pidf[i].kind==PK_PID_TASKDIR && *r3){
+            /* [U9] task/<tid>[/file] = the pid dir of that thread of this process */
+            if(g_ps.pid != g_ps.tgid) return 0;        /* only under the process's own dir */
+            uint32_t tid; int n3=0; while(r3[n3] && r3[n3]!='/') n3++;
+            if(parse_u32(r3,n3,&tid)!=0 || !snap(tid) || g_ps.tgid != pid) return 0;
+            const char* r4=r3+n3; while(*r4=='/') r4++;
+            char sub[96]; int o=0;
+            sub[o++]='/';
+            for(int j=0;j<n3 && o<20;j++) sub[o++]=r3[j];
+            if(*r4){ sub[o++]='/'; for(int j=0; r4[j] && o<94; j++) sub[o++]=r4[j]; }
+            sub[o]=0;
+            for(int j=0; r4[j]; j++) if(r4[j]=='t' && seq(r4+j,"task")) return 0;   /* no nesting */
+            return path_key(sub);
+        }
         if(g_pidf[i].kind==PK_PID_FDDIR && *r3){
             uint32_t fd; int n3=0; while(r3[n3] && r3[n3]!='/') n3++;
             if(r3[n3] || parse_u32(r3,n3,&fd)!=0 || fd>=32 || g_ps.fd[fd].kind==FDK_NONE) return 0;
@@ -847,7 +888,9 @@ static vfs_inode_t* procfs_lookup(const char* rel){
  * and the callbacks run after it is dropped: a callback may wait (the kernel
  * shell's ls pages its output and waits for a key), which is never allowed
  * under a spinlock. */
-struct pd_list { uint64_t keys[128]; char names[128][24]; vfs_inode_t ent; };
+#define PD_MAX (PIDLIST_MAX + 32)
+struct pd_list { uint64_t keys[PD_MAX]; char names[PD_MAX][24]; vfs_inode_t ent;
+                 struct pidlist pl; struct tidlist tl; };   /* [U9] no big lists on the stack */
 static int procfs_readdir(const char* dir, vfs_iter_cb cb, void* user){
     if(!cb || !dir) return -1;
     struct pd_list* L = (struct pd_list*)kmalloc(sizeof(*L));
@@ -861,8 +904,8 @@ static int procfs_readdir(const char* dir, vfs_iter_cb cb, void* user){
         for(int i=0;i<NTOP;i++) keys[nk++]=KEY(g_top[i].kind,0,0);
         keys[nk++]=KEY(PK_BUS,0,0);                                  /* [M53a] */
         process_t* c=sched_get_current(); if(c && c->pid) keys[nk++]=KEY(PK_SELF,0,0);
-        struct pidlist l; list_pids(&l);
-        for(int i=0;i<l.n && nk<128;i++) keys[nk++]=KEY(PK_PID_DIR,l.pid[i],0);
+        struct pidlist* l=&L->pl; list_pids(l);
+        for(int i=0;i<l->n && nk<PD_MAX;i++) keys[nk++]=KEY(PK_PID_DIR,l->pid[i],0);
     } else if(k==PK_BUS){                                            /* [M53a] */
         keys[nk++]=KEY(PK_BUS_PCI,0,0);
     } else if(k==PK_BUS_PCI){
@@ -870,7 +913,15 @@ static int procfs_readdir(const char* dir, vfs_iter_cb cb, void* user){
     } else if(k==PK_NET){
         keys[nk++]=KEY(PK_NET_DEV,0,0);
     } else if(k==PK_PID_DIR){
-        for(int i=0;i<NPIDF;i++) keys[nk++]=KEY(g_pidf[i].kind,K_PID(key),0);
+        for(int i=0;i<NPIDF;i++){
+            if(g_pidf[i].kind==PK_PID_TASKDIR && (!snap(K_PID(key)) || g_ps.pid != g_ps.tgid)) continue;
+            keys[nk++]=KEY(g_pidf[i].kind,K_PID(key),0);
+        }
+    } else if(k==PK_PID_TASKDIR){                                  /* [U9] */
+        struct tidlist* t=&L->tl; t->tgid=K_PID(key); t->n=0;
+        process_foreach(tids_cb, t);
+        for(int i=1;i<t->n;i++){ uint32_t v=t->pid[i]; int j=i-1; while(j>=0 && t->pid[j]>v){ t->pid[j+1]=t->pid[j]; j--; } t->pid[j+1]=v; }
+        for(int i=0;i<t->n && nk<PD_MAX;i++) keys[nk++]=KEY(PK_PID_DIR,t->pid[i],0);
     } else {
         if(snap(K_PID(key)) && g_ps.inspect_ok)            /* [M43] fd/ is private */
             for(int i=0;i<32;i++) if(g_ps.fd[i].kind!=FDK_NONE) keys[nk++]=KEY(PK_PID_FD,K_PID(key),i);

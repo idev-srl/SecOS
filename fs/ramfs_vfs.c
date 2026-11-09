@@ -72,8 +72,8 @@ static void ramfs_busy_cb(process_t* p, void* u){
         if(!f->used || f->is_pipe || f->is_sock || !f->inode) continue;
         ramfs_busy_mark(b, f->inode);
     }
-    for(uint32_t i=0;i<p->vmas.count;i++){
-        const vma_t* v = &p->vmas.v[i];
+    for(uint32_t i=0;i<p->mm->vmas.count;i++){
+        const vma_t* v = &p->mm->vmas.v[i];
         if(v->type != VMA_TYPE_NONE && v->file_inode) ramfs_busy_mark(b, v->file_inode);
     }
     mm_unlock(p, fl);

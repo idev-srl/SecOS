@@ -31,6 +31,9 @@ void sched_kick_for(process_t* p);         // reschedule IPI to an idle CPU for 
 void sched_wake_note(void);                // a wait condition changed (lost-wakeup guard)
 uint64_t sched_wake_seq(void);             // current wake sequence (syscall entry snapshot)
 void sched_on_resched_ipi(trapframe_t* tf);
+// [U9] threads
+int  sched_wake_task_sync(process_t* p);   // BLOCKED -> READY under proc_lock (futex wake)
+void sched_thread_exit_current(int status); // Linux exit(2): this thread only (no return for a user task)
 void sched_cpu_stats(uint32_t cpu, uint64_t* switches, uint64_t* migrations,
                      uint64_t* ipi_tlb, uint64_t* ipi_resched);
 
