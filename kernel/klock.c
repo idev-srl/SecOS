@@ -123,7 +123,8 @@ static void kl_acquire(klock_t* l, int irq_on) {
         uint64_t t0 = tsc_read();
         int spin_on = irq_on || (rf & RF_IF);
 #ifdef SECOS_LOCKDEP
-        int reported = 0;
+        ld_wait_t ldw;
+        lockdep_wait_init(&ldw, __atomic_load_n(&l->serving, __ATOMIC_ACQUIRE));
 #endif
         t->spinning = 1;                  /* set with IF off: see above */
         if (spin_on) __asm__ volatile ("sti" ::: "memory");
@@ -131,7 +132,7 @@ static void kl_acquire(klock_t* l, int irq_on) {
             cpu_relax_poll();
             if (spin_on && l->recursive) bkl_wait_poll();   /* only the BKL */
 #ifdef SECOS_LOCKDEP
-            lockdep_klock_wait(l, t0, &reported);
+            lockdep_klock_wait(l, &ldw);
 #endif
         }
         __asm__ volatile ("cli" ::: "memory");

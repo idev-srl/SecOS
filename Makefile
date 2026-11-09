@@ -129,6 +129,7 @@ SRC_C   = \
 	$(KERNEL_DIR)/exec_test.c \
 	$(KERNEL_DIR)/iommu.c $(KERNEL_DIR)/iommu_test.c $(KERNEL_DIR)/iommu_ir_test.c $(KERNEL_DIR)/dma.c \
 	$(KERNEL_DIR)/udrv.c \
+	$(KERNEL_DIR)/ldwatch_test.c \
 	$(LIB_DIR)/terminal.c \
 	$(FS_DIR)/ramfs.c \
 	$(FS_DIR)/vfs.c \
