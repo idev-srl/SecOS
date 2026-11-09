@@ -92,8 +92,9 @@ typedef struct usock {
     /* name */
     uint8_t named;
     struct lx_sockaddr_un name; uint32_t namelen;   /* as getsockname returns it */
-    const void* name_ino;            /* path names: the socket file's inode */
-    uint64_t name_inonum;
+    const void* name_ino;            /* path names: the socket file's inode, */
+    uint64_t name_inonum;            /* its st_ino and its canonical path */
+    char name_canon[256];
     /* stream data (received) */
     uint8_t* rbuf; uint32_t rhead, rlen;
     /* datagrams (received) */
@@ -214,7 +215,12 @@ static int name_parse(const struct lx_sockaddr_un* a, uint32_t alen, int* abs, c
 }
 
 /* g_unix_lock held: the socket bound to this name. */
-static usock_t* name_find(int abs, const char* key, uint32_t klen, const void* ino, uint64_t inonum) {
+static int canon_eq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+static usock_t* name_find(int abs, const char* key, uint32_t klen, const void* ino, uint64_t inonum,
+                          const char* canon) {
     for (usock_t* o = g_all; o; o = o->next_all) {
         if (!o->named) continue;
         if (abs) {
@@ -223,7 +229,8 @@ static usock_t* name_find(int abs, const char* key, uint32_t klen, const void* i
             for (uint32_t i = 0; i < klen && eq; i++) if (o->name.sun_path[i] != key[i]) eq = 0;
             if (eq) return o;
         } else {
-            if (o->name.sun_path[0] == 0 || o->name_ino != ino || o->name_inonum != inonum) continue;
+            if (o->name.sun_path[0] == 0 || !o->name_ino || o->name_ino != ino ||
+                o->name_inonum != inonum || !canon_eq(o->name_canon, canon)) continue;
             return o;
         }
     }
@@ -232,11 +239,11 @@ static usock_t* name_find(int abs, const char* key, uint32_t klen, const void* i
 
 /* Resolve a path name for connect/sendto: the socket file's inode, write
  * permission required. */
-static int path_target(process_t* c, const char* path, const void** ino, uint64_t* inonum) {
-    char ab[256], canon[256];
+static int path_target(process_t* c, const char* path, const void** ino, uint64_t* inonum, char* canon) {
+    char ab[256];
     proc_resolve_path(c, path, ab, sizeof(ab));
     vfs_inode_t* v = NULL;
-    int e = cred_check_path(c, ab, 1, MAY_WRITE, canon, sizeof(canon), &v);
+    int e = cred_check_path(c, ab, 1, MAY_WRITE, canon, 256, &v);
     if (e) return e;                        /* -ENOENT / -EACCES / -ENOTDIR ... */
     if (!v) return -U_ECONNREFUSED;
     if (v->type == VFS_NODE_DIR) return -U_ECONNREFUSED;
@@ -251,9 +258,11 @@ int unix_bind(process_t* c, usock_t* u, const struct lx_sockaddr_un* a, uint32_t
     const void* ino = NULL; uint64_t inonum = 0;
     struct lx_sockaddr_un nm; bz(&nm, sizeof(nm)); nm.sun_family = 1;
     uint32_t nmlen;
+    char cp[256]; cp[0] = 0;
+    if (__atomic_load_n(&u->named, __ATOMIC_ACQUIRE)) return -U_EINVAL;   /* before creating a file */
     if (abs == 0) {
         /* A file, created like creat(path, 0777) but failing if it exists. */
-        char ab[256], cp[256];
+        char ab[256];
         proc_resolve_path(c, key, ab, sizeof(ab));
         if ((e = cred_resolve(c, ab, 0, cp, sizeof(cp)))) return e;
         if (vfs_lookup(cp)) return -U_EADDRINUSE;
@@ -276,11 +285,18 @@ int unix_bind(process_t* c, usock_t* u, const struct lx_sockaddr_un* a, uint32_t
             uint32_t v = g_autobind++ & 0xFFFFF;
             char h[6]; h[0] = 0;
             for (int i = 0; i < 5; i++) { uint32_t d = (v >> (16 - 4 * i)) & 0xF; h[1 + i] = (char)(d < 10 ? '0' + d : 'a' + d - 10); }
-            if (!name_find(1, h, 6, NULL, 0)) { bc(nm.sun_path, h, 6); nmlen = 2 + 6; break; }
+            if (!name_find(1, h, 6, NULL, 0, NULL)) { bc(nm.sun_path, h, 6); nmlen = 2 + 6; break; }
         }
-    } else if (abs == 1 && name_find(1, key, klen, NULL, 0)) {
+    } else if (abs == 1 && name_find(1, key, klen, NULL, 0, NULL)) {
         spin_unlock_irqrestore(&g_unix_lock, fl);
         return -U_EADDRINUSE;
+    }
+    if (abs == 0) {
+        /* An older binding to the same inode is stale (its file was removed
+         * and the inode slot reused): it is no longer reachable by name. */
+        for (usock_t* o = g_all; o; o = o->next_all)
+            if (o != u && o->named && o->name_ino == ino && o->name_inonum == inonum) o->name_ino = NULL;
+        int k = 0; for (; cp[k] && k < 255; k++) u->name_canon[k] = cp[k]; u->name_canon[k] = 0;
     }
     u->name = nm; u->namelen = nmlen; u->name_ino = ino; u->name_inonum = inonum; u->named = 1;
     spin_unlock_irqrestore(&g_unix_lock, fl);
@@ -311,7 +327,8 @@ int unix_connect(process_t* c, usock_t* u, const struct lx_sockaddr_un* a, uint3
     if (e) return e;
     if (abs == 2) return -U_EINVAL;
     const void* ino = NULL; uint64_t inonum = 0;
-    if (abs == 0 && (e = path_target(c, key, &ino, &inonum))) return e;
+    char canon[256]; canon[0] = 0;
+    if (abs == 0 && (e = path_target(c, key, &ino, &inonum, canon))) return e;
     usock_t* emb = NULL;
     if (u->type == 1) {
         emb = us_new(c, 1);                    /* the server side, before taking the lock */
@@ -319,7 +336,7 @@ int unix_connect(process_t* c, usock_t* u, const struct lx_sockaddr_un* a, uint3
     }
     usock_t* wake = NULL;
     uint64_t fl = spin_lock_irqsave(&g_unix_lock);
-    usock_t* t = name_find(abs, key, klen, ino, inonum);
+    usock_t* t = name_find(abs, key, klen, ino, inonum, canon);
     int r = 0;
     if (!t) r = -U_ECONNREFUSED;
     else if (t->type != u->type) r = -U_EPROTOTYPE;
@@ -437,18 +454,19 @@ int unix_send(process_t* c, usock_t* u, const void* kbuf, int len, int flags,
     if (len > U_DGRAM_MAX) return -U_EMSGSIZE;
     int abs = 0; char key[110]; uint32_t klen = 0;
     const void* ino = NULL; uint64_t inonum = 0;
+    char canon[256]; canon[0] = 0;
     if (dst) {
         int e = name_parse(dst, dlen, &abs, key, &klen);
         if (e) return e;
         if (abs == 2) return -U_EINVAL;
-        if (abs == 0 && (e = path_target(c, key, &ino, &inonum))) return e;
+        if (abs == 0 && (e = path_target(c, key, &ino, &inonum, canon))) return e;
     }
     struct udg* d = (struct udg*)kmalloc(sizeof(struct udg) + (size_t)len);
     if (!d) return -U_ENOMEM;
     d->next = NULL; d->len = (uint32_t)len;
     bc(d->data, kbuf, (size_t)len);
     uint64_t fl = spin_lock_irqsave(&g_unix_lock);
-    usock_t* t = dst ? name_find(abs, key, klen, ino, inonum) : u->peer;
+    usock_t* t = dst ? name_find(abs, key, klen, ino, inonum, canon) : u->peer;
     int r;
     if (u->shut & 2) r = -U_EPIPE;
     else if (!t) r = dst ? -U_ECONNREFUSED : (u->peer_closed ? -U_ECONNREFUSED : -U_ENOTCONN);
