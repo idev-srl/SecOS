@@ -136,35 +136,30 @@ int sched_make_ready(process_t* p) {
     return 1;
 }
 
-// [M48] BLOCKED/STOPPED -> READY from outside proc_lock (signals, job control).
+// [M48] BLOCKED/STOPPED -> READY from outside proc_lock (signals, job control,
+// futex, udrv). [U9] The state check and the CAS run under proc_lock, after a
+// wake-sequence bump: sched_block_current() reads the sequence and stores
+// BLOCKED in one proc_lock section, so either it sees the bump (and re-runs)
+// or this CAS sees BLOCKED. Done outside the lock, the CAS could land between
+// the two (the task read the old sequence, we saw RUNNING and gave up, it
+// stored BLOCKED) and the task slept on a satisfied condition. Callers hold
+// no lock at or above S30 (udrv holds its S25 event lock: S25 -> S30 is fine).
 int sched_wake_task(process_t* p, int from_state) {
-    if (!p) return 0;
-    if (p->state != from_state) return 0;
-    p->ready_tick = timer_get_ticks();
-    if (!__sync_bool_compare_and_swap(&p->state, from_state, PROC_READY)) return 0;
-    wake_seq_bump();
-    sched_kick_for(p);
-    return 1;
-}
-
-// [U9] BLOCKED -> READY for a waker that is not a table scan (futex): the
-// CAS is made under proc_lock, so it cannot fall between the blocker's
-// wake-sequence check and its RUNNING -> BLOCKED store (sched_block_current
-// does both under proc_lock); the sequence bump first makes a block that has
-// not reached that section yet re-run instead.
-int sched_wake_task_sync(process_t* p) {
     if (!p) return 0;
     wake_seq_bump();
     uint64_t fl = process_lock_irqsave();
     int ok = 0;
-    if (p->state == PROC_BLOCKED) {
+    if (p->state == from_state) {
         p->ready_tick = timer_get_ticks();
-        ok = __sync_bool_compare_and_swap(&p->state, PROC_BLOCKED, PROC_READY);
+        ok = __sync_bool_compare_and_swap(&p->state, from_state, PROC_READY);
     }
     process_unlock_irqrestore(fl);
     if (ok) sched_kick_for(p);
     return ok;
 }
+
+// [U9] BLOCKED -> READY for the futex wake (see sched_wake_task).
+int sched_wake_task_sync(process_t* p) { return sched_wake_task(p, PROC_BLOCKED); }
 
 // ---- low-level switch: load target space + kernel stack, iretq into it ----
 static void switch_to(process_t* next) __attribute__((noreturn));
