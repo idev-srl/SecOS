@@ -35,12 +35,12 @@ program the device's MSI-X from the kernel).
 claim of a network function with DMA rights and the manifest flag
 `UDRV_DRV_NET` (v3 `udrv_flags`). It allocates:
 
-- 2 control pages (`struct udrv_net_ctrl`: constants, kernel→driver and
-  driver→kernel indices on separate cache lines, rings `tx[128]`, `txc[128]`,
+- 3 control pages (`struct udrv_net_ctrl`: constants, kernel→driver and
+  driver→kernel indices on separate cache lines, rings `tx[256]`, `txc[256]`,
   `rxf[256]`, `rx[256]` of 8-byte `{slot, len}` entries), zeroed, mapped
   RW+NX into the driver (`VMA_VF_DONTFORK|PINNED`, munmap refused). Not in the
   device's IOMMU domain;
-- 384 packet slots of 2 KiB (128 TX + 256 RX, 192 pages) from
+- 512 packet slots of 2 KiB (256 TX + 256 RX, 256 pages) from
   `pmm_alloc_contiguous`, mapped only into the claim's IOMMU domain (RW). The
   driver gets their IOVA, never a mapping. They come from the PMM directly,
   not `dma_alloc_coherent`: those are frames of a ring-3 claim's own domain,
@@ -112,7 +112,7 @@ a handle at that point, since probes run after `udrv_init`).
 
 A port of `drivers/e1000e.c`: claim by id, INFO, command register
 MEM|BUSMASTER, `MAP_BAR 0`, device reset, link up, MAC from RAL0/RAH0, one
-DMA page each for 256 RX / 128 TX legacy descriptors, `NET_ATTACH`, one
+DMA page each for 256 RX / 256 TX legacy descriptors, `NET_ATTACH`, one
 MSI-X vector (IVAR: RxQ0, TxQ0 and Other → entry 0; IMS: TXDW, LSC, RXO,
 RXT0, RxQ0, TxQ0, Other). Without a vector (or with `--poll`) it polls every
 millisecond. Main loop: service the rings (TX done → `txc[]`, new `tx[]` →
@@ -146,6 +146,44 @@ FS_READ | PROC | TIME`, so `no_new_privs`), match `8086:10d3` only,
 
 (see "Test record" below)
 
+## Not covered
+
+The proxy's ring checks are separate pure functions (`udrv_net_check_index`,
+`udrv_net_check_rx`, `udrv_net_check_txc`, `udrv_net_reject_count`, commit
+`9828299`), but M58 has no dedicated test for them: the gate exercises only
+well-formed traffic from the real driver (`bad_total=0` is checked).
+
 ## VMware recipe (prepared for the user; not yet run)
 
-TBD
+Goal: the same image on VMware Workstation with a virtual IOMMU, the NIC
+driven from ring 3. Report the `[IOMMU]`, `[UDRV]` and `[udrv-e1000e]` lines
+and whether SSH works.
+
+1. Build: `make iso UDRV=8086:10d3 SSH_AUTHORIZED_KEYS=~/.ssh/id_ed25519.pub`
+   (optionally `CONSOLE=root`). The ISO is a GRUB hybrid (BIOS + UEFI).
+2. VM settings (Workstation 15.5+, hardware version 14 or later):
+   - Options → Advanced → Firmware type **UEFI** (the virtual IOMMU needs
+     it); Secure Boot off;
+   - Processors → **Virtualize IOMMU (IO memory management unit)** on;
+   - CD/DVD → the ISO, connected at power on;
+   - Network adapter: edit the `.vmx` so it is an 82574L:
+     `ethernet0.virtualDev = "e1000e"` (NAT or bridged);
+   - Serial port → output to a file (the debugcon port does not exist on
+     VMware; the console shows the same lines).
+3. Boot the first GRUB entry ("SecOS x64"). Expected:
+   - `[IOMMU] ...` DMAR found, translation on, `[IOMMU] IR: on`;
+   - `[UDRV] udrv= 0x:00.0 8086:10d3 assigned to ring 3 (iommu: blocked)`;
+   - `[NET] eth0: ring-3 driver proxy for ...`;
+   - `[init] started net0 (/sbin/udrv-e1000e)`, then
+     `[UDRV] claim ... iommu=translated dma=yes`, `[UDRV] eth0 driver
+     attached`, `[UDRV] irq_setup ... msix nvec=1`;
+   - `ifup: eth0: lease ...`.
+4. Check in the shell: `cat /proc/udrv` (device claimed, `net eth0 ...
+   attached link=1`, `faults=0`), `cat /var/log/net0.log`, `ifconfig`,
+   `wget -O /dev/null http://<host>/<file>`; SSH in from the host.
+5. If the claim says `dma=no` (no interrupt remapping on this VMware
+   version), the driver logs "no DMA rights" and exits: boot the second
+   build without `UDRV=` to get the in-kernel driver back, and send the
+   `[IOMMU]` lines.
+6. `kill -9 $(pidof udrv-e1000e)` once: `[UDRV] eth0 driver died`, a new
+   driver attaches within ~2 s, SSH reconnects (or the session survives).

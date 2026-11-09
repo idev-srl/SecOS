@@ -12,7 +12,7 @@
  *      driver);
  *   2. memory decode + bus mastering, MAP_BAR 0, device reset, link up, MAC
  *      from RAL0/RAH0;
- *   3. DMA_ALLOC one page each for the RX (256) and TX (128) descriptor
+ *   3. DMA_ALLOC one page each for the RX (256) and TX (256) descriptor
  *      rings; NET_ATTACH: the kernel's packet slots are the NIC buffers
  *      (their IOVAs go into the descriptors, nothing is copied here);
  *   4. IRQ_SETUP 1 MSI-X vector with RxQ0, TxQ0 and Other routed to it; if
@@ -83,7 +83,7 @@
 #define IVAR_ALL0  (0x8u | (0x8u << 8) | (0x8u << 16) | (1u << 31))
 
 #define NRX 256u
-#define NTX 128u
+#define NTX 256u
 
 struct rx_desc { uint64_t addr; uint16_t length, csum; uint8_t status, errors; uint16_t special; } __attribute__((packed));
 struct tx_desc { uint64_t addr; uint16_t length; uint8_t cso, cmd, status, css; uint16_t special; } __attribute__((packed));

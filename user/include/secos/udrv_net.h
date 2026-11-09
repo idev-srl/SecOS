@@ -73,7 +73,7 @@
 #define UDRV_NET_MAGIC      0x3154454Eu   /* "NET1" */
 #define UDRV_NET_VERSION    1u
 #define UDRV_NET_SLOT_SIZE  2048u
-#define UDRV_NET_TX_SLOTS   128u
+#define UDRV_NET_TX_SLOTS   256u
 #define UDRV_NET_RX_SLOTS   256u
 #define UDRV_NET_TX_BASE    0u
 #define UDRV_NET_RX_BASE    UDRV_NET_TX_SLOTS
@@ -113,7 +113,7 @@ struct udrv_net_ctrl {
     struct udrv_net_desc rxf[UDRV_NET_RX_RING];
     struct udrv_net_desc rx[UDRV_NET_RX_RING];
 };
-#define UDRV_NET_CTRL_PAGES 2u      /* sizeof(struct udrv_net_ctrl) = 6400    */
+#define UDRV_NET_CTRL_PAGES 3u      /* sizeof(struct udrv_net_ctrl) = 8448    */
 
 struct udrv_net_attach {
     uint8_t  mac[6];            /* in: the NIC's unicast address              */

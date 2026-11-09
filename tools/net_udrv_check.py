@@ -280,7 +280,7 @@ try:
     ok = len(sink_md5) > n0 and sink_md5[-1] == (len(PAYLOAD), MD5['/f8'])
     check('tcp-upload-8M-md5', ok, str(sink_md5[-1:]))
     o = run('nslookup localhost 10.0.2.3', 60) or ''
-    check('dns', re.search(r'Address:?\s+127\.0\.0\.1', o) is not None, o.strip().replace('\n', ' | ')[:200])
+    check('dns', re.search(r'Address( 1)?:?\s+127\.0\.0\.1', o) is not None, o.strip().replace('\n', ' | ')[:200])
     rc, so = ssh('echo NUD-SSH-OK; cat /proc/udrv | head -n1')
     check('ssh-session', rc == 0 and 'NUD-SSH-OK' in so, 'rc=%d' % rc)
 
