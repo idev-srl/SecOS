@@ -876,6 +876,15 @@ port-nano:
 	bash tools/port-nano.sh
 	@echo "port-nano: GNU nano built from source on musl + ncursesw, signed -> crypto/user_nano_elf.h"
 
+# [U10] network userland on musl: iputils ping (BSD-3-Clause, CAP_NET,
+# ICMP ping sockets). Tarballs are SHA-256 pinned (+ GPG where upstream
+# signs), fetched into build/dl.
+.PHONY: port-iputils
+port-iputils:
+	bash tools/port-musl.sh
+	bash tools/port-iputils.sh
+	@echo "port-iputils: ping built from source on musl, signed -> crypto/user_ping_elf.h"
+
 .PHONY: port-busybox
 port-busybox:
 	bash tools/port-busybox.sh
