@@ -10,8 +10,8 @@
  *      interrupt remapping) the NIC cannot work from ring 3: say so and exit
  *      0, so init does not restart it (remove udrv= to use the in-kernel
  *      driver);
- *   2. memory decode + bus mastering, MAP_BAR 0, device reset, link up, MAC
- *      from RAL0/RAH0;
+ *   2. MAP_BAR 0, device reset (bus mastering still off), then bus
+ *      mastering on, link up, MAC from RAL0/RAH0;
  *   3. DMA_ALLOC one page each for the RX (256) and TX (256) descriptor
  *      rings; NET_ATTACH: the kernel's packet slots are the NIC buffers
  *      (their IOVAs go into the descriptors, nothing is copied here);
@@ -136,6 +136,8 @@ static long dma_page(uint64_t* iova, void** uva) {
 
 static int hw_reset(uint8_t mac[6]) {
     wr(E_IMC, 0xFFFFFFFFu);
+    wr(E_RCTL, 0);
+    wr(E_TCTL, 0);
     (void)rd(E_ICR);
     wr(E_CTRL, rd(E_CTRL) | CTRL_RST);
     mb();
@@ -297,16 +299,20 @@ int main(int argc, char** argv) {
         udrv(UDRV_OP_RELEASE, 0, 0);
         return 0;
     }
-    struct udrv_cfg cf = { 0x04, 2, 0x0006, 0 };   /* memory decode + bus mastering */
-    if (udrv(UDRV_OP_CFG_WRITE, &cf, sizeof(cf)) != 0) { say("[udrv-e1000e] bus mastering refused\n"); return 1; }
     struct udrv_map_bar mb0;
     memset(&mb0, 0, sizeof(mb0));
     if (udrv(UDRV_OP_MAP_BAR, &mb0, sizeof(mb0)) != 0 || mb0.len < 0x20000) {
         say("[udrv-e1000e] MAP_BAR 0 failed\n"); return 1;
     }
     g_bar = (volatile uint8_t*)(uintptr_t)mb0.uva;
+    /* Reset the NIC before bus mastering goes on: the kernel's reset at the
+     * previous driver's exit may not clear the descriptor base registers
+     * (PM reset), and a device that resumes DMA at the old IOVAs faults in
+     * this claim's fresh IOMMU domain. */
     uint8_t mac[6];
     if (hw_reset(mac) != 0) return 1;
+    struct udrv_cfg cf = { 0x04, 2, 0x0006, 0 };   /* memory decode + bus mastering */
+    if (udrv(UDRV_OP_CFG_WRITE, &cf, sizeof(cf)) != 0) { say("[udrv-e1000e] bus mastering refused\n"); return 1; }
     void* rxu; void* txu;
     if (dma_page(&g_rx_iova, &rxu) != 0 || dma_page(&g_tx_iova, &txu) != 0) {
         say("[udrv-e1000e] DMA_ALLOC failed\n"); return 1;
