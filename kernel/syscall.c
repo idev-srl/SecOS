@@ -1819,6 +1819,14 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, u
     case SYS_GETCWD:  return (uint64_t)(int64_t)ksys_getcwd((char*)a0, (int)a1);
     case SYS_IOCTL:   return (uint64_t)(int64_t)ksys_ioctl((int)a0, a1, a2);
     case SYS_GETPPID: return (uint64_t)ksys_getppid();
+    case SYS_SIGVERIFY: {                     // [U6] Ed25519 over a digest, kernel trust root
+        uint8_t dg[32], sg[64];
+        if (!user_range_valid((const void*)a0, sizeof(dg)) || copy_from_user(dg, (const void*)a0, sizeof(dg)) != 0 ||
+            !user_range_valid((const void*)a1, sizeof(sg)) || copy_from_user(sg, (const void*)a1, sizeof(sg)) != 0)
+            return (uint64_t)(int64_t)-EFAULT;
+        extern int secos_sig_verify_digest(const uint8_t*, const uint8_t*, uint32_t);
+        return secos_sig_verify_digest(dg, sg, (uint32_t)a2) == 0 ? 0 : (uint64_t)(int64_t)-74;   // -EBADMSG
+    }
     case SYS_PRCTL: {                         // [M46] no_new_privs + capability query
         process_t* c = sched_get_current();
         if (!c) return (uint64_t)(int64_t)-22;

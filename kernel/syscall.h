@@ -90,6 +90,13 @@
 // ABI in user/include/secos/udrv.h (claim, BAR map, mediated config, DMA
 // buffers in the device's own IOMMU domain, IRQ fd). SYS_DRIVER (7) -> -ENOSYS.
 #define SYS_UDRV        92
+// [U6] sigverify(digest32*, sig64*, key_id): check an Ed25519 signature over a
+// 32-byte SHA-256 digest against the kernel's trusted key(s), with the same
+// rule as an ELF QSIG (revoked key_id refused). 0 = valid, -EBADMSG (74) =
+// invalid/revoked, -EFAULT. A pure function of public data: no capability.
+// Lets user-space installers (/bin/spkg) hash a package as a stream while the
+// trust root (key, revocation list, a future keyring) stays in the kernel.
+#define SYS_SIGVERIFY   96
 #define PR_SET_NO_NEW_PRIVS 38
 #define PR_GET_NO_NEW_PRIVS 39
 #define PR_SECOS_GET_CAPS   0x53430001

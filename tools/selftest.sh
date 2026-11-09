@@ -37,6 +37,10 @@ done
 # image with the pre-login console policy (make CONSOLE=root). A gate that
 # tests the console login itself passes CONSOLE=login on its make line.
 export CONSOLE=root
+# Every gate that boots through tools/smoke.sh builds its own kernel first
+# (often `make CFLAGS_EXTRA=-D<demo>`): smoke must boot that kernel.bin, not
+# rebuild it with the default flags (the Makefile tracks compiler flags).
+export SMOKE_KEEP_KERNEL=1
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -2052,6 +2056,30 @@ done
 [ "$(grep -c 'SW-VIOLATION client' "$WMLOG")" -eq 5 ]; check "GUI wm: exactly the 5 hostile clients were disconnected" $?
 ! grep -q "SWE-STILL-CONNECTED" "$WMLOG"; check "GUI wm: no hostile client stayed connected" $?
 
+# ============================================================================
+# [U5] TASKMGR GATE: /bin/taskmgr (LVGL task manager) in an unprivileged user's
+# desktop. tools/gui_wm_drive.py --taskmgr checks /proc/net/dev, creates the
+# user tmu (video/input), starts `startgui --trace --auto` as tmu, opens the
+# task manager from the panel and with Ctrl+Shift+Esc (one instance), and
+# drives it by its TASKMGR-* markers: the list holds init and bash, one CPU
+# graph per -smp CPU, a `sleep 1000` from the GUI terminal ends after End task
+# + confirm (SIGTERM), root's `sleep 2000` and init are refused (Access
+# denied, no signal) and survive, no [AUDIT] DENY for the task manager.
+# ============================================================================
+TMLOG=/tmp/secos_selftest_taskmgr.log
+TMDRV=/tmp/secos_selftest_taskmgr.drv
+TMSMP=${TASKMGR_SMP:-$SELFTEST_SMP}
+echo "[selftest] Running TASKMGR gate (task manager in a user session, -smp $TMSMP, serial+QMP, <=420s)..."
+: > "$TMDRV"
+timeout 450 python3 tools/gui_wm_drive.py --taskmgr --smp "$TMSMP" --log "$TMLOG" --out "$TMDRV" --timeout 420 >/dev/null 2>&1
+for t in procnetdev-format tm-setup tm-wm-ready tm-user-session tm-panel-button tm-window-opens tm-runs-as-user \
+         tm-cpus tm-cpu-graphs tm-list-init-bash tm-list-users tm-shortcut-single-instance tm-pixels tm-sort-click \
+         tm-select-row tm-confirm-dialog tm-sigterm tm-gone tm-gone-from-list tm-select-root-row tm-refused \
+         tm-refused-no-signal tm-refused-init-keyboard tm-tab-performance tm-perf-pixels tm-nic-listed tm-tab-users \
+         tm-close tm-shortcut-open tm-exit-gui tm-user-sleep-ended tm-root-sleep-survived tm-no-audit-deny tm-no-panic; do
+    grep -q "\[WM-DRV\] $t OK" "$TMDRV"; check "TASKMGR: $t" $?
+done
+
 GUIKLOG=/tmp/secos_selftest_gui_it.log
 GUIKDRV=/tmp/secos_selftest_gui_it.drv
 echo "[selftest] Building KEYMAP=it image + USB HID keyboard gate (<=300s)..."
@@ -2093,6 +2121,34 @@ if command -v mkfs.ext4 >/dev/null 2>&1 && command -v debugfs >/dev/null 2>&1 &&
     rm -f "$PERSIST_OUT"
 else
     echo "  [SKIP] M41 persistent root gate (needs mkfs.ext4, debugfs, ssh-keygen)"
+fi
+
+# ============================================================================
+# [U6] PKG2 GATE: package installer v2 + a grown root. tools/pkg2_test.sh: a
+# 1 GiB root with data grown to 8 GiB (make grow-root), a ~200 MB package from
+# an exFAT transfer disk (make pkgdisk) installed / checked / removed with no
+# leftovers, tampered and out-of-tree packages refused, kill -9 and a power
+# cut during upgrades leave one whole version. Then the M41 persist test on a
+# grown disk (tools/persist_test.sh --grow). PKG2_BIG_MB / PKG2_KILLS resize it.
+# ============================================================================
+if command -v mkfs.ext4 >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1 && command -v debugfs >/dev/null 2>&1; then
+    for g in "tools/pkg2_test.sh --big-mb ${PKG2_BIG_MB:-200} --kills ${PKG2_KILLS:-6}" \
+             "tools/persist_test.sh --grow --crash-runs ${PERSIST_CRASH_RUNS:-2}"; do
+        echo "[selftest] PKG2 gate: $g ..."
+        PKG2_OUT=$(mktemp /tmp/secos_selftest_pkg2.XXXXXX)
+        $g >"$PKG2_OUT" 2>&1
+        while IFS= read -r l; do
+            case "$l" in
+                "  [PASS] "*) check "${l#  \[PASS\] }" 0 ;;
+                "  [FAIL] "*) check "${l#  \[FAIL\] }" 1 ;;
+                "    "*) echo "$l" ;;
+            esac
+        done <"$PKG2_OUT"
+        grep -q "RESULT:" "$PKG2_OUT" || { check "PKG2 gate ran to completion ($g)" 1; tail -20 "$PKG2_OUT"; }
+        rm -f "$PKG2_OUT"
+    done
+else
+    echo "  [SKIP] PKG2 gate (needs mkfs.ext4, resize2fs, debugfs)"
 fi
 
 # ============================================================================

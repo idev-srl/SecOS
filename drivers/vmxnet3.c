@@ -426,6 +426,8 @@ static void vmxnet3_poll(net_dev_t* dev) {
 
         if (rxd_idx < VMXNET3_RX_RING_SIZE && len > 0 && len <= VMXNET3_RX_BUF_SIZE && eop) {
             net_rx(dev, g_rx_buf[rxd_idx], len);
+        } else {
+            net_dev_rx_error(dev);              /* [U5] bad index/length or not EOP */
         }
 
         /* Refill that RxDesc and hand it back to the device with the current gen. */

@@ -109,3 +109,22 @@ top), then **sign** the resulting SecOS-native ELF. SecOS does **not** run
 unmodified Linux binaries (no Linux syscall layer or dynamic linker) — that would
 import Linux's entire ABI/attack surface and break the security thesis. The
 signature is the integrator's admission of vetted, recompiled software.
+
+## 8. Packages (`.spkg`)
+
+Packages use the same rule as ELFs: `digest = SHA-256(whole file, the 64
+signature bytes zeroed)`, Ed25519 over the digest, signature = the last 64
+bytes of the file, made by `tools/secos-pkg` with the same key.
+
+- **v1** (M32): installed by the kernel shell (`pkg install`), which hashes
+  and verifies in the kernel (`kernel/pkg.c`).
+- **v2** (U6): installed by `/bin/spkg` in user space. A package can be many
+  GiB, so spkg hashes it as a stream and passes only the 32-byte digest and
+  the signature to the kernel: `SYS_SIGVERIFY` (96) checks them against the
+  trusted key and the revocation list with the ELF rule. The trust root (the
+  key, the revocation list, a future keyring) stays in the kernel; the user
+  space part computes a hash, which a caller could skip anyway, so the call
+  needs no privilege. Executables inside a package are still verified at
+  every exec: the package signature is what protects the files exec never
+  checks (headers, libraries, data, configuration). Format and installer:
+  `docs/devlog/U6-pkg2.md`.

@@ -244,6 +244,10 @@ static void e1000e_poll(net_dev_t* dev) {
             uint32_t len = rd->length;
             if (len > 0 && len <= E1000_BUF_SIZE)
                 net_rx(dev, g_rx_buf[idx], len);
+            else
+                net_dev_rx_error(dev);              /* [U5] bad length */
+        } else {
+            net_dev_rx_error(dev);                  /* [U5] spans buffers */
         }
         /* Recycle: reset the descriptor and hand it back to the NIC. */
         rd->status = 0;

@@ -70,6 +70,23 @@ CFLAGS  = -ffreestanding -O2 -nostdlib -lgcc -m64 -mcmodel=kernel -fno-pic -fno-
 DEPFLAGS = -MMD -MP
 CFLAGS  += $(DEPFLAGS)
 LDFLAGS = -n -T linker.ld
+# Compiler-flag tracking: -MMD tracks headers, not flags, so an object built
+# with other flags (CFLAGS_EXTRA, KEYMAP, a compiler upgrade...) was linked as
+# is. That happened: a months-old tsc.o with the pre-M44 %gs:0x28 stack canary
+# panicked the boot. FLAGS_STAMP holds the effective compiler/assembler flags
+# and the compiler version, and is rewritten (at parse time, with $(file), so
+# quotes in the defines need no shell escaping) only when they change; every
+# kernel object depends on it. BUILD_TS and GIT_HASH are left out, or every
+# build (and every commit) would recompile everything; as before, they are
+# refreshed only in the files that get recompiled.
+FLAGS_STAMP := .cflags.stamp
+FLAGS_SIG := cc=$(CC) $(shell $(CC) -dumpfullversion 2>/dev/null) \
+	cflags=$(filter-out -DBUILD_TS=% -DGIT_HASH=%,$(CFLAGS)) as=$(AS) asflags=$(ASFLAGS)
+ifneq ($(file <$(FLAGS_STAMP)),$(FLAGS_SIG))
+$(file >$(FLAGS_STAMP),$(FLAGS_SIG))
+endif
+$(FLAGS_STAMP):
+	$(file >$@,$(FLAGS_SIG))
 
 SRC_ASM = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_asm.asm $(ARCH_DIR)/syscall_asm.asm $(ARCH_DIR)/context_switch_asm.asm \
           $(ARCH_DIR)/uaccess.asm
@@ -195,6 +212,9 @@ KASLR_CORE = $(BOOT_DIR)/kaslr_core.o
 OBJS     = $(OBJS_ASM) $(OBJS_C) $(AP_TRAMPOLINE) $(KERNEL_NOTE) $(KASLR_CORE) $(ATH9K_HW)
 DEPS     = $(OBJS_C:%.o=%.d)
 -include $(DEPS)
+# Every object built here is rebuilt when the flags change (not the prebuilt,
+# committed ath9k_hw.o).
+$(filter-out $(ATH9K_HW),$(OBJS)): $(FLAGS_STAMP)
 
 # Keep `make` (no target) building the kernel: the rule below would otherwise be
 # the first target in the file and become the default goal.
@@ -451,7 +471,7 @@ user-progs: libcrypt
 	python3 tools/secos-sign user/coreutils.elf --dev
 	python3 tools/elf2h.py user/coreutils.elf user_coreutils_elf crypto/user_coreutils_elf.h
 	# [M32] signed package (.spkg): a dir + a text file, sealed with the dev key
-	python3 tools/secos-pkg create user/testpkg.spkg user/pkg_motd.txt:/etc/pkg-motd.txt --mkdir /opt/pkgdir user/pkg_motd.txt:/opt/pkgdir/info.txt
+	python3 tools/secos-pkg create user/testpkg.spkg --v1 user/pkg_motd.txt:/etc/pkg-motd.txt --mkdir /opt/pkgdir user/pkg_motd.txt:/opt/pkgdir/info.txt
 	python3 tools/elf2h.py user/testpkg.spkg user_testpkg_spkg crypto/user_testpkg_spkg.h
 	# [M32] init/service-manager + a demo service (signed)
 	$(CC) $(USER_CFLAGS) -c user/svc_demo.c    -o user/svc_demo.o
@@ -632,7 +652,8 @@ user-progs: libcrypt
 	$(MAKE) --no-print-directory acct-progs
 	$(MAKE) --no-print-directory m46-progs
 	$(MAKE) --no-print-directory udrv-progs
-	@echo "user-progs: built+signed hello + udrv_edu + udrv_negtest + udrv_user + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + smptest + pcstress + fsstress + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest -> crypto/*.h"
+	$(MAKE) --no-print-directory pkg-progs
+	@echo "user-progs: built+signed hello + udrv_edu + udrv_negtest + udrv_user + ipc_send + ipc_recv + spin + m31_libc + coreutils + testpkg.spkg + svc_demo + init + maxmem + crashtest + m16_{child,parent} + m17_sleeper + m18_mem + m19_fork + m20_mmap + m23_fs + m24_net{,_nonet} + m25_pipe + m30_sig + m39_posix + m35_caps + sysfuzz + smptest + pcstress + fsstress + uaccess_test + abi_test + kitest + pipe_test + power + netcfg + exectest{,_unsigned} + ttytest + ptytest + fbdemo + guitest{,_nocap} + loadkeys + secwm + sysinfo + swptest + spkg -> crypto/*.h"
 
 # [M57] Ring-3 driver test programs (docs/devlog/M57-udrv-core.md): udrv_edu
 # (positive: edu BAR, IRQ fd, DMA) and udrv_negtest (inputs the kernel must
@@ -654,6 +675,23 @@ udrv-progs:
 	    python3 tools/secos-sign user/$$n.elf --dev || exit 1; \
 	    python3 tools/elf2h.py user/$$n.elf user_$${n}_elf crypto/user_$${n}_elf.h || exit 1; \
 	done
+
+# [U6] /bin/spkg, the package installer v2 (docs/devlog/U6-pkg2.md): confined
+# manifest (CAP_ENFORCE|FS_READ|FS_WRITE|SIGNAL|TIME), SHA-256 from crypto/,
+# the signature itself is checked by the kernel (SYS_SIGVERIFY).
+.PHONY: pkg-progs
+pkg-progs:
+	$(CC) $(USER_CFLAGS) -c user/crt0.S       -o user/crt0.o
+	$(CC) $(USER_CFLAGS) -c user/note_spkg.S  -o user/note_spkg.o
+	$(CC) $(USER_CFLAGS) -c user/libsecos.c   -o user/libsecos.o
+	$(CC) $(USER_CFLAGS) -c user/libc.c       -o user/libc.o
+	$(CC) $(USER_CFLAGS) -c user/spkg.c       -o user/spkg.o
+	$(CC) $(USER_CFLAGS) -c crypto/sha256.c   -o user/sha256_u.o
+	$(LD) --gc-sections -T user/user.ld -o user/spkg.elf user/crt0.o user/note_spkg.o user/libsecos.o user/libc.o \
+	    user/spkg.o user/sha256_u.o
+	python3 tools/secos-sign user/spkg.elf --dev
+	python3 tools/elf2h.py user/spkg.elf user_spkg_elf crypto/user_spkg_elf.h
+	@echo "pkg-progs: built+signed spkg -> crypto/user_spkg_elf.h"
 
 # [M46] Exec confinement selftest (docs/devlog/M46-exec-confinement.md): one
 # source, three signed manifests -- m46conf (confined driver), m46probe (ambient
@@ -959,18 +997,46 @@ sysdisk-ext4-csum: sysroot-stage
 # MB2/ISO path (i440fx, -boot d so SeaBIOS boots the CD) and the UEFI/q35 path.
 ROOT      ?= disk
 ROOT_IMG  ?= secos-root.img
-ROOT_SIZE ?= 1G
+ROOT_SIZE ?= 8G
 ROOT_DRIVE := $(if $(filter ram,$(ROOT)),,-drive file=$(ROOT_IMG),if=virtio,format=raw)
 ROOT_DEP   := $(if $(filter ram,$(ROOT)),,root-img)
-.PHONY: root-img reset-root
+.PHONY: root-img reset-root grow-root
 root-img:
 	@bash tools/mkroot.sh $(ROOT_IMG) $(ROOT_SIZE)
 reset-root:
 	@bash tools/mkroot.sh --reset $(ROOT_IMG) $(ROOT_SIZE)
+# [U6] Grow an existing system disk in place, offline (SecOS shut down):
+#   make grow-root                         secos-root.img -> 8 GiB
+#   make grow-root SIZE=16G ROOT_IMG=...   another size / image
+# e2fsck before and after, resize2fs in between, a sparse backup copy first
+# (BACKUP=0 skips it). Nothing on the disk changes but its size.
+SIZE ?= 8G
+grow-root:
+	@bash tools/growroot.sh $(ROOT_IMG) $(SIZE)
+
+# [U6] Transfer disk for packages: an exFAT image holding the given .spkg
+# files (each verified on the host first), for `spkg install` in SecOS:
+#   make pkgdisk PKGS="a.spkg b.spkg"           -> pkgdisk.img
+#   make run-serial PKGDISK=pkgdisk.img          attached as USB storage (usb0)
+#   (SecOS) mount -t exfat /dev/usb0 /media; spkg install /media/a.spkg
+# For VMware: `make pkgdisk-vmdk` converts it (attach as a second SATA disk).
+PKGS ?=
+PKGDISK_IMG ?= pkgdisk.img
+.PHONY: pkgdisk pkgdisk-vmdk
+pkgdisk:
+	@bash tools/mkpkgdisk.sh $(PKGDISK_IMG) $(PKGS)
+pkgdisk-vmdk: pkgdisk
+	qemu-img convert -f raw -O vmdk $(PKGDISK_IMG) $(PKGDISK_IMG:.img=.vmdk)
+	@echo "pkgdisk-vmdk: $(PKGDISK_IMG:.img=.vmdk)"
+# Any run target: PKGDISK=<image> attaches it as a USB stick (always probed,
+# also next to the virtio root disk).
+PKGDISK ?=
+PKGDISK_DEV := $(if $(PKGDISK),-drive if=none$(comma)id=pkgdisk$(comma)file=$(PKGDISK)$(comma)format=raw -device usb-storage$(comma)drive=pkgdisk,)
+PKGDISK_HCI := $(if $(PKGDISK),-device qemu-xhci,)
 
 # Run with QEMU (graphical window — needs a working display backend)
 run: iso $(ROOT_DEP)
-	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -debugcon stdio -global isa-debugcon.iobase=0xe9
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -debugcon stdio -global isa-debugcon.iobase=0xe9 $(PKGDISK_HCI) $(PKGDISK_DEV)
 
 # Run headless with a virtio-blk disk attached (debugcon to stdio).
 .PHONY: run-disk
@@ -982,7 +1048,7 @@ run-disk: iso
 # No GUI/VNC needed (works where WSLg/GTK does not). Ctrl-A X to quit QEMU.
 .PHONY: run-serial
 run-serial: iso $(ROOT_DEP)
-	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -serial stdio -display none -no-reboot
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -serial stdio -display none -no-reboot $(PKGDISK_HCI) $(PKGDISK_DEV)
 
 # Serial console + an e1000 NIC with host port SSH_PORT (default 2222) forwarded
 # to guest :22, for the Dropbear SSH server (docs/SSH.md). -cpu max gives the
@@ -991,7 +1057,7 @@ SSH_PORT ?= 2222
 .PHONY: run-ssh
 run-ssh: iso $(ROOT_DEP)
 	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -m 512M -cpu max -serial stdio -display none -no-reboot \
-		-netdev user,id=n0,hostfwd=tcp::$(SSH_PORT)-:22 -device e1000,netdev=n0
+		-netdev user,id=n0,hostfwd=tcp::$(SSH_PORT)-:22 -device e1000,netdev=n0 $(PKGDISK_HCI) $(PKGDISK_DEV)
 
 # Graphical UI in a GTK window (docs/GUI.md): PS/2 keyboard + a USB tablet, so
 # the guest pointer follows the host cursor without a mouse grab. Type
@@ -1013,12 +1079,12 @@ run-gui: iso $(ROOT_DEP)
 	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -m $(GUI_MEM) -smp $(GUI_SMP) -cpu max -display gtk \
 		-device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 \
 		-netdev user,id=n0,hostfwd=tcp::$(GUI_SSH_PORT)-:22 -device e1000,netdev=n0 \
-		-debugcon file:secos-gui.log -global isa-debugcon.iobase=0xe9
+		-debugcon file:secos-gui.log -global isa-debugcon.iobase=0xe9 $(PKGDISK_DEV)
 
 # Run with a VNC server on :0 (connect a VNC viewer to localhost:5900)
 .PHONY: run-vnc
 run-vnc: iso $(ROOT_DEP)
-	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -display vnc=:0 -debugcon stdio -global isa-debugcon.iobase=0xe9
+	qemu-system-x86_64 -cdrom $(ISO) -boot d $(ROOT_DRIVE) -display vnc=:0 -debugcon stdio -global isa-debugcon.iobase=0xe9 $(PKGDISK_HCI) $(PKGDISK_DEV)
 
 # [M50] Lock validator run: a -DSECOS_LOCKDEP image through the SMP stress
 # (-smp 4/8), the network stress and a bkl=off boot; must stay free of
@@ -1045,11 +1111,12 @@ bklstress:
 # Clean generated files
 clean:
 	# keep the committed prebuilt ath9k_hw.o (rebuilding it needs network + upstream sources)
-	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP) $(CONSOLE_STAMP) $(BKL_STAMP)
+	rm -f $(filter-out $(ATH9K_HW),$(OBJS)) $(DEPS) $(KERNEL) $(KEYMAP_STAMP) $(GUI_STAMP) $(CONSOLE_STAMP) $(BKL_STAMP) $(FLAGS_STAMP)
 	rm -f $(BOOT_DIR)/ap_trampoline.bin $(BOOT_DIR)/kaslr_core.raw.o
 	rm -f build/kernel.pass1.elf build/kernel.pass2.elf $(KASLR_BIN) $(KASLR_OBJ)
 	rm -rf $(ISODIR) $(ISO) grub-mkrescue.log
 	rm -rf $(DIST_DIR) $(UEFI_LOADER_ELF)
+	rm -f $(UEFI_CRT0) $(UEFI_OBJS) $(UEFI_CRYPTO_OBJS) $(UEFI_FLAGS_STAMP)
 
 tree:
 	@echo "ASM: $(SRC_ASM)"
@@ -1073,6 +1140,17 @@ ifeq ($(SECURE_BOOT),1)
 UEFI_CFLAGS += -DSECOS_SECURE_BOOT
 endif
 UEFI_CRT0 = uefi/crt0.o
+
+# Same flag tracking as the kernel (FLAGS_STAMP): e.g. a SECURE_BOOT=0 build
+# must not leave a non-enforcing loader object behind for the next build.
+UEFI_FLAGS_STAMP := .uefi-cflags.stamp
+UEFI_FLAGS_SIG := cc=$(CC) $(shell $(CC) -dumpfullversion 2>/dev/null) cflags=$(UEFI_CFLAGS)
+ifneq ($(file <$(UEFI_FLAGS_STAMP)),$(UEFI_FLAGS_SIG))
+$(file >$(UEFI_FLAGS_STAMP),$(UEFI_FLAGS_SIG))
+endif
+$(UEFI_FLAGS_STAMP):
+	$(file >$@,$(UEFI_FLAGS_SIG))
+$(UEFI_CRT0) $(UEFI_OBJS) $(UEFI_CRYPTO_OBJS): $(UEFI_FLAGS_STAMP)
 
 uefi/%.o: uefi/%.c uefi/efi.h $(BOOT_DIR)/kaslr.h
 	$(CC) $(UEFI_CFLAGS) -c $< -o $@

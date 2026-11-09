@@ -72,6 +72,7 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_guitest_elf.h"
 #include "../crypto/user_guitest_nocap_elf.h"
 #include "../crypto/user_loadkeys_elf.h"
+#include "../crypto/user_spkg_elf.h"     // [U6] package installer v2
 #include "../crypto/user_secwm_elf.h"
 #include "../crypto/user_sysinfo_elf.h"
 #include "../crypto/user_swptest_elf.h"
@@ -80,6 +81,7 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_udrv_edu_elf.h"
 #include "../crypto/user_udrv_negtest_elf.h"
 #include "../crypto/user_udrv_user_elf.h"
+#include "../crypto/user_taskmgr_elf.h"  // [U5] LVGL task manager (make port-lvgl)
 #ifndef SECOS_NO_BUSYBOX
 #include "../crypto/user_busybox_elf.h"
 #include "../crypto/user_bbstub_elf.h"
@@ -376,6 +378,7 @@ static void build_table(void){
     sf_bin("guitest", user_guitest_elf, user_guitest_elf_len);
     sf_bin("guitest_nocap", user_guitest_nocap_elf, user_guitest_nocap_elf_len);
     sf_bin("loadkeys", user_loadkeys_elf, user_loadkeys_elf_len);
+    sf_bin("spkg", user_spkg_elf, user_spkg_elf_len);                 // [U6]
     sf_bin("secwm", user_secwm_elf, user_secwm_elf_len);
     sf_alias("startgui", "secwm", user_secwm_elf, user_secwm_elf_len, 0);
     sf_bin("sysinfo", user_sysinfo_elf, user_sysinfo_elf_len);
@@ -385,6 +388,7 @@ static void build_table(void){
     sf_bin("udrv_edu", user_udrv_edu_elf, user_udrv_edu_elf_len);
     sf_bin("udrv_negtest", user_udrv_negtest_elf, user_udrv_negtest_elf_len);
     sf_bin("udrv_user", user_udrv_user_elf, user_udrv_user_elf_len);
+    sf_bin("taskmgr", user_taskmgr_elf, user_taskmgr_elf_len);   // [U5]
 #ifndef SECOS_NO_BUSYBOX
     // BusyBox 1.36.1 from source: replaces the coreutils applets of the same
     // name. On ramfs every applet is the signed re-exec stub (user/bbstub.c).

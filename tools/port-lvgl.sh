@@ -4,7 +4,9 @@
 # libc with user/lvgl/lv_conf.h (features not enabled there compile to
 # nothing), links the LVGL system monitor (user/lvgl/sysmon.c) as an SWP client
 # of secwm with the confined manifest, signs it and embeds it as
-# crypto/user_sysmon_elf.h. LVGL is MIT (docs/licenses/lvgl-9.2.2-LICENCE.txt).
+# crypto/user_sysmon_elf.h. [U5] The task manager (user/lvgl/taskmgr.c) is
+# linked the same way with user/note_taskmgr.S (confined + CAP_SIGNAL) ->
+# crypto/user_taskmgr_elf.h, installed as /bin/taskmgr. LVGL is MIT (docs/licenses/lvgl-9.2.2-LICENCE.txt).
 # See docs/GUI.md.  SPDX-License-Identifier: MIT
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,11 +47,12 @@ printf '%s\0' "${LFLAGS[@]}" > "$OBJ/.flags"
         mapfile -d "" fl < "$OBJ/.flags"
         gcc "${fl[@]}" -c "$src" -o "$o" || { echo "[port-lvgl] FAILED: $1"; exit 255; }' _ {}
 
-echo "[port-lvgl] 3/4 compile + link sysmon"
+echo "[port-lvgl] 3/4 compile + link sysmon + taskmgr"
 UF=(-ffreestanding -nostdlib -fno-pie -no-pie -mno-red-zone -mcmodel=large -m64 -O2 -Wall
     -ffunction-sections -fdata-sections -I"$ROOT/user" -I"$ROOT/user/include" -I"$ROOT/user/secwm")
 gcc "${UF[@]}" -c "$ROOT/user/crt0.S" -o "$OBJ/crt0.o.u"
 gcc "${UF[@]}" -c "$ROOT/user/note_confined.S" -o "$OBJ/note_confined.o.u"
+gcc "${UF[@]}" -c "$ROOT/user/note_taskmgr.S" -o "$OBJ/note_taskmgr.o.u"
 gcc "${UF[@]}" -c "$ROOT/user/libsecos.c" -o "$OBJ/libsecos.o.u"
 gcc "${UF[@]}" -c "$ROOT/user/libc.c" -o "$OBJ/libc.o.u"
 gcc "${UF[@]}" -c "$ROOT/user/libm.c" -o "$OBJ/libm.o.u"
@@ -60,8 +63,15 @@ ld --gc-sections -T "$ROOT/user/user.ld" -o "$ROOT/user/lvgl/sysmon.elf" \
     "$OBJ/crt0.o.u" "$OBJ/note_confined.o.u" "$OBJ/libsecos.o.u" "$OBJ/libc.o.u" "$OBJ/libm.o.u" \
     "$OBJ/sysmon.o.u" "$OBJ/swpc.o.u" "$OBJ/gfx.o.u" "$OBJ"/*.o 2>&1 | grep -v "not in segment" || true
 [ -s "$ROOT/user/lvgl/sysmon.elf" ] || { echo "[port-lvgl] link failed"; exit 1; }
+gcc "${LFLAGS[@]}" -Wall -Wextra -c "$ROOT/user/lvgl/taskmgr.c" -o "$OBJ/taskmgr.o.u"
+ld --gc-sections -T "$ROOT/user/user.ld" -o "$ROOT/user/lvgl/taskmgr.elf" \
+    "$OBJ/crt0.o.u" "$OBJ/note_taskmgr.o.u" "$OBJ/libsecos.o.u" "$OBJ/libc.o.u" "$OBJ/libm.o.u" \
+    "$OBJ/taskmgr.o.u" "$OBJ/swpc.o.u" "$OBJ/gfx.o.u" "$OBJ"/*.o 2>&1 | grep -v "not in segment" || true
+[ -s "$ROOT/user/lvgl/taskmgr.elf" ] || { echo "[port-lvgl] taskmgr link failed"; exit 1; }
 
 echo "[port-lvgl] 4/4 sign + embed"
 python3 "$ROOT/tools/secos-sign" "$ROOT/user/lvgl/sysmon.elf" --dev
 python3 "$ROOT/tools/elf2h.py" "$ROOT/user/lvgl/sysmon.elf" user_sysmon_elf "$ROOT/crypto/user_sysmon_elf.h"
-ls -l "$ROOT/user/lvgl/sysmon.elf"
+python3 "$ROOT/tools/secos-sign" "$ROOT/user/lvgl/taskmgr.elf" --dev
+python3 "$ROOT/tools/elf2h.py" "$ROOT/user/lvgl/taskmgr.elf" user_taskmgr_elf "$ROOT/crypto/user_taskmgr_elf.h"
+ls -l "$ROOT/user/lvgl/sysmon.elf" "$ROOT/user/lvgl/taskmgr.elf"

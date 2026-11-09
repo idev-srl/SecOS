@@ -34,4 +34,10 @@ void elf_sign_revoke_key(uint32_t key_id);
 int  elf_sign_key_revoked(uint32_t key_id);
 int  elf_sign_revoked_count(void);   /* [M51-C6] entries in the revocation list */
 
+/* [U6] Verify an Ed25519 signature over an already-computed 32-byte digest
+ * (packages hashed by /bin/spkg as a stream, SYS_SIGVERIFY). Same trust rule as
+ * elf_signature_verify: the key_id must not be revoked, the signature must
+ * verify against the trusted key. Returns ELF_SIG_OK or ELF_SIG_BAD. */
+int  secos_sig_verify_digest(const uint8_t digest[32], const uint8_t sig[64], uint32_t key_id);
+
 #endif /* SECOS_ELF_SIGN_H */

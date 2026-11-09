@@ -9,6 +9,7 @@
  *
  *   /proc/{meminfo,uptime,loadavg,stat,version,cpuinfo,mounts,filesystems,
  *          kmsg,cmdline}
+ *   /proc/net/dev         [U5] per-NIC traffic counters (Linux format)
  *   /proc/self            -> symlink to the caller's pid
  *   /proc/<pid>/{stat,status,statm,cmdline,comm,environ,maps}
  *   /proc/<pid>/{cwd,exe,root} (symlinks), /proc/<pid>/fd/ (one symlink per
@@ -31,6 +32,7 @@
 #include "kclock.h"
 #include "../kernel/signal.h"
 #include "pci.h"
+#include "../net/net.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -81,6 +83,7 @@ enum pk {
     PK_MOUNTS, PK_FILESYSTEMS, PK_KMSG, PK_CMDLINE_K, PK_SMP, PK_LOCKSTAT,
     PK_BUS, PK_BUS_PCI, PK_PCI_DEVICES, PK_PCI_TOPOLOGY,   /* [M53a] /proc/bus/pci */
     PK_INTERRUPTS, PK_IOMMU, PK_UDRV,
+    PK_NET, PK_NET_DEV,              /* [U5] /proc/net, /proc/net/dev */
     PK_PID_DIR, PK_PID_STAT, PK_PID_STATUS, PK_PID_STATM, PK_PID_CMDLINE,
     PK_PID_COMM, PK_PID_ENVIRON, PK_PID_MAPS, PK_PID_CWD, PK_PID_EXE,
     PK_PID_ROOT, PK_PID_FDDIR, PK_PID_FD,
@@ -96,6 +99,7 @@ static const struct { const char* name; int kind; } g_top[] = {
     {"mounts",PK_MOUNTS}, {"filesystems",PK_FILESYSTEMS}, {"kmsg",PK_KMSG},
     {"cmdline",PK_CMDLINE_K}, {"smp",PK_SMP}, {"lockstat",PK_LOCKSTAT},
     {"interrupts",PK_INTERRUPTS}, {"iommu",PK_IOMMU}, {"udrv",PK_UDRV},
+    {"net",PK_NET},
 };
 #define NTOP (int)(sizeof(g_top)/sizeof(g_top[0]))
 static const struct { const char* name; int kind; } g_pidf[] = {
@@ -306,6 +310,32 @@ static void gen_stat(struct sb* s){
     struct run_ctx r={0,0}; process_foreach(run_cb,&r);
     sb_str(s,"\nprocs_running "); sb_u64(s,(uint64_t)(r.run?r.run:1));
     sb_str(s,"\nprocs_blocked 0\n");
+}
+/* [U5] /proc/net/dev in the Linux layout (net/core/net-procfs.c): two header
+ * lines, then one line per NIC with 8 receive and 8 transmit columns. SecOS
+ * has no loopback device and no fifo/frame/compressed/multicast/colls/carrier
+ * accounting: those columns are 0. The counters are read without a lock (see
+ * net_dev_stats_t in net/net.h). */
+static void gen_net_dev(struct sb* s){
+    sb_str(s,"Inter-|   Receive                                                |  Transmit\n");
+    sb_str(s," face |bytes    packets errs drop fifo frame compressed multicast|"
+             "bytes    packets errs drop fifo colls carrier compressed\n");
+    int n = net_dev_count();
+    for(int i=0;i<n;i++){
+        const net_dev_t* d = net_get_dev(i);
+        if(!d) continue;
+        int nl=0; while(nl<15 && d->name[nl]) nl++;
+        for(int k=nl;k<6;k++) sb_putc(s,' ');
+        for(int k=0;k<nl;k++) sb_putc(s,d->name[k]);
+        sb_putc(s,':');
+        const volatile net_dev_stats_t* st = &d->stats;
+        sb_u64w(s,st->rx_bytes,8,' ');   sb_putc(s,' '); sb_u64w(s,st->rx_packets,7,' '); sb_putc(s,' ');
+        sb_u64w(s,st->rx_errors,4,' ');  sb_putc(s,' '); sb_u64w(s,st->rx_dropped,4,' ');
+        sb_str(s,"    0     0          0         0 ");
+        sb_u64w(s,st->tx_bytes,8,' ');   sb_putc(s,' '); sb_u64w(s,st->tx_packets,7,' '); sb_putc(s,' ');
+        sb_u64w(s,st->tx_errors,4,' ');  sb_putc(s,' '); sb_u64w(s,st->tx_dropped,4,' ');
+        sb_str(s,"    0     0       0          0\n");
+    }
 }
 static void gen_version(struct sb* s){
     sb_str(s,"SecOS version 0.1.0-dev (gcc) #1 SMP build "); sb_str(s, BUILD_TS);
@@ -606,7 +636,7 @@ static void gen_udrv(struct sb* s){ udrv_generate(lockstat_emit, s); }
  * whose effective ids equal all of the target's ids (cred_may_inspect). */
 static int is_private(int k){ return k==PK_PID_ENVIRON||k==PK_PID_MAPS||k==PK_PID_CWD||k==PK_PID_EXE||
                                      k==PK_PID_ROOT||k==PK_PID_FDDIR||k==PK_PID_FD; }
-static int is_dir(int k){ return k==PK_ROOT||k==PK_PID_DIR||k==PK_PID_FDDIR||k==PK_BUS||k==PK_BUS_PCI; }
+static int is_dir(int k){ return k==PK_ROOT||k==PK_NET||k==PK_PID_DIR||k==PK_PID_FDDIR||k==PK_BUS||k==PK_BUS_PCI; }
 
 /* Generate node `key` into g_genbuf; returns its length (-1 = gone). Caller
  * holds g_proc_lock. kmsg is served straight from the log ring instead. */
@@ -650,6 +680,7 @@ static int gen_key(uint64_t key){
 #endif
         sb_putc(&s,'\n'); break; }
     case PK_SMP: gen_smp(&s); break;
+    case PK_NET_DEV: gen_net_dev(&s); break;
     case PK_LOCKSTAT: gen_lockstat(&s); break;
     case PK_PCI_DEVICES: gen_pci_devices(&s); break;
     case PK_PCI_TOPOLOGY: gen_pci_topology(&s); break;
@@ -677,6 +708,7 @@ static void name_of(uint64_t key, char* out){
     int k=K_KIND(key); int o=0;
     out[0]=0;
     for(int i=0;i<NTOP;i++) if(g_top[i].kind==k){ const char* n=g_top[i].name; while(*n) out[o++]=*n++; out[o]=0; return; }
+    if(k==PK_NET_DEV){ out[0]='d'; out[1]='e'; out[2]='v'; out[3]=0; return; }
     if(k==PK_SELF){ out[0]='s'; out[1]='e'; out[2]='l'; out[3]='f'; out[4]=0; return; }
     {   /* [M53a] */
         const char* nm = k==PK_BUS ? "bus" : k==PK_BUS_PCI ? "pci" : k==PK_PCI_DEVICES ? "devices" :
@@ -777,6 +809,10 @@ static uint64_t path_key(const char* rel){
         }
         return 0;
     } else if(parse_u32(c1,n1,&pid)!=0){
+        if(seq(c1,"net")){                      /* [U5] /proc/net[/dev] */
+            if(!*rest) return KEY(PK_NET,0,0);
+            return seq(rest,"dev") ? KEY(PK_NET_DEV,0,0) : 0;
+        }
         if(*rest) return 0;
         for(int i=0;i<NTOP;i++) if(seq(g_top[i].name,c1)) return KEY(g_top[i].kind,0,0);
         return 0;
@@ -831,6 +867,8 @@ static int procfs_readdir(const char* dir, vfs_iter_cb cb, void* user){
         keys[nk++]=KEY(PK_BUS_PCI,0,0);
     } else if(k==PK_BUS_PCI){
         keys[nk++]=KEY(PK_PCI_DEVICES,0,0); keys[nk++]=KEY(PK_PCI_TOPOLOGY,0,0);
+    } else if(k==PK_NET){
+        keys[nk++]=KEY(PK_NET_DEV,0,0);
     } else if(k==PK_PID_DIR){
         for(int i=0;i<NPIDF;i++) keys[nk++]=KEY(g_pidf[i].kind,K_PID(key),0);
     } else {

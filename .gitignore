@@ -52,3 +52,5 @@ tools/acpi_fuzz/acpi_fuzz
 *.img.list
 .console.stamp
 .bkl-default.stamp
+.cflags.stamp
+.uefi-cflags.stamp
