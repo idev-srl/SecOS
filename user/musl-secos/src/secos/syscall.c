@@ -1042,6 +1042,13 @@ static long dispatch(long n, long a, long b, long c, long d, long e, long f)
         long r = sc1(S_SIGSUSPEND, mask_to_k(*(const uint64_t *)a));
         return r >= 0 ? -EINTR : r;
     }
+    case SYS_pause: {                                /* [U10] = sigsuspend(current mask) */
+        uint64_t cur = 0;
+        long r = x_rt_sigprocmask(SIG_BLOCK, 0, &cur, 8);
+        if (r < 0) return r;
+        r = sc1(S_SIGSUSPEND, mask_to_k(cur));
+        return r >= 0 ? -EINTR : r;
+    }
     case SYS_kill:       return x_kill((int)a, (int)b);
     case SYS_tkill:      return x_kill((int)a, (int)b);           /* tid == pid */
     case SYS_tgkill:     return a == b ? x_kill((int)b, (int)c) : -ESRCH;
