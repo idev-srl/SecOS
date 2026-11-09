@@ -42,7 +42,7 @@ _Static_assert((UDRV_NET_TX_RING & (UDRV_NET_TX_RING - 1)) == 0 && (UDRV_NET_RX_
 
 /* ---------------------------------------------------------- the checks
  * Pure functions (no lock, no side effect): one verdict per shared field.
- * net/net_udrv_test.c (-DSECOS_UDRV_NET_TEST) runs a table through them. */
+ * Kept separate from the ring code so they can be tested on their own. */
 const char* udrv_net_verdict_name(int v) {
     switch (v) {
     case UNV_OK:          return "accepted";
