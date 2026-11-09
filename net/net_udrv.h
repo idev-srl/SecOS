@@ -41,6 +41,16 @@ int  net_udrv_waiting(void);
 /* /proc/udrv: one "net ..." line per proxy. */
 void net_udrv_generate(void (*emit)(void* ctx, const char* line), void* ctx);
 
+/* The per-field checks (pure; see net_udrv.c, tested by net_udrv_test.c). */
+enum { OWN_KERNEL = 0, OWN_TX = 1, OWN_RX = 2 };          /* slot owner */
+enum { UNV_OK = 0, UNV_BAD_INDEX, UNV_SLOT_RANGE, UNV_NOT_OWNED, UNV_BAD_LEN };
+int  udrv_net_check_index(uint32_t prod, uint32_t k_cons, uint32_t ring);
+int  udrv_net_check_rx(uint32_t slot, uint32_t len, const uint8_t* own);
+int  udrv_net_check_txc(uint32_t slot, const uint8_t* own);
+/* Count one rejected entry; 1 when this one must request the kill. */
+int  udrv_net_reject_count(uint32_t* count, int* kill_sent);
+const char* udrv_net_verdict_name(int v);
+
 /* Provided by kernel/udrv.c (called with px->lk held). */
 void udrv_net_notify(void* cookie, uint32_t gen);              /* UDRV_EV_TX_KICK */
 void udrv_net_kill(void* cookie, uint32_t gen, const char* why);

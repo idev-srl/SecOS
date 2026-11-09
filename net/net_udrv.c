@@ -40,7 +40,42 @@ _Static_assert((UDRV_NET_TX_RING & (UDRV_NET_TX_RING - 1)) == 0 && (UDRV_NET_RX_
 #define STALL_MS        5000ull
 #define VIOL_LOG_MAX    UDRV_NET_VIOL_KILL   /* every bad entry up to the kill is logged */
 
-enum { OWN_KERNEL = 0, OWN_TX = 1, OWN_RX = 2 };
+/* ---------------------------------------------------------- the checks
+ * Pure functions (no lock, no side effect): one verdict per shared field.
+ * net/net_udrv_test.c (-DSECOS_UDRV_NET_TEST) runs a table through them. */
+const char* udrv_net_verdict_name(int v) {
+    switch (v) {
+    case UNV_OK:          return "accepted";
+    case UNV_BAD_INDEX:   return "producer index outside the ring";
+    case UNV_SLOT_RANGE:  return "slot index out of range";
+    case UNV_NOT_OWNED:   return "slot not owned by the driver";
+    case UNV_BAD_LEN:     return "length out of range";
+    default:              return "?";
+    }
+}
+
+int udrv_net_check_index(uint32_t prod, uint32_t k_cons, uint32_t ring) {
+    return (prod - k_cons) <= ring ? UNV_OK : UNV_BAD_INDEX;
+}
+
+int udrv_net_check_rx(uint32_t slot, uint32_t len, const uint8_t* own) {
+    if (slot < UDRV_NET_RX_BASE || slot >= UDRV_NET_NSLOTS) return UNV_SLOT_RANGE;
+    if (own[slot] != OWN_RX) return UNV_NOT_OWNED;
+    if (len < UDRV_NET_FRAME_MIN || len > UDRV_NET_FRAME_MAX) return UNV_BAD_LEN;
+    return UNV_OK;
+}
+
+int udrv_net_check_txc(uint32_t slot, const uint8_t* own) {
+    if (slot < UDRV_NET_TX_BASE || slot >= UDRV_NET_TX_BASE + UDRV_NET_TX_SLOTS) return UNV_SLOT_RANGE;
+    if (own[slot] != OWN_TX) return UNV_NOT_OWNED;
+    return UNV_OK;
+}
+
+int udrv_net_reject_count(uint32_t* count, int* kill_sent) {
+    (*count)++;
+    if (*count >= UDRV_NET_VIOL_KILL && !*kill_sent) { *kill_sent = 1; return 1; }
+    return 0;
+}
 
 struct net_udrv {
     net_dev_t        dev;               /* first: poll/transmit get &dev */
@@ -87,7 +122,7 @@ static void ln_px(iommu_line_t* l, const net_udrv_t* px) {
 
 /* A bad entry from the driver (lk held). */
 static void violation(net_udrv_t* px, const char* what, uint32_t idx, uint32_t slot, uint32_t len) {
-    px->viol++;
+    int kill = udrv_net_reject_count(&px->viol, &px->kill_sent);
     px->viol_total++;
     if (px->viol <= VIOL_LOG_MAX) {
         iommu_line_t l; l.n = 0;
@@ -101,10 +136,7 @@ static void violation(net_udrv_t* px, const char* what, uint32_t idx, uint32_t s
         iommu_ln_s(&l, " pid="); iommu_ln_dec(&l, px->pid);
         debugcon_writestring(iommu_ln_end(&l));
     }
-    if (px->viol >= UDRV_NET_VIOL_KILL && !px->kill_sent) {
-        px->kill_sent = 1;
-        udrv_net_kill(px->cookie, px->gen, "ring violations");
-    }
+    if (kill) udrv_net_kill(px->cookie, px->gen, "too many rejected ring entries");
 }
 
 static void post_rx_locked(net_udrv_t* px, uint16_t slot) {
@@ -124,20 +156,18 @@ static void reap_tx_locked(net_udrv_t* px) {
     struct udrv_net_ctrl* c = px->ctrl;
     uint32_t prod = __atomic_load_n(&c->txc_prod, __ATOMIC_ACQUIRE);
     uint32_t avail = prod - px->k_txc_cons;
-    if (avail > UDRV_NET_TX_RING) {
-        violation(px, "tx completion index out of range", prod, 0, 0);
+    if (udrv_net_check_index(prod, px->k_txc_cons, UDRV_NET_TX_RING) != UNV_OK) {
+        violation(px, "txc producer index outside the ring", prod, 0, 0);
         return;
     }
     while (avail--) {
         uint32_t idx = px->k_txc_cons & (UDRV_NET_TX_RING - 1);
         uint32_t slot = *(volatile uint16_t*)&c->txc[idx].slot;
         px->k_txc_cons++;
-        if (slot < UDRV_NET_TX_BASE || slot >= UDRV_NET_TX_BASE + UDRV_NET_TX_SLOTS) {
-            violation(px, "tx completion slot out of range", px->k_txc_cons - 1, slot, 0);
-            continue;
-        }
-        if (px->own[slot] != OWN_TX) {
-            violation(px, "tx completion of a slot not given to the driver", px->k_txc_cons - 1, slot, 0);
+        int v = udrv_net_check_txc(slot, px->own);
+        if (v != UNV_OK) {
+            violation(px, v == UNV_SLOT_RANGE ? "txc slot index out of range" : "txc slot not owned by the driver",
+                      px->k_txc_cons - 1, slot, 0);
             continue;
         }
         px->own[slot] = OWN_KERNEL;
@@ -208,8 +238,8 @@ static void px_poll(net_dev_t* dev) {
             dev->link_up = (__atomic_load_n(&c->link, __ATOMIC_RELAXED) == 1);
             uint32_t prod = __atomic_load_n(&c->rx_prod, __ATOMIC_ACQUIRE);
             uint32_t avail = prod - px->k_rx_cons;
-            if (avail > UDRV_NET_RX_RING) {
-                violation(px, "rx producer index out of range", prod, 0, 0);
+            if (udrv_net_check_index(prod, px->k_rx_cons, UDRV_NET_RX_RING) != UNV_OK) {
+                violation(px, "rx producer index outside the ring", prod, 0, 0);
                 avail = 0;
             }
             uint32_t posted = 0;
@@ -220,16 +250,14 @@ static void px_poll(net_dev_t* dev) {
                 e.slot = *(volatile uint16_t*)&c->rx[idx].slot;
                 e.len = *(volatile uint16_t*)&c->rx[idx].len;
                 px->k_rx_cons++;
-                if (e.slot < UDRV_NET_RX_BASE || e.slot >= UDRV_NET_NSLOTS) {
-                    violation(px, "rx slot out of range", px->k_rx_cons - 1, e.slot, e.len);
-                    continue;
-                }
-                if (px->own[e.slot] != OWN_RX) {
-                    violation(px, "rx slot not posted to the driver", px->k_rx_cons - 1, e.slot, e.len);
+                int v = udrv_net_check_rx(e.slot, e.len, px->own);
+                if (v == UNV_SLOT_RANGE || v == UNV_NOT_OWNED) {
+                    violation(px, v == UNV_SLOT_RANGE ? "rx slot index out of range" : "rx slot not owned by the driver",
+                              px->k_rx_cons - 1, e.slot, e.len);
                     continue;
                 }
                 px->own[e.slot] = OWN_KERNEL;
-                if (e.len < UDRV_NET_FRAME_MIN || e.len > UDRV_NET_FRAME_MAX) {
+                if (v == UNV_BAD_LEN) {
                     violation(px, "rx length out of range", px->k_rx_cons - 1, e.slot, e.len);
                     post_rx_locked(px, e.slot);
                     posted++;
