@@ -672,7 +672,10 @@ static int ksys_open_pinned(process_t* c, const char* path, int flags, uint32_t 
     }
     if(!ino) return lerr ? lerr : -2;   // [M39] -ENOENT so libc can set errno (bash rcfile probing)
     if(!created){ int e = open_check_existing(c, ino, flags); if(e) return e; }
-    if((flags & 0x200) && ino->type==VFS_NODE_FILE && ino->size){            // O_TRUNC
+    // O_TRUNC truncates regular files only: on a device node it is ignored,
+    // as on Linux (devfs block nodes report the disk size; dd needs this).
+    uint32_t ift = ino->mode & 0170000u;
+    if((flags & 0x200) && ino->type==VFS_NODE_FILE && (ift==0 || ift==0100000u) && ino->size){
         if(vfs_ftruncate(ino, 0) != 0) return -1;                            // this inode, not the name
         pagecache_invalidate(ino, 0, 1ULL<<62);
     }
