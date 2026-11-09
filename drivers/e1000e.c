@@ -284,6 +284,17 @@ static void e1000e_irq_ack(net_dev_t* dev) {
     reg_wr(E1000_ICR, 0xFFFFFFFFu);
 }
 
+/* [M58] A failed bring-up: bus mastering off, then the DMA handle goes (the
+ * function leaves the strict kernel DMA domain). */
+static int e1000e_give_up(const pci_device_t* dev, const char* why) {
+    debugcon_writestring(why);
+    uint32_t cmd = pci_config_read32(dev->bus, dev->slot, dev->func, 0x04);
+    pci_config_write32(dev->bus, dev->slot, dev->func, 0x04, (cmd & 0xFFFFu) & ~0x4u);
+    dma_dev_release(g_dd);
+    g_dd = NULL;
+    return -1;
+}
+
 int e1000e_init(void) {
     pci_device_t dev;
     if (e1000e_find(&dev) != 0) {
@@ -294,9 +305,9 @@ int e1000e_init(void) {
     pci_enable_mem_and_busmaster(&dev);
 
     uint64_t bar = pci_bar_mem64(&dev, 0);
-    if (bar == 0) { debugcon_writestring("[E1000E] BAR0 not memory\n"); return -1; }
+    if (bar == 0) return e1000e_give_up(&dev, "[E1000E] BAR0 not memory\n");
     g_mmio = (volatile uint8_t*)pci_bar_map(&dev, 0, 0x20000);   // [M49] uncached, regs up to ~0x14000
-    if (!g_mmio) { debugcon_writestring("[E1000E] BAR0 map failed\n"); return -1; }
+    if (!g_mmio) return e1000e_give_up(&dev, "[E1000E] BAR0 map failed\n");
 
     debugcon_writestring("[E1000E] dev=0x"); debugcon_print_hex(dev.device_id);
     debugcon_writestring(" BAR0=0x"); debugcon_print_hex(bar); debugcon_writestring("\n");
@@ -309,7 +320,7 @@ int e1000e_init(void) {
     reg_wr(E1000_CTRL, reg_rd(E1000_CTRL) | CTRL_RST);
     io_mfence();
     for (volatile uint64_t i = 0; (reg_rd(E1000_CTRL) & CTRL_RST); i++)
-        if (i > 50000000ull) { debugcon_writestring("[E1000E] reset timeout\n"); return -1; }
+        if (i > 50000000ull) return e1000e_give_up(&dev, "[E1000E] reset timeout\n");
 
     /* Re-mask interrupts (reset re-arms some) and clear causes again. */
     reg_wr(E1000_IMC, 0xFFFFFFFFu);
@@ -338,8 +349,9 @@ int e1000e_init(void) {
     g_dev.link_up  = link;
 
     if (net_register_dev(&g_dev) != 0) {
-        debugcon_writestring("[E1000E] net_register_dev failed\n");
-        return -1;
+        reg_wr(E1000_RCTL, 0);                  /* receiver and transmitter off first */
+        reg_wr(E1000_TCTL, 0);
+        return e1000e_give_up(&dev, "[E1000E] net_register_dev failed\n");
     }
 
     /* Let the core wire the interrupt (MSI-X / INTx / timer-tick poll). */
