@@ -95,6 +95,13 @@ extern int vfs_read_all(const char*, void*, size_t);
 #ifndef SECOS_NO_LUA
 #include "../crypto/user_lua_elf.h"
 #endif
+#ifndef SECOS_NO_NANO
+// [U8] GNU nano on musl + ncursesw (tools/port-ncurses.sh, tools/port-nano.sh):
+// /usr/bin/nano, its syntax files and a small compiled terminfo database.
+#include "../crypto/user_nano_elf.h"
+#include "nano_syntax.h"
+#include "terminfo_db.h"
+#endif
 #include "../crypto/user_power_elf.h"    // /bin/{poweroff,reboot,halt,shutdown}
 #ifndef SECOS_NO_DROPBEAR
 #include "../crypto/user_dropbear_elf.h"
@@ -200,6 +207,9 @@ static void sf_alias(const char* name, const char* target, const void* d, size_t
 }
 static void sf_conf_mode(const char* path, const char* text, uint16_t mode){ sf_add(SF_CONF,path,text,sr_len(text),0,0,mode); }
 static void sf_conf(const char* path, const char* text){ sf_conf_mode(path, text, 0644); }
+/* [U8] A system data file (not a program): kernel-owned like a program
+ * (rewritten when it changes, removed when no longer shipped), mode 0644. */
+static void sf_data(const char* path, const void* d, size_t n){ sf_add(SF_BIN,path,d,n,0,0,0644); }
 
 /* System directories: created when missing (SD_CREATE) and given this owner
  * and mode at every boot when they differ. Only the directories themselves:
@@ -214,7 +224,8 @@ static const struct { const char* p; uint16_t mode; uint8_t flags; } g_dirs[] = 
     { "/etc/dropbear",  0700,  SD_CREATE },   /* the SSH host key */
     { "/etc/skel",      0755,  SD_CREATE },   /* copied into new homes (useradd) */
     { "/usr",           0755,  SD_CREATE },
-    { "/usr/bin",       0755,  0 },
+    { "/usr/bin",       0755,  SD_CREATE },
+    { "/usr/share",     0755,  SD_CREATE },
     { "/usr/local",     0755,  0 },
     { "/usr/local/bin", 0755,  0 },
     { "/lib",           0755,  0 },
@@ -422,6 +433,18 @@ static void build_table(void){
 #ifndef SECOS_NO_LUA
     sf_bin("lua", user_lua_elf, user_lua_elf_len);
 #endif
+#ifndef SECOS_NO_NANO
+    sf_add(SF_BIN, "/usr/bin/nano", user_nano_elf, user_nano_elf_len, 0, 0, 0755);
+    for(int i=0; nano_syntax[i].name; i++){
+        char p[64]; sr_cpy(p, "/usr/share/nano/", sizeof(p)); sr_cat(p, nano_syntax[i].name, sizeof(p));
+        sf_data(p, nano_syntax[i].text, sr_len(nano_syntax[i].text));
+    }
+    for(int i=0; terminfo_db[i].path; i++){
+        char p[64]; sr_cpy(p, "/usr/share/terminfo/", sizeof(p)); sr_cat(p, terminfo_db[i].path, sizeof(p));
+        sf_data(p, terminfo_db[i].data, terminfo_db[i].len);
+    }
+    sf_conf("/etc/nanorc", nano_nanorc);   // user/nano/nanorc, via nano_syntax.h
+#endif
     sf_bin("poweroff", user_power_elf, user_power_elf_len);
     sf_alias("reboot", "poweroff", user_power_elf, user_power_elf_len, 0);
     sf_alias("halt", "poweroff", user_power_elf, user_power_elf_len, 0);
@@ -464,13 +487,13 @@ static void build_table(void){
 }
 
 /* ---- content hashes (one per distinct embedded blob) ----------------------- */
-static struct { const uint8_t* p; size_t n; char hex[65]; } g_hc[48];
+static struct { const uint8_t* p; size_t n; char hex[65]; } g_hc[128];
 static int g_nhc;
 static const char* blob_hash(const uint8_t* p, size_t n){
     for(int i=0;i<g_nhc;i++) if(g_hc[i].p==p && g_hc[i].n==n) return g_hc[i].hex;
     uint8_t d[32]; sha256(p, n, d);
     static const char hx[] = "0123456789abcdef";
-    int slot = g_nhc < 48 ? g_nhc++ : 47;
+    int slot = g_nhc < 128 ? g_nhc++ : 127;
     g_hc[slot].p=p; g_hc[slot].n=n;
     for(int i=0;i<32;i++){ g_hc[slot].hex[2*i]=hx[d[i]>>4]; g_hc[slot].hex[2*i+1]=hx[d[i]&15]; }
     g_hc[slot].hex[64]=0;
@@ -901,6 +924,12 @@ static void report_components(void){
     debugcon_writestring(present("/bin/lua") ? "[M34] installed lua to /bin/lua\n"
                                              : "[M34] FAIL: could not install /bin/lua\n");
 #endif
+#ifndef SECOS_NO_NANO
+    debugcon_writestring(present("/usr/bin/nano") && present("/usr/share/terminfo/x/xterm") &&
+                         present("/usr/share/terminfo/l/linux") && present("/usr/share/nano/c.nanorc")
+                         ? "[NANO] installed GNU nano to /usr/bin/nano (+ syntax files, terminfo)\n"
+                         : "[NANO] FAIL: could not install /usr/bin/nano\n");
+#endif
 #ifndef SECOS_NO_DROPBEAR
     debugcon_writestring(present("/bin/dropbearmulti") ? "[SSH] installed dropbear to /bin/dropbearmulti\n"
                                                        : "[SSH] FAIL: could not install /bin/dropbearmulti\n");
@@ -914,6 +943,28 @@ static void report_components(void){
     debugcon_writestring(present("/bin/netcfg") && present("/bin/ifup") && present("/bin/ifdown") && present("/bin/ifconfig")
                          ? "[NET] netcfg/ifup/ifdown/ifconfig installed to /bin\n"
                          : "[NET] FAIL: could not install netcfg\n");
+}
+
+/* [U8] Create the missing parent directories of the table's entries outside
+ * g_dirs (e.g. /usr/share/terminfo/x), root:root 0755. Directories that
+ * exist are left as they are. */
+static void ensure_parents(void){
+    for(int i=0;i<g_nsf;i++){
+        char d[64]; sr_cpy(d, g_sf[i].path, sizeof(d));
+        size_t ls=0; for(size_t k=0; d[k]; k++) if(d[k]=='/') ls=k;
+        if(ls==0) continue;
+        d[ls]=0;
+        if(vfs_lookup(d)) continue;
+        for(size_t k=1; k<=ls; k++){                  /* mkdir -p */
+            if(d[k]!='/' && d[k]!=0) continue;
+            char c=d[k]; d[k]=0;
+            if(!vfs_lookup(d)){
+                if(vfs_mkdir(d)==0) fix_attr(d, 0755, 0, 0);
+                else { g_st.failed++; d[k]=c; break; }
+            }
+            d[k]=c;
+        }
+    }
 }
 
 static void sysroot_provision_locked(void);
@@ -931,6 +982,7 @@ static void sysroot_provision_locked(void){
         count_fix(fix_attr(g_dirs[i].p, g_dirs[i].mode, 0, 0));
     }
     build_table();
+    ensure_parents();
     if(g_persistent) provision_disk(); else provision_ramfs();
     ensure_groups();
     apply_root_password();

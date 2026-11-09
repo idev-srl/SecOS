@@ -13,6 +13,9 @@
  *   Linux-shaped  SecOS numbers 512 + Linux number (arch_prctl, ...): passed on.
  *   missing     -ENOSYS. With SECOS_SYSCALL_TRACE=1 in the environment each
  *               one is reported on stderr: the porting worklist (U2/U3).
+ *               SECOS_SYSCALL_TRACE=2 also logs every call and its result to
+ *               /tmp/secos-trace.<pid> (a debugging aid: full-screen programs
+ *               own stderr).
  *
  * docs/USERLAND_PLAN.md D1/D2, docs/devlog/U1-musl-base.md.
  *
@@ -136,7 +139,7 @@ static int trace_on(void)
             const char *k = "SECOS_SYSCALL_TRACE=";
             const char *p = *e; int i = 0;
             while (k[i] && p[i] == k[i]) i++;
-            if (!k[i]) { g_trace = p[i] && p[i] != '0'; break; }
+            if (!k[i]) { g_trace = !p[i] || p[i] == '0' ? 0 : p[i] == '2' ? 2 : 1; break; }
         }
     }
     return g_trace;
@@ -872,8 +875,64 @@ static long x_reboot(unsigned m1, unsigned m2, unsigned cmd)
     return er(sc1(S_REBOOT, k), EPERM);
 }
 
-/* ---- the table ------------------------------------------------------------ */
+/* ---- SECOS_SYSCALL_TRACE=2: one line per call --------------------------- */
+static long dispatch(long n, long a, long b, long c, long d, long e, long f);
+static void tr_put(char *buf, size_t *o, const char *s)
+{
+    while (*s && *o < 400) buf[(*o)++] = *s++;
+}
+static void tr_num(char *buf, size_t *o, long v)
+{
+    char b[24]; int i = 23; b[i] = 0;
+    int neg = v < 0; unsigned long u = neg ? -(unsigned long)v : (unsigned long)v;
+    do { b[--i] = (char)('0' + u % 10); u /= 10; } while (u);
+    if (neg) b[--i] = '-';
+    tr_put(buf, o, b + i);
+}
+static int tr_path_arg(long n)      /* which argument is a path (1-based), 0 = none */
+{
+    switch (n) {
+    case SYS_open: case SYS_stat: case SYS_lstat: case SYS_access: case SYS_unlink:
+    case SYS_rename: case SYS_mkdir: case SYS_rmdir: case SYS_readlink: case SYS_chdir:
+    case SYS_chmod: case SYS_chown: case SYS_lchown: case SYS_truncate: case SYS_creat:
+    case SYS_symlink: case SYS_link: case SYS_statfs: case SYS_execve:
+        return 1;
+    case SYS_openat: case SYS_newfstatat: case SYS_faccessat: case SYS_unlinkat:
+    case SYS_renameat: case SYS_mkdirat: case SYS_readlinkat: case SYS_fchmodat:
+    case SYS_fchownat: case SYS_utimensat: case SYS_faccessat2: case SYS_renameat2:
+        return 2;
+    }
+    return 0;
+}
+static void tr_log(long n, long a, long b, long c, long d, long r)
+{
+    char buf[420]; size_t o = 0;
+    tr_num(buf, &o, n); tr_put(buf, &o, "(");
+    tr_num(buf, &o, a); tr_put(buf, &o, ", "); tr_num(buf, &o, b); tr_put(buf, &o, ", ");
+    tr_num(buf, &o, c); tr_put(buf, &o, ", "); tr_num(buf, &o, d); tr_put(buf, &o, ")");
+    int pa = tr_path_arg(n);
+    const char *path = pa == 1 ? (const char *)a : pa == 2 ? (const char *)b : 0;
+    if (path) { tr_put(buf, &o, " \""); tr_put(buf, &o, path); tr_put(buf, &o, "\""); }
+    tr_put(buf, &o, " = "); tr_num(buf, &o, r); buf[o++] = '\n';
+    char name[40] = "/tmp/secos-trace.";
+    size_t k = xstrlen(name); long pid = sc0(S_GETPID);
+    char t[24]; int i = 0; do { t[i++] = (char)('0' + pid % 10); pid /= 10; } while (pid && i < 20);
+    while (i) name[k++] = t[--i];
+    name[k] = 0;
+    long fd = sc3(S_OPEN, name, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return;
+    sc3(S_WRITE, fd, buf, o);
+    sc1(S_CLOSE, fd);
+}
 long __secos_syscall(long n, long a, long b, long c, long d, long e, long f)
+{
+    long r = dispatch(n, a, b, c, d, e, f);
+    if (g_trace == 2 || (g_trace < 0 && __environ && trace_on() == 2)) tr_log(n, a, b, c, d, r);
+    return r;
+}
+
+/* ---- the table ------------------------------------------------------------ */
+static long dispatch(long n, long a, long b, long c, long d, long e, long f)
 {
     switch (n) {
     /* files */

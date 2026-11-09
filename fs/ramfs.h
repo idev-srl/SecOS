@@ -14,7 +14,7 @@
 // Simple in-memory filesystem with fixed table.
 // Limits: RAMFS_MAX_FILES entries, name < RAMFS_NAME_MAX chars, content in kernel memory.
 
-#define RAMFS_MAX_FILES 256 /* [M31] /bin coreutils + FHS skeleton; BusyBox adds ~125 applet stubs */
+#define RAMFS_MAX_FILES 512 /* [M31] /bin coreutils + FHS skeleton; BusyBox adds ~125 applet stubs; [U8] nano data */
 #define RAMFS_NAME_MAX  96  // full path length, subdirectories included
 
 // flags: bit0 immutable entry, bit1 directory

@@ -478,7 +478,14 @@ uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
     if (len > USER_MMAP_END - base) goto out;
     if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) goto out;
     if (!ino) {
-        if (vma_add(&c->vmas, base, base + len, m18_prot_to_flags(prot), VMA_TYPE_ANON,0,0,0,0) != 0)
+        // [U8] Right after the previous anonymous map with the same protection
+        // (the bump allocator makes that the common case): grow that VMA
+        // instead of taking a slot. musl's allocator maps one group per size
+        // class, so a program with many live allocations (nano's compiled
+        // syntax regexes) otherwise runs out of the VMA_MAX slots.
+        uint64_t f = m18_prot_to_flags(prot);
+        if (vma_extend_anon(&c->vmas, base, base + len, f) != 0 &&
+            vma_add(&c->vmas, base, base + len, f, VMA_TYPE_ANON,0,0,0,0) != 0)
             goto out;
     } else {
         if (vma_add_file(&c->vmas, base, base + len, m18_prot_to_flags(prot), ino, 0) != 0)
@@ -499,6 +506,15 @@ int ksys_munmap(uint64_t addr, uint64_t len){
     uint64_t end = addr + len;
     uint64_t fl = mm_lock(c);
     if (vma_pinned_overlap(&c->vmas, addr, end)) { mm_unlock(c, fl); return -22; }  // [M57] -EINVAL
+    // [U8] A hole inside one VMA splits it and needs a free slot: check first,
+    // so a full set fails the call (-ENOMEM, as Linux at its map limit)
+    // before anything is unmapped, instead of dropping the tail's VMA.
+    { uint32_t holes = 0;
+      for (uint32_t i = 0; i < c->vmas.count; i++) {
+          const vma_t* v = &c->vmas.v[i];
+          if (v->type != VMA_TYPE_NONE && v->start < addr && end < v->end) holes++;
+      }
+      if (holes > vma_free_slots(&c->vmas)) { mm_unlock(c, fl); return -12; } }
     // Every user page is VMA-backed (M14), so only VMA intersections can hold
     // present PTEs: unmap those instead of walking the whole (maybe huge) range.
     for (uint32_t i = 0; i < c->vmas.count; i++) {
@@ -515,14 +531,9 @@ int ksys_munmap(uint64_t addr, uint64_t len){
         if (addr <= v->start && end >= v->end)      vma_remove(&c->vmas, v);   // fully covered
         else if (addr <= v->start)                  v->start = end;            // trim front
         else if (end >= v->end)                     v->end = addr;             // trim back
-        else if (v->type == VMA_TYPE_PHYS) {                                   // hole in a device map:
-            if (vma_split(&c->vmas, v, end) != 0) { /* set full: the tail is dropped */ }
-            v->end = addr;                                                     // tail kept, rebased
-        }
-        else {                                                                 // hole: split (ANON)
-            uint64_t old_end = v->end; v->end = addr;
-            if (v->type == VMA_TYPE_ANON)
-                vma_add(&c->vmas, end, old_end, v->flags, VMA_TYPE_ANON,0,0,0,0);
+        else {                                     // hole: split (tail kept, backing rebased)
+            if (vma_split(&c->vmas, v, end) != 0) { /* cannot happen: slots checked above */ }
+            v->end = addr;
         }
     }
     mm_unlock(c, fl);

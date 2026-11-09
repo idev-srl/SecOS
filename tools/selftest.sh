@@ -2195,6 +2195,30 @@ else
 fi
 
 # ============================================================================
+# [U8] NANO GATE: GNU nano (musl + ncursesw, /usr/bin/nano) driven like a user
+# by tools/nano_drive.py in one boot: over SSH on a host pty (TERM=xterm-256color,
+# window change -> SIGWINCH repaint), on the kernel console (TERM=linux) and in
+# a secwm terminal (Italian layout for à è, resize grip -> repaint): type UTF-8,
+# search, cut/paste a line, save, exit; the saved bytes are compared with od.
+# ============================================================================
+if command -v ssh >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1; then
+    echo "[selftest] NANO gate (tools/nano_test.sh)..."
+    NANO_OUT=$(mktemp /tmp/secos_selftest_nano.XXXXXX)
+    tools/nano_test.sh >"$NANO_OUT" 2>&1
+    while IFS= read -r l; do
+        case "$l" in
+            "  [PASS] "*) check "${l#  \[PASS\] }" 0 ;;
+            "  [FAIL] "*) check "${l#  \[FAIL\] }" 1 ;;
+            "  [SKIP] "*) echo "$l" ;;
+        esac
+    done <"$NANO_OUT"
+    grep -q "RESULT:" "$NANO_OUT" || { check "NANO gate ran to completion" 1; tail -20 "$NANO_OUT"; }
+    rm -f "$NANO_OUT"
+else
+    echo "  [SKIP] NANO gate (host has no ssh / ssh-keygen)"
+fi
+
+# ============================================================================
 # INIT GATE: /bin/init as PID 1 — a ready system with no manual steps.
 # (a) An image built with SSH_AUTHORIZED_KEYS=<throwaway key generated here>
 #     boots with a user-net NIC: init must be PID 1, ifup must take a DHCP
