@@ -22,7 +22,8 @@
  *
  *   secwm [--trace] [--no-term] [--run PROGRAM]... [--auto]
  *   Ctrl+Alt+T terminal, Ctrl+Alt+N next window, Ctrl+Alt+W close window,
- *   Ctrl+Alt+Backspace leave the GUI (back to the text console).
+ *   Ctrl+Alt+Backspace leave the GUI (back to the text console),
+ *   Ctrl+Shift+Esc task manager (/bin/taskmgr).
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -123,6 +124,7 @@ static uint32_t* panel;             /* W x PANEL_H */
 static surf_t S_back, S_desk, S_panel;
 static int con_fd = -1, fb_fd = -1;
 static int trace, running = 1;
+static int have_taskmgr;          /* [U5] /bin/taskmgr installed */
 static volatile int sig_quit;
 
 static indev_t dev[MAXDEV]; static int ndev;
@@ -144,7 +146,7 @@ static char layout[16] = "us";
 /* panel hit regions */
 #define MAXBTN 24
 static struct { rect_t r; int action; win_t* w; } pbtn[MAXBTN]; static int npbtn;
-enum { ACT_TERM = 1, ACT_CLOCK, ACT_SYSINFO, ACT_EXIT, ACT_TASK };
+enum { ACT_TERM = 1, ACT_CLOCK, ACT_SYSINFO, ACT_EXIT, ACT_TASK, ACT_TASKMGR };
 
 static uint64_t now_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -302,7 +304,7 @@ static void paint_desktop(void) {
                             }
                 }
     }
-    const char* hint = "Ctrl+Alt+T terminal   Ctrl+Alt+N next window   Ctrl+Alt+Backspace leave the GUI";
+    const char* hint = "Ctrl+Alt+T terminal   Ctrl+Alt+N next window   Ctrl+Alt+Backspace leave the GUI   Ctrl+Shift+Esc task manager";
     gfx_text(s, 16, H - 24, hint, 0x6F8796, 0, 0);
 }
 
@@ -334,6 +336,7 @@ static void paint_panel(void) {
     x = panel_button(s, x, "\xE2\x96\xB6 Terminal", ACT_TERM, 0, 0);
     x = panel_button(s, x, "\xE2\x97\x8B Clock", ACT_CLOCK, 0, 0);
     x = panel_button(s, x, "\xE2\x96\xA0 System", ACT_SYSINFO, 0, 0);
+    if (have_taskmgr) x = panel_button(s, x, "\xE2\x96\x86 Task Manager", ACT_TASKMGR, 0, 0);
     gfx_fill(s, x, 7, 1, PANEL_H - 14, 0x34404E);
     x += 8;
     for (int i = 0; i < nz; i++) {
@@ -363,9 +366,9 @@ static void paint_panel(void) {
     static int logged;
     if (trace && !logged) {
         logged = 1;
-        static const char* const names[] = { "", "Terminal", "Clock", "System", "Exit" };
+        static const char* const names[] = { "", "Terminal", "Clock", "System", "Exit", "", "TaskManager" };
         for (int i = 0; i < npbtn; i++)
-            if (pbtn[i].action >= ACT_TERM && pbtn[i].action <= ACT_EXIT)
+            if ((pbtn[i].action >= ACT_TERM && pbtn[i].action <= ACT_EXIT) || pbtn[i].action == ACT_TASKMGR)
                 logf_("SW-PANEL %s %d,%d,%d,%d", names[pbtn[i].action], pbtn[i].r.x, pbtn[i].r.y, pbtn[i].r.w, pbtn[i].r.h);
     }
 }
@@ -666,6 +669,23 @@ static win_t* spawn_client(const char* cmd) {
 /* The System launcher: the LVGL monitor when installed, else the plain one. */
 static void open_system(void) {
     spawn_client(access("/bin/sysmon", 0) == 0 ? "/bin/sysmon" : "/bin/sysinfo");
+}
+
+/* [U5] The task manager (panel button, Ctrl+Shift+Esc): one instance. A second
+ * request raises the open one, as on Windows. It learns the largest window the
+ * screen takes from --max (CREATE larger than that is a protocol violation). */
+static void open_taskmgr(void) {
+    if (!have_taskmgr) return;
+    for (int i = 0; i < MAXWIN; i++) {
+        win_t* w = &wins[i];
+        if (!w->used || w->dead || w->kind != WK_CLIENT || strncmp(w->origin, "taskmgr ", 8) != 0) continue;
+        if (w->visible) { raise_win(w); set_focus(w); }
+        return;                           /* starting: its window comes by itself */
+    }
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "/bin/taskmgr --max %dx%d%s", W - 2 * BORDER, H - PANEL_H - TITLE_H - BORDER,
+             trace ? " --trace" : "");
+    spawn_client(cmd);
 }
 
 /* ---- SWP: client protocol (all input untrusted) ------------------------- */
@@ -1069,6 +1089,7 @@ static void key_event(int code, int value) {
         }
     }
     if (ctrl && k_lalt) return;
+    if (ctrl && shift && !k_lalt && code == KEY_ESC) { if (value == 1) open_taskmgr(); return; }   /* [U5] */
     if (!focus) return;
     if (focus->kind == WK_CLIENT && focus->cl && focus->cl->state == 2) {
         struct swp_key k;
@@ -1170,6 +1191,7 @@ static void button_event(int btn, int value) {
             case ACT_TERM: open_terminal(); break;
             case ACT_CLOCK: open_clock(); break;
             case ACT_SYSINFO: open_system(); break;
+            case ACT_TASKMGR: open_taskmgr(); break;
             case ACT_EXIT: quit_gui(); break;
             case ACT_TASK:
                 if (pbtn[i].w && pbtn[i].w->used && pbtn[i].w->visible) { raise_win(pbtn[i].w); set_focus(pbtn[i].w); }
@@ -1458,6 +1480,7 @@ int main(int argc, char** argv) {
     open_inputs();
     if (ndev == 0) { printf("secwm: no input devices (needs CAP_INPUT)\n"); return 1; }
     refresh_layout();
+    have_taskmgr = access("/bin/taskmgr", 0) == 0;
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGHUP, on_signal);

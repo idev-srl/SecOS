@@ -76,6 +76,7 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_sysinfo_elf.h"
 #include "../crypto/user_swptest_elf.h"
 #include "../crypto/user_sysmon_elf.h"   // LVGL 9.2 system monitor (make port-lvgl)
+#include "../crypto/user_taskmgr_elf.h"  // [U5] LVGL task manager (make port-lvgl)
 #ifndef SECOS_NO_BUSYBOX
 #include "../crypto/user_busybox_elf.h"
 #include "../crypto/user_bbstub_elf.h"
@@ -377,6 +378,7 @@ static void build_table(void){
     sf_bin("sysinfo", user_sysinfo_elf, user_sysinfo_elf_len);
     sf_bin("swptest", user_swptest_elf, user_swptest_elf_len);
     sf_bin("sysmon", user_sysmon_elf, user_sysmon_elf_len);
+    sf_bin("taskmgr", user_taskmgr_elf, user_taskmgr_elf_len);   // [U5]
 #ifndef SECOS_NO_BUSYBOX
     // BusyBox 1.36.1 from source: replaces the coreutils applets of the same
     // name. On ramfs every applet is the signed re-exec stub (user/bbstub.c).

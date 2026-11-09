@@ -95,7 +95,8 @@ boot default.
   **○ Clock** and **■ System**, one task button per window (click to raise
   it), the UTC clock, and **× Exit**. **System** opens `/bin/sysmon`, the
   LVGL system monitor (below). If it is missing, the plain `/bin/sysinfo`
-  opens instead.
+  opens instead. **Task Manager** opens `/bin/taskmgr` (below), also with
+  Ctrl+Shift+Esc; there is one instance, a second request raises it.
 - **Windows**: click anywhere in a window to focus and raise it. Drag the
   title bar to move it, and click the red × to close it. Terminals also have a
   resize grip in the bottom-right corner; the new size reaches the shell as
@@ -114,6 +115,7 @@ boot default.
   | Ctrl+Alt+C | clock |
   | Ctrl+Alt+S | System panel |
   | Ctrl+Alt+Backspace | leave the GUI |
+  | Ctrl+Shift+Esc | Task Manager |
 
   Windows (WSLg, QEMU GTK) sends AltGr as LeftCtrl+RightAlt. Because the
   shortcuts use the left Alt, AltGr combinations never trigger them.
@@ -295,6 +297,42 @@ It refreshes on the compositor's 1 Hz `FRAME` event. Another LVGL program
 takes the same glue (copy `sysmon.c`'s `main`) and a line in
 `tools/port-lvgl.sh`.
 
+### Task Manager (`/bin/taskmgr`)
+
+`user/lvgl/taskmgr.c`, built by the same `make port-lvgl`, modelled on the
+Windows Task Manager:
+
+- **Processes**: name, PID, user, status, CPU % (share of the whole machine,
+  from the `/proc/<pid>/stat` utime+stime deltas), memory (RSS) and command
+  line. Click a column header to sort, again to reverse. CPU and memory cells
+  are shaded by load. Keys: arrows, PgUp/PgDn, Home/End, typing a name
+  selects the first process that starts with it, Delete = End task.
+- **End task** asks for confirmation, sends SIGTERM, and when the process is
+  still there 3 s later offers SIGKILL ("End now" / "Wait"). The start time is
+  checked before each signal, so a reused pid is never hit. A process of
+  another user is refused before any dialog: `kill(pid, 0)` asks the kernel
+  (`cred_may_signal`), and EPERM shows "Access denied". There is no "end as
+  administrator": that would need an elevation prompt in the GUI.
+- **Performance**: a sidebar with CPU, memory and one entry per NIC, each with
+  a live mini graph. CPU shows one graph per online CPU (`/proc/stat`),
+  utilization, speed, processes, up time; memory shows in use / available /
+  total / kernel heap (`/proc/meminfo`); a NIC shows receive and send rates
+  and totals (`/proc/net/dev`).
+- **Users**: processes, CPU and memory grouped by user.
+
+It refreshes once a second. The list and the graphs are drawn by the program
+itself inside LVGL objects and invalidated only where a row or a graph
+changed; each flushed area is its own PUT, so an idle refresh sends a few
+rows, not the window. secwm starts it with `--max WxH` (the largest window
+the screen takes; a larger CREATE would be a protocol violation) and, when
+tracing, `--trace` (TASKMGR-* markers for the selftest).
+
+It is signed with `user/note_taskmgr.S`: the confined manifest plus
+`CAP_SIGNAL` (`CAP_ENFORCE | CAP_FS_READ | CAP_SIGNAL | CAP_TIME`). The
+capability lets it call `kill()`; which processes it may signal is still the
+kernel's credential rule: its own user's, or every process when the desktop
+runs as root.
+
 ## Security model and threat model
 
 **Assets.** What the user types, especially into a shell; what each window
@@ -364,6 +402,9 @@ Wayland compositor does).
      can read files and draw. They cannot write files, fork or exec, signal
      any process (secwm included), use the network, or create IPC. Every
      denial goes to the `[AUDIT]` ring.
+   - `taskmgr` has the same manifest plus `CAP_SIGNAL`, so "End task" can
+     signal the user's own processes (secwm included, after a warning); the
+     kernel refuses other users' processes with EPERM.
    - Each client runs in its own session, so terminal job-control signals
      never reach it.
 6. **No spoofing of trusted UI.**
@@ -425,6 +466,13 @@ it through QMP:
   keep its pixels, and no out-of-bounds magenta pixel may appear anywhere.
 - **Session 3**: `kill -SEGV` of secwm must bring back the text console, and
   bash must still answer.
+
+`tools/gui_wm_drive.py --taskmgr [--smp N]` is the **TASKMGR** gate (selftest
+"TASKMGR", 34 checks): the desktop runs as an unprivileged user; the task
+manager opens from the panel and with Ctrl+Shift+Esc, lists `init` and `bash`,
+has one CPU graph per CPU, ends a `sleep` started in a terminal (SIGTERM after
+the confirmation), refuses root's `sleep` and `init` (both survive), and the
+`[AUDIT]` log has no denial for it. It also checks the `/proc/net/dev` format.
 
 `tools/gui_wm_drive.py --demo --log L --out O --shots DIR` takes screenshots of
 `top`, `vi`, `less`, the clock and the LVGL System monitor, for looking at

@@ -24,6 +24,17 @@
 /* IRQ delivery mode chosen by net_request_irq(). */
 typedef enum { NET_IRQ_NONE = 0, NET_IRQ_MSIX, NET_IRQ_INTX, NET_IRQ_POLL } net_irq_mode_t;
 
+/* [U5] Per-NIC traffic counters (/proc/net/dev, Linux field names). The RX
+ * side is written only under the NIC's rx_lock (net_rx, called from
+ * dev->poll(), and the driver's own error/drop paths, also inside poll), the
+ * TX side only under tx_lock (net_dev_xmit), so each counter has one writer at
+ * a time. Readers take no lock: an aligned 64-bit load is atomic on x86-64,
+ * and two counters read a moment apart may disagree by a frame, as on Linux. */
+typedef struct net_dev_stats {
+    uint64_t rx_bytes, rx_packets, rx_errors, rx_dropped;
+    uint64_t tx_bytes, tx_packets, tx_errors, tx_dropped;
+} net_dev_stats_t;
+
 typedef struct net_dev {
     char     name[16];            /* "eth0", ... */
     uint8_t  mac[ETH_ALEN];       /* filled by the driver from the NIC */
@@ -50,7 +61,14 @@ typedef struct net_dev {
     net_spinlock_t rx_lock;
     net_spinlock_t tx_lock;
     volatile int   rx_kick;
+    net_dev_stats_t stats;        /* [U5] see net_dev_stats_t */
 } net_dev_t;
+
+/* [U5] Driver RX paths: a descriptor the NIC flagged bad or a frame the driver
+ * could not deliver (length out of range, not a single-buffer frame). Called
+ * from dev->poll() (rx_lock held). */
+static inline void net_dev_rx_error(net_dev_t* dev)   { dev->stats.rx_errors++; }
+static inline void net_dev_rx_dropped(net_dev_t* dev) { dev->stats.rx_dropped++; }
 
 /* ---- Driver-facing core API ---- */
 int        net_register_dev(net_dev_t* dev);       /* 0 ok, -1 full/dup */
