@@ -159,9 +159,28 @@ void bkl_init_mode(void) {
 // [U1] Linux-shaped calls (512 + Linux nr) that need no kernel lock: they
 // touch only the caller's own process_t (kernel/syscall_lx.c). Every other
 // number at or above SYSCALL_BKL_NR takes the BKL until it is listed here.
+// [U10] The socket family (kernel/lx_net.c: net stack N2, g_unix_lock S13,
+// the VFS for AF_UNIX path names) and eventfd/timerfd/epoll/itimer
+// (kernel/lx_event.c: g_ev_lock S14) have their own locks, like the M24
+// socket calls (D1).
 static int lx_lockfree(uint64_t num) {
-    return num == SYS_LX_ARCH_PRCTL || num == SYS_LX_SET_TID_ADDRESS ||
-           num == SYS_LX_EXIT_GROUP;
+    switch (num) {
+    case SYS_LX_ARCH_PRCTL: case SYS_LX_SET_TID_ADDRESS: case SYS_LX_EXIT_GROUP:
+    /* sockets: socket .. getsockopt (41-55), accept4 (288) */
+    case SYS_LX_BASE + 41: case SYS_LX_BASE + 42: case SYS_LX_BASE + 43: case SYS_LX_BASE + 44:
+    case SYS_LX_BASE + 45: case SYS_LX_BASE + 46: case SYS_LX_BASE + 47: case SYS_LX_BASE + 48:
+    case SYS_LX_BASE + 49: case SYS_LX_BASE + 50: case SYS_LX_BASE + 51: case SYS_LX_BASE + 52:
+    case SYS_LX_BASE + 53: case SYS_LX_BASE + 54: case SYS_LX_BASE + 55: case SYS_LX_BASE + 288:
+    /* getitimer, setitimer, epoll_create, epoll_wait, epoll_ctl, epoll_pwait,
+     * timerfd_create, eventfd, timerfd_settime, timerfd_gettime, eventfd2,
+     * epoll_create1, epoll_pwait2 */
+    case SYS_LX_BASE + 36: case SYS_LX_BASE + 38: case SYS_LX_BASE + 213: case SYS_LX_BASE + 232:
+    case SYS_LX_BASE + 233: case SYS_LX_BASE + 281: case SYS_LX_BASE + 283: case SYS_LX_BASE + 284:
+    case SYS_LX_BASE + 286: case SYS_LX_BASE + 287: case SYS_LX_BASE + 290: case SYS_LX_BASE + 291:
+    case SYS_LX_BASE + 441:
+        return 1;
+    }
+    return 0;
 }
 
 int syscall_needs_bkl(uint64_t num) {

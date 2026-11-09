@@ -302,6 +302,7 @@ static int ping_autobind(struct sock* s){
 }
 
 static void err_set(struct sock* s, int e){ s->so_error = e; }
+/* so_error holds a positive errno; reported once (calls return -err_take). */
 static int err_take(struct sock* s){ int e = s->so_error; s->so_error = 0; return e; }
 
 /* ------------------------------------------------------------ bind/connect */
@@ -366,7 +367,7 @@ static int l_connect_ex(int idx, uint32_t ip, uint16_t port, int unspec){
     if (!dev) return E_NETDOWN;
     if (s->listening) return E_INVAL;
     if (!s->tcp) {
-        if (s->so_error && !s->connecting) return err_take(s);
+        if (s->so_error && !s->connecting) return -err_take(s);
         if (!ip) return E_NETUNREACH;
         if (is_bcast(dev, ip)) return E_NETUNREACH;
         /* Start the handshake; the caller re-runs connect() to collect it. */
@@ -474,7 +475,7 @@ static int dgram_send(struct sock* s, const void* buf, int len, int has_dst, uin
     net_dev_t* dev = net_primary();
     if (!dev) return E_NETDOWN;
     if (s->shut & 2) return E_PIPE;
-    if (s->so_error) return err_take(s);
+    if (s->so_error) return -err_take(s);
     if (!has_dst){
         if (!s->peer_ip) return E_DESTADDRREQ;
         ip = s->peer_ip; port = s->peer_port;
@@ -517,7 +518,7 @@ static int l_sendmsg(int idx, const void* buf, int len, int flags, int has_dst, 
     if (s->kind != SKIND_TCP) return dgram_send(s, buf, len, has_dst, ip, port);
     net_dev_t* dev = net_primary();
     if (!dev) return E_NETDOWN;
-    if (!s->tcp && s->so_error) return err_take(s);
+    if (!s->tcp && s->so_error) return -err_take(s);
     if (!s->tcp || s->listening) return E_NOTCONN;
     if (s->connecting) {
         tcp_state_t cs = tcp_get_state(s->tcp);
@@ -570,7 +571,7 @@ static int l_recvmsg(int idx, void* buf, int len, int flags, sock_rxmeta_t* m){
     if (flags & SK_MSG_ERRQUEUE) return errq_recv(s, buf, len, m);
     if (s->kind == SKIND_TCP){
         if (flags & SK_MSG_OOB) return E_INVAL;
-        if (!s->tcp && s->so_error) return err_take(s);
+        if (!s->tcp && s->so_error) return -err_take(s);
         if (!s->tcp || s->listening) return E_NOTCONN;
         if (s->connecting) {
             if (tcp_get_state(s->tcp) == TCP_SYN_SENT) return E_AGAIN;
@@ -595,7 +596,7 @@ static int l_recvmsg(int idx, void* buf, int len, int flags, sock_rxmeta_t* m){
         if (n < 0 || tcp_was_reset(s->tcp)) return 0;    /* peer closed and drained / reset: EOF */
         return E_AGAIN;
     }
-    if (s->so_error) return err_take(s);
+    if (s->so_error) return -err_take(s);
     if (!s->dq_head) return (s->shut & 1) ? 0 : E_AGAIN;
     struct dgram* d = s->dq_head;
     int n = d->len; if (n > len) n = len;
