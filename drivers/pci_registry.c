@@ -592,11 +592,25 @@ static int live_find(int by_class, uint16_t v_or_c, uint16_t d_or_s, uint8_t pro
     return -1;
 }
 
+/* [M57] Functions given to ring-3 drivers (udrv=): the in-kernel probes
+ * (pci_find / pci_find_class) never see them. Set once at boot, before any
+ * probe; read without a lock. */
+static uint8_t g_reserved[PCI_MAX_DEVS];
+void pci_registry_reserve(const pci_dev_t* d) {
+    int i = pci_dev_index(d);
+    if (i >= 0 && i < PCI_MAX_DEVS) g_reserved[i] = 1;
+}
+int pci_dev_reserved(const pci_dev_t* d) {
+    int i = pci_dev_index(d);
+    return i >= 0 && i < PCI_MAX_DEVS && g_reserved[i];
+}
+
 int pci_find(uint16_t want_vendor, uint16_t want_device, pci_device_t* out) {
     pci_init();
     if (g_overflow) return live_find(0, want_vendor, want_device, 0, out);
     for (int i = 0; i < g_ndev; i++) {
         const pci_dev_t* d = &g_devs[i];
+        if (g_reserved[i]) continue;                  /* [M57] a ring-3 driver's */
         if (d->vendor_id == want_vendor && (want_device == 0 || d->device_id == want_device)) {
             fill_out(d, out);
             return 0;
@@ -610,6 +624,7 @@ int pci_find_class(uint8_t cls, uint8_t subcls, uint8_t progif, pci_device_t* ou
     if (g_overflow) return live_find(1, cls, subcls, progif, out);
     for (int i = 0; i < g_ndev; i++) {
         const pci_dev_t* d = &g_devs[i];
+        if (g_reserved[i]) continue;                  /* [M57] a ring-3 driver's */
         if (d->class_code == cls && d->subclass == subcls && (progif == 0xFF || d->prog_if == progif)) {
             fill_out(d, out);
             return 0;

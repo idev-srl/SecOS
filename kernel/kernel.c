@@ -42,7 +42,7 @@
 #include "shell.h"
 #include "sched.h"
 #include "panic.h"
-#include "driver_if.h" // driver registry init
+#include "driver_if.h" // driver teardown hook (M57: SYS_UDRV)
 #include "debugcon.h"   // ISA debugcon boot markers (port 0xE9)
 #include "block.h"      // block device registry (virtio-blk smoke check)
 #include "vfs.h"        // [M23] VFS types (vfs_inode_t) for boot self-checks
@@ -258,93 +258,8 @@ static void m9_run_demo(void) {
 }
 #endif /* M9_USER_DEMO */
 
-// ---- [M11] Driver Space demo (gated; off by default) ----
-// Runs two signed ring-3 programs back-to-back to prove the capability boundary
-// is rooted in the signature:
-//   1. /bin/driver   — manifest declares PROC_TYPE_DRIVER (dev 0, caps
-//      READ|WRITE|GET_INFO). Granted ops succeed via SYS_DRIVER; an un-granted
-//      op (MAP_MEM) is refused (DRV_ERR_PERM) even though the device supports it.
-//   2. /bin/userprobe — manifest is PROC_TYPE_USER. Every SYS_DRIVER call is
-//      refused (DRV_ERR_NOTDRV): a plain user process has no driver rights.
-#ifndef M11_DRIVER_DEMO
-#define M11_DRIVER_DEMO 0
-#endif
-#if M11_DRIVER_DEMO
-#include "trapframe.h"
-#include "../crypto/user_driver_elf.h"
-#include "../crypto/user_userprobe_elf.h"
-extern int vfs_create(const char* path, const void* data, size_t size);
-extern int vfs_read_all(const char* path, void* buf, size_t bufsize);
-
-static uint8_t m11_idle_stack[16384] __attribute__((aligned(16)));
-static uint8_t m11_loadbuf[16384];
-static int     m11_step = 0, m11_done = 0;
-
-// Load the signed ELF back from the VFS (ramfs). Since M12 the heap serves
-// multi-frame allocations, so ramfs can store a ~8 KB ELF intact — this loads
-// the same path that silently corrupted under the M11-era one-frame heap.
-static void m11_spawn(const char* path, const char* what) {
-    int n = vfs_read_all(path, m11_loadbuf, sizeof(m11_loadbuf));
-    debugcon_writestring("[M11] loaded "); debugcon_writestring(path);
-    debugcon_writestring(" bytes="); debugcon_print_hex((uint64_t)(uint32_t)n);
-    debugcon_writestring("\n");
-    process_t* p = (n > 0) ? process_create_from_elf(m11_loadbuf, (size_t)n) : 0;
-    if (p) {
-        debugcon_writestring("[M11] spawned "); debugcon_writestring(what);
-        debugcon_writestring(" proc_type="); debugcon_print_hex((uint64_t)(uint32_t)p->proc_type);
-        debugcon_writestring("\n");
-        sched_make_ready(p);              // last: it may run (and exit) at once on another CPU
-    } else {
-        debugcon_writestring("[M11] FAIL: "); debugcon_writestring(what);
-        debugcon_writestring(" not loaded/refused\n");
-    }
-}
-
-__attribute__((noreturn)) static void m11_idle_entry(void) {
-    for (;;) {
-        __asm__ volatile("cli");
-        sched_reap_zombies();
-        if (m11_step == 0) {
-            m11_step = 1;
-            debugcon_writestring("[M11] --- driver-type probe (granted dev0) ---\n");
-            m11_spawn("/bin/driver", "driver");
-        } else if (m11_step == 1 && sched_count_alive_user() == 0) {
-            m11_step = 2;
-            debugcon_writestring("[M11] --- user-type probe (no driver rights) ---\n");
-            m11_spawn("/bin/userprobe", "userprobe");
-        } else if (m11_step == 2 && sched_count_alive_user() == 0 && !m11_done) {
-            m11_done = 1;
-            debugcon_writestring("[M11] DONE\n");
-        }
-        cpu_wait_irq();
-    }
-}
-
-static void m11_run_demo(void) {
-    extern void tss_set_kernel_stack(uint64_t);
-    extern void arch_iret_to_tf(trapframe_t*) __attribute__((noreturn));
-    debugcon_writestring("[M11] driver space demo\n");
-    // [M12] Publish the signed ELFs into the VFS; the M12 heap makes the
-    // large-file ramfs copy reliable (closes the M11 gotcha).
-    if (sysroot_install_exec("/bin/driver", user_driver_elf, user_driver_elf_len) != 0)
-        debugcon_writestring("[M11] WARN: vfs_create /bin/driver failed\n");
-    if (sysroot_install_exec("/bin/userprobe", user_userprobe_elf, user_userprobe_elf_len) != 0)
-        debugcon_writestring("[M11] WARN: vfs_create /bin/userprobe failed\n");
-
-    static process_t  idle; static trapframe_t idle_tf;
-    for (unsigned i=0;i<sizeof(idle);i++)    ((uint8_t*)&idle)[i]=0;
-    for (unsigned i=0;i<sizeof(idle_tf);i++) ((uint8_t*)&idle_tf)[i]=0;
-    idle.pid = 0; idle.space = vmm_get_kernel_space();
-    idle.kstack_top = (uint64_t)(m11_idle_stack + sizeof(m11_idle_stack));
-    idle.tf = &idle_tf; idle.state = PROC_RUNNING;
-    idle_tf.rip = (uint64_t)m11_idle_entry; idle_tf.cs = 0x08; idle_tf.ss = 0x10;
-    idle_tf.rflags = 0x202; idle_tf.rsp = idle.kstack_top;
-    sched_set_idle(&idle); sched_set_current(&idle);
-    tss_set_kernel_stack(idle.kstack_top);
-    debugcon_writestring("[M11] entering scheduler\n");
-    arch_iret_to_tf(&idle_tf); // does not return
-}
-#endif /* M11_DRIVER_DEMO */
+// ---- [M11] Driver Space demo: retired in M57 with the SYS_DRIVER mock (the
+// ring-3 driver path is now SYS_UDRV; its gate is tools/udrv_gate.sh). ----
 
 // ---- [M13] Usability & policy demo (gated; off by default) ----
 // Proves, non-interactively: (1) manifest max_mem enforcement — a signed program
@@ -1649,7 +1564,6 @@ static void kernel_main_phase2(void) {
     }
 #endif
     sched_init();
-    driver_registry_init();
     { extern void ipc_init(void); ipc_init(); }  // [M13] kernel IPC channels
     { // [M28-1] discover CPUs/LAPIC/IOAPIC (read-only). UEFI hands the RSDP over;
       // MB2 falls back to a BIOS-area scan.
@@ -1765,6 +1679,10 @@ static void kernel_main_phase2(void) {
     // drivers' functions join a strict domain that maps only .dmabss and
     // dma_alloc_coherent frames. Before any driver probes.
     { extern void dma_init(void); dma_init(); }
+    // [M57] Ring-3 driver assignments (boot word udrv=): hide those functions
+    // from the in-kernel probes below, bus mastering off, IOMMU-blocked until a
+    // driver claims them. No-op without udrv=.
+    { extern void udrv_init(void); udrv_init(); }
 
 #if M4_SELFTEST_ENABLE
     m4_run_selftests();
@@ -2308,9 +2226,6 @@ static void kernel_main_phase2(void) {
     { extern int net_init(void); net_init(); }
 #if M9_USER_DEMO
     m9_run_demo(); // signed-userland demo (needs VFS) — does not return
-#endif
-#if M11_DRIVER_DEMO
-    m11_run_demo(); // driver-space demo (needs VFS) — does not return
 #endif
 #if M13_DEMO
     m13_run_demo(); // usability & policy demo — does not return

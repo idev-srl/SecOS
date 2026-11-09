@@ -167,8 +167,6 @@ static void sh_smp(const char* a);      // [M29] bring up secondary cores (opt-i
 static void sh_pkg(const char* a);      // [M32] signed package install
 static void sh_verbose(const char* a);  // [M31] toggle kernel debug verbosity
 static void sh_loadkeys(const char* a); // [M40] console keyboard layout (us, it)
-static void sh_drvreg(const char* a); static void sh_drvunreg(const char* a); static void sh_drvlog(const char* a); static void sh_drvinfo(const char* a);
-static void sh_drvtest(const char* a);
 #if ENABLE_RTC
 static void sh_date(const char* a);
 #endif
@@ -328,11 +326,6 @@ static const struct shell_cmd shell_cmds[] = {
     {"ext2mount", sh_ext2mount, 0},
     {"udpsend",   sh_udpsend,   0},
     {"tcptest",   sh_tcptest,   0},
-    {"drvreg",    sh_drvreg,    0},
-    {"drvunreg",  sh_drvunreg,  0},
-    {"drvlog",    sh_drvlog,    0},
-    {"drvinfo",   sh_drvinfo,   0},
-    {"drvtest",   sh_drvtest,   0},
 };
 
 // [M31] Compact `help`: user-facing command names laid out in columns.
@@ -1997,58 +1990,6 @@ static void sh_verbose(const char* a){
     terminal_writestring("verbose: "); terminal_writestring(g_kverbose?"on\n":"off\n");
 }
 // --- Driver space commands ---
-static void sh_drvreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev = dev*10 + (*a-'0'); a++; } extern int driver_register_binding(process_t*, int); extern const device_desc_t* driver_get_device(int); extern process_t* sched_get_current(void);
-    process_t* ref = NULL;   // [M50-B1] the fallback target is held by a reference
-    process_t* target = sched_get_current(); if(!target){ // fallback: last created process
-        target = ref = process_get_last();
-        if(target){ terminal_writestring("[drvreg] (fallback: using last process, no current)\n"); }
-    }
-    if(!target){ terminal_writestring("[drvreg] no process: run 'elfload' first\n"); return; }
-    if(!driver_get_device(dev)){ terminal_writestring("[drvreg] device not found\n"); process_put(ref); return; }
-    int r = driver_register_binding(target, dev);
-    // [M11] Manual/dev binding path: also mark the target a driver so SYS_DRIVER
-    // (which now requires PROC_TYPE_DRIVER) accepts it. The signed-manifest path
-    // is the production route; this is the interactive harness.
-    if(r==DRV_OK){ target->proc_type = PROC_TYPE_DRIVER; target->drv_dev_id = dev; target->drv_caps = driver_binding_caps(target, dev); terminal_writestring("[drvreg] OK\n"); }
-    else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvreg] FAIL device\n"); else if(r==DRV_ERR_PERM) terminal_writestring("[drvreg] FAIL no slot\n"); else terminal_writestring("[drvreg] FAIL\n");
-    process_put(ref); }
-static void sh_drvunreg(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvunreg <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev=dev*10+(*a-'0'); a++; } extern int driver_remove_binding(process_t*, int); extern process_t* sched_get_current(void); process_t* ref = NULL; process_t* target = sched_get_current(); if(!target) target = ref = process_get_last(); if(!target){ terminal_writestring("[drvunreg] no process (create with elfload)\n"); return; } int r=driver_remove_binding(target, dev); process_put(ref); if(r==DRV_OK) terminal_writestring("[drvunreg] OK (removed)\n"); else if(r==DRV_ERR_DEVICE) terminal_writestring("[drvunreg] FAIL binding not found\n"); else terminal_writestring("[drvunreg] FAIL\n"); }
-static void sh_drvlog(const char* a){
-    extern int driver_audit_dump(driver_audit_entry_t*, int);
-    int only_errors=0; int filter_dev=-1; int filter_op=-1; int limit=32;
-    // Simple parsing: space separated tokens: errors dev=ID op=OP limit=N
-    const char* s=a; while(*s==' ') s++; char token[32];
-    while(*s){ while(*s==' ') s++; int ti=0; while(*s && *s!=' ' && ti< (int)sizeof(token)-1){ token[ti++]=*s++; } token[ti]=0; if(ti==0) break;
-        if(strcmp(token,"errors")==0) only_errors=1; else if(strncmp(token,"dev=",4)==0){ filter_dev=0; const char* p=token+4; while(*p>='0'&&*p<='9'){ filter_dev = filter_dev*10 + (*p-'0'); p++; } }
-        else if(strncmp(token,"op=",3)==0){ filter_op=0; const char* p=token+3; while(*p>='0'&&*p<='9'){ filter_op = filter_op*10 + (*p-'0'); p++; } }
-        else if(strncmp(token,"limit=",6)==0){ limit=0; const char* p=token+6; while(*p>='0'&&*p<='9'){ limit = limit*10 + (*p-'0'); p++; } if(limit<=0) limit=32; if(limit>128) limit=128; }
-    }
-    if(limit>128) limit=128;
-    driver_audit_entry_t buf[128]; int n = driver_audit_dump(buf, limit);
-    if(n==0){ terminal_writestring("[drvlog] (empty)\n"); return; }
-    terminal_writestring("[drvlog] events (filtered):\n");
-    int shown=0; pager_begin();
-    for(int i=0;i<n;i++){
-        if(pager_should_stop()) break;
-        driver_audit_entry_t* e=&buf[i];
-        if(only_errors && e->result==DRV_OK) continue;
-        if(filter_dev!=-1 && e->device_id!=filter_dev) continue;
-        if(filter_op!=-1 && e->opcode!=filter_op) continue;
-        terminal_writestring("  pid="); print_dec(e->pid);
-        terminal_writestring(" dev="); print_dec(e->device_id);
-        terminal_writestring(" op="); print_dec(e->opcode);
-        terminal_writestring(" res="); print_dec(e->result);
-        terminal_writestring(" tgt="); print_hex(e->target);
-        terminal_writestring(" val="); print_hex(e->value);
-        terminal_writestring(" flags="); print_hex(e->flags);
-        terminal_writestring(" tick="); print_dec(e->tick);
-        terminal_writestring("\n");
-        shown++;
-    }
-    pager_end(); if(shown==0){ terminal_writestring("[drvlog] no events after filters\n"); }
-}
-static void sh_drvinfo(const char* a){ while(*a==' ') a++; if(!*a){ terminal_writestring("Usage: drvinfo <device_id>\n"); return; } int dev=0; while(*a>='0'&&*a<='9'){ dev=dev*10+(*a-'0'); a++; } extern const device_desc_t* driver_get_device(int); const device_desc_t* d = driver_get_device(dev); if(!d){ terminal_writestring("[drvinfo] device not found\n"); return; } terminal_writestring("[drvinfo] id="); print_dec(d->device_id); terminal_writestring(" reg_base="); print_hex(d->reg_base); terminal_writestring(" reg_size="); print_hex(d->reg_size); terminal_writestring(" mem_base="); print_hex(d->mem_base); terminal_writestring(" mem_size="); print_hex(d->mem_size); terminal_writestring(" caps="); print_hex(d->caps_mask); terminal_writestring("\n"); }
-static void sh_drvtest(const char* a){ (void)a; extern void user_test_driver(void); user_test_driver(); }
 // Mappa nomi colori (lowercase) -> codice VGA
 static void sh_halt(const char* a){ (void)a; cmd_halt(); }
 static void sh_reboot(const char* a){ (void)a; cmd_reboot(); }

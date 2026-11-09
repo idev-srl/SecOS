@@ -120,16 +120,25 @@ void vtd_flush_cache(const void* p, uint64_t len) {
     __asm__ volatile ("mfence" ::: "memory");
 }
 
+/* [M57] Table pages currently allocated (root, context, queue and every
+ * domain's page tables): /proc/iommu "tables live", for the leak checks. */
+static uint64_t g_tables_live;
+
 uint64_t vtd_table_alloc(void) {
     void* f = pmm_alloc_below(g_vtd_table_limit);
     if (!f) return 0;
+    __atomic_add_fetch(&g_tables_live, 1, __ATOMIC_RELAXED);
     uint64_t pa = (uint64_t)f;
     uint64_t* v = (uint64_t*)phys_to_virt(pa);
     for (int i = 0; i < 512; i++) v[i] = 0;
     vtd_flush_cache(v, 4096);
     return pa;
 }
-void vtd_table_free(uint64_t phys) { if (phys) pmm_free_frame((void*)phys); }
+void vtd_table_free(uint64_t phys) {
+    if (!phys) return;
+    pmm_free_frame((void*)phys);
+    __atomic_sub_fetch(&g_tables_live, 1, __ATOMIC_RELAXED);
+}
 
 /* Spin until (GSTS & mask) == want; 0 or -1 on timeout. */
 static int wait_gsts(vtd_unit_t* u, uint32_t mask, uint32_t want) {
@@ -969,6 +978,9 @@ static void vtd_generate(void (*emit)(void* ctx, const char* line), void* ctx) {
         iommu_ln_s(&l, " cleared "); iommu_ln_dec(&l, u->n_ctx_clear);
         emit(ctx, iommu_ln_end(&l));
     }
+    l.n = 0;
+    iommu_ln_s(&l, "tables live "); iommu_ln_dec(&l, __atomic_load_n(&g_tables_live, __ATOMIC_RELAXED));
+    emit(ctx, iommu_ln_end(&l));
 }
 
 static const iommu_ops_t g_vtd_ops = {

@@ -1,6 +1,5 @@
 /* SecOS minimal user libc. SPDX-License-Identifier: MIT */
 #include "libsecos.h"
-#include "secos_driver.h"
 #include "include/termios.h"   /* [M39] struct termios for tcgetattr/tcsetattr */
 #include "include/errno.h"     /* [M39] errno mapping for source ports (bash, …) */
 
@@ -16,7 +15,6 @@ static long __se(long r){
 #define SYS_EXIT     1
 #define SYS_WRITE    2
 #define SYS_GETPID   6
-#define SYS_DRIVER   7
 #define SYS_SPAWN    8
 #define SYS_WAIT     9
 #define SYS_GETTICKS 10
@@ -76,7 +74,8 @@ int stat(const char* path, struct stat* st) { if(st) stzero(st); return (int)__s
 void _exit(int code) { secos_syscall(SYS_EXIT, code, 0, 0, 0, 0); for (;;) {} }
 int  getpid(void)    { return (int)secos_syscall(SYS_GETPID, 0, 0, 0, 0, 0); }
 void sched_yield(void){ secos_syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
-long secos_driver(driver_call_t* call){ return secos_syscall(SYS_DRIVER, (long)call, 0, 0, 0, 0); }
+/* [M57] Driver Space v2 (user/include/secos/udrv.h). */
+long secos_udrv(long op, long handle, void* arg, unsigned long size){ return secos_syscall(92 /*SYS_UDRV*/, op, handle, (long)arg, (long)size, 0); }
 
 unsigned long getticks(void){ return (unsigned long)secos_syscall(SYS_GETTICKS, 0, 0, 0, 0, 0); }
 long msg_send(int chan, const void* buf, long len){ return secos_syscall(SYS_MSG_SEND, chan, (long)buf, len, 0, 0); }

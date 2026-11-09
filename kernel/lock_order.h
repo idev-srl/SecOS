@@ -47,6 +47,12 @@
                                    registers usbN disks and reads them (B3)     */
 #define LK_K40_BLKDEV      40   /* blkdev->lock on the base disk; a partition
                                    uses its parent's (fs/block.h, B3)           */
+#define LK_K45_UDRV        45   /* g_udrv_lock (kernel/udrv.c, M57): ring-3
+                                   driver claims, their ops and their teardown.
+                                   Inside: udrv fd/event S24/S25, mm S35 (the
+                                   owner's mappings), MSI S58, PCI config S64,
+                                   IOMMU S65-S68, vectors S66, heap, PMM. Never
+                                   held across a user copy                     */
 #define LK_KLOCK_MAX       99   /* every klock level is <= this                 */
 
 /* ---- S/N: CPU-owned spinlocks (arch/x86/spinlock.h) ----------------------- */
@@ -71,6 +77,16 @@
 #define LK_N2_NET_STACK    118
 #define LK_N3_NET_TX       119
 #define LK_S20_MOUNT       120  /* g_mount_lock: mount table only               */
+#define LK_S24_UDRV_FD     124  /* g_udrv_fd_lock (kernel/udrv.c, M57): the claim
+                                   fd pool (references taken/dropped by fork,
+                                   dup, close, exit); event S25 nests inside  */
+#define LK_S25_UDRV_EV     125  /* udrv_dev.ev (M57, one per assigned device):
+                                   IRQ count/pending/mask state and the owner
+                                   pointer. Taken by the device's MSI handler
+                                   and the IOMMU fault hook (IRQ context) and
+                                   by /proc/udrv under g_proc_lock (S15), so it
+                                   ranks above S15 (plan: S14). Inside: proc
+                                   S30 (wake / SIGKILL), MSI S58, PCI cfg S64 */
 #define LK_S30_PROC        130  /* proc_lock: process table, refcounts, creds   */
 #define LK_S35_MM          135  /* p->mm_lock (B1, per process). Since C2 it
                                    also publishes p->cwd and what each p->fds[]

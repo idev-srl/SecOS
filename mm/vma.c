@@ -36,6 +36,7 @@ int vma_add(vma_set_t* s, uint64_t start, uint64_t end, uint64_t flags,
     v->end = end;
     v->flags = flags;
     v->type = type;
+    v->vflags = 0;
     v->file_base = file_base;
     v->file_off = file_off;
     v->file_pad = file_pad;
@@ -123,6 +124,7 @@ int vma_split(vma_set_t* s, vma_t* v, uint64_t addr) {
     n->file_inode = hi.file_inode;
     n->file_voff = hi.file_voff;
     n->phys_base = hi.phys_base;
+    n->vflags = hi.vflags;
     v->end = addr;
     return 0;
 }
@@ -132,6 +134,16 @@ int vma_overlaps(const vma_set_t* s, uint64_t start, uint64_t end) {
     for (uint32_t i = 0; i < s->count; i++) {
         if (s->v[i].type == VMA_TYPE_NONE) continue;
         if (start < s->v[i].end && s->v[i].start < end) return 1;
+    }
+    return 0;
+}
+
+int vma_pinned_overlap(const vma_set_t* s, uint64_t start, uint64_t end) {
+    if (!s) return 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        const vma_t* v = &s->v[i];
+        if (v->type == VMA_TYPE_NONE || !(v->vflags & VMA_VF_PINNED)) continue;
+        if (start < v->end && v->start < end) return 1;
     }
     return 0;
 }
@@ -152,8 +164,13 @@ uint64_t vma_total_bytes(const vma_set_t* s) {
 // VMA flags already carry NX (mmap/mprotect refuse PROT_EXEC here).
 static int vma_map_phys_page(vmm_space_t* space, const vma_t* v, uint64_t pg) {
     uint64_t phys = v->phys_base + (pg - v->start);
+    // [M57] Ring-3 driver regions carry their own memory type and the
+    // DONTFORK PTE bit (vmm_fork_space skips them).
+    uint64_t cache = (v->vflags & VMA_VF_UC) ? (VMM_FLAG_PWT | VMM_FLAG_PCD) :
+                     (v->vflags & VMA_VF_WB) ? 0 : VMM_FLAG_PWT;
+    uint64_t df = (v->vflags & VMA_VF_DONTFORK) ? VMM_FLAG_DONTFORK : 0;
     return vmm_map_in_space(space, pg, phys,
-                            v->flags | VMM_FLAG_DEVICE | VMM_FLAG_PWT | VMM_FLAG_NOEXEC);
+                            v->flags | VMM_FLAG_DEVICE | cache | df | VMM_FLAG_NOEXEC);
 }
 
 // Allocate a frame for page 'pg' of VMA 'v' and fill it (file content + zero /

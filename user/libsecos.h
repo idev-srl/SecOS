@@ -8,6 +8,8 @@ typedef long ssize_t;
 
 /* Raw syscall: rax=num, args in rdi,rsi,rdx,rcx,r8; via int 0x80. */
 long secos_syscall(long num, long a0, long a1, long a2, long a3, long a4);
+/* [M57] SYS_UDRV: raw -errno result (no errno mapping). */
+long secos_udrv(long op, long handle, void* arg, unsigned long size);
 
 /* POSIX-ish wrappers */
 ssize_t write(int fd, const void* buf, size_t len);

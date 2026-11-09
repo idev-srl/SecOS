@@ -45,7 +45,19 @@ typedef struct vma {
     // [M40] VMA_TYPE_PHYS: physical address mapped at 'start'. The frames are
     // device memory, not PMM-owned: never allocated, refcounted or freed.
     uint64_t phys_base;
+    // [M57] VMA_VF_* (zero for every region but the ring-3 driver mappings).
+    uint8_t  vflags;
 } vma_t;
+
+// [M57] vma_t.vflags. A ring-3 driver's BAR and DMA mappings (kernel/udrv.c)
+// are VMA_TYPE_PHYS regions the kernel owns: never inherited by fork (the child
+// gets a hole), never unmapped or re-protected by the process (munmap/mprotect
+// -> EINVAL), torn down only by the claim. The cache flag picks the PTE memory
+// type of a PHYS region (default: Write-Combining, the M40 framebuffer).
+#define VMA_VF_DONTFORK  0x01
+#define VMA_VF_PINNED    0x02
+#define VMA_VF_UC        0x04   // uncached (PAT slot 3): MMIO BARs
+#define VMA_VF_WB        0x08   // write-back: kernel-allocated DMA frames
 
 typedef struct vma_set {
     vma_t    v[VMA_MAX];
@@ -70,6 +82,8 @@ void vma_remove(vma_set_t* s, vma_t* v);
 int vma_split(vma_set_t* s, vma_t* v, uint64_t addr);
 // [M18] Does any live VMA overlap [start,end)?
 int vma_overlaps(const vma_set_t* s, uint64_t start, uint64_t end);
+// [M57] Does any live VMA_VF_PINNED region overlap [start,end)?
+int vma_pinned_overlap(const vma_set_t* s, uint64_t start, uint64_t end);
 // [M18] Sum of live VMA sizes (reserved virtual footprint, for max_mem checks).
 uint64_t vma_total_bytes(const vma_set_t* s);
 

@@ -127,6 +127,7 @@ typedef struct process {
     uint64_t sig_eintr_rip;
     uint8_t  sig_rerun_eintr;
     void*    wait_pty;       // pty_t* the caller is blocked on (read/write either side; NULL = none)
+    void*    wait_udrv;      // [M57] ring-3 driver claim whose IRQ fd read() we sleep in (NULL = none)
     uint8_t  power_phase;    // SYS_REBOOT shutdown state machine (kernel/power.c)
     uint64_t power_deadline; // tick deadline of the current shutdown phase
     // [M30] Signals + job control. sig_pending/sig_blocked are bitmasks (bit n =

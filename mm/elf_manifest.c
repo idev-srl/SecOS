@@ -63,10 +63,33 @@ int elf_manifest_parse(const void* elf_buf, size_t size, elf_manifest_t* out) {
     out->dev_id    = 0;
     out->dev_caps  = 0;
     if (raw->version >= MANIFEST_VERSION_DRIVER &&
-        raw_descsz >= sizeof(elf_manifest_raw_t)) {
+        raw_descsz >= MANIFEST_RAW_V2_SIZE) {
         out->proc_type = raw->proc_type;
         out->dev_id    = raw->dev_id;
         out->dev_caps  = raw->dev_caps;
+    }
+    // [M57] v3: the ring-3 PCI driver fields, only for a DRIVER manifest whose
+    // descriptor really carries them. Counts are clamped, never trusted.
+    out->udrv_flags = 0; out->bar_mask = 0; out->irq_max = 0; out->nmatch = 0;
+    out->dma_max = 0; out->cfg_write_mask = 0;
+    for (uint32_t i = 0; i < MANIFEST_UDRV_MATCH_MAX; i++) {
+        out->match[i].vendor = 0; out->match[i].device = 0;
+        out->match[i].class_code = 0; out->match[i].subclass = 0;
+    }
+    if (raw->version >= MANIFEST_VERSION_UDRV && raw_descsz >= sizeof(elf_manifest_raw_t) &&
+        out->proc_type == MANIFEST_PROC_TYPE_DRIVER) {
+        out->udrv_flags = raw->udrv_flags;
+        out->bar_mask = raw->bar_mask & 0x3F;
+        out->irq_max = raw->irq_max > 32 ? 32 : raw->irq_max;
+        out->nmatch = raw->nmatch > MANIFEST_UDRV_MATCH_MAX ? MANIFEST_UDRV_MATCH_MAX : raw->nmatch;
+        out->dma_max = raw->dma_max;
+        out->cfg_write_mask = raw->cfg_write_mask;
+        for (uint32_t i = 0; i < out->nmatch; i++) {
+            out->match[i].vendor = raw->match[i].vendor;
+            out->match[i].device = raw->match[i].device;
+            out->match[i].class_code = raw->match[i].class_code;
+            out->match[i].subclass = raw->match[i].subclass;
+        }
     }
     if (g_kverbose) {
     terminal_writestring("[MANIFEST] parsed versione=");
