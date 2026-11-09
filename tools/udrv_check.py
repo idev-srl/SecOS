@@ -26,7 +26,17 @@ q35 machine with QEMU's edu device and runs one scenario:
                    -EPERM (1), the BAR still works;
   --mode default   an image without udrv=: no [UDRV] line at boot,
                    /proc/udrv lists no device, the edu function is in the
-                   PCI registry and nobody claims it.
+                   PCI registry and nobody claims it;
+  --mode negtest   only the argument-validation table (below) plus one
+                   udrv_edu run: --env noir (IOMMU without interrupt
+                   remapping: MMIO only, DMA and bus mastering refused) or
+                   --env unsafe (no IOMMU, udrv.unsafe: DMA allowed, the
+                   kernel reports the taint).
+
+--negtest ENV (every mode): /bin/udrv_negtest --env ENV, the SYS_UDRV
+argument-validation table (user/udrv_negtest.c), must pass every row, and so
+must /bin/udrv_user (same table, plain non-driver manifest); afterwards the
+device is free, nothing is held and no DMA fault was taken.
 
 Always: no CPU exception, panic, lockdep report or nested fault in the log.
 Prints "[udrv] <name>: <check> ok|FAIL ..." and "[udrv] <name>: PASS|FAIL".
@@ -40,11 +50,12 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--name', required=True)
 ap.add_argument('--workdir', required=True)
 ap.add_argument('--qemu', default='qemu-system-x86_64')
-ap.add_argument('--mode', required=True, choices=['run', 'service', 'nommu', 'default'])
+ap.add_argument('--mode', required=True, choices=['run', 'service', 'nommu', 'default', 'negtest'])
 ap.add_argument('--timeout', type=float, default=600, help='boot timeout (s)')
 ap.add_argument('--rounds', type=int, default=10000, help='IRQ round trips of the main run')
 ap.add_argument('--leak-runs', type=int, default=8, help='extra short runs for the leak check')
 ap.add_argument('--kills', type=int, default=3, help='service mode: kill -9 / restart cycles')
+ap.add_argument('--negtest', default='', help='environment for udrv_negtest (translated|unsafe|noir|nommu|nodev)')
 ap.add_argument('--expect', action='append', default=[])
 ap.add_argument('--absent', action='append', default=[])
 ap.add_argument('qemu_args', nargs=argparse.REMAINDER)
@@ -224,6 +235,34 @@ def edu_result(o, what):
 def proc_udrv():
     return run('cat /proc/udrv', 30) or ''
 
+def table_result(o, what):
+    """Check one udrv_negtest / udrv_user run: every row PASS."""
+    rows = re.findall(r'\[udrv_negtest\] ([AB]\d\d) [^\n]*: (PASS|FAIL|SKIP)', o or '')
+    r = re.search(r'\[udrv_negtest\] RESULT rows=(\d+) pass=(\d+) fail=(\d+) skip=(\d+)', o or '')
+    fl = re.findall(r'\[udrv_negtest\] [^\n]*: FAIL[^\n]*', o or '')
+    ok = r is not None and r.group(3) == '0' and '[udrv_negtest] PASS' in (o or '') and len(rows) == int(r.group(1))
+    check(what, ok, (r.group(0) if r else 'timeout/no RESULT') + ('; ' + ' | '.join(fl[:6]) if fl else ''))
+    return ok
+
+def negtest(env):
+    """The argument-validation table as a driver and as a plain program."""
+    o = run('/bin/udrv_negtest --env %s' % env, 300)
+    table_result(o, 'negtest-%s' % env)
+    for l in re.findall(r'\[udrv_negtest\] (?:RESULT|env )[^\n]*', o or ''):
+        print('[udrv] %s: %s' % (a.name, l), flush=True)
+    uenv = 'nodev' if env == 'nodev' else 'user'
+    o = run('/bin/udrv_user --env %s' % uenv, 120)
+    table_result(o, 'negtest-udrv_user-%s' % uenv)
+    if env == 'nodev': return
+    d = dlog()
+    check('negtest-log-not-root', re.search(r'\[UDRV\] claim pid=\d+ bdf=00:04\.0 refused\(not-root\)', d) is not None)
+    check('negtest-log-not-a-driver', re.search(r'\[UDRV\] claim pid=\d+ bdf=00:04\.0 refused\(not-a-driver\)', d) is not None)
+    check('negtest-log-busy', re.search(r'\[UDRV\] claim pid=\d+ bdf=00:04\.0 refused\(busy\)', d) is not None)
+    o = proc_udrv()
+    check('negtest-device-free', re.search(r'dev 00:04\.0 1234:11e8 free claims=\d+ faults=0 kills=0 ', o) is not None and
+          re.search(r'live_dma_pages=0 live_bar_pages=0', o) is not None and
+          re.search(r' mode=none nvec=0 pending=0x0 masked=0x0 dma=0', o) is not None, repr(o[-300:]))
+
 t_start = time.time()
 ok_prompt = wait_prompt(a.timeout)
 check('boot-to-bash', ok_prompt, '(%.0fs)' % (time.time() - t_start))
@@ -238,6 +277,7 @@ if a.mode == 'default':
     check('proc-udrv-empty', re.search(r'udrv devices 0 ', o) is not None and 'dev ' not in o, repr(o[-200:]))
     o = run('grep -i 11e8 /proc/bus/pci/devices', 30) or ''
     check('edu-in-registry', re.search(r'123411e8', o) is not None, repr(o[-120:]))
+    if a.negtest: negtest(a.negtest)
     finish()
 
 if a.mode == 'nommu':
@@ -255,6 +295,27 @@ if a.mode == 'nommu':
     check('log-bm-refused', re.search(r'\[UDRV\] cfg_write pid=\d+ bdf=00:04\.0 refused\(busmaster: no IOMMU\)', d) is not None)
     o = proc_udrv()
     check('proc-udrv-free', re.search(r'dev 00:04\.0 1234:11e8 free claims=1 faults=0', o) is not None, repr(o[-240:]))
+    if a.negtest: negtest(a.negtest)
+    finish()
+
+if a.mode == 'negtest':
+    o = run('/bin/udrv_edu -n 100', 300)
+    edu_result(o, 'udrv_edu-pass')
+    d = dlog()
+    if a.negtest == 'unsafe':
+        check('log-claim-tainted', re.search(r'\[UDRV\] claim pid=\d+ bdf=00:04\.0 ok fd=\d+ iommu=none dma=yes TAINTED\(unsafe\)', d)
+              is not None)
+        check('log-taint', '[UDRV] WARNING: TAINTED: ring-3 DMA without IOMMU (udrv.unsafe)' in d)
+        check('edu-dma-data', o is not None and re.search(r'\[udrv_edu\] dma-data ok', o) is not None)
+        o = proc_udrv()
+        check('proc-udrv-tainted', 'TAINTED: ring-3 DMA without IOMMU' in o, repr(o[:200]))
+    if a.negtest == 'noir':
+        check('log-claim-no-ir', re.search(r'\[UDRV\] claim pid=\d+ bdf=00:04\.0 ok fd=\d+ iommu=translated dma=no', d) is not None)
+        check('log-bm-refused-no-ir', re.search(r'\[UDRV\] cfg_write pid=\d+ bdf=00:04\.0 refused\(busmaster: no interrupt remapping\)', d)
+              is not None)
+        check('log-dma-refused-no-ir', re.search(r'\[UDRV\] dma_alloc pid=\d+ bdf=00:04\.0 refused\(no interrupt remapping\)', d)
+              is not None)
+    negtest(a.negtest)
     finish()
 
 def common_after(tag, claims):
@@ -299,6 +360,15 @@ if a.mode == 'run':
     check('runs-nothing-held', now is not None and now['dma'] == 0 and now['bar'] == 0,
           'dma %s bar %s' % (now and now['dma'], now and now['bar']))
     common_after('runs', 1 + a.leak_runs + a.leak_runs // 2)   # a --hold run claims twice
+    if a.negtest:
+        negtest(a.negtest)
+        time.sleep(2)
+        after = resources()
+        print('[udrv] %s: resources after the negative table %s' % (a.name, after), flush=True)
+        compare('negtest', now, after)
+        o = run('cat /proc/iommu', 30) or ''
+        check('negtest-iommu-no-faults', re.search(r'dev 00:04\.0 1234:11e8 domain blocked', o) is not None and
+              re.search(r'faults 0 irqs 0', o) is not None, repr(o[-300:]))
     finish()
 
 if a.mode == 'service':
