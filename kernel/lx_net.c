@@ -347,7 +347,7 @@ static int do_send(process_t* c, trapframe_t* tf, sockref_t* s, const void* k, i
 static void maybe_sigpipe(process_t* c, sockref_t* s, int r, int flags) {
     if (r != -E_PIPE || (flags & SK_MSG_NOSIGNAL)) return;
     int stream = s->inet ? (socket_kind(s->sx, NULL) == SKIND_TCP) : (unix_type(s->u) == SOCK_STREAM);
-    if (stream) signal_post(c, SIGPIPE);
+    if (stream) signal_post_thread(c, SIGPIPE);   /* [U9] to the writing thread (Linux) */
 }
 
 static uint64_t sys_sendto(process_t* c, trapframe_t* tf, int fd, uint64_t ubuf, uint64_t len,

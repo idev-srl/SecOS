@@ -119,8 +119,17 @@
 // through unchanged. kernel/syscall_lx.c.
 #define SYS_LX_BASE             512
 #define SYS_LX_ARCH_PRCTL       (SYS_LX_BASE + 158) // arch_prctl(ARCH_SET_FS/ARCH_GET_FS, addr)
-#define SYS_LX_SET_TID_ADDRESS  (SYS_LX_BASE + 218) // set_tid_address(int*) -> tid (= pid until U9 threads)
-#define SYS_LX_EXIT_GROUP       (SYS_LX_BASE + 231) // exit_group(status) = SYS_EXIT until U9
+#define SYS_LX_SET_TID_ADDRESS  (SYS_LX_BASE + 218) // set_tid_address(int*) -> tid
+#define SYS_LX_EXIT_GROUP       (SYS_LX_BASE + 231) // exit_group(status): every thread (= SYS_EXIT)
+// [U9] threads (kernel/thread.c, kernel/futex.c; dispatched in syscall_trap.c)
+#define SYS_LX_CLONE            (SYS_LX_BASE + 56)  // clone(flags, newsp, ptid, ctid, tls): threads only
+#define SYS_LX_EXIT             (SYS_LX_BASE + 60)  // exit(status): this thread
+#define SYS_LX_GETTID           (SYS_LX_BASE + 186) // gettid()
+#define SYS_LX_TKILL            (SYS_LX_BASE + 200) // tkill(tid, sig)
+#define SYS_LX_FUTEX            (SYS_LX_BASE + 202) // futex(uaddr, op, val, timeout|val2, uaddr2, val3)
+#define SYS_LX_TGKILL           (SYS_LX_BASE + 234) // tgkill(tgid, tid, sig)
+#define SYS_LX_SET_ROBUST_LIST  (SYS_LX_BASE + 273) // set_robust_list(head, len): stored
+#define SYS_LX_GET_ROBUST_LIST  (SYS_LX_BASE + 274) // get_robust_list(tid, *head, *len)
 #define SYS_LX_MAX              (SYS_LX_BASE + 512) // first number above the Linux range
 
 // Kernel interfaces for standard userland tools (kernel/kiface.c; semantics +

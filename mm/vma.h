@@ -20,7 +20,7 @@
 #include "spinlock.h"   // [M50-B1] the owner's mm_lock
 struct vfs_inode;
 
-#define VMA_MAX        64
+#define VMA_MAX        256   // [U9] two per thread stack (guard + stack); U4a makes it dynamic
 #define VMA_TYPE_ANON  0
 #define VMA_TYPE_FILE  1
 #define VMA_TYPE_PHYS  2    // [M40] device memory (framebuffer): phys_base + (va - start), shared
@@ -116,7 +116,8 @@ int vma_fault_in(vmm_space_t* space, const vma_t* v, uint64_t addr);
 // (a page-cache fill may call into a filesystem), then the lock is retaken,
 // the VMA re-checked (still there, unchanged) and the PTE installed. A page
 // some other path installed meanwhile counts as success. Must be called
-// without 'mm' held. Returns 0 on success, negative when not serviceable.
+// without 'mm' held. Returns 0 on success (also when the VMA changed meanwhile:
+// the access is retried and faults again), negative when not serviceable.
 int vma_fault_in_live(vmm_space_t* space, vma_set_t* set, spinlock_t* mm, uint64_t addr);
 
 #endif // VMA_H

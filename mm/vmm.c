@@ -1124,13 +1124,20 @@ int vmm_cow_fault(vmm_space_t* space, uint64_t addr) {
     if (!pt) return -1;
     int i = (va >> 12) & 0x1FF;
     uint64_t pte = pt[i];
+    // [U9] Already writable: another thread of this address space resolved
+    // the same COW page first (we faulted on the read-only entry it replaced,
+    // under mm_lock now). Retry the write; drop our stale TLB entry.
+    if ((pte & VMM_FLAG_PRESENT) && (pte & VMM_FLAG_RW) && (pte & VMM_FLAG_USER) && !(pte & VMM_FLAG_COW)) {
+        __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+        return 0;
+    }
     if (!(pte & VMM_FLAG_PRESENT) || !(pte & VMM_FLAG_COW)) return -1;
     {   // Only a region that is writable NOW may be COW-resolved: a COW page
         // later mprotect()ed read-only keeps its COW bit (it is still shared),
         // and a write to it is a real violation, not a copy request.
         process_t* cur = sched_get_current();
         if (cur && cur->space == space) MM_ASSERT_HELD(cur);   // [M50-B1]
-        const vma_t* v = (cur && cur->space == space) ? vma_find(&cur->vmas, va) : 0;
+        const vma_t* v = (cur && cur->space == space) ? vma_find(&cur->mm->vmas, va) : 0;
         if (!v || !(v->flags & VMM_FLAG_RW) || (v->flags & VMM_FLAG_PROTNONE)) return -1;
     }
     uint64_t oldphys = pte & ADDRESS_MASK;
@@ -1800,7 +1807,7 @@ int vmm_try_handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
             // (user access -> SIGSEGV, kernel uaccess -> -EFAULT via the fixup).
             // [M50-B1] vma_fault_in_live: VMA lookup and PTE install under the
             // owner's mm_lock, the frame fill (page cache) outside it.
-            if (vma_fault_in_live(cur->space, &cur->vmas, &cur->mm_lock, fault_addr) == 0) {
+            if (vma_fault_in_live(cur->space, &cur->mm->vmas, &cur->mm->lock, fault_addr) == 0) {
                 // Quiet success path (faults are frequent): a terse debugcon
                 // marker only, gated on verbosity (M34: a real program like lua
                 // faults in hundreds of pages and would drown its own output).

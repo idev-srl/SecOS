@@ -25,6 +25,7 @@ user/*.elf
 user/secwm/*.elf
 user/udrv/*.elf
 user/lvgl/*.elf
+user/thrtest/*.elf
 user/*.o
 # [crypt] user/libcrypt.a and its objects (rebuilt by `make libcrypt`)
 user/*.a

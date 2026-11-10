@@ -166,6 +166,10 @@ void bkl_init_mode(void) {
 static int lx_lockfree(uint64_t num) {
     switch (num) {
     case SYS_LX_ARCH_PRCTL: case SYS_LX_SET_TID_ADDRESS: case SYS_LX_EXIT_GROUP:
+    /* [U9] threads: the table/group state under proc_lock, futex queues
+     * under their own lock, fds under the group's fd_lock. */
+    case SYS_LX_CLONE: case SYS_LX_EXIT: case SYS_LX_GETTID: case SYS_LX_TKILL:
+    case SYS_LX_TGKILL: case SYS_LX_FUTEX: case SYS_LX_SET_ROBUST_LIST: case SYS_LX_GET_ROBUST_LIST:
     /* sockets: socket .. getsockopt (41-55), accept4 (288) */
     case SYS_LX_BASE + 41: case SYS_LX_BASE + 42: case SYS_LX_BASE + 43: case SYS_LX_BASE + 44:
     case SYS_LX_BASE + 45: case SYS_LX_BASE + 46: case SYS_LX_BASE + 47: case SYS_LX_BASE + 48:

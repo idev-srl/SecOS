@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "pty.h"
+#include "thread.h"   /* [U9] */
 #include "tty.h"
 #include "process.h"
 #include "signal.h"
@@ -190,7 +191,7 @@ static void ctty_drop(process_t* c, int leader_hangup) {
     uint64_t fl = spin_lock_irqsave(&g_pty_lock);
     pty_t* p = (pty_t*)t->owner;
     c->ctty = NULL;
-    if (leader_hangup && c->pid == c->sid && t->session == c->sid) hangup_session(t);
+    if (leader_hangup && c->tgid == c->sid && t->session == c->sid) hangup_session(t);   // [U9] tgid
     if (p->crefs > 0) p->crefs--;
     ns = tty_take_sigs(t, sigs);
     dead = maybe_detach(p);
@@ -201,6 +202,13 @@ static void ctty_drop(process_t* c, int leader_hangup) {
 void pty_proc_exit(process_t* p) {
     if (!p) return;
     ctty_drop(p, 1);
+}
+
+// [U9] A thread that is not the last of its process: drop its own controlling
+// terminal reference only (the session lives on).
+void pty_thread_exit(process_t* p) {
+    if (!p) return;
+    ctty_drop(p, 0);
 }
 
 void pty_inherit_ctty(process_t* child, const process_t* parent) {
@@ -546,7 +554,7 @@ int pty_console_sctty(process_t* c) {
     int con = 0;
     struct tty* t = pty_proc_ctty(c, &con);
     if (con) return 0;
-    if (t || c->sid != c->pid) return E_PERM;
+    if (t || c->sid != c->tgid) return E_PERM;
     if (c->ctty) ctty_drop(c, 0);
     c->ctty_detached = 0;
     return 0;
@@ -564,14 +572,15 @@ int pty_console_notty(process_t* c) {
 long ksys_setsid(void) {
     process_t* c = sched_get_current();
     if (!c || c->pid == 0) return E_PERM;
-    struct pg_find f = { c->pid, 0, 0 };            /* sid 0: any session */
+    if (thread_group_live(c) > 1) return E_PERM;     /* [U9] see ksys_ioctl (TIOCSCTTY) */
+    struct pg_find f = { c->tgid, 0, 0 };           /* sid 0: any session */
     /* [M52] The check and the sid/pgid stores in one proc_lock section: a
      * parent's setpgid() on another CPU checks our sid and stores our pgid
      * under the same lock. ctty_drop (g_pty_lock, S10) runs after it: it
      * does not look at the session (no leader hangup here). */
     uint64_t fl = process_lock_irqsave();
     process_foreach_locked(pg_find_cb, &f);
-    if (!f.found) { c->sid = c->pid; c->pgid = c->pid; }
+    if (!f.found) { c->sid = c->tgid; c->pgid = c->tgid; }
     process_unlock_irqrestore(fl);
     if (f.found) return E_PERM;                       /* already a group leader (POSIX) */
     ctty_drop(c, 0);

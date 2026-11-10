@@ -215,6 +215,7 @@ static int ap_alloc_idle(cpu_t* c) {
     idle->state = PROC_RUNNING;
     idle->cpu_affinity = c->index;
     idle->cpu_pin = (int32_t)c->index;
+    { extern void thread_attach_kernel_task(process_t*); thread_attach_kernel_task(idle); }   // [U9]
     c->idle_task = idle;
     c->switch_stack_top = (uint64_t)phys_to_virt((uint64_t)sw) + AP_SWITCH_STACK_SIZE;
     return 0;

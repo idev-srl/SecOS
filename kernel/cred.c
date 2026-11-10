@@ -190,7 +190,7 @@ void cred_new_owner(const process_t* c, const char* parent_canon,
 // creates the entry: created first and fixed up later, a new file existed
 // root-owned 0644 for a moment and another user could open it.
 unsigned cred_new_attr(const process_t* c, const char* canon, uint32_t mode, int is_dir, vfs_attr_t* a){
-    uint32_t um = c ? c->ki.umask : 022;
+    uint32_t um = c ? c->tg->umask : 022;
     uint32_t want = ((mode ? mode : (is_dir ? 0777u : 0666u)) & 07777u) & ~um;
     char par[256]; parent_of(canon, par, sizeof(par));
     uint32_t uid, gid; int sg;

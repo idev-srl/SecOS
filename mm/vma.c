@@ -275,12 +275,16 @@ int vma_fault_in_live(vmm_space_t* space, vma_set_t* set, spinlock_t* mm, uint64
     v = vma_find(set, pg);
     int r;
     if (!v || !vma_same(v, &snap)) {
-        r = -2;                                 // unmapped or changed meanwhile
+        // Unmapped or changed meanwhile. [U9] With threads another task of
+        // this mm edits the set concurrently (an adjacent mmap extends this
+        // very VMA, mprotect splits it): retry the access, and the next fault
+        // looks again (no VMA any more -> a real fault then).
+        r = v ? 2 : -2;
     } else {
         r = vmm_map_in_space(space, pg, (uint64_t)frame & ADDRESS_MASK, snap.flags);
         if (r == -3) r = 1;                     // installed by someone else: fine
     }
     spin_unlock_irqrestore(mm, fl);
     if (r != 0) pmm_free_frame(frame);
-    return r > 0 ? 0 : r;
+    return r > 0 ? 0 : r;                       // 1: installed by someone else, 2: retry
 }

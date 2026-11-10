@@ -2251,6 +2251,37 @@ else
 fi
 
 # ============================================================================
+# [U9] THREADS GATE: POSIX threads (docs/devlog/U9-threads.md).
+# tools/threads_test.sh builds user/thrtest/{thrraw,thrstress}.c with
+# tools/secos-cc and runs them from an ext2 disk at -smp 1/2/4: clone,
+# exit/exit_group, futex (all ops, timeouts, a lost-wakeup ping-pong),
+# per-thread signals and group stop, /proc/<pid>/task, musl pthreads (locks,
+# condvars, barriers, semaphores, cancellation, 10000 joins, 500 detached,
+# TLS, kill/SIGINT/execve of a multi-threaded process), smptest threads/
+# thrkill, no heap or frame growth, then a `nothreads` boot. THREADS_LOCKDEP=1
+# repeats it on a -DSECOS_LOCKDEP image at -smp 4.
+# ============================================================================
+if command -v mke2fs >/dev/null 2>&1; then
+    echo "[selftest] THREADS gate (tools/threads_test.sh)..."
+    TH_OUT=$(mktemp /tmp/secos_selftest_threads.XXXXXX)
+    tools/threads_test.sh >"$TH_OUT" 2>&1
+    if [[ "${THREADS_LOCKDEP:-0}" == 1 ]]; then
+        tools/threads_test.sh --lockdep --smp 4 --no-nothreads >>"$TH_OUT" 2>&1
+    fi
+    while IFS= read -r l; do
+        case "$l" in
+            "  [PASS] "*) check "${l#  \[PASS\] }" 0 ;;
+            "  [FAIL] "*) check "${l#  \[FAIL\] }" 1 ;;
+            "  [SKIP] "*) echo "$l" ;;
+        esac
+    done <"$TH_OUT"
+    grep -q "RESULT:" "$TH_OUT" || { check "THREADS gate ran to completion" 1; tail -20 "$TH_OUT"; }
+    rm -f "$TH_OUT"
+else
+    echo "  [SKIP] THREADS gate (needs mke2fs)"
+fi
+
+# ============================================================================
 # INIT GATE: /bin/init as PID 1 — a ready system with no manual steps.
 # (a) An image built with SSH_AUTHORIZED_KEYS=<throwaway key generated here>
 #     boots with a user-net NIC: init must be PID 1, ifup must take a DHCP

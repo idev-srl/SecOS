@@ -49,6 +49,21 @@
  *     a pattern of `kbytes` KiB in writes of 1..4093 bytes, each stage copies
  *     with its own buffer size, the consumer checks every byte and the count.
  *     Prints "[smptest] pipe PASS ..." / "FAIL ...".
+ *
+ *   smptest threads [threads] [secs]
+ *     Thread stress (U9) on raw clone() (no libc in the threads): pairs of
+ *     threads ping-pong over a futex word (a lost wakeup hangs the pair; the
+ *     main thread reports it after the deadline), every thread also maps,
+ *     touches, re-protects and unmaps its own regions of the shared address
+ *     space and closes/dups pipe fds of the shared table, and thread 0 forks
+ *     children that must see one thread. Threads migrate between CPUs all
+ *     the time. Prints "[smptest] threads PASS ..." / "FAIL ...".
+ *
+ *   smptest thrkill [rounds] [threads]
+ *     Kill races (U9): each round forks a child that starts `threads` raw
+ *     threads (blocked in futex waits, sleeping, spinning, in pipe reads),
+ *     then SIGKILLs it after a random delay; every wait status must say
+ *     killed by SIGKILL. Prints "[smptest] thrkill PASS ...".
  */
 #include "libsecos.h"
 #include <signal.h>
@@ -506,7 +521,164 @@ static int cmd_pipe(int lines, int stages, unsigned long kbytes) {
     return bad || spawn_fail ? 1 : 0;
 }
 
+/* ---- [U9] threads: raw clone (SecOS 512+56), futex (512+202) ---- */
+#define T_CLONE  (512 + 56)
+#define T_EXIT   (512 + 60)
+#define T_GETTID (512 + 186)
+#define T_FUTEX  (512 + 202)
+#define T_FLAGS  (0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x40000 | 0x100000 | 0x200000)
+long t_clone(long flags, void* stack_top, int* ptid, int* ctid, int (*fn)(void*), void* arg);
+__asm__(
+    ".text\n.global t_clone\n.type t_clone,@function\nt_clone:\n"
+    "  and $-16, %rsi\n  sub $16, %rsi\n  mov %r8, (%rsi)\n  mov %r9, 8(%rsi)\n"
+    "  xor %r8, %r8\n  mov $568, %eax\n  int $0x80\n  test %rax, %rax\n  jnz 1f\n"
+    "  pop %rax\n  pop %rdi\n  xor %ebp, %ebp\n  call *%rax\n  mov %rax, %rdi\n"
+    "  mov $572, %eax\n  int $0x80\n  hlt\n1: ret\n");
+static long t_sys6(long n, long a, long b, long c, long d, long e, long f) {
+    long r; register long r8 __asm__("r8") = e; register long r9 __asm__("r9") = f;
+    __asm__ volatile("int $0x80" : "=a"(r) : "0"(n), "D"(a), "S"(b), "d"(c), "c"(d), "r"(r8), "r"(r9) : "memory", "cc");
+    return r;
+}
+static int t_futex(volatile int* a, int op, int v) { return (int)t_sys6(T_FUTEX, (long)a, op | 128, v, 0, 0, 0); }
+#define T_STK (64 * 1024)
+typedef struct { volatile int tid, ctid; char* stk; } tth_t;
+static int t_start(tth_t* t, int (*fn)(void*), void* arg) {
+    char* s = (char*)mmap(0, T_STK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    if (!s || (long)s == -1) return -1;
+    t->stk = s; t->ctid = 1;
+    long r = t_clone(T_FLAGS, s + T_STK, (int*)&t->tid, (int*)&t->ctid, fn, arg);
+    if (r <= 0) { munmap(s, T_STK); t->stk = 0; t->ctid = 0; return -1; }
+    return 0;
+}
+/* CLONE_CHILD_CLEARTID zeroes ctid at thread exit and futex-wakes it (non-private). */
+static void t_join(tth_t* t) {
+    while (__atomic_load_n(&t->ctid, __ATOMIC_SEQ_CST))
+        t_sys6(T_FUTEX, (long)&t->ctid, 0 /*FUTEX_WAIT*/, 1, 0, 0, 0);
+    if (t->stk) munmap(t->stk, T_STK);
+    t->stk = 0;
+}
+
+#define TT_MAX 32
+static volatile int tt_word[TT_MAX / 2];
+static volatile unsigned long tt_rounds[TT_MAX], tt_maps[TT_MAX], tt_forks;
+static volatile int tt_stop, tt_bad;
+static unsigned long tt_deadline;
+static int tt_fn(void* a) {
+    int id = (int)(long)a, pair = id / 2, me = id & 1;
+    volatile int* w = &tt_word[pair];
+    unsigned long n = 0;
+    while (!tt_stop) {
+        /* ping-pong: the word says whose turn it is (0 / 1) */
+        while (__atomic_load_n(w, __ATOMIC_SEQ_CST) != me && !tt_stop)
+            t_futex(w, 0 /*WAIT*/, !me);
+        if (tt_stop) break;
+        __atomic_store_n(w, !me, __ATOMIC_SEQ_CST);
+        t_futex(w, 1 /*WAKE*/, 1);
+        n++;
+        tt_rounds[id] = n;
+        if ((n & 63) == 0) {
+            /* the shared VMA set and fd table */
+            char* m = (char*)mmap(0, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+            if (m && (long)m != -1) {
+                m[0] = (char)id; m[4096] = (char)id; m[8191] = (char)id;
+                mprotect(m + 4096, 4096, PROT_READ);
+                if (m[0] != (char)id || m[4096] != (char)id) tt_bad = 2;
+                munmap(m, 3 * 4096);
+                tt_maps[id]++;
+            }
+            int p[2];
+            if (pipe(p) == 0) { int d = dup(p[0]); close(p[0]); close(p[1]); if (d >= 0) close(d); }
+        }
+        if (id == 0 && (n & 1023) == 0) {
+            long pid = fork();
+            if (pid == 0) _exit(t_sys6(T_GETTID, 0, 0, 0, 0, 0, 0) == getpid() ? 0 : 1);
+            if (pid > 0) { if (waitpid((int)pid) != 0) tt_bad = 3; tt_forks++; }
+        }
+    }
+    tt_rounds[id] = n;
+    return 0;
+}
+/* A pair whose counters did not move for 5 s lost a wakeup (both sleep). */
+static int tt_watch(int nt) {
+    unsigned long last[TT_MAX / 2], since[TT_MAX / 2];
+    for (int i = 0; i < nt / 2; i++) { last[i] = 0; since[i] = getticks(); }
+    int stuck = 0;
+    while (getticks() < tt_deadline) {
+        sleep_ticks(100);
+        for (int i = 0; i < nt / 2; i++) {
+            unsigned long v = tt_rounds[2 * i] + tt_rounds[2 * i + 1];
+            if (v != last[i]) { last[i] = v; since[i] = getticks(); }
+            else if (getticks() - since[i] > 5000) stuck++;
+        }
+        if (stuck) break;
+    }
+    return stuck;
+}
+static int cmd_threads(int nt, int secs) {
+    if (nt < 2) nt = 2;
+    if (nt > TT_MAX) nt = TT_MAX;
+    nt &= ~1;
+    static tth_t th[TT_MAX];
+    tt_stop = 0; tt_bad = 0; tt_forks = 0;
+    for (int i = 0; i < nt / 2; i++) tt_word[i] = 0;
+    int made = 0;
+    for (int i = 0; i < nt; i++) if (t_start(&th[i], tt_fn, (void*)(long)i) == 0) made++;
+    tt_deadline = getticks() + (unsigned long)secs * 1000;
+    for (int i = 0; i < TT_MAX; i++) { tt_rounds[i] = 0; tt_maps[i] = 0; }
+    int stuck = tt_watch(nt);
+    if (stuck && !tt_bad) tt_bad = 4;              /* a lost futex wakeup */
+    tt_stop = 1;
+    for (int i = 0; i < nt / 2; i++) { tt_word[i] = 2; t_futex(&tt_word[i], 1, 2); }   /* release both sides */
+    for (int i = 0; i < nt; i++) if (th[i].stk) t_join(&th[i]);
+    unsigned long rounds = 0, maps = 0, minr = ~0UL;
+    for (int i = 0; i < nt; i++) { rounds += tt_rounds[i]; maps += tt_maps[i]; if (tt_rounds[i] < minr) minr = tt_rounds[i]; }
+    int ok = made == nt && !tt_bad && minr > 0;
+    P(ok ? "[smptest] threads PASS" : "[smptest] threads FAIL");
+    P(" threads="); put_dec((unsigned long)made); P(" pingpongs="); put_dec(rounds);
+    P(" min="); put_dec(minr); P(" maps="); put_dec(maps); P(" forks="); put_dec(tt_forks);
+    P(" bad="); put_dec((unsigned long)tt_bad); P("\n");
+    return ok ? 0 : 1;
+}
+
+static volatile int tk_never;
+static int tk_fn(void* a) {
+    int k = (int)(long)a;
+    if (k % 4 == 0) for (;;) t_futex(&tk_never, 0, 0);
+    if (k % 4 == 1) for (;;) sleep_ticks(1000);
+    if (k % 4 == 2) { int p[2]; char b; if (pipe(p) == 0) for (;;) read(p[0], &b, 1); }
+    for (;;) tk_never += 0;
+    return 0;
+}
+static int cmd_thrkill(int rounds, int nt) {
+    if (nt < 1) nt = 1;
+    if (nt > TT_MAX) nt = TT_MAX;
+    int bad = 0;
+    unsigned long seed = getticks() * 2654435761UL;
+    for (int r = 0; r < rounds; r++) {
+        long pid = fork();
+        if (pid == 0) {
+            static tth_t th[TT_MAX];
+            for (int i = 0; i < nt; i++) t_start(&th[i], tk_fn, (void*)(long)i);
+            for (;;) sleep_ticks(1000);
+        }
+        if (pid < 0) { bad++; continue; }
+        seed = seed * 6364136223846793005UL + 1442695040888963407UL;
+        sleep_ticks((unsigned)(seed >> 33) % 30);
+        kill((int)pid, 9);
+        int st = waitpid((int)pid);
+        if ((st & 0x7f) != 9) bad++;
+    }
+    P(bad ? "[smptest] thrkill FAIL" : "[smptest] thrkill PASS");
+    P(" rounds="); put_dec((unsigned long)rounds); P(" threads="); put_dec((unsigned long)nt);
+    P(" bad="); put_dec((unsigned long)bad); P("\n");
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 2 && strcmp(argv[1], "threads") == 0)
+        return cmd_threads((int)arg_num(argc > 2 ? argv[2] : 0, 8), (int)arg_num(argc > 3 ? argv[3] : 0, 10));
+    if (argc >= 2 && strcmp(argv[1], "thrkill") == 0)
+        return cmd_thrkill((int)arg_num(argc > 2 ? argv[2] : 0, 40), (int)arg_num(argc > 3 ? argv[3] : 0, 8));
     if (argc >= 2 && strcmp(argv[1], "fpu") == 0)
         return cmd_fpu((int)arg_num(argc > 2 ? argv[2] : 0, 8), arg_num(argc > 3 ? argv[3] : 0, 3000000));
     if (argc >= 2 && strcmp(argv[1], "burst") == 0)
@@ -523,6 +695,7 @@ int main(int argc, char** argv) {
                         arg_num(argc > 4 ? argv[4] : 0, 512));
     P("usage: smptest fpu [children] [iters] | burst [rounds] [width] | cpus"
       " | procrace [secs] [readers] [churners] | pty [pairs] [kbytes]"
-      " | pipe [pipelines] [stages] [kbytes]\n");
+      " | pipe [pipelines] [stages] [kbytes] | threads [threads] [secs]"
+      " | thrkill [rounds] [threads]\n");
     return 2;
 }

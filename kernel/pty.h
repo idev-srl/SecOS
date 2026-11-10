@@ -51,6 +51,7 @@ void pty_ref(void* inode);                 /* +1 fd reference (no-op for a non-p
 void pty_unref(void* inode);               /* -1 fd reference (hangup / EIO / free) */
 void pty_ctty_ref(void* tty);              /* +1 controlling-terminal holder (NULL ok) */
 void pty_proc_exit(struct process* p);     /* drop p's ctty; a session leader hangs it up */
+void pty_thread_exit(struct process* p);   /* [U9] a thread (not the last) exits */
 void pty_inherit_ctty(struct process* child, const struct process* parent); /* spawn */
 
 /* The controlling terminal of p: a pty slave's struct tty, or NULL. With NULL,

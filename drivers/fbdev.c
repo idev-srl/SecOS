@@ -210,13 +210,13 @@ int64_t fbdev_mmap(struct process* cp, uint64_t len, int prot, int flags, uint64
     /* [M50-B1] VMA edit + eager PTE install under the owner's mm_lock (device
      * pages: no frame fill, no page cache). */
     uint64_t mfl = mm_lock(c);
-    uint64_t base = c->mmap_next;
+    uint64_t base = c->mm->mmap_next;
     if (base >= USER_MMAP_END || len > USER_MMAP_END - base) { mm_unlock(c, mfl); return E_NOMEM; }
-    if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) { mm_unlock(c, mfl); return E_NOMEM; }
-    if (vma_add_phys(&c->vmas, base, base + len, vf, fi.addr + off) != 0) { mm_unlock(c, mfl); return E_NOMEM; }
-    c->mmap_next = base + len;
+    if (c->mem_limit && vma_total_bytes(&c->mm->vmas) + len > c->mem_limit) { mm_unlock(c, mfl); return E_NOMEM; }
+    if (vma_add_phys(&c->mm->vmas, base, base + len, vf, fi.addr + off) != 0) { mm_unlock(c, mfl); return E_NOMEM; }
+    c->mm->mmap_next = base + len;
     /* Map it eagerly (the #PF path would also fault pages in one by one). */
-    const vma_t* v = vma_find(&c->vmas, base);
+    const vma_t* v = vma_find(&c->mm->vmas, base);
     uint32_t n = 0;
     for (uint64_t va = base; v && va < base + len; va += 0x1000) {
         int r = vma_fault_in(c->space, v, va);
@@ -240,7 +240,7 @@ int64_t fbdev_mmap(struct process* cp, uint64_t len, int prot, int flags, uint64
  * the way back to text no longer races a CPU that is printing. The capability
  * checks (which audit) and the debugcon messages run outside it. */
 static int g_kd_mode = KD_TEXT;
-static uint32_t g_kd_owner;          /* pid that switched to KD_GRAPHICS */
+static uint32_t g_kd_owner;          /* process (tgid) that switched to KD_GRAPHICS */
 
 int vtcon_mode(void) { return g_kd_mode; }
 
@@ -271,7 +271,7 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
         if (arg == KD_GRAPHICS) {
             /* Blanking the console is a display privilege. */
             if (!cap_check_explicit(c, CAP_DISPLAY, 53 /*SYS_IOCTL*/, "KD_GRAPHICS")) return E_PERM;
-            uint32_t pid = c ? c->pid : 0;
+            uint32_t pid = c ? c->tgid : 0;   /* [U9] the process */
             uint64_t lf = con_lock();
             if (g_kd_mode == KD_GRAPHICS && g_kd_owner == pid) { con_unlock(lf); return 0; }
             g_kd_mode = KD_GRAPHICS; g_kd_owner = pid;
@@ -289,7 +289,7 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
              * would scribble the console over a compositor. The capability is
              * checked (and audited) only when the state needs it, with the
              * lock dropped; then the state is looked at again. */
-            uint32_t pid = c ? c->pid : 0;
+            uint32_t pid = c ? c->tgid : 0;   /* [U9] the process */
             int allowed = -1;                        /* -1: not checked yet */
             for (;;) {
                 uint64_t lf = con_lock();
@@ -315,10 +315,10 @@ int vtcon_ioctl(uint64_t cmd, uint64_t arg) {
 void vtcon_proc_exit(struct process* pp) {
     process_t* p = (process_t*)pp;
     if (!p || __atomic_load_n(&g_kd_mode, __ATOMIC_RELAXED) != KD_GRAPHICS ||
-        p->pid != __atomic_load_n(&g_kd_owner, __ATOMIC_RELAXED)) return;   /* fast path */
+        p->tgid != __atomic_load_n(&g_kd_owner, __ATOMIC_RELAXED)) return;   /* fast path */
     uint64_t lf = con_lock();
     int restored = 0;
-    if (g_kd_mode == KD_GRAPHICS && p->pid == g_kd_owner) restored = set_text_locked();
+    if (g_kd_mode == KD_GRAPHICS && p->tgid == g_kd_owner) restored = set_text_locked();
     con_unlock(lf);
-    if (restored) log_text("graphics owner exited", p->pid);
+    if (restored) log_text("graphics owner exited", p->tgid);
 }

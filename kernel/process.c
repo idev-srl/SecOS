@@ -26,8 +26,12 @@
 #include "fbdev.h"      // [M40] graphics-owner exit -> text console
 #include "udrv.h"       // [M57] ring-3 driver claims and their fds
 #include "anonfd.h"     // [U10] eventfd/timerfd/epoll/AF_UNIX fd references
+#include "thread.h"     // [U9] thread groups
+#include "futex.h"      // [U9] futex_exit
 
-#define MAX_PROCESSES 32
+// [U9] Every thread is a task here: 1024 tasks (threads + processes) system
+// wide, one kernel-stack slot each (mm/vmm.h M5_MAX_KSTACK_SLOTS).
+#define MAX_PROCESSES M5_MAX_KSTACK_SLOTS
 static process_t* volatile proc_table[MAX_PROCESSES];
 static uint32_t next_pid = 1;
 static int proc_inited = 0;
@@ -59,6 +63,7 @@ static uint32_t alloc_pid(void) {
     spin_unlock_irqrestore(&proc_lock, fl);
     return pid;
 }
+uint32_t process_alloc_pid(void) { return alloc_pid(); }   // [U9] thread ids
 
 // [M48] Push on create/fork: a new task's home is the online CPU with the
 // fewest runnable (NEW/READY/RUNNING) tasks homed on it; ties rotate so a burst
@@ -216,12 +221,14 @@ int process_get_affinity(uint32_t pid, uint64_t* mask, uint32_t nwords) {
 // mapped old one ("[M2][PANIC] vmm_map failed (-3)"), and the late unmap would
 // then free the new process's stack frames. Guarded by proc_lock.
 static uint8_t kstack_slot_busy[MAX_PROCESSES];
+int  process_table_add(process_t* p);
+void process_table_remove_unbuilt(process_t* p);
 
 static int proc_add(process_t* p) {
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (int i=0;i<MAX_PROCESSES;i++) {
         if (!proc_table[i] && !kstack_slot_busy[i]) {
-            proc_table[i]=p; p->kstack_slot = (uint8_t)i; kstack_slot_busy[i] = 1;
+            proc_table[i]=p; p->kstack_slot = (uint16_t)i; kstack_slot_busy[i] = 1;
             spin_unlock_irqrestore(&proc_lock, fl); return 0; }
     }
     spin_unlock_irqrestore(&proc_lock, fl);
@@ -253,6 +260,9 @@ static void proc_remove_unbuilt(process_t* p) {
     proc_remove(p);
     while (__atomic_load_n(&p->refs, __ATOMIC_ACQUIRE) != 0) cpu_relax_poll();
 }
+// [U9] For thread creation (kernel/thread.c).
+int  process_table_add(process_t* p) { return proc_add(p); }
+void process_table_remove_unbuilt(process_t* p) { proc_remove_unbuilt(p); }
 
 // [M50-B1] References. Taken under proc_lock, so a lookup can never race the
 // reaper's detach (process_reap_one checks refs under the same lock); dropped
@@ -334,6 +344,15 @@ void process_set_cred(process_t* p, const struct proc_cred* cr) {
     if (!p || !cr) return;
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     p->cred = *cr;
+    thread_group_sync_locked(p, TG_SYNC_CRED);   // [U9] one set of ids per process
+    spin_unlock_irqrestore(&proc_lock, fl);
+}
+// [U9] This task only (access()'s temporary real-id check must not change
+// the ids its sibling threads run with).
+void process_set_cred_task(process_t* p, const struct proc_cred* cr) {
+    if (!p || !cr) return;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    p->cred = *cr;
     spin_unlock_irqrestore(&proc_lock, fl);
 }
 
@@ -344,12 +363,12 @@ static void inode_use_cb(process_t* p, void* u){
     struct inode_use* x = (struct inode_use*)u;
     if (x->used) return;
     uint64_t fl = mm_lock(p);
-    for (int i = 0; i < 32 && !x->used; i++) {
+    for (int i = 0; i < PROC_NFDS && !x->used; i++) {
         const struct proc_fd_entry* f = &p->fds[i];
         if (f->used && !f->is_pipe && !f->is_sock && f->inode == x->ino) x->used = 1;
     }
-    for (uint32_t i = 0; i < p->vmas.count && !x->used; i++) {
-        const vma_t* v = &p->vmas.v[i];
+    for (uint32_t i = 0; i < p->mm->vmas.count && !x->used; i++) {
+        const vma_t* v = &p->mm->vmas.v[i];
         if (v->type != VMA_TYPE_NONE && (const void*)v->file_inode == x->ino) x->used = 1;
     }
     mm_unlock(p, fl);
@@ -387,7 +406,10 @@ int process_collect_zombie_child(uint32_t ppid, uint32_t* pid, int* code) {
     int found = 0;
     for (int i=0;i<MAX_PROCESSES;i++) {
         process_t* p = proc_table[i];
-        if (p && p->ppid == ppid && p->state == PROC_ZOMBIE && !p->collected) {
+        // [U9] A process is collectable once its last thread is gone; only
+        // its leader (pid == tgid) stands for it.
+        if (p && p->ppid == ppid && p->state == PROC_ZOMBIE && !p->collected &&
+            p->pid == p->tgid && p->tg->dead) {
             *pid = p->pid; *code = p->exit_code;
             p->collected = 1;
             found = 1;
@@ -407,6 +429,7 @@ uint32_t process_take_jobctl_child(uint32_t ppid, int want_stop, int want_cont, 
     for (int i=0;i<MAX_PROCESSES && !r;i++) {
         process_t* p = proc_table[i];
         if (!p || p->ppid != ppid || p->state == PROC_ZOMBIE) continue;
+        if (p->pid != p->tgid) continue;             // [U9] the leader reports for its group
         if (want_stop && p->stop_report && p->state == PROC_STOPPED) {
             p->stop_report = 0;
             *status = ((p->stop_sig & 0xff) << 8) | 0x7f;
@@ -437,11 +460,11 @@ int process_reparent_children(uint32_t dead) {
     int alive = 0, zombie = 0;
     for (int i=0;i<MAX_PROCESSES;i++) {
         process_t* q = proc_table[i];
-        if (q && q->pid == init && q->state != PROC_ZOMBIE) { alive = 1; break; }
+        if (q && q->tgid == init && q->state != PROC_ZOMBIE) { alive = 1; break; }
     }
     for (int i=0;i<MAX_PROCESSES && alive;i++) {
         process_t* p = proc_table[i];
-        if (!p || p->ppid != dead || p->pid == dead) continue;
+        if (!p || p->ppid != dead || p->tgid == dead) continue;
         p->ppid = init;
         if (p->state == PROC_ZOMBIE && !p->collected) zombie = 1;
     }
@@ -458,7 +481,8 @@ int process_has_children(uint32_t ppid) {
         // caller can wait for (it only awaits the reaper). Counting it made
         // waitpid(-1) block forever instead of returning ECHILD after the last
         // child was collected (bash `cmd & wait`).
-        if (p && p->ppid == ppid && !(p->state == PROC_ZOMBIE && p->collected)) { n++; break; }
+        if (p && p->ppid == ppid && p->pid == p->tgid &&            // [U9] processes, not threads
+            !(p->state == PROC_ZOMBIE && p->collected)) { n++; break; }
     }
     spin_unlock_irqrestore(&proc_lock, fl);
     return n;
@@ -477,6 +501,9 @@ process_t* process_reap_one(void) {
         // [M50-B1] Someone still holds a reference (procfs, kill, a waiter):
         // keep it; a later reap pass frees it after the last process_put().
         if (__atomic_load_n(&p->refs, __ATOMIC_ACQUIRE)) continue;
+        // [U9] A leader whose other threads still run stays (it stands for
+        // the process until the last thread has ended it).
+        if (p->pid == p->tgid && p->tg && !p->tg->dead) continue;
         // [M39] Unix zombie semantics: keep a zombie until its parent collects the
         // status via wait() — otherwise a parent that forks and continues (bash
         // subshells/pipelines) races this reaper and its SYS_WAIT(pid) finds the
@@ -488,7 +515,7 @@ process_t* process_reap_one(void) {
             int parent_alive = 0;
             for (int j=0;j<MAX_PROCESSES;j++) {
                 process_t* q = proc_table[j];
-                if (q && q->pid == p->ppid && q->state != PROC_ZOMBIE) { parent_alive = 1; break; }
+                if (q && q->tgid == p->ppid && q->state != PROC_ZOMBIE) { parent_alive = 1; break; }
             }
             if (!parent_alive) reapable = 1;   // orphan -> safe to reap
         }
@@ -676,7 +703,7 @@ void process_auxv_set_creds(process_t* p) {
     uint64_t vals[5] = { cr->ruid, cr->euid, cr->rgid, cr->egid, (uint64_t)auxv_secure(cr) };
     uint64_t fl = mm_lock(p);
     for (int i = 0; i < 5; i++)
-        (void)uwrite(p->space, &p->vmas, p->auxv_va + (uint64_t)(AUXI_UID + i) * 16 + 8, &vals[i], 8);
+        (void)uwrite(p->space, &p->mm->vmas, p->auxv_va + (uint64_t)(AUXI_UID + i) * 16 + 8, &vals[i], 8);
     mm_unlock(p, fl);
 }
 
@@ -879,24 +906,38 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
         if (owned) kfree(owned);
         return NULL;
     }
+    { uint8_t* z = (uint8_t*)p; for (size_t i = 0; i < sizeof(*p); i++) z[i] = 0; }
     klock_task_reset(&p->klk);               // [M50] holds no klock
-    p->refs = 0;                             // [M50-B1] lifetime + address-space lock
-    spin_init_class_dynamic(&p->mm_lock, LK_S35_MM, "mm");
+    p->refs = 0;                             // [M50-B1] lifetime
     p->mapped_pages = NULL;
     p->mapped_page_count = 0;
+    // [U9] A new process: its own address space and thread group (tgid = pid).
+    proc_mm_t* mm = mm_alloc();
+    thread_group_t* tg = tg_alloc(0);
+    if (!mm || !tg) {
+        if (mm) mm_put(mm);
+        if (tg) tg_put(tg);
+        kfree(p);
+        if (owned) kfree(owned);
+        return NULL;
+    }
+    thread_bind(p, mm, tg);
 
     proc_image_t im;
-    if (proc_image_build(elf_buf, size, owned, 0, &p->vmas, &im) != 0) {
+    if (proc_image_build(elf_buf, size, owned, 0, &p->mm->vmas, &im) != 0) {
+        mm_put(mm); tg_put(tg);
         kfree(p);
         return NULL;
     }
     vmm_space_t* space = im.space;
     uint64_t entry = im.entry;
     uint64_t st_top = im.stack_top;
-    p->image = im.image;
-    p->image_size = im.image_size;
+    p->mm->image = im.image;
+    p->mm->image_size = im.image_size;
+    p->mm->space = space;
 
     p->pid = alloc_pid();
+    p->tgid = p->pid; tg->tgid = p->pid;
     p->cpu_affinity = process_pick_home();   // [M48] home CPU (soft; may migrate)
     p->cpu_pin = -1; p->on_cpu = 0; p->wake_snap = 0; p->ready_tick = 0; p->smp_logged = 0;
     p->space = space;
@@ -926,20 +967,19 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     // shell sets pgid for pipelines after creation). pid is assigned above.
     { extern void signal_init_proc(process_t*); signal_init_proc(p); }
     p->fs_base = 0; p->clear_child_tid = 0; p->auxv_va = 0;   // [U1]
-    p->lx_wait_rip = 0; p->lx_deadline = 0; p->itimer_next_ns = 0; p->itimer_int_ns = 0;   // [U10]
+    p->lx_wait_rip = 0; p->lx_deadline = 0;   // [U10] (ITIMER_REAL: zeroed by tg_alloc)
     p->pgid = p->pid; p->ppid = 0; p->spawner_pid = 0;
     p->stop_report = 0; p->cont_report = 0; p->stop_sig = 0;
     p->wait_tty = 0; p->power_phase = 0; p->power_deadline = 0;
     p->wait_pty = NULL; p->wait_udrv = NULL; p->sid = p->pid; p->ctty = NULL; p->ctty_detached = 0;  // own session, console
     p->sigsusp_active = 0; p->sigsusp_saved = 0; p->sig_eintr_rip = 0; p->sig_rerun_eintr = 0; p->fpu_valid = 0;
-    p->cwd[0] = '/'; p->cwd[1] = 0;   // [M39] cwd defaults to root (inherited via fork copy)
     cred_init_root(&p->cred);         // [M43] kernel-made: root (SYS_SPAWN copies the spawner's)
     // [M39] User ASLR: random page-aligned slide of the heap and mmap arena bases
     // (<=32MB each, within their multi-GB regions). Transparent to programs.
-    p->brk_start = USER_HEAP_BASE + aslr_slide(32ULL*1024*1024);
-    p->brk_cur = p->brk_start;
-    p->mmap_next = USER_MMAP_BASE + aslr_slide(32ULL*1024*1024);
-    aslr_log(st_top, p->brk_start, p->mmap_next);
+    p->mm->brk_start = USER_HEAP_BASE + aslr_slide(32ULL*1024*1024);
+    p->mm->brk_cur = p->mm->brk_start;
+    p->mm->mmap_next = USER_MMAP_BASE + aslr_slide(32ULL*1024*1024);
+    aslr_log(st_top, p->mm->brk_start, p->mm->mmap_next);
     // [M14] mapped_page_count/user_mem_bytes report the RESERVED footprint.
     p->user_mem_bytes = im.footprint;
     p->mapped_page_count = (uint32_t)(im.footprint / 4096ULL);
@@ -960,13 +1000,11 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
     p->regs.rflags = 0x202; // IF enabled by default
     p->regs.rax = p->regs.rbx = p->regs.rcx = p->regs.rdx = 0;
     p->regs.rsi = p->regs.rdi = p->regs.rbp = 0;
-    // Init fd table
-    for(int i=0;i<32;i++){ p->fds[i].inode=NULL; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].used=0; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; p->fds[i].is_sock=0; }
-    // [M25] Reserve fds 0/1/2 as stdin/stdout/stderr so open()/pipe() allocate
-    // from fd 3 up (otherwise a pipe end would land on fd 0/1/2 and collide with
-    // the console special-cases in ksys_read/ksys_write). They carry no inode —
-    // the std-stream paths are keyed on the fd number.
-    p->fds[0].used=1; p->fds[1].used=1; p->fds[2].used=1;
+    // [M25] The fd table (tg_alloc): fds 0/1/2 reserved as stdin/stdout/stderr
+    // so open()/pipe() allocate from fd 3 up (otherwise a pipe end would land
+    // on fd 0/1/2 and collide with the console special-cases in ksys_read/
+    // ksys_write). They carry no inode: the std-stream paths are keyed on the
+    // fd number. cwd = "/" (inherited by fork and spawn).
     p->wait_pipe=NULL; p->pipe_wdone=0; // [M25]
     { extern void kiface_proc_init(process_t*, int, const char* const*);
       kiface_proc_init(p, argc, argv); }   // procfs identity, umask, CPU accounting
@@ -1029,10 +1067,10 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
         int sr = -1;
         if (blob) {
             uint64_t mfl = mm_lock(p);
-            sr = setup_user_args(space, &p->vmas, st_top, im.stack_lo, blob, blen,
+            sr = setup_user_args(space, &p->mm->vmas, st_top, im.stack_lo, blob, blen,
                                  argc, 0, &ai, rnd16, &rsp, &argvp, &envp, &auxv);
             if (sr != 0 && argc > 0)                      // too big: try without args
-                sr = setup_user_args(space, &p->vmas, st_top, im.stack_lo, blob, 0,
+                sr = setup_user_args(space, &p->mm->vmas, st_top, im.stack_lo, blob, 0,
                                      0, 0, &ai, rnd16, &rsp, &argvp, &envp, &auxv);
             mm_unlock(p, mfl);
         }
@@ -1063,8 +1101,8 @@ static process_t* process_create_common(const void* elf_buf, size_t size, uint8_
 fail_unbound:
     driver_remove_all_bindings(p);   // never leave a binding to a freed PCB
     if (p->manifest) kfree(p->manifest);
-    if (p->image) kfree(p->image);
-    vmm_space_destroy(space);
+    mm_put(p->mm);                   // the image and the space
+    tg_put(p->tg);
     kfree(p);
     return NULL;
 }
@@ -1140,7 +1178,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     uint64_t irqf;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(irqf) : : "memory");
     vmm_space_t* old_space = p->space;
-    uint8_t*     old_image = p->image;
+    uint8_t*     old_image = p->mm->image;
     void*        old_mf    = p->manifest;
     // The driver type of the old image goes with it ([M57] its claims were
     // released above); the new one is a driver only per exec_driver.
@@ -1149,9 +1187,10 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     // (cpu_affinity), so no other core has the old space loaded or cached; the
     // CR3 write flushes this core's non-global (user) TLB entries.
     p->space = im.space;
+    p->mm->space = im.space;                   // [U9] alone in the group now (execve de_thread)
     vmm_switch_space(im.space);
-    p->vmas = *nv;
-    p->image = im.image; p->image_size = im.image_size;
+    p->mm->vmas = *nv;
+    p->mm->image = im.image; p->mm->image_size = im.image_size;
     p->manifest = im.mf;
     {   // [M46] Exec confinement: the new image's caps are bounded by the old's.
         cap_exec_bound_t bound = cap_exec_bound(p);
@@ -1160,12 +1199,12 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     }
     p->entry = im.entry;
     p->stack_top = im.stack_top;
-    p->brk_start = brk; p->brk_cur = brk; p->mmap_next = mm;
+    p->mm->brk_start = brk; p->mm->brk_cur = brk; p->mm->mmap_next = mm;
     p->user_mem_bytes = im.footprint;
     p->mapped_page_count = (uint32_t)(im.footprint / 4096ULL);
     p->regs.rip = im.entry; p->regs.rsp = rsp;
     // [U1] A new image starts with no thread pointer and no tid address.
-    p->auxv_va = auxv; p->clear_child_tid = 0;
+    p->auxv_va = auxv; p->clear_child_tid = 0; p->robust_list = 0;
     p->fs_base = 0;
     arch_set_fs_base(0);                       // p is current: load it now
     __asm__ volatile("push %0; popfq" : : "r"(irqf) : "memory", "cc");
@@ -1180,7 +1219,7 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     // Close-on-exec descriptors.
     // [M51 C2] Each entry is unhooked under mm_lock (procfs reads the fd
     // table of other processes under it), then its object is dropped.
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < PROC_NFDS; i++) {
         if (!p->fds[i].used || !p->fds[i].cloexec) continue;
         uint64_t ffl = mm_lock(p);
         struct proc_fd_entry e = p->fds[i];
@@ -1202,12 +1241,14 @@ int process_exec(process_t* p, trapframe_t* tf, uint8_t* image, size_t size,
     }
     // Signals (POSIX): caught signals revert to SIG_DFL (their handlers lived in
     // the old image); ignored stay ignored; mask and pending set are preserved.
-    for (int s = 0; s < 32; s++)
+    for (int s = 0; s < PROC_NSIG; s++)
         if (p->sig_handler[s] != 0 /*SIG_DFL*/ && p->sig_handler[s] != 1 /*SIG_IGN*/)
             p->sig_handler[s] = 0;
-    p->sig_restorer = 0;
+    futex_exit(p);                             // [U9] (never queued here: belt and braces)
+    p->tg->restorer = 0;
     p->sigsusp_active = 0;
     p->sleep_until = 0; p->wait_pipe = NULL; p->pipe_wdone = 0; p->wait_tty = 0; p->wait_pty = NULL; p->recv_chan = -1;
+    p->lx_wait_rip = 0; p->lx_deadline = 0;    // [U10] no Linux-shaped call of the old image is pending
     p->sig_eintr_rip = 0; p->sig_rerun_eintr = 0;
     p->fpu_valid = 0;                          // proc_fpu_reset() loads the clean state
     p->ki.nsleep_deadline = 0; p->ki.poll_active = 0; p->ki.poll_wait = 0;
@@ -1245,44 +1286,60 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     if (!parent || !parent->space || !tf) return NULL;
     process_t* c = (process_t*)kmalloc(sizeof(process_t));
     if (!c) return NULL;
-    *c = *parent;                              // shallow-copy all fields (incl. VMAs, fds)
+    *c = *parent;                              // shallow-copy all fields (ids, creds, caps, mask)
     klock_task_reset(&c->klk);                 // [M50] the parent's klocks (the BKL) are not the child's
-    c->refs = 0;                               // [M50-B1] the parent's references and its
-    spin_init_class_dynamic(&c->mm_lock, LK_S35_MM, "mm");   //  (maybe held) mm_lock are not copied
+    c->refs = 0;                               // [M50-B1] the parent's references are not copied
     c->pid = alloc_pid();
+    c->tgid = c->pid;                          // [U9] a fork child has one thread (the caller's copy)
     c->cpu_affinity = process_pick_home();     // [M48] push the child to the least-loaded CPU
     c->on_cpu = 0; c->wake_snap = 0; c->ready_tick = 0; c->smp_logged = 0;   // cpu_pin is inherited
-    c->space = NULL; c->image = NULL; c->manifest = NULL; c->tf = NULL;
+    c->space = NULL; c->manifest = NULL; c->tf = NULL;
     c->kstack_top = 0; c->kstack_slot = 0; c->mapped_pages = NULL;
     c->sig_eintr_rip = 0; c->sig_rerun_eintr = 0;
+    c->robust_list = 0; c->thread_killed = 0; c->clear_child_tid = 0; c->fd_pin_on = 0;
+    c->futex_next = NULL; c->futex_active = 0; c->futex_queued = 0; c->futex_woken = 0;
+    c->futex_deadline = 0;
     // The parent's live x87/SSE registers (its saved image may be stale).
     __asm__ volatile("fxsave64 %0" : "=m"(*(uint8_t(*)[512])c->fpu));
     c->fpu_valid = 1;
+    // [U9] Its own address space and thread group, copied from the parent's.
+    proc_mm_t* mm = mm_alloc();
+    thread_group_t* tg = mm ? tg_copy_for_fork(parent->tg, c->pid) : NULL;
+    if (!tg) { if (mm) mm_put(mm); kfree(c); return NULL; }
+    for (int i = 0; i < PROC_NFDS; i++) tg->fd[i].used = 0;   // filled below under the parent's fd_lock
+    thread_bind(c, mm, tg);
 
     {   // [M50-B1] Copy the VMA set and share the pages COW as one step under
-        // the parent's mm_lock (vmm_fork_space rewrites the parent's PTEs).
+        // the parent's mm_lock (vmm_fork_space rewrites the parent's PTEs; with
+        // threads, the other threads of the parent see the change through the
+        // TLB shootdown vmm_fork_space issues).
         uint64_t mfl = mm_lock(parent);
-        c->vmas = parent->vmas;
+        mm->vmas = parent->mm->vmas;
+        mm->brk_start = parent->mm->brk_start; mm->brk_cur = parent->mm->brk_cur;
+        mm->mmap_next = parent->mm->mmap_next;
         // [M57] A ring-3 driver's device mappings are not inherited: the child
         // gets a hole there (its PTEs are skipped by vmm_fork_space too).
-        for (uint32_t i = 0; i < c->vmas.count; i++)
-            if (c->vmas.v[i].type != VMA_TYPE_NONE && (c->vmas.v[i].vflags & VMA_VF_DONTFORK))
-                vma_remove(&c->vmas, &c->vmas.v[i]);
-        c->space = vmm_fork_space(parent->space);
+        for (uint32_t i = 0; i < mm->vmas.count; i++)
+            if (mm->vmas.v[i].type != VMA_TYPE_NONE && (mm->vmas.v[i].vflags & VMA_VF_DONTFORK))
+                vma_remove(&mm->vmas, &mm->vmas.v[i]);
+        mm->space = vmm_fork_space(parent->space);
+        // The pinned image (parent->mm->image is stable: only an exec of a
+        // single-threaded process replaces it, and that is not us).
         mm_unlock(parent, mfl);
     }
-    if (!c->space) { kfree(c); return NULL; }
+    c->space = mm->space;
+    if (!c->space) { mm_put(mm); tg_put(tg); kfree(c); return NULL; }
 
-    if (parent->image && parent->image_size) {
-        c->image = (uint8_t*)kmalloc(parent->image_size);
-        if (!c->image) { vmm_space_destroy(c->space); kfree(c); return NULL; }
-        for (size_t i = 0; i < parent->image_size; i++) c->image[i] = parent->image[i];
-        c->image_size = parent->image_size;
+    if (parent->mm->image && parent->mm->image_size) {
+        mm->image = (uint8_t*)kmalloc(parent->mm->image_size);
+        if (!mm->image) { mm_put(mm); tg_put(tg); kfree(c); return NULL; }
+        for (size_t i = 0; i < parent->mm->image_size; i++) mm->image[i] = parent->mm->image[i];
+        mm->image_size = parent->mm->image_size;
         // Re-point FILE VMA backing pointers into the child's own image copy.
-        for (uint32_t i = 0; i < c->vmas.count; i++) {
-            vma_t* v = &c->vmas.v[i];
+        for (uint32_t i = 0; i < mm->vmas.count; i++) {
+            vma_t* v = &mm->vmas.v[i];
             if (v->type == VMA_TYPE_FILE && v->file_base)
-                v->file_base = c->image + ((uint64_t)v->file_base - (uint64_t)parent->image);
+                v->file_base = mm->image + ((uint64_t)v->file_base - (uint64_t)parent->mm->image);
         }
     }
     if (parent->manifest) {
@@ -1291,8 +1348,7 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
                            for (size_t i = 0; i < sizeof(elf_manifest_t); i++) d[i] = s[i]; }
     }
     c->tf = (trapframe_t*)kmalloc(sizeof(trapframe_t));
-    if (!c->tf) { if (c->manifest) kfree(c->manifest); if (c->image) kfree(c->image);
-                  vmm_space_destroy(c->space); kfree(c); return NULL; }
+    if (!c->tf) { if (c->manifest) kfree(c->manifest); mm_put(mm); tg_put(tg); kfree(c); return NULL; }
     *c->tf = *tf;                              // child resumes at the fork syscall...
     c->tf->rax = 0;                            // ...but fork() returns 0 in the child
 
@@ -1300,10 +1356,10 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->sleep_until = 0; c->recv_chan = -1; c->exit_code = 0; c->cpu_ticks = 0;
     c->wait_pipe = NULL; c->pipe_wdone = 0;    // [M25] not blocked on a pipe
     c->proc_type = PROC_TYPE_USER; c->drv_dev_id = -1; c->drv_caps = 0;
-    // [M30] Signal dispositions/mask/restorer are inherited (shallow-copied); the
+    // [M30] Signal dispositions/mask/restorer are inherited (copied); the
     // pending set starts empty in the child (POSIX). ppid = parent; pgid inherited.
     c->sig_pending = 0;
-    c->ppid = parent->pid; c->pgid = parent->pgid; c->spawner_pid = 0;
+    c->ppid = parent->tgid; c->pgid = parent->pgid; c->spawner_pid = 0;   // [U9] the parent process
     c->stop_report = 0; c->cont_report = 0; c->stop_sig = 0;
     c->wait_tty = 0; c->power_phase = 0; c->power_deadline = 0;
     c->wait_pty = NULL;                        // sid/ctty/ctty_detached inherited (copied)
@@ -1311,31 +1367,36 @@ process_t* process_fork(process_t* parent, trapframe_t* tf) {
     c->sigsusp_active = 0; c->sigsusp_saved = 0;
     c->state = PROC_EMBRYO;                    // not runnable until fully built (M52)
     c->lx_wait_rip = 0; c->lx_deadline = 0;    // [U10] the parent's blocked call is not ours
-    c->itimer_next_ns = 0; c->itimer_int_ns = 0;   // POSIX: a fork child has no interval timer
+    // POSIX: a fork child has no interval timer (tg_copy_for_fork zeroes tg->itimer_*).
     { extern void kiface_proc_fork(process_t*); kiface_proc_fork(c); }
 
-    // [M25] The child inherits the parent's open pipe ends (fds were shallow
-    // copied) — bump each inherited end's refcount so EOF/EPIPE accounting stays
-    // correct across fork. The pipe object itself is shared (kernel-owned).
-    // Pty ends, sockets and the controlling terminal are counted the same way.
+    // [M25] The child inherits the parent's open pipe ends — bump each
+    // inherited end's refcount so EOF/EPIPE accounting stays correct across
+    // fork. The pipe object itself is shared (kernel-owned). Pty ends, sockets
+    // and the controlling terminal are counted the same way. [U9] Copied and
+    // referenced under the parent's fd_lock: another thread of the parent may
+    // be closing these fds right now.
     { extern void pipe_ref(void*, int); extern void socket_ref(int);
-      for (int i = 0; i < 32; i++) {
+      klock_lock(&parent->tg->fd_lock);
+      for (int i = 0; i < PROC_NFDS; i++) {
+          c->fds[i] = parent->fds[i];
           if (!c->fds[i].used) continue;
           if (c->fds[i].is_pipe) pipe_ref(c->fds[i].inode, c->fds[i].pipe_w);
           else if (c->fds[i].is_sock) socket_ref(c->fds[i].is_sock - 1);
           else { pty_ref(c->fds[i].inode); input_obj_ref(c->fds[i].inode); udrv_fd_ref(c->fds[i].inode); anonfd_ref(c->fds[i].inode); }
       }
+      klock_unlock(&parent->tg->fd_lock);
       pty_ctty_ref(c->ctty); }
 
     if (proc_add(c) != 0) {
         process_release_pipes(c);
-        kfree(c->tf); if (c->manifest) kfree(c->manifest); if (c->image) kfree(c->image);
-        vmm_space_destroy(c->space); kfree(c); return NULL;
+        kfree(c->tf); if (c->manifest) kfree(c->manifest);
+        mm_put(mm); tg_put(tg); kfree(c); return NULL;
     }
     c->kstack_top = vmm_alloc_kernel_stack_for_slot(c->kstack_slot);
     if (!c->kstack_top) {
         proc_remove_unbuilt(c); process_release_pipes(c); kfree(c->tf); if (c->manifest) kfree(c->manifest);
-        if (c->image) kfree(c->image); vmm_space_destroy(c->space); kfree(c); return NULL;
+        mm_put(mm); tg_put(tg); kfree(c); return NULL;
     }
     debugcon_writestring("[FORK] parent="); debugcon_print_hex(parent->pid);
     debugcon_writestring(" -> child="); debugcon_print_hex(c->pid); debugcon_writestring("\n");
@@ -1369,7 +1430,7 @@ void process_release_pipes(process_t* p) {
     udrv_release_all(p);
     // [M51 C2] Entries are unhooked under mm_lock (procfs reads a zombie's
     // fd table under it) and their objects dropped after it.
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < PROC_NFDS; i++) {
         if (!p->fds[i].used) continue;
         int kind = p->fds[i].is_sock ? 1 : p->fds[i].is_pipe ? 2 :
                    pty_is_inode(p->fds[i].inode) ? 3 : input_is_client(p->fds[i].inode) ? 4 :
@@ -1400,21 +1461,24 @@ int process_destroy(process_t* p) {
     // [M25] Drop any still-open pipe ends and sockets so the peer observes
     // EOF/EPIPE and the objects are freed once the last reference is gone.
     // Normally already done at exit (process_release_pipes); this catches
-    // processes destroyed without exiting.
-    process_release_pipes(p);
+    // processes destroyed without exiting. [U9] Only the last task of a group
+    // owns the shared fd table; another thread only drops its tty reference.
+    if (!p->tg || __atomic_load_n(&p->tg->refs, __ATOMIC_ACQUIRE) <= 1) process_release_pipes(p);
+    else pty_thread_exit(p);
+    futex_exit(p);
     extern int elf_unload_process(process_t* p);
-    elf_unload_process(p);                       // unmap + free user page frames, zero PTEs
+    elf_unload_process(p);                       // the (M5) mapped_pages list, if any
     if (p->manifest) { kfree(p->manifest); p->manifest = NULL; }
     if (p->mapped_pages) { kfree(p->mapped_pages); p->mapped_pages = NULL; }
-    // [M14] Free the pinned ELF image backing the demand-paged FILE VMAs.
-    if (p->image) { kfree(p->image); p->image = NULL; p->image_size = 0; }
     // [M6] Free saved trapframe
     if (p->tf) { kfree(p->tf); p->tf = NULL; }
     // [M5] Free per-process kernel stack
     if (p->kstack_top) { vmm_free_kernel_stack_for_slot(p->kstack_slot); p->kstack_top = 0; }
-    // [M8] Free the whole address space: PT/PD page-table frames, the private
-    // PML4[0] PDPT, and the PML4 itself (also kfree's the vmm_space_t).
-    if (p->space) { vmm_space_destroy(p->space); p->space = NULL; }
+    // [M8] The address space (page tables, frames, the pinned image) and
+    // [U9] the thread group go with their last reference.
+    p->space = NULL;
+    mm_put(p->mm); p->mm = NULL;
+    tg_put(p->tg); p->tg = NULL;
     proc_remove(p);
     kfree(p);
     kvlog("[PROC] distrutto\n");

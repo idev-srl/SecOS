@@ -158,8 +158,8 @@ send 'poweroff'
 stop_vm 90; rc=$?
 ok "boot 1 poweroff makes QEMU exit by itself (rc=$rc)" $rc
 grep -aq "\[ROOT\] persistent root fs=ext4 dev=vda journal=on csum=on" "$W/p1.log"; ok "boot 1 root is the journalled metadata_csum ext4 disk" $?
-grep -aEq "\[SYSROOT\] persistent root: written=79 unchanged=0 linked=[1-9][0-9]* .*failed=0" "$W/p1.log"
-ok "boot 1 installs the system files (43 programs + 36 data files + symlinks, no failure)" $?
+grep -aEq "\[SYSROOT\] persistent root: written=80 unchanged=0 linked=[1-9][0-9]* .*failed=0" "$W/p1.log"
+ok "boot 1 installs the system files (44 programs + 36 data files + symlinks, no failure)" $?
 grep -aq "loadkeys: keyboard layout it (saved in /etc/vconsole.conf)" "$W/p1.ser"; ok "boot 1 loadkeys saves the layout" $?
 fsck_clean "$IMG"; ok "boot 1 disk e2fsck-clean after poweroff" $?
 dumpf /etc/dropbear/dropbear_ed25519_host_key "$W/hk1"

@@ -19,6 +19,7 @@
 #include "udrv.h"          /* [M57] claim fds in poll() */
 #include "anonfd.h"        /* [U10] eventfd/timerfd/epoll/AF_UNIX in poll() */
 #include "kiface.h"
+#include "klock.h"
 #include "cred.h"
 #include "process.h"
 #include "sched.h"
@@ -98,7 +99,7 @@ void kiface_proc_init(process_t* p, int argc, const char* const* argv) {
     if (!p) return;
     uint8_t* z = (uint8_t*)&p->ki;
     for (unsigned i = 0; i < sizeof(p->ki); i++) z[i] = 0;
-    p->ki.umask = 022;
+    p->tg->umask = 022;
     p->ki.start_ns = kclock_mono_ns();
     ki_copy_name(p->ki.comm, "init", sizeof(p->ki.comm));
     kiface_proc_set_cmdline(p, argc, argv, 0);
@@ -196,7 +197,7 @@ static void ki_block(trapframe_t* tf) {
 
 void kiface_apply_create_mode(const char* abs, uint32_t mode, int is_dir) {
     process_t* c = sched_get_current();
-    uint32_t um = c ? c->ki.umask : 022;
+    uint32_t um = c ? c->tg->umask : 022;
     uint32_t want = ((mode ? mode : (is_dir ? 0777u : 0666u)) & 07777u) & ~um;
     uint32_t dflt = is_dir ? 0755u : 0644u;     /* what the filesystems create */
     if (want == dflt) return;
@@ -516,6 +517,11 @@ static uint64_t sys_poll(process_t* c, trapframe_t* tf, uint64_t ufds, uint64_t 
         else c->ki.poll_deadline = now + (uint64_t)timeout_ms * 1000000ull;
     }
     int ready = 0, watch = 0;
+    /* [U9] Another thread of the process may close a polled fd and drop the
+     * last reference of its object meanwhile: the scan (no user copy, no
+     * block) runs under the group's fd_lock, like close() does. */
+    int mt = c->tg && __atomic_load_n(&c->tg->nr_live, __ATOMIC_RELAXED) > 1;
+    if (mt) klock_lock(&c->tg->fd_lock);
     for (uint64_t i = 0; i < nfds; i++) {
         pf[i].revents = 0;
         if (pf[i].fd < 0) continue;
@@ -531,6 +537,7 @@ static uint64_t sys_poll(process_t* c, trapframe_t* tf, uint64_t ufds, uint64_t 
         pf[i].revents = (int16_t)got;
         if (got) ready++;
     }
+    if (mt) klock_unlock(&c->tg->fd_lock);
     if (ready || now >= c->ki.poll_deadline) {
         c->ki.poll_active = 0; c->ki.poll_wait = 0; c->sleep_until = 0;
         if (nfds && copy_to_user((void*)ufds, pf, nfds * sizeof(pf[0]))) return NEG(E_FAULT);
@@ -695,16 +702,16 @@ int kiface_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret) {
          * the check, as with Linux's access() override credentials. */
         struct proc_cred saved = c->cred, tmp = c->cred;
         tmp.euid = tmp.ruid; tmp.egid = tmp.rgid;
-        process_set_cred(c, &tmp);
+        process_set_cred_task(c, &tmp);          /* [U9] not the sibling threads */
         vfs_inode_t* ino = 0;
         e = cred_check_path(c, p0, 1, mode, 0, 0, &ino);
-        process_set_cred(c, &saved);
+        process_set_cred_task(c, &saved);
         r = e ? NEG(-e) : 0;
         break;
     }
     case 76: {                                                          /* SYS_UMASK */
-        uint32_t old = c->ki.umask;
-        c->ki.umask = (uint32_t)a0 & 0777;
+        uint32_t old = c->tg->umask;
+        c->tg->umask = (uint32_t)a0 & 0777;
         r = old;
         break;
     }

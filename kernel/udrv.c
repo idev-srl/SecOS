@@ -474,15 +474,15 @@ int udrv_fd_poll(void* ino) {
 static uint64_t map_region(process_t* c, uint64_t va, uint64_t phys, uint64_t len, uint8_t vflags) {
     uint64_t vf = VMM_FLAG_USER | VMM_FLAG_RW | VMM_FLAG_NOEXEC;
     uint64_t fl = mm_lock(c);
-    if (vma_add_phys(&c->vmas, va, va + len, vf, phys) != 0) { mm_unlock(c, fl); return 0; }
-    vma_t* v = vma_find_mut(&c->vmas, va);
+    if (vma_add_phys(&c->mm->vmas, va, va + len, vf, phys) != 0) { mm_unlock(c, fl); return 0; }
+    vma_t* v = vma_find_mut(&c->mm->vmas, va);
     if (!v) { mm_unlock(c, fl); return 0; }
     v->vflags = vflags | VMA_VF_DONTFORK | VMA_VF_PINNED;
     for (uint64_t a = va; a < va + len; a += 0x1000) {
         int r = vma_fault_in(c->space, v, a);
         if (r != 0 && r != -3) {                     /* undo what we mapped */
             for (uint64_t b = va; b < a; b += 0x1000) vmm_unmap_in_space(c->space, b);
-            vma_remove(&c->vmas, v);
+            vma_remove(&c->mm->vmas, v);
             mm_unlock(c, fl);
             return 0;
         }
@@ -494,10 +494,10 @@ static uint64_t map_region(process_t* c, uint64_t va, uint64_t phys, uint64_t le
 /* Reserve [base, base+len) of c's mmap arena (plus a guard page). 0 = none. */
 static uint64_t va_reserve(process_t* c, uint64_t len) {
     uint64_t fl = mm_lock(c);
-    uint64_t base = c->mmap_next;
+    uint64_t base = c->mm->mmap_next;
     if (base >= USER_MMAP_END || len > USER_MMAP_END - base - 0x1000 ||
-        vma_overlaps(&c->vmas, base, base + len)) { mm_unlock(c, fl); return 0; }
-    c->mmap_next = base + len + 0x1000;
+        vma_overlaps(&c->mm->vmas, base, base + len)) { mm_unlock(c, fl); return 0; }
+    c->mm->mmap_next = base + len + 0x1000;
     mm_unlock(c, fl);
     return base;
 }
@@ -507,10 +507,10 @@ static void unmap_region(process_t* p, uint64_t va, uint64_t len) {
     if (!p || !p->space || !len) return;
     uint64_t fl = mm_lock(p);
     for (uint64_t a = va; a < va + len; a += 0x1000) vmm_unmap_in_space(p->space, a);
-    for (uint32_t i = 0; i < p->vmas.count; i++) {
-        vma_t* v = &p->vmas.v[i];
+    for (uint32_t i = 0; i < p->mm->vmas.count; i++) {
+        vma_t* v = &p->mm->vmas.v[i];
         if (v->type == VMA_TYPE_PHYS && (v->vflags & VMA_VF_PINNED) && v->start >= va && v->end <= va + len)
-            vma_remove(&p->vmas, v);
+            vma_remove(&p->mm->vmas, v);
     }
     mm_unlock(p, fl);
 }
@@ -941,7 +941,7 @@ static long op_dma_alloc(process_t* c, udrv_dev_t* d, struct udrv_dma* a) {
     if (a->size > (uint64_t)UDRV_DMA_MAX_PAGES * 4096) return -U_EINVAL;
     uint64_t len = (a->size + 0xFFF) & ~0xFFFull;
     if (d->dma_used + len > d->dma_max) { op_log(c, d, "dma_alloc", "refused(manifest dma_max)"); return -U_ENOMEM; }
-    if (c->mem_limit && vma_total_bytes(&c->vmas) + len > c->mem_limit) return -U_ENOMEM;
+    if (c->mem_limit && vma_total_bytes(&c->mm->vmas) + len > c->mem_limit) return -U_ENOMEM;
     int slot = -1;
     for (int i = 0; i < UDRV_MAX_DMA; i++) if (!d->dma[i].used) { slot = i; break; }
     if (slot < 0) return -U_ENOSPC;

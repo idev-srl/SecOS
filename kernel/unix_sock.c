@@ -129,7 +129,7 @@ usock_t* unix_of(const void* ino) { return (usock_t*)anonfd_of_kind(ino, &g_unix
 int unix_is_sock(const void* ino) { return unix_of(ino) != 0; }
 
 static void cred_now(process_t* c, struct lx_ucred* u) {
-    u->pid = c ? (int32_t)c->pid : 0;
+    u->pid = c ? (int32_t)c->tgid : 0;              /* [U9] getpid(), not the tid */
     u->uid = c ? c->cred.euid : 0;
     u->gid = c ? c->cred.egid : 0;
 }
@@ -689,7 +689,7 @@ static int unix_op_write(process_t* c, anonfd_t* f, const void* ubuf, int len, i
     if (copy_from_user(k, ubuf, (size_t)want) != 0) r = -U_EFAULT;
     else r = unix_send(c, u, k, want, 0, NULL, 0, &w);
     kfree(k);
-    if (r == -U_EPIPE && c && u->type == 1) signal_post(c, SIGPIPE);   /* write(): no MSG_NOSIGNAL */
+    if (r == -U_EPIPE && c && u->type == 1) signal_post_thread(c, SIGPIPE);   /* write(): no MSG_NOSIGNAL; [U9] to the writing thread */
     return r;
 }
 static int unix_op_poll(anonfd_t* f) { return unix_poll((usock_t*)f); }

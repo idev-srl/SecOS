@@ -126,6 +126,8 @@ SRC_C   = \
 	$(KERNEL_DIR)/syscall.c \
 	$(KERNEL_DIR)/syscall_trap.c \
 	$(KERNEL_DIR)/syscall_lx.c \
+	$(KERNEL_DIR)/thread.c \
+	$(KERNEL_DIR)/futex.c \
 	$(KERNEL_DIR)/signal.c \
 	$(KERNEL_DIR)/cap.c \
 	$(KERNEL_DIR)/cred.c \
@@ -867,6 +869,16 @@ port-bash:
 port-lvgl:
 	bash tools/port-lvgl.sh
 	@echo "port-lvgl: LVGL $(shell sed -n 's/^LV=//p' tools/port-lvgl.sh) built from source, sysmon signed -> crypto/user_sysmon_elf.h"
+
+# [U9] /bin/thrstress: the THREADS gate program (POSIX threads on musl,
+# user/thrtest/thrstress.c) -> crypto/user_thrstress_elf.h. Needs the musl
+# sysroot (tools/port-musl.sh, run on demand).
+.PHONY: thrstress
+thrstress:
+	@test -f build/sysroot/lib/libc.a || bash tools/port-musl.sh
+	tools/secos-cc -O2 -Wall -Wextra -o user/thrtest/thrstress.elf user/thrtest/thrstress.c -lsecos
+	python3 tools/elf2h.py user/thrtest/thrstress.elf user_thrstress_elf crypto/user_thrstress_elf.h
+	@echo "thrstress: signed musl pthread stress -> crypto/user_thrstress_elf.h"
 
 # [U8] ncurses 6.6 (MIT-X11) + GNU nano 8.7.1 (GPL-3.0) from source on musl:
 # tools/port-musl.sh (sysroot), tools/port-ncurses.sh (libncursesw.a +

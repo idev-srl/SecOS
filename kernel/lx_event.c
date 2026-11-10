@@ -598,8 +598,8 @@ static uint64_t tv_ns(const struct k_tv* t) { return (uint64_t)t->sec * 10000000
 static void ns_tv(uint64_t ns, struct k_tv* t) { t->sec = (int64_t)(ns / 1000000000ull); t->usec = (int64_t)((ns % 1000000000ull) / 1000ull); }
 
 static void itimer_get(process_t* c, uint64_t now, struct k_itv* o) {
-    uint64_t next = c->itimer_next_ns;
-    ns_tv(c->itimer_int_ns, &o->interval);
+    uint64_t next = c->tg->itimer_next_ns;
+    ns_tv(c->tg->itimer_int_ns, &o->interval);
     ns_tv(next ? (next > now ? next - now : 1000) : 0, &o->value);
 }
 
@@ -617,12 +617,13 @@ static uint64_t sys_setitimer(process_t* c, int which, uint64_t unew, uint64_t u
     uint64_t now = kclock_mono_ns();
     itimer_get(c, now, &ov);
     uint64_t v = tv_ns(&nv.value);
-    uint64_t was = __atomic_exchange_n(&c->itimer_next_ns, 0, __ATOMIC_SEQ_CST);
+    thread_group_t* tg = c->tg;                    /* [U9] the timer is per process */
+    uint64_t was = __atomic_exchange_n(&tg->itimer_next_ns, 0, __ATOMIC_SEQ_CST);
     if (was) __atomic_sub_fetch(&g_itimers, 1, __ATOMIC_SEQ_CST);
-    c->itimer_int_ns = tv_ns(&nv.interval);
+    tg->itimer_int_ns = tv_ns(&nv.interval);
     if (v) {
         __atomic_add_fetch(&g_itimers, 1, __ATOMIC_SEQ_CST);
-        __atomic_store_n(&c->itimer_next_ns, now + v, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&tg->itimer_next_ns, now + v, __ATOMIC_SEQ_CST);
     }
     if (uold && copy_to_user((void*)uold, &ov, sizeof(ov)) != 0) return NEG(E_FAULT);
     return 0;
@@ -637,16 +638,21 @@ static uint64_t sys_getitimer(process_t* c, int which, uint64_t ucur) {
 }
 
 /* BSP tick: post SIGALRM to every process whose ITIMER_REAL expired. The
- * scan runs under proc_lock (process_foreach); the posts after it. */
+ * scan runs under proc_lock (process_foreach); the posts after it. [U9] The
+ * timer lives in the thread group and every thread of it is visited: the
+ * compare-exchange below lets exactly one of them claim each expiry (the
+ * others then see the new value), and signal_post() is process-directed. */
 #define ITIMER_BATCH 32
 struct it_ctx { uint64_t now; int n; process_t* p[ITIMER_BATCH]; };
 static void it_cb(process_t* p, void* u) {
     struct it_ctx* x = (struct it_ctx*)u;
-    uint64_t next = __atomic_load_n(&p->itimer_next_ns, __ATOMIC_ACQUIRE);
+    thread_group_t* tg = p->tg;
+    if (!tg || tg->dead) return;
+    uint64_t next = __atomic_load_n(&tg->itimer_next_ns, __ATOMIC_ACQUIRE);
     if (!next || x->now < next || p->state == PROC_ZOMBIE || x->n >= ITIMER_BATCH) return;
-    uint64_t iv = p->itimer_int_ns, nn = 0;
+    uint64_t iv = tg->itimer_int_ns, nn = 0;
     if (iv) { nn = next + iv; if (nn <= x->now) nn = x->now + iv; }
-    if (!__atomic_compare_exchange_n(&p->itimer_next_ns, &next, nn, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+    if (!__atomic_compare_exchange_n(&tg->itimer_next_ns, &next, nn, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
         return;                                      /* setitimer raced us: its value wins */
     if (!nn) __atomic_sub_fetch(&g_itimers, 1, __ATOMIC_SEQ_CST);
     x->p[x->n++] = process_get(p);
@@ -661,7 +667,8 @@ void lx_itimer_tick(void) {
 }
 /* A process that goes away with its timer armed. */
 void lx_itimer_exit(process_t* p) {
-    uint64_t was = __atomic_exchange_n(&p->itimer_next_ns, 0, __ATOMIC_SEQ_CST);
+    if (!p->tg) return;
+    uint64_t was = __atomic_exchange_n(&p->tg->itimer_next_ns, 0, __ATOMIC_SEQ_CST);
     if (was) __atomic_sub_fetch(&g_itimers, 1, __ATOMIC_SEQ_CST);
 }
 

@@ -100,6 +100,16 @@ static long sc(long n, long a, long b, long c, long d, long e, long f)
                          : "memory", "cc");
     return ret;
 }
+/* [U9] A kernel call that is musl's cancellation point: with cp (the
+ * thread's cancel flag, from __syscall_cp_asm) it goes through the asm trap
+ * whose pc range [__cp_begin, __cp_end) musl's SIGCANCEL handler knows
+ * (src/thread/x86_64/syscall_cp.s); without, the plain trap. */
+long __secos_cp_trap(volatile int *cancel, long n, long a, long b, long c, long d, long e, long f)
+    __attribute__((__visibility__("hidden")));
+static long scp(volatile int *cp, long n, long a, long b, long c, long d, long e, long f)
+{
+    return cp ? __secos_cp_trap(cp, n, a, b, c, d, e, f) : sc(n, a, b, c, d, e, f);
+}
 #define sc0(n)             sc(n, 0, 0, 0, 0, 0, 0)
 #define sc1(n, a)          sc(n, (long)(a), 0, 0, 0, 0, 0)
 #define sc2(n, a, b)       sc(n, (long)(a), (long)(b), 0, 0, 0, 0)
@@ -280,18 +290,18 @@ static long io_err(int fd, int writing)
     if (writing && S_ISFIFO(k.mode)) return -EPIPE;
     return -EIO;
 }
-static long x_read(int fd, void *buf, size_t len)
+static long x_read(int fd, void *buf, size_t len, volatile int *cp)
 {
     if (len == 0) return 0;
     if (len > IO_MAX) len = IO_MAX;
-    long r = sc3(S_READ, fd, buf, len);
+    long r = scp(cp, S_READ, fd, (long)buf, (long)len, 0, 0, 0);
     return r == -1 ? io_err(fd, 0) : r;
 }
-static long x_write(int fd, const void *buf, size_t len)
+static long x_write(int fd, const void *buf, size_t len, volatile int *cp)
 {
     if (len == 0) return 0;
     if (len > IO_MAX) len = IO_MAX;
-    long r = sc3(S_WRITE, fd, buf, len);
+    long r = scp(cp, S_WRITE, fd, (long)buf, (long)len, 0, 0, 0);
     return r == -1 ? io_err(fd, 1) : r;
 }
 struct lx_iovec { void *base; size_t len; };
@@ -301,7 +311,7 @@ static long x_rwv(int fd, const struct lx_iovec *iov, int cnt, int writing)
     long total = 0;
     for (int i = 0; i < cnt; i++) {
         if (!iov[i].len) continue;
-        long r = writing ? x_write(fd, iov[i].base, iov[i].len) : x_read(fd, iov[i].base, iov[i].len);
+        long r = writing ? x_write(fd, iov[i].base, iov[i].len, 0) : x_read(fd, iov[i].base, iov[i].len, 0);
         if (r < 0) return total ? total : r;
         total += r;
         if ((size_t)r < iov[i].len) break;        /* short: stop like the kernel would */
@@ -317,7 +327,7 @@ static long x_prw(int fd, void *buf, size_t len, long off, int writing)
     if (cur < 0) return er(cur, ESPIPE);
     long r = sc3(S_LSEEK, fd, off, SEEK_SET);
     if (r < 0) return er(r, EINVAL);
-    r = writing ? x_write(fd, buf, len) : x_read(fd, buf, len);
+    r = writing ? x_write(fd, buf, len, 0) : x_read(fd, buf, len, 0);
     sc3(S_LSEEK, fd, cur, SEEK_SET);
     return r;
 }
@@ -619,28 +629,30 @@ static long x_madvise(long addr, size_t len, int advice)
 }
 
 /* ---- signals ---------------------------------------------------------------
- * SecOS has signals 1..31, masks with bit n = signal n (Linux: bit n-1), one
- * handler address per signal and one process-wide restorer. sa_mask, the
- * sa_flags and the old action are kept here (a process-local shadow: a
- * disposition inherited across exec reads as SIG_DFL until set again). */
-static struct lx_ksigaction g_sa[32];
+ * SecOS has signals 1..63 ([U9]; Linux 1..64: SIGRTMAX 64 is refused), masks
+ * with bit n = signal n (Linux: bit n-1), one handler address per signal and
+ * one process-wide restorer. sa_mask, the sa_flags and the old action are
+ * kept here (a process-local shadow, shared by the threads: a disposition
+ * inherited across exec reads as SIG_DFL until set again). SA_SIGINFO
+ * handlers get siginfo_t / ucontext_t from the kernel (U9). */
+static struct lx_ksigaction g_sa[64];
 
-static uint64_t mask_to_k(uint64_t l) { return (l << 1) & 0xfffffffeull; }
-static uint64_t mask_to_l(uint64_t k) { return (k >> 1) & 0x7fffffffull; }
+static uint64_t mask_to_k(uint64_t l) { return (l << 1) & ~1ull; }
+static uint64_t mask_to_l(uint64_t k) { return (k >> 1) & 0x7fffffffffffffffull; }
 
 static long x_rt_sigaction(int sig, const struct lx_ksigaction *act, struct lx_ksigaction *old, size_t ss)
 {
     if (ss != 8) return -EINVAL;
     if (sig < 1 || sig >= 65) return -EINVAL;
-    if (sig >= 32) {
-        if (act) return nosys(SYS_rt_sigaction, "signal >= 32");
+    if (sig >= 64) {
+        if (act) return nosys(SYS_rt_sigaction, "signal 64");
         if (old) xmemset(old, 0, sizeof *old);
         return 0;
     }
     if (act) {
         if (sig == SIGKILL || sig == SIGSTOP) return -EINVAL;
-        if (act->flags & (SA_SIGINFO | SA_RESETHAND | SA_NODEFER | SA_ONSTACK))
-            partial(SYS_rt_sigaction, "SA_SIGINFO/RESETHAND/NODEFER/ONSTACK not honoured");
+        if (act->flags & (SA_RESETHAND | SA_NODEFER | SA_ONSTACK))
+            partial(SYS_rt_sigaction, "SA_RESETHAND/NODEFER/ONSTACK not honoured");
         uint64_t restorer = (act->flags & SA_RESTORER) ? act->restorer : 0;
         long r = sc3(S_SIGACTION, sig, act->handler, restorer);
         if (r < 0) return er(r, EINVAL);
@@ -666,7 +678,7 @@ static long x_rt_sigprocmask(int how, const uint64_t *set, uint64_t *old, size_t
 static long x_kill(int pid, int sig)
 {
     if (sig < 0 || sig >= 65) return -EINVAL;
-    if (sig >= 32) return nosys(SYS_kill, "signal >= 32");
+    if (sig >= 64) return nosys(SYS_kill, "signal 64");
     return er(sc2(S_KILL, pid, sig), EPERM);
 }
 
@@ -676,22 +688,31 @@ static long x_kill(int pid, int sig)
  * waiting for another pid is stashed for its own waitpid. Process-group waits
  * (pid 0 / < -1) wait for any child. rusage is not tracked (zeroed). */
 static struct { int pid, st; } g_stash[16];
+/* [U9] The stash is process-wide: threads may wait concurrently. */
+static volatile int g_stash_lock;
+static void stash_lock(void) { while (__atomic_exchange_n(&g_stash_lock, 1, __ATOMIC_ACQUIRE)) sc0(S_YIELD); }
+static void stash_unlock(void) { __atomic_store_n(&g_stash_lock, 0, __ATOMIC_RELEASE); }
 static int stash_take(int pid, int *st)
 {
+    stash_lock();
     for (int i = 0; i < 16; i++)
         if (g_stash[i].pid && (pid <= 0 || g_stash[i].pid == pid)) {
             int p = g_stash[i].pid;
             if (st) *st = g_stash[i].st;
             g_stash[i].pid = 0;
+            stash_unlock();
             return p;
         }
+    stash_unlock();
     return 0;
 }
 static void stash_put(int pid, int st)
 {
-    for (int i = 0; i < 16; i++) if (!g_stash[i].pid) { g_stash[i].pid = pid; g_stash[i].st = st; return; }
+    stash_lock();
+    for (int i = 0; i < 16; i++) if (!g_stash[i].pid) { g_stash[i].pid = pid; g_stash[i].st = st; break; }
+    stash_unlock();
 }
-static long x_wait4(int pid, int *status, int options, void *ru)
+static long x_wait4(int pid, int *status, int options, void *ru, volatile int *cp)
 {
     if (options & ~(WNOHANG | WUNTRACED | WCONTINUED | __WALL | __WCLONE)) return -EINVAL;
     if (ru) { xmemset(ru, 0, 144); partial(SYS_wait4, "rusage not tracked"); }
@@ -699,7 +720,7 @@ static long x_wait4(int pid, int *status, int options, void *ru)
     int p = stash_take(pid, status);
     if (p) return p;
     if (pid > 0 && !(options & (WNOHANG | WUNTRACED | WCONTINUED))) {
-        long code = sc1(S_WAIT, pid);
+        long code = scp(cp, S_WAIT, pid, 0, 0, 0, 0, 0);
         if (code == -EINTR) return -EINTR;
         if (code < 0) return -ECHILD;
         if (status) *status = (int)(code & 0xffff);
@@ -707,7 +728,7 @@ static long x_wait4(int pid, int *status, int options, void *ru)
     }
     for (;;) {
         int code = 0;
-        long got = sc2(S_WAITANY, &code, options & (WNOHANG | WUNTRACED | WCONTINUED));
+        long got = scp(cp, S_WAITANY, (long)&code, options & (WNOHANG | WUNTRACED | WCONTINUED), 0, 0, 0, 0);
         if (got == -ECHILD) return -ECHILD;
         if (got == 0) return 0;
         if (got < 0) return got == -1 ? -EINTR : got;
@@ -756,10 +777,11 @@ static long x_clock_getres(int clk, struct timespec *res)
     return 0;
 }
 
-static long x_clock_nanosleep(int clk, int flags, const struct timespec *req, struct timespec *rem)
+static long x_clock_nanosleep(int clk, int flags, const struct timespec *req, struct timespec *rem,
+                              volatile int *cp)
 {
     if (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC && clk != CLOCK_BOOTTIME) return -EINVAL;
-    if (!(flags & TIMER_ABSTIME)) return er(sc2(S_NANOSLEEP, req, rem), EINVAL);
+    if (!(flags & TIMER_ABSTIME)) return er(scp(cp, S_NANOSLEEP, (long)req, (long)rem, 0, 0, 0, 0), EINVAL);
     struct timespec now, d;
     long r = sc2(S_CLOCK_GETTIME, clk, &now);
     if (r < 0) return er(r, EINVAL);
@@ -767,7 +789,7 @@ static long x_clock_nanosleep(int clk, int flags, const struct timespec *req, st
     d.tv_nsec = req->tv_nsec - now.tv_nsec;
     if (d.tv_nsec < 0) { d.tv_nsec += 1000000000L; d.tv_sec--; }
     if (d.tv_sec < 0) return 0;
-    return er(sc2(S_NANOSLEEP, &d, 0), EINVAL);              /* abstime: no rem */
+    return er(scp(cp, S_NANOSLEEP, (long)&d, 0, 0, 0, 0, 0), EINVAL);   /* abstime: no rem */
 }
 
 /* ---- poll / select ---------------------------------------------------------
@@ -780,17 +802,18 @@ static int ts_to_ms(const struct timespec *ts)
     long long ms = (long long)ts->tv_sec * 1000 + (ts->tv_nsec + 999999) / 1000000;
     return ms > 0x7fffffff ? 0x7fffffff : (int)ms;
 }
-static long x_poll_mask(struct pollfd *fds, unsigned long n, int ms, const uint64_t *sigmask, size_t ss)
+static long x_poll_mask(struct pollfd *fds, unsigned long n, int ms, const uint64_t *sigmask, size_t ss,
+                        volatile int *cp)
 {
     if (sigmask && ss != 8) return -EINVAL;
     uint64_t old = 0;
     if (sigmask) x_rt_sigprocmask(SIG_SETMASK, sigmask, &old, 8);
-    long r = er(sc3(S_POLL, fds, n, ms), EINVAL);
+    long r = er(scp(cp, S_POLL, (long)fds, (long)n, ms, 0, 0, 0), EINVAL);
     if (sigmask) x_rt_sigprocmask(SIG_SETMASK, &old, 0, 8);
     return r;
 }
 static long x_select(int nfds, fd_set *rd, fd_set *wr, fd_set *ex, int ms,
-                     const uint64_t *sigmask)
+                     const uint64_t *sigmask, volatile int *cp)
 {
     if (nfds < 0 || nfds > FD_SETSIZE) return -EINVAL;
     struct pollfd pf[64];
@@ -804,7 +827,7 @@ static long x_select(int nfds, fd_set *rd, fd_set *wr, fd_set *ex, int ms,
         if (n >= 64) return -EINVAL;              /* the kernel has 32 fds anyway */
         pf[n].fd = fd; pf[n].events = ev; pf[n].revents = 0; map[n] = fd; n++;
     }
-    long r = x_poll_mask(pf, (unsigned long)n, ms, sigmask, 8);
+    long r = x_poll_mask(pf, (unsigned long)n, ms, sigmask, 8, cp);
     if (r < 0) return r;
     for (int i = 0; i < n; i++)
         if (pf[i].revents & POLLNVAL) return -EBADF;
@@ -829,7 +852,7 @@ static long x_getrandom(void *buf, size_t len, unsigned flags)
     if (fd < 0) return nosys(SYS_getrandom, "/dev/urandom unavailable");
     long got = 0;
     while ((size_t)got < len) {
-        long r = x_read((int)fd, (char *)buf + got, len - (size_t)got);
+        long r = x_read((int)fd, (char *)buf + got, len - (size_t)got, 0);
         if (r <= 0) break;
         got += r;
     }
@@ -876,7 +899,7 @@ static long x_reboot(unsigned m1, unsigned m2, unsigned cmd)
 }
 
 /* ---- SECOS_SYSCALL_TRACE=2: one line per call --------------------------- */
-static long dispatch(long n, long a, long b, long c, long d, long e, long f);
+static long dispatch(long n, long a, long b, long c, long d, long e, long f, volatile int *cp);
 static void tr_put(char *buf, size_t *o, const char *s)
 {
     while (*s && *o < 400) buf[(*o)++] = *s++;
@@ -926,18 +949,31 @@ static void tr_log(long n, long a, long b, long c, long d, long r)
 }
 long __secos_syscall(long n, long a, long b, long c, long d, long e, long f)
 {
-    long r = dispatch(n, a, b, c, d, e, f);
+    long r = dispatch(n, a, b, c, d, e, f, 0);
     if (g_trace == 2 || (g_trace < 0 && __environ && trace_on() == 2)) tr_log(n, a, b, c, d, r);
     return r;
 }
 
+/* [U9] musl's cancellable syscall entry (pthread_cancel.c __syscall_cp_c):
+ * a cancel already pending is acted on here; the translated call's blocking
+ * kernel call goes through __secos_cp_trap (scp() with cp set). */
+long __cancel(void) __attribute__((__visibility__("hidden")));
+__attribute__((__visibility__("hidden")))
+long __syscall_cp_asm(volatile int *cancel, long n, long a, long b, long c, long d, long e, long f)
+{
+    if (*cancel) return __cancel();
+    long r = dispatch(n, a, b, c, d, e, f, cancel);
+    if (g_trace == 2) tr_log(n, a, b, c, d, r);
+    return r;
+}
+
 /* ---- the table ------------------------------------------------------------ */
-static long dispatch(long n, long a, long b, long c, long d, long e, long f)
+static long dispatch(long n, long a, long b, long c, long d, long e, long f, volatile int *cp)
 {
     switch (n) {
     /* files */
-    case SYS_read:       return x_read((int)a, (void *)b, (size_t)c);
-    case SYS_write:      return x_write((int)a, (const void *)b, (size_t)c);
+    case SYS_read:       return x_read((int)a, (void *)b, (size_t)c, cp);
+    case SYS_write:      return x_write((int)a, (const void *)b, (size_t)c, cp);
     case SYS_readv:      return x_rwv((int)a, (const struct lx_iovec *)b, (int)c, 0);
     case SYS_writev:     return x_rwv((int)a, (const struct lx_iovec *)b, (int)c, 1);
     case SYS_pread64:    return x_prw((int)a, (void *)b, (size_t)c, d, 0);
@@ -1039,30 +1075,31 @@ static long dispatch(long n, long a, long b, long c, long d, long e, long f)
     case SYS_rt_sigprocmask: return x_rt_sigprocmask((int)a, (const uint64_t *)b, (uint64_t *)c, (size_t)d);
     case SYS_rt_sigsuspend: {
         if (b != 8) return -EINVAL;
-        long r = sc1(S_SIGSUSPEND, mask_to_k(*(const uint64_t *)a));
+        long r = scp(cp, S_SIGSUSPEND, (long)mask_to_k(*(const uint64_t *)a), 0, 0, 0, 0, 0);
         return r >= 0 ? -EINTR : r;
     }
     case SYS_pause: {                                /* [U10] = sigsuspend(current mask) */
         uint64_t cur = 0;
         long r = x_rt_sigprocmask(SIG_BLOCK, 0, &cur, 8);
         if (r < 0) return r;
-        r = sc1(S_SIGSUSPEND, mask_to_k(cur));
+        r = scp(cp, S_SIGSUSPEND, (long)mask_to_k(cur), 0, 0, 0, 0, 0);   /* [U9] a cancellation point */
         return r >= 0 ? -EINTR : r;
     }
     case SYS_kill:       return x_kill((int)a, (int)b);
-    case SYS_tkill:      return x_kill((int)a, (int)b);           /* tid == pid */
-    case SYS_tgkill:     return a == b ? x_kill((int)b, (int)c) : -ESRCH;
+    /* [U9] thread-directed: Linux-shaped kernel calls */
+    case SYS_tkill:      return (b < 0 || b >= 64) ? -EINVAL : sc2(S_LX + SYS_tkill, a, b);
+    case SYS_tgkill:     return (c < 0 || c >= 64) ? -EINVAL : sc3(S_LX + SYS_tgkill, a, b, c);
 
     /* processes */
     case SYS_getpid:     return sc0(S_GETPID);
-    case SYS_gettid:     return sc0(S_GETPID);
+    case SYS_gettid:     return sc0(S_LX + SYS_gettid);
     case SYS_getppid:    return sc0(S_GETPPID);
     case SYS_fork:
     case SYS_vfork:      return er(sc0(S_FORK), EAGAIN);
     case SYS_execve:     return er(sc3(S_EXECVE, a, b, c), ENOENT);
-    case SYS_exit:       sc1(S_EXIT, a); for (;;) ;
+    case SYS_exit:       sc1(S_LX + SYS_exit, a); for (;;) ;   /* [U9] this thread */
     case SYS_exit_group: sc1(S_LX + SYS_exit_group, a); for (;;) ;
-    case SYS_wait4:      return x_wait4((int)a, (int *)b, (int)c, (void *)d);
+    case SYS_wait4:      return x_wait4((int)a, (int *)b, (int)c, (void *)d, cp);
     case SYS_set_tid_address: return sc1(S_LX + SYS_set_tid_address, a);
     case SYS_arch_prctl: return sc2(S_LX + SYS_arch_prctl, a, b);
     case SYS_sched_yield: sc0(S_YIELD); return 0;
@@ -1095,8 +1132,8 @@ static long dispatch(long n, long a, long b, long c, long d, long e, long f)
     case SYS_clock_gettime: return er(sc2(S_CLOCK_GETTIME, a, b), EINVAL);
     case SYS_clock_settime: return er(sc2(S_CLOCK_SETTIME, a, b), EPERM);
     case SYS_clock_getres:  return x_clock_getres((int)a, (struct timespec *)b);
-    case SYS_clock_nanosleep: return x_clock_nanosleep((int)a, (int)b, (const struct timespec *)c, (struct timespec *)d);
-    case SYS_nanosleep:  return er(sc2(S_NANOSLEEP, a, b), EINVAL);
+    case SYS_clock_nanosleep: return x_clock_nanosleep((int)a, (int)b, (const struct timespec *)c, (struct timespec *)d, cp);
+    case SYS_nanosleep:  return er(scp(cp, S_NANOSLEEP, a, b, 0, 0, 0, 0), EINVAL);
     case SYS_gettimeofday: {
         struct timespec ts;
         long r = sc2(S_CLOCK_GETTIME, CLOCK_REALTIME, &ts);
@@ -1112,11 +1149,11 @@ static long dispatch(long n, long a, long b, long c, long d, long e, long f)
     }
 
     /* poll / select */
-    case SYS_poll:       return er(sc3(S_POLL, a, b, c), EINVAL);
+    case SYS_poll:       return er(scp(cp, S_POLL, a, b, c, 0, 0, 0), EINVAL);
     case SYS_ppoll: {
         int ms = ts_to_ms((const struct timespec *)c);
         if (ms == -2) return -EINVAL;
-        return x_poll_mask((struct pollfd *)a, (unsigned long)b, ms, (const uint64_t *)d, (size_t)e);
+        return x_poll_mask((struct pollfd *)a, (unsigned long)b, ms, (const uint64_t *)d, (size_t)e, cp);
     }
     case SYS_select: {
         int ms = -1;
@@ -1126,7 +1163,7 @@ static long dispatch(long n, long a, long b, long c, long d, long e, long f)
             long long v = (long long)tv[0] * 1000 + (tv[1] + 999) / 1000;
             ms = v > 0x7fffffff ? 0x7fffffff : (int)v;
         }
-        return x_select((int)a, (fd_set *)b, (fd_set *)c, (fd_set *)d, ms, 0);
+        return x_select((int)a, (fd_set *)b, (fd_set *)c, (fd_set *)d, ms, 0, cp);
     }
     case SYS_pselect6: {
         int ms = ts_to_ms((const struct timespec *)e);
@@ -1136,7 +1173,7 @@ static long dispatch(long n, long a, long b, long c, long d, long e, long f)
             const long *data = (const long *)f;         /* { const sigset_t *ss; size_t len; } */
             if (data[0]) { if (data[1] != 8) return -EINVAL; mask = (const uint64_t *)data[0]; }
         }
-        return x_select((int)a, (fd_set *)b, (fd_set *)c, (fd_set *)d, ms, mask);
+        return x_select((int)a, (fd_set *)b, (fd_set *)c, (fd_set *)d, ms, mask, cp);
     }
 
     /* system */
@@ -1144,10 +1181,19 @@ static long dispatch(long n, long a, long b, long c, long d, long e, long f)
     case SYS_sysinfo:    return er(sc1(S_SYSINFO, a), EFAULT);
     case SYS_getrandom:  return x_getrandom((void *)a, (size_t)b, (unsigned)c);
 
-    /* missing in the kernel: the U2/U3/U9/U10 worklist */
-    case SYS_clone:      return nosys(n, "clone (threads: U9)");
-    case SYS_futex:      return nosys(n, "futex (U9)");
-    case SYS_set_robust_list: return nosys(n, "set_robust_list (U9)");
+    /* [U9] threads (kernel/thread.c, kernel/futex.c) */
+    case SYS_futex:      return scp(cp, S_LX + SYS_futex, a, b, c, d, e, f);
+    case SYS_set_robust_list: return sc2(S_LX + SYS_set_robust_list, a, b);
+    case SYS_get_robust_list: return sc3(S_LX + SYS_get_robust_list, a, b, c);
+    case SYS_clone:
+        /* Threads come through __clone (src/thread/x86_64/clone.s): a raw
+         * clone() returning on a new stack inside this C code cannot work.
+         * The fork form (no new stack) can. */
+        if (b == 0) return er(sc(S_LX + SYS_clone, a, 0, c, d, e, 0), EAGAIN);
+        return nosys(n, "clone with a stack (use pthread_create / __clone)");
+    case SYS_membarrier: return nosys(n, "membarrier (musl falls back to signals)");
+
+    /* missing in the kernel: the U2/U3/U10 worklist */
     case SYS_rt_sigpending: return nosys(n, "rt_sigpending (U2)");
     case SYS_rt_sigtimedwait: return nosys(n, "rt_sigtimedwait (U2)");
     case SYS_rt_sigqueueinfo: return nosys(n, "rt_sigqueueinfo (U2)");
@@ -1168,16 +1214,19 @@ static long dispatch(long n, long a, long b, long c, long d, long e, long f)
     }
     /* [U10] Linux-shaped in the kernel (kernel/lx_net.c, kernel/lx_event.c):
      * sockets (AF_INET TCP/UDP/ICMP/raw, AF_UNIX), epoll, eventfd, timerfd. */
-    case SYS_socket: case SYS_socketpair: case SYS_connect: case SYS_bind:
-    case SYS_listen: case SYS_accept: case SYS_accept4: case SYS_sendto:
-    case SYS_recvfrom: case SYS_sendmsg: case SYS_recvmsg: case SYS_shutdown:
-    case SYS_getsockname: case SYS_getpeername: case SYS_setsockopt:
-    case SYS_getsockopt:
-    case SYS_epoll_create: case SYS_epoll_create1: case SYS_epoll_ctl:
+    /* [U9] The blocking ones are pthread cancellation points: through scp(). */
+    case SYS_connect: case SYS_accept: case SYS_accept4: case SYS_sendto:
+    case SYS_recvfrom: case SYS_sendmsg: case SYS_recvmsg:
     case SYS_epoll_wait: case SYS_epoll_pwait:
 #ifdef SYS_epoll_pwait2
     case SYS_epoll_pwait2:
 #endif
+                         return scp(cp, S_LX + n, a, b, c, d, e, f);
+    case SYS_socket: case SYS_socketpair: case SYS_bind:
+    case SYS_listen: case SYS_shutdown:
+    case SYS_getsockname: case SYS_getpeername: case SYS_setsockopt:
+    case SYS_getsockopt:
+    case SYS_epoll_create: case SYS_epoll_create1: case SYS_epoll_ctl:
     case SYS_eventfd: case SYS_eventfd2:
     case SYS_timerfd_create: case SYS_timerfd_settime: case SYS_timerfd_gettime:
                          return sc(S_LX + n, a, b, c, d, e, f);
