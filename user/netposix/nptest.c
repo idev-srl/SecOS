@@ -14,7 +14,11 @@
  *                        echo replies, ICMP net unreachable)
  *   nptest local DIR     AF_UNIX (stream, dgram, socketpair, abstract names,
  *                        SO_PEERCRED), epoll (also with every free fd),
- *                        eventfd, timerfd, setitimer/alarm
+ *                        eventfd, timerfd, setitimer/alarm, and with
+ *                        threads (U9 x U10): recv with SO_RCVTIMEO in one
+ *                        thread while another runs, a cross-thread wake,
+ *                        SIGPIPE to the writing thread, SO_PEERCRED = pid,
+ *                        one SIGALRM per expiry for the whole process
  *   nptest userver PATH  bind PATH (current umask), echo one connection
  *   nptest uconnect PATH connect to PATH, print "NP UCONNECT errno=N"
  *   nptest raw HOST      try SOCK_RAW ICMP: "NP RAW errno=N" (0 = allowed, an
@@ -44,6 +48,7 @@
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <sys/ioctl.h>
+#include <pthread.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netinet/ip_icmp.h>
@@ -672,6 +677,121 @@ static void t_itimer(void)
     close(p[0]); close(p[1]);
 }
 
+/* ============================================= threads x sockets (U9 x U10) */
+static volatile int g_spin_stop;
+static volatile long g_spins;
+static void *spin_main(void *a)
+{
+    (void)a;
+    while (!g_spin_stop) { g_spins++; if ((g_spins & 0xFFFF) == 0) sched_yield(); }
+    return NULL;
+}
+struct rt_arg { int fd; int timeo_ms; int r; int err; long dt; char c; };
+static void *recv_main(void *a)
+{
+    struct rt_arg *x = a;
+    if (x->timeo_ms) {
+        struct timeval tv = { x->timeo_ms / 1000, (x->timeo_ms % 1000) * 1000 };
+        setsockopt(x->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    }
+    long t0 = now_ms();
+    x->r = (int)recv(x->fd, &x->c, 1, 0);
+    x->err = errno;
+    x->dt = now_ms() - t0;
+    return NULL;
+}
+static volatile pid_t g_pipe_tid;
+static volatile int g_pipe_n;
+static void on_pipe_thr(int s) { (void)s; g_pipe_tid = gettid(); g_pipe_n++; }
+struct wr_arg { int fd; int use_send; pid_t tid; int r; int err; };
+static void *write_main(void *a)
+{
+    struct wr_arg *x = a;
+    x->tid = gettid();
+    char c = 'x';
+    x->r = x->use_send ? (int)send(x->fd, &c, 1, 0) : (int)write(x->fd, &c, 1);
+    x->err = errno;
+    return NULL;
+}
+struct pc_arg { int ok; pid_t pid; pid_t want; };
+static void *peercred_main(void *a)
+{
+    struct pc_arg *x = a;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+    struct ucred uc; socklen_t l = sizeof uc;
+    x->ok = getsockopt(sv[1], SOL_SOCKET, SO_PEERCRED, &uc, &l) == 0;
+    x->pid = uc.pid;
+    x->want = getpid();
+    close(sv[0]); close(sv[1]);
+    return NULL;
+}
+static void t_threads(void)
+{
+    int sv[2];
+    pthread_t ts, tr;
+    /* 1. recv with SO_RCVTIMEO in a thread while a sibling keeps running */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    struct rt_arg ra; memset(&ra, 0, sizeof ra); ra.fd = sv[0]; ra.timeo_ms = 300;
+    g_spin_stop = 0; g_spins = 0;
+    pthread_create(&ts, NULL, spin_main, NULL);
+    pthread_create(&tr, NULL, recv_main, &ra);
+    pthread_join(tr, NULL);
+    long spins = g_spins;
+    g_spin_stop = 1; pthread_join(ts, NULL);
+    CHECK("threads: recv SO_RCVTIMEO 300 ms in one thread times out (EAGAIN) while a sibling runs",
+          ra.r == -1 && (ra.err == EAGAIN || ra.err == EWOULDBLOCK) && ra.dt >= 250 && ra.dt < 3000 && spins > 0,
+          "r=%d errno=%d dt=%ld spins=%ld", ra.r, ra.err, ra.dt, spins);
+    /* 2. a thread blocked in recv (no timeout) is woken by data from another */
+    memset(&ra, 0, sizeof ra); ra.fd = sv[0];
+    struct timeval z = { 0, 0 }; setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &z, sizeof z);
+    pthread_create(&tr, NULL, recv_main, &ra);
+    usleep(200000);
+    send(sv[1], "q", 1, 0);
+    pthread_join(tr, NULL);
+    CHECK("threads: a recv blocked in one thread wakes on data sent by another",
+          ra.r == 1 && ra.c == 'q' && ra.dt >= 100, "r=%d c=%d dt=%ld", ra.r, ra.c, ra.dt);
+    close(sv[0]); close(sv[1]);
+    /* 3. SIGPIPE goes to the writing thread (write() and send() paths) */
+    struct sigaction sa, old; memset(&sa, 0, sizeof sa); sa.sa_handler = on_pipe_thr;
+    sigaction(SIGPIPE, &sa, &old);
+    for (int use_send = 0; use_send < 2; use_send++) {
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        close(sv[1]);
+        g_pipe_tid = 0; g_pipe_n = 0;
+        struct wr_arg wa; memset(&wa, 0, sizeof wa); wa.fd = sv[0]; wa.use_send = use_send;
+        pthread_create(&tr, NULL, write_main, &wa);
+        pthread_join(tr, NULL);
+        usleep(50000);
+        CHECK(use_send ? "threads: send() on a closed AF_UNIX stream: EPIPE, SIGPIPE to the writing thread"
+                       : "threads: write() on a closed AF_UNIX stream: EPIPE, SIGPIPE to the writing thread",
+              wa.r == -1 && wa.err == EPIPE && g_pipe_n == 1 && g_pipe_tid == wa.tid && wa.tid != gettid(),
+              "r=%d errno=%d n=%d sigtid=%d writer=%d main=%d", wa.r, wa.err, g_pipe_n, (int)g_pipe_tid, (int)wa.tid, (int)gettid());
+        close(sv[0]);
+    }
+    sigaction(SIGPIPE, &old, NULL);
+    /* 4. SO_PEERCRED of a socketpair made in a thread reports the pid, not the tid */
+    struct pc_arg pa; memset(&pa, 0, sizeof pa);
+    pthread_create(&tr, NULL, peercred_main, &pa);
+    pthread_join(tr, NULL);
+    CHECK("threads: SO_PEERCRED from a thread reports getpid() (not the tid)",
+          pa.ok && pa.pid == pa.want, "ok=%d pid=%d getpid=%d", pa.ok, (int)pa.pid, (int)pa.want);
+    /* 5. ITIMER_REAL is per process: one SIGALRM per expiry with a sibling running */
+    struct sigaction sb; memset(&sb, 0, sizeof sb); sb.sa_handler = on_alrm; sigaction(SIGALRM, &sb, NULL);
+    g_alrm = 0; g_spin_stop = 0;
+    pthread_create(&ts, NULL, spin_main, NULL);
+    struct itimerval it = { { 0, 100000 }, { 0, 100000 } };
+    long t0 = now_ms();
+    setitimer(ITIMER_REAL, &it, NULL);
+    while (now_ms() - t0 < 550) usleep(10000);
+    struct itimerval zi = { { 0, 0 }, { 0, 0 } };
+    setitimer(ITIMER_REAL, &zi, NULL);
+    int n = g_alrm;
+    g_spin_stop = 1; pthread_join(ts, NULL);
+    CHECK("threads: setitimer 100 ms with 2 threads: one SIGALRM per expiry (~5 in 550 ms)",
+          n >= 4 && n <= 6, "alrm=%d", n);
+}
+
 /* ================================================================ helpers */
 static int userver(const char *path)
 {
@@ -728,7 +848,7 @@ int main(int argc, char **argv)
         return g_fail != 0;
     }
     if (!strcmp(cmd, "local") && argc > 2) {
-        t_unix(argv[2]); t_epoll(); t_eventfd(); t_timerfd(); t_itimer();
+        t_unix(argv[2]); t_epoll(); t_eventfd(); t_timerfd(); t_itimer(); t_threads();
         printf("NP DONE local pass=%d fail=%d\n", g_pass, g_fail);
         return g_fail != 0;
     }
