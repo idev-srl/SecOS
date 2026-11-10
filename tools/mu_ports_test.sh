@@ -220,7 +220,7 @@ ok "sshd log: wrong password and locked account" $?
 ! grep -q "Password auth succeeded for 'root'" "$W/k3"; ok "sshd log: no root password success" $?
 grep -q "^SH6=/bin/sh-" "$W/k6" && grep -q "^SSHSH-7" "$W/k6"
 ok "SSH command through the login shell /bin/sh (bash as sh), sh -c inside" $?
-grep -q "^NV1-0" "$W/k6" && grep -q "^NV2-1" "$W/k6"
+grep -q "NV1-0$" "$W/k6" && grep -q "^NV2-1" "$W/k6" && grep -q "^\[sudo\] password for wuser: sudo: authentication failed" "$W/k6"
 ok "sudo without a controlling terminal: password from stdin works, no cached record" $?
 ! grep -q "\[EXC\]\|\[PANIC\]" "$LOG"; ok "no CPU exception or panic" $?
 
