@@ -60,11 +60,17 @@
 // unsigned program cannot claim it) and has no effect once no_new_privs is
 // already set (inherited or voluntary). Not a capability.
 #define MANIFEST_FLAG_SESSION_GATEWAY       (1u<<16)
+// [U10] Raw IP sockets (SOCK_RAW): EXPLICIT like CAP_INPUT/CAP_DISPLAY, so a
+// program can send arbitrary packets only when root runs it or its signed
+// manifest says so. Normal ping does not need it (ICMP ping sockets). A
+// locally signed program must never get it without root's approval: it is in
+// CAP_LOCAL_SIGN_CEILING_DENY (kernel/cap.h) for the D9 machine-key signer.
+#define MANIFEST_FLAG_CAP_NET_RAW           (1u<<17)
 #define MANIFEST_CAP_MASK \
     (MANIFEST_FLAG_CAP_NET | MANIFEST_FLAG_CAP_FS_READ | MANIFEST_FLAG_CAP_FS_WRITE | \
      MANIFEST_FLAG_CAP_PROC | MANIFEST_FLAG_CAP_IPC | MANIFEST_FLAG_CAP_SIGNAL | \
      MANIFEST_FLAG_CAP_TIME | MANIFEST_FLAG_CAP_POWER | MANIFEST_FLAG_CAP_INPUT | \
-     MANIFEST_FLAG_CAP_DISPLAY)
+     MANIFEST_FLAG_CAP_DISPLAY | MANIFEST_FLAG_CAP_NET_RAW)
 
 // Manifest versions
 #define MANIFEST_VERSION_BASE    1u   // version/flags/max_mem/entry_hint (24-byte desc)

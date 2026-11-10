@@ -17,10 +17,20 @@ static uint8_t g_icmpbuf[NET_FRAME_MAX];       /* [M47] stack lock */
 
 uint32_t icmp_echo_replies(void) { return g_echo_replies; }
 
+/* [U10] net/socket.c: ping sockets and ICMP error delivery. */
+extern int  sock_ping_reply(uint32_t src, const uint8_t* icmp, uint32_t len);
+extern void sock_icmp_error(uint32_t from, const uint8_t* icmp, uint32_t len);
+
 void icmp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* pkt, uint32_t len) {
     if (len < 8) return;
+    if (net_checksum(pkt, len) != 0) return;            /* [U10] corrupt message */
     uint8_t type = pkt[0];
+    if (type == 3 || type == 11 || type == 12) {        /* [U10] errors -> the quoting socket */
+        sock_icmp_error(src_ip, pkt, len);
+        return;
+    }
     if (type == ICMP_ECHO_REPLY) {
+        if (sock_ping_reply(src_ip, pkt, len)) return;  /* [U10] a ping socket's identifier */
         g_echo_replies++;
         debugcon_writestring("[ICMP] echo reply from 0x"); debugcon_print_hex(src_ip);
         debugcon_writestring("\n");

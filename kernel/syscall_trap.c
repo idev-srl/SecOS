@@ -63,6 +63,45 @@ static struct proc_fd_entry* sock_wait_fd(process_t* cur, uint64_t num, uint64_t
 #define SOCK_O_NONBLOCK 0x800
 #define SOCK_WAIT_TICKS 2   // re-check readiness every ~2 ms (no RX wakeup hook yet)
 
+// [U10] Block a Linux-shaped call (kernel/lx_*.c) that cannot progress yet,
+// or report why it must not. The call re-runs from the start when woken:
+//   wake_obj      armed as wait_pipe (an anonfd_wake / sched_wake_pipe on it
+//                 wakes us; NULL = none);
+//   recheck_ticks also wake after this many ticks to re-check (0 = no);
+//   timeout_ns    relative timeout of the whole call (0 = none): the deadline
+//                 is fixed at the first attempt of this call site and kept
+//                 across re-runs (process_t.lx_wait_rip), so a timed recv()
+//                 that is woken repeatedly still ends on time.
+// Returns -EINTR (a signal is pending; a pending stop stops and restarts the
+// call instead) or `timeout_ret` once the deadline passed; otherwise it does
+// not return. The dispatcher clears lx_wait_rip when a call completes.
+long lx_wait(trapframe_t* tf, void* wake_obj, uint32_t recheck_ticks,
+             uint64_t timeout_ns, long timeout_ret) {
+    extern uint64_t kclock_mono_ns(void);
+    extern uint64_t timer_get_ticks(void);
+    process_t* cur = sched_get_current();
+    if (!cur) return -4;
+    uint64_t now = kclock_mono_ns();
+    if (cur->lx_wait_rip != tf->rip) {
+        cur->lx_wait_rip = tf->rip;
+        cur->lx_deadline = timeout_ns ? now + timeout_ns : 0;
+    }
+    if (sig_interrupted(cur, tf)) { cur->lx_wait_rip = 0; return -4; }
+    if (cur->lx_deadline && now >= cur->lx_deadline) { cur->lx_wait_rip = 0; return timeout_ret; }
+    uint64_t t = timer_get_ticks();
+    uint64_t wake = recheck_ticks ? t + recheck_ticks : 0;
+    if (cur->lx_deadline) {
+        uint64_t left = (cur->lx_deadline - now + 999999ull) / 1000000ull;
+        uint64_t w2 = t + (left ? left : 1);
+        if (!wake || w2 < wake) wake = w2;
+    }
+    cur->sleep_until = wake;
+    cur->wait_pipe = wake_obj;
+    tf->rip -= 2;                                   // re-run `int 0x80` on wake
+    sched_block_current(tf);                        // NORETURN
+    return -4;                                      // not reached
+}
+
 static uint64_t syscall_handler_body(trapframe_t* tf);
 
 // [M48] Every syscall body runs under the kernel lock (kernel/bkl.h). Paths
@@ -354,15 +393,16 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
             (num == SYS_CONNECT && (ret == (uint64_t)(int64_t)(-115) ||
                                     ret == (uint64_t)(int64_t)(-114)));
         if (wouldblock && !(e->flags & SOCK_O_NONBLOCK)) {
-            if (sig_interrupted(cur, tf)) {
-                ret = (uint64_t)(int64_t)(-4);          // EINTR
-            } else {
-                extern uint64_t timer_get_ticks(void);
-                cur->sleep_until = timer_get_ticks() + SOCK_WAIT_TICKS;
-                tf->rip -= 2;                           // re-run on wake
-                sched_block_current(tf);                // NORETURN
-                ret = 0;                                 // not reached
-            }
+            // [U10] Bounded by SO_RCVTIMEO / SO_SNDTIMEO (EAGAIN on expiry).
+            // read/write/recv/send only: connect and accept keep their M47
+            // behaviour on the old ABI.
+            extern uint64_t socket_timeo(int idx, int send);
+            uint64_t to = 0;
+            if (num == SYS_READ || num == SYS_RECV || num == SYS_RECVFROM) to = socket_timeo(e->is_sock - 1, 0);
+            else if (num == SYS_WRITE || num == SYS_SEND || num == SYS_SENDTO) to = socket_timeo(e->is_sock - 1, 1);
+            ret = (uint64_t)lx_wait(tf, NULL, SOCK_WAIT_TICKS, to, -11);   // returns on EINTR / timeout
+        } else {
+            cur->lx_wait_rip = 0;                       // [U10] this call is over: no stale deadline
         }
     }
     // [M25] SYS_READ / SYS_WRITE on a pipe may block. ksys_read/ksys_write return
@@ -411,6 +451,13 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
                 tf->rip -= 2;
                 sched_block_current(tf);                // NORETURN
                 ret = 0;
+            } else if (cur->wait_pipe) {
+                // [U10] An anonfd (eventfd, timerfd, AF_UNIX socket) that
+                // cannot progress yet armed its own wake object (and maybe a
+                // deadline in sleep_until): sleep until anonfd_wake().
+                tf->rip -= 2;
+                sched_block_current(tf);                // NORETURN
+                ret = 0;
             } else if (pipe_fd) {
                 cur->wait_pipe = cur->fds[fd].inode;
                 // SMP: the peer on another CPU can queue data / free room and
@@ -432,9 +479,10 @@ static uint64_t syscall_handler_body(trapframe_t* tf) {
     }
     else if (num >= SYS_LX_BASE && num < SYS_LX_MAX) {
         // [U1] Linux-shaped calls (kernel/syscall_lx.c): 6 arguments, -errno.
-        extern uint64_t syscall_lx_dispatch(uint64_t, uint64_t, uint64_t, uint64_t,
-                                            uint64_t, uint64_t, uint64_t);
-        ret = syscall_lx_dispatch(num, tf->rdi, tf->rsi, tf->rdx, tf->rcx, tf->r8, tf->r9);
+        // [U10] The trapframe goes along: socket/epoll/eventfd calls block
+        // through lx_wait() above.
+        extern uint64_t syscall_lx_dispatch(trapframe_t*, uint64_t);
+        ret = syscall_lx_dispatch(tf, num);
     }
     else if (num == SYS_MMAP) {
         // [M40] mmap takes a 6th argument (file offset, r9) for device maps.

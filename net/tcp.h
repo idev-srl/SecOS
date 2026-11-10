@@ -28,7 +28,8 @@ typedef struct tcp_conn tcp_conn_t;
 /* ---- non-blocking core (used by the socket layer) ---- */
 tcp_conn_t* tcp_alloc(void);                              /* a free CLOSED conn, or NULL */
 void        tcp_free(tcp_conn_t* c);                      /* release (aborts if open) */
-int         tcp_start_connect(tcp_conn_t* c, net_dev_t* dev, uint32_t dip, uint16_t dport);
+int         tcp_start_connect(tcp_conn_t* c, net_dev_t* dev, uint32_t dip, uint16_t dport,
+                              uint16_t lport);   /* [U10] lport 0 = ephemeral */
 int         tcp_start_listen(tcp_conn_t* c, net_dev_t* dev, uint16_t port, int backlog);
 tcp_conn_t* tcp_accept_ready(tcp_conn_t* lc);             /* a newly ESTABLISHED child, or NULL */
 int         tcp_accept_pending(const tcp_conn_t* lc);     /* children ready for accept (peek) */
@@ -42,6 +43,14 @@ int         tcp_was_reset(const tcp_conn_t* c);          /* peer RST / retransmi
 void        tcp_get_addrs(const tcp_conn_t* c, uint32_t* lip, uint16_t* lport,
                           uint32_t* rip, uint16_t* rport); /* ip: network-order octets */
 void        tcp_release(tcp_conn_t* c);                  /* non-blocking close (socket layer) */
+/* [U10] Linux-shaped socket support. */
+int         tcp_peek(const tcp_conn_t* c, void* buf, uint32_t len);    /* MSG_PEEK */
+void        tcp_abort(tcp_conn_t* c);                    /* RST + free (SO_LINGER 0) */
+int         tcp_port_use(uint16_t port);                 /* 2 listener, 1 in use, 0 free */
+uint16_t    tcp_ephemeral_port(void);
+uint32_t    tcp_rcvbuf_size(void);
+uint32_t    tcp_sndbuf_size(void);
+uint32_t    tcp_mss(void);
 
 /* ---- blocking convenience (shell tcptest) ---- */
 tcp_conn_t* tcp_connect(net_dev_t* dev, uint32_t dip, uint16_t dport);   /* NULL on fail */

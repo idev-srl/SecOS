@@ -107,6 +107,15 @@ extern int vfs_read_all(const char*, void*, size_t);
 #include "../crypto/user_dropbear_elf.h"
 #endif
 #include "../crypto/user_netcfg_elf.h"
+#ifndef SECOS_NO_NETTOOLS
+// [U10] Network userland on musl: iputils ping (tools/port-iputils.sh),
+// BusyBox ntpd + hwclock (tools/port-bbnet.sh), Mozilla's CA bundle
+// (tools/fetch-cabundle.sh) and the netdb files.
+#include "../crypto/user_ping_elf.h"
+#include "../crypto/user_bbnet_elf.h"
+#include "ca_bundle.h"
+#include "netdb_files.h"
+#endif
 #include "../build/authorized_keys.h"
 // [M43] Multi-user tools: login/su/sudo/passwd (SETID manifest, root 04755),
 // usertools (useradd & co., id, whoami, groups).
@@ -261,7 +270,15 @@ static const char g_default_passwd[] = "root:x:0:0:root:/root:/bin/bash\n";
 // hook (`startgui --auto` is a no-op unless /etc/gui-autostart, or the build
 // default on /proc/cmdline when the file is absent, enables it). Format:
 // docs/devlog/M40-init.md.
-#define INITTAB_TEXT(driver_line, console_line) \
+#define INITTAB_TEXT(driver_line, console_line) INITTAB_TEXT_T(INITTAB_TIME, driver_line, console_line)
+// [U10] Time sync (userland plan D10, Q13 default): one NTP step after the
+// network is up (ntpd -q gives up after 10 s when offline: the clock stays the
+// RTC's, UTC), and the system clock back into the RTC at shutdown.
+#define INITTAB_TIME \
+    "# Clock: one NTP step at boot (gives up after 10 s offline), RTC at shutdown.\n" \
+    "ntp:once:/bin/ntpd -n -q -p pool.ntp.org\n" \
+    "rtc:shutdown:/bin/hwclock -w -u\n"
+#define INITTAB_TEXT_T(time_lines, driver_line, console_line) \
     "# /etc/inittab - SecOS init (PID 1). One entry per line:\n" \
     "#   <id>:<action>:<command> [args...]\n" \
     "# id       short name, used in messages and for /var/log/<id>.log\n" \
@@ -277,6 +294,7 @@ static const char g_default_passwd[] = "root:x:0:0:root:/root:/bin/bash\n";
     "# The command is split on blanks and run directly (no shell, no quoting).\n" \
     driver_line \
     "net:sysinit:/bin/ifup -t 10\n" \
+    time_lines \
     "sshd:respawn:/bin/dropbearmulti dropbear -F -R -p 22\n" \
     console_line \
     "# GUI at boot: on when /etc/gui-autostart says 1 (0 = off); without the\n" \
@@ -292,6 +310,12 @@ static const char g_inittab_root[]  = INITTAB_TEXT("", "console:console:/bin/bas
 #define INITTAB_DRV "net0:driver:/sbin/udrv-e1000e\n"
 static const char g_inittab_login_drv[] = INITTAB_TEXT(INITTAB_DRV, "console:console:/bin/login\n");
 static const char g_inittab_root_drv[]  = INITTAB_TEXT(INITTAB_DRV, "console:console:/bin/bash -i\n");
+// The defaults before U10 (no time lines): an untouched one is still "ours"
+// and gets upgraded (update_default_inittab).
+static const char g_inittab_login_v0[]     = INITTAB_TEXT_T("", "", "console:console:/bin/login\n");
+static const char g_inittab_root_v0[]      = INITTAB_TEXT_T("", "", "console:console:/bin/bash -i\n");
+static const char g_inittab_login_drv_v0[] = INITTAB_TEXT_T("", INITTAB_DRV, "console:console:/bin/login\n");
+static const char g_inittab_root_drv_v0[]  = INITTAB_TEXT_T("", INITTAB_DRV, "console:console:/bin/bash -i\n");
 #ifdef SECOS_CONSOLE_ROOT
 #define g_default_inittab (udrv_has_net() ? g_inittab_root_drv : g_inittab_root)
 #else
@@ -472,6 +496,18 @@ static void build_table(void){
     sf_conf("/etc/profile", g_profile);
     sf_conf("/etc/skel/.profile", g_skel_profile);
     sf_conf("/etc/skel/.bashrc", g_skel_bashrc);
+#ifndef SECOS_NO_NETTOOLS
+    // [U10] After BusyBox: iputils' ping replaces BusyBox's (which needs raw
+    // sockets); ntpd/hwclock are a second, musl-built BusyBox.
+    sf_bin("ping", user_ping_elf, user_ping_elf_len);
+    sf_bin("bbnet", user_bbnet_elf, user_bbnet_elf_len);
+    sf_alias("ntpd", "bbnet", user_bbnet_elf, user_bbnet_elf_len, 0);
+    sf_alias("hwclock", "bbnet", user_bbnet_elf, user_bbnet_elf_len, 0);
+    sf_data("/etc/ssl/certs/ca-certificates.crt", ca_bundle_pem, CA_BUNDLE_PEM_LEN);
+    sf_conf("/etc/hosts", g_etc_hosts);
+    sf_conf("/etc/services", g_etc_services);
+    sf_conf("/etc/protocols", g_etc_protocols);
+#endif
     sf_bin("netcfg", user_netcfg_elf, user_netcfg_elf_len);
     sf_alias("ifup", "netcfg", user_netcfg_elf, user_netcfg_elf_len, 0);
     sf_alias("ifdown", "netcfg", user_netcfg_elf, user_netcfg_elf_len, 0);
@@ -837,10 +873,12 @@ static void update_default_inittab(void){
     // without the ring-3 NIC driver line. An untouched default follows this
     // boot's console policy and udrv= assignment; an edited one is left.
     const char* want = g_default_inittab;
-    static const char* const all[] = { g_inittab_login, g_inittab_root, g_inittab_login_drv, g_inittab_root_drv };
+    static const char* const all[] = { g_inittab_login, g_inittab_root, g_inittab_login_drv, g_inittab_root_drv,
+                                       g_inittab_login_v0, g_inittab_root_v0, g_inittab_login_drv_v0,
+                                       g_inittab_root_drv_v0 };   // [U10] + the pre-U10 texts
     if(file_equals("/etc/inittab", want, sr_len(want))) return;
     int dflt = 0;
-    for(int i=0;i<4;i++) if(all[i]!=want && file_equals("/etc/inittab", all[i], sr_len(all[i]))) dflt = 1;
+    for(int i=0;i<8;i++) if(all[i]!=want && file_equals("/etc/inittab", all[i], sr_len(all[i]))) dflt = 1;
     if(!dflt){
         if(udrv_has_net() && !file_contains("/etc/inittab", "udrv-e1000e"))
             debugcon_writestring("[SYSROOT] udrv= gives a NIC to ring 3 but the edited /etc/inittab has no "

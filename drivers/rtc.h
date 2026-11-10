@@ -21,6 +21,7 @@ struct rtc_datetime {
 };
 
 bool rtc_read(struct rtc_datetime* dt);
+bool rtc_write(const struct rtc_datetime* dt);   // [U10] /dev/rtc0, hwclock -w
 void rtc_format(const struct rtc_datetime* dt, char* buf, uint32_t bufsize);
 #endif // ENABLE_RTC
 

@@ -16,6 +16,7 @@
 #include "../mm/user_copy.h"
 #include "../mm/pagecache.h"  // [M20] unified file page cache
 #include "socket.h"           // [M24] kernel-side socket layer (-Inet)
+#include "anonfd.h"           // [U10] eventfd/timerfd/epoll/AF_UNIX fds
 #include "pipe.h"             // [M25] anonymous pipes
 #include "cap.h"              // [M35] generalized capability checks
 #include "heap.h"             // kmalloc for read()/write() bounce buffers
@@ -50,9 +51,11 @@ void proc_resolve_path(process_t* c, const char* in, char* out, int outsz);
 // offset/flags/cloexec are read by nobody else and stay unlocked.
 static inline uint64_t fdt_lock(process_t* p){ return mm_lock(p); }
 static inline void fdt_unlock(process_t* p, uint64_t fl){ mm_unlock(p, fl); }
+static uint32_t g_fd_gen;                    // [U10] proc_fd_entry.gen source
 static int fd_alloc(process_t* p){
+    uint32_t gen = __atomic_add_fetch(&g_fd_gen, 1, __ATOMIC_RELAXED);
     uint64_t fl = fdt_lock(p);
-    for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; p->fds[i].is_sock=0; fdt_unlock(p, fl); return i; } }
+    for(int i=0;i<32;i++){ if(!p->fds[i].used){ p->fds[i].used=1; p->fds[i].gen=gen; p->fds[i].offset=0; p->fds[i].flags=0; p->fds[i].inode=NULL; p->fds[i].is_pipe=0; p->fds[i].pipe_w=0; p->fds[i].cloexec=0; p->fds[i].is_sock=0; fdt_unlock(p, fl); return i; } }
     fdt_unlock(p, fl);
     return -1;
 }
@@ -66,6 +69,17 @@ int ksys_fd_install(process_t* c, void* ino, uint32_t flags, int cloexec){
     fdt_unlock(c, fl);
     return fd;
 }
+// [U10] Install AF_INET socket `sx` (its reference moves to the fd) as a new
+// fd of c with status flags (O_NONBLOCK) and FD_CLOEXEC. -1 = table full.
+int ksys_sock_install(process_t* c, int sx, uint32_t flags, int cloexec){
+    int fd = fd_alloc(c);
+    if (fd < 0) return -1;
+    uint64_t fl = fdt_lock(c);
+    c->fds[fd].is_sock = sx + 1; c->fds[fd].flags = (flags & 0x800u) | 2u /* O_RDWR */;
+    c->fds[fd].cloexec = cloexec ? 1 : 0;
+    fdt_unlock(c, fl);
+    return fd;
+}
 // Release an fd slot fd_alloc reserved (error paths).
 static void fd_release(process_t* p, int fd){ uint64_t fl = fdt_lock(p); p->fds[fd].used=0; p->fds[fd].inode=NULL; fdt_unlock(p, fl); }
 
@@ -76,12 +90,12 @@ static void fd_release(process_t* p, int fd){ uint64_t fl = fdt_lock(p); p->fds[
 static void fd_entry_ref(struct proc_fd_entry* e){
     if(e->is_pipe) pipe_ref((pipe_t*)e->inode, e->pipe_w);
     else if(e->is_sock) socket_ref(e->is_sock - 1);
-    else { pty_ref(e->inode); input_obj_ref(e->inode); udrv_fd_ref(e->inode); }
+    else { pty_ref(e->inode); input_obj_ref(e->inode); udrv_fd_ref(e->inode); anonfd_ref(e->inode); }
 }
 static void fd_entry_unref(struct proc_fd_entry* e){
     if(e->is_pipe){ pipe_unref((pipe_t*)e->inode, e->pipe_w); e->is_pipe=0; }
     else if(e->is_sock){ int sx=e->is_sock-1; e->is_sock=0; socket_unref(sx); }
-    else { void* ino=e->inode; e->inode=NULL; pty_unref(ino); input_obj_unref(ino); udrv_fd_unref(ino); }   // a pty end may hang up
+    else { void* ino=e->inode; e->inode=NULL; pty_unref(ino); input_obj_unref(ino); udrv_fd_unref(ino); anonfd_unref(ino); }   // a pty end may hang up
 }
 
 // [M25] pipe(): allocate a pipe object and two fds (read end + write end).
@@ -456,6 +470,7 @@ uint64_t ksys_mmap6(uint64_t addr, uint64_t len, int prot, int flags, int fd, ui
             return (uint64_t)fbdev_mmap(c, len, prot, flags, off);
         if (input_is_client(c->fds[fd].inode)) return (uint64_t)(int64_t)-19;   // -ENODEV
         if (udrv_is_fd(c->fds[fd].inode)) return (uint64_t)(int64_t)-19;        // [M57] MAP_BAR instead
+        if (anonfd_is(c->fds[fd].inode)) return (uint64_t)(int64_t)-19;         // [U10] eventfd, socket, ...
     }
     if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) return (uint64_t)-1; // W^X
     vfs_inode_t* ino = 0;
@@ -780,6 +795,8 @@ int ksys_read(int fd, void* ubuf, int len){ extern process_t* sched_get_current(
     if(c->fds[fd].used && c->fds[fd].is_sock) return ksys_sock_read(c, fd, ubuf, len);
     if(c->fds[fd].used && c->fds[fd].inode && udrv_is_fd(c->fds[fd].inode))   // [M57] claim fd: events
         return udrv_fd_read(c, c->fds[fd].inode, ubuf, len, (c->fds[fd].flags & 0x800) != 0);   // -2: blocks
+    if(c->fds[fd].used && !c->fds[fd].is_pipe && anonfd_is(c->fds[fd].inode))   // [U10] eventfd, AF_UNIX, ...
+        return anonfd_read(c, fd, ubuf, len);                 // -2: blocks (wait_pipe = the object)
     int is_pipe = c->fds[fd].used && c->fds[fd].is_pipe;
     int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
     if(!is_pipe && !is_file && fd!=0) return -1;
@@ -844,6 +861,8 @@ int ksys_write(int fd, const void* ubuf, int len){ extern process_t* sched_get_c
     if(c->fds[fd].used && c->fds[fd].is_sock) return ksys_sock_write(c, fd, ubuf, len);
     if(c->fds[fd].used && c->fds[fd].inode && udrv_is_fd(c->fds[fd].inode))   // [M57] claim fd: ack + unmask
         return udrv_fd_write(c, c->fds[fd].inode, ubuf, len);
+    if(c->fds[fd].used && !c->fds[fd].is_pipe && anonfd_is(c->fds[fd].inode))   // [U10] eventfd, AF_UNIX, ...
+        return anonfd_write(c, fd, ubuf, len);
     int is_pipe = c->fds[fd].used && c->fds[fd].is_pipe;
     int is_file = c->fds[fd].used && c->fds[fd].inode && !is_pipe;
     if(!is_pipe && !is_file && fd!=1 && fd!=2) return -1;
@@ -947,7 +966,7 @@ long ksys_lseek(int fd, long offset, int whence){
     if(fd<0||fd>=32||!c->fds[fd].used) return -1;
     if(c->fds[fd].is_pipe || c->fds[fd].is_sock) return -29;   // -ESPIPE: not a seekable file
     vfs_inode_t* ino=(vfs_inode_t*)c->fds[fd].inode; if(!ino) return -1;
-    if(c->fds[fd].is_pipe || pty_is_inode(ino)) return -29;   // -ESPIPE: a stream
+    if(c->fds[fd].is_pipe || pty_is_inode(ino) || anonfd_is(ino)) return -29;   // -ESPIPE: a stream
     long base;
     switch(whence){
         case SEEK_SET: base=0; break;
@@ -1408,6 +1427,10 @@ int ksys_fstat(int fd, struct secos_stat* st){
 int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
     process_t* c=sched_get_current(); if(!c) return -1;
     if(fd<0||fd>=32) return -1;
+    // [U10] The request is an unsigned int (Linux): musl passes ioctl's int
+    // request sign-extended, so 0x80247009 (RTC_RD_TIME) arrived as
+    // 0xffffffff80247009 and matched nothing.
+    cmd &= 0xFFFFFFFFull;
     // FIONBIO (ioctl form of fcntl O_NONBLOCK) on a terminal fd.
     #define FD_SET_NONBLOCK() do { int v_; \
         if(copy_from_user(&v_,(void*)arg,sizeof(v_))!=0) return -EFAULT; \
@@ -1419,12 +1442,25 @@ int ksys_ioctl(int fd, uint64_t cmd, uint64_t arg){
         int r = pty_ioctl(c, c->fds[fd].inode, cmd, arg);
         return r == -515 ? -22 : r;             // unknown request: -EINVAL
     }
+    // [U10] AF_INET socket: FIONBIO / FIONREAD (kernel/lx_net.c).
+    if(c->fds[fd].used && c->fds[fd].is_sock){
+        extern long lx_net_inet_ioctl(process_t*, int, uint64_t, uint64_t);
+        return (int)lx_net_inet_ioctl(c, fd, cmd, arg);
+    }
+    // [U10] anonfds: FIONBIO here, the rest per kind (FIONREAD on sockets).
+    if(c->fds[fd].used && !c->fds[fd].is_pipe && !c->fds[fd].is_sock && anonfd_is(c->fds[fd].inode))
+        return (int)anonfd_ioctl(c, fd, cmd, arg);
     // [M40] evdev client (EVIOCG*) and /dev/fb0 (FBIO*).
     if(c->fds[fd].used && !c->fds[fd].is_pipe && !c->fds[fd].is_sock && c->fds[fd].inode){
         extern int devfs_is_fb(void* inode);
         if(input_is_client(c->fds[fd].inode)){
             if(cmd == TTY_FIONBIO) FD_SET_NONBLOCK();
             return input_ioctl(c->fds[fd].inode, cmd, arg);
+        }
+        extern int devfs_is_rtc(void* inode);
+        if(devfs_is_rtc(c->fds[fd].inode)){                 // [U10] hwclock
+            extern int devfs_rtc_ioctl(void*, uint64_t, uint64_t, int);
+            return devfs_rtc_ioctl(c, cmd, arg, (c->fds[fd].flags & 3) != 0);
         }
         if(devfs_is_fb(c->fds[fd].inode)){
             if(cmd == TTY_FIONBIO) FD_SET_NONBLOCK();

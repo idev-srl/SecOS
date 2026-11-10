@@ -132,6 +132,16 @@ void arp_tick(void);                                                  /* cache a
 /* IPv4 / ICMP */
 void ipv4_input(net_dev_t* dev, const uint8_t* frame, uint32_t len, const uint8_t src_mac[6]);
 int  ipv4_send(net_dev_t* dev, uint32_t dst_ip, uint8_t proto, const void* payload, uint32_t len);
+/* [U10] ttl 0 = 64; queue: hold the packet (bounded, 3 s) while ARP resolves
+ * the next hop instead of failing. ipv4_output_hdr: the caller built the IP
+ * header (SOCK_RAW + IP_HDRINCL). ipv4_rx_ttl/tos: of the packet being
+ * demultiplexed right now (RX path, stack lock held). */
+int  ipv4_send_ex(net_dev_t* dev, uint32_t dst_ip, uint8_t proto, const void* payload,
+                  uint32_t len, uint8_t ttl, uint8_t tos, int queue);
+int  ipv4_output_hdr(net_dev_t* dev, const void* pkt, uint32_t len);
+void ipv4_arp_resolved(net_dev_t* dev, uint32_t nexthop, const uint8_t mac[6]);
+uint8_t ipv4_rx_ttl(void);
+uint8_t ipv4_rx_tos(void);
 void icmp_input(net_dev_t* dev, uint32_t src_ip, const uint8_t* pkt, uint32_t len);
 int  icmp_send_echo(net_dev_t* dev, uint32_t dst_ip, uint16_t id, uint16_t seq);
 uint32_t icmp_echo_replies(void);   /* count of received echo replies (ping test) */

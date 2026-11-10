@@ -17,6 +17,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "udrv.h"          /* [M57] claim fds in poll() */
+#include "anonfd.h"        /* [U10] eventfd/timerfd/epoll/AF_UNIX in poll() */
 #include "kiface.h"
 #include "cred.h"
 #include "process.h"
@@ -462,6 +463,8 @@ static int ki_fd_revents(process_t* c, int fd, int events, int* watch) {
     if (e->used && e->is_pipe) return pipe_poll((pipe_t*)e->inode, e->pipe_w);
     if (e->used && e->inode && udrv_is_fd(e->inode))          /* [M57] claim fd: its IRQ wakes the poller */
         return udrv_fd_poll(e->inode);
+    if (e->used && e->inode && anonfd_is(e->inode))           /* [U10] eventfd/timerfd/epoll/AF_UNIX */
+        return anonfd_poll(e->inode);
     if (e->used && e->inode && input_is_client(e->inode)) {   /* [M40] evdev */
         *watch |= PW_INPUT;
         return input_poll(e->inode);
@@ -478,6 +481,22 @@ static int ki_fd_revents(process_t* c, int fd, int events, int* watch) {
     }
     if (e->used && e->inode) return POLLIN | POLLOUT;              /* regular file / device */
     return POLLNVAL;
+}
+
+/* [U10] The same readiness for epoll (kernel/lx_event.c), plus the wake-up
+ * sources a blocked epoll_wait arms and clears like poll() does. */
+int kiface_fd_revents(process_t* c, int fd, int events, int* watch) {
+    return ki_fd_revents(c, fd, events, watch);
+}
+void kiface_arm_watch(process_t* c, int watch) {
+    c->ki.poll_wait = 1;                          /* any pipe/anonfd activity */
+    if (watch & PW_PTY) c->wait_pty = PTY_WAIT_ANY;
+    if (watch & PW_CONSOLE) c->wait_tty = 1;
+}
+void kiface_clear_watch(process_t* c) {
+    c->ki.poll_wait = 0;
+    if (c->wait_pty == PTY_WAIT_ANY) c->wait_pty = NULL;
+    c->wait_tty = 0;
 }
 
 static uint64_t sys_poll(process_t* c, trapframe_t* tf, uint64_t ufds, uint64_t nfds, int64_t timeout_ms) {

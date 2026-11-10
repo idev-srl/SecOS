@@ -16,6 +16,7 @@
 #include "syscall.h"
 #include "process.h"
 #include "user_copy.h"
+#include "trapframe.h"
 
 extern process_t* sched_get_current(void);
 
@@ -49,18 +50,34 @@ static long lx_arch_prctl(process_t* c, uint64_t code, uint64_t addr) {
     }
 }
 
-uint64_t syscall_lx_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
-                             uint64_t a3, uint64_t a4, uint64_t a5) {
-    (void)a2; (void)a3; (void)a4; (void)a5;
+// [U10] Calls served by other files: the socket family (kernel/lx_net.c),
+// eventfd / timerfd / epoll / interval timers (kernel/lx_event.c). Each
+// returns 1 and sets *ret when it owns `num`.
+extern int lx_net_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret);
+extern int lx_event_syscall(trapframe_t* tf, uint64_t num, uint64_t* ret);
+
+uint64_t syscall_lx_dispatch(trapframe_t* tf, uint64_t num) {
     process_t* c = sched_get_current();
     if (!c) return (uint64_t)(int64_t)-LX_ENOSYS;
+    uint64_t a0 = tf->rdi, a1 = tf->rsi;
+    uint64_t r;
+    // Wait conditions armed by a previous, now re-run, attempt are stale.
+    c->sleep_until = 0; c->wait_pipe = NULL;
     switch (num) {
     case SYS_LX_ARCH_PRCTL:
-        return (uint64_t)lx_arch_prctl(c, a0, a1);
+        r = (uint64_t)lx_arch_prctl(c, a0, a1);
+        break;
     case SYS_LX_SET_TID_ADDRESS:
         c->clear_child_tid = a0;          // meaningful with CLONE_CHILD_CLEARTID (U9)
-        return (uint64_t)c->pid;          // tid == pid: one thread per process
+        r = (uint64_t)c->pid;             // tid == pid: one thread per process
+        break;
     default:
-        return (uint64_t)(int64_t)-LX_ENOSYS;
+        if (lx_net_syscall(tf, num, &r) || lx_event_syscall(tf, num, &r)) break;
+        r = (uint64_t)(int64_t)-LX_ENOSYS;
+        break;
     }
+    // A call that returns has completed: its lx_wait deadline is over.
+    c->lx_wait_rip = 0;
+    c->sleep_until = 0;
+    return r;
 }

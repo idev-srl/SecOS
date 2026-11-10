@@ -33,6 +33,7 @@
 #include "process.h"
 #include "cred.h"
 #include "heap.h"
+#include "user_copy.h"
 #include "spinlock.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -41,7 +42,8 @@ extern uint64_t timer_get_ticks(void);
 
 enum dev_kind { DEV_NULL, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_CONSOLE, DEV_BLOCK,
                 DEV_TTY /* controlling terminal */, DEV_PTMX /* pty multiplexer */,
-                DEV_KMSG /* kernel log */, DEV_FB /* [M40] framebuffer */ };
+                DEV_KMSG /* kernel log */, DEV_FB /* [M40] framebuffer */,
+                DEV_RTC /* [U10] CMOS clock: hwclock's RTC_RD_TIME/RTC_SET_TIME */ };
 
 struct dev_node {
     char name[16];
@@ -90,6 +92,7 @@ static uint32_t dev_mode(enum dev_kind k, uint32_t* gid) {
     case DEV_CONSOLE:              return 0020600;
     case DEV_KMSG:                 return 0020600;
     case DEV_FB:     *gid = GID_VIDEO; return 0020660;
+    case DEV_RTC:                  return 0020600;    /* setting the clock: root */
     case DEV_BLOCK:  *gid = GID_DISK;  return 0060660;
     }
     return 0020600;
@@ -163,6 +166,7 @@ static void devfs_build(void) {
     // before the boot path set the framebuffer up, e.g. under UEFI); lookups
     // and listings hide it while fbdev_present() is false.
     add("fb0", DEV_FB, NULL);
+    add("rtc0", DEV_RTC, NULL);                  // [U10] (ioctl only: read/write fail)
     int n = block_count();
     for (int i = 0; i < n; i++) {
         block_dev_t* b = block_get(i);
@@ -264,6 +268,41 @@ static int devfs_kind_is(void* p, enum dev_kind k) {
 int devfs_is_devtty(void* p) { return devfs_kind_is(p, DEV_TTY); }
 int devfs_is_ptmx(void* p) { return devfs_kind_is(p, DEV_PTMX); }
 int devfs_is_fb(void* p) { return devfs_kind_is(p, DEV_FB); }
+int devfs_is_rtc(void* p) { return devfs_kind_is(p, DEV_RTC); }
+
+/* [U10] /dev/rtc0 ioctls (Linux <linux/rtc.h>): struct rtc_time is nine ints
+ * laid out like the first nine of struct tm; the CMOS clock holds UTC. */
+#include "../drivers/rtc.h"
+struct lx_rtc_time { int sec, min, hour, mday, mon, year, wday, yday, isdst; };
+#define RTC_RD_TIME_  0x80247009u
+#define RTC_SET_TIME_ 0x4024700au
+int devfs_rtc_ioctl(void* cp, uint64_t cmd, uint64_t arg, int writable) {
+    process_t* c = (process_t*)cp;
+    struct lx_rtc_time t;
+    struct rtc_datetime d;
+    if (cmd == RTC_RD_TIME_) {
+        if (!rtc_read(&d)) return -5;                          /* EIO */
+        t.sec = d.second; t.min = d.minute; t.hour = d.hour; t.mday = d.day;
+        t.mon = d.month - 1; t.year = d.year - 1900; t.wday = 0; t.yday = 0; t.isdst = 0;
+        /* day of the week / year (proleptic Gregorian) for tm consumers */
+        static const int cum[12] = { 0,31,59,90,120,151,181,212,243,273,304,334 };
+        int y = d.year, leap = (y % 4 == 0 && y % 100) || y % 400 == 0;
+        t.yday = cum[t.mon] + t.mday - 1 + (leap && t.mon > 1);
+        long days = 365L * (y - 1970) + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400 + t.yday;
+        t.wday = (int)((days + 4) % 7);
+        return copy_to_user((void*)arg, &t, sizeof(t)) ? -14 : 0;
+    }
+    if (cmd == RTC_SET_TIME_) {
+        if (!writable) return -9;                              /* EBADF: opened read-only */
+        if (!cred_is_root(c) || !cap_check(c, CAP_TIME, 53, "rtc-set")) return -13;
+        if (copy_from_user(&t, (const void*)arg, sizeof(t))) return -14;
+        if (t.year < 100 || t.year > 199 || t.mon < 0 || t.mon > 11) return -22;
+        d.second = (uint8_t)t.sec; d.minute = (uint8_t)t.min; d.hour = (uint8_t)t.hour;
+        d.day = (uint8_t)t.mday; d.month = (uint8_t)(t.mon + 1); d.year = (uint16_t)(t.year + 1900);
+        return rtc_write(&d) ? 0 : -22;
+    }
+    return -25;                                                /* ENOTTY */
+}
 
 /* [M40] open() of a GUI device: /dev/fb0 needs CAP_DISPLAY, /dev/input/eventN
  * CAP_INPUT (and gets a per-open evdev client). 0 = allowed / not a GUI node,

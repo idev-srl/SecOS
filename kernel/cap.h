@@ -26,6 +26,7 @@ typedef enum {
     CAP_POWER   = (1u<<12),   /* SYS_REBOOT: a confined program must declare it */
     CAP_INPUT   = (1u<<13),   /* [M40] explicit: open /dev/input/eventN */
     CAP_DISPLAY = (1u<<14),   /* [M40] explicit: open /dev/fb0, KD_GRAPHICS */
+    CAP_NET_RAW = (1u<<17),   /* [U10] explicit: SOCK_RAW without being root */
     /* [M46] Audit-only pseudo capabilities (never granted through cap_mask):
      * used to log privileges a no_new_privs exec refused. */
     CAP_AUDIT_SETID  = (1u<<15),   /* set-id execution (MANIFEST_FLAG_SETID) */
@@ -37,7 +38,14 @@ typedef enum {
  * manifest declares them. */
 #define CAP_IMPLICIT_SET (CAP_FS_READ | CAP_FS_WRITE | CAP_PROC | CAP_IPC | \
                           CAP_SIGNAL | CAP_TIME | CAP_POWER)
-#define CAP_EXPLICIT_SET (CAP_NET | CAP_INPUT | CAP_DISPLAY)
+#define CAP_EXPLICIT_SET (CAP_NET | CAP_INPUT | CAP_DISPLAY | CAP_NET_RAW)
+
+/* [U10] Capability ceiling of the D9 local signing key (programs SecOS
+ * compiles and signs itself, U12a): manifest bits a machine-key signature must
+ * never grant on its own. The keyring/signer that enforces it does not exist
+ * yet; this is the list it must use (plus DRIVER, SETID, SESSION_GATEWAY,
+ * which are not capabilities). */
+#define CAP_LOCAL_SIGN_CEILING_DENY (CAP_NET_RAW | CAP_INPUT | CAP_DISPLAY | CAP_POWER)
 
 /* [M46] The effective capability set of `p`: what cap_check / cap_check_explicit
  * / the CAP_NET gate would allow. Confined: cap_mask. Ambient: every implicit

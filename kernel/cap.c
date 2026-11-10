@@ -26,6 +26,7 @@ const char* cap_name(uint32_t cap) {
         case CAP_POWER:    return "POWER";
         case CAP_INPUT:    return "INPUT";
         case CAP_DISPLAY:  return "DISPLAY";
+        case CAP_NET_RAW:  return "NET_RAW";
         case CAP_AUDIT_SETID:  return "SETID";
         case CAP_AUDIT_DRIVER: return "DRIVER";
         default:           return "?";
@@ -111,7 +112,7 @@ uint32_t cap_effective(const process_t* p) {
         if (!p->cap_net) m &= ~(uint32_t)CAP_NET;
         return m;
     }
-    uint32_t m = CAP_IMPLICIT_SET | (p->cap_mask & (CAP_INPUT | CAP_DISPLAY));
+    uint32_t m = CAP_IMPLICIT_SET | (p->cap_mask & (CAP_INPUT | CAP_DISPLAY | CAP_NET_RAW));
     if (p->cap_net) m |= CAP_NET;
     return m;
 }

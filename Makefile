@@ -132,6 +132,10 @@ SRC_C   = \
 	$(KERNEL_DIR)/driver_if.c \
 	$(KERNEL_DIR)/ipc.c \
 	$(KERNEL_DIR)/pipe.c \
+	$(KERNEL_DIR)/anonfd.c \
+	$(KERNEL_DIR)/lx_event.c \
+	$(KERNEL_DIR)/lx_net.c \
+	$(KERNEL_DIR)/unix_sock.c \
 	$(KERNEL_DIR)/tty.c \
 	$(KERNEL_DIR)/tty_test.c \
 	$(KERNEL_DIR)/pty.c \
@@ -875,6 +879,29 @@ port-nano:
 	bash tools/port-ncurses.sh
 	bash tools/port-nano.sh
 	@echo "port-nano: GNU nano built from source on musl + ncursesw, signed -> crypto/user_nano_elf.h"
+
+# [U10] network userland on musl: iputils ping (BSD-3-Clause, CAP_NET,
+# ICMP ping sockets) and a tiny BusyBox with ntpd + hwclock (GPL-2.0,
+# CAP_NET). Tarballs are SHA-256 pinned (+ GPG where upstream signs),
+# fetched into build/dl.
+.PHONY: port-iputils
+port-iputils:
+	bash tools/port-musl.sh
+	bash tools/port-iputils.sh
+	@echo "port-iputils: ping built from source on musl, signed -> crypto/user_ping_elf.h"
+
+.PHONY: port-bbnet
+port-bbnet:
+	bash tools/port-musl.sh
+	bash tools/port-bbnet.sh
+	@echo "port-bbnet: BusyBox ntpd+hwclock built on musl, signed -> crypto/user_bbnet_elf.h"
+
+# [U10] Mozilla's CA bundle as published by curl (MPL-2.0), SHA-256 pinned
+# and cross-checked with curl.se's .sha256 -> kernel/ca_bundle.h.
+.PHONY: fetch-cabundle
+fetch-cabundle:
+	bash tools/fetch-cabundle.sh
+	@echo "fetch-cabundle: Mozilla CA bundle -> kernel/ca_bundle.h"
 
 .PHONY: port-busybox
 port-busybox:

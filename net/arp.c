@@ -68,6 +68,7 @@ void arp_input(net_dev_t* dev, const uint8_t* frame, uint32_t len) {
     uint32_t tpa = (uint32_t)a[24] | ((uint32_t)a[25]<<8) | ((uint32_t)a[26]<<16) | ((uint32_t)a[27]<<24);
     const uint8_t* sha = a + 8;
     cache_put(spa, sha);                                // learn the sender
+    ipv4_arp_resolved(dev, spa, sha);                   // [U10] send what waited for it
 
     if (op == ARP_OP_REQ && tpa == dev->ip && dev->ip) {
         // Reply with our MAC.
