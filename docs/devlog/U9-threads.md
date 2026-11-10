@@ -296,6 +296,35 @@ refused, bash and musl programs fine). `--lockdep` repeats it on a
   cancellation points (accept, connect, recv*, send*, epoll_wait/pwait) must
   go through `scp(cp, ...)` (src/secos/syscall.c) for pthread_cancel to
   interrupt them.
+- **Mapping of U10 (feat/net-posix ee43af4) onto this design:**
+  1. Wait state (`wait_pipe`, `sleep_until`, `ki.poll_wait`, `wait_tty`,
+     `wait_pty`, U10's `lx_wait_rip`, `lx_deadline`) is already per thread:
+     it stays in `process_t`, which is the thread. Nothing moves. Clone
+     must reset the two new fields (`thread_clone()` resets every wait
+     field next to `wait_pipe`: add them there); `process_exec` resets as
+     for `sleep_until`. Wakes by object scan (`sched_wake_pipe`) and the
+     `sleep_until` tick scan already reach every thread.
+  2. `itimer_next_ns` / `itimer_int_ns` are per process: move them into
+     `thread_group_t` (`p->tg->itimer_*`), zeroed in `tg_alloc` and
+     `tg_copy_for_fork` (fork does not inherit timers); `lx_itimer_tick`
+     should walk groups once (e.g. only the leader / first task of each
+     `tg`) and post SIGALRM with `signal_post()` (process-directed: it goes
+     to a thread that does not block it). `proc_fd_entry.gen` is a field
+     of the entry, which now lives in `thread_group_t.fd[]`: it stays as is
+     (`fd_alloc` still sets it under mm_lock).
+  3. The anonfd kinds go into `fd_entry_ref`/`fd_entry_unref`; fork's copy
+     (`process_fork`, under the parent's `fd_lock`), exec's cloexec loop and
+     `process_release_pipes` kind 6 need no further change: since U9
+     `process_release_pipes` runs only when the process ends (last live
+     thread, `exit_process_end`) or from `process_destroy` of the last task
+     of a group (`tg->refs <= 1`), i.e. on the last table reference.
+  4. SIGPIPE in `maybe_sigpipe` / `unix_op_write`: the writer is the current
+     thread: use `signal_post_thread(c, SIGPIPE)` (thread-directed, as on
+     Linux). SO_PEERCRED: store `c->tgid` (getpid), not `c->pid` (the tid).
+  5. The musl layer conflict is textual only (U9's block replaced the
+     `clone/futex/set_robust_list` ENOSYS lines; U10 adds a pass-through
+     block and `SYS_pause`). `pause` is a musl cancellation point: route it
+     through `scp(cp, ...)` like `rt_sigsuspend`.
 - `lx_lockfree()` (kernel/bkl.c) and `syscall_lx_dispatch()` /
   `src/secos/syscall.c` gained entries; U10 adds its own: take both.
 - `kernel/sysroot.c` gains one `sf_bin("thrstress", ...)` line and an
