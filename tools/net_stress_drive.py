@@ -224,7 +224,23 @@ def host_conn(i, res):
     8 KB and then resets (data in flight on the guest side)."""
     data = bytes((i * 7 + k) & 0xff for k in range(32768))
     try:
-        s = socket.create_connection(("127.0.0.1", P_LISTEN), timeout=30)
+        # The guest's listener is started over ssh just before; its "server
+        # listening" line only arrives when that ssh command ends, so a
+        # refused connect (no listener yet, e.g. on a slow lockdep guest) is
+        # retried for up to 10 s, bounded and logged.
+        t_end = time.time() + 10
+        tries = 0
+        while True:
+            try:
+                s = socket.create_connection(("127.0.0.1", P_LISTEN), timeout=30)
+                break
+            except ConnectionRefusedError:
+                tries += 1
+                if time.time() >= t_end:
+                    raise
+                time.sleep(0.25)
+        if tries:
+            log("[NSD] host conn %d connected after %d refused attempt(s)" % (i, tries))
         if i % 3 == 2:
             s.sendall(data[:8192])
             time.sleep(0.05)
