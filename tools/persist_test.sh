@@ -146,7 +146,7 @@ fi
 echo "[persist] boot 1 (image A, fresh disk)..."
 start_vm "$W/a.iso" p1
 waitfor "$PROMPT" 150; ok "boot 1 reaches the bash prompt" $?
-send 'echo persist-data > /root/notes.txt; mkdir -p /home/alice; echo hello-alice > /home/alice/f.txt; echo M1-$((20+1))'
+send 'echo persist-data > /root/notes.txt; mkdir -p /home/alice; echo hello-alice > /home/alice/f.txt; readlink /bin/sh | sed s/^/SHL1-/; echo M1-$((20+1))'
 waitfor '^M1-21' 30
 send 'loadkeys it; echo M2-$((20+2))'
 waitfor '^M2-22' 30
@@ -161,6 +161,7 @@ grep -aq "\[ROOT\] persistent root fs=ext4 dev=vda journal=on csum=on" "$W/p1.lo
 grep -aEq "\[SYSROOT\] persistent root: written=80 unchanged=0 linked=[1-9][0-9]* .*failed=0" "$W/p1.log"
 ok "boot 1 installs the system files (44 programs + 36 data files + symlinks, no failure)" $?
 grep -aq "loadkeys: keyboard layout it (saved in /etc/vconsole.conf)" "$W/p1.ser"; ok "boot 1 loadkeys saves the layout" $?
+grep -aEq "^SHL1-bash.?$" "$W/p1.ser"; ok "boot 1 /bin/sh is a relative symlink to bash" $?
 fsck_clean "$IMG"; ok "boot 1 disk e2fsck-clean after poweroff" $?
 dumpf /etc/dropbear/dropbear_ed25519_host_key "$W/hk1"
 [[ -s "$W/hk1" ]]; ok "boot 1 SSH host key generated on the disk" $?
@@ -218,17 +219,21 @@ fi
 
 # ---- 3. upgraded kernel image ------------------------------------------------------
 echo "[persist] boot 3 (image B: one program changed, one more baked key)..."
+# A disk from before /bin/sh existed: the upgrade boot must create the link.
+debugfs -w -R "rm /bin/sh" "$IMG" >/dev/null 2>&1
 start_vm "$W/b.iso" p3
 waitfor "$PROMPT" 150
-send '/bin/sysroot_probe one; grep -c ssh-ed25519 /root/.ssh/authorized_keys; grep -c persist-k2 /root/.ssh/authorized_keys; cat /root/notes.txt; tail -n1 /etc/inittab; loadkeys; echo M5-$((20+5))'
+send 'readlink /bin/sh | sed s/^/SHL3-/; sh -c "echo SHP-\$((2+5))"; /bin/sysroot_probe one; grep -c ssh-ed25519 /root/.ssh/authorized_keys; grep -c persist-k2 /root/.ssh/authorized_keys; cat /root/notes.txt; tail -n1 /etc/inittab; loadkeys; echo M5-$((20+5))'
 waitfor '^M5-25' 30
 waitfor 'started sshd' 60
 HK3=$(hostkey)
 send 'poweroff'
 stop_vm 90; rc=$?
 grep -aq "\[SYSROOT\] wrote /bin/sysroot_probe" "$W/p3.log" && \
-  grep -aEq "\[SYSROOT\] persistent root: written=1 unchanged=[1-9][0-9]* linked=0 .* modes_fixed=0 failed=0" "$W/p3.log"
-ok "boot 3 rewrites exactly the changed program" $?
+  grep -aEq "\[SYSROOT\] persistent root: written=1 unchanged=[1-9][0-9]* linked=1 .* modes_fixed=0 failed=0" "$W/p3.log"
+ok "boot 3 rewrites exactly the changed program and recreates the missing /bin/sh link" $?
+grep -aEq "^SHL3-bash.?$" "$W/p3.ser" && grep -aEq "^SHP-7.?$" "$W/p3.ser"
+ok "boot 3 /bin/sh (removed from the disk) is back as the bash link and runs" $?
 grep -aq "\[child\] arg: one" "$W/p3.ser"; ok "boot 3 the upgraded program runs" $?
 grep -aq "\[SSH\] baked authorized_keys installed to /root/.ssh (added=1)" "$W/p3.log" && grep -aEq "^3.?$" "$W/p3.ser"
 ok "boot 3 new baked key appended, user key kept (3 lines)" $?

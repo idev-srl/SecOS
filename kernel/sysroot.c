@@ -453,6 +453,13 @@ static void build_table(void){
     sf_conf_mode("/etc/shadow", default_shadow(), 0600);
 #ifndef SECOS_NO_BASH
     sf_bin("bash", user_bash_elf, user_bash_elf_len);
+    // /bin/sh = GNU bash (POSIX mode when started as sh): a relative symlink on
+    // disk; on ramfs the BusyBox stub, which re-executes /bin/bash for "sh".
+#ifndef SECOS_NO_BUSYBOX
+    sf_alias("sh", "bash", user_bbstub_elf, user_bbstub_elf_len, 0);
+#else
+    sf_alias("sh", "bash", 0, 0, SF_DISK_ONLY);
+#endif
     sf_conf("/etc/bash.bashrc", g_bashrc);
     sf_conf("/etc/inputrc", g_inputrc);
 #endif

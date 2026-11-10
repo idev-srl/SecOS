@@ -50,9 +50,13 @@ ssh-keygen -q -t ed25519 -N '' -C mu-root -f "$W/rkey"
 D=$W/stage; mkdir -p "$D/many"
 for i in $(seq -w 0 999); do : > "$D/many/f$i"; done
 printf 'tuser:x:1000:1000:Test User:/home/tuser:/bin/bash\nlocked:x:1001:1001:Locked:/home/locked:/bin/bash\n' > "$D/passwd.add"
+# [U-sudo] wuser: in wheel, login shell /bin/sh (Dropbear runs commands through it).
+printf 'wuser:x:1002:1002:Wheel User:/home/wuser:/bin/sh\n' >> "$D/passwd.add"
 printf 'tuser:%s:20000:0:99999:7:::\nlocked:!%s:20000:0:99999:7:::\n' "$UHASH" "$UHASH" > "$D/shadow.add"
+printf 'wuser:%s:20000:0:99999:7:::\n' "$UHASH" >> "$D/shadow.add"
 printf 'root:%s:20000:0:99999:7:::\n' "$RHASH" > "$D/root.shadow"
 printf 'tuser:x:1000:\nlocked:x:1001:\nmutest:x:1500:tuser\n' > "$D/group.add"
+printf 'wuser:x:1002:\n' >> "$D/group.add"
 cp "$W/ukey.pub" "$D/tuser.keys"; cp "$W/rkey.pub" "$D/root.keys"
 cat > "$D/setup.sh" <<'EOF'
 # Run as root from the console: add the accounts by editing the files directly.
@@ -63,6 +67,9 @@ cat /mnt/root.shadow /tmp/shadow.rest /mnt/shadow.add > /etc/shadow
 rm -f /tmp/shadow.rest
 mkdir -p /home/tuser/.ssh /home/locked /root/.ssh
 cp /mnt/tuser.keys /home/tuser/.ssh/authorized_keys
+sed -i 's/^wheel:x:10:\(.*\)$/wheel:x:10:\1,wuser/' /etc/group
+mkdir -p /home/wuser/.ssh; cp /mnt/tuser.keys /home/wuser/.ssh/authorized_keys
+chown -R wuser:wuser /home/wuser; chmod 700 /home/wuser /home/wuser/.ssh
 cp /mnt/root.keys /root/.ssh/authorized_keys
 echo private > /home/tuser/secret
 chown -R tuser:tuser /home/tuser
@@ -138,6 +145,10 @@ echo "[muports] boot (mb2, ext2 /mnt, hostfwd $PORT->22, ~170s)..."
   spass "$W/p4" "$RPW" root 'echo PWROOT-RAN'
   skey "$W/k3" "$W/rkey" root 'grep "^Uid:" /proc/self/status; echo ROOTKEY-$((7*6)); cat /var/log/sshd.log'
   skey "$W/k4" "$W/rkey" tuser 'echo WRONGKEY-RAN'
+  # [U-sudo] /bin/sh as the login shell of an SSH command, and sudo with no
+  # controlling terminal (Dropbear's session has none without -t): the
+  # password comes from stdin, and no credential record may be left behind.
+  skey "$W/k6" "$W/ukey" wuser "echo \"SH6=\$SHELL-\$0\"; sh -c 'echo SSHSH-\$((2+5))'; printf '%s\\n' '$UPW' | sudo -v; echo NV1-\$?; sudo id -u </dev/null; echo NV2-\$?"
   printf '  poweroff\r'; sleep 5 ) | \
     timeout 240 qemu-system-x86_64 -cdrom myos.iso -boot d -m 512M \
         "${DISKS[@]}" \
@@ -145,7 +156,7 @@ echo "[muports] boot (mb2, ext2 /mnt, hostfwd $PORT->22, ~170s)..."
         -debugcon file:"$LOG" -global isa-debugcon.iobase=0xe9 \
         -no-reboot -display none -serial stdio >"$SER" 2>&1
 tr -d '\r' < "$SER" > "$SER.txt"
-for f in k1 k2 k3 k4 k5 p1 p2 p3 p4; do { echo "--- $f"; cat "$W/$f" 2>/dev/null; } >>"$W/ssh.txt"; done
+for f in k1 k2 k3 k4 k5 k6 p1 p2 p3 p4; do { echo "--- $f"; cat "$W/$f" 2>/dev/null; } >>"$W/ssh.txt"; done
 S=$SER.txt
 
 # ---- setup + BusyBox (console, root) ----------------------------------------
@@ -207,6 +218,10 @@ ok "sshd log: tuser key and password logins" $?
 grep -q "Bad password attempt for 'tuser'" "$W/k3" && grep -q "User account 'locked' is locked" "$W/k3"
 ok "sshd log: wrong password and locked account" $?
 ! grep -q "Password auth succeeded for 'root'" "$W/k3"; ok "sshd log: no root password success" $?
+grep -q "^SH6=/bin/sh-" "$W/k6" && grep -q "^SSHSH-7" "$W/k6"
+ok "SSH command through the login shell /bin/sh (bash as sh), sh -c inside" $?
+grep -q "NV1-0$" "$W/k6" && grep -q "^NV2-1" "$W/k6" && grep -q "^\[sudo\] password for wuser: sudo: authentication failed" "$W/k6"
+ok "sudo without a controlling terminal: password from stdin works, no cached record" $?
 ! grep -q "\[EXC\]\|\[PANIC\]" "$LOG"; ok "no CPU exception or panic" $?
 
 if [[ $FAILN -ne 0 ]]; then

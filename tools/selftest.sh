@@ -2850,16 +2850,21 @@ fi
 # password and a login with the new one. Then, as an unprivileged user, the
 # syscall fuzzer (which also fuzzes the id syscalls 100-109) must finish
 # without any batch coming out with root ids.
+# [U-sudo] The image is built with -DSECOS_SUDO_TS_TEST_TIMEOUT=60 (the kernel
+# caps sudo's 15-minute credential cache at 60 s) and the SC* steps check the
+# cache: no second prompt in the same session, -k / -K / expiry / a wrong
+# password, a new pty session (script) twice on the same /dev/pts/0, another
+# wheel user (erin) in the same terminal, su still asking. SH*: /bin/sh.
 MULOG=/tmp/secos_selftest_users.log
 MUSER=/tmp/secos_selftest_users.serial
-echo "[selftest] Account tools: console login, su, sudo, passwd, unprivileged fuzzing (mb2, serial, ~210s)..."
-if make iso CONSOLE=login ROOT_PASSWORD=Root-pw9 >/tmp/secos_selftest_build.log 2>&1; then
+echo "[selftest] Account tools: console login, su, sudo (+ cache), passwd, /bin/sh, unprivileged fuzzing (mb2, serial, ~450s)..."
+if make iso CONSOLE=login ROOT_PASSWORD=Root-pw9 CFLAGS_EXTRA=-DSECOS_SUDO_TS_TEST_TIMEOUT=60 >/tmp/secos_selftest_build.log 2>&1; then
     : > "$MULOG"
     ( sleep 25
       printf 'root\r'; sleep 2; printf 'nope\r'; sleep 6
       printf 'root\r'; sleep 2; printf 'Root-pw9\r'; sleep 4
       printf 'echo MU1-$(id -u)-$HOME\r'; sleep 2
-      printf 'useradd carol; useradd dave; useradd -M fz; usermod -aG wheel,video,input carol; printf "carol:Carol-pw1\\ndave:Dave-pw1\\n" | chpasswd; echo MU2-$?\r'; sleep 8
+      printf 'useradd carol; useradd dave; useradd erin; useradd -M fz; usermod -aG wheel,video,input carol; usermod -aG wheel erin; printf "carol:Carol-pw1\\ndave:Dave-pw1\\nerin:Erin-pw1\\n" | chpasswd; echo MU2-$?\r'; sleep 9
       printf 'echo MU3-$(stat -c %%a-%%U /home/carol /bin/su | tr "\\n" -)\r'; sleep 2
       printf 'exit\r'; sleep 4
       printf 'carol\r'; sleep 2; printf 'Carol-pw1\r'; sleep 4
@@ -2867,6 +2872,29 @@ if make iso CONSOLE=login ROOT_PASSWORD=Root-pw9 >/tmp/secos_selftest_build.log 
       printf 'su dave -c "echo MU5-\\$(id -un)"\r'; sleep 3; printf 'Dave-pw1\r'; sleep 4
       printf 'su dave -c "echo MU6-BAD"; echo MU6-rc$?\r'; sleep 3; printf 'wrongpw\r'; sleep 5
       printf 'sudo /bin/bash -c "echo MU7-\\$(id -u)"\r'; sleep 3; printf 'Carol-pw1\r'; sleep 4
+      printf 'echo SC1-B; sudo id -u; echo SC1-E\r'; sleep 4
+      printf 'echo SH1-B; sudo sh -c "echo SH1-\\$(id -u)-\\$0"; echo SH1-E\r'; sleep 4
+      printf 'sudo -k; echo SC2-B; sudo id -u; echo SC2-E\r'; sleep 3; printf 'Carol-pw1\r'; sleep 4
+      printf 'sudo -k; echo SC3-B; sudo id -u; echo SC3-E\r'; sleep 3
+      printf 'wrongpw\r'; sleep 4; printf 'wrongpw\r'; sleep 4; printf 'wrongpw\r'; sleep 5
+      printf 'echo SC3B-B; sudo id -u; echo SC3B-E\r'; sleep 3; printf 'Carol-pw1\r'; sleep 4
+      printf 'script\r'; sleep 4
+      printf 'echo SC4-B; tty; sudo id -u; echo SC4-E\r'; sleep 3; printf 'Carol-pw1\r'; sleep 4
+      printf 'echo SC4B-B; sudo id -u; echo SC4B-E\r'; sleep 4
+      printf 'exit\r'; sleep 4
+      printf 'echo SC5-B; sudo id -u; echo SC5-E\r'; sleep 4
+      printf 'script\r'; sleep 4
+      printf 'echo SC6-B; tty; sudo id -u; echo SC6-E\r'; sleep 3; printf 'Carol-pw1\r'; sleep 4
+      printf 'exit\r'; sleep 4
+      printf 'su erin -c "echo SC7-B; sudo id -u; echo SC7-E"\r'; sleep 3; printf 'Erin-pw1\r'; sleep 4; printf 'Erin-pw1\r'; sleep 5
+      printf 'echo SC10-B; su erin -c "echo SC10-\\$(id -un)"; echo SC10-E\r'; sleep 3; printf 'Erin-pw1\r'; sleep 5
+      printf 'echo SC8-B; sudo -v; echo SC8-rc$?; echo SC8-E\r'; sleep 70
+      printf 'echo SC8B-B; sudo id -u; echo SC8B-E\r'; sleep 3; printf 'Carol-pw1\r'; sleep 4
+      printf 'sudo -K; echo SC9-B; sudo id -u; echo SC9-E\r'; sleep 3; printf 'Carol-pw1\r'; sleep 4
+      printf 'echo SCL-$(sudo grep -c "cached authentication reused" /var/log/auth.log)\r'; sleep 4
+      printf 'printf "#!/bin/sh\\necho SH2-\\$((1+2))-\\$SHELLOPTS\\n" > /tmp/s.sh; chmod +x /tmp/s.sh; /tmp/s.sh\r'; sleep 3
+      printf 'echo a | xargs -I{} sh -c "echo SH3-{}"; awk "BEGIN{system(\\"echo SH4-\\$PPID\\")}"; find /etc/passwd -exec sh -c "echo SH5-\\$1" sh {} \\;\r'; sleep 4
+      printf 'sh -c "echo SH6-\\$SHELLOPTS"\r'; sleep 3
       printf 'su dave -c "sudo id; echo MU8-rc\\$?"\r'; sleep 3; printf 'Dave-pw1\r'; sleep 5
       printf 'passwd\r'; sleep 3; printf 'Carol-pw1\r'; sleep 3; printf 'Carol-pw2\r'; sleep 2; printf 'Carol-pw2\r'; sleep 5
       printf 'exit\r'; sleep 4
@@ -2875,7 +2903,7 @@ if make iso CONSOLE=login ROOT_PASSWORD=Root-pw9 >/tmp/secos_selftest_build.log 
       printf 'sudo su fz -c "/bin/sysfuzz -s 4711 -b 12 -c 150"\r'; sleep 3
       printf 'Carol-pw2\r'; sleep 60
       printf 'echo MU10-alive-$(id -un)\r'; sleep 3 ) | \
-        timeout 210 qemu-system-x86_64 -cdrom myos.iso -boot d -m 512M \
+        timeout 450 qemu-system-x86_64 -cdrom myos.iso -boot d -m 512M \
             -debugcon file:"$MULOG" -global isa-debugcon.iobase=0xe9 \
             -no-reboot -display none -serial stdio > "$MUSER" 2>&1
     tr -d '\r' < "$MUSER" > "$MUSER.txt"
@@ -2889,6 +2917,31 @@ if make iso CONSOLE=login ROOT_PASSWORD=Root-pw9 >/tmp/secos_selftest_build.log 
     grep -q "su: Authentication failure" "$MUSER.txt" && grep -q "^MU6-rc1" "$MUSER.txt" && ! grep -q "^MU6-BAD" "$MUSER.txt"
     check "USERS su with a wrong password fails (exit 1)" $?
     grep -q "^MU7-0" "$MUSER.txt"; check "USERS sudo as a wheel member with the own password" $?
+    sc() { sed -n "/^$1-B\$/,/^$1-E\$/p" "$MUSER.txt"; }      # one SC* step's output
+    asked() { sc "$1" | grep -q "^\[sudo\] password for"; }
+    sc SC1 | grep -qx 0 && ! asked SC1; check "USERS sudo cache: a second sudo in the same session does not ask" $?
+    sc SC2 | grep -qx 0 && asked SC2; check "USERS sudo cache: after sudo -k it asks again" $?
+    sc SC3 | grep -q "authentication failed" && sc SC3B | grep -qx 0 && asked SC3B
+    check "USERS sudo cache: a wrong password creates no record (next sudo asks)" $?
+    sc SC4 | grep -q "^/dev/pts/" && sc SC4 | grep -qx 0 && asked SC4 && sc SC4B | grep -qx 0 && ! asked SC4B
+    check "USERS sudo cache: another terminal (pty session) asks, then has its own record" $?
+    sc SC5 | grep -qx 0 && ! asked SC5; check "USERS sudo cache: the console record survives the other session" $?
+    sc SC6 | grep -q "^/dev/pts/0" && sc SC4 | grep -q "^/dev/pts/0" && sc SC6 | grep -qx 0 && asked SC6
+    check "USERS sudo cache: a new session on the same reused pty asks" $?
+    sc SC7 | grep -qx 0 && sc SC7 | grep -q "^\[sudo\] password for erin"
+    check "USERS sudo cache: another user in the same terminal asks" $?
+    sc SC10 | grep -q "^SC10-erin" && sc SC10 | grep -q "^Password:"
+    check "USERS sudo cache: su still asks while a sudo record is valid" $?
+    sc SC8 | grep -q "^SC8-rc0" && ! asked SC8 && sc SC8B | grep -qx 0 && asked SC8B
+    check "USERS sudo cache: sudo -v refreshes without asking; the record expires (test timeout 60 s)" $?
+    sc SC9 | grep -qx 0 && asked SC9; check "USERS sudo cache: after sudo -K it asks again" $?
+    n=$(grep -a "^SCL-" "$MUSER.txt" | head -1 | sed 's/SCL-//'); [[ -n "$n" && "$n" -ge 4 ]]
+    check "USERS sudo cache: each reuse logged in /var/log/auth.log (${n:-?})" $?
+    sc SH1 | grep -q "^SH1-0-sh" && ! asked SH1; check "USERS /bin/sh: sudo sh -c runs bash as sh, as root" $?
+    grep -q "^SH2-3-" "$MUSER.txt" && grep -q "^SH6-.*:posix" "$MUSER.txt"
+    check "USERS /bin/sh: a #!/bin/sh script runs; sh -c is bash in POSIX mode" $?
+    grep -q "^SH3-a" "$MUSER.txt" && grep -q "^SH4-" "$MUSER.txt" && grep -q "^SH5-/etc/passwd" "$MUSER.txt"
+    check "USERS /bin/sh: xargs sh -c, awk system(), find -exec sh -c" $?
     grep -q "not a member of group wheel" "$MUSER.txt" && grep -q "^MU8-rc1" "$MUSER.txt"
     check "USERS sudo refused outside wheel" $?
     grep -q "password updated successfully" "$MUSER.txt" && grep -q "^MU9-carol" "$MUSER.txt"

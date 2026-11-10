@@ -229,6 +229,22 @@ struct tty* pty_proc_ctty(process_t* p, int* is_console) {
     return NULL;
 }
 
+/* [U-sudo] A stable id for p's controlling terminal (kernel/sudo_ts.c): the
+ * pty pool index + 1, or PTY_CTTY_CONSOLE. -1 when p has none. */
+int pty_ctty_id(process_t* p, uint32_t* id) {
+    if (!p || !id) return -1;
+    int con = 0, r = -1;
+    uint64_t fl = spin_lock_irqsave(&g_pty_lock);
+    struct tty* t = pty_proc_ctty(p, &con);
+    if (con) { *id = PTY_CTTY_CONSOLE; r = 0; }
+    else if (t && t->owner && !t->hungup) {
+        pty_t* o = (pty_t*)t->owner;
+        if (o >= g_pty_mem && o < g_pty_mem + PTY_MAX) { *id = (uint32_t)(o - g_pty_mem) + 1; r = 0; }
+    }
+    spin_unlock_irqrestore(&g_pty_lock, fl);
+    return r;
+}
+
 /* Make t the controlling terminal of c's session. Lock held. Old (stale)
  * ctty references are dropped by the caller before. */
 static void acquire_ctty(process_t* c, pty_t* p) {
