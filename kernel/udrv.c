@@ -516,12 +516,29 @@ static void unmap_region(process_t* p, uint64_t va, uint64_t len) {
 }
 
 /* ------------------------------------------------------- IRQ teardown */
+/* Busy-wait about 1 ms (TSC; a bounded pause loop when it is not calibrated). */
+static void udrv_drain_wait(void) {
+    uint64_t t0 = ktime_ns();
+    if (t0 || tsc_hz()) {
+        for (uint32_t n = 0; ktime_ns() - t0 < 1000000ull && n < 50000000u; n++)
+            __asm__ volatile("pause");
+    } else {
+        for (uint32_t n = 0; n < 2000000u; n++) __asm__ volatile("pause");
+    }
+}
 static void irq_teardown_locked(udrv_dev_t* d) {
     if (!d->nvec) return;
     uint64_t fl = spin_lock_irqsave(&d->ev);
     for (int i = 0; i < d->nvec; i++) vec_mask_locked(d, i);
     int mode = d->irq_mode;
     spin_unlock_irqrestore(&d->ev, fl);
+    /* Let in-flight messages drain before MSI/MSI-X is turned off: ~1 ms of
+     * bounded busy-wait with every vector masked (no sleep; only g_udrv_lock,
+     * a klock, is held). A masked message only sets its pending bit. This also
+     * avoids the QEMU 6.2 e1000e assert in its MSI-X throttling-timer callback,
+     * which fires up to ~128 us after an interrupt and asserts when MSI-X is
+     * already disabled (docs/devlog/M58-udrv-e1000e.md). */
+    if (mode == UDRV_IRQ_MSIX || mode == UDRV_IRQ_MSI) udrv_drain_wait();
     if (mode == UDRV_IRQ_MSIX) pci_msix_disable(&d->loc);
     else if (mode == UDRV_IRQ_MSI) pci_msi_disable(&d->loc);
     for (int i = 0; i < d->nvec; i++) if (d->vec[i].vec >= 0) irq_vec_free(d->vec[i].vec);
