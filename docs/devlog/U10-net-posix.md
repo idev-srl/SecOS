@@ -304,12 +304,17 @@ Checks (each `nptest` line is one gate check; `net` and `local` run as root
 
 | Run | Result |
 |---|---|
-| NETPOSIX, in-kernel e1000, `-smp 2` | see below |
-| NETPOSIX `--udrv` (q35 + intel-iommu,intremap=on + e1000e, ring-3 driver), `-smp 2` | |
-| NETPOSIX `--lockdep --smp 4` (`-DSECOS_LOCKDEP` image) | |
-| NETSMP (`tools/net_stress_drive.py`, lockdep image, smp4-msix / smp4-poll / smp1-msix) | |
-| M58 gate, MUSL-BASE, NANO, persist, smoke `--mb2` / `--uefi` | |
-| warnings (`make`, `make CFLAGS_EXTRA=-DSECOS_LOCKDEP`), base 10179d8 vs U10 | 0 / 0 vs 0 / 0 |
+| NETPOSIX, in-kernel e1000, `-smp 2` | 191/191 |
+| NETPOSIX `--udrv` (q35 + intel-iommu,intremap=on + e1000e, ring-3 driver), `-smp 2` | 192/192 |
+| NETPOSIX `--lockdep --smp 4 --nic e1000e` (in-kernel e1000e, MSI-X NAPI, `-DSECOS_LOCKDEP`) | 192/192, no lockdep report |
+| NETPOSIX `--lockdep --udrv --smp 4` | 192/192, no lockdep report |
+| NETSMP (`tools/net_stress_drive.py`, lockdep image, in a private net namespace): smp4-msix / smp4-poll / smp1-msix | 25/25 each, no `[LOCKDEP]`/panic/`[EXC]` |
+| M58 gate (`tools/net_udrv_gate.sh`: udrv-smp2/4, kern-smp2, netstress-smp2/4, lockdep-smp4, lockdep-netstress-smp4) | 7/7 |
+| MUSL-BASE (`tools/musl_base_test.sh`) | 55/55 |
+| NANO (`tools/nano_test.sh`) | 34/34 |
+| persist (`tools/persist_test.sh`, CONSOLE=root) | 30/30 (count updated: 43 programs + 36 data files) |
+| `tools/smoke.sh --mb2` / `--uefi` | PASS / PASS |
+| warnings (`make`, `make CFLAGS_EXTRA=-DSECOS_LOCKDEP`, every gate image), base 10179d8 vs U10 | 0 / 0 vs 0 / 0 |
 
 ## Deviations from the plan
 
