@@ -84,10 +84,30 @@ Anyone can run these:
 - `sudo [-u USER] [-i|-s] CMD...` has one fixed rule. There is no sudoers
   file: **members of `wheel` may run any command as any user, after typing
   their own password.** Root is never asked. Everyone else is refused and is
-  not asked for a password. There is no credential cache, so sudo asks every
-  time (`-k` is accepted and does nothing). `sudo -l` shows the rule. The
-  command runs with a clean environment (`TERM` kept, a fixed `PATH`, and
+  not asked for a password. `sudo -l` shows the rule. The command runs with
+  a clean environment (`TERM` kept, a fixed `PATH`, and
   `SUDO_USER`/`SUDO_UID`/`SUDO_GID`/`SUDO_COMMAND` set).
+- **Credential cache.** After you type your password, sudo does not ask again
+  for **15 minutes in the same terminal session**. Each successful sudo
+  restarts the 15 minutes. The cache is per user and per terminal session:
+  another terminal (another SSH login, another secwm window, `script`),
+  another user in the same terminal (`su`), or a new login on a reused
+  `/dev/pts/N` or on the console always gets the prompt. A program with no
+  controlling terminal (for example `ssh host 'sudo ...'` without `-t`) gets
+  no cache at all. A wrong password never creates or extends the cache.
+  - `sudo -k` forgets this session's cache. `sudo -k CMD` asks for the
+    password and leaves the cache as it was.
+  - `sudo -K` forgets all of your caches (every terminal).
+  - `sudo -v` asks only if needed and restarts the 15 minutes.
+
+  The kernel keeps the cache (not a file): a small table, readable and
+  writable only by a set-uid root program, keyed by your real uid, the
+  controlling terminal, the session id and the start time of the session's
+  leader. It uses the monotonic clock, so changing the date does not extend
+  it, and it is gone at reboot. su and login never use it.
+- **`/bin/sh`** is GNU bash. Started as `sh`, bash runs in POSIX mode, so
+  `#!/bin/sh` scripts, `sh -c`, `sudo sh -c '...'`, `system()` and `popen()`
+  work. On a disk root `/bin/sh` is a symlink to `bash`.
 
 `login`, `su`, `sudo` and `passwd` are the only set-uid programs. They are
 installed root `04755`, and the kernel honours the bit only because their
@@ -103,7 +123,9 @@ reject as a wrong password.
 ## The log
 
 `/var/log/auth.log` (root `0600`) records logins, failed logins, every su,
-every sudo attempt with its command, password changes and account changes.
+every sudo attempt with its command (and a `cached authentication reused` line
+when the cache answered instead of a password), password changes and account
+changes.
 
 ## Logging in, the terminal, logging out
 
