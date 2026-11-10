@@ -2332,7 +2332,7 @@ else
     init_rc=$?
     { echo "--- s1"; cat "$INITDIR/s1"; } >>"$INITLOG"
     grep -q "\[INIT\] /bin/init started, pid=0x0000000000000001 (PID 1)" "$INITLOG"; check "INIT /bin/init started by the kernel as PID 1" $?
-    grep -q "\[init\] SecOS init (pid 1): 4 entries from /etc/inittab" "$INITSER"; check "INIT reads the default /etc/inittab" $?
+    grep -q "\[init\] SecOS init (pid 1): 6 entries from /etc/inittab" "$INITSER"; check "INIT reads the default /etc/inittab (6 entries: net, ntp, rtc, sshd, console, gui)" $?
     grep -q "\[SSH\] baked authorized_keys installed to /root/.ssh" "$INITLOG"; check "INIT baked SSH key installed as /root/.ssh/authorized_keys" $?
     grep -q "\[DHCP\] lease ip=" "$INITLOG" && grep -q "ifup: eth0: lease 10.0.2.15/24 gw 10.0.2.2" "$INITSER"
     check "INIT networking came up by itself (ifup took a DHCP lease)" $?
