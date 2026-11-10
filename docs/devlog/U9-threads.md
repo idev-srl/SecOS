@@ -253,9 +253,33 @@ musl's futex waits treat that as spurious), `SA_ONSTACK`, `SA_RESETHAND`,
   (U3) is not in this tree yet.
 - **robust lists** are stored, not walked at thread exit.
 
-## Gate THREADS (`tools/threads_test.sh`)
+## Gate THREADS (`tools/threads_test.sh`, in `tools/selftest.sh`)
 
-(results in the table below)
+Host: sysroot, both test programs build signed and warning-free. Guest
+(CONSOLE=root, no root disk, binaries on an ext2 disk at /mnt, `-cpu max`:
+SMAP + KASLR) at -smp 1, 2 and 4 (N = 8, 8, 16 worker threads): every
+`thrraw` and `thrstress` test is a check (22 + 20), smptest threads/thrkill,
+the shell checks (Threads: 9, 9 task entries, kill -9 -> 137, SIGINT ->
+130), a second full run, no SUnreclaim growth (+0..1 kB) and no frame leak,
+a clean debugcon; then a `nothreads` boot (pthread_create and raw clone
+refused, bash and musl programs fine). `--lockdep` repeats it on a
+`-DSECOS_LOCKDEP` image (selftest: `THREADS_LOCKDEP=1`).
+
+## Tests run (at the end of U9)
+
+| Run | Result |
+|---|---|
+| `tools/threads_test.sh` (-smp 1/2/4 + nothreads) | 169/169 |
+| `tools/threads_test.sh --lockdep --smp 4 --no-nothreads` | 58/58, no lockdep report |
+| selftest M16, M19, execve, M25, M30, M29-3, M48 gate (incl. smp_stress_drive -smp 4/8), PROCRACE (lockdep, -smp 4/8), M51 EXEC | 142/142 (the 4 M48 boot-marker checks failed once with two gate sets in parallel: the 40 s boot window; re-run alone: pass) |
+| selftest bash regressions (command substitution, job control, bash over execve) | 37/37 |
+| `tools/musl_base_test.sh` (MUSL-BASE) | 55/55 |
+| `tools/nano_test.sh` (NANO) | 34/34 |
+| `tools/persist_test.sh --crash-runs 3` (CONSOLE=root, as selftest runs it) | 30/30 |
+| GUI compositor gate (`gui_wm_drive.py`) / TASKMGR (`--taskmgr`) | 57/57, 5 hostile clients cut / 34/34 |
+| `tools/net_udrv_gate.sh` (M58 NET-UDRV) | 7/7 |
+| `tools/smoke.sh --mb2` / `--uefi` | PASS / PASS |
+| warnings (`make`, `make CFLAGS_EXTRA=-DSECOS_LOCKDEP`) | 0 / 0 (base 0 / 0) |
 
 ## Notes for the integrator
 
